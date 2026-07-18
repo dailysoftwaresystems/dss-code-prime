@@ -1,5 +1,5 @@
 {
-  "$comment": "FC17.9(e) + D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): the per-format long-double axis, runtime-witnessed on BOTH axes. f64-axis (pe64 x86_64 MSVC + Apple arm64): the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves `long double` with zero new codegen. x87-80 axis (elf64 x86_64 linux): `long double` is the 80-bit x87 extended type — the literals widen double->80-bit extended in rodata, `g_a + g_b` runs on the REAL x87 FPU (fld/fld/faddp/fstp), and `(int)sum` truncates via fld/fisttp/mov (LD-1). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (the `>= sizeof(double)` guard holds on both axes: equal on f64, 16-vs-8 on x87-80), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The ieee128 formats (linux-arm64) remain ABSENT until D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH lands; the still-walled F80 CALL BOUNDARIES (Arg/Call-result/Return-operand — LD-4) are pinned in the unit suites (F80{Arg,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp; the in-function arithmetic + Store LOWER, witnessed by F80ArithmeticAndStoreLowerToX87Sequence + F80StoreValueLowersToX87Copy). exit = (int)(20.0L + 22.0L) = 42.",
+  "$comment": "FC17.9(e) + D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) + -IEEE128-ARITH (LD-2): the per-format long-double axis, runtime-witnessed on ALL THREE axes. f64-axis (pe64 x86_64 MSVC + Apple arm64): the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves `long double` with zero new codegen. x87-80 axis (elf64 x86_64 linux): `long double` is the 80-bit x87 extended type — the literals widen double->80-bit extended in rodata, `g_a + g_b` runs on the REAL x87 FPU (fld/fld/faddp/fstp), and `(int)sum` truncates via fld/fisttp/mov (LD-1). ieee128 axis (elf64 aarch64 linux, qemu): `long double` is IEEE binary128 — the literals widen double->binary128 in rodata (appendF128), `g_a + g_b` lowers to a CALL to the libgcc softfloat helper __addtf3 (v0/v1 args, v0 result), and `(int)sum` to __fixtfsi (v0 arg, x0 result), with the extern imports auto-injected + bound to libgcc_s.so.1 (LD-2). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (the `>= sizeof(double)` guard holds on all axes: equal on f64, 16-vs-8 on x87-80, 16-vs-8 on ieee128), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The still-walled F80/F128 CALL BOUNDARIES (Arg/Call-result/Return-operand — LD-4) are pinned in the unit suites ({F80,F128}{Arg,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp; the in-function arithmetic + Store LOWER, witnessed by F80ArithmeticAndStoreLowerToX87Sequence + F128AddLowersToSoftcallSequence + the store/conversion pins). exit = (int)(20.0L + 22.0L) = 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -14,6 +14,12 @@
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "artifact": "main",
       "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
     },
     {
       "spec": "arm64:macho64-arm64-darwin-exec",

@@ -388,6 +388,10 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // c116 (D-WIN64-SEH-FUNCLETS): SEH scope records from
                       // `synthesizeSehFunclets` (empty for a non-SEH program).
                       std::vector<MirSehScope> sehScopes,
+                      // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
+                      // softcall runtime library, pre-resolved in program.cpp
+                      // (no ObjectFormatKind in scope in the merge lower body).
+                      std::optional<std::string> wideFloatSoftcallLibrary,
                       DiagnosticReporter&  reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of

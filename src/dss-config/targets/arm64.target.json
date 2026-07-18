@@ -2220,6 +2220,31 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): FPR 128-bit memory LOAD — LDUR Qt, [Xn, #simm9] (SIMD&FP 128-bit, unscaled). The load sibling of fstur_q above: same size=00/[29:27]=111/V=1 encoding with opc=11 (128-bit LOAD) instead of 10 (store). CRITICAL fixedWord = 0x3CC00000 = 1019215872: fstur_q's 0x3C800000 with opc bit [23]=1 (opc 10→11). Derivation (ARM ARM C7 LDR/STR SIMD&FP unscaled, 128-bit): size[31:30]=00, [29:27]=111 (0x38000000), V[26]=1 (0x04000000), opc[23:22]=11 load-128 (0x00C00000) → 0x3CC00000. Operand layout mirrors the D/S-form fldur row exactly (shared LIR load form [base_reg, MemBase(scale=1), MemOffset(disp)] + result): result→Rt (rd), base→Rn, MemOffset→Imm9 (signed -256..255), MemBase carries no bits. Single 128-bit form (no width variants — Q is always 16 bytes). Byte-pin: LDUR Q0,[X1,#0] = 0x3CC00000 (Rd=0, Rn=1<<5=0x20, Imm9=0 → 0x3CC00020), LE bytes 20 00 C0 3C. Bound to the vr class's `load` slot in registerClassOps[] — the F128 softcall verb's operand marshalling (fldur_q vN <- [home]) is its sole consumer.",
+      "mnemonic":      "fldur_q",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 1019215872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional.",
@@ -2311,12 +2336,59 @@
     { "name": "d28", "class": "fpr", "widthBytes": 8, "hwEncoding": 28 },
     { "name": "d29", "class": "fpr", "widthBytes": 8, "hwEncoding": 29 },
     { "name": "d30", "class": "fpr", "widthBytes": 8, "hwEncoding": 30 },
-    { "name": "d31", "class": "fpr", "widthBytes": 8, "hwEncoding": 31 }
+    { "name": "d31", "class": "fpr", "widthBytes": 8, "hwEncoding": 31 },
+
+    { "$comment": "D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the V-register file's FULL 128-bit Q views, class vr. widthBytes=16 (the whole SIMD&FP register, NOT the d/s sub-views above). The 5-bit hwEncoding is SHARED with the matching d-view (v0/d0 both encode register number 0) — the fldur_q/fstur_q Q-form memory ops the registerClassOps `vr` row binds address these by that shared encoding. These rows are DELIBERATELY absent from the AAPCS64 calling-convention register lists (argFprs/callerSaved/calleeSaved name the d-views), so lir_regalloc's buildFreeLists SKIPS them (not allocatable) — no VR virtual register is ever minted; the F128 softcall verb uses v0/v1 as PHYSICAL transient scratch around the BL, and the BL's caller-saved clobber of the aliased d0-d7 is what keeps a live double off them (the x87 st0/st1 precedent, one axis over). A future SIMD/vector cycle that makes VR allocatable must add the subOf aliasing + callerSaved membership then (the calleeSaved d8-d15 caveat in $calleeSavedFprComment applies).",
+      "name": "v0",  "class": "vr", "widthBytes": 16, "hwEncoding": 0 },
+    { "name": "v1",  "class": "vr", "widthBytes": 16, "hwEncoding": 1 },
+    { "name": "v2",  "class": "vr", "widthBytes": 16, "hwEncoding": 2 },
+    { "name": "v3",  "class": "vr", "widthBytes": 16, "hwEncoding": 3 },
+    { "name": "v4",  "class": "vr", "widthBytes": 16, "hwEncoding": 4 },
+    { "name": "v5",  "class": "vr", "widthBytes": 16, "hwEncoding": 5 },
+    { "name": "v6",  "class": "vr", "widthBytes": 16, "hwEncoding": 6 },
+    { "name": "v7",  "class": "vr", "widthBytes": 16, "hwEncoding": 7 },
+    { "name": "v8",  "class": "vr", "widthBytes": 16, "hwEncoding": 8 },
+    { "name": "v9",  "class": "vr", "widthBytes": 16, "hwEncoding": 9 },
+    { "name": "v10", "class": "vr", "widthBytes": 16, "hwEncoding": 10 },
+    { "name": "v11", "class": "vr", "widthBytes": 16, "hwEncoding": 11 },
+    { "name": "v12", "class": "vr", "widthBytes": 16, "hwEncoding": 12 },
+    { "name": "v13", "class": "vr", "widthBytes": 16, "hwEncoding": 13 },
+    { "name": "v14", "class": "vr", "widthBytes": 16, "hwEncoding": 14 },
+    { "name": "v15", "class": "vr", "widthBytes": 16, "hwEncoding": 15 },
+    { "name": "v16", "class": "vr", "widthBytes": 16, "hwEncoding": 16 },
+    { "name": "v17", "class": "vr", "widthBytes": 16, "hwEncoding": 17 },
+    { "name": "v18", "class": "vr", "widthBytes": 16, "hwEncoding": 18 },
+    { "name": "v19", "class": "vr", "widthBytes": 16, "hwEncoding": 19 },
+    { "name": "v20", "class": "vr", "widthBytes": 16, "hwEncoding": 20 },
+    { "name": "v21", "class": "vr", "widthBytes": 16, "hwEncoding": 21 },
+    { "name": "v22", "class": "vr", "widthBytes": 16, "hwEncoding": 22 },
+    { "name": "v23", "class": "vr", "widthBytes": 16, "hwEncoding": 23 },
+    { "name": "v24", "class": "vr", "widthBytes": 16, "hwEncoding": 24 },
+    { "name": "v25", "class": "vr", "widthBytes": 16, "hwEncoding": 25 },
+    { "name": "v26", "class": "vr", "widthBytes": 16, "hwEncoding": 26 },
+    { "name": "v27", "class": "vr", "widthBytes": 16, "hwEncoding": 27 },
+    { "name": "v28", "class": "vr", "widthBytes": 16, "hwEncoding": 28 },
+    { "name": "v29", "class": "vr", "widthBytes": 16, "hwEncoding": 29 },
+    { "name": "v30", "class": "vr", "widthBytes": 16, "hwEncoding": 30 },
+    { "name": "v31", "class": "vr", "widthBytes": 16, "hwEncoding": 31 }
   ],
   "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D).",
   "registerClassOps": [
-    { "class": "fpr", "move": "fmov", "load": "fldur", "store": "fstur" }
+    { "class": "fpr", "move": "fmov", "load": "fldur", "store": "fstur" },
+    { "$comment": "D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the 128-bit VR (Q-view) class carries only load=fldur_q / store=fstur_q — the F128 softcall verb LOADS an operand's 16-byte memory home into a physical arg Q-register (v0/v1) and STORES the result Q-register back to a fresh home. NO `move` (trigger discipline): the softcall never register-copies a full Q value class-internally (the value is memory-resident; only its 16 bytes move through fldur_q/fstur_q), so declaring a Q-form FMOV with no consumer would be dead vocabulary. An omitted slot fails loud at the consumer, exactly like the fpr row's discipline.",
+      "class": "vr", "load": "fldur_q", "store": "fstur_q" }
   ],
+  "$wideFloatSoftcallsComment": "D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the softfloat runtime-libcall table for IEEE binary128 `long double` arithmetic. Each row names the libgcc helper an F128 op lowers to a CALL of, plus the physical registers the operands/result are marshalled through (AAPCS64: __*tf3 take two Q-register quad args in v0/v1 and return the quad in v0; __fixtfsi takes the quad in v0 and returns the int32 in x0; __extenddftf2 takes a double in d0 and returns the quad in v0). The MIR→LIR engine keys the softcall verb on TypeKind::F128 + the PRESENCE of the row for the op (wideFloatSoftcall(op) != nullptr) — NEVER a target-name/format check; a target that declares F128 but omits this table falls straight through to the requireEncodedFloatWidth fail-loud gate (the load-bearing agnosticism condition). The helper symbols live in libgcc_s.so.1 (see wideFloatSoftcallLibraryByFormat); the lowerer auto-injects the extern import on first use.",
+  "wideFloatSoftcalls": [
+    { "op": "add",      "helperSymbol": "__addtf3",      "argRegisters": ["v0", "v1"], "resultRegister": "v0" },
+    { "op": "sub",      "helperSymbol": "__subtf3",      "argRegisters": ["v0", "v1"], "resultRegister": "v0" },
+    { "op": "mul",      "helperSymbol": "__multf3",      "argRegisters": ["v0", "v1"], "resultRegister": "v0" },
+    { "op": "div",      "helperSymbol": "__divtf3",      "argRegisters": ["v0", "v1"], "resultRegister": "v0" },
+    { "op": "to_i32",   "helperSymbol": "__fixtfsi",     "argRegisters": ["v0"],       "resultRegister": "x0" },
+    { "op": "from_f64", "helperSymbol": "__extenddftf2", "argRegisters": ["d0"],       "resultRegister": "v0" }
+  ],
+  "$wideFloatSoftcallLibraryComment": "D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the DT_NEEDED library each minted softcall extern binds to, keyed by object-format name. The aarch64 softfloat helpers (__addtf3 family) live in libgcc_s.so.1 (verified present in /usr/aarch64-linux-gnu/lib/libgcc_s.so.1), versioned @@GCC_3.0 — a single default version, so the extern import is UNVERSIONED (binds the default, as the setjmp imports do). Only `elf` is declared: the f64-axis formats (pe64/macho-arm64) collapse long double to double and never reach the softcall path; the x87-80 axis (elf/macho x86_64) uses the inline x87 sequence (LD-1), not a libcall.",
+  "wideFloatSoftcallLibraryByFormat": { "elf": "libgcc_s.so.1" },
   "$callingConventionsComment": "AAPCS64 (https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst). Integer args: x0..x7. FP args: d0..d7 (D-ARM64-FLOAT-SUBSTRATE 2026-06-10 — declared with the FPR substrate). Caller-saved: x0..x18 (incl. x16/x17 = IP0/IP1; PLT-clobberable) + v0-v7/v16-v31 in their d views. Callee-saved: x19..x28 + x29 (frame ptr) + x30 (link reg) + v8-v15 low 64 bits (d8..d15).",
   "callingConventions": [
     {

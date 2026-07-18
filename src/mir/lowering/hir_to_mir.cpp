@@ -2122,7 +2122,17 @@ struct Lowerer {
                         // address). Promoting it here (rather than the prior
                         // fall-through to a bare `addConst` that walls at MIR→LIR)
                         // is what unblocks `long double a = 20.0L;`.
-                        || interner.kind(t) == TypeKind::F80)) {
+                        || interner.kind(t) == TypeKind::F80
+                        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE
+                        // binary128 `long double` literal (20.0L on the
+                        // ieee128 axis, arm64-ELF) rides the SAME rodata-
+                        // promotion path — mint a global whose data item
+                        // lowerMirGlobalsToDataItems widens double->binary128,
+                        // then GlobalAddr + Load. Its F128 Load lowers to the
+                        // memory-resident model (the value IS its address),
+                        // and the softcall verb realizes the arithmetic. Same
+                        // unblock as F80, one axis over.
+                        || interner.kind(t) == TypeKind::F128)) {
                     SymbolId const sym = mintSyntheticGlobalSymbol();
                     if (!sym.valid()) {
                         unsupported(node,

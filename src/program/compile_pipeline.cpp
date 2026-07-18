@@ -711,6 +711,13 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // module). Threaded into MIR→LIR, which emits the
                          // SehScopeDescriptors this body then binds post-assemble.
                          std::vector<MirSehScope>                    sehScopes,
+                         // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the active
+                         // format's F128 softfloat-helper runtime library
+                         // (libgcc_s.so.1 on elf-arm64), threaded into MIR→LIR
+                         // exactly like the extern-dispatch/TLS blocks (nullopt =
+                         // this leg has no F128 softcall binding; an F128 softcall
+                         // then fails loud). Resolved per-leg by each wrapper.
+                         std::optional<std::string>                  wideFloatSoftcallLibrary,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -727,7 +734,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           externCallDispatch,
                           dataImportBinding,
                           tlsAccess,
-                          sehScopes);
+                          sehScopes,
+                          std::move(wideFloatSoftcallLibrary));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1302,6 +1310,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return r ? dss::ffi::applyCMangling(r->name, fmtKind) : std::string{};
     };
 
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's
+    // F128 softcall runtime library inline (fmtKind + the CU's target are both
+    // in scope here — no new CuMirModule field needed). Empty = the format
+    // declares none (nullopt → an F128 softcall fails loud).
+    std::string_view const wfLib =
+        cuMir.target->wideFloatSoftcallLibrary(objectFormatKindName(fmtKind));
+    std::optional<std::string> wideFloatSoftcallLibrary =
+        wfLib.empty() ? std::nullopt
+                      : std::optional<std::string>(std::string(wfLib));
+
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
@@ -1309,7 +1327,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -1338,6 +1356,12 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::optional<DataImportBinding> dataImportBinding,
                       std::optional<TlsAccessInfo> tlsAccess,
                       std::vector<MirSehScope> sehScopes,
+                      // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
+                      // softcall runtime library, pre-resolved one level up in
+                      // program.cpp (no ObjectFormatKind in scope here — the
+                      // merge path resolves it near **formatR, exactly as
+                      // externCallDispatch is pre-resolved there).
+                      std::optional<std::string> wideFloatSoftcallLibrary,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -1352,7 +1376,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, tlsAccess,
-        std::move(sehScopes), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

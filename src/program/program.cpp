@@ -613,6 +613,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // D-CSUBSET-BITFIELD-ABI-EXACT: resolve + pass the FORMAT-determined bit-field
     // strategy (gnu_packed / msvc_straddle) so a bit-field global in the merged
     // whole-program image is laid out byte-ABI-exact for the active format.
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the F128 softcall
+    // runtime library here (the merge lower body has no ObjectFormatKind in
+    // scope) — exactly where externCallDispatch is pre-resolved from the
+    // format. Empty = the format declares none (nullopt → F128 softcall fails
+    // loud).
+    std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary(
+        objectFormatKindName((*formatR)->kind()));
+    std::optional<std::string> wideFloatSoftcallLibrary =
+        wfLib.empty() ? std::nullopt
+                      : std::optional<std::string>(std::string(wfLib));
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
@@ -623,6 +633,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      // format's thread-local access block.
                                      (*formatR)->tlsAccess(),
                                      std::move(sehScopes),
+                                     std::move(wideFloatSoftcallLibrary),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links

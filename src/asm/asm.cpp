@@ -644,6 +644,79 @@ void appendF80Extended(std::vector<std::uint8_t>& bytes, double dv) noexcept {
     for (int i = 0; i < 6; ++i) bytes.push_back(0u);
 }
 
+// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): widen a host `double` (IEEE-754
+// binary64) LOSSLESSLY into IEEE-754 binary128 (quad precision) and append its
+// 16 on-disk bytes. binary128 layout: 1 sign (bit 127) | 15-bit exponent (bits
+// 126..112, bias 16383) | 112-bit fraction (bits 111..0) with an IMPLICIT
+// leading 1 for normals — UNLIKE the x87 extended format (appendF80Extended),
+// whose integer bit is EXPLICIT. 16 bytes EXACT, NO padding (scalarByteSize
+// (F128) == 16). Little-endian: bytes 0..13 hold the 112-bit fraction low-
+// justified, bytes 14..15 hold sign(bit 127) | exponent(bits 126..112).
+//
+// The widen from binary64 (11-bit exponent bias 1023, 52-bit fraction, implicit
+// leading 1): rebias 1023 -> 16383 and move the 52-bit fraction up by 60 into
+// the 112-bit field (lossless — the low 60 bits stay zero). Zero, infinity/NaN
+// and subnormal are special-cased: a binary64 SUBNORMAL is a binary128 NORMAL
+// (the wider exponent absorbs it), so it renormalizes — but because binary128's
+// leading 1 is IMPLICIT, the renormalized integer bit is DROPPED from the
+// stored fraction (the crucial difference from the F80 renormalize, which KEEPS
+// its explicit integer bit). The subnormal arm is NOT exercised by the
+// 20.0L/22.0L witness (both normals) — hand-verified. Verified: 20.0L -> exp
+// 0x4003, fraction top nibble 0x4 -> the 16 LE bytes are 00 x13 then 40 03 40
+// (bytes 13/14/15).
+void appendF128(std::vector<std::uint8_t>& bytes, double dv) noexcept {
+    std::uint64_t d = 0;
+    std::memcpy(&d, &dv, sizeof(double));
+    std::uint64_t const sign   = (d >> 63) & 0x1ull;
+    std::uint64_t const exp11  = (d >> 52) & 0x7FFull;
+    std::uint64_t const frac52 = d & 0x000F'FFFF'FFFF'FFFFull;
+
+    std::uint16_t exp15    = 0;
+    std::uint64_t fracLo64 = 0;   // binary128 fraction bits 0..63
+    std::uint64_t fracHi48 = 0;   // binary128 fraction bits 64..111 (48 bits)
+    if (exp11 == 0x7FFull) {
+        // Infinity (frac52 == 0) / NaN (frac52 != 0): max exponent 0x7FFF, the
+        // 52-bit payload shifted up 60 (its MSB -> fraction bit 111, so a quiet
+        // NaN stays quiet); infinity's zero fraction stays zero.
+        exp15    = 0x7FFFu;
+        fracLo64 = (frac52 & 0xFull) << 60;
+        fracHi48 = frac52 >> 4;
+    } else if (exp11 == 0) {
+        if (frac52 == 0) {
+            exp15 = 0;   // signed zero (fraction all zero)
+        } else {
+            // binary64 subnormal (value = frac52 * 2^-1074) -> binary128 NORMAL:
+            // shift the highest set bit up to bit 63, set the exponent so
+            // (63 - shift) + 15309 == unbiased + 16383, then DROP the now-
+            // implicit leading 1 and left-justify the remaining 63 fraction bits
+            // into the 112-bit field (<< 49). frac52 < 2^52 => countl_zero >= 12.
+            int const shift = std::countl_zero(frac52);
+            std::uint64_t const mant = frac52 << shift;   // leading 1 now at bit 63
+            exp15 = static_cast<std::uint16_t>(((63 - shift) + 15309) & 0x7FFF);
+            std::uint64_t const fracBits =
+                mant & 0x7FFF'FFFF'FFFF'FFFFull;           // drop the integer bit
+            fracLo64 = fracBits << 49;                     // low 64 bits
+            fracHi48 = fracBits >> 15;                     // high 48 bits
+        }
+    } else {
+        // Normal: rebias 1023 -> 16383, move the 52-bit fraction up by 60 into
+        // the 112-bit field (implicit leading 1 in BOTH formats — nothing to
+        // set). exp11 in [1, 0x7FE] => exp15 in [0x3C01, 0x43FE], never 0/0x7FFF.
+        exp15    = static_cast<std::uint16_t>((exp11 - 1023 + 16383) & 0x7FFF);
+        fracLo64 = (frac52 & 0xFull) << 60;
+        fracHi48 = frac52 >> 4;
+    }
+
+    std::uint64_t const hi64 =
+        (sign << 63)
+        | (static_cast<std::uint64_t>(exp15 & 0x7FFFu) << 48)
+        | fracHi48;
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>((fracLo64 >> (i * 8)) & 0xFFu));
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>((hi64 >> (i * 8)) & 0xFFu));
+}
+
 // Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
 // extended into a u64; the writer takes the low `width` bytes). Handles
 // bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
@@ -1340,6 +1413,35 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 continue;
             }
             // A non-`double` F80 initializer is a malformed pool entry — fall
+            // through to the decode chokepoint's fail-loud below.
+        }
+        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE binary128 `long
+        // double` global — the widened quad value is 16 bytes, WIDER than the
+        // u64 `decodeScalarLiteralBits` returns, so (like F80) it has this
+        // dedicated widen+append path (the SOLE F128 scalar-global producer;
+        // F128 struct members stay walled at the aggregate-leaf recursion). The
+        // double->binary128 widen is lossless for the l-suffixed literals this
+        // slice exercises. `*widthOpt` is 16 by construction (scalarByteSize
+        // (F128)); assert-guard the invariant, exactly as the F80 arm does.
+        if (k == TypeKind::F128) {
+            if (auto const* dv = std::get_if<double>(&v.value)) {
+                std::size_t const before = d.bytes.size();
+                appendF128(d.bytes, *dv);
+                if (d.bytes.size() - before != *widthOpt) {
+                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("lowerMirGlobalsToDataItems: F128 global "
+                                     "SymbolId={{ {} }} widened to {} bytes but "
+                                     "scalarByteSize reserves {} — the binary128 "
+                                     "encoder and the layout disagree.",
+                                     sym.v, d.bytes.size() - before, *widthOpt));
+                    continue;
+                }
+                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*widthOpt)));
+                out.push_back(std::move(d));
+                continue;
+            }
+            // A non-`double` F128 initializer is a malformed pool entry — fall
             // through to the decode chokepoint's fail-loud below.
         }
         // Decode the scalar value through the shared chokepoint (the SAME

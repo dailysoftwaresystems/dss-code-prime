@@ -687,6 +687,26 @@ struct Lowerer {
     // silent default — the wrong shape miscompiles).
     std::optional<ExternCallDispatch> externCallDispatch_;
 
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE object format's
+    // DT_NEEDED library for the F128 softfloat helpers (`libgcc_s.so.1` on
+    // elf), captured from `target.wideFloatSoftcallLibrary(formatKey)` one
+    // level up (the LOWER half sees only this value, not the format).
+    // std::nullopt = the format declares none → an F128 softcall that needs a
+    // runtime binding fails loud rather than mint an unbound extern.
+    // `newWideFloatExterns_` accumulates the extern imports the softcall verb
+    // MINTS on first use of each helper (self-serve LIR-tier synthesis — the
+    // propagation chain lowerToLir -> result.externImports -> assemble() ->
+    // linker is pre-wired); `softcallExternByHelper_` dedups them within the
+    // CU (one `__addtf3` import no matter how many F128 adds).
+    std::optional<std::string>              wideFloatSoftcallLibrary_;
+    std::vector<ExternImport>               newWideFloatExterns_;
+    std::unordered_map<std::string, SymbolId> softcallExternByHelper_;
+    // Caller-supplied extern imports keyed by mangled name — so a minted
+    // softcall REUSES a user import of the same helper instead of minting a
+    // duplicate (which would be a link-time "declared more than once"). Built
+    // once at ctor from the same span that populates `externSymbols`.
+    std::unordered_map<std::string, SymbolId> suppliedExternByName_;
+
     // D-LK-EXTERN-DATA-IMPORT (c117): the ACTIVE format's extern-DATA
     // binding model + the derived set of extern-DATA SymbolIds that need
     // GOT-indirect address materialization. `externDataGotSymbols_` is
@@ -842,16 +862,21 @@ struct Lowerer {
             std::optional<ExternCallDispatch> externCallDispatch,
             std::optional<DataImportBinding> dataImportBinding,
             std::optional<TlsAccessInfo> tlsAccess,
-            std::span<MirSehScope const> sehScopes)
+            std::span<MirSehScope const> sehScopes,
+            std::optional<std::string> wideFloatSoftcallLibrary)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
+          wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
             externSymbols.insert(e.symbol.v);
+            // LD-2: index by mangled name so a minted F128 softcall reuses a
+            // user import of the same helper (dedup at the link boundary).
+            suppliedExternByName_.emplace(e.mangledName, e.symbol);
         }
         // D-LK-EXTERN-DATA-IMPORT (c117): under a GOT-indirect format
         // (Mach-O __got), an extern-DATA object's address is not a direct
@@ -1768,6 +1793,15 @@ struct Lowerer {
                 // in-function arithmetic producer.
                 if (interner.kind(mir.instType(id)) == TypeKind::F80)
                     return lowerF80Arith(id, MnemonicSlot::FaddP);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an F128 result
+                // routes to the softfloat CALL (__addtf3) — gated on the
+                // PRESENCE of a config row, NOT a target/format check. A target
+                // with F128 but no softcall row falls through to the width gate
+                // (fail-loud). No arch identity branch here.
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Add))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Add, *cfg);
+                }
                 // FC2 Part B / FC3.5 c2: fadd carries the F64 addsd +
                 // F32 addss encodings, width-axis-selected — gate the
                 // width before the class-blind lowering (the result
@@ -1782,6 +1816,11 @@ struct Lowerer {
                 // opcode $comment).
                 if (interner.kind(mir.instType(id)) == TypeKind::F80)
                     return lowerF80Arith(id, MnemonicSlot::FsubP);
+                // LD-2: F128 -> softcall __subtf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Sub))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Sub, *cfg);
+                }
                 // Cluster-F F3: fsub gains its encodings (SUBSD/SUBSS, arm64
                 // FSUB D/S) — same width gate+axis as FAdd/FDiv (an F16/F128
                 // FSub would otherwise first-match the width:64 SUBSD variant —
@@ -1793,6 +1832,11 @@ struct Lowerer {
                 // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 → x87 fmulp.
                 if (interner.kind(mir.instType(id)) == TypeKind::F80)
                     return lowerF80Arith(id, MnemonicSlot::FmulP);
+                // LD-2: F128 -> softcall __multf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Mul))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Mul, *cfg);
+                }
                 // Cluster-F F3: fmul gains its encodings (MULSD/MULSS, arm64
                 // FMUL D/S) — same gate+axis.
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
@@ -1803,6 +1847,11 @@ struct Lowerer {
                 // (st1/st0 = a/b — see the fdivp opcode $comment).
                 if (interner.kind(mir.instType(id)) == TypeKind::F80)
                     return lowerF80Arith(id, MnemonicSlot::FdivP);
+                // LD-2: F128 -> softcall __divtf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Div))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Div, *cfg);
+                }
                 // FC3.5 sweep-c2: fdiv gains its first encodings
                 // (DIVSD/DIVSS, arm64 FDIV D/S) — the NaN-construction
                 // path (0.0/0.0). Same gate+axis as FAdd.
@@ -1824,6 +1873,21 @@ struct Lowerer {
                 // widthOverride. Gate BOTH ends: an F16/F128 source
                 // or result has no encoded conversion at any width.
                 auto const cvtOps = mir.instOperands(id);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an FPExt whose
+                // RESULT is F128 from a single F64 source widens via the
+                // softfloat CALL (__extenddftf2) — intercept BEFORE the width
+                // gate below (which would wall the unencoded F128 result). An
+                // F128 FPTrunc (narrowing) has no __trunctfdf2 row this cycle
+                // and falls through to that gate (walls loud). Config-row-gated.
+                if (op == MirOpcode::FPExt
+                    && interner.kind(mir.instType(id)) == TypeKind::F128
+                    && cvtOps.size() == 1
+                    && interner.kind(mir.instType(cvtOps[0])) == TypeKind::F64) {
+                    if (auto const* cfg =
+                            target.wideFloatSoftcall(WideFloatOp::FromFloat64))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::FromFloat64,
+                                                      *cfg);
+                }
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                         op == MirOpcode::FPExt ? "MIR FPExt (result)"
                                                : "MIR FPTrunc (result)")) {
@@ -1852,6 +1916,21 @@ struct Lowerer {
                 if (convOps.size() == 1
                     && interner.kind(mir.instType(convOps[0])) == TypeKind::F80)
                     return lowerF80ToSI(id);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an F128 SOURCE with
+                // a 32-bit result converts via the softfloat CALL (__fixtfsi) —
+                // the SAME 32-bit-only scope as lowerF80ToSI (a wider I64 result
+                // has no __fixtfdi row this cycle and falls through to the source
+                // width gate, which walls the F128 source loud). Config-row-gated.
+                if (convOps.size() == 1
+                    && interner.kind(mir.instType(convOps[0])) == TypeKind::F128
+                    && lirInstWidthBits(
+                           memAccessWidthFlags(mir.instType(id),
+                                               LirRegClass::GPR)) == 32) {
+                    if (auto const* cfg =
+                            target.wideFloatSoftcall(WideFloatOp::ToInt32))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::ToInt32,
+                                                      *cfg);
+                }
                 // FC2 Part B / FC3.5 c2: fp_to_si carries the F64
                 // cvttsd2si + F32 cvttss2si encodings — the SOURCE
                 // operand's float width is the encoded axis (the
@@ -2961,6 +3040,291 @@ struct Lowerer {
         defineValue(id, result);
     }
 
+    // ── D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): IEEE binary128 softcall ──
+    //
+    // THE REPRESENTATION mirrors LD-1's F80: an F128 SSA value is the GPR-held
+    // ADDRESS of its 16-byte memory home (a 128-bit VR register is invisible to
+    // the flat linear-scan allocator, so F128 never lives in a register as a
+    // VALUE). Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
+    // realizes it as a CALL to a config'd softfloat helper (`__addtf3` …): the
+    // operands are marshalled into the config'd physical arg registers (v0/v1 —
+    // transient scratch, the x87 st0/st1 precedent), `BL <helper>`, and the
+    // config'd result register is captured to a fresh home. The `BL` (a `Call`
+    // opcode, isCall=true) clobbers the caller-saved v0-v7/x0-x18, so regalloc
+    // spills any live d-reg/gpr around it — zero register-allocator changes for
+    // VALUES (the F128 value stays memory-resident).
+
+    // Realize an F128 op as a softfloat-helper CALL. The GENERIC verb — it
+    // reads the helper symbol + arg/result register NAMES from `cfg` (a
+    // `wideFloatSoftcalls[]` row) and projects them; it keys on NOTHING
+    // target/format-specific (the caller already proved `wideFloatSoftcall(op)
+    // != nullptr`). `op` selects only the diagnostic scope; `cfg` carries all
+    // the realization data.
+    void lowerWideFloatSoftcall(MirInstId id, WideFloatOp /*op*/,
+                                WideFloatSoftcall const& cfg) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != cfg.argRegisterNames.size()
+            || operands.size() != cfg.argRegisterOrdinals.size()) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        bool const f128Result =
+            interner.kind(mir.instType(id)) == TypeKind::F128;
+        // For an F128 result, reserve its 16-byte home + materialize the
+        // address BEFORE the operand loads (the lowerF80Arith scratch-first
+        // order): the home-address vreg is a GPR live across the BL — regalloc
+        // parks it in a callee-saved register — ready to receive the result
+        // store immediately after the call, keeping fldur/fldur/call/fstur
+        // contiguous. (A `to_i32` int result needs no home.)
+        std::optional<std::uint32_t> resultSlotIndex;
+        std::optional<LirReg>        resultHomeAddr;
+        if (f128Result) {
+            resultSlotIndex =
+                emitF80ScratchSlot(kF80StorageBytes, "MIR F128 softcall result");
+            if (!resultSlotIndex.has_value()) { poisonValue(id); return; }
+            resultHomeAddr = emitLeaFrameSlot(*resultSlotIndex);
+            if (!resultHomeAddr.has_value()) { poisonValue(id); return; }
+        }
+        // 1. Marshal each operand into its config'd physical arg register.
+        for (std::size_t i = 0; i < operands.size(); ++i) {
+            std::uint16_t const argOrd = cfg.argRegisterOrdinals[i];
+            auto const* argInfo = target.registerInfo(argOrd);
+            if (argInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(id), id);
+                poisonValue(id);
+                return;
+            }
+            LirRegClass const argCls =
+                static_cast<LirRegClass>(argInfo->regClass);
+            LirReg const argPhys = makePhysicalReg(argOrd, argCls);
+            std::optional<LirReg> const src = regForValue(operands[i]);
+            if (!src.has_value()) { poisonValue(id); return; }
+            if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
+                // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
+                // into the physical arg register with the class's load op
+                // (fldur_q), the same [base, MemBase, MemOffset] shape lowerLoad
+                // uses.
+                auto const loadOp = classOp(argCls, RegClassOp::Load);
+                if (!loadOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Load,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return;
+                }
+                std::array<LirOperand, 3> ldOps{
+                    LirOperand::makeReg(*src),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(0),
+                };
+                emitInst(*loadOp, argPhys, ldOps);
+            } else {
+                // Register-resident (an F64/F32 source of `from_f64`): MOVE the
+                // vreg into the physical arg register with the class's move op
+                // (fmov). Width-blind copy (the D-form fmov preserves the value).
+                auto const moveOp = classOp(argCls, RegClassOp::Move);
+                if (!moveOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Move,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return;
+                }
+                std::array<LirOperand, 1> mvOps{LirOperand::makeReg(*src)};
+                emitInst(*moveOp, argPhys, mvOps);
+            }
+        }
+        // 2. The CALL: resolve/mint the extern, emit the format-appropriate
+        //    call opcode with a BARE [SymbolRef] operand list — DELIBERATELY
+        //    bypassing the callconv arg-classifier (the args are already pinned
+        //    in their physical registers; this internal controlled call must
+        //    NOT open the general F128-user-call path the LD-4 walls keep shut).
+        auto const sym =
+            resolveWideFloatSoftcallExtern(cfg.helperSymbol, "MIR F128 softcall");
+        if (!sym.has_value()) { poisonValue(id); return; }
+        bool const useIndirect = externCallDispatch_.has_value()
+            && externCallUsesIndirectShape(*externCallDispatch_);
+        MnemonicSlot const callSlot = useIndirect
+            ? MnemonicSlot::CallIndirectViaExtern
+            : MnemonicSlot::Call;
+        if (!opcode(callSlot).has_value()) {
+            reportMissingOpcode(callSlot, "MIR F128 softcall (call)");
+            poisonValue(id);
+            return;
+        }
+        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(sym->v)};
+        emitInst(*opcode(callSlot), InvalidLirReg, callOps);
+        // 3. Capture the config'd physical result register.
+        std::uint16_t const resOrd = cfg.resultRegisterOrdinal;
+        auto const* resInfo = target.registerInfo(resOrd);
+        if (resInfo == nullptr) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        LirRegClass const resCls = static_cast<LirRegClass>(resInfo->regClass);
+        LirReg const resPhys = makePhysicalReg(resOrd, resCls);
+        if (f128Result) {
+            // F128 result: STORE the physical result register into the home
+            // reserved above; the value IS its home address (recorded in
+            // allocaSlotIndex_ so consumers rematerialize it), exactly like
+            // lowerF80Arith. The store shape [value, base, MemBase, MemOffset]
+            // mirrors the shipped fstur_q row + the generic FPR store.
+            auto const storeOp = classOp(resCls, RegClassOp::Store);
+            if (!storeOp.has_value()) {
+                reportMissingClassOp(resCls, RegClassOp::Store,
+                                     "MIR F128 softcall (store result)");
+                poisonValue(id);
+                return;
+            }
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(resPhys),
+                LirOperand::makeReg(*resultHomeAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps);
+            allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
+        } else {
+            // Non-F128 result (the `to_i32` int32): MOVE the physical result
+            // register into a fresh result vreg (the idiv implicit-RAX-capture
+            // precedent — width-default GPR copy, the low 32 bits are the int).
+            auto const moveOp = classOp(resCls, RegClassOp::Move);
+            if (!moveOp.has_value()) {
+                reportMissingClassOp(resCls, RegClassOp::Move,
+                                     "MIR F128 softcall (capture result)");
+                poisonValue(id);
+                return;
+            }
+            LirReg const result = lir.newVReg(resCls);
+            std::array<LirOperand, 1> mvOps{LirOperand::makeReg(resPhys)};
+            emitInst(*moveOp, result, mvOps);
+            defineValue(id, result);
+        }
+    }
+
+    // MIR F128 Store -> a memory->memory copy of the 16-byte datum as TWO
+    // 8-byte GPR words (NO VR needed — the F128 "value" operand is itself a
+    // 16-byte home ADDRESS, memory-resident). operands[0] = the F128 value (a
+    // GPR-held address), [1] = the dest pointer. Mirrors lowerF80Store's
+    // memory->memory shape, but as GPR load/store pairs (there is no x87 stack
+    // on arm64).
+    void lowerF128Store(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        std::optional<LirReg> const valueAddr = regForValue(operands[0]);
+        std::optional<LirReg> const destAddr  = regForValue(operands[1]);
+        if (!valueAddr.has_value() || !destAddr.has_value()) return;
+        auto const loadOp  = classOp(LirRegClass::GPR, RegClassOp::Load);
+        auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                 "MIR F128 Store");
+            return;
+        }
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store,
+                                 "MIR F128 Store");
+            return;
+        }
+        for (std::int32_t const offset : {0, 8}) {
+            LirReg const tmp = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 3> ldOps{
+                LirOperand::makeReg(*valueAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(offset),
+            };
+            emitInst(*loadOp, tmp, ldOps);
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(tmp),
+                LirOperand::makeReg(*destAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(offset),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps);
+        }
+    }
+
+    // Resolve (or MINT) the extern import for softfloat helper `helperSymbol`.
+    // Self-serve LIR-tier synthesis: on first use of a helper in this CU it
+    // mints a fresh SymbolId + an ExternImport bound to the active format's
+    // softcall library, memoizes it, and accumulates it in
+    // `newWideFloatExterns_` (run()'s tail moves it into the result — the
+    // propagation chain lowerToLir -> result.externImports -> assemble() ->
+    // linker is pre-wired). Deduped within the CU. Reuses a user-supplied
+    // import if the program already imported the helper. nullopt (fail-loud)
+    // when the format declares no runtime-library binding OR no extern-call
+    // dispatch shape (never mint an unbound / undispatchable extern).
+    [[nodiscard]] std::optional<SymbolId>
+    resolveWideFloatSoftcallExtern(std::string const& helperSymbol,
+                                   std::string_view context) {
+        // 1. Already minted/seen in this CU?
+        if (auto it = softcallExternByHelper_.find(helperSymbol);
+            it != softcallExternByHelper_.end()) {
+            return it->second;
+        }
+        // 2. The user already imported this symbol? Reuse its SymbolId (never
+        //    mint a duplicate → "declared more than once" at link).
+        if (auto it = suppliedExternByName_.find(helperSymbol);
+            it != suppliedExternByName_.end()) {
+            softcallExternByHelper_.emplace(helperSymbol, it->second);
+            return it->second;
+        }
+        // 3. Minting needs a runtime-library binding — fail loud if the active
+        //    format declares none (D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH).
+        if (!wideFloatSoftcallLibrary_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: F128 softcall needs a runtime-library binding but the "
+                    "active format declares none — helper '{}' cannot be "
+                    "imported. Declare the library in the target's "
+                    "`wideFloatSoftcallLibraryByFormat` for this format "
+                    "(D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH).",
+                    context, helperSymbol));
+            return std::nullopt;
+        }
+        // Lazily re-assert the D-FFI-EXTERN-CALL-DISPATCH gate: the ctor's gate
+        // fires only when the caller-supplied externImports was NON-empty, so a
+        // module whose ONLY extern is this minted softcall must still have a
+        // dispatch shape + the dispatch-appropriate call opcode (else the
+        // call-site has no defined form — the ctor-gate rationale, one level in).
+        if (!externCallDispatch_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: F128 softcall to '{}' needs an extern-call dispatch "
+                    "shape but the active object format declares none — declare "
+                    "`externCallDispatch` in the format's `.format.json` "
+                    "(D-FFI-EXTERN-CALL-DISPATCH).",
+                    context, helperSymbol));
+            return std::nullopt;
+        }
+        MnemonicSlot const needSlot =
+            externCallUsesIndirectShape(*externCallDispatch_)
+                ? MnemonicSlot::CallIndirectViaExtern
+                : MnemonicSlot::Call;
+        if (!opcode(needSlot).has_value()) {
+            reportMissingOpcode(needSlot,
+                                "MIR F128 softcall (extern-call dispatch)");
+            return std::nullopt;
+        }
+        // 4. Mint. Draw the SymbolId from the shared monotone `nextBlockSym_`
+        //    sequence (collision-free: seeded past every func/global/extern id)
+        //    and record it in `externSymbols` so any downstream extern-aware
+        //    site treats it correctly.
+        SymbolId const sym = mintJumpTableSymbol();
+        ExternImport imp;
+        imp.symbol      = sym;
+        imp.mangledName = helperSymbol;
+        imp.libraryPath = *wideFloatSoftcallLibrary_;
+        imp.isData      = false;
+        imp.version     = "";   // unversioned → binds the default @@GCC_3.0
+        externSymbols.insert(sym.v);
+        newWideFloatExterns_.push_back(std::move(imp));
+        softcallExternByHelper_.emplace(helperSymbol, sym);
+        return sym;
+    }
+
     // c116 H1 (D-WIN64-SEH-FUNCLETS): lower `RecoverParentFrameSlot(establisher)`
     // (payload = the parent-local slot index) to the LIR `recover_parent_frame_slot`
     // op — operand[0] = the establisher-frame base register, payload = the slot
@@ -2991,12 +3355,16 @@ struct Lowerer {
     void lowerLoad(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
-        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an F80 (x87 80-bit) load
-        // does NOT read into a register — the value lives in MEMORY and its
-        // LIR representation IS its memory address (address propagation). Route
-        // it to the dedicated x87 path BEFORE the riprel fold / class-op
-        // selection (whose FPR movsd_load would be a wrong-width XMM read).
-        if (interner.kind(mir.instType(id)) == TypeKind::F80)
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) / -IEEE128-ARITH (LD-2): an
+        // F80 (x87 80-bit) OR F128 (IEEE binary128) load does NOT read into a
+        // register — the value lives in MEMORY and its LIR representation IS its
+        // memory address (address propagation, reused verbatim by both wide-
+        // float memory-resident models). Route it to the dedicated path BEFORE
+        // the riprel fold / class-op selection (whose FPR movsd_load / fldur
+        // would be a wrong-width scalar read of a 16-byte value). lowerF80Load
+        // is width/type-agnostic (pure address propagation) — one-line widen.
+        if (interner.kind(mir.instType(id)) == TypeKind::F80
+            || interner.kind(mir.instType(id)) == TypeKind::F128)
             return lowerF80Load(id);
         // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): the
         // address comes from a single-use GlobalAddr whose lea was
@@ -3071,6 +3439,13 @@ struct Lowerer {
     void lowerStore(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): storing an F128 value is a
+        // memory→memory copy of the 16-byte datum as two GPR words — the "value"
+        // operand is itself a memory ADDRESS, not a register. Sibling of the F80
+        // store below; intercept before the width gate (which still walls the
+        // Arg/Call/Return F128 boundaries — LD-4).
+        if (interner.kind(mir.instType(operands[0])) == TypeKind::F128)
+            return lowerF128Store(id);
         // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): storing an F80 value is a
         // memory→memory copy of the 80-bit datum (fld_m80 [value-addr];
         // fstp_m80 [dest-addr]) — the "value" operand is itself a memory
@@ -3438,14 +3813,16 @@ struct Lowerer {
         }
         MirInstId const user = it->second.user;
         if (mir.instOpcode(user) != MirOpcode::Load) return false;
-        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an F80 (x87 80-bit) load is
-        // NEVER foldable. Its regClass is FPR and its width flags default to 0
-        // (=64), so the probe below WOULD match movsd_load's width-64 [symbol]
-        // riprel variant — an 8-byte SSE `movsd xmm,[rip+sym]` of a 16-byte x87
-        // value into an XMM (a silent wrong-width miscompile, and x87 values
-        // cannot live in XMM at all). Keep the lea so the F80 load path
-        // (lowerF80Load) reads a GPR base register for its fld_m80.
-        if (interner.kind(mir.instType(user)) == TypeKind::F80) return false;
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) / -IEEE128-ARITH (LD-2): an F80
+        // (x87 80-bit) OR F128 (IEEE binary128) load is NEVER foldable. Its
+        // regClass is FPR and its width flags default to 0 (=64), so the probe
+        // below WOULD match a width-64 [symbol] riprel load variant — an 8-byte
+        // scalar read of a 16-byte value (a silent wrong-width miscompile; and
+        // the value cannot live in a scalar float register at all). Keep the lea
+        // so the memory-resident load path (lowerF80Load) reads a GPR base
+        // register for its fldur_q / fld_m80.
+        if (interner.kind(mir.instType(user)) == TypeKind::F80
+            || interner.kind(mir.instType(user)) == TypeKind::F128) return false;
         auto const userOps = mir.instOperands(user);
         if (userOps.size() != 1 || userOps[0].v != gaId.v) return false;
         // Probe the load's class-op mnemonic for a [symbol] variant at
@@ -7296,7 +7673,12 @@ struct Lowerer {
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
             .signMaskConstants    = std::move(signMaskConstants_),
             .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
-            .externImports        = {},
+            // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the extern imports the
+            // F128 softcall verb MINTED during this lowering walk (empty for
+            // every module without an F128 softcall). `lowerToLir`'s tail
+            // APPENDS the caller-supplied externImports after these, so the two
+            // compose (the pre-wired propagation chain to the linker).
+            .externImports        = std::move(newWideFloatExterns_),
             .funcLocalAlignments  = std::move(funcLocalAlignments),
             .ok                   = !hadError()
         };
@@ -7344,7 +7726,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<ExternCallDispatch> externCallDispatch,
                           std::optional<DataImportBinding> dataImportBinding,
                           std::optional<TlsAccessInfo> tlsAccess,
-                          std::span<MirSehScope const> sehScopes) {
+                          std::span<MirSehScope const> sehScopes,
+                          std::optional<std::string> wideFloatSoftcallLibrary) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -7357,8 +7740,13 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // thread-local access block — `lowerGlobalAddr`'s TLS arm reads it;
     // nullopt + a thread-local access = fail-loud
     // (K_FormatLacksThreadLocalSupport, no silent process-shared alias).
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): also pass the active
+    // format's F128 softcall runtime library — the F128 softcall verb
+    // binds each minted extern to it; nullopt + an F128 softcall =
+    // fail-loud (no unbound extern).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, dataImportBinding, tlsAccess, sehScopes};
+              externCallDispatch, dataImportBinding, tlsAccess, sehScopes,
+              std::move(wideFloatSoftcallLibrary)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

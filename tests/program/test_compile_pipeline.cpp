@@ -1106,7 +1106,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      /*externCallDispatch=*/std::nullopt,
                                      /*dataImportBinding=*/std::nullopt,
                                      /*tlsAccess=*/std::nullopt,
-                                     /*sehScopes=*/{}, rep);
+                                     /*sehScopes=*/{},
+                                     /*wideFloatSoftcallLibrary=*/std::nullopt, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
     // (2) The lowered module carries no `add5` import either (direct call).
