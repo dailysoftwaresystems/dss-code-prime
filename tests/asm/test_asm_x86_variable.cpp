@@ -1972,6 +1972,158 @@ TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
     EXPECT_EQ(bytes[7], 0x00);
 }
 
+// ── D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit opcode byte pins ──────
+// These pin the EXACT machine bytes against the Intel SDM (a wrong x87 byte is
+// SIGILL or a wrong result, not a diagnostic). The memory forms mirror the
+// universal [base, MemBase, MemOffset] shape; the arithmetic forms are bare
+// register-implicit 2-byte opcodes.
+
+TEST(X86VariableEncoder, FldM80EmitsDbSlash5) {
+    // `fld tword [rdi + 0]` = DB /5, ModR/M mod=10 reg=5 rm=rdi(7) = 0xAF,
+    // disp32 = 0 → DB AF 00 00 00 00. Intel SDM: DB /5 FLD m80fp.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic("fld_m80");
+    ASSERT_TRUE(op.has_value());
+    LirReg const rdi = physGprByName(**schema, "rdi");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*op, InvalidLirReg, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xDB);
+    EXPECT_EQ(bytes[1], 0xAF);  // mod=10 reg=/5 rm=rdi
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+}
+
+TEST(X86VariableEncoder, FstpM80EmitsDbSlash7) {
+    // `fstp tword [rdi + 0]` = DB /7, ModR/M mod=10 reg=7 rm=rdi(7) = 0xBF →
+    // DB BF 00 00 00 00. Intel SDM: DB /7 FSTP m80fp.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(op.has_value());
+    LirReg const rdi = physGprByName(**schema, "rdi");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*op, InvalidLirReg, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xDB);
+    EXPECT_EQ(bytes[1], 0xBF);  // mod=10 reg=/7 rm=rdi
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+}
+
+TEST(X86VariableEncoder, FisttpM32EmitsDbSlash1) {
+    // `fisttp dword [rdi + 0]` = DB /1, ModR/M mod=10 reg=1 rm=rdi(7) = 0x8F →
+    // DB 8F 00 00 00 00. Intel SDM (SSE3): DB /1 FISTTP m32int.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic("fisttp_m32");
+    ASSERT_TRUE(op.has_value());
+    LirReg const rdi = physGprByName(**schema, "rdi");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*op, InvalidLirReg, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xDB);
+    EXPECT_EQ(bytes[1], 0x8F);  // mod=10 reg=/1 rm=rdi
+    EXPECT_EQ(bytes[2], 0x00);
+}
+
+TEST(X86VariableEncoder, X87ArithmeticPopFormsEmitFixedTwoByteOpcodes) {
+    // The four register-implicit st1←st1 OP st0 + pop ops (Intel SDM):
+    //   FADDP ST(1),ST(0) = DE C1   FSUBP ST(1),ST(0) = DE E9  (NOT E1=FSUBRP)
+    //   FMULP ST(1),ST(0) = DE C9   FDIVP ST(1),ST(0) = DE F9  (NOT F1=FDIVRP)
+    // The FSUBP/FDIVP DIRECTION (st1−st0 = a−b, st1/st0 = a/b) is the crux the
+    // a-then-b push order relies on; pin the exact bytes so a reversed-form
+    // regression (SIGILL-free but WRONG results) fails here, loud.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    struct Row { char const* mnem; std::uint8_t b0; std::uint8_t b1; };
+    Row const rows[] = {
+        {"faddp", 0xDE, 0xC1},
+        {"fsubp", 0xDE, 0xE9},
+        {"fmulp", 0xDE, 0xC9},
+        {"fdivp", 0xDE, 0xF9},
+    };
+    for (auto const& r : rows) {
+        auto const op = (*schema)->opcodeByMnemonic(r.mnem);
+        ASSERT_TRUE(op.has_value()) << r.mnem;
+        Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+            (void)b.addInst(*op, InvalidLirReg,
+                            std::span<LirOperand const>{});
+        });
+        DiagnosticReporter rep;
+        auto const bytes = assembleFirstFn(lir, **schema, rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << r.mnem;
+        ASSERT_GE(bytes.size(), 2u) << r.mnem;
+        EXPECT_EQ(bytes[0], r.b0) << r.mnem;
+        EXPECT_EQ(bytes[1], r.b1) << r.mnem;
+    }
+}
+
+TEST(X86VariableEncoder, FldM80FromR12ForcesSibAndRexB) {
+    // An F80 home addressed through r12 (rsp-family lo3=4, hi bit set) exercises
+    // BOTH the SIB-force and REX.B paths under the /5 opcode-extension:
+    // `fld tword [r12 + 0]` = 41 DB AC 24 00 00 00 00
+    //   REX.B=41 ; DB ; ModR/M mod=10 reg=/5 rm=100(SIB) = 0xAC ;
+    //   SIB scale0 index=100(none) base=100(r12.lo3) = 0x24 ; disp32=0.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic("fld_m80");
+    ASSERT_TRUE(op.has_value());
+    LirReg const r12 = physGprByName(**schema, "r12");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(r12),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*op, InvalidLirReg, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x41);  // REX.B (r12 hi bit)
+    EXPECT_EQ(bytes[1], 0xDB);
+    EXPECT_EQ(bytes[2], 0xAC);  // mod=10 reg=/5 rm=SIB
+    EXPECT_EQ(bytes[3], 0x24);  // SIB: index=none base=r12.lo3
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
 TEST(X86VariableEncoder, LoadFromRbxEmitsNoSibByte) {
     // Negative-test for non-rsp/r12-family base. `mov rax, [rbx+0x10]`
     // → 48 8B 43 10 00 00 00 — rbx.lo3 = 3, NOT in {4} (rsp/r12 family),

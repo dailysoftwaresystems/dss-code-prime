@@ -2112,7 +2112,17 @@ struct Lowerer {
                 if (std::holds_alternative<double>(src.value)
                     && t.valid()
                     && (interner.kind(t) == TypeKind::F64
-                        || interner.kind(t) == TypeKind::F32)) {
+                        || interner.kind(t) == TypeKind::F32
+                        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an x87 80-bit
+                        // `long double` literal (20.0L on the x87-80 axis) rides
+                        // the SAME rodata-promotion path — mint a global whose
+                        // data item lowerMirGlobalsToDataItems widens double→80-
+                        // bit extended, then GlobalAddr + Load. Its F80 Load
+                        // lowers to the x87 memory model (the value IS its
+                        // address). Promoting it here (rather than the prior
+                        // fall-through to a bare `addConst` that walls at MIR→LIR)
+                        // is what unblocks `long double a = 20.0L;`.
+                        || interner.kind(t) == TypeKind::F80)) {
                     SymbolId const sym = mintSyntheticGlobalSymbol();
                     if (!sym.valid()) {
                         unsupported(node,

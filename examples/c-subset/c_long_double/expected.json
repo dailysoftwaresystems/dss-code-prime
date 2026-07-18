@@ -1,5 +1,5 @@
 {
-  "$comment": "FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis, runtime-witnessed on the f64-axis formats where `long double` IS `double` (pe64 x86_64 MSVC + Apple arm64 — the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves it with zero new codegen). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (f64-axis identity guard), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The x87-80/ieee128 formats are deliberately ABSENT — long double VALUE ops wall loud there until D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH land; that walled behavior is pinned in the unit suites (the F80 arithmetic-wall arm + the four call-boundary walls F80{Arg,StoreValue,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp, the constexpr fold-gate refusal in the semantic + const_eval suites), not by a runtime arm here. exit = (int)(20.0L + 22.0L) = 42.",
+  "$comment": "FC17.9(e) + D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): the per-format long-double axis, runtime-witnessed on BOTH axes. f64-axis (pe64 x86_64 MSVC + Apple arm64): the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves `long double` with zero new codegen. x87-80 axis (elf64 x86_64 linux): `long double` is the 80-bit x87 extended type — the literals widen double->80-bit extended in rodata, `g_a + g_b` runs on the REAL x87 FPU (fld/fld/faddp/fstp), and `(int)sum` truncates via fld/fisttp/mov (LD-1). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (the `>= sizeof(double)` guard holds on both axes: equal on f64, 16-vs-8 on x87-80), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The ieee128 formats (linux-arm64) remain ABSENT until D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH lands; the still-walled F80 CALL BOUNDARIES (Arg/Call-result/Return-operand — LD-4) are pinned in the unit suites (F80{Arg,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp; the in-function arithmetic + Store LOWER, witnessed by F80ArithmeticAndStoreLowerToX87Sequence + F80StoreValueLowersToX87Copy). exit = (int)(20.0L + 22.0L) = 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -9,6 +9,11 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "main.exe",
       "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
     },
     {
       "spec": "arm64:macho64-arm64-darwin-exec",

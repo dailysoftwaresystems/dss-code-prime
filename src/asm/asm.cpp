@@ -8,6 +8,7 @@
 #include "core/types/type_lattice/type_layout.hpp"   // computeLayout, scalarByteSize
 #include "lir/lir_pass_util.hpp"
 
+#include <bit>
 #include <cstring>
 #include <format>
 #include <limits>
@@ -574,6 +575,73 @@ void appendLE(std::vector<std::uint8_t>& bytes,
         bytes.push_back(static_cast<std::uint8_t>(
             (value >> (j * 8)) & 0xFFu));
     }
+}
+
+// D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): widen a host `double` (IEEE-754
+// binary64) LOSSLESSLY into the x87 80-bit extended format and append its 16
+// on-disk bytes (10 significant + 6 zero pad — the SysV/darwin 16-byte,
+// 16-aligned slot `scalarByteSize(F80)` reserves). This is 80-bit, WIDER than
+// the u64 `decodeScalarLiteralBits` yields, so F80 has this dedicated
+// widen+append path rather than routing through that chokepoint (which stays
+// nullopt for F80, keeping the aggregate-member leaf recursion walled — F80
+// struct members are LD-3). The x87 extended memory layout is little-endian:
+//   bytes 0-7  = the 64-bit significand with an EXPLICIT integer bit (bit 63),
+//   bytes 8-9  = sign (bit 15) | 15-bit exponent,
+//   bytes 10-15 = zero pad.
+// The widen from binary64 (11-bit exponent bias 1023, 52-bit fraction with an
+// IMPLICIT leading 1): copy the sign; rebias the exponent to bias 16383; move
+// the 52-bit fraction up by 11 into the significand and SET bit 63 (extended's
+// integer bit is explicit). Zero, subnormal, infinity and NaN are handled
+// specially — a binary64 subnormal is a NORMAL extended value (the wider
+// exponent range absorbs it), so it is renormalized rather than emitted as a
+// (never-produced-by-widening) extended subnormal.  Verified by hand: 20.0L →
+// exponent 0x4003, significand 0xA000000000000000 → LE bytes
+// 00 00 00 00 00 00 00 A0 03 40 00 00 00 00 00 00.
+void appendF80Extended(std::vector<std::uint8_t>& bytes, double dv) noexcept {
+    std::uint64_t d = 0;
+    std::memcpy(&d, &dv, sizeof(double));
+    std::uint64_t const sign   = (d >> 63) & 0x1ull;
+    std::uint64_t const exp11  = (d >> 52) & 0x7FFull;
+    std::uint64_t const frac52 = d & 0x000F'FFFF'FFFF'FFFFull;
+
+    std::uint16_t signExp = 0;
+    std::uint64_t mant64  = 0;
+    constexpr std::uint64_t kIntegerBit = 0x8000'0000'0000'0000ull;
+    if (exp11 == 0x7FFull) {
+        // Infinity (frac52 == 0) / NaN (frac52 != 0): max exponent 0x7FFF,
+        // integer bit set, the 52-bit payload shifted up 11 (quiet bit
+        // preserved) — infinity's zero fraction stays zero.
+        signExp = static_cast<std::uint16_t>((sign << 15) | 0x7FFFu);
+        mant64  = kIntegerBit | (frac52 << 11);
+    } else if (exp11 == 0) {
+        if (frac52 == 0) {
+            signExp = static_cast<std::uint16_t>(sign << 15);   // signed zero
+            mant64  = 0;
+        } else {
+            // binary64 subnormal (value = frac52 * 2^-1074) → renormalize into
+            // an extended NORMAL: shift the highest set bit up to bit 63 and
+            // set the exponent E so that (63 - shift) + 15309 == the unbiased
+            // exponent + 16383. frac52 < 2^52 ⇒ countl_zero ≥ 12.
+            int const shift = std::countl_zero(frac52);
+            int const e     = (63 - shift) + 15309;
+            signExp = static_cast<std::uint16_t>(
+                (sign << 15) | static_cast<std::uint16_t>(e & 0x7FFF));
+            mant64  = frac52 << shift;
+        }
+    } else {
+        // Normal: rebias 1023 → 16383, set the explicit integer bit, and lift
+        // the fraction into place.
+        std::uint64_t const e80 = exp11 - 1023 + 16383;
+        signExp = static_cast<std::uint16_t>(
+            (sign << 15) | static_cast<std::uint16_t>(e80 & 0x7FFFu));
+        mant64  = kIntegerBit | (frac52 << 11);
+    }
+
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>((mant64 >> (i * 8)) & 0xFFu));
+    bytes.push_back(static_cast<std::uint8_t>(signExp & 0xFFu));
+    bytes.push_back(static_cast<std::uint8_t>((signExp >> 8) & 0xFFu));
+    for (int i = 0; i < 6; ++i) bytes.push_back(0u);
 }
 
 // Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
@@ -1243,6 +1311,36 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                              "AGGREGATE-GLOBAL.",
                              sym.v, static_cast<int>(k)));
             continue;
+        }
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an x87 80-bit `long double`
+        // global — the widened extended value is 10 significant + 6 pad = 16
+        // bytes, WIDER than the u64 `decodeScalarLiteralBits` returns, so it
+        // has this dedicated widen+append path (the SOLE F80 scalar-global
+        // producer — F80 struct members stay walled at the aggregate-leaf
+        // recursion, LD-3). The double→extended widen is lossless (the pool
+        // carries the value as a host `double`, exactly representable for the
+        // l-suffixed literals this slice exercises). `*widthOpt` is 16 by
+        // construction (scalarByteSize(F80)); assert-guard the invariant.
+        if (k == TypeKind::F80) {
+            if (auto const* dv = std::get_if<double>(&v.value)) {
+                std::size_t const before = d.bytes.size();
+                appendF80Extended(d.bytes, *dv);
+                if (d.bytes.size() - before != *widthOpt) {
+                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("lowerMirGlobalsToDataItems: F80 global "
+                                     "SymbolId={{ {} }} widened to {} bytes but "
+                                     "scalarByteSize reserves {} — the x87 "
+                                     "extended encoder and the layout disagree.",
+                                     sym.v, d.bytes.size() - before, *widthOpt));
+                    continue;
+                }
+                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*widthOpt)));
+                out.push_back(std::move(d));
+                continue;
+            }
+            // A non-`double` F80 initializer is a malformed pool entry — fall
+            // through to the decode chokepoint's fail-loud below.
         }
         // Decode the scalar value through the shared chokepoint (the SAME
         // int/float semantics the aggregate-leaf recursion uses, incl. the
