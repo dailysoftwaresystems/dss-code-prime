@@ -19,6 +19,23 @@ static_assert(detail::type_rules::floatRank(TypeKind::F64) > detail::type_rules:
 static_assert(detail::type_rules::signedIntRank(TypeKind::Bool) == 0);
 static_assert(detail::type_rules::unsignedIntRank(TypeKind::Char) == 0);
 static_assert(detail::type_rules::floatRank(TypeKind::I32) == 0);
+// C14 (C 6.2.5p15 / 6.7.9p14): the three character types are {Char, I8=signed
+// char, U8=unsigned char}; a NARROW string literal (element Char) may init an
+// array of ANY of them, a WIDE literal only its same-kind array, and a
+// non-character lhs never. RED-ON-DISABLE (compile-time): revert
+// stringLiteralArrayInitCompatible to char-only and the U8/I8-from-Char asserts
+// below FAIL to compile.
+static_assert(detail::type_rules::isCharacterType(TypeKind::Char));
+static_assert(detail::type_rules::isCharacterType(TypeKind::I8));
+static_assert(detail::type_rules::isCharacterType(TypeKind::U8));
+static_assert(!detail::type_rules::isCharacterType(TypeKind::I16));  // `short` is not a char type
+static_assert(!detail::type_rules::isCharacterType(TypeKind::I32));
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::U8,   TypeKind::Char));  // unsigned char[] = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I8,   TypeKind::Char));  // signed char[]   = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::Char, TypeKind::Char));  // char[]          = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I32,  TypeKind::I32));   // wchar_t[] = L"…" (same kind)
+static_assert(!detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I32, TypeKind::Char));  // int[]  = "…"  → reject
+static_assert(!detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::U8,  TypeKind::I32));   // uchar[] = L"…" → reject
 
 namespace {
 
@@ -256,6 +273,34 @@ TEST(TypeRules, IsAssignableDifferentEnumsRemainMismatch) {
         << "different enums stay a mismatch even gated (no over-admission)";
     EXPECT_TRUE(isAssignable(in, a, a, {}, false, false, /*enum=*/true))
         << "same enum is the identity path";
+}
+// C14 (C 6.7.9p14 + 6.2.5p15, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a NARROW
+// string literal (`char[M]`) may initialize an array of ANY character type —
+// char, signed char (I8), unsigned char (U8) — when N >= M. Gated on
+// `charArrayFromStringLiteralInit` (position 8). RED-ON-DISABLE: revert the arm's
+// element check to char-on-both-sides → the U8/I8 EXPECT_TRUEs below fail.
+TEST(TypeRules, IsAssignableStringLiteralInitsAnyCharacterArray) {
+    auto in     = makeInterner();
+    auto charEl = in.primitive(TypeKind::Char);
+    auto char4  = in.array(charEl, 4);                       // the narrow literal "abc" → char[4]
+    auto uchar8 = in.array(in.primitive(TypeKind::U8), 8);
+    auto schar8 = in.array(in.primitive(TypeKind::I8), 8);
+    auto char8  = in.array(charEl, 8);
+    auto int8   = in.array(in.primitive(TypeKind::I32), 8);
+    auto uchar3 = in.array(in.primitive(TypeKind::U8), 3);   // N=3 < M=4 → over-long
+    auto G      = true;   // charArrayFromStringLiteralInit gate (position 8)
+    EXPECT_TRUE(isAssignable(in, uchar8, char4, {}, false, false, false, false, false, false, false, G))
+        << "unsigned char[8] <- char[4] string literal (C 6.2.5p15) — the sqlite `const unsigned char zHex[]` shape";
+    EXPECT_TRUE(isAssignable(in, schar8, char4, {}, false, false, false, false, false, false, false, G))
+        << "signed char[8] <- char[4] string literal";
+    EXPECT_TRUE(isAssignable(in, char8, char4, {}, false, false, false, false, false, false, false, G))
+        << "char[8] <- char[4] string literal (the baseline must still hold)";
+    EXPECT_FALSE(isAssignable(in, int8, char4, {}, false, false, false, false, false, false, false, G))
+        << "int[8] <- char[4]: int is NOT a character type → stays a loud mismatch";
+    EXPECT_FALSE(isAssignable(in, uchar3, char4, {}, false, false, false, false, false, false, false, G))
+        << "unsigned char[3] <- char[4]: OVER-LONG (N < M) stays a loud mismatch";
+    EXPECT_FALSE(isAssignable(in, uchar8, char4))
+        << "ungated (no string-literal init context) → not admitted";
 }
 // UAC: an enum participates in arithmetic AS its underlying int (`e + 1` types
 // as int, not enum). RED-ON-DISABLE: revert the enum-underlying resolution in

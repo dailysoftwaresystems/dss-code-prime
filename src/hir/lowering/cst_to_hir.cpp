@@ -498,15 +498,20 @@ struct Lowerer {
             auto const toElem   = interner.operands(target);
             auto const fromLen  = interner.scalars(child.type);
             auto const toLen    = interner.scalars(target);
-            // C11/C23 6.4.5: SAME element kind on both sides (was Char-only) so a
-            // wide-string initializer `wchar_t buf[3]=L"hi"` / `char16_t b[3]=u"hi"`
-            // gets the same trailing zero-fill as a narrow `char[N]="…"`. The element
-            // KIND must match (a `char[N]` cannot be inited by a `u"…"` array — the
-            // semantic tier rejects the mismatch); the string bytes are already
-            // element-width-encoded, and the producer pads to N*sizeof(elem).
+            // C11/C23 6.4.5 + 6.2.5p15: element-type compatibility via the shared
+            // `stringLiteralArrayInitCompatible` (LOCKSTEP with the semantic admit
+            // in type_rules.hpp::isAssignable). SAME element kind on both sides
+            // carries a wide-string initializer `wchar_t buf[3]=L"hi"` /
+            // `char16_t b[3]=u"hi"`; a NARROW literal (element Char) ALSO retypes
+            // into a signed/unsigned-char array (`unsigned char z[N]="…"` — C
+            // 6.2.5p15, all three character types are 1-byte, identical bytes). A
+            // `char[N]` cannot be inited by a `u"…"` array (neither shape holds —
+            // the semantic tier already rejected it). RE-TYPING to `target` (the lhs
+            // `<c>[N]`) keeps the post-coerce verifier's child==slot equality exact.
             if (!fromElem.empty() && !toElem.empty()
                 && !fromLen.empty() && !toLen.empty()
-                && interner.kind(fromElem[0]) == interner.kind(toElem[0])
+                && detail::type_rules::stringLiteralArrayInitCompatible(
+                       interner.kind(toElem[0]), interner.kind(fromElem[0]))
                 && toLen[0] >= fromLen[0]
                 && std::holds_alternative<std::string>(
                        literals.at(builder.payload(child.id)).value)) {

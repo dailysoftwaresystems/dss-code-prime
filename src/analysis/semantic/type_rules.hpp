@@ -61,6 +61,36 @@ namespace detail::type_rules {
     }
 }
 
+// C 6.2.5p15 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): the THREE character
+// types — plain `char` (interned as the distinct TypeKind::Char), `signed char`
+// (the 1-byte signed int I8), and `unsigned char` (the 1-byte unsigned int U8).
+// A string literal may initialize an array of ANY of them (C 6.7.9p14). DSS
+// interns the two 1-byte int types as I8/U8 and plain `char` as Char, so the
+// character-type set is exactly {Char, I8, U8}.
+[[nodiscard]] inline constexpr bool isCharacterType(TypeKind k) noexcept {
+    return k == TypeKind::Char || k == TypeKind::I8 || k == TypeKind::U8;
+}
+
+// C 6.7.9p14: may a `<rhsElem>[M]` string-literal array initialize a
+// `<lhsElem>[N]` array slot (element-type compatibility only; the caller checks
+// the N >= M length fit and the string-literal shape)? Two admissible shapes:
+// (1) SAME element kind on both sides — the exact-kind path carrying a WIDE
+// literal (`wchar_t buf[N]=L"…"`, `char16_t[N]=u"…"`) into its matching wide
+// array, and the plain `char[N]="…"` case; (2) a NARROW string literal (element
+// Char) into an array of ANY character type (char / signed char / unsigned
+// char) — `unsigned char z[N]="…"`, `signed char s[N]="…"` (C 6.2.5p15). A wide
+// rhs into a DIFFERENT-kind lhs, or a narrow rhs into a NON-character lhs
+// (`int[N]="…"`), satisfies NEITHER shape → a loud reject. Used in LOCKSTEP by
+// isAssignable (the semantic admit), the cst_to_hir coerce() realize arm (which
+// retypes the literal node to the lhs type so the post-coerce verifier sees an
+// exact match), and asm.cpp's char-array producer (via isCharacterType) — a
+// divergence between the three is a silent miscompile.
+[[nodiscard]] inline constexpr bool stringLiteralArrayInitCompatible(
+    TypeKind lhsElem, TypeKind rhsElem) noexcept {
+    return lhsElem == rhsElem
+        || (rhsElem == TypeKind::Char && isCharacterType(lhsElem));
+}
+
 } // namespace detail::type_rules
 
 // Arithmetic = any integer (signed/unsigned) or float type. Bool/Char/
@@ -350,16 +380,19 @@ namespace detail::type_rules {
         return true;
     }
     // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a string literal
-    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `char[N]` is
+    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `<c>[N]` is
     // assignable FROM the string literal's `char[M]` when N >= M (M = the literal's
     // own array length, chars + NUL). Gated on `charArrayFromStringLiteralInit`
     // (the caller sets it only when the init IS a string literal), so an ordinary
-    // array-to-array assignment never reaches here as `true`. Both element types
-    // must be `char` (the C string-literal element); a wide / non-char array stays
-    // out of scope. The same-type (N==M) exact fit already returned above; the
-    // `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`) a loud mismatch.
-    // The HIR `coerce()` realizes it by retyping the literal to `char[N]` so the
-    // MIR producer pads the rodata global to N (no OOB copy).
+    // array-to-array assignment never reaches here as `true`. The element types
+    // must satisfy `stringLiteralArrayInitCompatible` — C 6.2.5p15: a NARROW
+    // literal (`char[M]`) inits an array of ANY character type (char / signed char
+    // / unsigned char, the sqlite `const unsigned char zHex[]="…"` shape), and a
+    // wide literal inits its matching wide array; every other element pairing
+    // (`int[N]="…"`) stays out of scope. The same-type (N==M) exact fit already
+    // returned above; the `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`)
+    // a loud mismatch. The HIR `coerce()` realizes it by retyping the literal to
+    // the lhs `<c>[N]` so the MIR producer pads the rodata global to N (no OOB copy).
     if (charArrayFromStringLiteralInit
         && lk == TypeKind::Array && rk == TypeKind::Array) {
         auto const lhsElem = interner.operands(lhs);
@@ -368,8 +401,8 @@ namespace detail::type_rules {
         auto const rhsLen  = interner.scalars(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()
             && !lhsLen.empty() && !rhsLen.empty()
-            && interner.kind(lhsElem[0]) == TypeKind::Char
-            && interner.kind(rhsElem[0]) == TypeKind::Char
+            && stringLiteralArrayInitCompatible(interner.kind(lhsElem[0]),
+                                                interner.kind(rhsElem[0]))
             && lhsLen[0] >= rhsLen[0]) {
             return true;
         }

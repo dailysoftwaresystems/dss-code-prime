@@ -869,21 +869,26 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     }
 
     if (k == TypeKind::Array) {
-        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a CHAR-ARRAY
-        // field/element initialized by a STRING LITERAL (`char zName[7] = "hour";`
-        // inside a static const aggregate). The const-eval folds the string-literal
-        // leaf to a `std::string` value (NOT a per-char `MirAggregateValue`), so a
-        // char[N] element here carries a string arm. Write the string bytes + the
-        // implicit NUL at `base`; the caller pre-zeroed `buf` to the full layout
-        // size, so the trailing N−(len+1) bytes are already zero (the C 6.7.9p14
-        // zero-fill) — the aggregate twin of the standalone string-literal global's
-        // producer-side padding. Element must be `char`; the NUL+bytes must fit the
-        // array's byte extent (a layout↔value disagreement fails loud). A non-char
-        // array with a string value, or an over-long string, falls through to the
-        // shape-mismatch `false` below.
+        // c62 / C14 (C 6.7.9p14 + 6.2.5p15, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL):
+        // a CHARACTER-ARRAY field/element initialized by a STRING LITERAL
+        // (`char zName[7] = "hour";` / `unsigned char u[7] = "hour";` inside a static
+        // aggregate). The const-eval folds the string-literal leaf to a `std::string`
+        // value (NOT a per-char `MirAggregateValue`), so the element here carries a
+        // string arm. Write the string bytes + the implicit NUL at `base`; the caller
+        // pre-zeroed `buf` to the full layout size, so the trailing N−(len+1) bytes
+        // are already zero (the C 6.7.9p14 zero-fill) — the aggregate twin of the
+        // standalone string-literal global's producer-side padding. Element must be a
+        // 1-byte CHARACTER type — char / signed char (I8) / unsigned char (U8), the
+        // three C 6.2.5p15 character types, all 1 byte with identical string bytes
+        // (LOCKSTEP with type_rules.hpp isCharacterType / the coerce realize arm); the
+        // NUL+bytes must fit the array's byte extent (a layout↔value disagreement
+        // fails loud). A non-character array with a string value, or an over-long
+        // string, falls through to the shape-mismatch `false` below.
         if (std::holds_alternative<std::string>(v.value)
             && !in.operands(ty).empty()
-            && in.kind(in.operands(ty)[0]) == TypeKind::Char) {
+            && (in.kind(in.operands(ty)[0]) == TypeKind::Char
+                || in.kind(in.operands(ty)[0]) == TypeKind::I8
+                || in.kind(in.operands(ty)[0]) == TypeKind::U8)) {
             auto const& s   = std::get<std::string>(v.value);
             auto const  lay = computeLayout(ty, in, lp, dm);
             if (!lay.has_value()) return false;
