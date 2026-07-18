@@ -3090,10 +3090,11 @@ TEST(Preprocessor, CommandLineDefineViaDefinedOperatorIncludeLive) {
 
 // Pin 3 (CHILD THREADING, depth>=1, RED-ON-DISABLE): a header included LIVE from an
 // outer command-line-gated conditional must ITSELF see the command-line define for
-// its OWN gated includes -- proving `seededDefines` threads into child builders.
-// `outer.h` (resolved + inlined from main) has its own `#ifdef GATE #include
-// <missing_inner>`; with child-threading that inner include resolves + errors,
-// without it the child never learns GATE -> inner skipped -> no error.
+// its OWN gated includes -- proving the C21 `preScanDefinePrefix` (which supersedes
+// the C19 `seededDefines` NAME set) threads into child builders. `outer.h`
+// (resolved + inlined from main) has its own `#ifdef GATE #include <missing_inner>`;
+// with child-threading that inner include resolves + errors, without it the child
+// never learns GATE -> inner skipped -> no error.
 TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path() / "dss_c19_child_seed";
@@ -3136,6 +3137,174 @@ TEST(Preprocessor, CommandLineDefineSeedDoesNotContaminateOutput) {
     ASSERT_EQ(lexs.size(), 5u) << "expected exactly: int v = 7 ;";
     EXPECT_EQ(lexs[3], "7") << "GATE expands to its prologue value, seed adds no "
                                "shadowing #define";
+}
+
+// ── C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): the include-gating pre-scan
+// now seeds command-line/predefined macro VALUES (not just definedness) via a
+// NON-EMITTED span-safe `#define NAME VALUE` prefix on each build()'s scan buffer,
+// so a `#if <macro>` VALUE guard gating a quote-`#include` evaluates correctly.
+// These pins use the same "missing-header-errors-when-LIVE" oracle as the C19 pins
+// above and are RED-ON-DISABLE (revert the value prefix -> the value guard folds to
+// 0 -> the include is silently skipped -> NO error). ────────────────────────────
+
+// C21 Pin A (VALUE CORE, RED-ON-DISABLE): a command-line `--define M=1` makes the
+// VALUE guard `#if M` LIVE (not merely `#ifdef M`), so its quote-`#include`
+// RESOLVES (and errors on the missing header). This is the value capability C19's
+// definedness-only seed lacked: without the value prefix `#if M` folds M->0->dead
+// -> the include is silently skipped -> NO error (the exact drop this cycle fixes).
+TEST(Preprocessor, CommandLineDefineValueMakesIfIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a command-line --define M=1 must make the VALUE guard #if M live in the "
+           "include-gating pre-scan so its quote-#include resolves "
+           "(D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE)";
+}
+
+// C21 Pin B (VALUE-vs-DEFINEDNESS PARITY): with `--define M=1`, BOTH `#if defined(M)`
+// (definedness, via sbNameDefined) AND `#if M` (value, via the prefix seeding
+// localMacros) gate the include LIVE -> both error. The two contexts agree.
+TEST(Preprocessor, CommandLineDefineValueAndDefinednessAgree) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    {
+        auto buf = SourceBuffer::fromString(
+            "#if defined(M)\n#include \"still_missing.h\"\n#endif\nint x;\n",
+            "main.c");
+        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+            << "#if defined(M) must gate the include LIVE for --define M=1";
+    }
+    {
+        auto buf = SourceBuffer::fromString(
+            "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+            << "#if M (value) must agree with #if defined(M) for --define M=1";
+    }
+}
+
+// C21 Pin C (NEGATIVE / P0016 one-directional divergence): `--define M=0` makes the
+// VALUE guard `#if M` DEAD, so the quote-`#include` is NOT resolved -> NO error.
+// Proves the value seed does not OVER-resolve -- a 0-valued define stays dead, so
+// the pre-scan is more-live only IN LOCKSTEP with the authoritative pass.
+TEST(Preprocessor, CommandLineDefineValueZeroKeepsIncludeDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=0"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "--define M=0 must leave #if M dead so its quote-#include is not resolved "
+           "(no P0016 over-resolution)";
+}
+
+// C21 Pin D (FINDING-C, NOT-EMIT, RED-ON-DISABLE): the value prefix is pre-scan
+// knowledge ONLY -- it must NEVER be emitted into the synth buffer. Token-count is
+// BLIND to a leak (a duplicate `#define GATE 7` is an idempotent redefinition -> 0
+// extra output tokens), so this inspects the synth buffer TEXT and asserts the
+// `#define GATE` string occurs EXACTLY ONCE (the authoritative <command-line>
+// prologue). A leaked prefix -> TWO occurrences.
+TEST(Preprocessor, CommandLineDefineValuePrefixNotEmittedIntoSynthText) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("#ifdef GATE\nint v = GATE;\n#endif\n",
+                                        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE=7"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    std::string_view syn = out.synthBuffer->text();
+    std::size_t count = 0;
+    for (std::size_t pos = syn.find("#define GATE");
+         pos != std::string_view::npos; pos = syn.find("#define GATE", pos + 1)) {
+        ++count;
+    }
+    EXPECT_EQ(count, 1u)
+        << "the non-emitted value prefix must NOT leak into the synth buffer -- "
+           "`#define GATE` must appear exactly once (the <command-line> prologue)";
+}
+
+// C21 Pin E (predefined-VALUE, RED-ON-DISABLE -- CLOSES the sibling anchor
+// D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): a predefined macro used in VALUE
+// position (`#if __STDC_VERSION__ >= 201112L`) now gates a quote-`#include` LIVE ->
+// the missing header errors. Before C21 the pre-scan folded __STDC_VERSION__ to 0
+// -> 0 >= 201112L is false -> dead -> the include was conservatively skipped (the
+// exact residual this anchor tracked). The value comes from the OBJECT-like
+// predefined subset of the prefix (c-subset __STDC_VERSION__ = 202311L).
+TEST(Preprocessor, PredefinedValueGuardMakesIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __STDC_VERSION__ >= 201112L\n#include \"still_missing.h\"\n#endif\n"
+        "int x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a predefined VALUE guard (#if __STDC_VERSION__ >= 201112L) must gate the "
+           "quote-#include LIVE (closes D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE)";
+}
+
+// C21 Pin E' (predefined-VALUE converse): the SAME predefined used in a FALSE guard
+// (`#if __STDC_VERSION__ < 0`) stays DEAD -> NO error. Proves the seeded value is
+// REAL (not a blanket "predefined -> live").
+TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __STDC_VERSION__ < 0\n#include \"still_missing.h\"\n#endif\nint x;\n",
+        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "#if __STDC_VERSION__ < 0 must stay dead (the seeded predefined value is "
+           "real, not a blanket predefined->live)";
+}
+
+// C21 Pin F (FINDING-A, function-like predefine must NOT be value-seeded): a bare
+// `#if NAME` (no call) on a FUNCTION-like predefine must fold to 0 in the pre-scan
+// EXACTLY as in the authoritative pass; value-seeding it would make the pre-scan
+// MORE-live -> a silent P0016 re-open. The prefix builder therefore SKIPS
+// `isFunctionLike` predefines (mirroring the MacroExpander ctor + the <built-in>
+// prologue). NOTE: the c-subset schema's ONLY function-like predefine is
+// `__declspec` (pe-only, value ""), a WEAK red-on-disable witness -- wrongly
+// value-seeding it yields an object-like EMPTY macro, so `#if __declspec` -> empty
+// operand -> uncertain -> conservative skip -> NO error, the SAME outcome as the
+// correct guard (`#if __declspec` -> undefined identifier -> 0 -> skip). So this pin
+// POSITIVELY confirms the guarded outcome (the function-like predefine is available
+// on pe yet its VALUE guard stays dead -> no include resolved); the CODE guard is
+// what enforces FINDING-A. Run on the pe format so __declspec passes the
+// availability filter and actually reaches the isFunctionLike guard.
+TEST(Preprocessor, FunctionLikePredefinedNotValueSeededIntoPrescan) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __declspec\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Pe, noDefs);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a function-like predefine (__declspec) must NOT be value-seeded into the "
+           "pre-scan: #if __declspec stays dead so its quote-#include is not resolved";
+}
+
+// C21 Pin G (#undef COMPOSE, Option 2): `--define M=1` followed by an in-source
+// `#undef M` BEFORE the `#if M`-gated include leaves the include DEAD -> NO error.
+// The Option-2 improvement over C19's separate NAME set (which ignored #undef): the
+// value seeds `localMacros`, so a source `#undef` erases it and the guard composes.
+TEST(Preprocessor, CommandLineDefineThenUndefComposesDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#undef M\n#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "an in-source #undef M must compose with --define M=1 (Option 2 seeds the "
+           "value into localMacros, which #undef erases) -> #if M dead -> no include";
 }
 
 // AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by

@@ -372,6 +372,27 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
     stack.pop_back();
 }
 
+// C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE / FINDING-B): the SINGLE
+// per-object-format availability predicate for a config PREDEFINED macro. A
+// macro with a non-empty `availableObjectFormats` set is available ONLY when the
+// active object format is in that set; an EMPTY set means EVERY format; absent an
+// active format only a universal (empty-set) macro is available. Shared by the
+// include-gating pre-scan's definedness oracle (`sbNameDefined`), the value-seed
+// prefix builder (`preprocess`), the `MacroExpander` `predefined_` seed, AND the
+// function-like "<built-in>" prologue filter -- so all four apply ONE filter and
+// can NEVER drift. A divergence between the pre-scan's seed and the authoritative
+// `predefined_` set would be a silent P0016 seam (the pre-scan resolving a
+// value-gated include the authoritative pass reads dead), so this MUST stay the
+// one definition.
+[[nodiscard]] bool predefinedMacroAvailableOnActiveFormat(
+    std::vector<std::string> const&        availableObjectFormats,
+    std::optional<ObjectFormatKind> const& activeFormat) {
+    if (availableObjectFormats.empty()) return true;
+    if (!activeFormat.has_value()) return false;
+    return ffi::objectFormatInAvailabilitySet(availableObjectFormats,
+                                              *activeFormat);
+}
+
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
@@ -396,18 +417,25 @@ struct SynthBuilder {
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
     bool&                                fatal;
-    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): the command-line `--define` NAMES,
-    // shared by const-ref across EVERY child builder. The include-gating pre-scan
-    // must know them so a `#ifdef <cmdline-define>`-gated quote-`#include` is read
-    // LIVE -- it would otherwise be a FALSE-DEAD skip, the un-inlined header's
-    // `#define`s vanish, and the drop surfaces as a spurious P0009 at the macro's
-    // use site (D-PP-CONDITIONAL-INCLUDE-ORDERING lineage). A `--define` is in
-    // NEITHER `localMacros` (it never passes through this pre-scan's `#define`
-    // tracking -- the `<command-line>` prologue is spliced straight into
-    // `synthText`) NOR `predefinedMacros`, so it is threaded in explicitly.
-    // DEFINEDNESS-only: a VALUE-context guard (`#if NAME==k`) on a command-line
-    // define stays conservative (uncertain -> loud), never silently mis-resolved.
-    std::unordered_set<std::string> const& seededDefines;
+    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2 — supersedes the
+    // C19 `seededDefines` NAME-set): a `#define NAME VALUE\n` prefix for every
+    // command-line `--define` + every OBJECT-like predefined macro available on
+    // the active format, shared by const-ref across EVERY child builder. The
+    // include-gating pre-scan must see these VALUES so a `#if <cmdline/predefined>`
+    // VALUE guard (`#if SQLITE_TEST`, `#if __STDC_VERSION__ >= 201112L`) gating a
+    // quote-`#include` evaluates correctly -- it would otherwise fold to 0 -> a
+    // FALSE-DEAD skip, the un-inlined header's `#define`s vanish, and the drop
+    // surfaces as a spurious P0009/P9006 at the macro's use site
+    // (D-PP-CONDITIONAL-INCLUDE-ORDERING lineage). `build()` prepends this as a
+    // NON-EMITTED span-safe SCAN-BUFFER prefix (its `#define` lines seed
+    // `localMacros` with values whose replacement-token spans slice the SAME
+    // `scanBuf` sbExpand reads). This SUBSUMES C19's definedness-only seed AND
+    // composes with a source `#undef` (which now erases the seeded value from
+    // `localMacros`, unlike the old separate NAME set). The one-directional-
+    // divergence invariant is preserved: the values EXACTLY match the
+    // `<command-line>`/`<built-in>` prologues the authoritative pass sees, so the
+    // pre-scan is more-live only IN LOCKSTEP (P0016 stays closed).
+    std::string const& preScanDefinePrefix;
     // c17: a SynthBuilder-local object-like macro, tracked from LIVE-branch
     // `#define`s so a `#if FOO`/`#if FOO == 1` guard gating a quote-`#include`
     // evaluates with the macro state visible at the include point. Independent
@@ -430,34 +458,40 @@ struct SynthBuilder {
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
-    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): the SINGLE definedness oracle for the
-    // include-gating pre-scan's `#ifdef`/`#ifndef`/`#if defined()`. Before, the two
-    // DISAGREED -- `#ifdef` saw only `localMacros`, `#if defined()` also saw
-    // `predefinedMacros` -- and NEITHER saw a command-line `--define`, so a
-    // `#ifdef SQLITE_TEST`-gated quote-`#include` was falsely skipped. Now BOTH
-    // consult, in one place: an in-source `#define` (localMacros), a command-line
-    // `--define` (seededDefines), or a config predefined macro with the SAME
-    // per-format availability filter the authoritative MacroExpander applies. So
-    // the pre-scan can only ever be MORE live IN LOCKSTEP with the authoritative
-    // pass -- never resolving a branch the real pass reads dead (the one-directional
-    // divergence invariant that keeps P0016 closed): the seeded/predefined names
-    // are exactly the ones the authoritative pass also sees defined. EDGE (pre-
-    // existing + LOUD-not-silent): a stack-live `#undef` of a seeded/predefined NAME
-    // is NOT reflected here -- `localMacros` erases it but this arm still reports it
-    // defined -- so the pre-scan may read MORE-live than the authoritative pass; the
-    // effect is at worst a spurious include-resolve (loud `P_PreprocessorIncludeError`)
-    // or a benign splice-then-elide, NEVER a silent mis-include. This matched the
-    // predefined arm's behavior before C19; tracking undef'd seed names belongs with
-    // the sibling predefined value-position residual, not this cycle.
+    // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY + -PREDEFINED-VALUE-INCLUDE-GATE):
+    // the SINGLE definedness oracle for the include-gating pre-scan's
+    // `#ifdef`/`#ifndef`/`#if defined()`. Before C19 the two DISAGREED -- `#ifdef`
+    // saw only `localMacros`, `#if defined()` also saw `predefinedMacros` -- and
+    // NEITHER saw a command-line `--define`, so a `#ifdef SQLITE_TEST`-gated
+    // quote-`#include` was falsely skipped. Now BOTH consult, in one place: an
+    // in-source `#define` OR a command-line `--define` OR an object-like predefined
+    // (all now materialized in `localMacros` via the C21 value prefix that build()
+    // prepends), OR a config predefined macro via the SHARED per-format filter the
+    // authoritative MacroExpander applies (this arm keeps a FUNCTION-like predefine
+    // -- excluded from the value prefix per FINDING-A -- reporting DEFINED). So the
+    // pre-scan can only ever be MORE live IN LOCKSTEP with the authoritative pass --
+    // never resolving a branch the real pass reads dead (the one-directional
+    // divergence invariant that keeps P0016 closed). C21 IMPROVEMENT: a source
+    // `#undef` of a command-line define now COMPOSES (it erases the value from
+    // `localMacros` and the define is not a predefined, so this reports it
+    // undefined). EDGE (pre-existing + LOUD-not-silent): a `#undef` of a PREDEFINED
+    // name is still not reflected by the predefined for-loop arm -- so the pre-scan
+    // may read MORE-live than the authoritative pass; the effect is at worst a
+    // spurious include-resolve (loud `P_PreprocessorIncludeError`) or a benign
+    // splice-then-elide, NEVER a silent mis-include.
     [[nodiscard]] bool sbNameDefined(std::string_view n) const {
+        // Option 2 (C21): a command-line `--define`'s definedness now comes from
+        // `localMacros` (the value prefix seeds it via the main-loop `#define`
+        // handler), so the separate C19 `seededDefines` NAME set is gone. KEEP the
+        // predefined arm: a FUNCTION-like predefine (EXCLUDED from the value prefix
+        // per FINDING-A) must still report DEFINED here for `#if defined(NAME)` /
+        // `#ifdef NAME`. The predefined filter is the SHARED helper (FINDING-B) so
+        // it can never drift from the value prefix's predefined subset.
         if (localMacros.find(std::string{n}) != localMacros.end()) return true;
-        if (seededDefines.find(std::string{n}) != seededDefines.end()) return true;
         for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
             if (pm.name != n) continue;
-            if (pm.availableObjectFormats.empty()) return true;
-            if (!activeFormat.has_value()) return false;
-            return ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                      *activeFormat);
+            return predefinedMacroAvailableOnActiveFormat(
+                pm.availableObjectFormats, activeFormat);
         }
         return false;
     }
@@ -697,11 +731,11 @@ struct SynthBuilder {
                 return sbExpand(in, buf, active, 0);
             };
         PpIsDefined definedCb = [this](std::string_view n) {
-            // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): unified with `#ifdef`/`#ifndef`
-            // via `sbNameDefined`. Adds command-line `--define`s (seededDefines) to
-            // the localMacros-or-predefined (format-filtered) check this did inline,
-            // so `#if defined(SQLITE_TEST)` and `#ifdef SQLITE_TEST` now agree AND
-            // both see a command-line define.
+            // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY): unified with
+            // `#ifdef`/`#ifndef` via `sbNameDefined`. A command-line `--define` is
+            // seen through `localMacros` (the C21 value prefix seeds it), so
+            // `#if defined(SQLITE_TEST)` and `#ifdef SQLITE_TEST` agree AND both see
+            // a command-line define.
             return sbNameDefined(n);
         };
         // Resolve `__has_include` EXACTLY as the include machinery / the macro
@@ -769,7 +803,26 @@ struct SynthBuilder {
             fatal = true;   // splice truncated — PP fatal
             return;
         }
-        std::string spliced;
+        // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): prepend the command-
+        // line/predefined `#define` VALUE prefix as a NON-EMITTED span-safe HEADER
+        // of THIS build's scan buffer, so a `#if <cmdline/predefined>` VALUE guard
+        // (`#if SQLITE_TEST`) evaluates with the macro's value at the include point
+        // -- its replacement tokens slice the SAME `scanBuf` sbExpand reads. Two
+        // LOAD-BEARING invariants keep the prefix un-emittable (so it never
+        // contaminates the output and no diagnostic offset leaks):
+        //   (1) it is prepended as RAW bytes with NO localMap segment (NOT through
+        //       appendWithContinuationSplice), and copyVerbatim is SEGMENT-DRIVEN
+        //       (it emits ONLY bytes covered by a localMap segment) -> the prefix
+        //       is STRUCTURALLY un-copyable; AND
+        //   (2) copiedUpTo starts at prefixLen (below), not 0.
+        // The prefix's `#define` lines are consumed by the main loop's `#define`
+        // handler (seeding `localMacros` with VALUES) and that handler does
+        // `i=lineEndTok-1; continue;` -- it never touches copiedUpTo -- so NO
+        // pre-pass is needed. appendWithContinuationSplice bases each source
+        // segment at the CURRENT out.size() (== prefixLen), so the line-map stays
+        // correct (source at synthStart >= prefixLen).
+        std::string spliced = preScanDefinePrefix;
+        std::size_t const prefixLen = spliced.size();
         LineMap     localMap;
         appendWithContinuationSplice(source->text(), source, 0, spliced,
                                      localMap);
@@ -786,7 +839,8 @@ struct SynthBuilder {
         const auto angleKind =
             schema->schemaTokens().find(cfg().angleIncludeToken);
 
-        std::size_t copiedUpTo = 0;
+        // C21: start PAST the non-emitted value prefix (load-bearing invariant 2).
+        std::size_t copiedUpTo = prefixLen;
         fs::path const includingDir = fs::path{source->name()}.parent_path();
 
         auto isHash = [&](Token const& t) {
@@ -1132,7 +1186,7 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
-                               depth + 1, includeStack, fatal, seededDefines};
+                               depth + 1, includeStack, fatal, preScanDefinePrefix};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -1282,12 +1336,12 @@ public:
             // UNCONDITIONALLY only when the filter is empty; a format-restricted
             // macro stays unseeded absent a format (it is meaningless without
             // one). This lets `_WIN32` be predefined for the pe target ONLY.
-            if (!pm.availableObjectFormats.empty()) {
-                if (!activeFormat_.has_value()) continue;
-                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                        *activeFormat_)) {
-                    continue;
-                }
+            // FINDING-B (C21): the SHARED per-format filter, so this authoritative
+            // `predefined_` seed can never drift from the pre-scan's value prefix +
+            // sbNameDefined.
+            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                        activeFormat_)) {
+                continue;
             }
             // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
             // NOT seeded here — it lowers to a `#define name(params) value`
@@ -3294,12 +3348,11 @@ PreprocessResult preprocess(
         std::string builtinText;
         for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
             if (!pm.isFunctionLike) continue;
-            if (!pm.availableObjectFormats.empty()) {
-                if (!activeFormat.has_value()) continue;
-                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                        *activeFormat)) {
-                    continue;
-                }
+            // FINDING-B (C21): the SHARED per-format filter (same as the pre-scan
+            // value prefix / sbNameDefined / the predefined_ seed).
+            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                        activeFormat)) {
+                continue;
             }
             builtinText += "#define ";
             builtinText += pm.name;
@@ -3343,16 +3396,50 @@ PreprocessResult preprocess(
         fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
-    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): the command-line `--define` NAMES for
-    // the include-gating pre-scan's definedness oracle (`sbNameDefined`). Built from
-    // the SAME `userDefines` the `<command-line>` prologue above emits, so the
-    // pre-scan sees EXACTLY the names the authoritative pass sees defined (the
-    // one-directional-divergence invariant). Function-scope: it outlives every
-    // (recursive) SynthBuilder, which hold it by const-ref + thread it into children.
-    std::unordered_set<std::string> seededDefineNames;
+    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
+    // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
+    // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
+    // `#if __STDC_VERSION__ >= 201112L`) gating a quote-`#include` evaluates
+    // correctly, the pre-scan must see the macro's VALUE -- not just its
+    // definedness. Built from:
+    //   (a) every command-line `--define`, parsed EXACTLY like the `<command-line>`
+    //       prologue above (VALUE defaults to 1) -- so the pre-scan is more-live
+    //       only IN LOCKSTEP with the authoritative pass (the one-directional-
+    //       divergence invariant that keeps P0016 closed); PLUS
+    //   (b) every OBJECT-like predefined macro available on the active format, via
+    //       the SHARED filter (FINDING-B) the authoritative `predefined_` seed +
+    //       `sbNameDefined` use -- so the sets cannot drift. FINDING-A: FUNCTION-
+    //       like predefines (`isFunctionLike`) are EXCLUDED -- a bare `#if NAME`
+    //       (no call) must fold to 0 in the pre-scan exactly as in the authoritative
+    //       pass; value-seeding one would make the pre-scan MORE-live -> a silent
+    //       P0016 re-open.
+    // Each SynthBuilder prepends this as a NON-EMITTED span-safe scanBuf prefix (see
+    // build()). Function-scope: it outlives every (recursive) SynthBuilder, held by
+    // const-ref + threaded into children.
+    std::string preScanDefinePrefix;
     for (std::string const& d : userDefines) {
         auto const eq = d.find('=');
-        seededDefineNames.insert(eq == std::string::npos ? d : d.substr(0, eq));
+        std::string const name =
+            (eq == std::string::npos) ? d : d.substr(0, eq);
+        std::string const val =
+            (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+        preScanDefinePrefix += "#define ";
+        preScanDefinePrefix += name;
+        preScanDefinePrefix += ' ';
+        preScanDefinePrefix += val;
+        preScanDefinePrefix += '\n';
+    }
+    for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+        if (pm.isFunctionLike) continue;   // FINDING-A: never value-seed a call macro
+        if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                    activeFormat)) {
+            continue;
+        }
+        preScanDefinePrefix += "#define ";
+        preScanDefinePrefix += pm.name;
+        preScanDefinePrefix += ' ';
+        preScanDefinePrefix += pm.value;
+        preScanDefinePrefix += '\n';
     }
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder is conditional-
     // aware ONLY to gate quote-`#include` splicing (a dead-branch quote include
@@ -3363,7 +3450,7 @@ PreprocessResult preprocess(
     // the illegal-char oracle can never diverge from the real branch decision.
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          *result.diagnostics, 0, includeStack, result.fatal,
-                         seededDefineNames};
+                         preScanDefinePrefix};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
