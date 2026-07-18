@@ -1664,3 +1664,46 @@ TEST(TargetSchema, WideFloatSoftcallSchemaParsesArgAndResultRegisters) {
     ASSERT_FALSE(badOp.has_value());
     EXPECT_TRUE(anyHasCode(badOp.error(), DiagnosticCode::C_MalformedJson));
 }
+
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the argVrs/returnVrs calling-
+// convention lists (the AAPCS64 binary128 arg/return VR registers) parse +
+// resolve like argFprs, are validated VR-class, and a mis-classed name fails
+// loud. Mirrors the LD-2 wideFloatSoftcall schema pin.
+TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
+    // Positive: the shipped arm64 aapcs64 cc (index 0) declares v0..v7 args +
+    // v0..v3 returns, all resolving to VR-class 128-bit registers.
+    auto r = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE((*r)->callingConventions().empty());
+    auto const& cc = (*r)->callingConventions()[0];
+    EXPECT_EQ(cc.name, "aapcs64");
+    ASSERT_EQ(cc.argVrs.size(), 8u);
+    ASSERT_EQ(cc.returnVrs.size(), 4u);
+    for (std::size_t k = 0; k < cc.argVrs.size(); ++k) {
+        EXPECT_EQ(cc.argVrs[k], std::string("v") + std::to_string(k));
+        auto const ord = (*r)->registerByName(cc.argVrs[k]);
+        ASSERT_TRUE(ord.has_value()) << cc.argVrs[k];
+        auto const* info = (*r)->registerInfo(*ord);
+        ASSERT_NE(info, nullptr);
+        EXPECT_EQ(info->regClass, TargetRegClass::VR);
+        EXPECT_EQ(info->widthBytes, 16u);
+    }
+    EXPECT_EQ(cc.returnVrs[0], "v0");
+
+    // Negative: an argVrs naming a NON-VR register (a GPR) must fail the
+    // VR-class validation (C_MalformedJson), exactly as argFprs rejects a
+    // non-FPR name — a mis-classed boundary register is a silent wrong-file move.
+    auto bad = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"},
+                       {"mnemonic":"mov","result":"value"}],
+            "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+                         {"name":"v0","class":"vr","widthBytes":16,"hwEncoding":0}],
+            "callingConventions":[
+              {"name":"cc","argVrs":["x0"],"returnVrs":["v0"],"stackAlignment":16}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(bad.has_value())
+        << "an argVrs naming a GPR (non-VR) register must fail loud";
+    EXPECT_TRUE(anyHasCode(bad.error(), DiagnosticCode::C_MalformedJson));
+}

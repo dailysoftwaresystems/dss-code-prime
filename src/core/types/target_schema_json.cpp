@@ -1715,6 +1715,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readStringArray(c, i, "argFprs",     cc.argFprs);
                 readStringArray(c, i, "returnGprs",  cc.returnGprs);
                 readStringArray(c, i, "returnFprs",  cc.returnFprs);
+                // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
+                // arg/return register lists (empty on non-ieee128 targets).
+                readStringArray(c, i, "argVrs",      cc.argVrs);
+                readStringArray(c, i, "returnVrs",   cc.returnVrs);
                 readStringArray(c, i, "callerSaved", cc.callerSaved);
                 readStringArray(c, i, "calleeSaved", cc.calleeSaved);
                 std::string const ccPath = std::format("/callingConventions/{}", i);

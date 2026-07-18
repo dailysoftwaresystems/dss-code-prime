@@ -1311,6 +1311,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "argFprs",     cc.argFprs,     TargetRegClass::FPR);
         checkRefs(i, "returnGprs",  cc.returnGprs,  TargetRegClass::GPR);
         checkRefs(i, "returnFprs",  cc.returnFprs,  TargetRegClass::FPR);
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
+        // arg/return registers must resolve to VR-class registers (the F128
+        // boundary verb reads them; a mis-classed name = a silent wrong-file
+        // move), exactly as argFprs must be FPR-class.
+        checkRefs(i, "argVrs",      cc.argVrs,      TargetRegClass::VR);
+        checkRefs(i, "returnVrs",   cc.returnVrs,   TargetRegClass::VR);
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
 
@@ -1363,6 +1369,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         // is a real misconfiguration.
         bool const hasAbiInfo = !cc.argGprs.empty() || !cc.argFprs.empty()
                               || !cc.returnGprs.empty() || !cc.returnFprs.empty()
+                              || !cc.argVrs.empty() || !cc.returnVrs.empty()
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
                               || cc.stackAlignment   != 0

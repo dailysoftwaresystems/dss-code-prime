@@ -6633,6 +6633,33 @@ struct Lowerer {
         auto kids = hir.children(ctx.node);
         std::size_t const i = ctx.argIdx;          // the in-flight arg
         TypeId const argTy = hir.typeId(kids[i]);
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a SysV x87 80-bit `long
+        // double` scalar arg is MEMORY-class — it rides the outgoing STACK (an
+        // `fldt` from a stack slot), NOT an SSE register. WRAP its value (a
+        // GPR-held ADDRESS of the 16-byte home, the memory-resident F80 model)
+        // in a `ByValueStackArg` carrier (payload = 16 bytes, exhaust NONE), so
+        // lir_callconv reserves the outgoing slots + byte-copies the home onto
+        // the stack — reusing the existing carrier + call-site copy VERBATIM
+        // (zero new caller-arg mir_to_lir). It consumes NO gpr/fpr ordinal: a
+        // bare `++runFpr` (the scalar tail below) would STEAL an SSE slot from a
+        // later F64 arg (an ABI-divergent register skew the runtime can't catch).
+        if (argTy.valid() && interner.kind(argTy) == TypeKind::F80) {
+            std::array<MirInstId, 1> carrierOps{argResult};
+            MirInstId const carrier =
+                mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
+                            interner.pointer(argTy),
+                            /*payload=*/std::uint32_t{16}
+                                | (static_cast<std::uint32_t>(
+                                       kByValueStackArgExhaustNone)
+                                   << kByValueStackArgExhaustShift));
+            ctx.operands.push_back(carrier.valid() ? carrier : argResult);
+            if (i == ctx.fnParamsSize) {
+                ctx.fixedOperandCount = ctx.operands.size() - ctx.operandsBeforeArgs;
+                ctx.fixedOperandCountStamped = true;
+            }
+            ++ctx.argIdx;
+            return;
+        }
         ctx.operands.push_back(argResult);
         if (argTy.valid()) {
             if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++ctx.runFpr;
@@ -6725,9 +6752,19 @@ struct Lowerer {
     // single/double form (a wrong F64 load of a float HFA would read 8 bytes and
     // clobber the next element). The piece's register CLASS follows from the type.
     [[nodiscard]] TypeId pieceType(AbiPiece const& p) {
-        if (p.cls == AbiPieceClass::Fpr)
-            return interner.primitive(p.widthBytes <= 4 ? TypeKind::F32
-                                                        : TypeKind::F64);
+        if (p.cls == AbiPieceClass::Fpr) {
+            // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4) ★ LOAD-BEARING: a
+            // 16-byte FPR piece is a binary128 HFA leaf (AAPCS64) — it MUST
+            // type F128, not F64. Without this arm a 16-byte Fpr piece would
+            // silently type F64 → the whole boundary would move 8 of 16 bytes
+            // (an aggregate-ABI miscompile the runtime can't catch). F128 pieces
+            // share the FPR/NSRN ordinal pool (classifying them Fpr for counting
+            // is CORRECT — no new AbiPieceClass); the width-16 dispatch here is
+            // the minimal in-character fix.
+            if (p.widthBytes <= 4)  return interner.primitive(TypeKind::F32);
+            if (p.widthBytes == 16) return interner.primitive(TypeKind::F128);
+            return interner.primitive(TypeKind::F64);
+        }
         return interner.primitive(TypeKind::I64);
     }
 
@@ -10344,6 +10381,43 @@ struct Lowerer {
                     return false;
                 }
                 addressableLocal[sym.v] = ptr;
+                continue;
+            }
+            // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a SysV x87 80-bit `long
+            // double` PARAMETER is MEMORY-class — the caller passes it on the
+            // incoming STACK (an `fldt` slot, never an SSE register). Mirror the
+            // straddled-aggregate arm (receiveByValueParam) EXACTLY: receive the
+            // incoming home ADDRESS via `RecvByValueStackParam` (the byte offset is
+            // a FULL 32-bit payload — an `Arg` op's ordinal channel can't hold it,
+            // and the MIR verifier bounds Arg.argIndex by the physical-arg count),
+            // byte-copy it into a PRIVATE local slot (by-value semantics, the
+            // memory-resident F80 home), and register that slot as the symbol's
+            // addressable home. Consume NO gpr/fpr ordinal; ★ CRITICAL — bump
+            // currentFnFixedStackBytes_ + set the sawStackedAggregate /
+            // sawFixedStackParam guards, else a VARIADIC fn with a fixed F80 param
+            // double-counts its slot and hands va_start a wrong overflow base
+            // (invisible to a non-variadic witness). F80 forms ONLY on the x87-80
+            // axis (SysV/darwin, !argSlotAligned) by construction, so the TypeKind
+            // is the ISA proxy — no CC/format gate needed.
+            if (interner.kind(ty) == TypeKind::F80) {
+                MirInstId const slot = allocaForLocal(sym, ty, p);
+                if (!slot.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                std::uint32_t const byteOff = currentFnFixedStackBytes_;
+                currentFnFixedStackBytes_ += 16;   // the 16-byte x87 stack slot
+                currentFnSawStackedAggregate_ = true;
+                currentFnSawFixedStackParam_  = true;
+                (void)argCtr.nextPosition();       // one call operand (the carrier)
+                MirInstId const src =
+                    mir.addInst(MirOpcode::RecvByValueStackParam, {},
+                                interner.pointer(ty), /*payload=*/byteOff);
+                if (!src.valid() || !lowerByteWiseCopy(src, slot, 16)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                addressableLocal[sym.v] = slot;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar

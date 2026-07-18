@@ -829,15 +829,21 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                                 TypeId const vt = mir_.instType(opnd);
                                 if (!vt.valid() || vt.v == returnTy.v) continue;
                                 TypeKind const vk = interner_->kind(vt);
+                                // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a
+                                // binary128 HFA piece (F128) is a legitimate
+                                // register return piece (AAPCS64, a Q-register), as
+                                // is an F80 x87 piece (symmetric; x87 struct
+                                // returns are ByReference so this is defensive).
                                 if (vk != TypeKind::I64 && vk != TypeKind::F64
-                                    && vk != TypeKind::F32 && vk != TypeKind::Ptr) {
+                                    && vk != TypeKind::F32 && vk != TypeKind::Ptr
+                                    && vk != TypeKind::F80 && vk != TypeKind::F128) {
                                     reportInst(reporter,
                                         DiagnosticCode::I_TerminatorTypeMismatch, id,
                                         std::format("(return) of by-value struct/union "
                                                     "func #{} must carry the aggregate "
-                                                    "value, register pieces (I64/F64), "
-                                                    "or an sret pointer, not a kind-{} "
-                                                    "value (FC7 C1c)",
+                                                    "value, register pieces "
+                                                    "(I64/F64/F128), or an sret pointer, "
+                                                    "not a kind-{} value (FC7 C1c)",
                                             f.v, static_cast<int>(vk)));
                                 }
                             }

@@ -517,6 +517,18 @@ struct DSS_EXPORT TargetCallingConvention {
     std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
     std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
     std::vector<std::string> returnFprs;  // float-return registers
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the 128-bit VR (Q-view)
+    // arg-passing / return registers for an IEEE binary128 `long double`
+    // (AAPCS64 v0..v7 args, v0..v3 return). Parallel to argFprs/returnFprs and
+    // indexed by the SAME per-class (NSRN) ordinal — an F128 arg at NSRN k is
+    // passed in `argVrs[k]` (v{k}), which ALIASES `argFprs[k]` (d{k}), so an
+    // F64 and an F128 sharing a signature never collide by ordinal. EMPTY on
+    // every f64/x87-80 target (x87 long double uses the implicit st0 stack; the
+    // f64 axis never forms an F128), so this stays inert there. Validated
+    // VR-class in `validate()` exactly as argFprs is validated FPR-class; the
+    // MIR→LIR F128 boundary verb resolves each name→ordinal like argFprs.
+    std::vector<std::string> argVrs;      // binary128 arg-passing VR registers, in order
+    std::vector<std::string> returnVrs;   // binary128 VR-return registers
     std::vector<std::string> callerSaved; // volatile across calls (caller must spill if reused)
     std::vector<std::string> calleeSaved; // non-volatile (callee must restore on return)
     std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
