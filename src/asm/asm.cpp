@@ -583,8 +583,12 @@ void appendLE(std::vector<std::uint8_t>& bytes,
 // 16-aligned slot `scalarByteSize(F80)` reserves). This is 80-bit, WIDER than
 // the u64 `decodeScalarLiteralBits` yields, so F80 has this dedicated
 // widen+append path rather than routing through that chokepoint (which stays
-// nullopt for F80, keeping the aggregate-member leaf recursion walled — F80
-// struct members are LD-3). The x87 extended memory layout is little-endian:
+// nullopt for F80, keeping the aggregate-member leaf recursion walled — a struct/
+// array long-double MEMBER in a rodata global is a DISTINCT deferral,
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, NOT the scalar arithmetic const-fold
+// this cycle's LD-3 closed: a 16-byte leaf cannot flow through the u64
+// decodeScalarLiteralBits chokepoint the aggregate recursion uses).
+// The x87 extended memory layout is little-endian:
 //   bytes 0-7  = the 64-bit significand with an EXPLICIT integer bit (bit 63),
 //   bytes 8-9  = sign (bit 15) | 15-bit exponent,
 //   bytes 10-15 = zero pad.
@@ -717,6 +721,20 @@ void appendF128(std::vector<std::uint8_t>& bytes, double dv) noexcept {
         bytes.push_back(static_cast<std::uint8_t>((hi64 >> (i * 8)) & 0xFFu));
 }
 
+// LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): append the 16 on-disk bytes
+// of a CONST-FOLDED F80/F128 value carried in the `WideFloatValue` pool arm. The
+// kernel's `pack()` already produces {lo, hi} in EXACTLY the byte layout
+// `appendF80Extended`/`appendF128` emit (F80: 10 significant + 6 pad; F128: 16),
+// so this is a pure lo-then-hi little-endian write — ADDITIVE to those two
+// (unmodified) `double`-arm widen producers, chosen FIRST for the folded arm.
+void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const& wf) noexcept {
+    WideFloatValue::Packed const p = wf.pack();
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>((p.lo >> (i * 8)) & 0xFFu));
+    for (int i = 0; i < 8; ++i)
+        bytes.push_back(static_cast<std::uint8_t>((p.hi >> (i * 8)) & 0xFFu));
+}
+
 // Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
 // extended into a u64; the writer takes the low `width` bytes). Handles
 // bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
@@ -725,9 +743,14 @@ void appendF128(std::vector<std::uint8_t>& bytes, double dv) noexcept {
 // for kinds the pool cannot represent as plain bytes: F16/F80/F128 — any float
 // wider than F64 or otherwise without a lossless host-`double` arm (F80 joined
 // with FC17.9(e)) — or a non-scalar / monostate variant (string /
-// MirAggregateValue / unknown). The SOLE scalar-encode chokepoint — the
-// scalar-global arm and the aggregate-leaf recursion both route through it,
-// so the int/float value semantics can never drift between the two encoders.
+// MirAggregateValue / a LD-3 `WideFloatValue` folded leaf / unknown). The SOLE
+// scalar-encode chokepoint — the scalar-global arm and the aggregate-leaf
+// recursion both route through it, so the int/float value semantics can never
+// drift between the two encoders. A folded F80/F128 SCALAR global is handled
+// BEFORE this chokepoint (the dedicated appendWideFloatBits arm, LD-3); a folded
+// F80/F128 leaf reaching HERE inside an AGGREGATE correctly stays nullopt → the
+// aggregate recursion fails loud (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, a
+// 16-byte leaf cannot pass through this u64 chokepoint).
 [[nodiscard]] std::optional<std::uint64_t>
 decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     if (std::holds_alternative<std::uint64_t>(v.value))
@@ -1395,6 +1418,27 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // l-suffixed literals this slice exercises). `*widthOpt` is 16 by
         // construction (scalarByteSize(F80)); assert-guard the invariant.
         if (k == TypeKind::F80) {
+            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): a CONST-FOLDED F80
+            // global — the value lives in the `WideFloatValue` pool arm at true
+            // 80-bit precision. Checked FIRST; `pack()` yields the identical 16-byte
+            // x87 layout, so it shares the size-check + alignment path.
+            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+                std::size_t const before = d.bytes.size();
+                appendWideFloatBits(d.bytes, *wf);
+                if (d.bytes.size() - before != *widthOpt) {
+                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("lowerMirGlobalsToDataItems: F80 folded global "
+                                     "SymbolId={{ {} }} packed to {} bytes but "
+                                     "scalarByteSize reserves {} — the wide-float "
+                                     "encoder and the layout disagree.",
+                                     sym.v, d.bytes.size() - before, *widthOpt));
+                    continue;
+                }
+                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*widthOpt)));
+                out.push_back(std::move(d));
+                continue;
+            }
             if (auto const* dv = std::get_if<double>(&v.value)) {
                 std::size_t const before = d.bytes.size();
                 appendF80Extended(d.bytes, *dv);
@@ -1412,8 +1456,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 out.push_back(std::move(d));
                 continue;
             }
-            // A non-`double` F80 initializer is a malformed pool entry — fall
-            // through to the decode chokepoint's fail-loud below.
+            // A non-`double`, non-`WideFloatValue` F80 initializer is a malformed
+            // pool entry — fall through to the decode chokepoint's fail-loud below.
         }
         // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE binary128 `long
         // double` global — the widened quad value is 16 bytes, WIDER than the
@@ -1424,6 +1468,26 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // slice exercises. `*widthOpt` is 16 by construction (scalarByteSize
         // (F128)); assert-guard the invariant, exactly as the F80 arm does.
         if (k == TypeKind::F128) {
+            // LD-3: a CONST-FOLDED F128 global — the value lives in the
+            // `WideFloatValue` pool arm at true 113-bit precision. Checked FIRST;
+            // `pack()` yields the identical 16-byte binary128 layout.
+            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+                std::size_t const before = d.bytes.size();
+                appendWideFloatBits(d.bytes, *wf);
+                if (d.bytes.size() - before != *widthOpt) {
+                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                         std::format("lowerMirGlobalsToDataItems: F128 folded global "
+                                     "SymbolId={{ {} }} packed to {} bytes but "
+                                     "scalarByteSize reserves {} — the wide-float "
+                                     "encoder and the layout disagree.",
+                                     sym.v, d.bytes.size() - before, *widthOpt));
+                    continue;
+                }
+                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*widthOpt)));
+                out.push_back(std::move(d));
+                continue;
+            }
             if (auto const* dv = std::get_if<double>(&v.value)) {
                 std::size_t const before = d.bytes.size();
                 appendF128(d.bytes, *dv);
@@ -1441,8 +1505,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 out.push_back(std::move(d));
                 continue;
             }
-            // A non-`double` F128 initializer is a malformed pool entry — fall
-            // through to the decode chokepoint's fail-loud below.
+            // A non-`double`, non-`WideFloatValue` F128 initializer is a malformed
+            // pool entry — fall through to the decode chokepoint's fail-loud below.
         }
         // Decode the scalar value through the shared chokepoint (the SAME
         // int/float semantics the aggregate-leaf recursion uses, incl. the

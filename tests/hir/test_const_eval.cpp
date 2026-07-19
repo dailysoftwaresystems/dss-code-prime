@@ -861,16 +861,14 @@ TEST(ConstEval, RemOnFloatRefusesAsUnsupportedTypeKind) {
     EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
 }
 
-// ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the hostBacked
-// fold gate. F80 (x87) and F128 (binary128) values CANNOT be represented by
-// the host `double` the fold engine computes in — folding `20.0L + 22.0L` at
-// binary64 would bake a silently-ROUNDED constant that then RUNS (never
-// reaching the LIR encoded-width wall). applyBinaryFloat/applyUnaryFloat
-// refuse when EITHER operand core has floatKindInfo(...).hostBacked == false;
-// F32/F64 keep folding exactly as before (F32 narrows losslessly through
-// narrowToFloatWidth; F64 is identity).
+// ── LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the fold gate is RELAXED.
+// F80 (x87) and F128 (binary128) now fold at TRUE target precision via the
+// `WideFloatValue` soft-float kernel — the result carries the WideFloatValue arm
+// (core F80/F128), NEVER a binary64-rounded `double`. These tests were INVERTED
+// from the former refusal pins: a folded 20.0L + 22.0L = 42.0L must now SUCCEED
+// and hold the exact wide value. F16 stays walled (no kernel arm). ────────────
 
-TEST(ConstEval, NonHostBackedFloatBinaryFoldRefuses) {
+TEST(ConstEval, NonHostBackedFloatBinaryFoldSucceeds) {
     for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
         Rig r;
         TypeId const t = r.interner.primitive(k);
@@ -881,17 +879,20 @@ TEST(ConstEval, NonHostBackedFloatBinaryFoldRefuses) {
         opts.allowFloat = true;
         Hir hir = r.finishWith(add);
         auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
-        EXPECT_FALSE(res.value.has_value())
+        ASSERT_TRUE(res.value.has_value())
+            << "kind " << static_cast<int>(k) << ": F80/F128 ADD must now fold (LD-3)";
+        ASSERT_TRUE(std::holds_alternative<WideFloatValue>(res.value->value))
             << "kind " << static_cast<int>(k)
-            << ": a non-host-backed float ADD must refuse the binary64 fold";
-        EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind)
-            << "kind " << static_cast<int>(k);
+            << ": the folded result must carry the WideFloatValue arm, NOT a rounded double";
+        EXPECT_EQ(res.value->core, k);
+        auto const& wf = std::get<WideFloatValue>(res.value->value);
+        EXPECT_EQ(wf.kind(), k);
+        EXPECT_EQ(*wf.toInt64(), 42) << "20.0L + 22.0L must fold to 42.0L";
     }
 }
 
-TEST(ConstEval, NonHostBackedFloatComparisonAndNegRefuse) {
-    // Comparisons and unary Neg route through the SAME gated helpers — one
-    // operand being F80 is enough (the mixed-operand case).
+TEST(ConstEval, NonHostBackedFloatComparisonAndNegFold) {
+    // Comparison: 20.0L < 22.0L is true (mixed F80 + F64 operand homogenizes to F80).
     Rig r;
     TypeId const f80 = r.interner.primitive(TypeKind::F80);
     HirNodeId const a  = r.litFloat(20.0, f80);
@@ -901,18 +902,81 @@ TEST(ConstEval, NonHostBackedFloatComparisonAndNegRefuse) {
     opts.allowFloat = true;
     Hir hir = r.finishWith(lt);
     auto res = evaluateConstant(hir, r.interner, r.literals, lt, {}, opts);
-    EXPECT_FALSE(res.value.has_value())
-        << "an F80-vs-F64 comparison must refuse (either operand gates)";
-    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+    ASSERT_TRUE(res.value.has_value()) << "an F80-vs-F64 comparison must now fold";
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1) << "20.0L < 22.0L is true";
 
+    // Unary Neg: -(20.0L) folds to -20.0L at F80 precision (WideFloatValue arm).
     Rig r2;
     TypeId const f80b = r2.interner.primitive(TypeKind::F80);
     HirNodeId const v   = r2.litFloat(20.0, f80b);
     HirNodeId const neg = r2.unary(HirOpKind::Neg, v, f80b);
     Hir hir2 = r2.finishWith(neg);
     auto res2 = evaluateConstant(hir2, r2.interner, r2.literals, neg, {}, opts);
-    EXPECT_FALSE(res2.value.has_value()) << "F80 unary Neg must refuse";
-    EXPECT_EQ(res2.failure, ConstEvalFailure::UnsupportedTypeKind);
+    ASSERT_TRUE(res2.value.has_value()) << "F80 unary Neg must now fold";
+    ASSERT_TRUE(std::holds_alternative<WideFloatValue>(res2.value->value));
+    EXPECT_EQ(res2.value->core, TypeKind::F80);
+    EXPECT_EQ(*std::get<WideFloatValue>(res2.value->value).toInt64(), -20);
+}
+
+// LD-3: float div-by-zero folds to a signed INFINITY (IEEE), NOT a
+// DivisionByZero refusal (that is the INT path). The result is a foldable
+// WideFloatValue — a subsequent (int) cast of it would then refuse (Overflow).
+TEST(ConstEval, WideFloatDivByZeroFoldsToInfinity) {
+    Rig r;
+    TypeId const t = r.interner.primitive(TypeKind::F128);
+    HirNodeId const a   = r.litFloat(1.0, t);
+    HirNodeId const b   = r.litFloat(0.0, t);
+    HirNodeId const div = r.binary(HirOpKind::Div, a, b, t);
+    EvalOptions opts;
+    opts.allowFloat = true;
+    opts.refuseOnDivByZero = true;   // the INT path would refuse; the float path must NOT
+    Hir hir = r.finishWith(div);
+    auto res = evaluateConstant(hir, r.interner, r.literals, div, {}, opts);
+    ASSERT_TRUE(res.value.has_value()) << "float x/0 folds to inf, never DivisionByZero";
+    ASSERT_TRUE(std::holds_alternative<WideFloatValue>(res.value->value));
+    EXPECT_TRUE(std::get<WideFloatValue>(res.value->value).isInfinity());
+}
+
+// LD-3: mixing F80 and F128 in one op is a defensive fail-loud refuse (valid C
+// never mixes the two long-double axes; a silent cross-kind fold would be wrong).
+TEST(ConstEval, WideFloatCrossKindRefusesLoud) {
+    Rig r;
+    TypeId const f80  = r.interner.primitive(TypeKind::F80);
+    TypeId const f128 = r.interner.primitive(TypeKind::F128);
+    HirNodeId const a   = r.litFloat(20.0, f80);
+    HirNodeId const b   = r.litFloat(22.0, f128);
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, f128);
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(add);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
+    EXPECT_FALSE(res.value.has_value()) << "an F80-vs-F128 op must refuse (defensive)";
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// LD-3 regression: F16 is UNAFFECTED. F16 is host-backed (floatKindInfo.hostBacked
+// == true — the 11-bit mantissa ⊆ 53-bit double), so it ALWAYS folded via the host
+// `double` path and STILL does — it is NEVER pulled into the WideFloatValue kernel
+// (isSupportedKind(F16) == false). The result must carry the `double` arm, NOT a
+// WideFloatValue arm. RED if F16 accidentally routes through the wide-float dispatch.
+TEST(ConstEval, F16FoldStaysOnDoublePathUnaffectedByLd3) {
+    EXPECT_FALSE(WideFloatValue::isSupportedKind(TypeKind::F16));
+    Rig r;
+    TypeId const f16 = r.interner.primitive(TypeKind::F16);
+    HirNodeId const a   = r.litFloat(20.0, f16);
+    HirNodeId const b   = r.litFloat(22.0, f16);
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, f16);
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(add);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
+    ASSERT_TRUE(res.value.has_value()) << "F16 arithmetic folds via the host double path (as before)";
+    EXPECT_TRUE(std::holds_alternative<double>(res.value->value))
+        << "F16 must stay on the double arm — NEVER the WideFloatValue kernel";
+    EXPECT_FALSE(std::holds_alternative<WideFloatValue>(res.value->value));
+    EXPECT_EQ(res.value->core, TypeKind::F16);
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 42.0);
 }
 
 TEST(ConstEval, FloatKindInfoPinsHostBacking) {
@@ -1054,19 +1118,56 @@ TEST(ConstEval, CastF64ToF16OverflowsToInfinity) {
     EXPECT_TRUE(std::isinf(std::get<double>(res.value->value)));
 }
 
-// F128 stays refused — no host backing AND no engine arithmetic on F128.
-// Plan 12.5 §0.2 D1b → mapped to plan 19 HR-HW reserved (first consumer
-// owns the soft-float / wider-than-int64 substrate).
-TEST(ConstEval, CastF64ToF128RefusesAsUnsupportedTypeKind) {
+// LD-3: F64 → F128 (and F64 → F80) now WIDENS via the soft-float kernel — the
+// widen is EXACT (53-bit ⊆ 64/113-bit) and the result carries the WideFloatValue
+// arm. INVERTED from the former refusal (F128 had no engine).
+TEST(ConstEval, CastF64ToWideFloatWidensExactly) {
+    for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
+        Rig r;
+        HirNodeId const f = r.litFloat(1.0, r.f64T());
+        HirNodeId const c = r.cast(f, r.interner.primitive(k));
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+        ASSERT_TRUE(res.value.has_value()) << "F64→wide widen must fold (LD-3)";
+        ASSERT_TRUE(std::holds_alternative<WideFloatValue>(res.value->value));
+        EXPECT_EQ(res.value->core, k);
+        EXPECT_EQ(std::get<WideFloatValue>(res.value->value).toDouble(), 1.0);
+    }
+}
+
+// LD-3: int → F80/F128 is EXACT for any int64 (unlike int → F64). A folded (int)
+// cast BACK truncates toward zero at the operand's own precision.
+TEST(ConstEval, CastIntToWideFloatAndBack) {
     Rig r;
-    HirNodeId const f = r.litFloat(1.0, r.f64T());
-    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F128));
+    HirNodeId const lit = r.litInt(42, r.i64T());
+    HirNodeId const toF80 = r.cast(lit, r.interner.primitive(TypeKind::F80));
+    HirNodeId const back  = r.cast(toF80, r.intT());
     EvalOptions opts;
     opts.allowFloat = true;
-    Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
-    EXPECT_FALSE(res.value.has_value());
-    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+    Hir hir = r.finishWith(back);
+    auto res = evaluateConstant(hir, r.interner, r.literals, back, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 42);
+}
+
+// LD-3: F80/F128 → F64 narrows via the kernel's round-to-nearest-even toDouble.
+TEST(ConstEval, CastWideFloatToF64Narrows) {
+    Rig r;
+    // Build a folded F128 value (20+22=42), then cast to F64.
+    TypeId const f128 = r.interner.primitive(TypeKind::F128);
+    HirNodeId const a   = r.litFloat(20.0, f128);
+    HirNodeId const b   = r.litFloat(22.0, f128);
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, f128);
+    HirNodeId const narrow = r.cast(add, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(narrow);
+    auto res = evaluateConstant(hir, r.interner, r.literals, narrow, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F64);
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 42.0);
 }
 
 // Plan 12.5 §0.2 D2 (closed): refuseOnLossyFloatConversion knob.

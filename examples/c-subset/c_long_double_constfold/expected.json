@@ -1,0 +1,34 @@
+{
+  "$comment": "LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): target-precision constant folding for `long double`. The const-evaluator folds F80 (x87 80-bit) / F128 (IEEE binary128) arithmetic at TRUE 64/113-bit significand precision via a portable soft-float (WideFloatValue), instead of refusing the fold. NO anti-fold trick — the POINT is it folds: `constexpr long double k = 20.0L + 22.0L;` is a REQUIRED-constant initializer (a fold refusal would be a compile error S_ConstexprNonConstantInitializer, so a green build proves the fold), and `const long double g_answer = 20.0L + 22.0L;` folds its initializer to the wide-precision 42.0L whose 16 rodata bytes are emitted via appendWideFloatBits on the walled axes. On the f64 axes (pe64 x86_64 MSVC + Apple arm64) long double IS binary64 so the fold runs on the host double path; the x87-80 axis (elf64 x86_64) folds via the F80 kernel; the ieee128 axis (elf64 aarch64, qemu) folds via the F128 kernel. exit = (int)(20.0L + 22.0L) = 42 on all four axes.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

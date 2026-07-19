@@ -55,6 +55,13 @@ namespace {
             // literal MIR lowering extracts the container int from this arm; the
             // wide path fills limbs; the globals emitter fails loud on it.
             dst.value = arm;
+        } else if constexpr (std::is_same_v<T, WideFloatValue>) {
+            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the folded F80/F128
+            // wide-float value is the SAME host type in both pools — copy it directly
+            // (the generic `else` below would also carry it, but the explicit branch
+            // documents the new arm's round-trip contract, mirroring BitIntValue). The
+            // globals byte-emitter encodes it via `appendWideFloatBits`.
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -2103,13 +2110,29 @@ struct Lowerer {
                 // `double` only; a typed-float pool arm is the
                 // D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT successor's
                 // concern. Exactly-representable corpus values are
-                // unaffected.) F16/F80/F128 fall through to `addConst`
-                // and fail loud at MIR→LIR
-                // (D-TARGET-ENCODING-WIDTH-GUARD — promoting them
-                // here would silently pair them with wrong-width
-                // load/arithmetic encodings; F80/F128 joined the
-                // fall-through with D-CSUBSET-LONG-DOUBLE).
-                if (std::holds_alternative<double>(src.value)
+                // unaffected.) F16 falls through to `addConst` and fails
+                // loud at MIR→LIR (D-TARGET-ENCODING-WIDTH-GUARD —
+                // promoting it here would silently pair it with a wrong-
+                // width load/arithmetic encoding). F80/F128 DO promote —
+                // the `double`-arm unfolded leaf (LD-1/LD-2) and the
+                // `WideFloatValue`-arm folded result (LD-3) both below.
+                // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): a FOLDED
+                // F80/F128 body value rides the `WideFloatValue` arm (not the
+                // `double` arm) — promote it through this SAME rodata path,
+                // keeping the promoter SYMMETRIC with the globals byte-emitter
+                // (whose `get_if<WideFloatValue>` arm already encodes the arm at
+                // true 80/128-bit precision via `appendWideFloatBits`);
+                // `toMirLiteral` copies the arm through unchanged. DEFENSIVE:
+                // no current lowering mints a WideFloatValue BODY literal — the
+                // HIR const-evaluator's folded results become global-init data or
+                // int folds, never a body scalar Const (verified empirically), so
+                // this arm is dormant today. Were such a literal ever produced
+                // (e.g. a future HIR-level const-propagation pass), it materializes
+                // correctly HERE instead of hitting the MIR->LIR FPR-class Const
+                // wall. A WideFloatValue is only ever F80/F128-typed, so the kind
+                // gate below admits exactly those.
+                if ((std::holds_alternative<double>(src.value)
+                     || std::holds_alternative<WideFloatValue>(src.value))
                     && t.valid()
                     && (interner.kind(t) == TypeKind::F64
                         || interner.kind(t) == TypeKind::F32

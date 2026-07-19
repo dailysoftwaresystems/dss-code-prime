@@ -953,6 +953,18 @@ private:
             for (std::uint64_t l : bi->limbs()) out_ += std::format(" {}", l);
             return;
         }
+        if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION) folded F80/F128 value:
+            // `wfloat <bits> <hi> <lo>` — the format bit-width (80|128, a STABLE
+            // semantic discriminator, NOT the version-fragile TypeKind ordinal) plus
+            // the pack() bit pattern, read back via WideFloatValue::fromPacked (a
+            // lossless bit-exact round-trip; pack ∘ fromPacked is identity, pinned in
+            // test_wide_float_value).
+            WideFloatValue::Packed const p = wf->pack();
+            int const bits = (wf->kind() == TypeKind::F128) ? 128 : 80;
+            out_ += std::format("wfloat {} {} {}", bits, p.hi, p.lo);
+            return;
+        }
     }
 
     void appendOpName(std::uint32_t payload) {
@@ -1361,6 +1373,16 @@ private:
             for (std::uint64_t i = 0; i < nLimbs; ++i) limbs.push_back(takeInt());
             v.value = BitIntValue(std::move(limbs),
                                   static_cast<std::uint32_t>(width), sgn != 0);
+        }
+        else if (tag == "wfloat") {
+            // LD-3: `wfloat <bits> <hi> <lo>` — the inverse of appendLiteralValue's
+            // pack() serialization; the bit-width (80|128) selects the F80 vs F128
+            // unpack layout via WideFloatValue::fromPacked.
+            std::uint64_t const bits = takeInt();
+            std::uint64_t const hi   = takeInt();
+            std::uint64_t const lo   = takeInt();
+            TypeKind const k = (bits == 128) ? TypeKind::F128 : TypeKind::F80;
+            v.value = WideFloatValue::fromPacked(lo, hi, k);
         }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;

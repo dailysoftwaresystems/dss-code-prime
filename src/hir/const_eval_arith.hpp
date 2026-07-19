@@ -17,6 +17,7 @@
 // with policy applied.
 
 #include "core/types/bit_int_value.hpp"
+#include "core/types/wide_float_value.hpp"   // LD-3: F80/F128 target-precision fold kernel
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -78,7 +79,11 @@ asInt64(HirLiteralValue const& v) noexcept {
 }
 
 [[nodiscard]] inline bool isFloatValue(HirLiteralValue const& v) noexcept {
-    return std::holds_alternative<double>(v.value);
+    // LD-3: an F80/F128 value lives in EITHER the `double` arm (unfolded leaf) or
+    // the `WideFloatValue` arm (folded/widened) — both are "float" for the routing
+    // in combineUnary/combineBinary/combineCast, so recognize both.
+    return std::holds_alternative<double>(v.value)
+        || std::holds_alternative<WideFloatValue>(v.value);
 }
 
 // Pull a numeric `HirLiteralValue` into `double` for IEEE 754
@@ -87,6 +92,13 @@ asInt64(HirLiteralValue const& v) noexcept {
 // non-numeric arms.
 [[nodiscard]] inline std::optional<double>
 asDouble(HirLiteralValue const& v) noexcept {
+    // ★ LD-3 FAIL-LOUD (no silent mis-fold): a `WideFloatValue` (F80/F128) arm
+    // returns nullopt HERE — it must NEVER be silently narrowed to a rounded
+    // `double` (that would defeat the whole point of the target-precision fold).
+    // A forgetful future caller that reaches an F80/F128 value through asDouble
+    // then crashes loud on the empty optional rather than baking a binary64 value.
+    // Wide-float consumers go through `toWideFloatOperand` (arm-checked) instead.
+    if (std::holds_alternative<WideFloatValue>(v.value)) return std::nullopt;
     if (auto p = std::get_if<double>(&v.value)) return *p;
     if (auto p = std::get_if<std::int64_t>(&v.value)) return static_cast<double>(*p);
     if (auto p = std::get_if<std::uint64_t>(&v.value)) return static_cast<double>(*p);
@@ -99,7 +111,14 @@ asDouble(HirLiteralValue const& v) noexcept {
 // arms or for float operands when `allowFloat` is off.
 [[nodiscard]] inline std::optional<bool>
 asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
-    if (isFloatValue(v)) {
+    // LD-3: an F80/F128 value's truthiness folds via `isZero` — NEVER via
+    // `asDouble` (which nullopts for this arm; a `*asDouble(v)` deref would be UB).
+    // ±0.0 is false; every other value (incl. NaN / ±inf) is true, per C99.
+    if (auto p = std::get_if<WideFloatValue>(&v.value)) {
+        if (!allowFloat) return std::nullopt;
+        return !p->isZero();
+    }
+    if (isFloatValue(v)) {   // the `double` arm (F16/F32/F64 and unfolded F80/F128 leaves)
         if (!allowFloat) return std::nullopt;
         return *asDouble(v) != 0.0;
     }
@@ -185,16 +204,58 @@ struct FloatKindInfo {
     }
 }
 
-// FC17.9(e) (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): does the operand's
-// core refuse host-double folding? A non-host-backed float kind (F80/F128)
-// folded at binary64 precision would produce a silently-ROUNDED constant that
-// then RUNS (never reaching the LIR encoded-width wall) — a precision
-// mis-bind for any value needing more than a 53-bit mantissa. Refusing keeps
-// the runtime op alive so the wall fires loud. On f64-axis formats `long
-// double` IS F64 (host-backed) and folds normally.
+// FC17.9(e) → LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): does the
+// operand's core refuse host-double folding? A non-host-backed float kind folded
+// at binary64 precision would produce a silently-ROUNDED constant that then RUNS
+// (never reaching the LIR encoded-width wall) — a precision mis-bind for any
+// value needing more than a 53-bit mantissa. That was the original F80/F128 gate.
+//
+// LD-3 RELAXES it for the kinds the `WideFloatValue` soft-float now folds at TRUE
+// target precision: refuse ONLY a non-host-backed float that is ALSO not a
+// supported wide kind (`WideFloatValue::isSupportedKind`). Today F80 and F128 are
+// both supported, so this is dead for them — the wide-float dispatch in
+// `applyUnaryFloat`/`applyBinaryFloat` (checked BEFORE the asDouble path) folds
+// them. `floatKindInfo`/`hostBacked` stay UNTOUCHED (hostBacked keeps its true
+// meaning — the `double` arm cannot carry an exact F80/F128 value; the new arm
+// does); F16 is UNAFFECTED. The gate remains as defense for any FUTURE
+// non-host-backed kind the kernel does not yet realize.
 [[nodiscard]] inline bool refusesHostFloatFold(TypeKind k) noexcept {
     auto const fi = floatKindInfo(k);
-    return fi.has_value() && !fi->hostBacked;
+    return fi.has_value() && !fi->hostBacked && !WideFloatValue::isSupportedKind(k);
+}
+
+// LD-3: pull a float-typed operand into a `WideFloatValue` at `kernelKind` (F80/
+// F128) for the soft-float engine. A `WideFloatValue` arm passes through when its
+// kind already matches `kernelKind` (a cross-kind operand — F80 vs F128, never
+// produced by valid C — is a defensive nullopt refuse). Every other numeric arm
+// (an unfolded F80/F128 `double` leaf, an F64/F32 `double`, or a promoted integer)
+// widens EXACTLY-or-IEEE via `fromDouble(asDouble(...))` — 53-bit ⊆ 64/113-bit for
+// a genuine long-double leaf; a huge-int operand shares the documented binary64
+// precision loss the f64 path already accepts (and the typed tier normally inserts
+// an explicit widening Cast first, so an int operand rarely reaches here).
+[[nodiscard]] inline std::optional<WideFloatValue>
+toWideFloatOperand(HirLiteralValue const& v, TypeKind kernelKind) noexcept {
+    if (auto p = std::get_if<WideFloatValue>(&v.value)) {
+        if (p->kind() != kernelKind) return std::nullopt;   // cross-kind defensive refuse
+        return *p;
+    }
+    auto dv = asDouble(v);
+    if (!dv.has_value()) return std::nullopt;
+    return WideFloatValue::fromDouble(*dv, kernelKind);
+}
+
+// LD-3: the F80/F128 kind for a wide-float fold of operand cores `ac`/`bc` — the
+// supported (F80/F128) kind present. nullopt = neither is wide (use the double
+// path). A supported-but-DIFFERENT pair (F80 vs F128) returns nullopt AND sets
+// `crossKind` (the caller refuses loud) — valid C never mixes the two axes.
+[[nodiscard]] inline std::optional<TypeKind>
+wideFloatFoldKind(TypeKind ac, TypeKind bc, bool& crossKind) noexcept {
+    crossKind = false;
+    bool const aWide = WideFloatValue::isSupportedKind(ac);
+    bool const bWide = WideFloatValue::isSupportedKind(bc);
+    if (!aWide && !bWide) return std::nullopt;
+    if (aWide && bWide && ac != bc) { crossKind = true; return std::nullopt; }
+    return aWide ? ac : bc;
 }
 
 // Fold a UnaryOp(Neg) on a float. BitNot/Not on float is C99-undefined
@@ -207,6 +268,24 @@ applyUnaryFloat(HirOpKind op, HirLiteralValue const& inner,
     if (refusesHostFloatFold(inner.core)) {
         outFailure = ConstEvalFailure::UnsupportedTypeKind;
         return std::nullopt;
+    }
+    // LD-3: an F80/F128 operand folds through the soft-float kernel at TRUE target
+    // precision — BEFORE the asDouble path (which nullopts for the new arm). The
+    // result core is the OPERAND's core (F80/F128), NOT a hardcoded F64.
+    if (WideFloatValue::isSupportedKind(inner.core)) {
+        auto w = toWideFloatOperand(inner, inner.core);
+        if (!w.has_value()) { outFailure = ConstEvalFailure::UnsupportedTypeKind; return std::nullopt; }
+        switch (op) {
+            case HirOpKind::Neg: {
+                HirLiteralValue folded;
+                folded.core  = inner.core;
+                folded.value = w->negate();   // exact sign flip
+                return folded;
+            }
+            default:
+                outFailure = ConstEvalFailure::UnsupportedTypeKind;   // BitNot/Not on float
+                return std::nullopt;
+        }
     }
     auto dv = asDouble(inner);
     if (!dv.has_value()) return std::nullopt;
@@ -311,12 +390,66 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
 [[nodiscard]] inline std::optional<HirLiteralValue>
 applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
                  ConstEvalFailure& outFailure) {
-    // FC17.9(e): refuse when EITHER operand's core is a non-host-backed float
-    // (F80/F128) — see refusesHostFloatFold. Covers arithmetic AND comparisons
-    // for both const-eval walkers by construction (this is their one chokepoint).
+    // FC17.9(e): refuse when EITHER operand's core is a non-host-backed float that
+    // the kernel does NOT realize — see refusesHostFloatFold (dead for F80/F128
+    // now that LD-3 folds them; live as defense for a future unrealized kind).
     if (refusesHostFloatFold(a.core) || refusesHostFloatFold(b.core)) {
         outFailure = ConstEvalFailure::UnsupportedTypeKind;
         return std::nullopt;
+    }
+    // ★ LD-3: an F80/F128 operand folds through the soft-float kernel at TRUE
+    // target precision — BEFORE the asDouble path. Homogenize both operands to the
+    // kernel kind (F80 or F128), then arithmetic → kernel; comparisons → compare().
+    // The arithmetic RESULT core is the KERNEL kind (NOT the hardcoded F64 below);
+    // the caller's commonType retag agrees (F80/F128 outranks F64). A subnormal
+    // result / cross-kind mismatch is a fail-loud nullopt (UnsupportedTypeKind).
+    {
+        bool crossKind = false;
+        auto kk = wideFloatFoldKind(a.core, b.core, crossKind);
+        if (crossKind) { outFailure = ConstEvalFailure::UnsupportedTypeKind; return std::nullopt; }
+        if (kk.has_value()) {
+            auto wa = toWideFloatOperand(a, *kk);
+            auto wb = toWideFloatOperand(b, *kk);
+            if (!wa.has_value() || !wb.has_value()) {
+                outFailure = ConstEvalFailure::UnsupportedTypeKind;
+                return std::nullopt;
+            }
+            if (isComparison(op)) {
+                WideFloatValue::Ordering const ord = WideFloatValue::compare(*wa, *wb);
+                using O = WideFloatValue::Ordering;
+                bool res = false;
+                switch (op) {
+                    case HirOpKind::Eq: res = (ord == O::Equal); break;
+                    case HirOpKind::Ne: res = (ord != O::Equal); break;   // NaN → true
+                    case HirOpKind::Lt: res = (ord == O::Less); break;
+                    case HirOpKind::Le: res = (ord == O::Less || ord == O::Equal); break;
+                    case HirOpKind::Gt: res = (ord == O::Greater); break;
+                    case HirOpKind::Ge: res = (ord == O::Greater || ord == O::Equal); break;
+                    default: outFailure = ConstEvalFailure::UnsupportedTypeKind; return std::nullopt;
+                }
+                return makeBoolLiteral(res ? 1 : 0);
+            }
+            std::optional<WideFloatValue> r;
+            switch (op) {
+                case HirOpKind::Add: r = WideFloatValue::add(*wa, *wb); break;
+                case HirOpKind::Sub: r = WideFloatValue::sub(*wa, *wb); break;
+                case HirOpKind::Mul: r = WideFloatValue::mul(*wa, *wb); break;
+                case HirOpKind::Div: r = WideFloatValue::div(*wa, *wb); break;   // x/0 → signed inf/NaN
+                default:
+                    outFailure = ConstEvalFailure::UnsupportedTypeKind;   // Rem etc. on float
+                    return std::nullopt;
+            }
+            if (!r.has_value()) {
+                // Subnormal RESULT (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT)
+                // or a defensive cross-kind — fail loud, NEVER silently flushed.
+                outFailure = ConstEvalFailure::UnsupportedTypeKind;
+                return std::nullopt;
+            }
+            HirLiteralValue folded;
+            folded.core  = *kk;        // the kernel kind — NOT F64
+            folded.value = *r;
+            return folded;
+        }
     }
     auto adv = asDouble(a);
     auto bdv = asDouble(b);

@@ -9363,22 +9363,32 @@ TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble)
            "F80, not F64";
 }
 
-TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldRefusedOnWalledAxis) {
-    // IMPORTANT-5 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval
-    // fold gate. F80/F128 are NOT host-backed (floatKindInfo.hostBacked ==
-    // false) — folding `20.0L + 22.0L` at the host's binary64 would bake a
-    // silently-rounded constant for any value needing >53 mantissa bits. The
-    // gate refuses at applyBinaryFloat, so the constexpr initializer is NOT a
-    // compile-time constant on a walled axis (loud), while the SAME source on
-    // the f64 axis folds exactly (long double IS binary64 there).
+TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldSucceedsOnWalledAxis) {
+    // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval fold gate
+    // is RELAXED. F80/F128 now fold at TRUE target precision via the
+    // `WideFloatValue` soft-float kernel, so `constexpr long double k = 20.0L +
+    // 22.0L;` IS a valid compile-time constant on EVERY long-double axis — no
+    // `S_ConstexprNonConstantInitializer`. INVERTED from the former refusal pin
+    // (which asserted the walled axis walled the fold). The x87-80 (F80) axis:
     auto walled = analyzeWithLongDoubleAxis(
         {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
         LongDoubleFormat::X87_80);
     EXPECT_EQ(countCode(walled.diagnostics(),
-                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
-        << "F80 constexpr arithmetic must REFUSE the host-double fold "
-           "(hostBacked==false) — a clean analysis here means the fold gate "
-           "is bypassed and a binary64-rounded constant was baked";
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "F80 constexpr arithmetic must now FOLD (LD-3 target-precision kernel) "
+           "— a non-constant diagnostic here means the fold gate is still walled";
+    EXPECT_FALSE(walled.hasErrors())
+        << "the x87-80 constexpr long double fold must analyze clean";
+
+    // The ieee128 (F128) sibling — the SAME source folds via the binary128 kernel.
+    auto ieee128 = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::Ieee128);
+    EXPECT_EQ(countCode(ieee128.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "F128 constexpr arithmetic must fold (LD-3 binary128 kernel)";
+    EXPECT_FALSE(ieee128.hasErrors())
+        << "the ieee128 constexpr long double fold must analyze clean";
 
     auto f64 = analyzeWithLongDoubleAxis(
         {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
