@@ -162,8 +162,9 @@ uniformLibraryMap(std::string lib) {
 
 // Post-fold #8 simplifier R2 + code-reviewer I1: the
 // `decl.arraySuffix ? decl.arraySuffix->rule : RuleId{}` pattern
-// appears at lowerTopLevel (global init walk) AND lowerExternDecl
-// (extern-init reject). Stateless — lives at file scope alongside
+// appears in the legacy positional global/var init walk (an array
+// declarator's `[N]` length is part of the TYPE, not the initializer).
+// Stateless — lives at file scope alongside
 // the other anon-namespace helpers. Returns `RuleId{}` when the
 // language has no array decl form; downstream consumers gate on
 // `.valid()` to skip the rule-match.
@@ -193,7 +194,8 @@ struct Lowerer {
     // pendingSpans (shared): applied to the result's HirSourceMap after finish().
     std::vector<std::pair<HirNodeId, HirSourceLoc>>& spans;
     // FF6 Slice 2 (2026-06-02): shared accumulator for source-
-    // declared externs, one record per `lowerExternDecl` call
+    // declared externs, one record per extern node `lowerExternDeclInto`
+    // emitted (D-CSUBSET-EXTERN-MULTI-DECLARATOR: one per declarator)
     // that successfully produced an ExternFunction / ExternGlobal
     // HIR node. Consumed by `compileSingleUnit` via
     // `synthesizeFfiFromSourceDecls` to populate the
@@ -4634,26 +4636,37 @@ struct Lowerer {
             if (k == "TypeDecl")    { stmtResult = lowerTypeDecl(n); return; }
             // D-CSUBSET-BLOCK-SCOPE-EXTERN (C89 6.7.1): a block-scope `extern`
             // declaration statement — `extern int f(int);` (function prototype) OR
-            // `extern T *p;` (object reference) inside a function body. It reuses the
-            // FILE-scope externDecl lowering WHOLESALE: `lowerExternDecl` mints the
-            // ExternFunction/ExternGlobal HIR node AND records its import row. We route
-            // that node to the module-decls accumulator (the D-CSUBSET-LOCAL-STATIC /
-            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE pattern) — NEVER a statement-position push
-            // (lowerStmtNode has no ExternFunction/ExternGlobal arm → it would fail-loud)
-            // — and lower the STATEMENT itself to a no-op (an empty Block, the `Skip`
-            // precedent below), since the extern emits no code in the body. Pass-1 bound
-            // the symbol into the enclosing BLOCK scope (C 6.2.2p4 name scope; NOT
-            // re-homed to file scope the way the bare proto is, so a block extern OBJECT
-            // that shadows an outer local reads the extern), and collectExterns registers
-            // the symbol so a block use resolves via GlobalAddr — identical to a
-            // file-scope extern. An absorbed extern (a same-scope in-TU definition won
-            // the Pass-1 merge) returns an invalid node → push nothing, mirroring the
+            // `extern T *p;` (object reference), incl. the c23 MULTI-DECLARATOR form
+            // `extern int a, b;` (D-CSUBSET-EXTERN-MULTI-DECLARATOR) — inside a function
+            // body. It reuses the FILE-scope externDecl lowering WHOLESALE:
+            // `lowerExternDeclInto` mints N ExternFunction/ExternGlobal HIR nodes (one
+            // per declarator) AND records each import row. We route EACH node to the
+            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
+            // SCOPE-PROTOTYPE pattern) — NEVER a statement-position push (lowerStmtNode
+            // has no ExternFunction/ExternGlobal arm → it would fail-loud) — and lower
+            // the STATEMENT itself to a no-op (an empty Block, the `Skip` precedent
+            // below), since the extern emits no code in the body. Pass-1 bound each
+            // symbol into the enclosing BLOCK scope (C 6.2.2p4 name scope; NOT re-homed
+            // to file scope the way the bare proto is — the isProto re-home is suppressed
+            // for a non-defining extern — so a block extern OBJECT or FUNCTION that
+            // shadows an outer local reads the extern), and collectExterns registers the
+            // symbol so a block use resolves via GlobalAddr — identical to a file-scope
+            // extern. An absorbed extern (a same-scope in-TU definition won the Pass-1
+            // merge) emits no node for that declarator, mirroring the
             // top-level `lowerDeclInto` ExternDecl arm.
             if (k == "ExternDecl") {
-                HirNodeId const e = lowerExternDecl(n);
-                if (e.valid()) {
+                // D-CSUBSET-EXTERN-MULTI-DECLARATOR: a block-scope extern lowers to N
+                // ExternGlobal/ExternFunction nodes (one per declarator, or none when
+                // absorbed). They carry no runtime code, so route EACH to the module-
+                // decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
+                // SCOPE-PROTOTYPE pattern — a statement-position push would fail loud
+                // in lowerStmtNode, which has no Extern* arm) and lower the STATEMENT
+                // to a no-op empty Block (the Skip precedent).
+                std::vector<HirNodeId> externs;
+                lowerExternDeclInto(n, externs);
+                if (!externs.empty()) {
                     if (moduleDecls_ != nullptr) {
-                        moduleDecls_->push_back(e);
+                        for (HirNodeId e : externs) moduleDecls_->push_back(e);
                     } else {
                         // Mirrors the block-proto / static-local MF-3 guard: a
                         // block-scope extern reached with no module-decls accumulator
@@ -8330,217 +8343,174 @@ struct Lowerer {
         return fn_;
     }
 
-    // extern function / global (no body). The FnSig/var type comes from the
-    // symbol the semantic phase minted (FFI linkage metadata is plan 11).
-    HirNodeId lowerExternDecl(NodeId node) {
+    // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): lower an extern
+    // declaration to N ExternGlobal/ExternFunction nodes — ONE per NAMED declarator
+    // (`extern int a, b;` → two ExternGlobals; `extern int f(int), g;` → an
+    // ExternFunction f + an ExternGlobal g). externDecl is a DECLARATOR-MODE row
+    // (head:0/declaratorList:1), so Pass-1 minted one `nonDefiningDeclaration`
+    // symbol per declarator; each declarator's TYPE (its own pointer/array/fn suffix
+    // folded onto the shared head base type) rides its bound symbol's `rec->type`.
+    // Mirrors lowerVarLikeInto's declarator loop; the emitted nodes append to `out`
+    // (the top-level dispatch pushes them into the module decls directly; a
+    // block-scope extern routes each to the module-decls accumulator). Emits NOTHING
+    // for an absorbed extern (an in-TU definition won the Pass-1 merge).
+    void lowerExternDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         auto it = declMap_.find(tree().rule(node).v);
-        if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
+        if (it == declMap_.end()) {
+            out.push_back(reportedError(node, "extern decl has no semantics rule"));
+            return;
+        }
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declRoleChildren(tree(), node, decl);
-        SymbolId sym{};
-        TypeId type = InvalidType;
-        if (decl.nameChild && *decl.nameChild < vis.size()) {
-            sym = model.symbolAt(vis[*decl.nameChild]);
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
-        }
-        // D-CSUBSET-EXTERN-DEFINITION-MERGE: an `extern` declaration that an in-TU
-        // DEFINITION superseded (`isAbsorbedProto` set by the Pass-1 merge — the
-        // definition won the binding) emits NO HIR node and registers NO extern
-        // import row. The definition carries the symbol (a Function body or a
-        // Global with storage); emitting an ExternFunction/ExternGlobal here would
-        // create a spurious duplicate import for a symbol defined locally. Returns
-        // an invalid HirNodeId; the dispatch (lowerDecl) skips pushing it. Mirrors
-        // the topLevelDecl proto-skip (`isProtoDeclaration || isAbsorbedProto`),
-        // here on the extern-lowering path.
-        if (auto const* rec = model.recordFor(sym);
-            rec != nullptr && rec->isAbsorbedProto) {
-            return HirNodeId{};
-        }
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
-        // 2026-06-02): scan the tail subtree (varDeclTail or
-        // externFuncTail) for an optional trailing `stringLiteralExpr`
-        // node — when present, decode its body as the per-symbol
-        // import-library override. Source-language agnostic by rule
-        // name (any grammar that produces a child rule named
-        // `stringLiteralExpr` populates the override the same way).
-        // The decoder uses `decodeStringLiteralBody` (the same path
-        // string-literal-arg uses), so all C-family escapes work in
-        // the override string body.
-        auto extractLibraryOverride = [&]() -> std::string {
-            if (!decl.kindByChild) return {};
-            // Strip-aware: `childPath` is authored against the declaration's
-            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
-            // no-op today — externDecl declares no specifierPrefix.
-            NodeId disc = descendVisibleDecl(tree(), node,
-                                             decl.kindByChild->childPath, decl);
-            if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
-                return {};
-            }
-            // Match by rule-name to stay source-agnostic. Any language
-            // whose grammar wraps the override in a rule named
-            // `stringLiteralExpr` (StringStart + StringLiteral body)
-            // gets per-symbol library routing for free.
-            RuleId const stringLitRule =
-                tree().schema().rules().find("stringLiteralExpr");
-            if (!stringLitRule.valid()) return {};
-            SchemaTokenId const stringLitTok =
-                tree().schema().schemaTokens().find("StringLiteral");
-            if (!stringLitTok.valid()) return {};
-            for (auto const& c : tree().children(disc)) {
-                if (tree().kind(c) != NodeKind::Internal) continue;
-                if (isEmptySpace(tree().flags(c))) continue;
-                if (tree().rule(c).v != stringLitRule.v) continue;
-                // The override body is the inner StringLiteral token(s). Route
-                // through the SAME chokepoint string-literal lowering uses so an
-                // adjacent-concatenated override (`extern void f() "lib" ".dll";`,
-                // C 5.1.1.2 phase 6) decodes its WHOLE byte sequence — reading
-                // only the first body child would silently drop the rest.
-                auto decoded =
-                    decodeAdjacentStringBodies(tree(), c, stringLitTok);
-                if (decoded.has_value()) return std::move(*decoded);
-                // F4 audit fix (6-agent 2nd-order, step 13.3a): fail-loud on a
-                // malformed escape rather than silently falling back to the
-                // format-level default — pre-fix a user-typed `extern void f()
-                // "k\xZZ.dll";` would silently link against msvcrt.dll with no
-                // breadcrumb pointing at the malformed override.
-                // H_ExternDeclMalformed is already used for malformed extern
-                // declarations. The span points at the whole stringLiteralExpr
-                // node `c` (the offending override), since the failing segment
-                // is no longer singled out by the loop.
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::H_ExternDeclMalformed;
-                d.severity = DiagnosticSeverity::Error;
-                d.buffer   = tree().source().id();
-                d.span     = tree().span(c);
-                d.actual   = std::string{tree().text(c)};
-                reporter.report(std::move(d));
-                return {};
-            }
-            return {};
-        };
-
-        // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
-        // the extern for FFI synthesis. The canonical name comes
-        // from the SymbolRecord (unmangled identifier as declared
-        // in source). Empty name when the semantic phase couldn't
-        // resolve the symbol — synthesize() then fails loud with
-        // F_FfiIngestEmptyCanonical PROVIDED the language has a
-        // per-format library entry; if the language config has no
-        // entry the upstream F_FfiNoImportLibraryForFormat fires
-        // FIRST and short-circuits before the per-extern guard.
-        // Both surfaces are unsuppressable + upstream-of-link.
-        auto recordExtern = [&](HirNodeId h) {
-            // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14, design-audit
-            // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
-            // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
-            // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
-            // A no-op today (externDecl declares no specifierPrefix →
-            // specifierPrefixChild returns invalid → linkageFrom early-returns);
-            // structural for the day an extern gains specifiers.
-            recordLinkage(h, linkageFrom(specifierPrefixChild(tree(), node, decl),
-                                         decl));
-            auto const* rec = model.recordFor(sym);
-            // Model 3: the source `"libname"` override is format-independent →
-            // project it under every object-format key so the compile-pipeline
-            // fold yields it for whatever the active target's format is.
-            externDecls.push_back({h,
-                                   rec ? rec->name : std::string{},
-                                   uniformLibraryMap(extractLibraryOverride())});
-        };
-        if (decl.kindByChild) {
-            // Strip-aware: `childPath` is authored against the declaration's
-            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
-            // no-op today — externDecl declares no specifierPrefix.
-            NodeId disc = descendVisibleDecl(tree(), node,
-                                             decl.kindByChild->childPath, decl);
-            if (disc.valid() && tree().kind(disc) == NodeKind::Internal
-                && tree().rule(disc).v == decl.kindByChild->whenRule.v) {
-                std::vector<HirNodeId> params;
-                NodeId paramsNode = descend(disc, decl.kindByChild->paramsPath);
-                if (paramsNode.valid()) collectParams(paramsNode, params);
-                HirNodeId const n =
-                    track(builder.makeExternFunction(type, sym.v, params), node);
-                recordExtern(n);
-                return n;
-            }
-        }
-        // D-FF2-3: reject `extern int x = 5;` (and `= y`, `= {}`, etc.).
-        // An extern announces a symbol whose storage lives in another
-        // translation unit; an initializer would either redefine the
-        // symbol locally (contradicting `extern`) or be silently dropped
-        // at lowering.
-        //
-        // SHAPE-based detection (post-fold #7 silent-failure F4): the
-        // varDeclTail subtree's visible children are at most {
-        // arrayDeclSuffix, AssignOp + initValue, EndStatement }. Any
-        // internal child that isn't arrayDeclSuffix IS the initValue
-        // subtree — even when its contents are empty (`= {}`) or
-        // contain no expression nodes. Pre-fix the check walked for
-        // `isExprNode` descendants which missed empty-brace inits.
-        //
-        // Post-fold #8 silent-failure H1 + post-fold #9 H2 split:
-        // distinguish "engine-config error" (kindByChild absent → the
-        // language hasn't told the engine HOW to navigate the extern's
-        // tail) from "parse-recovery shape" (kindByChild IS configured
-        // but `descend` returned invalid/non-Internal for THIS
-        // particular CST). Different audiences, different remediations,
-        // different codes:
-        //   - H_UnsupportedLoweringForKind: grammar-author config bug
-        //   - H_ExternDeclMalformed: incomplete/malformed user source
-        // Pre-split both arms collapsed into UnsupportedLoweringForKind
-        // and blamed the grammar config for what could be a recovery
-        // shape. No shipped grammar trips either arm today (c-subset
-        // configures kindByChild + the `if (model.hasErrors()) return`
-        // short-circuit in FF2/lowering paths catches malformed
-        // input upstream), but defensive split prevents either future
-        // surface from re-opening the D-FF2-3 silent-drop.
-        if (!decl.kindByChild) {
+        // Config contract: the shipped externDecl row IS declarator-mode with a
+        // declaratorList carrier + the `declarators` vocabulary. A language that
+        // maps ExternDecl WITHOUT them is a grammar-author config bug — fail loud,
+        // never a silent drop of the import row.
+        if (!decl.isDeclaratorMode() || !decl.declaratorListChild.has_value()
+            || !sem.declarators.has_value()) {
             emitH(DiagnosticCode::H_UnsupportedLoweringForKind, node,
-                  "externDecl rule has no kindByChild configuration — "
-                  "the engine cannot locate the varDeclTail-equivalent "
-                  "subtree to check for an initializer. Configure "
-                  "`kindByChild` in the language's semantics so this "
-                  "extern shape can be lowered safely");
-            return errorNode(node);
+                  "externDecl rule is not declarator-mode (missing "
+                  "head/declaratorList roles or the `declarators` vocabulary) — "
+                  "the engine cannot locate the declarator list to lower the "
+                  "extern; configure the externDecl semantics row");
+            out.push_back(errorNode(node));
+            return;
         }
-        // Strip-aware for the same reason as the two `disc` probes above.
-        NodeId const varDeclTail =
-            descendVisibleDecl(tree(), node, decl.kindByChild->childPath, decl);
-        if (!varDeclTail.valid()
-            || tree().kind(varDeclTail) != NodeKind::Internal) {
-            // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
-            // names the user-source problem ("incomplete declaration")
-            // not the engine internals ("kindByChild->childPath",
-            // "Internal node", "CST"). The diagnostic infrastructure
-            // already carries the source span for the user to inspect.
+        DeclaratorConfig const& dc = *sem.declarators;
+        auto vis = declRoleChildren(tree(), node, decl);
+        if (*decl.declaratorListChild >= vis.size()) {
+            // A recovery shape (a malformed extern whose list child is absent).
+            // Distinct from the config-bug arm above (D-FF2 H1/H2 split).
             emitH(DiagnosticCode::H_ExternDeclMalformed, node,
-                  "extern declaration is incomplete or malformed at "
-                  "this position — the declaration's body structure "
-                  "could not be located; check that the declaration "
-                  "is complete (e.g. `extern int x;` without an "
-                  "initializer, or `extern int f(int);` for a "
-                  "function declaration)");
-            return errorNode(node);
+                  "extern declaration is incomplete or malformed — the declarator "
+                  "list could not be located; check the declaration is complete "
+                  "(e.g. `extern int x;` / `extern int f(int);`)");
+            out.push_back(errorNode(node));
+            return;
         }
-        RuleId const skipRule = arraySuffixSkipRule(decl);
-        for (NodeId c : visible(varDeclTail)) {
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*decl.declaratorListChild], dc, declarators);
+        // The specifier prefix (`externSpecifiers`) is per-DECLARATION — shared by
+        // every declarator — so resolve its linkage ONCE. D-CSUBSET-LINKAGE-UNKNOWN-
+        // SPECIFIER-DIAGNOSTIC: route through the SAME linkageFrom chokepoint as
+        // lowerTopLevel/lowerFunctionDecl so specifier validation is by-construction.
+        LinkageAttr const externLinkage =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
+        // `stringLiteralExpr` after the declarator list is a DSS per-declaration
+        // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
+        // — examples/c-subset/hello_writefile). Decode it ONCE and apply the same
+        // map to EVERY declarator's import row (a source override is format-
+        // independent → projected under every object-format key by uniformLibraryMap;
+        // the compile-pipeline fold reads the active format's key). Absent → empty
+        // map → the FFI synthesize stage uses the language default / cross-TU merge /
+        // a shipped descriptor. Source-language agnostic (matched by rule name).
+        std::unordered_map<std::string, std::string> const libraryOverride =
+            uniformLibraryMap(externLibraryOverride(node, decl));
+        // FF6 Slice 2: record one FFI-synthesis import row per emitted extern node.
+        // The canonical name is the SymbolRecord's unmangled identifier.
+        auto recordExtern = [&](HirNodeId h, SymbolId sym) {
+            recordLinkage(h, externLinkage);
+            auto const* rec = model.recordFor(sym);
+            externDecls.push_back({h, rec ? rec->name : std::string{},
+                                   libraryOverride});
+        };
+        for (NodeId d : declarators) {
+            NodeId const nameNode = declaratorNameNode(tree(), d, dc);
+            // Abstract declarator (`extern int *;`): Pass-1's requireNamedDeclarators
+            // already erred (S_DeclarationDeclaresNothing) — mint nothing here.
+            if (!nameNode.valid()) continue;
+            SymbolId const sym = model.symbolAt(nameNode);
+            auto const* rec = model.recordFor(sym);
+            if (rec == nullptr) continue;
+            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an extern superseded by an in-TU
+            // DEFINITION (the Pass-1 merge set isAbsorbedProto — the definition won
+            // the binding) emits NO node + NO import row (the definition carries the
+            // symbol; a duplicate import would be spurious). Per-declarator.
+            if (rec->isAbsorbedProto) continue;
+            TypeId const type = rec->type;
+            // A FUNCTION declarator (`extern int f(int);` — its name carries an
+            // fnSuffix → Pass-1 set isProtoDeclaration) → ExternFunction. The FnSig
+            // (rec->type) is the load-bearing signature (HIR→MIR reads it); the param
+            // CHILDREN are informational (the HIR-text representation). Collect them
+            // from the declarator's fn-suffix paramList — collectParams recurses the
+            // declarator to each `param` (VarDecl) leaf — to keep the ExternFunction
+            // node byte-identical to the pre-c23 single-declarator lowering.
+            if (rec->isProtoDeclaration) {
+                std::vector<HirNodeId> params;
+                collectParams(d, params);
+                HirNodeId const ef =
+                    track(builder.makeExternFunction(type, sym.v, params), d);
+                recordExtern(ef, sym);
+                out.push_back(ef);
+                continue;
+            }
+            // An OBJECT declarator → ExternGlobal. D-FF2-3: reject `extern int x = 5;`
+            // LOUD — an extern announces storage in another TU; an initializer would
+            // either redefine it locally (contradicting `extern`) or be silently
+            // dropped. An initializer shows up as the initDeclarator carrying a
+            // non-declarator visible child (the `= initValue`); check per-declarator.
+            if (initDeclaratorHasInitializer(d, dc)) {
+                emitH(DiagnosticCode::H_ExternHasInitializer, d,
+                      "extern declarations cannot carry an initializer — storage "
+                      "lives in another translation unit; remove the initializer");
+                out.push_back(errorNode(d));
+                continue;
+            }
+            HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
+            recordExtern(g, sym);
+            // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
+            // record's flag rides the intra-module global side-table so HIR→MIR's
+            // extern-data pre-pass stamps ExternImport.isThreadLocal.
+            recordThreadLocal(g, sym);
+            out.push_back(g);
+        }
+    }
+
+    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): decode the OPTIONAL trailing
+    // `stringLiteralExpr` library-override on an extern declaration (`extern void
+    // f() "lib";`) — the per-declaration import-library name. Scans the declaration's
+    // role children (the stringLiteralExpr sits after the initDeclaratorList, before
+    // EndStatement). Returns "" when absent. Decodes through the SAME
+    // decodeAdjacentStringBodies chokepoint string literals use (so an adjacent-
+    // concatenated override `"lib" ".dll"` joins its whole byte sequence + C escapes
+    // work); a MALFORMED escape fails LOUD (H_ExternDeclMalformed) rather than
+    // silently defaulting to the format-level library. Source-language agnostic —
+    // any grammar wrapping the override in a `stringLiteralExpr` gets it for free.
+    [[nodiscard]] std::string
+    externLibraryOverride(NodeId node, DeclarationRule const& decl) {
+        RuleId const stringLitRule =
+            tree().schema().rules().find("stringLiteralExpr");
+        if (!stringLitRule.valid()) return {};
+        SchemaTokenId const stringLitTok =
+            tree().schema().schemaTokens().find("StringLiteral");
+        if (!stringLitTok.valid()) return {};
+        for (NodeId c : declRoleChildren(tree(), node, decl)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
-            if (skipRule.valid()
-                && tree().rule(c).v == skipRule.v) continue;
-            emitH(DiagnosticCode::H_ExternHasInitializer, c,
-                  "extern declarations cannot carry an "
-                  "initializer — storage lives in another "
-                  "translation unit; remove the initializer");
-            return errorNode(node);
+            if (tree().rule(c).v != stringLitRule.v) continue;
+            auto decoded = decodeAdjacentStringBodies(tree(), c, stringLitTok);
+            if (decoded.has_value()) return std::move(*decoded);
+            // Fail loud on a malformed escape (`extern void f() "k\xZZ.dll";`) — a
+            // silent fallback to the format default would hide the bad override.
+            emitH(DiagnosticCode::H_ExternDeclMalformed, c,
+                  std::string{tree().text(c)});
+            return {};
         }
-        HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
-        recordExtern(g);
-        // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
-        // record's flag rides the same side-table as intra-module globals so
-        // HIR→MIR's extern-data pre-pass stamps ExternImport.isThreadLocal
-        // (the linker-side surviving-extern handling is slice C).
-        recordThreadLocal(g, sym);
-        return g;
+        return {};
+    }
+
+    // True iff `d` (a declarator/initDeclarator from collectDeclarators) carries an
+    // initializer — an initDeclarator with a visible Internal child that is NOT the
+    // declarator (the `= initValue` subtree). Used to reject an extern-with-
+    // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
+    [[nodiscard]] bool
+    initDeclaratorHasInitializer(NodeId d, DeclaratorConfig const& dc) {
+        if (tree().rule(d).v != dc.initDeclaratorRule.v) return false;
+        for (NodeId c : visible(d)) {
+            if (isToken(c)) continue;
+            if (tree().rule(c).v == dc.declaratorRule.v) continue;
+            return true;   // a non-declarator internal child = the initializer
+        }
+        return false;
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
@@ -8653,10 +8623,11 @@ struct Lowerer {
         if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
         if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
         if (m->hirKind == "ExternDecl") {
-            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an absorbed extern (superseded by
-            // an in-TU definition) returns an invalid node — push nothing.
-            HirNodeId const e = lowerExternDecl(core);
-            if (e.valid()) out.push_back(e);
+            // D-CSUBSET-EXTERN-MULTI-DECLARATOR: N declarators → N extern nodes
+            // (each an ExternGlobal/ExternFunction; an absorbed extern — superseded
+            // by an in-TU definition — contributes nothing). Appends directly to the
+            // module-decls `out`.
+            lowerExternDeclInto(core, out);
             return;
         }
         // A `var`-style declaration at module scope is a Global (the same rule

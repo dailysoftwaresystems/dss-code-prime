@@ -154,20 +154,44 @@ TEST(FfiCHeaderParser, ParseFailurePropagatesUnderlyingDiagnostics) {
            "reporter alongside the FF2-layer F_HeaderParseFailed";
 }
 
-TEST(FfiCHeaderParser, DuplicateExternRedeclarationRejectedByFrontend) {
-    // pr-test-analyzer P8 fold: same-symbol redeclaration must
-    // propagate the c-subset frontend's S_* / P_* code, not be
-    // silently merged. If the frontend ever relaxes redecl, the
-    // test trips and we re-decide FF2's stance.
+TEST(FfiCHeaderParser, IncompatibleExternRedeclarationRejectedByFrontend) {
+    // pr-test-analyzer P8 fold: an INCOMPATIBLE same-symbol redeclaration must
+    // propagate the c-subset frontend's S_* / P_* code (here S_IncompatibleRe-
+    // declaration), not be silently accepted. RE-DECIDED 2026-07-18 (D-CSUBSET-
+    // EXTERN-MULTI-DECLARATOR): externDecl became a declarator-mode declaration,
+    // so a COMPATIBLE (identical) extern redeclaration now MERGES cleanly — the
+    // C-conformant behavior (C 6.7p4; gcc accepts `extern int puts(const char*);`
+    // twice), whereas the legacy single-declarator externDecl over-rejected it. So
+    // this tripwire now uses an INCOMPATIBLE redeclaration (int vs long return),
+    // which still fails loud — the meaningful FF2 propagation case. (An IDENTICAL
+    // redeclaration is exercised as an ACCEPT below.)
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n"
-        "extern int puts(const char* s);\n",
+        "extern long puts(const char* s);\n",
         "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
     EXPECT_GT(rep.all().size(), 1u);  // underlying S_* / P_* reaches reporter
+}
+
+TEST(FfiCHeaderParser, IdenticalExternRedeclarationMergesCleanly) {
+    // D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): a COMPATIBLE (identical)
+    // extern redeclaration is legal C (6.7p4) and now MERGES to ONE symbol —
+    // the FF2 header parser accepts it and yields a single descriptor row, the
+    // C-conformant counterpart to the incompatible-redecl rejection above.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "extern int puts(const char* s);\n"
+        "extern int puts(const char* s);\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_TRUE(rowsOrErr.has_value())
+        << "an identical compatible extern redeclaration is legal C — it must "
+           "merge, not reject";
+    auto const& rows = *rowsOrErr;
+    EXPECT_EQ(rows.size(), 1u)
+        << "the two identical `puts` declarations merge to ONE descriptor row";
 }
 
 TEST(FfiCHeaderParser, FileNotFoundReportsFileOpenFailed) {

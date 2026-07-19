@@ -120,6 +120,41 @@ TEST(SemanticAnalyzerCSubset, ExternAggregateSpecifiersParse) {
     EXPECT_EQ(in.kind(rec("gB")->type), TypeKind::Struct);  // inline struct-definition-in-extern (body form)
 }
 
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: a MULTI-declarator `extern` mints ONE
+// nonDefiningDeclaration symbol PER declarator, each with its OWN per-declarator
+// pointer/array suffix folded onto the shared head base type — `extern int a, b;`
+// mints a AND b (both int); `extern int *p, arr[3];` mints p (int*) and arr
+// (int[3]). RED-ON-DISABLE: reverting externDecl to the single-declarator spine
+// P0009's on the comma, so `assertNoBuilderErrors` fails (the decl won't parse);
+// a shared-head star (the retired `typeRef` spine) would type `arr`/`b` as Ptr too.
+TEST(SemanticAnalyzerCSubset, ExternMultiDeclaratorMintsPerDeclaratorSymbols) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int a, b;\n"          // two objects, ONE extern declaration
+        "extern int *p, arr[3];\n"    // per-declarator pointer (p) + array (arr)
+    });
+    assertNoBuilderErrors(*cu);       // red-on-disable: the multi-declarator externs must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"a", "b", "p", "arr"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "multi-declarator extern symbol '" << n
+                              << "' was not minted (one symbol per declarator)";
+        ASSERT_TRUE(r->type.valid()) << "extern symbol '" << n << "' has no type";
+        EXPECT_TRUE(r->isExternDeclaration)
+            << "extern symbol '" << n << "' must be a non-defining declaration";
+    }
+    // Per-declarator TYPES: the pointer/array suffix binds to its OWN declarator.
+    EXPECT_EQ(in.kind(rec("a")->type), TypeKind::I32);
+    EXPECT_EQ(in.kind(rec("b")->type), TypeKind::I32);   // NOT a pointer (no shared-head star)
+    EXPECT_EQ(in.kind(rec("p")->type), TypeKind::Ptr);   // `*p` — a pointer
+    EXPECT_EQ(in.kind(rec("arr")->type), TypeKind::Array); // `arr[3]` — an array, not int/ptr
+}
+
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
 // `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
 // `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`

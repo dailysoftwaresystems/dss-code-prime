@@ -759,12 +759,13 @@
     },
 
     "externDecl": {
-      "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the former bare `ExternKeyword` child 0 is now the `externSpecifiers` HEAD WRAPPER (`extern` + an optional thread-storage specifier run) so `extern thread_local int e;` parses (C11 6.7.1p3 — extern IS one of the two specifiers thread_local may pair with; the cross-TU TLS declaration form). The wrapper occupies exactly the ONE child slot the keyword did AND is the row's `specifierPrefix`, so the shared first-child strip (decl_prefix_strip.hpp / the parser sketch's strip) renumbers the role children to [typeRef, Identifier, externTail] = name 1 / type 0 / kindByChild [2,0] REGARDLESS of specifier presence — no index shift, no new engine mechanism. FIRST(externDecl) stays {ExternKeyword}. The REVERSE order `thread_local extern` stays a loud parse error (topLevelDecl's head never matches `extern`), matching the `extern constexpr` posture.",
+      "$comment": "c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (SQLite testfixture arc, 2026-07-18): a C 6.7 extern declaration is `extern` + a decl-specifier HEAD + an init-declarator LIST + `;` — the extern-flavored twin of `topLevelDecl`. SUPERSEDES the legacy single-declarator spine (`externSpecifiers typeRef Identifier externTail`), which bound exactly ONE `name` at a fixed child index and P0009'd on `extern int a, b;` (test1.c:9341 `extern int sqlite3_sync_count, sqlite3_fullsync_count;`). The head is `typeRefAllowingStruct` — the SAME star-free base-type head struct FIELDS use (base type + cv-qualifiers, NO pointer stars): pointer stars MUST bind PER-DECLARATOR (inside each slot's `declarator` pointerLayer) so `extern int *a, b;` types a as int* and b as int (a shared-head star would mis-type b). It admits struct/union/enum aggregates (D-CSUBSET-EXTERN-AGGREGATE-TYPE preserved — typeBaseAllowingStruct carries the same specifiers the retired `typeBase` did) + typedef-names + typeof + a `volatile` head (a strict gain over the retired `typeRef`, which had const only). The `initDeclaratorList` is the PROVEN `initDeclarator (, initDeclarator)*` list every object declaration uses; each `declarator` owns its pointer/array/fn suffix, so a function prototype (`extern int f(int);` — a declarator with an fnSuffix), an incomplete-array object (`extern char v[];`), and a mixed list (`extern int a, *p, g[4], h(void);`) ALL parse through ONE list — no bespoke func-vs-object tail. Pass-1 routes through the DECLARATOR-MODE minting (head:0/declaratorList:1) which mints N `nonDefiningDeclaration` symbols; CST→HIR's `lowerExternDeclInto` emits N ExternGlobal/ExternFunction nodes (one per declarator). FIRST(externDecl) stays {ExternKeyword} (unique-production direct descent, non-speculative). TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 stays the `externSpecifiers` HEAD WRAPPER (`extern` + an optional thread-storage run) so `extern thread_local int e;` parses (C11 6.7.1p3); it is the row's `specifierPrefix` (stripped before the head:0/list:1 count, so the indices are stable whether or not a specifier is present). The REVERSE order `thread_local extern` stays a loud parse error (topLevelDecl's head never matches `extern`). D-CSUBSET-EXTERN-LIBRARY-SYNTAX: a TRAILING `{optional stringLiteralExpr}` after the list carries the DSS per-declaration import-library override (`extern void* GetStdHandle(int) \"kernel32.dll\";` — examples/c-subset/hello_writefile); FIRST(stringLiteralExpr) = string-openers, DISJOINT from Comma/`=`/`;`, so the list stops before it (non-speculative) and it applies to EVERY declarator in this declaration. CST→HIR's `lowerExternDeclInto` decodes it (extractLibraryOverride) into each emitted extern's import-library map. It sits AFTER initDeclaratorList so it never shifts the head:0/list:1 indices.",
       "sequence": [
         "externSpecifiers",
-        "typeRef",
-        "Identifier",
-        "externTail"
+        "typeRefAllowingStruct",
+        "initDeclaratorList",
+        { "optional": "stringLiteralExpr" },
+        "EndStatement"
       ]
     },
 
@@ -776,35 +777,10 @@
       ]
     },
 
-    "externFuncTail": {
-      "sequence": [
-        "ParenOpen",
-        { "optional": "paramList" },
-        "ParenClose",
-        { "optional": "stringLiteralExpr" },
-        "EndStatement"
-      ]
-    },
-
-    "externTail": {
-      "alt": [
-        "externFuncTail",
-        "varDeclTail"
-      ]
-    },
-
-    "varDeclTail": {
-      "sequence": [
-        { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "initValue" ] } },
-        "EndStatement"
-      ]
-    },
-
     "initValue": { "$comment": "FC5: assignmentExpr (NOT expression) — the comma-gate. Covers ALL three initializer consumers (initDeclarator, structField, braceInitList initElement), so `int a = b, c;` stays 2 declarators (not `a = (b,c)`).", "alt": [ "braceInitList", "assignmentExpr" ] },
 
     "arrayDeclSuffix": {
-      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl) + the legacy externDecl. It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`).",
+      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl, externDecl). It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`).",
       "sequence": [
         "BracketOpen",
         { "repeat": { "alt": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] } },
@@ -826,23 +802,8 @@
       ]
     },
 
-    "typeBase": {
-      "$comment": "The extern-declaration type-base (consumed ONLY by typeRef ← externDecl). D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture 2026-07-17): admits the struct/union/enum aggregate specifiers so a file-scope `extern struct Foo g;` / `extern union U g;` / `extern enum E g;` (and body/const/pointer forms) parses — the form sqliteInt.h uses at file scope (`extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`, SQLITE_WSD→empty in the default no-WSD build), which 19 of the 44 sqlite `src/test*.c` TUs hit FIRST. Before this, `extern struct` P0009'd (`static struct`/plain/typedef already worked — the extern path was the sole gap). Mirrors `typeBaseAllowingStruct` (the struct-FIELD type-base) — the two stay separate named rules because their WRAPPERS differ: `typeRef` (extern) keeps a `{repeat StarOp}` pointer slot + a leading `{optional ConstKeyword}`, while `typeRefAllowingStruct` (field) drops the stars (they bind per-declarator) and uses a `{repeat headQualifier}` (const|volatile) prefix. SPECULATIVE + lookahead mirror the sibling + topLevelCompositeSpec: the composite FIRSTs (Struct/Union/EnumKeyword) are disjoint from the keyword/ident/typeof arms → unique-survivor direct descent in practice (the flag is defensive, moot). The type RESOLVER dispatches on the composite node's OWN rule (structSpec/unionSpec/enumSpec isTagReference / definition arms), NOT on externDecl, so an aggregate extern flows through the IDENTICAL resolution as `static struct Foo g;` — zero semantic/HIR change.",
-      "alt": [ "typeSpecifierSeq", "structSpec", "unionSpec", "enumSpec", "Identifier", "typeofSpecifier" ],
-      "speculative": true, "lookahead": 256
-    },
-
-    "typeRef": {
-      "sequence": [
-        { "optional": "ConstKeyword" },
-        "typeBase",
-        { "repeat": "StarOp" },
-        { "optional": "ConstKeyword" }
-      ]
-    },
-
     "typeBaseAllowingStruct": {
-      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
+      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested. c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: also the extern-declaration head type-base (via `typeRefAllowingStruct`), so an aggregate extern (`extern struct Foo g;`) resolves through the SAME arms — the retired `typeBase` sibling folded into this rule.",
       "alt": [
         "typeSpecifierSeq",
         "structSpec",
@@ -1377,7 +1338,7 @@
       "sequence": [ { "alt": [ "CharStart", "WideCharStart", "Utf16CharStart", "Utf32CharStart", "Utf8CharStart" ] }, "CharLiteral" ]
     },
     "stringLiteralExpr": {
-      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), the externDecl library-override tail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
       "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral", { "repeat": { "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral" ] } } ]
     },
 
@@ -1574,25 +1535,18 @@
         "anonymousNameAllowed": true,
         "specifierPrefix": "structMemberDeclSpecifiers" },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
-      { "rule": "externDecl", "name": 1, "type": 0, "kind": "variable",
+      { "rule": "externDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "nonDefiningDeclaration": true,
-        "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is now the `externSpecifiers` head wrapper (`extern` + optional thread-storage run) and is this row's specifierPrefix — the shared first-child strip renumbers the role children to [typeRef, Identifier, externTail], so name/type/kindByChild are 1/0/[2,0] (they were 2/1/[3,0] against the raw shape) and stay STABLE whether or not a specifier is present. The linkage scan resolves both thread-storage spellings to {threadStorage:true} (`extern thread_local int e;` — the cross-TU TLS declaration, C11 6.7.1p3) and ignores ExternKeyword by kind (extern-ness IS the rule's identity: nonDefiningDeclaration mints the record; a binding entry would be the noreturn clobber hazard).",
+        "requireNamedDeclarators": true,
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
+        "$multiDeclaratorComment": "c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): externDecl is now a DECLARATOR-MODE row (the extern twin of topLevelDecl) — head:0 (`typeRefAllowingStruct`, the star-free base type) + declaratorList:1 (`initDeclaratorList`), POST-STRIP indices (the `externSpecifiers` specifierPrefix at child 0 is stripped, so head/list stay 0/1 whether or not `extern thread_local` is spelled). SUPERSEDES the legacy `name:1/type:0/kindByChild[externFuncTail]` single-declarator row. Pass-1's declarator-mode minting (semantic_analyzer.cpp) mints ONE `nonDefiningDeclaration` symbol PER named declarator — `extern int a, b;` mints a AND b, each with its OWN per-declarator pointer/array/fn suffix folded onto the shared head base type (`extern int *a, b[10];` → a:int*, b:int[10]). `requireNamedDeclarators` fails loud (S_DeclarationDeclaresNothing) on an abstract declarator (`extern int *;`) — an extern must name a symbol. A FUNCTION declarator (`extern int f(int);` — its name carries an fnSuffix) is detected as a prototype (hasFnSuffixOnName → isProtoDeclaration) and lowered to ExternFunction; an OBJECT declarator to ExternGlobal — no bespoke func/object tail. Function-ness NO LONGER upgrades the kind to Function (it stays Variable+isProto, the same model topLevelDecl uses for a bare prototype `int f(int);`); the observable HIR (ExternFunction import) is unchanged. constMarker/volatileMarker mirror topLevelDecl so `extern const int x;` marks x const via the per-declarator declaratorObjectIsConst path. allowFlexibleArray preserves the extern INCOMPLETE-array object (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, `extern char v[];`) through the declarator's absent-length `[]`. TLS C1 (D-CSUBSET-THREAD-LOCAL): the `externSpecifiers` specifierPrefix carries `extern thread_local` — the declarator-mode storage scan reads {threadStorage:true} and marks every declarator's symbol isThreadLocal; ExternKeyword is ignored by kind (extern-ness IS the rule's identity — nonDefiningDeclaration mints the record). RE-HOME: a block-scope extern (object OR function) binds in the CURRENT block scope, NOT re-homed to file scope — the Pass-1 isProto file-scope re-home is SUPPRESSED for a non-defining extern (D-CSUBSET-BLOCK-SCOPE-EXTERN shadow correctness; see semantic_analyzer.cpp).",
         "specifierPrefix": "externSpecifiers",
         "linkageSpecifiers": {
           "_Thread_local": { "threadStorage": true },
           "thread_local":  { "threadStorage": true }
         },
         "linkageSpecifierIgnoredKinds": ["ExternKeyword"],
-        "kindByChild": {
-          "childPath": [2, 0],
-          "whenRule": "externFuncTail",
-          "whenKind": "function",
-          "paramsPath": [1]
-        },
-        "variadicMarker": "EllipsisOp",
-        "$allowFlexibleArrayComment": "c82 (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, C 6.7p7/6.9.2): an extern OBJECT declaration may carry an INCOMPLETE array type — sqlite3.h's `SQLITE_EXTERN const char sqlite3_version[];`. The absent-length `[]` resolves through the SAME incomplete-array path a FAM uses (interner incompleteArray = the Array kind + a length sentinel, so decay/index consumers keep working while sizeof fails loud). The symbol is non-defining: a sibling-TU DEFINITION completes it at the MIR merge (LK11 name resolution drops the import row); a NEVER-defined one survives as an extern-data import, which the link tier fail-louds on until the extern-data import model lands (the c82 §B, D-LK-EXTERN-DATA-IMPORT).",
-        "allowFlexibleArray": true,
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
+        "allowFlexibleArray": true }
     ],
     "references": [
       { "rule": "operand" },

@@ -4256,7 +4256,7 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
         if (priorNonDef && !newNonDef) {
             // nonDefining → definition: the DEFINITION wins the binding; the prior
             // non-defining decl is absorbed (a proto/extern declarator emits no HIR
-            // node — see the topLevelDecl proto-skip and lowerExternDecl's
+            // node — see the topLevelDecl proto-skip and lowerExternDeclInto's
             // absorbed-skip).
             s.scopes.injectBinding(bindScope, name, newId);
             priorRec.isAbsorbedProto = true;
@@ -4449,8 +4449,24 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // at HIR→MIR exactly like a file-scope undefined proto
                         // (consistent fail-loud, not a block-local shadow). A
                         // non-proto declarator binds in `current` unchanged.
+                        //
+                        // D-CSUBSET-BLOCK-SCOPE-EXTERN / D-CSUBSET-EXTERN-MULTI-
+                        // DECLARATOR: the re-home is for a BARE prototype (implicit
+                        // external linkage referring to the file-scope function). An
+                        // EXPLICIT `extern` declaration (nonDefiningDeclaration) is
+                        // NOT re-homed: it is a non-defining declaration that already
+                        // merges cross-TU via the extern path (isExtern below), and a
+                        // block-scope extern — OBJECT (isProto false) OR FUNCTION
+                        // (isProto true, e.g. `extern int f(int);` in a body) — MUST
+                        // bind in the CURRENT block scope so a block extern that
+                        // shadows an outer local reads the extern, not the local
+                        // (C 6.2.1; design-audit Finding 3). Suppressing the re-home
+                        // for `nonDefiningDeclaration` keeps the C10 block-scope-extern
+                        // shadow rule for BOTH forms; a file-scope extern is already at
+                        // file scope, so the guard is a no-op there.
                         ScopeId bindScope = current;
-                        if (isProto) bindScope = fileScopeOf(s, tree, current);
+                        if (isProto && !decl.nonDefiningDeclaration)
+                            bindScope = fileScopeOf(s, tree, current);
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
                         // declaration with NO initializer is a TENTATIVE DEFINITION
                         // (C 6.9.2) — it announces an object whose single definition
@@ -11152,6 +11168,31 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
+            // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
+            // SAME element type are compatible when ONE side is INCOMPLETE — the
+            // composite is the completed array. `extern char v[]; char v[3];` (either
+            // order) merges: one record resolves to Array<char,3>, the other to the
+            // incomplete Array<char,[]>, differing TypeIds but C-compatible. The legacy
+            // positional externDecl path folded this via the Pass-1.5 downgrade guard
+            // (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY); the c23 declarator-mode externDecl
+            // resolves each record's type independently, so the compat is recognized
+            // HERE. Two COMPLETE arrays of different size, or different element types,
+            // stay INCOMPATIBLE (the strict inequality below fires) — only an
+            // incomplete side relaxes.
+            {
+                auto& in = s.lattice.interner();
+                bool const bothArrays = in.kind(sRec.type) == TypeKind::Array
+                                     && in.kind(aRec.type) == TypeKind::Array;
+                bool const oneIncomplete = in.isIncompleteArray(sRec.type)
+                                        || in.isIncompleteArray(aRec.type);
+                if (bothArrays && oneIncomplete) {
+                    auto const sOps = in.operands(sRec.type);
+                    auto const aOps = in.operands(aRec.type);
+                    if (!sOps.empty() && !aOps.empty()
+                        && sOps[0].valid() && sOps[0].v == aOps[0].v)
+                        continue;   // same element type + one incomplete → compatible
+                }
+            }
             auto aTreeIt = treeById.find(aRec.tree.v);
             if (aTreeIt == treeById.end()) continue;
             Tree const& aTree = *aTreeIt->second;

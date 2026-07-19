@@ -312,8 +312,12 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // statement-ambiguity rules replace them.
     for (std::string_view rule : {"root", "topLevel", "topLevelDecl",
                                   "topLevelDeclTail", "topLevelHead",
-                                  "varDeclTail",
-                                  "typeBase", "typeRef",
+                                  // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: externDecl
+                                  // became the extern twin of topLevelDecl (star-free
+                                  // head + initDeclaratorList), retiring the single-
+                                  // declarator `varDeclTail`/`typeBase`/`typeRef` +
+                                  // `externTail`/`externFuncTail` (pinned ABSENT below).
+                                  "typeRefAllowingStruct", "typeBaseAllowingStruct",
                                   "declarator", "directDeclarator",
                                   "parenDeclarator", "pointerLayer",
                                   "fnSuffix", "initDeclarator",
@@ -345,11 +349,16 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     }
 
     // c25: the former specifier-body rules were RETIRED (folded into the
-    // unified XxxSpec). Pin their ABSENCE so a stray re-introduction (or an
-    // incomplete unification) is visible at load.
+    // unified XxxSpec). c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: the single-
+    // declarator extern spine rules were RETIRED (externDecl routes through
+    // typeRefAllowingStruct + initDeclaratorList). Pin their ABSENCE so a stray
+    // re-introduction (or an incomplete unification) is visible at load.
     for (std::string_view retired : {"structSpecifierBody",
                                      "unionSpecifierBody",
-                                     "enumSpecifierBody"}) {
+                                     "enumSpecifierBody",
+                                     "typeRef", "typeBase",
+                                     "externTail", "externFuncTail",
+                                     "varDeclTail"}) {
         EXPECT_FALSE(schema.rules().find(retired).valid())
             << "retired rule must not resolve: " << retired;
     }
@@ -787,16 +796,22 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
         << "FIRST(expression) must include Identifier (atom FIRST)";
 }
 
-// `typeRef` admits `const int const x` (double-const). Real C allows
-// double-const only with intervening type modifiers; the c-subset is
-// deliberately more permissive while precedence/arity are deferred.
-// Pinned so a future PR doesn't tighten this without intent.
-TEST(GrammarSchema, CSubsetTypeRefAllowsDoubleConst) {
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: externDecl's head is now the star-free
+// `typeRefAllowingStruct` (the retired `typeRef` folded into it). It admits
+// `const int const x` (double-const: leading const via the `{repeat headQualifier}`
+// prefix, trailing const via the `{opt ConstKeyword}` east-const) AND `volatile`
+// in the head — a strict superset of the retired typeRef's const-only leading
+// qualifier. Real C allows double-const only with intervening type modifiers; the
+// c-subset is deliberately more permissive. Pinned so a future PR doesn't tighten
+// this without intent.
+TEST(GrammarSchema, CSubsetExternHeadAllowsDoubleConst) {
     auto result = GrammarSchema::loadShipped("c-subset");
     if (!result.has_value()) {
         FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
     }
-    EXPECT_TRUE((*result)->rules().find("typeRef").valid());
+    EXPECT_TRUE((*result)->rules().find("typeRefAllowingStruct").valid());
+    EXPECT_FALSE((*result)->rules().find("typeRef").valid())
+        << "the retired single-declarator typeRef must not resolve";
 }
 
 // dssSchemaVersion 2 must load AND emit zero diagnostics — a future

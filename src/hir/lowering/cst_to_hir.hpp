@@ -151,8 +151,8 @@ struct DSS_EXPORT CstToHirResult {
     // shared reporter don't taint the verdict).
     bool           ok = false;
     // FF6 Slice 2 (2026-06-02): the source-declared externs the
-    // lowerer produced. Populated by `lowerExternDecl` in
-    // declaration order. Consumed by the FFI synthesis stage at
+    // lowerer produced. Populated by `lowerExternDeclInto` in
+    // declaration order (one per declarator). Consumed by the FFI synthesis stage at
     // `compileSingleUnit` between HIR and MIR lowering. Empty
     // when the source declares no externs (every existing
     // pre-FF6 test fixture).
