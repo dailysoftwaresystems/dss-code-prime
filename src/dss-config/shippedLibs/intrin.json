@@ -4,6 +4,9 @@
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
   "typedefs": [
-    { "name": "size_t", "type": "u64" }
+    { "name": "size_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] }
   ]
 }

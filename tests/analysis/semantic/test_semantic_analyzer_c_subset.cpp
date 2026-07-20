@@ -9300,10 +9300,13 @@ TEST(SemanticAnalyzerCSubset, LongDoubleUndeclaredAxisFailsLoud) {
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleIsDoubleOnF64Axis) {
-    // The f64 axis (pe64 / apple-arm64): `long double` COLLAPSES to F64 —
-    // assignment-compatible with `double` in BOTH directions (the LLP64
-    // long==int identity-collapse precedent), so the whole double machinery
-    // serves it with zero new codegen.
+    // The f64 axis (pe64 / apple-arm64): `long double` has double's
+    // REPRESENTATION (F64). It remains a DISTINCT TYPE
+    // (D-LANG-TYPE-IDENTITY-VOCABULARY — identity is the vocabulary entry,
+    // never the core), and the conversion between the two is a LEGAL IMPLICIT
+    // conversion in both directions, so the whole double machinery serves it
+    // with zero new codegen (the same-representation conversion re-tags; it
+    // emits no Cast).
     auto model = analyzeWithLongDoubleAxis(
         {"int main(void) { long double x; double d; x = d; d = x; x = 1.5; }\n"},
         LongDoubleFormat::F64);

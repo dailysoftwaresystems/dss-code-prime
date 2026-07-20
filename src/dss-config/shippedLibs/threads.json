@@ -39,16 +39,16 @@
 
     { "name": "tss_create",    "signature": "fn(ptr<u32>, ptr<void>) -> i32", "availableObjectFormats": ["pe"], "synthesize": "tss_create" },
     { "name": "tss_create",    "signature": "fn(ptr<u32>, ptr<void>) -> i32", "availableObjectFormats": ["elf"] },
-    { "name": "tss_create",    "signature": "fn(ptr<u64>, ptr<void>) -> i32", "availableObjectFormats": ["macho"], "synthesize": "tss_create" },
+    { "name": "tss_create",    "signature": "fn(ptr<u64 \"unsigned long\">, ptr<void>) -> i32", "availableObjectFormats": ["macho"], "synthesize": "tss_create" },
     { "name": "tss_get",       "signature": "fn(u32) -> ptr<void>", "availableObjectFormats": ["pe"], "synthesize": "tss_get" },
     { "name": "tss_get",       "signature": "fn(u32) -> ptr<void>", "availableObjectFormats": ["elf"] },
-    { "name": "tss_get",       "signature": "fn(u64) -> ptr<void>", "availableObjectFormats": ["macho"], "synthesize": "tss_get" },
+    { "name": "tss_get",       "signature": "fn(u64 \"unsigned long\") -> ptr<void>", "availableObjectFormats": ["macho"], "synthesize": "tss_get" },
     { "name": "tss_set",       "signature": "fn(u32, ptr<void>) -> i32", "availableObjectFormats": ["pe"], "synthesize": "tss_set" },
     { "name": "tss_set",       "signature": "fn(u32, ptr<void>) -> i32", "availableObjectFormats": ["elf"] },
-    { "name": "tss_set",       "signature": "fn(u64, ptr<void>) -> i32", "availableObjectFormats": ["macho"], "synthesize": "tss_set" },
+    { "name": "tss_set",       "signature": "fn(u64 \"unsigned long\", ptr<void>) -> i32", "availableObjectFormats": ["macho"], "synthesize": "tss_set" },
     { "name": "tss_delete",    "signature": "fn(u32) -> void", "availableObjectFormats": ["pe"], "synthesize": "tss_delete" },
     { "name": "tss_delete",    "signature": "fn(u32) -> void", "availableObjectFormats": ["elf"] },
-    { "name": "tss_delete",    "signature": "fn(u64) -> void", "availableObjectFormats": ["macho"], "synthesize": "tss_delete" },
+    { "name": "tss_delete",    "signature": "fn(u64 \"unsigned long\") -> void", "availableObjectFormats": ["macho"], "synthesize": "tss_delete" },
 
     { "name": "thrd_yield",    "signature": "fn() -> void", "availableObjectFormats": ["pe"], "synthesize": "thrd_yield" },
     { "name": "thrd_yield",    "signature": "fn() -> void", "availableObjectFormats": ["elf"] },
@@ -100,7 +100,7 @@
     { "name": "tss_t", "variants": [
       { "when": { "format": "elf" },   "type": "u32" },
       { "when": { "format": "pe" },    "type": "u32" },
-      { "when": { "format": "macho" }, "type": "u64" }
+      { "when": { "format": "macho" }, "type": "u64 \"unsigned long\"" }
     ] },
     { "name": "thrd_start_t", "type": "ptr<fn(ptr<void>) -> i32>" },
     { "name": "tss_dtor_t",   "type": "ptr<void>" }

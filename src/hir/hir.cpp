@@ -1,6 +1,9 @@
 #include "hir/hir.hpp"
 
 #include "core/substrate/mint_monotonic_id.hpp"
+// D-LANG-TYPE-IDENTITY-VOCABULARY: `retagType` checks its same-representation
+// precondition against the interner (forward-declared in the header).
+#include "core/types/type_lattice/type_interner.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -224,6 +227,57 @@ HirNodeId HirBuilder::addParent(HirKind kind, std::span<HirNodeId const> childre
         parentOf_[child.v] = id;
     }
     return id;
+}
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY: see the header for WHY this in-place tag
+// mutation is the one sanctioned exception to the builder's read-only rule.
+// Every clause of the precondition is enforced here — a violation is a caller
+// bug (structural corruption), not a diagnosable analysis outcome, so it aborts
+// exactly like `addParent`'s double-attach guard.
+void HirBuilder::retagType(HirNodeId id, TypeId newType,
+                           TypeInterner const& interner) {
+    // The vocabulary tag is a SCALAR-identity concept. Restricting the retag to
+    // arithmetic-core primitives keeps it away from every kind whose operands /
+    // scalars a consumer may already have read (Ptr/Struct/Array/FnSig/Complex).
+    auto const isArithmeticCore = [](TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::Bool:
+            case TypeKind::Char: case TypeKind::Byte:
+            case TypeKind::I8:   case TypeKind::I16:  case TypeKind::I32:
+            case TypeKind::I64:  case TypeKind::I128:
+            case TypeKind::U8:   case TypeKind::U16:  case TypeKind::U32:
+            case TypeKind::U64:  case TypeKind::U128:
+            case TypeKind::F16:  case TypeKind::F32:  case TypeKind::F64:
+            case TypeKind::F80:  case TypeKind::F128:
+                return true;
+            default:
+                return false;
+        }
+    };
+    TypeId const oldType = arena_.at(id).typeId;   // validates bounds/provenance
+    char const* violation = nullptr;
+    if (!oldType.valid() || !newType.valid()) {
+        violation = "one of the types is invalid";
+    } else if (!interner.sameRepresentation(oldType, newType)) {
+        violation = "the types have DIFFERENT representations — a retag would "
+                    "silently change layout/codegen";
+    } else if (interner.qualifierBits(oldType) != interner.qualifierBits(newType)) {
+        violation = "the qualifier masks differ — a retag would silently demote "
+                    "a volatile/_Atomic access";
+    } else if (!isArithmeticCore(interner.kind(oldType))) {
+        violation = "the type is not an arithmetic-core primitive — the "
+                    "vocabulary tag is a scalar-identity concept";
+    } else if (id.v < parentOf_.size() && parentOf_[id.v].valid()) {
+        violation = "the node is already ATTACHED — the aliasing is only safe "
+                    "for a freshly-minted, unparented node";
+    }
+    if (violation != nullptr) {
+        std::fprintf(stderr,
+                     "dss::HirBuilder fatal: retagType: HirNodeId=%u: %s\n",
+                     id.v, violation);
+        std::abort();
+    }
+    arena_.at(id).typeId = newType;
 }
 
 Hir HirBuilder::finish(HirNodeId root) && {

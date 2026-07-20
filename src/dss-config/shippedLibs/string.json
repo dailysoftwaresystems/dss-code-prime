@@ -4,7 +4,10 @@
   "$comment": "★ c82 (shell.c): `typedefs`/`constants` re-provide size_t + NULL — C89 7.21.1 REQUIRES string.h to provide both without stddef.h; widths/values identical to stddef.json, first-wins dedup makes the multi-header provision moot (stdio/stdlib/time re-provide too, exactly like real libc headers). strdup is POSIX (C23 adopted it) → per-symbol [elf,macho]; the msvcrt spelling is _strdup (the plain-name legacy alias is unverified) — ungate when a pe consumer verifies it.",
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "typedefs": [
-    { "name": "size_t", "type": "u64" }
+    { "name": "size_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] }
   ],
   "constants": [
     { "name": "NULL", "value": 0, "type": "i64" }

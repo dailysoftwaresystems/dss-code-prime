@@ -149,7 +149,18 @@ TypeId TypeInterner::internContent(TypeKind kind, TypeKindId extensionKind,
 // ── TypeInterner: builders ────────────────────────────────────────────────
 
 TypeId TypeInterner::primitive(TypeKind kind) {
-    return internContent(kind, {}, {}, {}, {});
+    return primitive(kind, {});
+}
+
+TypeId TypeInterner::primitive(TypeKind kind, std::string_view vocabularyName) {
+    // ★ The empty name MUST short-circuit to the literal `TypeNameId{}` sentinel.
+    // `Interner<T>::intern("")` MINTS a real (non-zero) entry for the empty
+    // string — routing the anonymous case through it would give every anonymous
+    // primitive a fresh name id and silently break dedup against the 1-arg path
+    // (D-LANG-TYPE-IDENTITY-VOCABULARY).
+    TypeNameId const name =
+        vocabularyName.empty() ? TypeNameId{} : names_.intern(vocabularyName);
+    return internContent(kind, {}, {}, {}, name);
 }
 
 TypeId TypeInterner::vector(TypeId element, std::int64_t lanes) {
@@ -816,6 +827,52 @@ std::string_view TypeInterner::name(TypeId id) const {
     return names_.name(arena_.at(id).name);
 }
 
+bool TypeInterner::sameRepresentation(TypeId a, TypeId b) const {
+    if (!a.valid() || !b.valid()) return false;
+    if (a == b) return true;
+    // Every axis below reads through the qualifier-transparent accessors (and
+    // `materialId_` for the raw-only extensionKind), so a qualifier skin is
+    // representation-neutral: `volatile long` and `long` compare equal here.
+    if (kind(a) != kind(b)) return false;
+    if (arena_.at(materialId_(a)).extensionKind
+        != arena_.at(materialId_(b)).extensionKind) {
+        return false;
+    }
+    auto const opsA = operands(a);
+    auto const opsB = operands(b);
+    if (opsA.size() != opsB.size()) return false;
+    for (std::size_t i = 0; i < opsA.size(); ++i) {
+        if (opsA[i] != opsB[i]) return false;
+    }
+    auto const scA = scalars(a);
+    auto const scB = scalars(b);
+    if (scA.size() != scB.size()) return false;
+    for (std::size_t i = 0; i < scA.size(); ++i) {
+        if (scA[i] != scB[i]) return false;
+    }
+    return true;
+}
+
+std::string_view TypeInterner::vocabularyName(TypeId id) const {
+    if (!id.valid()) return {};
+    return names_.name(arena_.at(materialId_(id)).name);
+}
+
+void TypeInterner::declareVocabularyRank(std::string_view vocabularyName, int rank) {
+    if (vocabularyName.empty()) {
+        latticeFatal("declareVocabularyRank: the anonymous (empty) vocabulary "
+                     "name has no rank — it is the rank-0 representative of its "
+                     "kind by definition");
+    }
+    nameRank_[names_.intern(vocabularyName).v] = rank;
+}
+
+int TypeInterner::vocabularyRank(TypeId id) const {
+    if (!id.valid()) return 0;
+    auto const it = nameRank_.find(arena_.at(materialId_(id)).name.v);
+    return it == nameRank_.end() ? 0 : it->second;
+}
+
 std::optional<std::uint32_t>
 TypeInterner::fieldBitWidth(TypeId structId, std::size_t fieldIndex) const {
     // FC8 bitfields: scalars[i] holds (width + 1) for a bitfield, 0 for an
@@ -910,27 +967,61 @@ TypeId TypeInterner::commonType(TypeId a, TypeId b) {
     if (!a.valid() || !b.valid()) return InvalidType;
     TypeKind const ka = kind(a);
     TypeKind const kb = kind(b);
-    // Same-type short-circuit applies ONLY when no integer promotion is
-    // owed. C99 §6.3.1.8: integer promotion (rank-<int → int) applies
-    // per-operand BEFORE the common-type computation, so `u16 + u16`
-    // produces `i32`, not `u16`. Floats and ≥int integer ranks have
-    // identity promotion and may short-circuit.
-    if (a == b) {
-        int const r = integerRank(ka);
-        if (r < 0 || r >= 3) return a;
-        // Else fall through to the promotion path below.
-    }
+    // Same-type short-circuit applies ONLY to NON-ARITHMETIC operands.
+    //
+    // Two reasons it cannot cover the arithmetic ones:
+    //   * C99 §6.3.1.8: integer promotion (rank-<int → int) applies per-operand
+    //     BEFORE the common-type computation, so `u16 + u16` produces `i32`,
+    //     not `u16`;
+    //   * C 6.3.2.1p2: the usual arithmetic conversions yield the UNQUALIFIED
+    //     type. Returning `a` VERBATIM let a `volatile`/`_Atomic` skin ride into
+    //     the common type of `x + x` — the SAME defect the float branch below
+    //     had, and the one thing a same-representation re-tag refuses, so it
+    //     materializes a spurious Cast downstream. An arithmetic pair therefore
+    //     always goes through `pick`, which rebuilds a bare `primitive(kind,
+    //     name)`; for `a == b` that is the identical TypeId minus any skin, so
+    //     the only observable change is the qualifier drop.
+    // A non-arithmetic pair (two identical pointers / structs) has no common-type
+    // rule to apply and is returned as-is, exactly as before.
+    if (a == b && integerRank(ka) < 0 && floatRank(ka) < 0) return a;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the KIND is what the rank rules compute;
+    // the IDENTITY is the vocabulary entry of whichever operand ALREADY has that
+    // kind (higher declared rank wins when both do — C 6.3.1.1 ranks by type
+    // NAME, and `long double`/`double` share a core on an f64 axis). An operand
+    // whose kind CHANGED under promotion contributes no name — a promoted `char`
+    // IS the anonymous `int`. Reduces to `primitive(kind)` exactly when neither
+    // operand is named, so every block-less language (toy / tsql) is unchanged.
+    auto const pick = [&](TypeKind winner) -> TypeId {
+        bool const aHas = (ka == winner);
+        bool const bHas = (kb == winner);
+        std::string_view name{};
+        if (aHas && bHas) {
+            name = vocabularyRank(b) > vocabularyRank(a) ? vocabularyName(b)
+                                                         : vocabularyName(a);
+        } else if (aHas) {
+            name = vocabularyName(a);
+        } else if (bHas) {
+            name = vocabularyName(b);
+        }
+        return primitive(winner, name);
+    };
     // Floating-point hierarchy wins over integer (per C99): if either is
     // float, promote both to the wider float.
     int const fa = floatRank(ka);
     int const fb = floatRank(kb);
     if (fa >= 0 || fb >= 0) {
-        // If only one side is float, the other must promote to it; the
-        // common type is the float side (or the wider float if both).
-        if (fa >= 0 && fb < 0) return a;
-        if (fb >= 0 && fa < 0) return b;
-        // Both float: wider rank wins.
-        return (fa >= fb) ? a : b;
+        // If only one side is float, the other must promote to it; the common
+        // type is the float side (or the wider float if both). Routed through
+        // `pick` — never returned verbatim — so (a) the equal-core `long
+        // double`/`double` tie is broken by the declared rank rather than by
+        // width, and (b) a `volatile`/`_Atomic` SKIN cannot ride into the common
+        // type (C 6.3.2.1p2: the usual arithmetic conversions yield the
+        // UNQUALIFIED type), exactly as the integer side below already behaves.
+        TypeKind const winner = (fb < 0)   ? ka
+                              : (fa < 0)   ? kb
+                              : (fa >= fb) ? ka
+                                           : kb;
+        return pick(winner);
     }
     // Integer side: apply integer promotions (rank < I32 → I32) and then
     // pick the wider rank, with signedness tie-break on equal width.
@@ -953,7 +1044,9 @@ TypeId TypeInterner::commonType(TypeId a, TypeId b) {
         // Different width → take the wider side's signedness.
         signedness = (prA > prB) ? sA : sB;
     }
-    return primitive(integerKindAtRank(targetRank, signedness));
+    // The KIND is what the rank/signedness rules just computed; `pick` (above)
+    // supplies the IDENTITY.
+    return pick(integerKindAtRank(targetRank, signedness));
 }
 
 // ── TypeRegistry ──────────────────────────────────────────────────────────

@@ -17,16 +17,16 @@
           "fields": [
             { "name": "l_type",   "type": "i16" },
             { "name": "l_whence", "type": "i16" },
-            { "name": "l_start",  "type": "i64" },
-            { "name": "l_len",    "type": "i64" },
+            { "name": "l_start",  "type": "i64 \"long\"" },
+            { "name": "l_len",    "type": "i64 \"long\"" },
             { "name": "l_pid",    "type": "i32" }
           ]
         },
         {
           "when": { "format": "macho" },
           "fields": [
-            { "name": "l_start",  "type": "i64" },
-            { "name": "l_len",    "type": "i64" },
+            { "name": "l_start",  "type": "i64 \"long long\"" },
+            { "name": "l_len",    "type": "i64 \"long long\"" },
             { "name": "l_pid",    "type": "i32" },
             { "name": "l_type",   "type": "i16" },
             { "name": "l_whence", "type": "i16" }

@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 122> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -128,6 +128,18 @@ constexpr std::array<DiagnosticCode, 122> kUnsuppressableCodes{{
     DiagnosticCode::F_ShippedConstantVariantAmbiguous,
     DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
     DiagnosticCode::F_ShippedMacroVariantAmbiguous,
+    // F_ShippedTypeIdentityConflict (D-LANG-TYPE-IDENTITY-VOCABULARY,
+    // 2026-07-20): two descriptors resolved for the SAME target declare one
+    // struct/union TAG (or typedef NAME) as DIFFERENT types, or a descriptor's
+    // vocabulary tag contradicts the active language's width for that name.
+    // The per-file reader structurally cannot see either — it reads ONE
+    // descriptor at a time — yet injection is FIRST-WINS BY NAME, so the loser
+    // interns a second type with NO field scope and the user gets an
+    // include-order-dependent member-access failure (or, for the width case, a
+    // phantom type matching no `_Generic` arm). Suppressing it would restore
+    // exactly that silent first-wins. Same class as the five shipped surfaces
+    // above: a wrong-bytes / unreachable-member import must never ship green.
+    DiagnosticCode::F_ShippedTypeIdentityConflict,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-

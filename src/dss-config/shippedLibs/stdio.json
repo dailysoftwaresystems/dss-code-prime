@@ -5,7 +5,10 @@
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "typedefs": [
     { "name": "FILE",   "type": "struct \"FILE\" { arr<u64, 6> }" },
-    { "name": "size_t", "type": "u64" },
+    { "name": "size_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] },
     { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] }
   ],
   "constants": [

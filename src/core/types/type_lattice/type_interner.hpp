@@ -129,6 +129,23 @@ public:
     // ── canonicalizing builders ──
     // primitive: a leaf kind (Bool/I*/U*/F*/Char/Byte/Void) — no operands/scalars.
     TypeId primitive(TypeKind kind);
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: a NAMED primitive — the same leaf kind
+    // carrying a language-declared VOCABULARY tag. Identity comes from the
+    // vocabulary entry, representation from the kind: `long` and `int` are two
+    // distinct TypeIds even where a target's data model gives them the SAME core
+    // (LLP64 I32), and `long double` stays distinct from `double` on an f64 axis.
+    // The tag rides the EXISTING `name` content slot (what Struct/Union/Enum/
+    // Extension already use for nominal identity), so `kind()` — and therefore
+    // every representation consumer (rank tables, layout, ABI, codegen) — is
+    // unaffected BY CONSTRUCTION.
+    //
+    // `vocabularyName` is OPAQUE: the interner never interprets or spell-checks
+    // it, it is only an interner key. An EMPTY name is the anonymous
+    // representative of the kind and MUST intern bit-identically to the 1-arg
+    // overload — hence the empty short-circuit to the literal `TypeNameId{}`
+    // sentinel rather than `names_.intern("")`, which would mint a real (non-zero)
+    // entry for `""` and silently break dedup against every anonymous primitive.
+    TypeId primitive(TypeKind kind, std::string_view vocabularyName);
     // vector: operands=[element], scalars=[lanes].
     TypeId vector(TypeId element, std::int64_t lanes);
     // matrix: operands=[element], scalars=[rows, cols].
@@ -404,6 +421,38 @@ public:
     [[nodiscard]] GuardedSpan<std::int64_t> scalars(TypeId id)  const;
     [[nodiscard]] std::string_view           name(TypeId id)     const;
 
+    // ── D-LANG-TYPE-IDENTITY-VOCABULARY ──
+    // Do `a` and `b` have the SAME REPRESENTATION — identical in every content
+    // axis EXCEPT the vocabulary/nominal `name`? True for `long` vs `int` under
+    // LLP64 (both I32) and for `long double` vs `double` on an f64 axis, false
+    // whenever the kind / extension kind / operands / scalars differ. Reads
+    // through the qualifier-transparent accessors, so `volatile long` and `long`
+    // compare representation-equal.
+    //
+    // This is what lets an identity-distinct pair be RETAGGED instead of cast:
+    // a conversion between two same-representation types changes no bits, so
+    // materializing it as a Cast would invent a runtime instruction that did not
+    // exist before identity was split off representation.
+    [[nodiscard]] bool sameRepresentation(TypeId a, TypeId b) const;
+    // The vocabulary tag on `id`'s MATERIAL type (`""` when anonymous). Unlike
+    // `name()` — which reads the raw record, as reintern / text round-trip
+    // require — this sees THROUGH a qualifier skin, so `volatile long` reports
+    // "long". The arithmetic-conversion tie-break reads it.
+    [[nodiscard]] std::string_view vocabularyName(TypeId id) const;
+
+    // The language-declared CONVERSION RANK of a vocabulary name (C 6.3.1.1:
+    // rank is a property of the type NAME — `long long` > `long` > `int`,
+    // `long double` > `double` — NOT of its width). Declared from the language
+    // config; the interner treats both name and rank as opaque data. An
+    // undeclared name (every anonymous primitive) ranks 0, so a named entry
+    // always out-ranks the anonymous representative of the same kind.
+    //
+    // Used ONLY to break a tie between two operands of the SAME kind and
+    // DIFFERENT vocabulary names; when the kinds differ the existing
+    // width-keyed rank tables decide, unchanged.
+    void declareVocabularyRank(std::string_view vocabularyName, int rank);
+    [[nodiscard]] int vocabularyRank(TypeId id) const;
+
     // FC8 bitfields (D-CSUBSET-BITFIELD): the declared bit-width of struct field
     // `fieldIndex`, or nullopt if that field is ordinary (non-bitfield). A
     // zero-width bitfield returns 0 (distinct from nullopt). A struct interned
@@ -539,6 +588,10 @@ private:
     // captures this at creation and aborts on a stale read.
     std::uint64_t                                  poolGen_ = 0;
     Interner<TypeNameId>                           names_;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: TypeNameId.v → the language-declared
+    // conversion rank of that vocabulary entry. Absent = rank 0 (anonymous /
+    // undeclared). Opaque config data; the interner never interprets the name.
+    std::unordered_map<std::uint32_t, int>         nameRank_;
     std::unordered_multimap<std::uint64_t, TypeId> byHash_;
     std::unordered_map<std::uint32_t, CompositeFields> compositeFields_;
 };

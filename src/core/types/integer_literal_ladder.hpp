@@ -87,6 +87,13 @@ enum class IntegerLadderStatus : std::uint8_t {
 struct IntegerLadderResult {
     IntegerLadderStatus status = IntegerLadderStatus::NoRule;
     TypeKind            kind   = TypeKind::Void;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the winning candidate's vocabulary tag
+    // ("long", "unsigned long long", …; empty for an anonymous type such as
+    // `int`). Both typing tiers mint `primitive(kind, vocabularyName)` with it —
+    // WITHOUT it `20L` on LP64 would intern the ANONYMOUS I64, i.e. a type
+    // `_Generic`'s `long:` association could not match. A view into the
+    // schema's `DataModelTypeRef`, which outlives every ladder call.
+    std::string_view    vocabularyName{};
 };
 
 // Run the ladder. `rawText` is the literal token's verbatim source text;
@@ -127,7 +134,7 @@ typeIntegerLiteral(std::string_view rawText,
     for (auto const& c : candidates) {
         TypeKind const k = c.resolveCore(dm);
         if (detail::int_ladder::magnitudeFits(k, magnitude)) {
-            return {IntegerLadderStatus::Typed, k};
+            return {IntegerLadderStatus::Typed, k, c.vocabularyName};
         }
     }
     return {IntegerLadderStatus::TooLarge, TypeKind::Void};
@@ -186,6 +193,11 @@ enum class FloatLadderStatus : std::uint8_t {
 struct FloatLadderResult {
     FloatLadderStatus status = FloatLadderStatus::NoRule;
     TypeKind          kind   = TypeKind::Void;   // meaningful only when Typed
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the resolved rule's vocabulary tag — the
+    // integer ladder's sibling. Empty for `double`/`float`; "long double" for
+    // the l/L rule, which is what keeps `20.0L` distinct from `20.0` on an
+    // f64 axis where BOTH are F64.
+    std::string_view  vocabularyName{};
 };
 
 [[nodiscard]] inline FloatLadderResult
@@ -197,7 +209,7 @@ typeFloatLiteral(std::string_view rawText,
     auto const resolve = [&](FloatLiteralTypingRule const& r) -> FloatLadderResult {
         auto const k = r.type.resolveCore(dm, ldf);
         if (!k.has_value()) return {FloatLadderStatus::AxisUndeclared, TypeKind::Void};
-        return {FloatLadderStatus::Typed, *k};
+        return {FloatLadderStatus::Typed, *k, r.type.vocabularyName};
     };
     std::string_view const suffix = matchFloatSuffix(rawText, ns);
     for (auto const& r : rules) {

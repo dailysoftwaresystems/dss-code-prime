@@ -19,8 +19,8 @@
         {
           "when": { "format": "elf" },
           "fields": [
-            { "name": "d_ino",    "type": "u64" },
-            { "name": "d_off",    "type": "i64" },
+            { "name": "d_ino",    "type": "u64 \"unsigned long\"" },
+            { "name": "d_off",    "type": "i64 \"long\"" },
             { "name": "d_reclen", "type": "u16" },
             { "name": "d_type",   "type": "u8" },
             { "name": "d_name",   "type": "arr<char, 256>" }
@@ -29,8 +29,8 @@
         {
           "when": { "format": "macho" },
           "fields": [
-            { "name": "d_ino",     "type": "u64" },
-            { "name": "d_seekoff", "type": "u64" },
+            { "name": "d_ino",     "type": "u64 \"unsigned long long\"" },
+            { "name": "d_seekoff", "type": "u64 \"unsigned long long\"" },
             { "name": "d_reclen",  "type": "u16" },
             { "name": "d_namlen",  "type": "u16" },
             { "name": "d_type",    "type": "u8" },

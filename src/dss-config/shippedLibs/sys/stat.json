@@ -56,49 +56,49 @@
         {
           "when": { "arch": "x86_64", "format": "elf" },
           "fields": [
-            { "name": "st_dev",      "type": "u64" },
-            { "name": "st_ino",      "type": "u64" },
-            { "name": "st_nlink",    "type": "u64" },
+            { "name": "st_dev",      "type": "u64 \"unsigned long\"" },
+            { "name": "st_ino",      "type": "u64 \"unsigned long\"" },
+            { "name": "st_nlink",    "type": "u64 \"unsigned long\"" },
             { "name": "st_mode",     "type": "u32" },
             { "name": "st_uid",      "type": "u32" },
             { "name": "st_gid",      "type": "u32" },
             { "name": "__pad0",      "type": "i32" },
-            { "name": "st_rdev",     "type": "u64" },
-            { "name": "st_size",     "type": "i64" },
-            { "name": "st_blksize",  "type": "i64" },
-            { "name": "st_blocks",   "type": "i64" },
-            { "name": "st_atim_sec", "type": "i64" },
-            { "name": "st_atim_nsec","type": "i64" },
-            { "name": "st_mtim_sec", "type": "i64" },
-            { "name": "st_mtim_nsec","type": "i64" },
-            { "name": "st_ctim_sec", "type": "i64" },
-            { "name": "st_ctim_nsec","type": "i64" },
-            { "name": "__glibc_reserved0", "type": "i64" },
-            { "name": "__glibc_reserved1", "type": "i64" },
-            { "name": "__glibc_reserved2", "type": "i64" }
+            { "name": "st_rdev",     "type": "u64 \"unsigned long\"" },
+            { "name": "st_size",     "type": "i64 \"long\"" },
+            { "name": "st_blksize",  "type": "i64 \"long\"" },
+            { "name": "st_blocks",   "type": "i64 \"long\"" },
+            { "name": "st_atim_sec", "type": "i64 \"long\"" },
+            { "name": "st_atim_nsec","type": "i64 \"long\"" },
+            { "name": "st_mtim_sec", "type": "i64 \"long\"" },
+            { "name": "st_mtim_nsec","type": "i64 \"long\"" },
+            { "name": "st_ctim_sec", "type": "i64 \"long\"" },
+            { "name": "st_ctim_nsec","type": "i64 \"long\"" },
+            { "name": "__glibc_reserved0", "type": "i64 \"long\"" },
+            { "name": "__glibc_reserved1", "type": "i64 \"long\"" },
+            { "name": "__glibc_reserved2", "type": "i64 \"long\"" }
           ]
         },
         {
           "when": { "arch": "arm64", "format": "elf" },
           "fields": [
-            { "name": "st_dev",      "type": "u64" },
-            { "name": "st_ino",      "type": "u64" },
+            { "name": "st_dev",      "type": "u64 \"unsigned long\"" },
+            { "name": "st_ino",      "type": "u64 \"unsigned long\"" },
             { "name": "st_mode",     "type": "u32" },
             { "name": "st_nlink",    "type": "u32" },
             { "name": "st_uid",      "type": "u32" },
             { "name": "st_gid",      "type": "u32" },
-            { "name": "st_rdev",     "type": "u64" },
-            { "name": "__pad1",      "type": "u64" },
-            { "name": "st_size",     "type": "i64" },
+            { "name": "st_rdev",     "type": "u64 \"unsigned long\"" },
+            { "name": "__pad1",      "type": "u64 \"unsigned long\"" },
+            { "name": "st_size",     "type": "i64 \"long\"" },
             { "name": "st_blksize",  "type": "i32" },
             { "name": "__pad2",      "type": "i32" },
-            { "name": "st_blocks",   "type": "i64" },
-            { "name": "st_atim_sec", "type": "i64" },
-            { "name": "st_atim_nsec","type": "i64" },
-            { "name": "st_mtim_sec", "type": "i64" },
-            { "name": "st_mtim_nsec","type": "i64" },
-            { "name": "st_ctim_sec", "type": "i64" },
-            { "name": "st_ctim_nsec","type": "i64" },
+            { "name": "st_blocks",   "type": "i64 \"long\"" },
+            { "name": "st_atim_sec", "type": "i64 \"long\"" },
+            { "name": "st_atim_nsec","type": "i64 \"long\"" },
+            { "name": "st_mtim_sec", "type": "i64 \"long\"" },
+            { "name": "st_mtim_nsec","type": "i64 \"long\"" },
+            { "name": "st_ctim_sec", "type": "i64 \"long\"" },
+            { "name": "st_ctim_nsec","type": "i64 \"long\"" },
             { "name": "__glibc_reserved0", "type": "i32" },
             { "name": "__glibc_reserved1", "type": "i32" }
           ]
@@ -109,27 +109,27 @@
             { "name": "st_dev",          "type": "i32" },
             { "name": "st_mode",         "type": "u16" },
             { "name": "st_nlink",        "type": "u16" },
-            { "name": "st_ino",          "type": "u64" },
+            { "name": "st_ino",          "type": "u64 \"unsigned long long\"" },
             { "name": "st_uid",          "type": "u32" },
             { "name": "st_gid",          "type": "u32" },
             { "name": "st_rdev",         "type": "i32" },
             { "name": "__pad0",          "type": "i32" },
-            { "name": "st_atim_sec",     "type": "i64" },
-            { "name": "st_atim_nsec",    "type": "i64" },
-            { "name": "st_mtim_sec",     "type": "i64" },
-            { "name": "st_mtim_nsec",    "type": "i64" },
-            { "name": "st_ctim_sec",     "type": "i64" },
-            { "name": "st_ctim_nsec",    "type": "i64" },
-            { "name": "st_birthtim_sec", "type": "i64" },
-            { "name": "st_birthtim_nsec","type": "i64" },
-            { "name": "st_size",         "type": "i64" },
-            { "name": "st_blocks",       "type": "i64" },
+            { "name": "st_atim_sec",     "type": "i64 \"long\"" },
+            { "name": "st_atim_nsec",    "type": "i64 \"long\"" },
+            { "name": "st_mtim_sec",     "type": "i64 \"long\"" },
+            { "name": "st_mtim_nsec",    "type": "i64 \"long\"" },
+            { "name": "st_ctim_sec",     "type": "i64 \"long\"" },
+            { "name": "st_ctim_nsec",    "type": "i64 \"long\"" },
+            { "name": "st_birthtim_sec", "type": "i64 \"long\"" },
+            { "name": "st_birthtim_nsec","type": "i64 \"long\"" },
+            { "name": "st_size",         "type": "i64 \"long long\"" },
+            { "name": "st_blocks",       "type": "i64 \"long long\"" },
             { "name": "st_blksize",      "type": "i32" },
             { "name": "st_flags",        "type": "u32" },
             { "name": "st_gen",          "type": "u32" },
             { "name": "st_lspare",       "type": "i32" },
-            { "name": "st_qspare0",      "type": "i64" },
-            { "name": "st_qspare1",      "type": "i64" }
+            { "name": "st_qspare0",      "type": "i64 \"long long\"" },
+            { "name": "st_qspare1",      "type": "i64 \"long long\"" }
           ]
         }
       ]
@@ -147,10 +147,10 @@
             { "name": "st_uid", "type": "i16" },
             { "name": "st_gid", "type": "i16" },
             { "name": "st_rdev", "type": "u32" },
-            { "name": "st_size", "type": "i32" },
-            { "name": "st_atime", "type": "i64" },
-            { "name": "st_mtime", "type": "i64" },
-            { "name": "st_ctime", "type": "i64" }
+            { "name": "st_size", "type": "i32 \"long\"" },
+            { "name": "st_atime", "type": "i64 \"long long\"" },
+            { "name": "st_mtime", "type": "i64 \"long long\"" },
+            { "name": "st_ctime", "type": "i64 \"long long\"" }
           ]
         }
       ]
@@ -168,10 +168,10 @@
             { "name": "st_uid", "type": "i16" },
             { "name": "st_gid", "type": "i16" },
             { "name": "st_rdev", "type": "u32" },
-            { "name": "st_size", "type": "i64" },
-            { "name": "st_atime", "type": "i64" },
-            { "name": "st_mtime", "type": "i64" },
-            { "name": "st_ctime", "type": "i64" }
+            { "name": "st_size", "type": "i64 \"long long\"" },
+            { "name": "st_atime", "type": "i64 \"long long\"" },
+            { "name": "st_mtime", "type": "i64 \"long long\"" },
+            { "name": "st_ctime", "type": "i64 \"long long\"" }
           ]
         }
       ]
@@ -189,10 +189,10 @@
             { "name": "st_uid", "type": "i16" },
             { "name": "st_gid", "type": "i16" },
             { "name": "st_rdev", "type": "u32" },
-            { "name": "st_size", "type": "i64" },
-            { "name": "st_atime", "type": "i64" },
-            { "name": "st_mtime", "type": "i64" },
-            { "name": "st_ctime", "type": "i64" }
+            { "name": "st_size", "type": "i64 \"long long\"" },
+            { "name": "st_atime", "type": "i64 \"long long\"" },
+            { "name": "st_mtime", "type": "i64 \"long long\"" },
+            { "name": "st_ctime", "type": "i64 \"long long\"" }
           ]
         }
       ]

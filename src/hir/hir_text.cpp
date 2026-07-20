@@ -515,6 +515,17 @@ private:
             default: { // primitives (and any unexpected kind)
                 std::string_view const p = primName(in.kind(t));
                 if (!p.empty()) out_ += p; else { report("unprintable type kind"); out_ += '?'; }
+                // D-LANG-TYPE-IDENTITY-VOCABULARY: emit the vocabulary tag when the
+                // primitive carries one, so the text round-trip preserves IDENTITY
+                // and not merely representation. Anonymous primitives (every core
+                // whose C spelling is its own representation) print exactly as
+                // before — zero churn for existing dumps.
+                std::string_view const vocab = in.vocabularyName(t);
+                if (!vocab.empty()) {
+                    out_ += " \"";
+                    out_ += vocab;
+                    out_ += '"';
+                }
                 return;
             }
         }
@@ -1963,7 +1974,20 @@ private:
         if (!peekIs(Tk::Ident)) { malformed("expected a type"); return InvalidType; }
         std::string kw = lex_.take().text;
         if (kw == "invalid") return InvalidType;
-        if (auto p = primFromName(kw)) return interner_.primitive(*p);
+        if (auto p = primFromName(kw)) {
+            // D-LANG-TYPE-IDENTITY-VOCABULARY: an OPTIONAL quoted VOCABULARY TAG
+            // after the core (`u64 "unsigned long long"`, the `struct "N"` naming
+            // precedent). The bare core spells the ANONYMOUS representative of
+            // that representation — which is what `int`/`unsigned`/`short`/`char`
+            // are, so every existing spelling is unchanged. A type whose C
+            // identity is distinct from its representation (`long`, `long long`,
+            // `long double` and their unsigned forms) MUST carry the tag here or
+            // the text round-trip silently re-collapses it onto the anonymous
+            // type — and an FFI descriptor's pointer parameter would reject the
+            // very C type it models (`ptr<u64>` vs a user's `unsigned long long*`).
+            if (peekIs(Tk::Str)) return interner_.primitive(*p, lex_.take().text);
+            return interner_.primitive(*p);
+        }
         auto wrap1 = [&](TypeId (TypeInterner::*fn)(TypeId)) -> TypeId {
             expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::RAngle, "'>'"); return (interner_.*fn)(e);
         };

@@ -53,7 +53,15 @@ struct Lowered {
 
 [[nodiscard]] Lowered lowerCSubset(std::string src,
                                    std::string targetName = "x86_64",
-                                   std::string ccName     = "sysv_amd64") {
+                                   std::string ccName     = "sysv_amd64",
+                                   DataModel   dataModel  = DataModel::Lp64,
+                                   // FC17.9(e): the active format's `long double`
+                                   // axis. `None` (the default, unchanged for
+                                   // every existing fixture) means the source may
+                                   // not spell `long double` at all; the f64 axis
+                                   // is the pe64 / apple-arm64 shape where `long
+                                   // double` and `double` share ONE core.
+                                   LongDoubleFormat ldf = LongDoubleFormat::None) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -69,7 +77,8 @@ struct Lowered {
             vaStrategy = cc->vaListLayout->strategy;
         }
     }
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, vaStrategy);
+    auto model = analyze(cu, dataModel, std::nullopt, vaStrategy, std::nullopt,
+                         std::nullopt, ldf);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -10386,4 +10395,194 @@ TEST(MirLoweringCSubset, LongjmpNoreturnTerminatesBlockInUnreachable) {
     }
     EXPECT_TRUE(sawUnreachable)
         << "longjmp is noreturn → its block must terminate in Unreachable";
+}
+
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: codegen is UNCHANGED by the split ──────
+//
+// Splitting type IDENTITY off REPRESENTATION makes `long` and `int` two TypeIds
+// under LLP64 (both I32). The danger is that `coerce()` then sees
+// `child.type != target` and materializes a `Cast(I32→I32)`, which HIR→MIR maps
+// to a REAL `MirOpcode::Bitcast` — a runtime instruction that did not exist
+// before, for a conversion C 6.3.1.3p1 defines as the IDENTITY.
+//
+// The proof is STRUCTURAL, not "the tests still pass": the LLP64 lowering must
+// contain the SAME instruction shape as the byte-identical LP64 control where
+// the two types genuinely coincide, and ZERO Cast/Bitcast/width-change ops.
+namespace {
+[[nodiscard]] std::size_t countHirKind(Hir const& h, HirKind k) {
+    std::size_t n = 0;
+    std::uint32_t const tag = h.id().v;
+    for (std::uint32_t i = 1; i < h.nodeCount(); ++i) {
+        if (h.kind(HirNodeId{i, tag}) == k) ++n;
+    }
+    return n;
+}
+} // namespace
+
+TEST(MirLoweringCSubset, SameRepresentationAssignEmitsNoCastOrBitcast) {
+    // `long l = i;` under LLP64: `long` is I32 and `int` is I32, two DISTINCT
+    // vocabulary entries at ONE representation.
+    auto llp = lowerCSubset(
+        "long f(int i) { long l = i; return l; }",
+        "x86_64", "sysv_amd64", DataModel::Llp64);
+    ASSERT_FALSE(llp.model.hasErrors())
+        << "semantic: " << (llp.model.diagnostics().all().empty()
+            ? "" : llp.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(llp.hir->ok);
+    ASSERT_TRUE(llp.mir.ok);
+
+    // (a) HIR: the implicit `long l = i;` conversion produced NO Cast node at
+    //     all — the source contains no explicit cast, so any Cast here came from
+    //     coerce() falling through to the arithmetic-core fallback.
+    EXPECT_EQ(countHirKind(llp.hir->hir, HirKind::Cast), 0u)
+        << "a same-representation conversion must RE-TAG, never emit a Cast — "
+           "one here means coerce() fell through to the arithmetic-core fallback";
+
+    // (b) MIR: zero representation-changing instructions of ANY kind. Bitcast is
+    //     the specific opcode a same-kind Cast lowers to; the width-changing
+    //     siblings are asserted absent too so a future mapCast change cannot
+    //     smuggle the instruction back under a different opcode.
+    Mir const& m = llp.mir.mir;
+    EXPECT_EQ(countOp(m, MirOpcode::Bitcast), 0u)
+        << "Cast(I32→I32) lowers to a REAL Bitcast instruction — the exact "
+           "codegen regression the re-tag exists to prevent";
+    EXPECT_EQ(countOp(m, MirOpcode::Trunc), 0u);
+    EXPECT_EQ(countOp(m, MirOpcode::SExt), 0u);
+    EXPECT_EQ(countOp(m, MirOpcode::ZExt), 0u);
+
+    // (c) The IDENTITY side, asserted DIRECTLY on TypeIds — the only place it is
+    //     observable. `long` and `int` under LLP64 must be TWO TypeIds with ONE
+    //     representation; that is precisely what makes (a)+(b) meaningful (with a
+    //     single collapsed TypeId there would be no conversion to elide, so a
+    //     zero-cast count would prove nothing).
+    //
+    //     NOTE on what MIR TEXT can and cannot witness: the MIR text codec drops
+    //     the vocabulary tag on emit (mir_text.cpp `primName`) and rebuilds an
+    //     ANONYMOUS primitive on parse, so MIR text CANNOT express identity. A
+    //     text comparison against an `int`-only control is therefore NOT evidence
+    //     that identity survived — it is only evidence of codegen-neutrality,
+    //     which (b) already states in stronger, opcode-exact terms. So the text
+    //     compare is deliberately NOT made here; the assertion below is.
+    auto const& in = llp.model.lattice().interner();
+    TypeId longTy = InvalidType, intTy = InvalidType;
+    for (std::size_t i = 1; i < llp.model.symbols().size(); ++i) {
+        auto const& sym = llp.model.symbols()[i];
+        if (sym.name == "l") longTy = sym.type;
+        if (sym.name == "i") intTy  = sym.type;
+    }
+    ASSERT_TRUE(longTy.valid() && intTy.valid());
+    EXPECT_NE(longTy.v, intTy.v)
+        << "`long` and `int` are DISTINCT types under LLP64 — if they collapsed "
+           "to one TypeId there would be no conversion for (a)/(b) to elide";
+    EXPECT_EQ(in.kind(longTy), in.kind(intTy))
+        << "... at the SAME representation (both I32) — which is exactly why the "
+           "conversion must re-tag rather than emit a Cast";
+    EXPECT_TRUE(in.sameRepresentation(longTy, intTy));
+}
+
+// The FLOAT sibling, on the f64 long-double axis (the pe64 / apple-arm64 shape)
+// where `long double` and `double` share ONE core. Two things are pinned:
+//
+//   * `long double ld = d;` is a same-representation conversion → re-tag, no node.
+//   * `double r = vld + d;` with a VOLATILE `long double` operand. C 6.3.2.1p2
+//     makes the usual arithmetic conversions yield the UNQUALIFIED type; while
+//     the float branch returned the winning operand VERBATIM the common type
+//     became `volatile long double`, and a qualifier CHANGE is the one thing the
+//     re-tag refuses — so the ASSIGNMENT materialized a Cast that lowers to a
+//     REAL Bitcast. The `volatile double` control is the same shape with no
+//     identity split in it, so its instruction counts are the definition of
+//     "nothing extra": identity differs, representation does not, so codegen
+//     must not.
+//
+//     ★ OPERAND ORDER IS LOAD-BEARING, and getting it wrong made an earlier
+//     version of this pin VACUOUS. The pre-fix float branch was
+//     `return fa >= fb ? a : b;` and on the f64 axis `floatRank(F64) ==
+//     floatRank(F64)`, so it returned `a` — the LEFT operand. With the plain
+//     `double` on the left (`d + vld`) the skin never entered the common type
+//     and the pin passed WITH THE FIX REVERTED. The qualified operand must be
+//     the LEFT one for the defect to be reachable at all.
+TEST(MirLoweringCSubset, VolatileLongDoubleArithmeticEmitsNoExtraCast) {
+    auto const counts = [](Lowered const& L) {
+        return std::pair{countHirKind(L.hir->hir, HirKind::Cast),
+                         countOp(L.mir.mir, MirOpcode::Bitcast)};
+    };
+    // (a) the plain same-representation conversion — ZERO of either.
+    auto plain = lowerCSubset(
+        "double f(double d) { long double ld = d; return ld; }",
+        "x86_64", "sysv_amd64", DataModel::Llp64, LongDoubleFormat::F64);
+    ASSERT_FALSE(plain.model.hasErrors())
+        << (plain.model.diagnostics().all().empty()
+                ? "" : plain.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(plain.hir->ok);
+    ASSERT_TRUE(plain.mir.ok);
+    EXPECT_EQ(countHirKind(plain.hir->hir, HirKind::Cast), 0u)
+        << "`long double ld = d;` on an f64 axis changes no bits — RE-TAG, "
+           "never a Cast node";
+    EXPECT_EQ(countOp(plain.mir.mir, MirOpcode::Bitcast), 0u);
+    EXPECT_EQ(countOp(plain.mir.mir, MirOpcode::FPExt), 0u);
+    EXPECT_EQ(countOp(plain.mir.mir, MirOpcode::FPTrunc), 0u);
+
+    // (b) the QUALIFIED operand, against its identity-free control.
+    auto ld = lowerCSubset(
+        "double f(double d, volatile long double vld) { double r = vld + d;\n"
+        "  return r; }",
+        "x86_64", "sysv_amd64", DataModel::Llp64, LongDoubleFormat::F64);
+    ASSERT_FALSE(ld.model.hasErrors())
+        << (ld.model.diagnostics().all().empty()
+                ? "" : ld.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(ld.hir->ok);
+    ASSERT_TRUE(ld.mir.ok);
+    auto ctl = lowerCSubset(
+        "double f(double d, volatile double vd) { double r = vd + d;\n"
+        "  return r; }",
+        "x86_64", "sysv_amd64", DataModel::Llp64, LongDoubleFormat::F64);
+    ASSERT_TRUE(ctl.mir.ok);
+    EXPECT_EQ(counts(ld), counts(ctl))
+        << "`volatile long double + double` must cost exactly what `volatile "
+           "double + double` costs — the ONE conversion here is the pre-existing "
+           "volatile lvalue strip, and the identity split must not add a second";
+    // The ABSOLUTE counts, not just the delta: a regression that added a Cast to
+    // BOTH sides would keep the equality above true while breaking the claim.
+    // ONE is the correct number — the pre-existing `volatile` lvalue strip on
+    // `vld`'s read, which predates the identity split and is not what this pins.
+    // Pre-fix there were TWO on the `ld` side: that strip PLUS the assignment's
+    // qualifier-changing cast, because the common type came out `volatile long
+    // double` (C 6.3.2.1p2 says it must be UNQUALIFIED).
+    EXPECT_EQ(countHirKind(ld.hir->hir, HirKind::Cast), 1u)
+        << "exactly the pre-existing volatile lvalue strip — the identity split "
+           "must not add a second conversion";
+    EXPECT_EQ(countHirKind(ctl.hir->hir, HirKind::Cast), 1u)
+        << "... and the identity-free control costs the same one";
+    // And the operand really IS the identity-split pair (else the control would
+    // be trivially equal for the wrong reason).
+    auto const& in = ld.model.lattice().interner();
+    TypeId vldTy = InvalidType, dTy = InvalidType;
+    for (std::size_t i = 1; i < ld.model.symbols().size(); ++i) {
+        auto const& sym = ld.model.symbols()[i];
+        if (sym.name == "vld") vldTy = sym.type;
+        if (sym.name == "d")   dTy   = sym.type;
+    }
+    ASSERT_TRUE(vldTy.valid() && dTy.valid());
+    EXPECT_NE(vldTy.v, dTy.v);
+    EXPECT_TRUE(in.sameRepresentation(vldTy, dTy))
+        << "on the f64 axis `long double` and `double` are ONE representation";
+}
+
+TEST(MirLoweringCSubset, SameRepresentationIntegerReturnEmitsNoCast) {
+    // `return 0;` from a `long` function under LLP64: the literal is `int`
+    // (anonymous I32), the return type is `long` (named I32). Before the re-tag
+    // this produced either a spurious Bitcast or an I_TerminatorTypeMismatch.
+    auto L = lowerCSubset("long f(long *p) { *p = 42; return 0; }",
+                          "x86_64", "sysv_amd64", DataModel::Llp64);
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << "MIR: " << (L.mirReporter.all().empty()
+        ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countHirKind(L.hir->hir, HirKind::Cast), 0u);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Bitcast), 0u);
+    // And the module VERIFIES — the return value's type must equal the
+    // function's return type EXACTLY (the check that caught the stale re-tag).
+    DiagnosticReporter rep;
+    MirVerifier verifier{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "errorCount=" << rep.errorCount();
 }

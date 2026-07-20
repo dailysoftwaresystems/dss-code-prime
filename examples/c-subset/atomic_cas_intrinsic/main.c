@@ -25,16 +25,33 @@
 //      final y read returns 11, shifting the exit by -12.
 // volatile globals keep the final x/y reads honest loads AND make the &x args
 // the exact sqlite winMutex shape (`LONG volatile winMutex_lock`):
-// Ptr<volatile i32> coercing to the builtin's ptr<i32> param.
+// Ptr<volatile CasWord> coercing to the builtin's declared pointee.
+//
+// D-LANG-TYPE-IDENTITY-VOCABULARY: the CAS WORD is now spelled per platform.
+// The Windows SDK declares the intrinsic `_InterlockedCompareExchange(LONG
+// volatile*, LONG, LONG)` and `LONG` IS `long` — a 32-bit `long` under LLP64.
+// Since type identity is no longer derived from representation, `int*` and
+// `long*` are DISTINCT types even at one width, so passing an `int volatile*`
+// where the SDK says `long volatile*` is the same constraint violation a real
+// C compiler diagnoses. `_WIN32` is pe-gated (c-subset.lang.json predefines),
+// so this stays i32 on EVERY target (Win32 `long` is 32-bit; elsewhere the
+// builtin's own base signature is the anonymous `int*`) — the example's
+// all-targets i32 CAS shape is unchanged, only its SPELLING is now honest.
 //
 // exit = r1 + r2 + x + y = 5 + 9 + 9 + 23 = 46.
 
-static int volatile x = 5;
-static int volatile y = 11;
+#if defined(_WIN32)
+typedef long CasWord;    /* Win32 LONG — 32-bit under LLP64 */
+#else
+typedef int  CasWord;
+#endif
+
+static CasWord volatile x = 5;
+static CasWord volatile y = 11;
 
 int main(void) {
-    int r1 = _InterlockedCompareExchange(&x, 9, 5);    /* success: 5, x->9   */
-    int r2 = _InterlockedCompareExchange(&x, 77, 5);   /* failure: 9, x stays */
-    (void)_InterlockedCompareExchange(&y, 23, 11);     /* unused result: y->23 */
-    return r1 + r2 + x + y;
+    CasWord r1 = _InterlockedCompareExchange(&x, 9, 5);   /* success: 5, x->9   */
+    CasWord r2 = _InterlockedCompareExchange(&x, 77, 5);  /* failure: 9, x stays */
+    (void)_InterlockedCompareExchange(&y, 23, 11);        /* unused result: y->23 */
+    return (int)(r1 + r2 + x + y);
 }

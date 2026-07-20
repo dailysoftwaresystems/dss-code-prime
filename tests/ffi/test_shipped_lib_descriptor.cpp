@@ -3451,4 +3451,119 @@ TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
     EXPECT_FALSE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::MachO));
 }
 
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: the per-DATA-MODEL `when` selector ────
+//
+// C defines `size_t` / `uint64_t` / `intmax_t` as ALIASES of a standard NAMED
+// type, and WHICH name is DATA-MODEL-dependent (`size_t` IS `unsigned long` on
+// LP64 and `unsigned long long` on LLP64). The descriptors spelled them as a
+// bare `u64` — the ANONYMOUS representative, a THIRD type matching NEITHER named
+// entry, so a `_Generic` over the two standard names silently missed. `when:
+// {dataModel}` is the third target axis alongside {arch, format}; these pin the
+// SHIPPED spelling, structurally (TypeId equality against a freshly-built named
+// primitive), never a string compare.
+TEST(ShippedLibDescriptor, ShippedFixedWidthAliasesCarryTheirVocabularyTag) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    struct Row { char const* lib; char const* alias; TypeKind core;
+                 char const* lp64Name; char const* llp64Name; };
+    constexpr Row kRows[] = {
+        {"stddef", "size_t",     TypeKind::U64, "unsigned long", "unsigned long long"},
+        {"stddef", "ptrdiff_t",  TypeKind::I64, "long",          "long long"},
+        {"stdint", "uint64_t",   TypeKind::U64, "unsigned long", "unsigned long long"},
+        {"stdint", "int64_t",    TypeKind::I64, "long",          "long long"},
+        {"stdint", "uintptr_t",  TypeKind::U64, "unsigned long", "unsigned long long"},
+        {"stdint", "intmax_t",   TypeKind::I64, "long",          "long long"},
+        {"stdio",  "size_t",     TypeKind::U64, "unsigned long", "unsigned long long"},
+        {"string", "size_t",     TypeKind::U64, "unsigned long", "unsigned long long"},
+        {"time",   "time_t",     TypeKind::I64, "long",          "long long"},
+    };
+    for (Row const& row : kRows) {
+        for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
+            SCOPED_TRACE(std::string{row.lib} + "." + row.alias
+                         + (dm == DataModel::Lp64 ? " LP64" : " LLP64"));
+            TypeInterner interner{CompilationUnitId{1}};
+            TypeRegistry typeReg;
+            DiagnosticReporter rep;
+            // stdio's `vfprintf` needs the SysV va_list binding, exactly as the
+            // production reader threads it (c82).
+            auto const namedTypes = sysvVaListBinding(interner);
+            auto desc = readShippedLibDescriptor(
+                root / (std::string{row.lib} + ".json"), interner, typeReg, rep,
+                dm, "x86_64",
+                dm == DataModel::Lp64 ? ObjectFormatKind::Elf : ObjectFormatKind::Pe,
+                namedTypes);
+            ASSERT_TRUE(desc.has_value());
+            EXPECT_FALSE(rep.hasErrors());
+            char const* want = dm == DataModel::Lp64 ? row.lp64Name : row.llp64Name;
+            bool found = false;
+            for (auto const& td : desc->typedefs) {
+                if (td.name != row.alias) continue;
+                found = true;
+                EXPECT_EQ(td.type, interner.primitive(row.core, want))
+                    << "the alias must BE the data model's named standard type";
+                EXPECT_NE(td.type, interner.primitive(row.core))
+                    << "... and must NOT be the ANONYMOUS representative of its "
+                       "core, which matches no named `_Generic` association";
+            }
+            EXPECT_TRUE(found) << "alias not injected on this data model";
+        }
+    }
+}
+
+// The selector composes with {arch, format} and rejects a typo'd model name —
+// a silently-never-matching key would make the entry VANISH on every target.
+TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "dm.json", R"JSON({
+        "header": "dm.h",
+        "typedefs": [
+            { "name": "alias_t", "variants": [
+                { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+                { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+            ] }
+        ]
+    })JSON");
+    auto aliasFor = [&](DataModel dm, TypeInterner& interner) -> TypeId {
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, dm);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        if (!desc.has_value()) return {};
+        for (auto const& td : desc->typedefs)
+            if (td.name == "alias_t") return td.type;
+        ADD_FAILURE() << "alias_t missing";
+        return {};
+    };
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        EXPECT_EQ(aliasFor(DataModel::Lp64, interner),
+                  interner.primitive(TypeKind::U64, "unsigned long"));
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        EXPECT_EQ(aliasFor(DataModel::Llp64, interner),
+                  interner.primitive(TypeKind::U64, "unsigned long long"));
+    }
+    // A typo'd data-model name is a CLOSED-vocabulary violation, not a silent
+    // never-match.
+    auto const bad = writeTemp(dir, "dmbad.json", R"JSON({
+        "header": "dmbad.h",
+        "typedefs": [
+            { "name": "alias_t", "variants": [
+                { "when": { "dataModel": "LP62" }, "type": "u64" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(bad, interner, typeReg, rep,
+                                         DataModel::Lp64);
+    EXPECT_TRUE(rep.hasErrors())
+        << "an unknown data-model name must fail LOUD (it could never match)";
+    EXPECT_FALSE(desc.has_value());
+}
+
 } // namespace

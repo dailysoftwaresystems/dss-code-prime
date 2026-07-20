@@ -962,3 +962,122 @@ TEST(HirText, MemberAlignsRoundTrip) {
     EXPECT_TRUE(in.hasExplicitAligns(reparsed));
     EXPECT_EQ(in.explicitFieldAlign(reparsed, 0), 16u);
 }
+
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: the vocabulary-tag text round-trip ─────
+//
+// `hir_text` is the ONE type-text codec — it serves `.dsshir` dumps AND every
+// shipped-descriptor `signature`/field/typedef spelling. If the EMIT side drops
+// the vocabulary tag, or the PARSE side ignores it, a `long` silently
+// re-collapses onto the anonymous `int` at every text boundary (a `.dsshir`
+// reload, a static-link merge) and an FFI descriptor's `ptr<u64 "unsigned long">`
+// stops matching the very C type it models.
+//
+// RED-ON-DISABLE: delete the tag emission and the emitted text loses the quoted
+// name (and the decoded TypeId collapses onto the anonymous one); delete the tag
+// parse and the reparsed type is anonymous, so the two emits differ.
+
+TEST(ParseTypeFromText, VocabularyTagRoundTripsAndStaysDistinct) {
+    TypeInterner interner{CompilationUnitId{13}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    // The tagged form and the bare form are DIFFERENT types at the SAME
+    // representation — the entire point of the split.
+    TypeId const tagged = parseTypeFromText("i64 \"long\"", interner, reg, rep);
+    TypeId const anon   = parseTypeFromText("i64", interner, reg, rep);
+    ASSERT_TRUE(tagged.valid() && anon.valid());
+    EXPECT_NE(tagged.v, anon.v);
+    EXPECT_EQ(interner.kind(tagged), TypeKind::I64);
+    EXPECT_EQ(std::string{interner.vocabularyName(tagged)}, "long");
+    EXPECT_TRUE(interner.vocabularyName(anon).empty())
+        << "the BARE core spells the ANONYMOUS representative — that is what "
+           "`int`/`short`/`char` are, so it must never acquire a tag";
+    EXPECT_TRUE(interner.sameRepresentation(tagged, anon));
+
+    // Two spellings of the same tag dedup to ONE TypeId; a different tag does not.
+    EXPECT_EQ(parseTypeFromText("i64 \"long\"", interner, reg, rep).v, tagged.v);
+    EXPECT_NE(parseTypeFromText("i64 \"long long\"", interner, reg, rep).v, tagged.v);
+
+    // The tag survives NESTED positions — the shape a descriptor actually uses
+    // (`ptr<...>` out-params, struct fields, FnSig params/results).
+    TypeId const pl = parseTypeFromText("ptr<u64 \"unsigned long\">", interner, reg, rep);
+    ASSERT_TRUE(pl.valid());
+    ASSERT_EQ(interner.kind(pl), TypeKind::Ptr);
+    EXPECT_EQ(std::string{interner.vocabularyName(interner.operands(pl)[0])},
+              "unsigned long");
+    EXPECT_NE(pl.v, parseTypeFromText("ptr<u64>", interner, reg, rep).v)
+        << "`unsigned long *` and an anonymous `u64 *` are NOT the same pointer "
+           "type — this inequality is what makes LPDWORD match `unsigned long *`";
+
+    TypeId const st = parseTypeFromText(
+        "struct \"timeval\" {i64 \"long\", i64 \"long\"}", interner, reg, rep);
+    ASSERT_TRUE(st.valid());
+    ASSERT_EQ(interner.kind(st), TypeKind::Struct);
+    ASSERT_EQ(interner.operands(st).size(), 2u);
+    EXPECT_EQ(std::string{interner.vocabularyName(interner.operands(st)[0])}, "long");
+    EXPECT_NE(st.v, parseTypeFromText("struct \"timeval\" {i64, i64}",
+                                      interner, reg, rep).v)
+        << "the SAME tag with differently-tagged fields is a DIFFERENT struct — "
+           "the cross-descriptor divergence that produced an include-order-"
+           "dependent member-access failure";
+
+    TypeId const fn = parseTypeFromText(
+        "fn(ptr<i32 \"long\">, i32) -> i64 \"long long\"", interner, reg, rep);
+    ASSERT_TRUE(fn.valid());
+    EXPECT_EQ(std::string{interner.vocabularyName(interner.fnResult(fn))},
+              "long long");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// The EMIT side, through the full `.dsshir` emit→parse→emit stability check —
+// the half `tests/hir/test_hir_text.cpp` never exercised. A tagged primitive
+// must print its tag AND survive the reparse; the untagged control must stay
+// anonymous (a blanket "always print a tag" would break every existing dump).
+TEST(HirText, VocabularyTagEmitsAndSurvivesReparse) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const lng   = in.primitive(TypeKind::I64, "long");
+    TypeId const ull   = in.primitive(TypeKind::U64, "unsigned long long");
+    TypeId const anon  = in.primitive(TypeKind::I64);          // the control
+    TypeId const ptrL  = in.pointer(lng);
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const t1 = b.makeTypeRef(lng);
+    HirNodeId const t2 = b.makeTypeRef(ull);
+    HirNodeId const t3 = b.makeTypeRef(anon);
+    HirNodeId const t4 = b.makeTypeRef(ptrL);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{
+        b.makeExprStmt(t1), b.makeExprStmt(t2), b.makeExprStmt(t3),
+        b.makeExprStmt(t4), b.makeReturn()});
+    HirNodeId const fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    // Byte-identical emit→parse→emit: if the tag were emitted but not parsed,
+    // the SECOND emit would print the anonymous form and this fails.
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("i64 \"long\""), std::string::npos)
+        << "the vocabulary tag must be EMITTED — text that carries only the "
+           "representation cannot express identity:\n" << text;
+    EXPECT_NE(text.find("u64 \"unsigned long long\""), std::string::npos) << text;
+    EXPECT_NE(text.find("ptr<i64 \"long\">"), std::string::npos) << text;
+
+    // The untagged control prints BARE — zero churn for every existing dump.
+    DiagnosticReporter r;
+    std::string const only = emitHir(hir, ctx, r);
+    HirBuilder b2{"toy"};
+    HirNodeId const c1   = b2.makeTypeRef(anon);
+    HirNodeId const cb   = b2.makeBlock(std::vector<HirNodeId>{
+        b2.makeExprStmt(c1), b2.makeReturn()});
+    HirNodeId const cfn  = b2.makeFunction(sig, 1, {}, cb);
+    HirNodeId const croot = b2.makeModule(std::vector<HirNodeId>{cfn});
+    Hir ctlHir = std::move(b2).finish(croot);
+    DiagnosticReporter r2;
+    std::string const ctlText = emitHir(ctlHir, ctx, r2);
+    EXPECT_EQ(ctlText.find('"' + std::string{"long"}), std::string::npos)
+        << "an ANONYMOUS primitive must print with no tag at all:\n" << ctlText;
+    (void)only;
+}

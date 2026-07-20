@@ -28,6 +28,10 @@
 #include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
 #include "core/types/wide_string_encode.hpp"  // C 6.4.5: encodeWideString (wide/UTF code-unit count, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
+// D-LANG-TYPE-IDENTITY-VOCABULARY: the CROSS-descriptor identity invariant. The
+// per-file reader sees ONE descriptor and cannot know a sibling spells the same
+// tag differently; this CU-wide accumulator can, and fails loud.
+#include "ffi/shipped_type_consistency.hpp"
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
@@ -926,6 +930,23 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
     }
 }
 
+// D-LANG-TYPE-IDENTITY-VOCABULARY: the ONE seam every ENGINE-SYNTHESIZED
+// standard type mints through (`sizeof`/`_Alignof` → C's `size_t`; a
+// same-pointee `p - q` → `ptrdiff_t`). The language config declares WHICH
+// vocabulary entry serves the role under the active data model; the engine only
+// carries the resolved (core, tag) pair here — it never sees a name to compare,
+// so no site branches on a spelling. An UNDECLARED role falls back to
+// `historicCore` as an ANONYMOUS primitive, which is byte-for-byte what these
+// sites did before the block existed (and what every non-C schema still gets).
+[[nodiscard]] TypeId synthesizedType(TypeInterner& interner,
+                                     SynthesizedTypeRule const& rule,
+                                     DataModel dm, TypeKind historicCore) {
+    if (auto const r = rule.resolve(dm)) {
+        return interner.primitive(r->first, r->second);
+    }
+    return interner.primitive(historicCore);
+}
+
 // Fill `idx` from `cfg` (the owning schema's semantics). Interns the schema's
 // builtin types into the shared CU lattice (idempotent). Called once per
 // distinct schema in the CU (HR11).
@@ -991,9 +1012,13 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             continue;
         }
         // FC3 c1: the ACTIVE data model's override (if declared) wins —
-        // c-subset's `long` is I64 base / I32 under LLP64.
+        // c-subset's `long` is I64 base / I32 under LLP64. The vocabulary tag
+        // (loader-DERIVED from the matching typeSpecifiers row) supplies the
+        // IDENTITY, so the text-keyed path and the keyword path intern the
+        // SAME TypeId for `long` (D-LANG-TYPE-IDENTITY-VOCABULARY).
         idx.builtinTypeIds[bt.name] =
-            s.lattice.interner().primitive(bt.resolveCore(s.dataModel));
+            s.lattice.interner().primitive(bt.resolveCore(s.dataModel),
+                                           bt.vocabularyName);
     }
     for (auto const& lt : cfg.literalTypes) {
         // A string-literal row carries an ELEMENT core (Char) + a per-occurrence
@@ -1032,9 +1057,25 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
         // genuine Complex TypeId at EVERY type position (decl/param/member/cast/
         // sizeof funnel through this table). The element rode the same resolveCore
         // axis, so `long double _Complex`'s element is F80/F128/F64 for free.
-        TypeId const elemTy = s.lattice.interner().primitive(*resolved);
+        // D-LANG-TYPE-IDENTITY-VOCABULARY: identity comes from the row's
+        // VOCABULARY name, representation from the resolved core. The two axes
+        // are independent, so a target that gives `long` and `int` (LLP64) or
+        // `long double` and `double` (f64 axis) the same core still yields two
+        // DISTINCT TypeIds. A `complex` row's name rides its ELEMENT (the
+        // Complex wrapper is structural), which is exactly what keeps
+        // `long double _Complex` distinct from `double _Complex`.
+        TypeId const elemTy =
+            s.lattice.interner().primitive(*resolved, ts.name);
         idx.typeSpecifierSets[std::move(key)] =
             ts.complex ? s.lattice.interner().complex(elemTy) : elemTy;
+    }
+    // The C 6.3.1.1 conversion rank of each NAMED vocabulary entry — the
+    // usual-arithmetic-conversions tie-break for two operands that share a core
+    // but not an identity. Declared once per index build; the loader's cross-row
+    // consistency check guarantees every row spelling a name agrees on its rank.
+    for (auto const& ts : cfg.typeSpecifiers) {
+        if (ts.name.empty()) continue;
+        s.lattice.interner().declareVocabularyRank(ts.name, ts.rank);
     }
 }
 
@@ -6925,7 +6966,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                         s.dataModel, *magnitude);
                     switch (r.status) {
                         case IntegerLadderStatus::Typed:
-                            litTy = s.lattice.interner().primitive(r.kind);
+                            litTy = s.lattice.interner().primitive(r.kind,
+                                                                   r.vocabularyName);
                             break;
                         case IntegerLadderStatus::TooLarge:
                             fits = false;
@@ -7002,7 +7044,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                     s.reporter.report(std::move(d));
                     return;
                 }
-                litTy = s.lattice.interner().primitive(fk.kind);
+                litTy = s.lattice.interner().primitive(fk.kind, fk.vocabularyName);
             }
             // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
             // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
@@ -7469,12 +7511,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // castTypeRef child through the SAME type resolver casts use (so the HIR
         // lowering's `resolveStampedTypeBelow` recovers the SIZED type); the VALUE
         // form (`sizeof e`) leaves its operand typed normally. BOTH forms stamp the
-        // node `size_t` (U64) — the result type for enclosing checks. The operand
-        // is UNEVALUATED (C 6.5.3.4); only its type matters. NOTE: U64 is correct
-        // for LP64 + LLP64 (both 64-bit `size_t`); a future ILP32 target wants a
-        // 32-bit `size_t` here — track under D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-
-        // WIDTH (the FOLDED VALUE is already per-target-correct: the MIR layout
-        // engine reads `dataModel`; and `(int)sizeof(...)` is the idiom anyway).
+        // node `size_t` — the result type for enclosing checks. The operand is
+        // UNEVALUATED (C 6.5.3.4); only its type matters. D-LANG-TYPE-IDENTITY-
+        // VOCABULARY: `size_t` is C's NAMED alias (`unsigned long` on LP64,
+        // `unsigned long long` on LLP64), declared per data model in
+        // `semantics.synthesizedTypes` and resolved through `synthesizedType`. A
+        // bare anonymous U64 here matched NEITHER named entry, so
+        // `_Generic(sizeof(int), unsigned long: 1, unsigned long long: 2,
+        // default: 0)` silently took `default`. The core still comes from the
+        // TARGET (both current models make it 64-bit), so this also carries the
+        // ILP32 width for free once such a target exists.
         if (cfg.sizeofTypeRule.valid() && rule.v == cfg.sizeofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.sizeofTypeChild < kids.size()) {
@@ -7483,15 +7529,18 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.sizeofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
         // C11/C23 6.5.3.4: `_Alignof(T)` typing — an ADDITIVE mirror of the sizeof
         // TYPE arm. Resolves + stamps its castTypeRef child through the SAME type
         // resolver (so the HIR lowering's `resolveStampedTypeBelow` recovers the
-        // queried type) and stamps the node size_t (U64). Type-name form ONLY (no
-        // value arm — `_Alignof(expr)` is a constraint violation the binder
-        // rejects at type-resolve). U64 is correct for LP64 + LLP64; see the
-        // sizeof arm's note on a future ILP32 `size_t`.
+        // queried type) and stamps the node `size_t` (the SAME declared vocabulary
+        // entry the sizeof arm mints — C 6.5.3.4p5). Type-name form ONLY (no value
+        // arm — `_Alignof(expr)` is a constraint violation the binder rejects at
+        // type-resolve).
         if (cfg.alignofTypeRule.valid() && rule.v == cfg.alignofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.alignofTypeChild < kids.size()) {
@@ -7500,7 +7549,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (queried.valid()) s.nodeToType.set(typeNode, queried);
                 // queried invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.alignofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
         if (cfg.sizeofValueRule.valid() && rule.v == cfg.sizeofValueRule.v) {
             // c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): stamp the VALUE-form
@@ -7523,7 +7575,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
                 break;  // the single operand child
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.sizeofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
 
         // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
@@ -9317,16 +9372,20 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             }
             // c40 (D-CSUBSET-POINTER-SUBTRACTION): mirror cst_to_hir's
             // combineBinary — `p - q` (both Ptr<T>, same pointee) is ptrdiff_t
-            // (I64) so it passes as a numeric function ARGUMENT. This is the
+            // so it passes as a numeric function ARGUMENT. This is the
             // asymmetry the cycle fixes: a `long n = a - b;` init-check skips the
             // binary node (no error), but a call-arg's `isAssignable(I64param, …)`
-            // saw Ptr<T> → S_TypeMismatch; now it sees I64. Same-pointee only.
+            // saw Ptr<T> → S_TypeMismatch; now it sees the integer. Same-pointee
+            // only. D-LANG-TYPE-IDENTITY-VOCABULARY: `ptrdiff_t` is C's NAMED
+            // alias (`long` on LP64, `long long` on LLP64), declared per data
+            // model — a bare anonymous I64 matches NEITHER in a `_Generic`.
             if (*op == HirOpKind::Sub
                 && lt.valid() && rt.valid()
                 && interner.kind(lt) == TypeKind::Ptr
                 && interner.kind(rt) == TypeKind::Ptr
                 && interner.operands(lt)[0] == interner.operands(rt)[0]) {
-                return interner.primitive(TypeKind::I64);
+                return synthesizedType(interner, sem.pointerDifferenceType,
+                                       s.dataModel, TypeKind::I64);
             }
             // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
             // the commutative add form) is a POINTER, not the integer. `p + n`
@@ -9542,13 +9601,21 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         //    fallthrough would return the PRE-cast type — `sizeof((char)x)` would
         //    fold the wrong size. ──
         if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
-            result = interner.primitive(TypeKind::U64); return;        // size_t
+            // `size_t` — the SAME declared vocabulary entry Pass 2's sizeof arms
+            // stamp (D-LANG-TYPE-IDENTITY-VOCABULARY); a divergence here would
+            // give a Pass-1.5 `sizeof` a different TypeId than the same
+            // expression re-typed in Pass 2.
+            result = synthesizedType(interner, sem.sizeofResultType, s.dataModel,
+                                     TypeKind::U64);
+            return;
         }
-        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t (U64) — an ADDITIVE mirror of
-        // the sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
+        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t — an ADDITIVE mirror of the
+        // sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
         // read as its pre-alignof type).
         if (hirCfg.alignofRule.valid() && r.v == hirCfg.alignofRule.v) {
-            result = interner.primitive(TypeKind::U64); return;        // size_t
+            result = synthesizedType(interner, sem.alignofResultType, s.dataModel,
+                                     TypeKind::U64);
+            return;
         }
         // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule
         // whose Identifier child is a LABEL name, never typed as an expression).
@@ -10152,8 +10219,39 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // or malformed text (parseTypeFromText already reported the detail).
             TypeId fnTy = InvalidType;
             if (!bf.signatureText.empty()) {
-                fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
-                                         s.lattice.registry(), s.reporter);
+                // D-LANG-TYPE-IDENTITY-VOCABULARY: decode EVERY declared
+                // per-data-model override, not just the active one — a malformed
+                // override under an inactive model would otherwise lurk until
+                // that model is first compiled (the shipped-lib
+                // `signatureByDataModel` anti-lurking rule). The ACTIVE model's
+                // text, when declared, is the one that binds.
+                bool decodeFailed = false;
+                for (auto const& [dm, text] : bf.signatureTextByDataModel) {
+                    TypeId const t = parseTypeFromText(text, s.lattice.interner(),
+                                                       s.lattice.registry(),
+                                                       s.reporter);
+                    bool const bad =
+                        !t.valid()
+                        || s.lattice.interner().kind(t) != TypeKind::FnSig;
+                    if (bad) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::C_InvalidSemantics;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "builtin function '{}': 'signatureByDataModel.{}' must "
+                            "decode to a function type, got '{}'",
+                            bf.name, dataModelName(dm), text);
+                        s.reporter.report(std::move(d));
+                        decodeFailed = true;
+                        continue;
+                    }
+                    if (dm == s.dataModel) fnTy = t;
+                }
+                if (decodeFailed) continue;
+                if (!fnTy.valid()) {
+                    fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
+                                             s.lattice.registry(), s.reporter);
+                }
                 if (!fnTy.valid()
                  || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
                     ParseDiagnostic d;
@@ -10507,6 +10605,54 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // descriptor `struct stat` does NOT collide with the ordinary `stat`
         // function, so tag first-wins dedup uses its own set.
         std::unordered_set<std::string> injectedTags;
+
+        // ── D-LANG-TYPE-IDENTITY-VOCABULARY: the CROSS-DESCRIPTOR invariant ──
+        //
+        // Both dedup sets above are FIRST-WINS BY NAME, and only the winner gets
+        // a `compositeScopeByType` field scope. So two descriptors declaring one
+        // tag DIFFERENTLY (the `struct timeval` that `sys/time.json` spells
+        // `{i64 "long", i64 "long"}` and `sys/resource.json` once spelled
+        // `{i64, i64}`) intern TWO TypeIds, and whichever loses the race has
+        // UNREACHABLE members — an include-order-dependent `S000D`. The per-file
+        // reader structurally cannot catch it; this accumulator can, and does,
+        // BEFORE the first-wins skip silently swallows the divergence.
+        //
+        // The checker also verifies that every vocabulary tag a descriptor
+        // spells has the width THIS LANGUAGE gives that name under the active
+        // data model — a `i64 "long"` on LLP64 is a phantom pair no source
+        // spelling can produce. The vocabulary is handed over as opaque
+        // (name → core) rows resolved HERE from the active schemas' own
+        // `typeSpecifiers`; the checker never sees a spelling it can branch on.
+        //
+        // A name two schemas of a MIXED-language CU resolve DIFFERENTLY is
+        // dropped rather than guessed — the descriptor is neutral, so there is
+        // no single language to hold it to.
+        std::vector<std::pair<std::string, TypeKind>> vocabRows;
+        {
+            std::unordered_map<std::string, TypeKind> byName;
+            std::unordered_set<std::string>           ambiguous;
+            for (GrammarSchema const* sch : distinctSchemas) {
+                for (auto const& ts : sch->semantics().typeSpecifiers) {
+                    if (ts.name.empty()) continue;
+                    auto const core = ts.resolveCore(s.dataModel, s.longDoubleFormat);
+                    if (!core.has_value()) continue;   // unrealized on this axis
+                    auto const [it, fresh] = byName.try_emplace(ts.name, *core);
+                    if (!fresh && it->second != *core) ambiguous.insert(ts.name);
+                }
+            }
+            vocabRows.reserve(byName.size());
+            for (auto& [name, core] : byName) {
+                if (ambiguous.contains(name)) continue;
+                vocabRows.emplace_back(name, core);
+            }
+        }
+        std::vector<ffi::VocabularyCore> vocabulary;
+        vocabulary.reserve(vocabRows.size());
+        for (auto const& [name, core] : vocabRows) {
+            vocabulary.push_back(ffi::VocabularyCore{name, core});
+        }
+        ffi::ShippedTypeConsistency typeConsistency{s.lattice.interner(),
+                                                    vocabulary, s.activeFormat};
         for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
             std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
@@ -10574,6 +10720,16 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.reporter.report(std::move(d));
                 continue;   // unavailable for this target — inject nothing
             }
+
+            // D-LANG-TYPE-IDENTITY-VOCABULARY: cross-descriptor consistency, run
+            // AFTER the availability gate (a header that does not exist on this
+            // target contributes no declarations) and BEFORE injection (so the
+            // ROOT CAUSE is reported instead of the downstream member-access
+            // failure). Reports and CONTINUES: the error delta already aborts
+            // the pipeline, and injecting anyway keeps the historic first-wins
+            // behavior for every other name in the descriptor rather than
+            // cascading a wall of "undefined symbol".
+            (void)typeConsistency.add(desc->header, *desc, s.reporter);
 
             for (auto const& sym : desc->symbols) {
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.

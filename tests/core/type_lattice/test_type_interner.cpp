@@ -32,6 +32,116 @@ TEST(TypeInterner, PrimitivesCanonicalize) {
     EXPECT_EQ(f32a.arenaTag, 1u);          // carries owner-CU provenance
 }
 
+// D-LANG-TYPE-IDENTITY-VOCABULARY: a primitive's IDENTITY is (core, vocabulary
+// tag). Same core + different tags → different TypeIds; same tag → one TypeId.
+// `kind()` is UNCHANGED by the tag, which is what keeps every representation
+// consumer (rank tables, layout, ABI, codegen) unaffected BY CONSTRUCTION.
+TEST(TypeInterner, NamedPrimitivesAreDistinctAtOneRepresentation) {
+    auto ti = makeInterner(1);
+    const TypeId anon      = ti.primitive(TypeKind::I64);
+    const TypeId longT     = ti.primitive(TypeKind::I64, "long");
+    const TypeId longT2    = ti.primitive(TypeKind::I64, "long");
+    const TypeId longLong  = ti.primitive(TypeKind::I64, "long long");
+    EXPECT_EQ(longT.v, longT2.v)      << "one vocabulary entry → one TypeId";
+    EXPECT_NE(anon.v, longT.v);
+    EXPECT_NE(longT.v, longLong.v);
+    EXPECT_NE(anon.v, longLong.v);
+    EXPECT_EQ(ti.size(), 3u)          << "exactly three types, no accidental churn";
+    // Representation is identical on all three.
+    EXPECT_EQ(ti.kind(anon), TypeKind::I64);
+    EXPECT_EQ(ti.kind(longT), TypeKind::I64);
+    EXPECT_EQ(ti.kind(longLong), TypeKind::I64);
+    EXPECT_EQ(ti.vocabularyName(anon), "");
+    EXPECT_EQ(ti.vocabularyName(longT), "long");
+}
+
+// ★ The empty name MUST short-circuit to the literal `TypeNameId{}` sentinel.
+// `Interner<T>::intern("")` MINTS a real (non-zero) entry for the empty string,
+// so routing the anonymous case through it would give every anonymous primitive
+// a fresh name id — silently breaking dedup against the 1-arg overload. This pin
+// is RED the moment that short-circuit is removed.
+TEST(TypeInterner, EmptyVocabularyNameIsTheAnonymousPrimitive) {
+    auto ti = makeInterner(1);
+    const TypeId oneArg = ti.primitive(TypeKind::I32);
+    const TypeId empty  = ti.primitive(TypeKind::I32, "");
+    const TypeId sv     = ti.primitive(TypeKind::I32, std::string_view{});
+    EXPECT_EQ(oneArg.v, empty.v)
+        << "an EMPTY vocabulary name IS the anonymous primitive — it must NOT "
+           "mint a distinct type";
+    EXPECT_EQ(oneArg.v, sv.v);
+    EXPECT_EQ(ti.size(), 1u)
+        << "one type total: an empty name that interned a real name id would "
+           "make this 2 or 3";
+    // Order-independence: the named form first, then the anonymous one.
+    auto ti2 = makeInterner(1);
+    const TypeId named  = ti2.primitive(TypeKind::I32, "long");
+    const TypeId plain  = ti2.primitive(TypeKind::I32);
+    const TypeId plain2 = ti2.primitive(TypeKind::I32, "");
+    EXPECT_NE(named.v, plain.v);
+    EXPECT_EQ(plain.v, plain2.v);
+    EXPECT_EQ(ti2.size(), 2u);
+}
+
+// `sameRepresentation` is true iff two types agree on every content axis EXCEPT
+// the name — the predicate that lets a same-representation conversion RETAG
+// instead of emitting a Cast that would become a real MIR instruction.
+TEST(TypeInterner, SameRepresentationIgnoresOnlyTheVocabularyTag) {
+    auto ti = makeInterner(1);
+    const TypeId i64   = ti.primitive(TypeKind::I64);
+    const TypeId longT = ti.primitive(TypeKind::I64, "long");
+    const TypeId i32   = ti.primitive(TypeKind::I32);
+    const TypeId u64   = ti.primitive(TypeKind::U64);
+
+    EXPECT_TRUE(ti.sameRepresentation(i64, longT));
+    EXPECT_TRUE(ti.sameRepresentation(longT, i64));      // symmetric
+    EXPECT_TRUE(ti.sameRepresentation(longT, longT));    // reflexive
+    EXPECT_FALSE(ti.sameRepresentation(i64, i32))  << "a width difference IS a "
+                                                      "representation difference";
+    EXPECT_FALSE(ti.sameRepresentation(i64, u64))  << "so is signedness";
+    EXPECT_FALSE(ti.sameRepresentation(i64, InvalidType));
+    EXPECT_FALSE(ti.sameRepresentation(InvalidType, i64));
+
+    // Qualifier-TRANSPARENT: `volatile long` and `long` are the same
+    // representation (the qualifier is an access property, not a layout one).
+    EXPECT_TRUE(ti.sameRepresentation(ti.volatileQualified(longT), i64));
+    EXPECT_TRUE(ti.sameRepresentation(ti.atomicQualified(i64), longT));
+
+    // Structural axes still discriminate: operands and scalars are compared.
+    EXPECT_TRUE(ti.sameRepresentation(ti.pointer(longT), ti.pointer(longT)));
+    EXPECT_FALSE(ti.sameRepresentation(ti.pointer(longT), ti.pointer(i64)))
+        << "the OPERAND TypeIds differ — a `long *` and an `int64 *` are not the "
+           "same representation even though their pointees are";
+    EXPECT_FALSE(ti.sameRepresentation(ti.array(i64, 2), ti.array(i64, 3)));
+    EXPECT_FALSE(ti.sameRepresentation(ti.pointer(i64), ti.array(i64, 1)));
+}
+
+// Conversion RANK is opaque per-name config data the interner never interprets.
+TEST(TypeInterner, VocabularyRankIsPerNameAndDefaultsToZero) {
+    auto ti = makeInterner(1);
+    const TypeId anon     = ti.primitive(TypeKind::I64);
+    const TypeId longT    = ti.primitive(TypeKind::I64, "long");
+    const TypeId longLong = ti.primitive(TypeKind::I64, "long long");
+    EXPECT_EQ(ti.vocabularyRank(anon), 0);
+    EXPECT_EQ(ti.vocabularyRank(longT), 0)   << "undeclared ranks 0";
+
+    ti.declareVocabularyRank("long", 3);
+    ti.declareVocabularyRank("long long", 4);
+    EXPECT_EQ(ti.vocabularyRank(longT), 3);
+    EXPECT_EQ(ti.vocabularyRank(longLong), 4);
+    EXPECT_EQ(ti.vocabularyRank(anon), 0)
+        << "the anonymous representative always ranks BELOW every named entry "
+           "of its core";
+    EXPECT_EQ(ti.vocabularyRank(InvalidType), 0);
+    // Rank is read through a qualifier skin (a `volatile long` still ranks 3).
+    EXPECT_EQ(ti.vocabularyRank(ti.volatileQualified(longT)), 3);
+}
+
+TEST(TypeInternerDeathTest, DeclaringARankForTheAnonymousNameAborts) {
+    auto ti = makeInterner(1);
+    EXPECT_DEATH({ ti.declareVocabularyRank("", 1); },
+                 "anonymous .* vocabulary name has no rank");
+}
+
 TEST(TypeInterner, VectorOfF32x4InternsToOneTypeId) {
     auto ti = makeInterner(1);
     const TypeId f32 = ti.primitive(TypeKind::F32);
@@ -702,4 +812,66 @@ TEST(TypeInterner, VlaArrayIsDistinctSentinelAndDedups) {
     EXPECT_EQ(ti.size(), before);   // no growth on re-intern
     // A different element is a different VLA TypeId.
     EXPECT_NE(ti.vlaArray(ti.primitive(TypeKind::I64)), vla);
+}
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY + C 6.3.2.1p2: `TypeInterner::commonType` —
+// the block-less-language sibling of `usualArithmeticCommonType` — short-circuits
+// on `a == b`. That short-circuit used to `return a` VERBATIM for every float and
+// every ≥int integer rank, so `commonType(volatile double, volatile double)`
+// answered `volatile double`: the usual arithmetic conversions yield the
+// UNQUALIFIED type, and a qualifier CHANGE is precisely what the
+// same-representation re-tag refuses (i.e. a spurious Cast downstream). It also
+// bypassed the vocabulary rebuild, so the two paths through one function
+// disagreed about what a common type IS.
+//
+// RED-ON-DISABLE: restore `if (a == b) { … return a; }` for arithmetic kinds and
+// every `qualifierBits == 0` assertion below fails.
+TEST(TypeInterner, CommonTypeOfIdenticalOperandsDropsTheQualifierSkin) {
+    auto ti = makeInterner(1);
+    ti.declareVocabularyRank("long", 2);
+    ti.declareVocabularyRank("long double", 3);
+
+    // (a) Floats — the arm the `r < 0` half of the old short-circuit covered.
+    TypeId const dbl  = ti.primitive(TypeKind::F64);
+    TypeId const vdbl = ti.volatileQualified(dbl);
+    EXPECT_EQ(ti.commonType(vdbl, vdbl).v, dbl.v)
+        << "C 6.3.2.1p2: `volatile double + volatile double` is `double`";
+    EXPECT_EQ(ti.qualifierBits(ti.commonType(vdbl, vdbl)), 0);
+
+    // ... and the NAMED float keeps its identity while losing the skin.
+    TypeId const ld  = ti.primitive(TypeKind::F64, "long double");
+    TypeId const vld = ti.atomicQualified(ld);
+    EXPECT_EQ(ti.commonType(vld, vld).v, ld.v)
+        << "identity survives the rebuild; only the qualifier is dropped";
+
+    // (b) Integers at rank >= int — the `r >= 3` half.
+    TypeId const i64  = ti.primitive(TypeKind::I64);
+    TypeId const vi64 = ti.volatileQualified(i64);
+    EXPECT_EQ(ti.commonType(vi64, vi64).v, i64.v);
+    TypeId const lng  = ti.primitive(TypeKind::I64, "long");
+    TypeId const vlng = ti.volatileQualified(lng);
+    EXPECT_EQ(ti.commonType(vlng, vlng).v, lng.v)
+        << "`volatile long + volatile long` is the bare `long` entry";
+
+    // (c) The UNQUALIFIED identical pair is byte-identical to before — the
+    // rebuild must be a no-op there or every existing caller shifts.
+    EXPECT_EQ(ti.commonType(dbl, dbl).v, dbl.v);
+    EXPECT_EQ(ti.commonType(i64, i64).v, i64.v);
+    EXPECT_EQ(ti.commonType(lng, lng).v, lng.v);
+    // ... including the sub-int promotion path the short-circuit never covered.
+    TypeId const u16 = ti.primitive(TypeKind::U16);
+    EXPECT_EQ(ti.kind(ti.commonType(u16, u16)), TypeKind::I32)
+        << "C99 6.3.1.8: `u16 + u16` still promotes to int";
+
+    // (d) A NON-ARITHMETIC identical pair still returns the operand verbatim —
+    // there is no common-type rule to apply, and rebuilding one as a primitive
+    // would be nonsense.
+    TypeId const ptr = ti.pointer(i64);
+    EXPECT_EQ(ti.commonType(ptr, ptr).v, ptr.v);
+    TypeId const st = ti.structType("S", std::array<TypeId, 1>{i64});
+    EXPECT_EQ(ti.commonType(st, st).v, st.v);
+    TypeId const vptr = ti.volatileQualified(ptr);
+    EXPECT_EQ(ti.commonType(vptr, vptr).v, vptr.v)
+        << "a qualified POINTER pair is untouched — only arithmetic operands "
+           "are subject to the usual arithmetic conversions";
 }

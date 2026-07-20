@@ -668,14 +668,31 @@ namespace detail::type_rules {
         if (w == 0) return InvalidType;   // non-integer other operand
         return n > w ? bit : (aBit ? b : a);
     }
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: equal WIDTH rank no longer implies equal
+    // TYPE — `long`/`int` (LLP64), `long`/`long long` (LP64) and `long
+    // double`/`double` (f64 axis) each share a core. The declared conversion rank
+    // (C 6.3.1.1, keyed on the type NAME) breaks the tie; an unnamed operand
+    // ranks 0, so equal ranks keep the historic "return a" verbatim.
+    auto const byVocabularyRank = [&](TypeId x, TypeId y) noexcept {
+        return interner.vocabularyRank(y) > interner.vocabularyRank(x) ? y : x;
+    };
     if (signedIntRank(ak) != 0 && signedIntRank(bk) != 0) {
-        return signedIntRank(ak) >= signedIntRank(bk) ? a : b;
+        if (signedIntRank(ak) != signedIntRank(bk)) {
+            return signedIntRank(ak) > signedIntRank(bk) ? a : b;
+        }
+        return byVocabularyRank(a, b);
     }
     if (unsignedIntRank(ak) != 0 && unsignedIntRank(bk) != 0) {
-        return unsignedIntRank(ak) >= unsignedIntRank(bk) ? a : b;
+        if (unsignedIntRank(ak) != unsignedIntRank(bk)) {
+            return unsignedIntRank(ak) > unsignedIntRank(bk) ? a : b;
+        }
+        return byVocabularyRank(a, b);
     }
     if (floatRank(ak) != 0 && floatRank(bk) != 0) {
-        return floatRank(ak) >= floatRank(bk) ? a : b;
+        if (floatRank(ak) != floatRank(bk)) {
+            return floatRank(ak) > floatRank(bk) ? a : b;
+        }
+        return byVocabularyRank(a, b);
     }
     return InvalidType;
 }
@@ -886,6 +903,28 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
         }
         return false;
     };
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: rebuild a BARE primitive of `winner`,
+    // taking the vocabulary IDENTITY from whichever of the two candidates already
+    // carries that kind — the higher-RANKED one when both do (C 6.3.1.1 defines
+    // rank by type NAME: `long long` > `long` > `int`, `long double` > `double`,
+    // NOT by width). Shared by `pick` below and the `_Complex` element selection,
+    // which needs the identical treatment one level down.
+    auto const pickFrom = [&](TypeKind winner, TypeId x, TypeKind kx,
+                              TypeId y, TypeKind ky) -> TypeId {
+        bool const xHas = (kx == winner);
+        bool const yHas = (ky == winner);
+        std::string_view name{};
+        if (xHas && yHas) {
+            name = interner.vocabularyRank(y) > interner.vocabularyRank(x)
+                       ? interner.vocabularyName(y)
+                       : interner.vocabularyName(x);
+        } else if (xHas) {
+            name = interner.vocabularyName(x);
+        } else if (yHas) {
+            name = interner.vocabularyName(y);
+        }
+        return interner.primitive(winner, name);
+    };
     // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.8): if EITHER operand is complex, the
     // result is complex over the WIDER float element. A real operand contributes its
     // own float rank as the element (`complex(F32) + double` → `complex(F64)`); a real
@@ -895,21 +934,66 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
     if (ka == TypeKind::Complex || kb == TypeKind::Complex) {
         TypeId const ea = ka == TypeKind::Complex ? interner.complexElement(a) : a;
         TypeId const eb = kb == TypeKind::Complex ? interner.complexElement(b) : b;
-        int const rea = floatRank(interner.kind(ea));
-        int const reb = floatRank(interner.kind(eb));
-        TypeId elem;
-        if (rea != 0 && reb != 0) elem = rea >= reb ? ea : eb;
-        else if (rea != 0)        elem = ea;   // e.g. complex(F64) + int → element F64
-        else if (reb != 0)        elem = eb;
+        TypeKind const kea = interner.kind(ea);
+        TypeKind const keb = interner.kind(eb);
+        int const rea = floatRank(kea);
+        int const reb = floatRank(keb);
+        TypeKind elemKind;
+        if (rea != 0 && reb != 0) elemKind = rea >= reb ? kea : keb;
+        else if (rea != 0)        elemKind = kea;  // complex(F64) + int → element F64
+        else if (reb != 0)        elemKind = keb;
         else                      return InvalidType;   // neither element is a float
-        return interner.complex(elem);
+        // The element goes through `pickFrom` for the SAME two reasons the real
+        // float branch below does — and this arm ran BEFORE it, so it kept both
+        // defects after that one was fixed:
+        //   (a) C 6.3.2.1p2 — the element was taken VERBATIM, so a
+        //       `volatile`/`_Atomic` skin on the real operand rode into it
+        //       (`volatileDouble + complexF64` → `Complex<volatile f64>`), and a
+        //       qualifier change is exactly what the same-representation re-tag
+        //       refuses, i.e. a spurious Bitcast downstream;
+        //   (b) an EQUAL float rank cannot separate two vocabulary entries that
+        //       share a core, so `_Complex long double` + `double` on an f64 axis
+        //       needs the declared-RANK tie-break to keep the `long double`
+        //       element instead of silently demoting to `_Complex double`.
+        return interner.complex(pickFrom(elemKind, ea, kea, eb, keb));
     }
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the common type's KIND is whatever the
+    // width/signedness rules below compute; its IDENTITY is the vocabulary entry
+    // of whichever operand ALREADY carries that kind — the higher-RANKED one when
+    // both do (C 6.3.1.1 defines rank by type NAME: `long long` > `long` > `int`,
+    // NOT by width). Re-synthesizing the anonymous primitive would silently drop
+    // the name, so `someLong + someLongLong` on LP64 would stop being `long long`
+    // — the identity-from-representation defect one tier up. An operand whose kind
+    // CHANGED under integer promotion never contributes its name (a promoted
+    // `char` IS the anonymous `int`). Rebuilt as a bare `primitive(kind, name)`
+    // rather than returned verbatim so a qualifier skin cannot ride along
+    // (C 6.3.2.1p2: an lvalue conversion yields the UNQUALIFIED type). Reduces to
+    // today's `primitive(kind)` exactly whenever no operand is named.
+    auto const pick = [&](TypeKind winner) -> TypeId {
+        return pickFrom(winner, a, ka, b, kb);
+    };
     int const fa = floatRank(ka);
     int const fb = floatRank(kb);
     if (fa != 0 || fb != 0) {
         if (!isArith(ka) || !isArith(kb)) return InvalidType;
-        if (fa != 0 && fb != 0) return fa >= fb ? a : b;
-        return fa != 0 ? a : b;
+        // The winning REPRESENTATION is the wider float (or the only float, when
+        // the other operand is an integer); `pick` then supplies the IDENTITY —
+        // the vocabulary entry of whichever operand ALREADY has that kind, the
+        // higher-ranked one when both do (`long double` vs `double` on an f64
+        // axis, where `floatRank` alone cannot separate them because they share
+        // a core).
+        //
+        // Routed through `pick` — NOT returned verbatim — for exactly the C
+        // 6.3.2.1p2 reason the integer branch below is: the usual arithmetic
+        // conversions yield the UNQUALIFIED type. Returning the winning operand
+        // WHOLE let a `volatile`/`_Atomic` SKIN ride into the common type, and a
+        // qualifier CHANGE is the one thing `coerce`'s same-representation
+        // re-tag deliberately refuses — so `d + vld` (a `volatile long double`
+        // on an f64 axis) materialized a synthetic Cast, which HIR→MIR lowers to
+        // a REAL `Bitcast` instruction. `pick` rebuilds a bare primitive, so the
+        // skin is dropped exactly as it always has been on the integer side.
+        if (fa != 0 && fb != 0) return pick(fa >= fb ? ka : kb);
+        return pick(fa != 0 ? ka : kb);
     }
     // C23 6.3.1.8 (D-CSUBSET-BITINT): bit-precise integers in the usual arithmetic
     // conversions (reached only for a NON-float pair — a BitInt-vs-float returned
@@ -938,18 +1022,18 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
         TypeKind const pStd = promoteIntegerKind(stdK, rules);
         int      const w    = intKindBits(pStd);
         if (w == 0) return InvalidType;   // the other operand is not an integer
-        return n > w ? bit : interner.primitive(pStd);
+        return n > w ? bit : pick(pStd);
     }
     TypeKind const pa = promoteIntegerKind(ka, rules);
     TypeKind const pb = promoteIntegerKind(kb, rules);
     int const ra = intWidthRank(pa);
     int const rb = intWidthRank(pb);
     if (ra == 0 || rb == 0) return InvalidType;   // not arithmetic
-    if (pa == pb) return interner.primitive(pa);
+    if (pa == pb) return pick(pa);
     bool const sa = signedIntRank(pa) != 0;
     bool const sb = signedIntRank(pb) != 0;
     if (sa == sb) {
-        return interner.primitive(kindAtRank(ra >= rb ? ra : rb, sa));
+        return pick(kindAtRank(ra >= rb ? ra : rb, sa));
     }
     // Mixed signedness — closed verb (loader rejects unknown spellings,
     // so this switch is exhaustive over the declared vocabulary).
@@ -958,9 +1042,9 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
             int const  uRank = sa ? rb : ra;
             int const  sRank = sa ? ra : rb;
             if (uRank >= sRank) {
-                return interner.primitive(kindAtRank(uRank, /*isSigned=*/false));
+                return pick(kindAtRank(uRank, /*isSigned=*/false));
             }
-            return interner.primitive(kindAtRank(sRank, /*isSigned=*/true));
+            return pick(kindAtRank(sRank, /*isSigned=*/true));
         }
     }
     return InvalidType;

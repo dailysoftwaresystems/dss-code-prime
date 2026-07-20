@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -48,6 +49,29 @@ namespace {
     auto cu = buildShippedUnit("c-subset", {std::move(src)});
     assertNoBuilderErrors(*cu);
     return analyze(cu, dm);
+}
+
+// The SOURCE TEXT of each `_Generic`'s SELECTED result expression, in source
+// order — the DIRECT observation of which association won. Strictly stronger
+// than watching a downstream type: two associations can coincide in result width
+// (and DSS still types the selection from its CONTROLLING expression today —
+// D-CSUBSET-GENERIC-RESULT-TYPE-DEDUCTION), so a type-based check can be green
+// for the wrong arm.
+[[nodiscard]] std::vector<std::string> selectedGenericArms(SemanticModel const& m) {
+    std::vector<std::string> out;
+    for (auto const& tree : m.unit().trees()) {
+        RuleId const gid = tree.schema().rules().find("genericExpr");
+        if (!gid.valid()) continue;
+        for (std::uint32_t i = 1; i < tree.nodeCount(); ++i) {
+            NodeId const node{i};
+            if (tree.kind(node) != NodeKind::Internal) continue;
+            if (tree.rule(node).v != gid.v) continue;
+            NodeId const sel = m.selectedGenericExpr(node);
+            out.push_back(sel.valid() ? std::string{tree.text(sel)}
+                                      : std::string{"<none>"});
+        }
+    }
+    return out;
 }
 
 // The TypeKind of the named symbol (test fails when absent/untyped).
@@ -796,20 +820,24 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
     fs::remove(tmp);
 }
 
-// ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 4-way _Generic routing ──
-// The generic `stdc_<op>(x)` macro (shippedLibs/stdbit.json) expands to a 4-WAY
-// _Generic over {unsigned char, unsigned short, unsigned int, unsigned long long}
-// — `unsigned long` is DROPPED (audit C1): DSS interns it to a width-core TypeId
-// that would COLLIDE with `_ui` (LLP64) / `_ull` (LP64) in a 5-way → an
-// S_GenericSelectionAmbiguous. The 4-way is unambiguous on BOTH data models AND
-// routes an `unsigned long` operand correctly by the SAME width-collapse
-// (pe/LLP64: U32 → the `unsigned int` arm; elf+macho/LP64: U64 → the `unsigned
-// long long` arm). These pins lock that in on both models — the exact source the
-// macro produces (built here, since the semantic harness does not run #include).
+// ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 5-way _Generic routing ──
+// The generic `stdc_<op>(x)` macro (shippedLibs/stdbit.json) expands to a 5-WAY
+// _Generic over {unsigned char, unsigned short, unsigned int, unsigned long,
+// unsigned long long} — the full C23 §7.18 association set. It was a 4-way with
+// `unsigned long` DROPPED until D-LANG-TYPE-IDENTITY-VOCABULARY: identity was
+// derived from REPRESENTATION, so `unsigned long` interned to the same TypeId as
+// `unsigned int` (LLP64) / `unsigned long long` (LP64) and a 5-way was
+// S_GenericSelectionAmbiguous. Identity now comes from the language vocabulary
+// entry, so all five are distinct types on BOTH data models. These pins lock that
+// in — the exact source the macro produces (built here, since the semantic
+// harness does not run #include).
 
-// The 4-way _Generic text for `op` over operand expression `arg`.
-[[nodiscard]] static std::string stdbitGeneric4Way(std::string const& op,
-                                                   std::string const& arg) {
+// The 5-way _Generic text for `op` over operand expression `arg`. The
+// `unsigned long` arm routes to the width the ACTIVE data model gives it, which
+// is what the shipped per-format `stdc_<op>_ul` variant macro resolves to.
+[[nodiscard]] static std::string stdbitGeneric5Way(std::string const& op,
+                                                   std::string const& arg,
+                                                   DataModel dm) {
     auto call = [&](char const* w) {
         return "__builtin_stdc_" + op + "_" + w + "(" + arg + ")";
     };
@@ -817,46 +845,87 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
            "unsigned char: "      + call("uc")  + ", "
            "unsigned short: "     + call("us")  + ", "
            "unsigned int: "       + call("ui")  + ", "
+           "unsigned long: "      + call(dm == DataModel::Llp64 ? "ui" : "ull") + ", "
            "unsigned long long: " + call("ull") + ")";
 }
 
-// The 4-way over uc/us/ui/UL/ull compiles with NO ambiguity + NO no-match (the C1
-// regression guard — `unsigned long` collapses onto exactly one distinct arm).
-static void expectStdbit4WayCleanUnder(DataModel dm) {
+// All five associations compile with NO ambiguity + NO no-match on both models —
+// the red-on-disable guard for the identity split (collapse `unsigned long` back
+// onto a width core and this goes S_GenericSelectionAmbiguous again).
+static void expectStdbit5WayCleanUnder(DataModel dm) {
     std::string const src =
         "unsigned f(unsigned char a, unsigned short b, unsigned int c,\n"
         "           unsigned long d, unsigned long long e){\n"
-        "  return " + stdbitGeneric4Way("count_ones", "a")
-              + "\n       + " + stdbitGeneric4Way("count_ones", "b")
-              + "\n       + " + stdbitGeneric4Way("count_ones", "c")
-              + "\n       + " + stdbitGeneric4Way("count_ones", "d")
-              + "\n       + " + stdbitGeneric4Way("count_ones", "e") + ";\n}\n";
+        "  return " + stdbitGeneric5Way("count_ones", "a", dm)
+              + "\n       + " + stdbitGeneric5Way("count_ones", "b", dm)
+              + "\n       + " + stdbitGeneric5Way("count_ones", "c", dm)
+              + "\n       + " + stdbitGeneric5Way("count_ones", "d", dm)
+              + "\n       + " + stdbitGeneric5Way("count_ones", "e", dm) + ";\n}\n";
     auto m = analyzeCSubset(src, dm);
-    EXPECT_FALSE(m.hasErrors()) << "the 4-way _Generic must compile clean";
+    EXPECT_FALSE(m.hasErrors()) << "the 5-way _Generic must compile clean";
     EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_GenericSelectionAmbiguous), 0u)
-        << "the 4-way (unsigned long DROPPED) must NOT be ambiguous";
+        << "all five unsigned vocabulary entries are DISTINCT types — never ambiguous";
     EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_GenericSelectionNoMatch), 0u)
-        << "every unsigned width (incl. unsigned long via width-collapse) matches an arm";
+        << "every unsigned width matches exactly one association";
 }
 
-TEST(Fc3Stdbit, GenericFourWayNoAmbiguityLp64)  { expectStdbit4WayCleanUnder(DataModel::Lp64); }
-TEST(Fc3Stdbit, GenericFourWayNoAmbiguityLlp64) { expectStdbit4WayCleanUnder(DataModel::Llp64); }
+TEST(Fc3Stdbit, GenericFiveWayNoAmbiguityLp64)  { expectStdbit5WayCleanUnder(DataModel::Lp64); }
+TEST(Fc3Stdbit, GenericFiveWayNoAmbiguityLlp64) { expectStdbit5WayCleanUnder(DataModel::Llp64); }
 
-// Positive routing of an `unsigned long` operand through the 4-way, observed via
-// bit_floor (whose result type = the SELECTED arm's width) into an `auto` local —
-// promotion-immune here since both candidate widths (U32/U64) are ≥ int. LP64:
-// unsigned long is 64-bit → the `unsigned long long` arm → U64. LLP64: 32-bit →
-// the `unsigned int` arm → U32. A mis-route or a reintroduced ambiguity changes r.
+// Positive routing of an `unsigned long` operand through the 5-way: it takes its
+// OWN `unsigned long:` association rather than width-collapsing onto a neighbour.
+//
+// ★ WHY THE WINNER IS OBSERVED DIRECTLY. The earlier form of this pin read
+// `kindOf(r)` off an `auto r = _Generic(...)`, which is NOT evidence of arm
+// selection for TWO independent reasons:
+//   * the `unsigned long:` arm DELIBERATELY calls the same builtin as its
+//     same-width neighbour (that is the whole point — the shipped `stdc_<op>_ul`
+//     variant resolves to the model's width), so the RESULT WIDTH is identical
+//     whether `unsigned long:` or that neighbour won; and
+//   * DSS types a generic selection from its CONTROLLING expression today, not
+//     from the selected association (D-CSUBSET-GENERIC-RESULT-TYPE-DEDUCTION), so
+//     `kindOf(r)` was reporting `x`'s own width regardless of the outcome.
+// `SemanticModel::selectedGenericExpr` names the winning association's expression
+// node outright — the only observation that cannot be faked by a coincidence of
+// widths. The two same-builtin arms are made textually distinguishable by an
+// extra pair of parentheses around the argument, which changes neither the callee
+// nor the operand type.
 TEST(Fc3Stdbit, GenericUnsignedLongRoutesByDataModel) {
-    std::string const src =
-        "unsigned long f(unsigned long x){ auto r = "
-        + stdbitGeneric4Way("bit_floor", "x") + "; return r; }\n";
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
-    ASSERT_FALSE(lp.hasErrors());
-    EXPECT_EQ(kindOf(lp, "r"), TypeKind::U64)
-        << "LP64: unsigned long (64-bit) → the unsigned long long arm → U64";
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
-    ASSERT_FALSE(llp.hasErrors());
-    EXPECT_EQ(kindOf(llp, "r"), TypeKind::U32)
-        << "LLP64: unsigned long (32-bit) → the unsigned int arm → U32";
+    // The 5-way with the `unsigned long` arm and its same-width neighbour calling
+    // the SAME builtin, spelled differently so the winner is readable.
+    auto const srcFor = [](DataModel dm) {
+        auto call = [](char const* w, char const* arg) {
+            return "__builtin_stdc_bit_floor_" + std::string{w} + "(" + arg + ")";
+        };
+        bool const llp = (dm == DataModel::Llp64);
+        std::string const gen =
+            std::string{"_Generic((x), "}
+            + "unsigned char: "      + call("uc", "x")  + ", "
+            + "unsigned short: "     + call("us", "x")  + ", "
+            // The neighbour that SHARES the model's `unsigned long` width spells
+            // its argument `(x)`; the `unsigned long` arm spells it `x`.
+            + "unsigned int: "       + call("ui",  llp ? "(x)" : "x")  + ", "
+            + "unsigned long: "      + call(llp ? "ui" : "ull", "x") + ", "
+            + "unsigned long long: " + call("ull", llp ? "x" : "(x)") + ")";
+        return "unsigned long f(unsigned long x){ auto r = " + gen
+             + "; return r; }\n";
+    };
+    for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
+        SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
+        auto m = analyzeCSubset(srcFor(dm), dm);
+        ASSERT_FALSE(m.hasErrors());
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+        // The `unsigned long` arm is the ONLY one spelling its argument bare `x`
+        // at the model's own width, so its text pins the selection exactly.
+        std::string const want =
+            std::string{"__builtin_stdc_bit_floor_"}
+            + (dm == DataModel::Llp64 ? "ui" : "ull") + "(x)";
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{want}))
+            << "an `unsigned long` operand must select the `unsigned long:` "
+               "association — not the same-width neighbour it collapsed onto "
+               "before identity was split off representation";
+    }
 }

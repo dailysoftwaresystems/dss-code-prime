@@ -373,6 +373,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedMacroVariantAmbiguous";
         case DiagnosticCode::F_FfiResolveLibrarySymbolAbsent:
             return "F_FfiResolveLibrarySymbolAbsent";
+        case DiagnosticCode::F_ShippedTypeIdentityConflict:
+            return "F_ShippedTypeIdentityConflict";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

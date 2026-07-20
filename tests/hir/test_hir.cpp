@@ -1,6 +1,7 @@
 // HR1: the frozen Hir module + HirBuilder — bottom-up build, child-pool layout,
 // parent back-patching, cross-module guard, and HirAttribute side-tables.
 
+#include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_node.hpp"
 
@@ -245,4 +246,97 @@ TEST(HirAttributeDeathTest, CrossModuleAborts) {
     EXPECT_DEATH({ (void)notesB.has(nA); },
                  "dss::HirAttribute fatal: HirAttribute bound to HirModuleId=12 got "
                  "HirNodeId from HirModuleId=11");
+}
+
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: `HirBuilder::retagType` ────────────────
+//
+// The ONE sanctioned in-place mutation of the builder's otherwise read-only
+// arena, and the ONLY new `std::abort()` in the tree. Its safety argument is
+// entirely mechanical — same representation, same qualifier mask, arithmetic
+// core, still unparented — so every clause is CHECKED rather than trusted to a
+// caller's comment. These pin all five abort clauses (the `TypeInternerDeathTest`
+// precedent) plus the happy path, because an unchecked clause is a silent
+// miscompile: a retag across representations changes layout/codegen, and a retag
+// of an ATTACHED node aliases a decision a parent already baked.
+
+TEST(HirBuilder, RetagTypeRewritesIdentityInPlace) {
+    dss::TypeInterner in{dss::CompilationUnitId{1}};
+    dss::TypeId const anonI32 = in.primitive(dss::TypeKind::I32);
+    dss::TypeId const longI32 = in.primitive(dss::TypeKind::I32, "long");
+    ASSERT_NE(anonI32.v, longI32.v);
+    ASSERT_TRUE(in.sameRepresentation(anonI32, longI32));
+
+    HirBuilder b{"x"};
+    HirNodeId const lit = b.addLeaf(HirKind::Literal, anonI32, /*payload=*/0);
+    EXPECT_EQ(b.typeId(lit).v, anonI32.v);
+    b.retagType(lit, longI32, in);
+    EXPECT_EQ(b.typeId(lit).v, longI32.v)
+        << "the node now carries the NAMED identity at the SAME representation "
+           "— zero new nodes, which is the whole point (a Cast here would lower "
+           "to a real Bitcast that did not exist before the identity split)";
+    EXPECT_EQ(b.size(), 2u) << "no node was minted";
+    // Idempotent + reversible while still unparented.
+    b.retagType(lit, anonI32, in);
+    EXPECT_EQ(b.typeId(lit).v, anonI32.v);
+}
+
+TEST(HirDeathTest, RetagTypeAcrossRepresentationsAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({
+        dss::TypeInterner in{dss::CompilationUnitId{1}};
+        HirBuilder b{"x"};
+        HirNodeId const n = b.addLeaf(HirKind::Literal,
+                                      in.primitive(dss::TypeKind::I32));
+        b.retagType(n, in.primitive(dss::TypeKind::I64), in);
+    }, "DIFFERENT representations");
+}
+
+TEST(HirDeathTest, RetagTypeAcrossQualifierMasksAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({
+        dss::TypeInterner in{dss::CompilationUnitId{1}};
+        dss::TypeId const lng = in.primitive(dss::TypeKind::I32, "long");
+        HirBuilder b{"x"};
+        HirNodeId const n = b.addLeaf(HirKind::Literal, in.volatileQualified(lng));
+        // Same representation, but the volatile skin would be silently dropped —
+        // demoting a volatile access to a plain Load.
+        b.retagType(n, lng, in);
+    }, "qualifier masks differ");
+}
+
+TEST(HirDeathTest, RetagTypeOfANonArithmeticTypeAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({
+        dss::TypeInterner in{dss::CompilationUnitId{1}};
+        dss::TypeId const p = in.pointer(in.primitive(dss::TypeKind::I32));
+        HirBuilder b{"x"};
+        HirNodeId const n = b.addLeaf(HirKind::Literal, p);
+        b.retagType(n, p, in);   // same type, but a POINTER — out of scope
+    }, "not an arithmetic-core primitive");
+}
+
+TEST(HirDeathTest, RetagTypeOfAnAttachedNodeAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({
+        dss::TypeInterner in{dss::CompilationUnitId{1}};
+        dss::TypeId const anon = in.primitive(dss::TypeKind::I32);
+        dss::TypeId const lng  = in.primitive(dss::TypeKind::I32, "long");
+        HirBuilder b{"x"};
+        HirNodeId const child = b.addLeaf(HirKind::Literal, anon);
+        (void)b.addParent(HirKind::Block, std::array{child});
+        // The ONLY structural reason the aliasing is safe is that the node is
+        // freshly minted and unparented; once attached, a parent may already
+        // have baked a decision on the old tag.
+        b.retagType(child, lng, in);
+    }, "already ATTACHED");
+}
+
+TEST(HirDeathTest, RetagTypeWithAnInvalidTypeAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({
+        dss::TypeInterner in{dss::CompilationUnitId{1}};
+        HirBuilder b{"x"};
+        HirNodeId const n = b.addLeaf(HirKind::Literal, dss::InvalidType);
+        b.retagType(n, in.primitive(dss::TypeKind::I32), in);
+    }, "one of the types is invalid");
 }

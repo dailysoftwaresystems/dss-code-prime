@@ -73,7 +73,7 @@ target's object format picks the runtime image from the map at resolution time.
 | `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. |
 | `symbols`   | no\*     | The exported LINK surface (extern functions/objects). Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`. |
 | `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like / float / string macro is out of scope (not a constant). |
-| `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, `type` (any hir-text type). Injected as a type-position name. A builtin type of the same name wins. |
+| `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, and EITHER a flat `type` (any hir-text type) OR per-target `variants` (`when` + `type`). Injected as a type-position name. A builtin type of the same name wins. |
 
 \* A descriptor must declare **at least one** of `symbols` / `constants` /
 `typedefs` (a descriptor that declares nothing **fails loud**). A header may
@@ -117,6 +117,76 @@ neutral `long` will resolve to i32 on Windows and i64 on Unix automatically; the
 test `ShippedLibDescriptor.ShippedStdlibSignaturesAreLp64` guards the current
 form. Every other symbol uses fixed-width or model-invariant types
 (`int`, `double`, `size_t`, pointers) and is width-identical everywhere.
+
+---
+
+## Type IDENTITY — the vocabulary tag and the `dataModel` selector
+
+A DSS primitive interns on **(representation, vocabulary name)**. The name comes
+from the LANGUAGE config (`typeSpecifiers[].name`), the representation from the
+TARGET. `long`, `unsigned long`, `long long`, `unsigned long long` and
+`long double` are NAMED entries; `int`, `short`, `unsigned`, `float`, `double`,
+`char`, `bool` are deliberately ANONYMOUS (they must stay the anonymous
+representative of their core, because integer promotion and enum-underlying
+synthesis independently re-mint them).
+
+That makes a bare core in a descriptor a **third thing**: `ptr<u32>` is a
+pointer to the ANONYMOUS 32-bit unsigned, which matches neither `unsigned long*`
+nor `unsigned int*`… it matches only itself. So **any descriptor type a user
+would spell with a NAMED vocabulary entry must carry the hir-text tag**:
+
+```jsonc
+{ "name": "LPDWORD", "type": "ptr<u32 \"unsigned long\">" }   // Win32 DWORD* IS unsigned long*
+{ "name": "ssize_t", "type": "i64 \"long\"" }                 // POSIX ssize_t IS long
+```
+
+Where the width genuinely denotes the anonymous representative (`int`,
+`unsigned`, `short`, `BOOL`, `WORD`, `mode_t`, …) the type stays **untagged** —
+tagging it would be the same lie in the other direction.
+
+When the correct NAME is **data-model-dependent** — C's `size_t` IS
+`unsigned long` on LP64 and `unsigned long long` on LLP64, `ptrdiff_t` IS `long`
+/ `long long`, and every `<stdint.h>` 64-bit alias follows — a fixed tag cannot
+express it. `when` therefore carries a third selector axis alongside
+`arch`/`format`:
+
+```jsonc
+{ "name": "size_t", "variants": [
+    { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+    { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" } ] }
+```
+
+The contract is the same MATCH-ALL-SPECIFIED / exactly-one-match rule the other
+axes use, and the value is validated against the closed data-model vocabulary
+(`LP64`/`LLP64`/`ILP32`) so a typo **fails loud** instead of silently never
+matching. Keys compose: `{ "format": "macho", "dataModel": "LP64" }`.
+
+### Two ENFORCED rules — `F_ShippedTypeIdentityConflict`
+
+Descriptors are authored independently but intern into ONE lattice, and both
+injection paths are **first-wins by name**. Two rules are therefore
+machine-checked (`ffi::ShippedTypeConsistency`, run by the semantic phase just
+before injection, plus the exhaustive `tests/ffi/test_shipped_type_consistency.cpp`
+sweep over every descriptor × every shipped target):
+
+1. **One name, one type.** Every declaration of a struct/union **tag** — a
+   `structs` entry, an INLINE `struct "N" {…}` inside another type's text, or a
+   repeat in a *second descriptor* — must resolve to a byte-identical type for a
+   given target. Same for a **typedef** name. Only the first-injected tag gets a
+   field scope, so a divergent second declaration interns a *second* type whose
+   members are unreachable — an **include-order-dependent** `S000D member access
+   requires a composite-typed operand`. This is exactly how `struct timeval`
+   broke when `sys/time.json` was retagged and its `sys/resource.json` twin (both
+   the `structs` entry AND the two inline `struct "timeval" {…}` field texts) was
+   not.
+
+2. **A tag must be producible on every target the descriptor ships on.** A
+   vocabulary name's WIDTH belongs to the data model, so a FLAT tag is only legal
+   when every format in `availableObjectFormats` shares one model. `i64 "long"`
+   on a descriptor that also ships on `pe` is a **phantom** — LLP64 mints `long`
+   as I32, so that pair matches no `_Generic` association and no pointer of that
+   spelling. Give the entry per-format / per-`dataModel` `variants` instead (as
+   `off_t` and `ssize_t` do).
 
 ---
 

@@ -315,6 +315,22 @@ struct Lowerer {
         return interner.commonType(a, b);
     }
 
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the ONE seam every ENGINE-SYNTHESIZED
+    // standard type mints through here — the exact sibling of the semantic
+    // tier's `synthesizedType`, so `sizeof` / `_Alignof` / `p - q` carry the
+    // SAME TypeId at BOTH tiers (the MIR store/terminator checks compare
+    // TypeIds exactly, so a divergence would be a hard lowering failure). The
+    // language config declares WHICH vocabulary entry serves the role under the
+    // active data model; this carries only the resolved (core, tag) pair, so no
+    // site branches on a spelling. Undeclared ⇒ the historic anonymous core.
+    [[nodiscard]] TypeId synthesizedType(SynthesizedTypeRule const& rule,
+                                         TypeKind historicCore) {
+        if (auto const r = rule.resolve(dataModel_)) {
+            return interner.primitive(r->first, r->second);
+        }
+        return interner.primitive(historicCore);
+    }
+
     // The arithmetic type for a read-modify-write of an lvalue of type `t`
     // (++/--). C 6.7.2.2: an enum has NO arithmetic of its own — `x++` on an
     // enum computes `x + 1` at the underlying integer, then converts back to
@@ -668,6 +684,31 @@ struct Lowerer {
         // (int + float kinds — file-scope `isArithmeticCore`) is the
         // implicit-conversion surface.
         if (!isArithmeticCore(ck) || !isArithmeticCore(tk)) return child;
+        // D-LANG-TYPE-IDENTITY-VOCABULARY: two DISTINCT named types can share a
+        // representation (`long`/`int` under LLP64; `long double`/`double` on an
+        // f64 axis). C 6.3.1.3p1 makes such a conversion the IDENTITY — no bits
+        // change — so it must RETAG, never materialize a node. Falling through to
+        // `makeCast` below would emit `Cast(I32→I32)`, which HIR→MIR maps to a
+        // real `MirOpcode::Bitcast` instruction that did not exist before identity
+        // was split off representation: a codegen change for a pure type-identity
+        // fix. Placed AFTER the arithmetic-core gate so the pointer/struct/FnSig
+        // pass-through above is untouched.
+        //
+        // The qualifier mask must match too. `sameRepresentation` is deliberately
+        // qualifier-TRANSPARENT (`volatile long` and `long` do have the same
+        // representation), but c27 carries volatile/_Atomic ON the type, and the
+        // access-site lowering reads those bits off THIS node — retagging a
+        // `volatile int` deref to plain `int` would silently demote its Load to
+        // non-volatile. A qualifier CHANGE keeps the historic Cast path.
+        if (interner.qualifierBits(child.type) == interner.qualifierBits(target)
+            && interner.sameRepresentation(child.type, target)) {
+            // Re-tag the NODE too, not just the returned pair: the MIR
+            // terminator / store checks compare the producing node's TypeId to
+            // the function's return type / the slot's type EXACTLY, so a stale
+            // identity on the node would surface as I_TerminatorTypeMismatch.
+            builder.retagType(child.id, target, interner);
+            return E{child.id, target};
+        }
         HirNodeId const cast = builder.makeCast(child.id, target, HirFlags::Synthetic);
         // Alias the synthetic Cast to its operand's pending span entry so
         // diagnostics anchored at the Cast locate to real source. The
@@ -3253,7 +3294,7 @@ struct Lowerer {
                     longDoubleFormat_);
                 if (fk.status == FloatLadderStatus::Typed) {
                     core = fk.kind;
-                    type = interner.primitive(core);
+                    type = interner.primitive(core, fk.vocabularyName);
                 } else {
                     // NoRule: loader invariant violated (uncovered suffix).
                     // AxisUndeclared (FC17.9(e)): a long-double literal on a
@@ -3311,7 +3352,7 @@ struct Lowerer {
                     text, numberStyle, sem.integerLiteralTyping, dataModel_, *iv);
                 if (r.status == IntegerLadderStatus::Typed) {
                     core = r.kind;
-                    type = interner.primitive(core);
+                    type = interner.primitive(core, r.vocabularyName);
                 } else {
                     // TooLarge / NoRule: the semantic tier already
                     // diagnosed (S_IntegerLiteralTooLarge / loader
@@ -3545,8 +3586,13 @@ struct Lowerer {
             && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) == TypeKind::Ptr
             && interner.kind(rc.type) != TypeKind::Ptr;
+        // D-LANG-TYPE-IDENTITY-VOCABULARY: `p - q` is C's `ptrdiff_t` — a NAMED
+        // alias (`long` on LP64, `long long` on LLP64), declared per data model
+        // in `semantics.synthesizedTypes`. The historic bare I64 was ANONYMOUS,
+        // so it matched NEITHER named entry in a `_Generic`.
         TypeId const result = isComparison(*op) ? boolType()
-                            : ptrSub      ? interner.primitive(TypeKind::I64)
+                            : ptrSub      ? synthesizedType(sem.pointerDifferenceType,
+                                                            TypeKind::I64)
                             : ptrIntArith ? lc.type   // Ptr<T> (the pointer operand)
                             : (common.valid() ? common
                                               : (lhs.type.valid() ? lhs.type : rhs.type));
@@ -5618,7 +5664,10 @@ struct Lowerer {
             return exprError(node, "sizeof operand did not resolve to a type");
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
-        TypeId const u64 = interner.primitive(TypeKind::U64);
+        // D-LANG-TYPE-IDENTITY-VOCABULARY: C's `size_t` — the NAMED entry the
+        // language declares for this data model, matching the semantic tier's
+        // stamp on the SAME node exactly.
+        TypeId const u64 = synthesizedType(sem.sizeofResultType, TypeKind::U64);
         HirNodeId const so = track(builder.makeSizeOf(tref, u64), node);
         // VLA C2/C3 (D-CSUBSET-VLA): for a VLA-OBJECT operand, `sizeof a` (and the C3
         // ROW form `sizeof a[0]`) is a RUNTIME value (the size frozen at a's decl,
@@ -5662,7 +5711,8 @@ struct Lowerer {
             return exprError(node, "_Alignof operand did not resolve to a type");
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
-        TypeId const u64 = interner.primitive(TypeKind::U64);
+        // `size_t`, the same declared entry `lowerSizeof` mints (C 6.5.3.4p5).
+        TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
         return {track(builder.makeAlignOf(tref, u64), node), u64};
     }
 
