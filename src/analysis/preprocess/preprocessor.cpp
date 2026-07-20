@@ -560,8 +560,23 @@ struct SynthBuilder {
     // keep the original bytes (angle) or rewrite them to the angle form (quote
     // fallback), and owns the surrounding `copyVerbatim`. Inert (NotAvailable)
     // when there are no systemDirs.
+    //
+    // `reportMalformed` gates ONLY the malformed-descriptor DIAGNOSTIC (a
+    // confidently-live include). The SPLICE itself is UNGATED (the
+    // D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS change), but the
+    // `P_PreprocessorIncludeError` for a descriptor that exists-but-fails-macro-
+    // decode must stay gated on confident-live: the AUTHORITATIVE pass never reads
+    // the descriptor (the pre-scan is the sole emitter here), so emitting it for a
+    // DEAD-branch include would break C 6.10p1 dead-branch inertness (asymmetric
+    // with the still-gated quote arm). Passing `includeResolvable()` at both call
+    // sites RESTORES the pre-change behavior of this diagnostic exactly: it fired
+    // only on a confidently-live include before, when the whole splice was gated.
+    // On a dead/uncertain branch a malformed descriptor is therefore SILENT here
+    // (the branch is inert; an uncertain-but-live use still fails loud downstream as
+    // the missing macro — the P0016-safe direction), never a silent MISCOMPILE.
     SystemMacroSplice spliceSystemDescriptorMacros(std::string const& headerName,
-                                                   std::string& out) {
+                                                   std::string& out,
+                                                   bool reportMalformed) {
         if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
         auto descPath = resolveSystemDescriptor(headerName, systemDirs);
         if (!descPath) return SystemMacroSplice::NotAvailable;
@@ -578,10 +593,16 @@ struct SynthBuilder {
         // right replacement; nullopt ⇒ a variants-only macro is not injected.
         auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
         if (!macros) {
-            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
-                   SourceSpan::empty(0),
-                   std::string{"shipped-header descriptor malformed (macros): "}
-                       + descPath->generic_string());
+            // Malformed descriptor: report ONLY on a confidently-live include (see
+            // the `reportMalformed` note above). A dead/uncertain branch stays
+            // silent — dead-branch inertness — while the include is left verbatim by
+            // the caller (Malformed != Spliced) and elided by the authoritative pass.
+            if (reportMalformed) {
+                emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"shipped-header descriptor malformed (macros): "}
+                           + descPath->generic_string());
+            }
             return SystemMacroSplice::Malformed;
         }
         for (auto const& macro : *macros) {
@@ -1044,13 +1065,27 @@ struct SynthBuilder {
             const bool isQuote =
                 quoteKind.valid() && toks[k].tok.schemaKind == quoteKind;
             if (!isQuote) {
-                // c17: a DEAD-branch (or uncertain-group) angle `#include <h>`
-                // does not splice its macros -- the macro pass elides the line +
-                // the post-parse resolver never sees it (the typed surfaces are
-                // not injected for an elided include), so all three descriptor
-                // consumers stay consistent with the conditional decision. Leave
-                // it verbatim for the macro pass to elide.
-                if (!includeResolvable()) continue;
+                // D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS (Option B):
+                // the angle shipped-macro splice is NOT gated on the pre-scan's
+                // (weaker) conditional verdict -- UNLIKE the quote-include INLINE
+                // below, which MUST stay gated on confident-live (P0016) because it
+                // EAGERLY resolves a file. The two differ fundamentally: the angle
+                // splice only EMITS synthetic `#define` lines INSIDE the include's
+                // conditional region (right before the KEPT `#include <h>` line), so
+                // the AUTHORITATIVE MacroExpander pass -- which has the full, correct
+                // macro table and ELIDES dead-branch `#define`s (handleDirective
+                // returns early on !stackActive()) -- is the proper arbiter of the
+                // injected defines' liveness. Gating on the pre-scan here was a BUG:
+                // the pre-scan is BLIND to a quote-included header's `#define`s, so it
+                // CONFIDENTLY folds a `#if <macro-defined-in-a-quote-include>` to 0
+                // (an undefined identifier -> 0, C 6.10.1p4) and mis-marks the branch
+                // dead -- suppressing the splice on VALID, authoritatively-LIVE code
+                // (the errno / test_syscall `#if SQLITE_OS_UNIX` -> `#include <errno.h>`
+                // S0001). One-directional-safe (P0016 preserved): a TRULY-dead branch
+                // still elides the injected defines in the authoritative pass (the
+                // final token stream is byte-identical), so a dead-branch shipped
+                // include never leaks a live macro -- witnessed by the negative pin +
+                // the preprocessor_dead_branch_include example.
                 // D-PP-DESCRIPTOR-MACRO-INJECT: an ANGLE `#include <h>` whose
                 // shipped descriptor declares a `macros` surface — splice a
                 // synthetic `#define` for each into the synth buffer BEFORE the
@@ -1084,7 +1119,12 @@ struct SynthBuilder {
                 // resolver still injects the typed surfaces (a typed-only
                 // descriptor splices zero macros but the line is still kept).
                 std::string defs;
-                if (spliceSystemDescriptorMacros(angleName, defs)
+                // Splice UNGATED (the authoritative pass arbitrates liveness), but
+                // report a malformed descriptor ONLY on a confidently-live include
+                // (`includeResolvable()`) — restoring the pre-change dead-branch
+                // inertness of that diagnostic.
+                if (spliceSystemDescriptorMacros(angleName, defs,
+                                                 /*reportMalformed=*/includeResolvable())
                     != SystemMacroSplice::Spliced) {
                     continue;
                 }
@@ -1142,8 +1182,12 @@ struct SynthBuilder {
                 // NOR a shipped descriptor stays the same hard error as before.
                 if (!filename.empty()) {
                     std::string defs;
+                    // This fallback is reached only PAST the quote arm's
+                    // `includeResolvable()` gate (below), so the include is
+                    // confidently-live here — report a malformed descriptor loud.
                     SystemMacroSplice const sr =
-                        spliceSystemDescriptorMacros(filename, defs);
+                        spliceSystemDescriptorMacros(filename, defs,
+                                                     /*reportMalformed=*/includeResolvable());
                     if (sr != SystemMacroSplice::NotAvailable) {
                         // Malformed already emitted its own error; on Spliced the
                         // macros are in `defs`. Either way rewrite quote→angle:

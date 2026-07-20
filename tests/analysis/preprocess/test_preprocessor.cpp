@@ -3307,6 +3307,186 @@ TEST(Preprocessor, CommandLineDefineThenUndefComposesDead) {
            "value into localMacros, which #undef erases) -> #if M dead -> no include";
 }
 
+// ── D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS: the ANGLE shipped-
+// macro splice is NO LONGER gated on the pre-scan's (weaker, sometimes-blind)
+// conditional verdict -- the injected `#define`s are emitted inside the include's
+// conditional region and the AUTHORITATIVE MacroExpander (which elides dead-branch
+// defines) arbitrates their liveness. Two pins: the POSITIVE case the fix unblocks
+// (a shipped macro under a `#if` gated by a QUOTE-include define the pre-scan cannot
+// see) and the NEGATIVE final-output invariant (a `#if 0`-gated shipped include must
+// not leak a usable macro -- the authoritative pass elides it). ──────────────────
+
+// POSITIVE (RED-ON-DISABLE): a shipped OBJECT-macro from an ANGLE `#include` must
+// inject+expand even when that include is gated by `#if <flag>` whose flag is
+// `#define`d in a QUOTE-included header -- a flag the include-gating pre-scan is BLIND
+// to (a child SynthBuilder's localMacros is discarded), so the pre-scan CONFIDENTLY
+// folds the guard to 0 (an undefined identifier -> 0, C 6.10.1p4) and mis-marks the
+// branch dead, while the authoritative pass (seeing platform.h's spliced text) reads
+// it LIVE. This is the reduced sqlite test_syscall.c shape (`#if SQLITE_OS_UNIX` ->
+// `#include <errno.h>`, SQLITE_OS_UNIX from the quote-included os_setup.h). Uses a
+// FLAT object-macro (no per-format variant) so it injects under the harness's nullopt
+// activeFormat. RED-ON-DISABLE: restore the `includeResolvable()` gate on the angle
+// arm -> the pre-scan skips the splice -> SHIPPED_MAC survives unexpanded.
+TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_pos_sys";
+    auto incdir = fs::temp_directory_path() / "dss_ppangle_pos_inc";
+    fs::create_directories(sysdir, ec);
+    fs::create_directories(incdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    { std::ofstream(incdir / "platform.h", std::ios::binary)
+          << "#define GATE_FLAG 1\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include \"platform.h\"\n"
+        "#if GATE_FLAG\n"
+        "#include <shippedmac.h>\n"
+        "int v = SHIPPED_MAC;\n"
+        "#endif\n",
+        r, {incdir}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has777 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "777") has777 = true;
+        if (l == "SHIPPED_MAC") hasBareMac = true;
+    }
+    EXPECT_TRUE(has777)
+        << "the shipped object-macro must inject+expand under a quote-include-gated "
+           "#if the pre-scan is blind to (D-PP-PRESCAN-ANGLE-MACRO-SPLICE-"
+           "AUTHORITATIVE-LIVENESS)";
+    EXPECT_FALSE(hasBareMac) << "SHIPPED_MAC must not survive the parser boundary "
+                               "unexpanded";
+    fs::remove_all(sysdir, ec);
+    fs::remove_all(incdir, ec);
+}
+
+// NEGATIVE (final-output layer, RED-ON-DISABLE): splice-always emits the shipped
+// `#define` into scanBuf even for a confidently-DEAD `#if 0` angle include, but the
+// AUTHORITATIVE pass elides dead-branch `#define`s -- so the macro must NOT be usable
+// in the final token stream (the P0016 one-directional-divergence invariant, measured
+// where it matters: the tokens the parser sees). This is the layer the SynthBuilder
+// emit-only property protects: the spliced define never enters the pre-scan's
+// localMacros, and the authoritative pass drops it in the dead branch. RED-ON-DISABLE:
+// if the authoritative pass ever stops eliding a dead-branch `#define`, SHIPPED_MAC
+// would expand to 777 here -> the leak this pin forbids.
+TEST(Preprocessor, DeadBranchAngleShippedMacroDoesNotLeakToFinalOutput) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_dead_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#if 0\n"
+        "#include <shippedmac.h>\n"
+        "#endif\n"
+        "int v = SHIPPED_MAC;\n",
+        r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has777 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "777") has777 = true;
+        if (l == "SHIPPED_MAC") hasBareMac = true;
+    }
+    EXPECT_FALSE(has777)
+        << "a #if 0-gated shipped include must NOT leak a usable macro into the final "
+           "token stream (the authoritative pass elides the dead-branch #define)";
+    EXPECT_TRUE(hasBareMac)
+        << "SHIPPED_MAC stays an undefined bare identifier after the dead-branch "
+           "include (final-output P0016 invariant)";
+    fs::remove_all(sysdir, ec);
+}
+
+// DIRECT P0016 PIN (RED-ON-DISABLE against a future refactor): a shipped `#define`
+// spliced inside a confidently-DEAD `#if 0` angle include must be INVISIBLE to a
+// LATER pre-scan `#if defined(thatMacro)`. The splice is EMIT-ONLY (`out.append`
+// into the authoritative buffer), never tracked into the pre-scan's localMacros, so
+// the later guard folds dead in the pre-scan exactly as in the authoritative pass --
+// the pre-scan is never MORE-live. Observed via the include gate: the later guard
+// gates a MISSING quote-`#include`, which must NOT resolve (no missing-file error).
+// RED-ON-DISABLE: route the splice through localMacros and the pre-scan would see
+// the macro defined -> resolve that guard live -> the missing include errors (a P0016
+// re-open). A DIRECT `#define` positive-control proves the probe can observe a leak.
+TEST(Preprocessor, DeadBranchAngleShippedMacroInvisibleToLaterPrescanGuard) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_p0016_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    // MAIN: dead-branch splice must not leak into the later pre-scan guard.
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if 0\n#include <shippedmac.h>\n#endif\n"
+            "#if defined(SHIPPED_MAC)\n#include \"missing_p0016_probe.h\"\n#endif\n"
+            "int v = 0;\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a shipped #define spliced in a DEAD #if 0 angle include must be "
+               "INVISIBLE to a later pre-scan #if defined() -- emit-only, never "
+               "tracked into localMacros (the P0016 one-directional invariant)";
+    }
+    // POSITIVE CONTROL: a DIRECT #define makes the SAME later guard resolve LIVE in
+    // the pre-scan -> the missing include DOES error, so the MAIN case's silence
+    // genuinely means "no leak" (not "the probe can't observe a live guard").
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#define SHIPPED_MAC 777\n"
+            "#if defined(SHIPPED_MAC)\n#include \"missing_p0016_probe.h\"\n#endif\n"
+            "int v = 0;\n",
+            r, {}, {sysdir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a DIRECT #define must make #if defined() live in the pre-scan (the "
+               "leak-observability control)";
+    }
+    fs::remove_all(sysdir, ec);
+}
+
+// ITEM-2 PIN (RED-ON-DISABLE for the reportMalformed gate): removing the angle-arm
+// `includeResolvable()` gate also un-gated the malformed-descriptor DIAGNOSTIC
+// (`spliceSystemDescriptorMacros` emits P_PreprocessorIncludeError on an exists-but-
+// fails-macro-decode descriptor). Threading `reportMalformed = includeResolvable()`
+// restores its dead-branch inertness (C 6.10p1): the SPLICE stays ungated but the
+// diagnostic fires only on a confidently-LIVE include. RED-ON-DISABLE: pass
+// reportMalformed=true unconditionally and the DEAD case below emits the error.
+TEST(Preprocessor, DeadBranchMalformedShippedDescriptorStaysSilent) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_malformed_sys";
+    fs::create_directories(sysdir, ec);
+    // Malformed: `macros` is not an array -> readShippedLibMacros fails to decode ->
+    // the "descriptor malformed (macros)" P_PreprocessorIncludeError would fire.
+    { std::ofstream(sysdir / "badmac.json", std::ios::binary)
+          << "{ \"macros\": \"not-an-array\" }\n"; }
+    // LIVE (top-level, confidently-live): the malformed descriptor errors loud.
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#include <badmac.h>\nint v = 0;\n", r, {}, {sysdir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a malformed shipped descriptor on a CONFIDENTLY-LIVE include must "
+               "error loud (reportMalformed = includeResolvable() = true)";
+    }
+    // DEAD (#if 0): the SAME malformed descriptor stays SILENT (dead-branch inertness).
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if 0\n#include <badmac.h>\n#endif\nint v = 0;\n", r, {}, {sysdir});
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a malformed shipped descriptor on a DEAD #if 0 include must stay "
+               "SILENT -- the reportMalformed gate restores dead-branch inertness "
+               "(code-audit Item-2)";
+    }
+    fs::remove_all(sysdir, ec);
+}
+
 // AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by
 // the CONFIG conditional words, not a hard-coded "if". Rebind `ifDirective` to
 // "whenever" and reload: a quote-`#include` inside `#whenever 0` must STILL be
