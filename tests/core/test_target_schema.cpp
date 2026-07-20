@@ -1599,3 +1599,111 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ((*r)->registerCount(), 33u);
 }
+
+// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the wideFloatSoftcalls table
+// parses + resolves arg/result register NAMES to ordinals, and an unresolvable
+// name fails loud.
+TEST(TargetSchema, WideFloatSoftcallSchemaParsesArgAndResultRegisters) {
+    // Positive: the shipped arm64 schema declares the __addtf3 softcall with
+    // args v0/v1 and result v0, resolved to valid register ordinals.
+    auto r = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(r.has_value());
+    auto const* add = (*r)->wideFloatSoftcall(::dss::WideFloatOp::Add);
+    ASSERT_NE(add, nullptr) << "arm64 must declare an F128 `add` softcall row";
+    EXPECT_EQ(add->helperSymbol, "__addtf3");
+    ASSERT_EQ(add->argRegisterOrdinals.size(), 2u);
+    // The arg ordinals resolve to the v0/v1 registers.
+    auto const v0 = (*r)->registerByName("v0");
+    auto const v1 = (*r)->registerByName("v1");
+    ASSERT_TRUE(v0.has_value() && v1.has_value());
+    EXPECT_EQ(add->argRegisterOrdinals[0], *v0);
+    EXPECT_EQ(add->argRegisterOrdinals[1], *v1);
+    EXPECT_EQ(add->resultRegisterOrdinal, *v0);
+    // Cross-check the ordinal actually names v0/v1 (VR-class, 128-bit).
+    auto const* v0Info = (*r)->registerInfo(add->argRegisterOrdinals[0]);
+    ASSERT_NE(v0Info, nullptr);
+    EXPECT_EQ(v0Info->name, "v0");
+    EXPECT_EQ(v0Info->regClass, TargetRegClass::VR);
+    EXPECT_EQ(v0Info->widthBytes, 16u);
+    // The from_f64 row marshals its double source through d0 (an FPR register),
+    // proving the table is register-class-agnostic (not v-register-only).
+    auto const* fromF64 = (*r)->wideFloatSoftcall(::dss::WideFloatOp::FromFloat64);
+    ASSERT_NE(fromF64, nullptr);
+    ASSERT_EQ(fromF64->argRegisterOrdinals.size(), 1u);
+    auto const* d0Info = (*r)->registerInfo(fromF64->argRegisterOrdinals[0]);
+    ASSERT_NE(d0Info, nullptr);
+    EXPECT_EQ(d0Info->name, "d0");
+    EXPECT_EQ(d0Info->regClass, TargetRegClass::FPR);
+
+    // Negative: a softcall naming an UNRESOLVABLE register must fail loud.
+    auto bad = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"},
+                       {"mnemonic":"mov","result":"value"}],
+            "registers":[{"name":"v0","class":"vr","widthBytes":16,"hwEncoding":0}],
+            "wideFloatSoftcalls":[
+              {"op":"add","helperSymbol":"__addtf3",
+               "argRegisters":["v0","vX"],"resultRegister":"v0"}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(bad.has_value())
+        << "a softcall arg naming an undeclared register must fail loud";
+    EXPECT_TRUE(anyHasCode(bad.error(), DiagnosticCode::C_MalformedJson));
+
+    // Negative: an unknown op name must also fail loud.
+    auto badOp = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"},
+                       {"mnemonic":"mov","result":"value"}],
+            "registers":[{"name":"v0","class":"vr","widthBytes":16,"hwEncoding":0}],
+            "wideFloatSoftcalls":[
+              {"op":"bogus","helperSymbol":"__x","argRegisters":["v0"],
+               "resultRegister":"v0"}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(badOp.has_value());
+    EXPECT_TRUE(anyHasCode(badOp.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the argVrs/returnVrs calling-
+// convention lists (the AAPCS64 binary128 arg/return VR registers) parse +
+// resolve like argFprs, are validated VR-class, and a mis-classed name fails
+// loud. Mirrors the LD-2 wideFloatSoftcall schema pin.
+TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
+    // Positive: the shipped arm64 aapcs64 cc (index 0) declares v0..v7 args +
+    // v0..v3 returns, all resolving to VR-class 128-bit registers.
+    auto r = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE((*r)->callingConventions().empty());
+    auto const& cc = (*r)->callingConventions()[0];
+    EXPECT_EQ(cc.name, "aapcs64");
+    ASSERT_EQ(cc.argVrs.size(), 8u);
+    ASSERT_EQ(cc.returnVrs.size(), 4u);
+    for (std::size_t k = 0; k < cc.argVrs.size(); ++k) {
+        EXPECT_EQ(cc.argVrs[k], std::string("v") + std::to_string(k));
+        auto const ord = (*r)->registerByName(cc.argVrs[k]);
+        ASSERT_TRUE(ord.has_value()) << cc.argVrs[k];
+        auto const* info = (*r)->registerInfo(*ord);
+        ASSERT_NE(info, nullptr);
+        EXPECT_EQ(info->regClass, TargetRegClass::VR);
+        EXPECT_EQ(info->widthBytes, 16u);
+    }
+    EXPECT_EQ(cc.returnVrs[0], "v0");
+
+    // Negative: an argVrs naming a NON-VR register (a GPR) must fail the
+    // VR-class validation (C_MalformedJson), exactly as argFprs rejects a
+    // non-FPR name — a mis-classed boundary register is a silent wrong-file move.
+    auto bad = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"},
+                       {"mnemonic":"mov","result":"value"}],
+            "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+                         {"name":"v0","class":"vr","widthBytes":16,"hwEncoding":0}],
+            "callingConventions":[
+              {"name":"cc","argVrs":["x0"],"returnVrs":["v0"],"stackAlignment":16}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(bad.has_value())
+        << "an argVrs naming a GPR (non-VR) register must fail loud";
+    EXPECT_TRUE(anyHasCode(bad.error(), DiagnosticCode::C_MalformedJson));
+}

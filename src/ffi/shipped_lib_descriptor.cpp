@@ -241,34 +241,67 @@ enum class WhenMatch { Match, NoMatch, Error };
 // value (generic string equality — never an `if (arch == "x86_64")` here); an
 // unspecified key is a wildcard. A key tested against an UNKNOWN active value
 // (activeTarget / activeFormat nullopt — direct-API/LSP/test callers) can never
-// match. `allowArch` gates whether `arch` is a legal key: the typed surfaces
-// (struct/constant/typedef) carry BOTH {arch,format}; the preprocessor `macros`
-// surface is FORMAT-ONLY (arch is not threaded into preprocess — c9 build-key
-// avoidance), so its `when` keys are {format} alone and an `arch` key there fails
-// loud. `activeFormatName` is the precomputed `objectFormatKindName(*activeFormat)`
-// (empty when activeFormat is nullopt). `whenCtx` is the caller's diagnostic
-// context for the `when` object (e.g. "structs[0] variants[1].when"). Reports via
-// `emitMalformed` on a malformed `when`; the format VALUE is validated against the
-// closed `objectFormatKindFromName` vocabulary so a typo'd "elff" fails loud rather
-// than silently never matching.
+// match. `allowArch` gates whether `arch` and `dataModel` are legal keys: the
+// TYPED surfaces (struct/constant/typedef) carry all three of
+// {arch,format,dataModel}; the preprocessor `macros` surface is FORMAT-ONLY
+// (neither arch nor the data model is threaded into preprocess — c9 build-key
+// avoidance), so its `when` keys are {format} alone and an `arch`/`dataModel` key
+// there fails loud. `activeFormatName` is the precomputed
+// `objectFormatKindName(*activeFormat)` (empty when activeFormat is nullopt);
+// `activeDataModelName` is the precomputed `dataModelName(dataModel)` — the
+// descriptor reader always has a data model (a non-optional parameter), so unlike
+// arch/format this axis can never be "unknown". `whenCtx` is the caller's
+// diagnostic context for the `when` object (e.g. "structs[0] variants[1].when").
+// Reports via `emitMalformed` on a malformed `when`; the format and data-model
+// VALUES are validated against their closed vocabularies so a typo'd "elff" /
+// "LP62" fails loud rather than silently never matching.
+//
+// D-LANG-TYPE-IDENTITY-VOCABULARY: `dataModel` is the axis that lets a descriptor
+// spell a type C defines as a per-data-model ALIAS of a standard NAMED type —
+// `size_t` IS `unsigned long` on LP64 and `unsigned long long` on LLP64, `int64_t`
+// IS `long` / `long long`. A FIXED vocabulary tag would be wrong on one of the two
+// models, and an untagged core is a THIRD type matching neither. It rides the SAME
+// selector arch/format already use rather than a typedef-only `typeByDataModel`
+// key, so structs/constants/versions gain the axis for free.
 [[nodiscard]] WhenMatch
 matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
                  std::optional<std::string_view> activeTarget,
                  std::optional<ObjectFormatKind> activeFormat,
                  std::string const& activeFormatName,
+                 std::string_view activeDataModelName,
                  DiagnosticReporter& reporter) {
-    // Closed key vocabulary: {arch,format} for the typed surfaces, {format} only
-    // for macros. An unknown/forbidden key (e.g. `arch` in a macro `when`, or a
-    // typo'd "ach") fails loud — a silently-ignored key would match more broadly
-    // than intended.
+    // Closed key vocabulary: {arch,format,dataModel} for the typed surfaces,
+    // {format} only for macros. An unknown/forbidden key (e.g. `arch` in a macro
+    // `when`, or a typo'd "ach") fails loud — a silently-ignored key would match
+    // more broadly than intended.
     if (allowArch) {
-        if (!rejectUnknownKeys(reporter, when, whenCtx, {"arch", "format"}))
+        if (!rejectUnknownKeys(reporter, when, whenCtx,
+                               {"arch", "format", "dataModel"}))
             return WhenMatch::Error;
     } else {
         if (!rejectUnknownKeys(reporter, when, whenCtx, {"format"}))
             return WhenMatch::Error;
     }
     bool matches = true;
+    if (allowArch && when.contains("dataModel")) {
+        if (!when.at("dataModel").is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
+                                        + ": 'dataModel' must be a string");
+            return WhenMatch::Error;
+        }
+        std::string const wantModel = when.at("dataModel").get<std::string>();
+        // CLOSED vocabulary (the same spellings `coreByDataModel` /
+        // `signatureByDataModel` use) — a typo would otherwise silently never
+        // match, making the entry vanish on every target.
+        if (!dataModelFromName(wantModel).has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
+                                        + ": 'dataModel' has unknown data-model name '"
+                                        + wantModel
+                                        + "' (expected \"LP64\"/\"LLP64\"/\"ILP32\")");
+            return WhenMatch::Error;
+        }
+        if (activeDataModelName != wantModel) matches = false;
+    }
     if (allowArch && when.contains("arch")) {
         if (!when.at("arch").is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
@@ -492,7 +525,8 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
             // preprocessor). A nullopt activeFormat can never match (no selection).
             WhenMatch const wm = matchVariantWhen(
                 vdef.at("when"), /*allowArch=*/false, vat + ".when",
-                /*activeTarget=*/std::nullopt, activeFormat, activeFormatName, reporter);
+                /*activeTarget=*/std::nullopt, activeFormat, activeFormatName,
+                /*activeDataModelName=*/std::string_view{}, reporter);
             if (wm == WhenMatch::Error) { okVariants = false; break; }
             if (wm == WhenMatch::Match) {
                 ++matchCount;
@@ -727,6 +761,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     json const& doc = *docPtr;
 
     ShippedLibDescriptor out;
+
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the ACTIVE data model's canonical JSON
+    // spelling — the third `when` selector axis, alongside arch + format. Unlike
+    // those two the data model is never "unknown" (it is a non-optional
+    // parameter with an LP64 default), so a `when:{dataModel}` always resolves.
+    std::string const activeDataModelName{dataModelName(dataModel)};
 
     // (1.5) Required `header` provenance string (non-empty). Every shipped
     // descriptor must declare which header its symbols come from — a missing
@@ -1029,7 +1069,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     }
                     WhenMatch const wm = matchVariantWhen(
                         vdef.at("when"), /*allowArch=*/true, vctx + ".when",
-                        activeTarget, activeFormat, activeFormatName, reporter);
+                        activeTarget, activeFormat, activeFormatName,
+                        activeDataModelName, reporter);
                     if (wm == WhenMatch::Error) { verErr = true; break; }
                     if (wm == WhenMatch::Match) {
                         ++matchCount;
@@ -1266,7 +1307,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     }
                     WhenMatch const wm = matchVariantWhen(
                         vdef.at("when"), /*allowArch=*/true, vat + ".when",
-                        activeTarget, activeFormat, activeFormatName, reporter);
+                        activeTarget, activeFormat, activeFormatName,
+                        activeDataModelName, reporter);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
                     if (wm == WhenMatch::Match) {
                         ++matchCount;
@@ -1495,7 +1537,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     if (vType == InvalidType) { okVariants = false; break; }
                     WhenMatch const wm = matchVariantWhen(
                         vdef.at("when"), /*allowArch=*/true, vat + ".when",
-                        activeTarget, activeFormat, activeFormatName, reporter);
+                        activeTarget, activeFormat, activeFormatName,
+                        activeDataModelName, reporter);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
                     if (wm == WhenMatch::Match) {
                         ++matchCount;
@@ -1664,7 +1707,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         // SHARED selector — typed surfaces allow {arch,format}.)
                         WhenMatch const wm = matchVariantWhen(
                             vdef.at("when"), /*allowArch=*/true, vat + ".when",
-                            activeTarget, activeFormat, activeFormatName, reporter);
+                            activeTarget, activeFormat, activeFormatName,
+                            activeDataModelName, reporter);
                         if (wm == WhenMatch::Error) { okVariants = false; break; }
                         if (wm == WhenMatch::Match) {
                             ++matchCount;

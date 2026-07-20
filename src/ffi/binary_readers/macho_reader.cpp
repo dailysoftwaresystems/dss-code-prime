@@ -111,6 +111,7 @@ constexpr std::uint32_t kLcDyldExportsTrie  = 0x33u | kLcReqDyld;       // 0x800
 // library ordinal space that reexport terminals (and two-level binds)
 // index. ALL five kinds count -- omitting any shifts every later ordinal
 // and would name the wrong dependent dylib for a reexport target.
+constexpr std::uint32_t kLcIdDylib          = 0xDu;   // LC_ID_DYLIB (install name)
 constexpr std::uint32_t kLcLoadDylib        = 0xCu;
 constexpr std::uint32_t kLcLoadWeakDylib    = 0x18u | kLcReqDyld;       // 0x80000018
 constexpr std::uint32_t kLcReexportDylib    = 0x1Fu | kLcReqDyld;       // 0x8000001F
@@ -583,6 +584,14 @@ readMacho(std::span<std::uint8_t const> bytes,
     std::vector<SectionInfo>   sections;
     std::vector<std::string>   dylibLeaves;
     std::optional<std::uint64_t> machHeaderVa;   // vmaddr of the header segment
+    // D-FF1-READER-SONAME (c171): the LC_ID_DYLIB install name — this dylib's
+    // OWN loader-resolvable identity (`@rpath/libfoo.dylib`), the value a
+    // CLIENT records at link time and dyld resolves at load. Preferred over
+    // the file basename downstream; empty when absent (an MH_OBJECT / a dylib
+    // with no LC_ID_DYLIB). The FULL install name is kept verbatim (NOT the
+    // leaf) — unlike `dylibLeaves`, which the reexport-target join needs
+    // leaf-only; a client links against the whole `@rpath/...` string.
+    std::string                idDylibName;
 
     std::size_t       lcOff = kMachOHeaderSize;
     std::size_t const lcEnd = kMachOHeaderSize + sizeofcmds;
@@ -690,6 +699,16 @@ readMacho(std::span<std::uint8_t const> bytes,
                     exportTrieSize = static_cast<std::size_t>(dsz);
                 }
             }
+        } else if (cmd == kLcIdDylib) {
+            // dylib_command (LC_ID_DYLIB): name.offset @ +8, install name at
+            // lcOff + name.offset. Kept VERBATIM (the whole `@rpath/...`
+            // string a client records), not leaf-reduced.
+            std::uint32_t const nameOff = (cmdsize >= 12u)
+                ? readU32(bytes, lcOff + 8) : 0u;
+            if (nameOff >= kMachOLcPreamble && nameOff < cmdsize) {
+                idDylibName = readNulTerminated(bytes, lcOff,
+                                                lcOff + cmdsize, nameOff);
+            }
         } else if (cmd == kLcLoadDylib   || cmd == kLcLoadWeakDylib
                 || cmd == kLcReexportDylib || cmd == kLcLazyLoadDylib
                 || cmd == kLcLoadUpwardDylib) {
@@ -740,6 +759,9 @@ readMacho(std::span<std::uint8_t const> bytes,
                   "section (out-of-section export pointer). Surfaced "
                 + std::to_string(out.size()) + " valid exports.");
         }
+        // D-FF1-READER-SONAME (c171): stamp the LC_ID_DYLIB install name on
+        // every export row (empty if the image declared none).
+        for (auto& r : out) r.soname = idDylibName;
         return out;
     }
 
@@ -879,6 +901,9 @@ readMacho(std::span<std::uint8_t const> bytes,
             + " valid symbols.");
     }
 
+    // D-FF1-READER-SONAME (c171): stamp the LC_ID_DYLIB install name on every
+    // nlist row (empty if the image declared none — e.g. an MH_OBJECT).
+    for (auto& r : out) r.soname = idDylibName;
     return out;
 }
 

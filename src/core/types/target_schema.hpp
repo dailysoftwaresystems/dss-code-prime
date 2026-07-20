@@ -361,6 +361,48 @@ struct DSS_EXPORT TargetRegisterClassOps {
     }
 };
 
+// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the six abstract wide-float
+// (IEEE binary128 `long double`) operations a softfloat-libcall target
+// realizes by CALLING a runtime helper (`__addtf3`/`__fixtfsi`/…) instead of
+// an inline instruction sequence. The engine keys the softcall verb on
+// `TypeKind::F128` + the PRESENCE of a config row for the op (never a
+// target/format identity branch): a target that declares F128 but no softcall
+// rows falls straight through to the `requireEncodedFloatWidth` fail-loud gate.
+enum class WideFloatOp : std::uint8_t {
+    Add = 0, Sub = 1, Mul = 2, Div = 3, ToInt32 = 4, FromFloat64 = 5,
+};
+inline constexpr std::size_t kWideFloatOpCount = 6;
+inline constexpr EnumNameTable<WideFloatOp, 6> kWideFloatOpTable{{{
+    { WideFloatOp::Add, "add" }, { WideFloatOp::Sub, "sub" },
+    { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
+    { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
+}}};
+[[nodiscard]] constexpr std::string_view wideFloatOpName(WideFloatOp op) noexcept {
+    return kWideFloatOpTable.name(op);
+}
+[[nodiscard]] constexpr std::optional<WideFloatOp>
+wideFloatOpFromName(std::string_view s) noexcept {
+    return kWideFloatOpTable.fromName(s);
+}
+
+// One softcall row (the JSON `wideFloatSoftcalls[]` entry for a `WideFloatOp`).
+// `helperSymbol` is the runtime library symbol the op lowers to a CALL of
+// (`__addtf3` …); `argRegisterNames`/`resultRegisterName` are the physical
+// register NAMES the operands/result are marshalled through (v0/v1 for the
+// 128-bit args, x0 for a `to_i32` result, d0 for a `from_f64` source). The
+// `*Ordinals` are validator-populated (each name resolved against the target's
+// register table) so the lowering never re-resolves a name. `declared` is false
+// on any op with no JSON row — the softcall accessor returns nullptr and the
+// engine falls through to the encoded-width wall.
+struct DSS_EXPORT WideFloatSoftcall {
+    bool                       declared = false;
+    std::string                helperSymbol;
+    std::vector<std::string>   argRegisterNames;
+    std::string                resultRegisterName;
+    std::vector<std::uint16_t> argRegisterOrdinals;   // validator-populated
+    std::uint16_t              resultRegisterOrdinal = 0;
+};
+
 // FC12a-core variadic CALLEE ABI (D-FC12A-VARIADIC-CALLEE): the layout of this
 // CC's `__va_list_tag` PLUS the register-save-area geometry a `va_start`/`va_arg`
 // walk needs. A target WITHOUT this block fails loud at the variadic-callee site
@@ -475,6 +517,18 @@ struct DSS_EXPORT TargetCallingConvention {
     std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
     std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
     std::vector<std::string> returnFprs;  // float-return registers
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the 128-bit VR (Q-view)
+    // arg-passing / return registers for an IEEE binary128 `long double`
+    // (AAPCS64 v0..v7 args, v0..v3 return). Parallel to argFprs/returnFprs and
+    // indexed by the SAME per-class (NSRN) ordinal — an F128 arg at NSRN k is
+    // passed in `argVrs[k]` (v{k}), which ALIASES `argFprs[k]` (d{k}), so an
+    // F64 and an F128 sharing a signature never collide by ordinal. EMPTY on
+    // every f64/x87-80 target (x87 long double uses the implicit st0 stack; the
+    // f64 axis never forms an F128), so this stays inert there. Validated
+    // VR-class in `validate()` exactly as argFprs is validated FPR-class; the
+    // MIR→LIR F128 boundary verb resolves each name→ordinal like argFprs.
+    std::vector<std::string> argVrs;      // binary128 arg-passing VR registers, in order
+    std::vector<std::string> returnVrs;   // binary128 VR-return registers
     std::vector<std::string> callerSaved; // volatile across calls (caller must spill if reused)
     std::vector<std::string> calleeSaved; // non-volatile (callee must restore on return)
     std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
@@ -2439,6 +2493,20 @@ struct DSS_EXPORT TargetSchemaData {
     // opcode row. arm64 (no table, no fpr registers) is untouched.
     std::array<TargetRegisterClassOps, 5> registerClassOps{};
 
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the per-`WideFloatOp`
+    // softfloat-libcall table (the JSON `wideFloatSoftcalls[]` section),
+    // indexed by the `WideFloatOp` ordinal. An op with no row keeps
+    // `declared == false` → `wideFloatSoftcall()` returns nullptr → the
+    // F128 engine verb falls through to the fail-loud encoded-width gate
+    // (this ABSENCE, not a target/format check, is what gates the softcall
+    // path). `wideFloatSoftcallLibraryByFormat` maps an object-format key
+    // ("elf") → the DT_NEEDED library the minted extern imports bind to
+    // ("libgcc_s.so.1"); the LIR lowerer resolves the ACTIVE format's entry
+    // and threads it in (nullopt = the format declares none → the softcall
+    // fails loud rather than mint an unbound extern).
+    std::array<WideFloatSoftcall, kWideFloatOpCount> wideFloatSoftcalls{};
+    std::unordered_map<std::string, std::string> wideFloatSoftcallLibraryByFormat;
+
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
     std::vector<TargetCallingConvention> callingConventions;
@@ -2656,6 +2724,30 @@ public:
             case RegClassOp::Store: return opcodeByMnemonic("store");
         }
         return std::nullopt;
+    }
+
+    // ── Wide-float softcalls (LD-2, D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH) ──
+    // The softfloat-libcall row for `op`, or nullptr when this target
+    // declares none (`!declared`). The F128 engine verb keys its softcall
+    // path on a NON-NULL return here — a target with F128 but zero rows
+    // returns nullptr for every op and falls through to the encoded-width
+    // wall (the load-bearing agnosticism condition: no target/format branch).
+    [[nodiscard]] WideFloatSoftcall const*
+    wideFloatSoftcall(WideFloatOp op) const noexcept {
+        auto const idx = static_cast<std::size_t>(op);
+        if (idx >= d_.wideFloatSoftcalls.size()) return nullptr;
+        auto const& row = d_.wideFloatSoftcalls[idx];
+        return row.declared ? &row : nullptr;
+    }
+    // The DT_NEEDED library the minted F128-softcall externs bind to, for
+    // the object format named `formatKey` ("elf"), or empty when the format
+    // declares none. Resolved once per compilation (the LIR lowerer captures
+    // it), so the `std::string` key temporary is not a hot-path cost.
+    [[nodiscard]] std::string_view
+    wideFloatSoftcallLibrary(std::string_view formatKey) const {
+        auto it = d_.wideFloatSoftcallLibraryByFormat.find(std::string(formatKey));
+        if (it == d_.wideFloatSoftcallLibraryByFormat.end()) return {};
+        return it->second;
     }
 
     // ── Calling conventions (cycle 2b) ──────────────────────────

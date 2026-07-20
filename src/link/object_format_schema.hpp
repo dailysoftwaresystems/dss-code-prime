@@ -689,6 +689,54 @@ struct DSS_EXPORT MachOImage {
     bool          useChainedFixups = false;
 };
 
+// ── Output container (D-FF1-AR-STATICLIB-DRIVER-WIRING, c171) ──────
+//
+// WHAT the format's output is PACKAGED as — a single standalone file
+// (the default: one relocatable `.o`/`.obj` OR one loadable image) vs
+// an `ar` static ARCHIVE bundling N relocatable members a foreign
+// linker later pulls + merges (a `.a` / `.lib` static library).
+//
+// This axis is ORTHOGONAL to `isImageFlavor()` (object-vs-image): an
+// archive holds RELOCATABLE OBJECTS (never images — `validate()`
+// rejects `container: archive` on any image-flavor schema, since a
+// foreign linker cannot pull a member out of a pre-linked image); a
+// `single` file can be either an object or an image. The combos:
+//   * single + object → one `.o`/`.obj`
+//   * single + image  → one `.exe`/`.so`/`.dll`/`.dylib`
+//   * archive + object → a `.a`/`.lib` (the staticlib formats)
+//   * archive + image  → INVALID (validate-rejected)
+//
+// **Agnosticism (the §B decision, user Option 1 / format-container):**
+// output SHAPE stays 100% FORMAT-driven (cli→exec, lib→shared,
+// staticlib→archive are ALL selected by the format the driver resolves,
+// exactly as `elf.objectType` selects Rel/Exec/Dyn) — the driver
+// dispatches on THIS declared field, NEVER on the `artifactProfile`
+// name (`artifact_profile.hpp`'s standing veto). A relocatable format
+// that declares `container: "archive"` + `artifactProfiles:
+// ["staticlib"]` IS the static-library artifact producer; the driver
+// routes it to `linkAndWriteStaticArchive`.
+//
+// Default `Single` ⇒ every format that omits the field is byte-
+// identical (the whole shipped set predates this axis).
+enum class ObjectFormatContainer : std::uint8_t {
+    Single  = 0,  // one standalone file (object OR image) — the default
+    Archive = 1,  // an `ar` static archive of relocatable members (.a/.lib)
+};
+
+inline constexpr EnumNameTable<ObjectFormatContainer, 2> kObjectFormatContainerTable{{{
+    { ObjectFormatContainer::Single,  "single"  },
+    { ObjectFormatContainer::Archive, "archive" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+objectFormatContainerName(ObjectFormatContainer c) noexcept {
+    return kObjectFormatContainerTable.name(c);
+}
+[[nodiscard]] constexpr std::optional<ObjectFormatContainer>
+objectFormatContainerFromName(std::string_view s) noexcept {
+    return kObjectFormatContainerTable.fromName(s);
+}
+
 namespace detail {
 
 struct DSS_EXPORT ObjectFormatData {
@@ -696,6 +744,19 @@ struct DSS_EXPORT ObjectFormatData {
     std::string          name;         // "elf64-x86_64-linux" etc.
     std::string          version;
     ObjectFormatKind     kind = ObjectFormatKind::Elf;
+
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): output container ──
+    //
+    // OPTIONAL top-level `"container"` ("single" / "archive"; closed
+    // enum, loader fails loud on an unknown spelling). `archive` marks
+    // a static-library format whose driver output is an `ar` bundle of
+    // relocatable members (`.a`/`.lib`) — the driver routes it to
+    // `linkAndWriteStaticArchive`, dispatching on THIS field (never the
+    // artifactProfile name). Absent ⇒ `Single` (one standalone file),
+    // so every pre-c171 format is byte-identical. `validate()` rejects
+    // `archive` on any image-flavor schema (a foreign linker cannot
+    // pull a member from a pre-linked image).
+    ObjectFormatContainer container = ObjectFormatContainer::Single;
 
     // ── FC3 c1: the data model (per-OS C-family width triple) ─────
     //
@@ -982,6 +1043,19 @@ public:
     [[nodiscard]] std::string_view     name()    const noexcept { return d_.name; }
     [[nodiscard]] std::string_view     version() const noexcept { return d_.version; }
     [[nodiscard]] ObjectFormatKind     kind()    const noexcept { return d_.kind; }
+    // D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the output container —
+    // `Archive` iff this format's driver output is an `ar` static
+    // library (`.a`/`.lib`) bundling relocatable members. The driver
+    // dispatches on this (→ `linkAndWriteStaticArchive`), NOT on the
+    // artifactProfile. `Single` (the default) for every image / lone
+    // relocatable-object format.
+    [[nodiscard]] ObjectFormatContainer container() const noexcept { return d_.container; }
+    // True iff `container() == Archive` — a static-library format.
+    // Convenience predicate paralleling `isImageFlavor()`; the two are
+    // mutually exclusive (validate() rejects `archive` on image flavors).
+    [[nodiscard]] bool isStaticArchive() const noexcept {
+        return d_.container == ObjectFormatContainer::Archive;
+    }
     // FC3 c1: the format's declared data model (LP64 / LLP64 / ILP32).
     // Always a valid member for a loader-produced schema (the field is
     // REQUIRED + closed-enum at load).

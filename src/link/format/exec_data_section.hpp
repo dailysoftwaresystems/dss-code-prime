@@ -437,21 +437,25 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                  writerName, di.symbol.v, rel.kind.v));
                 return false;
             }
-            // `pcRelative` is a Linear-only field (the loader forces every
-            // non-Linear formula row to pcRelative=false), so it alone
-            // cannot exclude the genuinely pc-relative instruction-fixup
-            // kinds (call26 / adr_prel_pg_hi21 / add_abs_lo12_nc). A data
-            // pointer slot takes a plain LINEAR absolute fixup only — a
-            // non-Linear kind here would apply instruction-formula
-            // semantics to data bytes (c147 silent-failure-review fold;
-            // same discriminator as the Mach-O MH_OBJECT data-reloc gate).
-            if (tri->formulaKind != RelocFormulaKind::Linear
-                || tri->pcRelative || tri->widthBytes == 0) {
+            // Data-item relocations are LINEAR fixups only: a non-Linear kind
+            // (call26 / adr_prel_pg_hi21 / add_abs_lo12_nc) would apply
+            // instruction-formula semantics to data bytes (c147 silent-failure
+            // -review fold; the Mach-O MH_OBJECT data-reloc gate's discriminator).
+            // A zero-width kind has nothing to write. Both are producer bugs.
+            //
+            // A LINEAR pc-relative kind, HOWEVER, is legitimate in data: a
+            // position-independent jump table (a gcc `switch`) stores 4-byte
+            // SELF-relative offsets (`entry = target - table_base`), reconstructed
+            // by the c164/c167 relocatable-object reader as Linear pcRelative data
+            // relocations. DSS emits a fixed-base image, so the patch VA is known
+            // here -- apply `S + A - P + addendBias` exactly as the schema formula
+            // states (the same value the instruction-fixup path computes for code).
+            if (tri->formulaKind != RelocFormulaKind::Linear || tri->widthBytes == 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
-                                 "pc-relative, zero-width, or a non-linear "
-                                 "instruction fixup - a data pointer needs a plain "
-                                 "absolute fixup with a concrete write width.",
+                                 "zero-width or a non-linear instruction fixup - a "
+                                 "data fixup must be a LINEAR absolute or pc-relative "
+                                 "kind with a concrete write width.",
                                  writerName, di.symbol.v, tri->name));
                 return false;
             }
@@ -465,13 +469,42 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                  static_cast<int>(tri->widthBytes), di.bytes.size()));
                 return false;
             }
-            std::uint64_t const value = static_cast<std::uint64_t>(
-                static_cast<std::int64_t>(sIt->second) + rel.addend);
+            // value = S + A + (pcRel ? -P : 0) + addendBias  (the schema formula).
+            std::uint64_t const patchVa =
+                sectionVa + static_cast<std::uint64_t>(patchOff);
+            std::int64_t signedValue = static_cast<std::int64_t>(sIt->second)
+                                     + rel.addend
+                                     + static_cast<std::int64_t>(tri->addendBias);
+            if (tri->pcRelative) signedValue -= static_cast<std::int64_t>(patchVa);
+            // Signed-fit tripwire for a narrow (< 8-byte) fixup -- the SAME
+            // last-line guard the instruction-fixup kernel applies
+            // (`applyExecRelocations`, exec_reloc_apply.hpp): a value outside the
+            // width's signed range would be silently truncated to its low bytes
+            // (a wrong displacement baked into data). Relevant now that a width-4
+            // pc-relative kind (a jump-table `rel32` entry) reaches this write;
+            // also closes the pre-existing width-4 absolute (`abs32`) exposure.
+            if (tri->widthBytes < 8) {
+                std::int64_t const sMax =
+                    (std::int64_t{1} << (8 * tri->widthBytes - 1)) - 1;
+                if (signedValue < -sMax - 1 || signedValue > sMax) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("{}: data item SymbolId={{ {} }} relocation '{}' "
+                                     "value {} does not fit signed in widthBytes={} - "
+                                     "would silently truncate.",
+                                     writerName, di.symbol.v, tri->name, signedValue,
+                                     static_cast<int>(tri->widthBytes)));
+                    return false;
+                }
+            }
+            std::uint64_t const value = static_cast<std::uint64_t>(signedValue);
             for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
                 bytesOut[patchOff + b] =
                     static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
             }
-            if (siteVasOut != nullptr) {
+            // A pc-relative (self-relative) data fixup is invariant under a uniform
+            // image rebase, so it needs NO base-relocation entry. Only an ABSOLUTE
+            // 8-byte pointer slot does (PE `.reloc` DIR64).
+            if (siteVasOut != nullptr && !tri->pcRelative) {
                 if (tri->widthBytes != 8) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("{}: data item SymbolId={{ {} }} absolute "

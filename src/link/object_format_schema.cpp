@@ -79,6 +79,43 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "widths");
     }
 
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
+    //
+    // `container: archive` is a STATIC-LIBRARY format: its driver output is
+    // an `ar` bundle of RELOCATABLE members a foreign linker later pulls +
+    // merges. Reject it on any IMAGE flavor (ET_EXEC/ET_DYN, PE Exec/Dll,
+    // MH_EXECUTE/MH_DYLIB) — a linker cannot pull a member out of a
+    // pre-linked image — and on WASM/SPIR-V, which have no `ar` archive
+    // concept. This mirrors the `linkAndWriteStaticArchive` runtime guard
+    // (`isImageFlavor()` reject) at LOAD time, so a mis-declared static-lib
+    // format fails loud at its source rather than deep in the driver.
+    if (container == ObjectFormatContainer::Archive) {
+        bool relocatableMember = false;
+        switch (kind) {
+            case ObjectFormatKind::Elf:
+                relocatableMember = (elf.objectType == ElfObjectType::Rel);
+                break;
+            case ObjectFormatKind::Pe:
+                relocatableMember = (pe.objectType == PeObjectType::Obj);
+                break;
+            case ObjectFormatKind::MachO:
+                relocatableMember = (macho.filetype == MachOObjectType::Object);
+                break;
+            default:
+                relocatableMember = false;  // wasm / spirv / unknown — no `ar`
+                break;
+        }
+        if (!relocatableMember) {
+            fail("/container",
+                 "'container: archive' (a static library) requires a "
+                 "RELOCATABLE member type — ELF 'rel' / PE 'obj' / Mach-O "
+                 "'object'; an image flavor (exec/dyn/dll/dylib) or a "
+                 "non-`ar` format (wasm/spirv) cannot be bundled into an "
+                 "archive a foreign linker pulls from "
+                 "(D-FF1-AR-STATICLIB-DRIVER-WIRING)");
+        }
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.

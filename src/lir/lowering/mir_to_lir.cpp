@@ -335,6 +335,21 @@ enum class MnemonicSlot : std::uint8_t {
     // acquire/release/seqcst slot FAILS LOUD (reportMissingOpcode) — the one
     // forbidden miscompile direction (a silent under-fence) can never happen.
     LoadAcquire, StoreRelease, StoreSeqCst,
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): the x87 80-bit `long double`
+    // memory-sequence ops. An F80 value lives in MEMORY (never a register —
+    // the x87 stack st0-7 is invisible to the flat linear-scan allocator), so
+    // every F80 op is a FIXED memory→memory instruction sequence built from
+    // these primitives (the idiv implicit-RAX/RDX precedent). Declared ONLY by
+    // x86_64 (the sole x87-80 target this cycle); arm64 never forms an F80
+    // (long double binds to F128/F64 there, never x87-80), so its cache ids
+    // stay nullopt and the x87 lowering arms are never reached — the FNegMask
+    // per-target-realization-slot precedent.
+    //   FldM80/FstpM80 — DB /5 push m80 / DB /7 pop-store m80 (the load/store
+    //     halves; a memory operand [addr,membase,memoffset]).
+    //   FaddP/FsubP/FmulP/FdivP — DE C1/E9/C9/F9, the bare register-implicit
+    //     st1←st1 OP st0 + pop (0 operands).
+    //   FisttpM32 — DB /1 truncating store st0→m32int + pop (the FPToSI tail).
+    FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -447,6 +462,14 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
     {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
     {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit long-double sequence ops (x86_64-only).
+    {MnemonicSlot::FldM80,             "fld_m80"},
+    {MnemonicSlot::FstpM80,            "fstp_m80"},
+    {MnemonicSlot::FaddP,              "faddp"},
+    {MnemonicSlot::FsubP,              "fsubp"},
+    {MnemonicSlot::FmulP,              "fmulp"},
+    {MnemonicSlot::FdivP,              "fdivp"},
+    {MnemonicSlot::FisttpM32,          "fisttp_m32"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -664,6 +687,26 @@ struct Lowerer {
     // silent default — the wrong shape miscompiles).
     std::optional<ExternCallDispatch> externCallDispatch_;
 
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE object format's
+    // DT_NEEDED library for the F128 softfloat helpers (`libgcc_s.so.1` on
+    // elf), captured from `target.wideFloatSoftcallLibrary(formatKey)` one
+    // level up (the LOWER half sees only this value, not the format).
+    // std::nullopt = the format declares none → an F128 softcall that needs a
+    // runtime binding fails loud rather than mint an unbound extern.
+    // `newWideFloatExterns_` accumulates the extern imports the softcall verb
+    // MINTS on first use of each helper (self-serve LIR-tier synthesis — the
+    // propagation chain lowerToLir -> result.externImports -> assemble() ->
+    // linker is pre-wired); `softcallExternByHelper_` dedups them within the
+    // CU (one `__addtf3` import no matter how many F128 adds).
+    std::optional<std::string>              wideFloatSoftcallLibrary_;
+    std::vector<ExternImport>               newWideFloatExterns_;
+    std::unordered_map<std::string, SymbolId> softcallExternByHelper_;
+    // Caller-supplied extern imports keyed by mangled name — so a minted
+    // softcall REUSES a user import of the same helper instead of minting a
+    // duplicate (which would be a link-time "declared more than once"). Built
+    // once at ctor from the same span that populates `externSymbols`.
+    std::unordered_map<std::string, SymbolId> suppliedExternByName_;
+
     // D-LK-EXTERN-DATA-IMPORT (c117): the ACTIVE format's extern-DATA
     // binding model + the derived set of extern-DATA SymbolIds that need
     // GOT-indirect address materialization. `externDataGotSymbols_` is
@@ -819,16 +862,21 @@ struct Lowerer {
             std::optional<ExternCallDispatch> externCallDispatch,
             std::optional<DataImportBinding> dataImportBinding,
             std::optional<TlsAccessInfo> tlsAccess,
-            std::span<MirSehScope const> sehScopes)
+            std::span<MirSehScope const> sehScopes,
+            std::optional<std::string> wideFloatSoftcallLibrary)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
+          wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
             externSymbols.insert(e.symbol.v);
+            // LD-2: index by mangled name so a minted F128 softcall reuses a
+            // user import of the same helper (dedup at the link boundary).
+            suppliedExternByName_.emplace(e.mangledName, e.symbol);
         }
         // D-LK-EXTERN-DATA-IMPORT (c117): under a GOT-indirect format
         // (Mach-O __got), an extern-DATA object's address is not a direct
@@ -1737,6 +1785,23 @@ struct Lowerer {
             case MirOpcode::Neg:    return lowerUnaryOp(id, MnemonicSlot::Neg);
             // ── cycle 3d float arithmetic (FPR-class result) ───────
             case MirOpcode::FAdd:
+                // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an F80 result routes
+                // to the x87 memory sequence (fld;fld;faddp;fstp) BEFORE the
+                // SSE width gate — F80 has no scalar-SSE encoding, so the gate
+                // still walls it for every OTHER site (Arg/Call/Return keep
+                // failing loud). This interception is the un-wall for the
+                // in-function arithmetic producer.
+                if (interner.kind(mir.instType(id)) == TypeKind::F80)
+                    return lowerF80Arith(id, MnemonicSlot::FaddP);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an F128 result
+                // routes to the softfloat CALL (__addtf3) — gated on the
+                // PRESENCE of a config row, NOT a target/format check. A target
+                // with F128 but no softcall row falls through to the width gate
+                // (fail-loud). No arch identity branch here.
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Add))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Add, *cfg);
+                }
                 // FC2 Part B / FC3.5 c2: fadd carries the F64 addsd +
                 // F32 addss encodings, width-axis-selected — gate the
                 // width before the class-blind lowering (the result
@@ -1746,6 +1811,16 @@ struct Lowerer {
                                               "MIR FAdd")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FAdd);
             case MirOpcode::FSub:
+                // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 → x87 fsubp
+                // (st1−st0 = a−b for the a-THEN-b push order — see the fsubp
+                // opcode $comment).
+                if (interner.kind(mir.instType(id)) == TypeKind::F80)
+                    return lowerF80Arith(id, MnemonicSlot::FsubP);
+                // LD-2: F128 -> softcall __subtf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Sub))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Sub, *cfg);
+                }
                 // Cluster-F F3: fsub gains its encodings (SUBSD/SUBSS, arm64
                 // FSUB D/S) — same width gate+axis as FAdd/FDiv (an F16/F128
                 // FSub would otherwise first-match the width:64 SUBSD variant —
@@ -1754,12 +1829,29 @@ struct Lowerer {
                                               "MIR FSub")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FSub);
             case MirOpcode::FMul:
+                // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 → x87 fmulp.
+                if (interner.kind(mir.instType(id)) == TypeKind::F80)
+                    return lowerF80Arith(id, MnemonicSlot::FmulP);
+                // LD-2: F128 -> softcall __multf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Mul))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Mul, *cfg);
+                }
                 // Cluster-F F3: fmul gains its encodings (MULSD/MULSS, arm64
                 // FMUL D/S) — same gate+axis.
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                                               "MIR FMul")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FMul);
             case MirOpcode::FDiv:
+                // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 → x87 fdivp
+                // (st1/st0 = a/b — see the fdivp opcode $comment).
+                if (interner.kind(mir.instType(id)) == TypeKind::F80)
+                    return lowerF80Arith(id, MnemonicSlot::FdivP);
+                // LD-2: F128 -> softcall __divtf3 (config-row-gated).
+                if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+                    if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Div))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::Div, *cfg);
+                }
                 // FC3.5 sweep-c2: fdiv gains its first encodings
                 // (DIVSD/DIVSS, arm64 FDIV D/S) — the NaN-construction
                 // path (0.0/0.0). Same gate+axis as FAdd.
@@ -1781,6 +1873,21 @@ struct Lowerer {
                 // widthOverride. Gate BOTH ends: an F16/F128 source
                 // or result has no encoded conversion at any width.
                 auto const cvtOps = mir.instOperands(id);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an FPExt whose
+                // RESULT is F128 from a single F64 source widens via the
+                // softfloat CALL (__extenddftf2) — intercept BEFORE the width
+                // gate below (which would wall the unencoded F128 result). An
+                // F128 FPTrunc (narrowing) has no __trunctfdf2 row this cycle
+                // and falls through to that gate (walls loud). Config-row-gated.
+                if (op == MirOpcode::FPExt
+                    && interner.kind(mir.instType(id)) == TypeKind::F128
+                    && cvtOps.size() == 1
+                    && interner.kind(mir.instType(cvtOps[0])) == TypeKind::F64) {
+                    if (auto const* cfg =
+                            target.wideFloatSoftcall(WideFloatOp::FromFloat64))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::FromFloat64,
+                                                      *cfg);
+                }
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                         op == MirOpcode::FPExt ? "MIR FPExt (result)"
                                                : "MIR FPTrunc (result)")) {
@@ -1801,6 +1908,29 @@ struct Lowerer {
                                  cvtSrcWidth);
             }
             case MirOpcode::FPToSI: {
+                auto const convOps = mir.instOperands(id);
+                // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an F80 SOURCE converts
+                // via the x87 memory sequence (fld_m80;fisttp_m32;mov r32) — not
+                // cvttsd2si — so it intercepts before the SSE source-width gate
+                // (which still walls F80 at every non-x87 conversion site).
+                if (convOps.size() == 1
+                    && interner.kind(mir.instType(convOps[0])) == TypeKind::F80)
+                    return lowerF80ToSI(id);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an F128 SOURCE with
+                // a 32-bit result converts via the softfloat CALL (__fixtfsi) —
+                // the SAME 32-bit-only scope as lowerF80ToSI (a wider I64 result
+                // has no __fixtfdi row this cycle and falls through to the source
+                // width gate, which walls the F128 source loud). Config-row-gated.
+                if (convOps.size() == 1
+                    && interner.kind(mir.instType(convOps[0])) == TypeKind::F128
+                    && lirInstWidthBits(
+                           memAccessWidthFlags(mir.instType(id),
+                                               LirRegClass::GPR)) == 32) {
+                    if (auto const* cfg =
+                            target.wideFloatSoftcall(WideFloatOp::ToInt32))
+                        return lowerWideFloatSoftcall(id, WideFloatOp::ToInt32,
+                                                      *cfg);
+                }
                 // FC2 Part B / FC3.5 c2: fp_to_si carries the F64
                 // cvttsd2si + F32 cvttss2si encodings — the SOURCE
                 // operand's float width is the encoded axis (the
@@ -1808,7 +1938,6 @@ struct Lowerer {
                 // its low 32 bits serve I32 results). The result-
                 // width default (an I32 result → width-32) would
                 // mis-key the SOURCE axis, so thread the override.
-                auto const convOps = mir.instOperands(id);
                 if (convOps.size() == 1
                     && !requireEncodedFloatWidth(id, mir.instType(convOps[0]),
                                                  "MIR FPToSI (source)")) {
@@ -1926,11 +2055,21 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Arg, "MIR Arg");
             return;
         }
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a `long double` PARAMETER
+        // crosses the boundary via the memory-resident model (NOT the width-
+        // gated FPR `arg` move, which would truncate a 16-byte value to 8).
+        // Intercept BEFORE the F32/F64-only width wall (which still fires for F16
+        // + any other unencoded FPR width). F80 = a SysV incoming-stack receive;
+        // F128 = an AAPCS64 v-register entry spill. This UN-WALLS the former
+        // FC17.9(e) F80/F128 Arg boundary gate.
+        if (interner.kind(mir.instType(id)) == TypeKind::F80)
+            return lowerF80Arg(id);
+        if (interner.kind(mir.instType(id)) == TypeKind::F128)
+            return lowerF128Arg(id);
         // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the call-boundary
-        // width gate — an F80/F128 PARAMETER would otherwise plumb through
-        // a width-0 (64-bit) FPR move (widthFlagsForType defaults them to
-        // 0), silently truncating a 16-byte value: `long double f(long
-        // double x){return x;}` ran 8-byte plumbing before this gate.
+        // width gate — an F16 (or other unencoded-FPR) PARAMETER would otherwise
+        // plumb through a width-0 (64-bit) FPR move (widthFlagsForType defaults
+        // them to 0), silently truncating the value. F80/F128 are handled above.
         if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR Arg")) return;
         // Cycle 3d: Arg's result reg class follows the parameter type
         // (F32/F64 → FPR; integer/ptr → GPR). ML7 callconv lowering
@@ -1950,6 +2089,21 @@ struct Lowerer {
     void lowerReturnPiece(MirInstId id) {
         if (!opcode(MnemonicSlot::RetPiece).has_value()) {
             reportMissingOpcode(MnemonicSlot::RetPiece, "MIR ReturnPiece");
+            return;
+        }
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the SCALAR RetPiece captures
+        // from the cc's per-class return register (lir_callconv), which for an FPR
+        // piece is a d-register (returnFprs). A 16-byte binary128 HFA piece (F128,
+        // piece 1..N-1 of a multi-Q return) lives in a v-register (returnVrs), so
+        // this scalar capture would read the WRONG file (8 of 16 bytes). The
+        // 1-element HFA (the LD-4 runtime witness) has NO piece 1..N-1 (piece 0 is
+        // the call's own result, captured via lowerCall's F128 arm), so this never
+        // fires there; a 2+-element binary128 HFA RETURN captured at the CALLER is
+        // beyond the witness — fail loud rather than silently mis-file it (the
+        // callee side already lowers it via lowerReturn's per-piece vrRet loop).
+        if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+            reportUnsupported(MirOpcode::ReturnPiece, id);
+            poisonValue(id);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
@@ -2719,6 +2873,563 @@ struct Lowerer {
         return result;
     }
 
+    // ── D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit long-double ──────
+    //
+    // THE REPRESENTATION: an F80 SSA value is represented by the ADDRESS of its
+    // 16-byte memory home (the x87 stack st0-7 is invisible to the flat linear-
+    // scan allocator, so F80 never lives in a register). Two home flavours,
+    // both reached uniformly through `regForValue(id)`:
+    //   * a Load address-propagates — the value IS the source pointer (entered
+    //     in `valueToReg`); no bytes move, the consumer's fld reads through it.
+    //   * an arithmetic RESULT gets a FRESH body-local stack home reserved via
+    //     the c69 alloca substrate and recorded in `allocaSlotIndex_`, so
+    //     `regForValue` rematerializes its address with a tiny-range
+    //     `lea_frame_slot` at EACH use (never one long-lived vreg — a spilled
+    //     alloca-result vreg would trip callconv's "alloca result must be
+    //     physical" wall).
+    // Every F80 op is a FIXED memory→memory instruction sequence over these
+    // addresses that starts AND ends with an EMPTY x87 stack (the idiv implicit-
+    // RAX/RDX precedent) — zero register-allocator changes.
+
+    // The on-disk / in-frame size of an x87 long double (10 significant bytes
+    // padded to the 16-byte, 16-aligned SysV/darwin slot; matches
+    // scalarByteSize(F80)).
+    static constexpr std::uint32_t kF80StorageBytes = 16;
+
+    // Reserve a fresh `bytes`-sized body-local stack home and return its
+    // scan-order slot index (address materialized on demand via
+    // `emitLeaFrameSlot`). Reuses the C-local `alloca` substrate: the op
+    // reserves the slot (lir_callconv lays it out) and its reservation vreg is
+    // def-only/tiny-range. MUST increment `allocaLirCount_` so every SUBSEQUENT
+    // real MIR alloca's scan-order slot index stays in lockstep (a divergence
+    // would overlap two frame slots — a silent miscompile). nullopt (fail-loud)
+    // if the target declares no `alloca`/`lea_frame_slot` (never on x86_64).
+    [[nodiscard]] std::optional<std::uint32_t>
+    emitF80ScratchSlot(std::uint32_t bytes, std::string_view context) {
+        auto const allocaOp = opcode(MnemonicSlot::Alloca);
+        if (!allocaOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Alloca, context);
+            return std::nullopt;
+        }
+        if (!opcode(MnemonicSlot::LeaFrameSlot).has_value()) {
+            reportMissingOpcode(MnemonicSlot::LeaFrameSlot, context);
+            return std::nullopt;
+        }
+        LirReg const reservation = lir.newVReg(LirRegClass::GPR);  // def-only
+        emitInst(*allocaOp, reservation, std::span<LirOperand const>{},
+                 /*payload=*/bytes);
+        std::uint32_t const slotIndex = allocaLirCount_;
+        ++allocaLirCount_;
+        return slotIndex;
+    }
+
+    // Emit one x87 MEMORY op (fld_m80 / fstp_m80 / fisttp_m32) addressing
+    // [addrReg + 0]. Operand shape mirrors the universal load/store memory form
+    // ([base, MemBase(scale), MemOffset(disp)]); there is NO LIR result (the
+    // datum flows through the implicit x87 stack). Fail-loud if undeclared.
+    [[nodiscard]] bool emitX87MemOp(MnemonicSlot slot, LirReg addrReg,
+                                    std::string_view context) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) { reportMissingOpcode(slot, context); return false; }
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(addrReg),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*op, InvalidLirReg, ops);
+        return true;
+    }
+
+    // Emit one BARE x87 stack op (faddp/fsubp/fmulp/fdivp) — no operands, no
+    // result; it combines st1 OP st0 and pops. Fail-loud if undeclared.
+    [[nodiscard]] bool emitX87StackOp(MnemonicSlot slot,
+                                      std::string_view context) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) { reportMissingOpcode(slot, context); return false; }
+        emitInst(*op, InvalidLirReg, std::span<LirOperand const>{});
+        return true;
+    }
+
+    // MIR F80 Load → address propagation (the loaded value IS the source
+    // pointer). Correct for the LD-1 slice: loads are consumed before the
+    // source memory is mutated. (A value-copy variant into a fresh home — which
+    // removes the residual aliasing hazard of `ld x = a; a = ...; use(x)` — is a
+    // later refinement; the x87-arith arc is scoped to the straight-line witness
+    // this cycle.)
+    void lowerF80Load(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::Load, id);
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const addr = regForValue(operands[0]);
+        if (!addr.has_value()) { poisonValue(id); return; }
+        defineValue(id, *addr);
+    }
+
+    // MIR F80 Store → memory→memory copy of the 80-bit datum:
+    //   fld_m80 [value-addr] ; fstp_m80 [dest-addr]
+    // operand[0] = the F80 value (a GPR-held address), [1] = the dest pointer.
+    void lowerF80Store(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        std::optional<LirReg> const valueAddr = regForValue(operands[0]);
+        std::optional<LirReg> const destAddr  = regForValue(operands[1]);
+        if (!valueAddr.has_value() || !destAddr.has_value()) return;
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *valueAddr,
+                          "MIR F80 Store (load value)")) return;
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, *destAddr,
+                          "MIR F80 Store (store dest)")) return;
+    }
+
+    // MIR F80 FAdd/FSub/FMul/FDiv → the fixed x87 memory sequence:
+    //   fld_m80 [a] ; fld_m80 [b] ; f{add,sub,mul,div}p ; fstp_m80 [home]
+    // Push order a THEN b (st1=a, st0=b), so the register-implicit fXXXp computes
+    // st1 OP st0 = a OP b — the correct C operand order for the non-commutative
+    // fsubp (a−b) / fdivp (a/b). The result's fresh 16-byte stack home is
+    // recorded in `allocaSlotIndex_`, so consumers rematerialize its address.
+    void lowerF80Arith(MirInstId id, MnemonicSlot combineSlot) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const aAddr = regForValue(operands[0]);
+        std::optional<LirReg> const bAddr = regForValue(operands[1]);
+        if (!aAddr.has_value() || !bAddr.has_value()) { poisonValue(id); return; }
+        auto const slotIndex =
+            emitF80ScratchSlot(kF80StorageBytes, "MIR F80 arithmetic result");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
+        if (!homeAddr.has_value()) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *aAddr,
+                          "MIR F80 arithmetic (push a)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *bAddr,
+                          "MIR F80 arithmetic (push b)")) { poisonValue(id); return; }
+        if (!emitX87StackOp(combineSlot,
+                            "MIR F80 arithmetic (combine)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, *homeAddr,
+                          "MIR F80 arithmetic (store result)")) { poisonValue(id); return; }
+        // The result value IS its stack home; consumers rematerialize the
+        // address via regForValue (the alloca-index remat path) — NOT a long-
+        // lived vreg.
+        allocaSlotIndex_.emplace(id.v, *slotIndex);
+    }
+
+    // MIR FPToSI from an F80 source → the x87 truncating-store sequence:
+    //   fld_m80 [src] ; fisttp_m32 [slot] ; mov r32, [slot]
+    // FISTTP (SSE3) truncates toward zero with no control-word touch — the C
+    // cast's round-toward-zero for free. This slice ships the m32int form (the
+    // `(int)ld` the LD-1 witness needs); a wider (I64) or sub-32 result has no
+    // x87 truncating-store form here and fails loud rather than mis-sizing.
+    void lowerF80ToSI(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::FPToSI, id);
+            poisonValue(id);
+            return;
+        }
+        std::uint8_t const resultWidth =
+            memAccessWidthFlags(mir.instType(id), LirRegClass::GPR);
+        if (lirInstWidthBits(resultWidth) != 32) {
+            reportUnsupported(MirOpcode::FPToSI, id);
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const srcAddr = regForValue(operands[0]);
+        if (!srcAddr.has_value()) { poisonValue(id); return; }
+        auto const slotIndex = emitF80ScratchSlot(4, "MIR F80→int slot");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!slotAddr.has_value()) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *srcAddr,
+                          "MIR F80→int (push)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FisttpM32, *slotAddr,
+                          "MIR F80→int (truncating store)")) { poisonValue(id); return; }
+        auto const loadOp = classOp(LirRegClass::GPR, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                 "MIR F80→int (reload)");
+            poisonValue(id);
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 3> ldOps{
+            LirOperand::makeReg(*slotAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*loadOp, result, ldOps, /*payload=*/0, kLirInstFlagWidth32);
+        defineValue(id, result);
+    }
+
+    // ── D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): call-boundary lowering ───
+    //
+    // Extends the LD-1/LD-2 memory-resident model to USER call boundaries. NO
+    // register-allocation model is added: an F80/F128 value is still the GPR-held
+    // ADDRESS of its 16-byte home; the physical arg/return registers (st0 for
+    // SysV x87; v0..v7 for AAPCS64 binary128, read from the cc's argVrs/returnVrs
+    // config) are transient scratch marshalled around the boundary. Dispatch is
+    // on TypeKind::F80 / TypeKind::F128 only (each forms solely on its own format
+    // axis) + config — never an arch/format identity branch.
+
+    // A SysV x87 80-bit `long double` PARAMETER (received on the incoming stack —
+    // MEMORY class). Its MIR `Arg` carries the incoming-overflow BYTE OFFSET as
+    // its argIndex (set by the callee param loop, mirroring the straddled-
+    // aggregate arm). Materialize the incoming home ADDRESS via
+    // `recv_by_value_stack_param` (byteOff payload → a lea into the incoming
+    // overflow area, exactly like a stacked aggregate) — a plain GPR result that
+    // IS the F80 value's address (the memory-resident model). NO width gate, NO
+    // SSE plumbing.
+    void lowerF80Arg(MirInstId id) {
+        if (!opcode(MnemonicSlot::RecvByValueStackParam).has_value()) {
+            reportMissingOpcode(MnemonicSlot::RecvByValueStackParam, "MIR F80 Arg");
+            poisonValue(id);
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // the home address
+        emitInst(*opcode(MnemonicSlot::RecvByValueStackParam), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.argIndex(id));
+        defineValue(id, result);
+    }
+
+    // An AAPCS64 IEEE binary128 `long double` PARAMETER (or a binary128 HFA
+    // piece) arrives in a physical arg V-register v0..v7 — its MIR `Arg` argIndex
+    // is the NSRN ordinal (shared with argFprs, so an F64 and an F128 sharing a
+    // signature never collide). SPILL it to a fresh 16-byte memory home at entry
+    // (fstur_q [home] <- v{k}) — the memory-resident F128 model (the value IS its
+    // home address, recorded in allocaSlotIndex_ so consumers rematerialize it).
+    // SAFE BY POSITION: nothing is live before entry, so reading the physical
+    // v-reg as the store source cannot be clobbered (the LD-2 transient-scratch
+    // precedent, entry side). NSRN past the pool (>8 F128 params, spilled to the
+    // incoming stack) carries no byte-offset here (the AAPCS64 param loop keeps
+    // the ordinal, not a byte offset) — fail loud rather than misread it.
+    void lowerF128Arg(MirInstId id) {
+        auto const* cc = target.callingConvention(0);
+        std::uint32_t const ord = mir.argIndex(id);
+        if (cc == nullptr || ord >= cc->argVrs.size()) {
+            reportUnsupported(MirOpcode::Arg, id);
+            poisonValue(id);
+            return;
+        }
+        auto const vrOrd = target.registerByName(cc->argVrs[ord]);
+        if (!vrOrd.has_value()) {
+            reportUnsupported(MirOpcode::Arg, id);
+            poisonValue(id);
+            return;
+        }
+        auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::VR, RegClassOp::Store, "MIR F128 Arg");
+            poisonValue(id);
+            return;
+        }
+        auto const slotIndex =
+            emitF80ScratchSlot(kF80StorageBytes, "MIR F128 Arg home");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
+        if (!homeAddr.has_value()) { poisonValue(id); return; }
+        LirReg const argPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+        // fstur_q [home] <- v{k} — the shipped vr-class store shape
+        // ([value, base, MemBase, MemOffset]), mirroring the LD-2 softcall result
+        // store exactly.
+        std::array<LirOperand, 4> stOps{
+            LirOperand::makeReg(argPhys),
+            LirOperand::makeReg(*homeAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*storeOp, InvalidLirReg, stOps);
+        allocaSlotIndex_.emplace(id.v, *slotIndex);
+    }
+
+    // ── D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): IEEE binary128 softcall ──
+    //
+    // THE REPRESENTATION mirrors LD-1's F80: an F128 SSA value is the GPR-held
+    // ADDRESS of its 16-byte memory home (a 128-bit VR register is invisible to
+    // the flat linear-scan allocator, so F128 never lives in a register as a
+    // VALUE). Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
+    // realizes it as a CALL to a config'd softfloat helper (`__addtf3` …): the
+    // operands are marshalled into the config'd physical arg registers (v0/v1 —
+    // transient scratch, the x87 st0/st1 precedent), `BL <helper>`, and the
+    // config'd result register is captured to a fresh home. The `BL` (a `Call`
+    // opcode, isCall=true) clobbers the caller-saved v0-v7/x0-x18, so regalloc
+    // spills any live d-reg/gpr around it — zero register-allocator changes for
+    // VALUES (the F128 value stays memory-resident).
+
+    // Realize an F128 op as a softfloat-helper CALL. The GENERIC verb — it
+    // reads the helper symbol + arg/result register NAMES from `cfg` (a
+    // `wideFloatSoftcalls[]` row) and projects them; it keys on NOTHING
+    // target/format-specific (the caller already proved `wideFloatSoftcall(op)
+    // != nullptr`). `op` selects only the diagnostic scope; `cfg` carries all
+    // the realization data.
+    void lowerWideFloatSoftcall(MirInstId id, WideFloatOp /*op*/,
+                                WideFloatSoftcall const& cfg) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != cfg.argRegisterNames.size()
+            || operands.size() != cfg.argRegisterOrdinals.size()) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        bool const f128Result =
+            interner.kind(mir.instType(id)) == TypeKind::F128;
+        // For an F128 result, reserve its 16-byte home + materialize the
+        // address BEFORE the operand loads (the lowerF80Arith scratch-first
+        // order): the home-address vreg is a GPR live across the BL — regalloc
+        // parks it in a callee-saved register — ready to receive the result
+        // store immediately after the call, keeping fldur/fldur/call/fstur
+        // contiguous. (A `to_i32` int result needs no home.)
+        std::optional<std::uint32_t> resultSlotIndex;
+        std::optional<LirReg>        resultHomeAddr;
+        if (f128Result) {
+            resultSlotIndex =
+                emitF80ScratchSlot(kF80StorageBytes, "MIR F128 softcall result");
+            if (!resultSlotIndex.has_value()) { poisonValue(id); return; }
+            resultHomeAddr = emitLeaFrameSlot(*resultSlotIndex);
+            if (!resultHomeAddr.has_value()) { poisonValue(id); return; }
+        }
+        // 1. Marshal each operand into its config'd physical arg register.
+        for (std::size_t i = 0; i < operands.size(); ++i) {
+            std::uint16_t const argOrd = cfg.argRegisterOrdinals[i];
+            auto const* argInfo = target.registerInfo(argOrd);
+            if (argInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(id), id);
+                poisonValue(id);
+                return;
+            }
+            LirRegClass const argCls =
+                static_cast<LirRegClass>(argInfo->regClass);
+            LirReg const argPhys = makePhysicalReg(argOrd, argCls);
+            std::optional<LirReg> const src = regForValue(operands[i]);
+            if (!src.has_value()) { poisonValue(id); return; }
+            if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
+                // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
+                // into the physical arg register with the class's load op
+                // (fldur_q), the same [base, MemBase, MemOffset] shape lowerLoad
+                // uses.
+                auto const loadOp = classOp(argCls, RegClassOp::Load);
+                if (!loadOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Load,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return;
+                }
+                std::array<LirOperand, 3> ldOps{
+                    LirOperand::makeReg(*src),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(0),
+                };
+                emitInst(*loadOp, argPhys, ldOps);
+            } else {
+                // Register-resident (an F64/F32 source of `from_f64`): MOVE the
+                // vreg into the physical arg register with the class's move op
+                // (fmov). Width-blind copy (the D-form fmov preserves the value).
+                auto const moveOp = classOp(argCls, RegClassOp::Move);
+                if (!moveOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Move,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return;
+                }
+                std::array<LirOperand, 1> mvOps{LirOperand::makeReg(*src)};
+                emitInst(*moveOp, argPhys, mvOps);
+            }
+        }
+        // 2. The CALL: resolve/mint the extern, emit the format-appropriate
+        //    call opcode with a BARE [SymbolRef] operand list — DELIBERATELY
+        //    bypassing the callconv arg-classifier (the args are already pinned
+        //    in their physical registers; this internal controlled call must
+        //    NOT open the general F128-user-call path the LD-4 walls keep shut).
+        auto const sym =
+            resolveWideFloatSoftcallExtern(cfg.helperSymbol, "MIR F128 softcall");
+        if (!sym.has_value()) { poisonValue(id); return; }
+        bool const useIndirect = externCallDispatch_.has_value()
+            && externCallUsesIndirectShape(*externCallDispatch_);
+        MnemonicSlot const callSlot = useIndirect
+            ? MnemonicSlot::CallIndirectViaExtern
+            : MnemonicSlot::Call;
+        if (!opcode(callSlot).has_value()) {
+            reportMissingOpcode(callSlot, "MIR F128 softcall (call)");
+            poisonValue(id);
+            return;
+        }
+        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(sym->v)};
+        emitInst(*opcode(callSlot), InvalidLirReg, callOps);
+        // 3. Capture the config'd physical result register.
+        std::uint16_t const resOrd = cfg.resultRegisterOrdinal;
+        auto const* resInfo = target.registerInfo(resOrd);
+        if (resInfo == nullptr) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        LirRegClass const resCls = static_cast<LirRegClass>(resInfo->regClass);
+        LirReg const resPhys = makePhysicalReg(resOrd, resCls);
+        if (f128Result) {
+            // F128 result: STORE the physical result register into the home
+            // reserved above; the value IS its home address (recorded in
+            // allocaSlotIndex_ so consumers rematerialize it), exactly like
+            // lowerF80Arith. The store shape [value, base, MemBase, MemOffset]
+            // mirrors the shipped fstur_q row + the generic FPR store.
+            auto const storeOp = classOp(resCls, RegClassOp::Store);
+            if (!storeOp.has_value()) {
+                reportMissingClassOp(resCls, RegClassOp::Store,
+                                     "MIR F128 softcall (store result)");
+                poisonValue(id);
+                return;
+            }
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(resPhys),
+                LirOperand::makeReg(*resultHomeAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps);
+            allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
+        } else {
+            // Non-F128 result (the `to_i32` int32): MOVE the physical result
+            // register into a fresh result vreg (the idiv implicit-RAX-capture
+            // precedent — width-default GPR copy, the low 32 bits are the int).
+            auto const moveOp = classOp(resCls, RegClassOp::Move);
+            if (!moveOp.has_value()) {
+                reportMissingClassOp(resCls, RegClassOp::Move,
+                                     "MIR F128 softcall (capture result)");
+                poisonValue(id);
+                return;
+            }
+            LirReg const result = lir.newVReg(resCls);
+            std::array<LirOperand, 1> mvOps{LirOperand::makeReg(resPhys)};
+            emitInst(*moveOp, result, mvOps);
+            defineValue(id, result);
+        }
+    }
+
+    // MIR F128 Store -> a memory->memory copy of the 16-byte datum as TWO
+    // 8-byte GPR words (NO VR needed — the F128 "value" operand is itself a
+    // 16-byte home ADDRESS, memory-resident). operands[0] = the F128 value (a
+    // GPR-held address), [1] = the dest pointer. Mirrors lowerF80Store's
+    // memory->memory shape, but as GPR load/store pairs (there is no x87 stack
+    // on arm64).
+    void lowerF128Store(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        std::optional<LirReg> const valueAddr = regForValue(operands[0]);
+        std::optional<LirReg> const destAddr  = regForValue(operands[1]);
+        if (!valueAddr.has_value() || !destAddr.has_value()) return;
+        auto const loadOp  = classOp(LirRegClass::GPR, RegClassOp::Load);
+        auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                 "MIR F128 Store");
+            return;
+        }
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store,
+                                 "MIR F128 Store");
+            return;
+        }
+        for (std::int32_t const offset : {0, 8}) {
+            LirReg const tmp = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 3> ldOps{
+                LirOperand::makeReg(*valueAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(offset),
+            };
+            emitInst(*loadOp, tmp, ldOps);
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(tmp),
+                LirOperand::makeReg(*destAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(offset),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps);
+        }
+    }
+
+    // Resolve (or MINT) the extern import for softfloat helper `helperSymbol`.
+    // Self-serve LIR-tier synthesis: on first use of a helper in this CU it
+    // mints a fresh SymbolId + an ExternImport bound to the active format's
+    // softcall library, memoizes it, and accumulates it in
+    // `newWideFloatExterns_` (run()'s tail moves it into the result — the
+    // propagation chain lowerToLir -> result.externImports -> assemble() ->
+    // linker is pre-wired). Deduped within the CU. Reuses a user-supplied
+    // import if the program already imported the helper. nullopt (fail-loud)
+    // when the format declares no runtime-library binding OR no extern-call
+    // dispatch shape (never mint an unbound / undispatchable extern).
+    [[nodiscard]] std::optional<SymbolId>
+    resolveWideFloatSoftcallExtern(std::string const& helperSymbol,
+                                   std::string_view context) {
+        // 1. Already minted/seen in this CU?
+        if (auto it = softcallExternByHelper_.find(helperSymbol);
+            it != softcallExternByHelper_.end()) {
+            return it->second;
+        }
+        // 2. The user already imported this symbol? Reuse its SymbolId (never
+        //    mint a duplicate → "declared more than once" at link).
+        if (auto it = suppliedExternByName_.find(helperSymbol);
+            it != suppliedExternByName_.end()) {
+            softcallExternByHelper_.emplace(helperSymbol, it->second);
+            return it->second;
+        }
+        // 3. Minting needs a runtime-library binding — fail loud if the active
+        //    format declares none (D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH).
+        if (!wideFloatSoftcallLibrary_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: F128 softcall needs a runtime-library binding but the "
+                    "active format declares none — helper '{}' cannot be "
+                    "imported. Declare the library in the target's "
+                    "`wideFloatSoftcallLibraryByFormat` for this format "
+                    "(D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH).",
+                    context, helperSymbol));
+            return std::nullopt;
+        }
+        // Lazily re-assert the D-FFI-EXTERN-CALL-DISPATCH gate: the ctor's gate
+        // fires only when the caller-supplied externImports was NON-empty, so a
+        // module whose ONLY extern is this minted softcall must still have a
+        // dispatch shape + the dispatch-appropriate call opcode (else the
+        // call-site has no defined form — the ctor-gate rationale, one level in).
+        if (!externCallDispatch_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: F128 softcall to '{}' needs an extern-call dispatch "
+                    "shape but the active object format declares none — declare "
+                    "`externCallDispatch` in the format's `.format.json` "
+                    "(D-FFI-EXTERN-CALL-DISPATCH).",
+                    context, helperSymbol));
+            return std::nullopt;
+        }
+        MnemonicSlot const needSlot =
+            externCallUsesIndirectShape(*externCallDispatch_)
+                ? MnemonicSlot::CallIndirectViaExtern
+                : MnemonicSlot::Call;
+        if (!opcode(needSlot).has_value()) {
+            reportMissingOpcode(needSlot,
+                                "MIR F128 softcall (extern-call dispatch)");
+            return std::nullopt;
+        }
+        // 4. Mint. Draw the SymbolId from the shared monotone `nextBlockSym_`
+        //    sequence (collision-free: seeded past every func/global/extern id)
+        //    and record it in `externSymbols` so any downstream extern-aware
+        //    site treats it correctly.
+        SymbolId const sym = mintJumpTableSymbol();
+        ExternImport imp;
+        imp.symbol      = sym;
+        imp.mangledName = helperSymbol;
+        imp.libraryPath = *wideFloatSoftcallLibrary_;
+        imp.isData      = false;
+        imp.version     = "";   // unversioned → binds the default @@GCC_3.0
+        externSymbols.insert(sym.v);
+        newWideFloatExterns_.push_back(std::move(imp));
+        softcallExternByHelper_.emplace(helperSymbol, sym);
+        return sym;
+    }
+
     // c116 H1 (D-WIN64-SEH-FUNCLETS): lower `RecoverParentFrameSlot(establisher)`
     // (payload = the parent-local slot index) to the LIR `recover_parent_frame_slot`
     // op — operand[0] = the establisher-frame base register, payload = the slot
@@ -2749,6 +3460,17 @@ struct Lowerer {
     void lowerLoad(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) / -IEEE128-ARITH (LD-2): an
+        // F80 (x87 80-bit) OR F128 (IEEE binary128) load does NOT read into a
+        // register — the value lives in MEMORY and its LIR representation IS its
+        // memory address (address propagation, reused verbatim by both wide-
+        // float memory-resident models). Route it to the dedicated path BEFORE
+        // the riprel fold / class-op selection (whose FPR movsd_load / fldur
+        // would be a wrong-width scalar read of a 16-byte value). lowerF80Load
+        // is width/type-agnostic (pure address propagation) — one-line widen.
+        if (interner.kind(mir.instType(id)) == TypeKind::F80
+            || interner.kind(mir.instType(id)) == TypeKind::F128)
+            return lowerF80Load(id);
         // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): the
         // address comes from a single-use GlobalAddr whose lea was
         // elided (see `lowerGlobalAddr`) — emit the load's declared
@@ -2822,6 +3544,20 @@ struct Lowerer {
     void lowerStore(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): storing an F128 value is a
+        // memory→memory copy of the 16-byte datum as two GPR words — the "value"
+        // operand is itself a memory ADDRESS, not a register. Sibling of the F80
+        // store below; intercept before the width gate (which still walls the
+        // Arg/Call/Return F128 boundaries — LD-4).
+        if (interner.kind(mir.instType(operands[0])) == TypeKind::F128)
+            return lowerF128Store(id);
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): storing an F80 value is a
+        // memory→memory copy of the 80-bit datum (fld_m80 [value-addr];
+        // fstp_m80 [dest-addr]) — the "value" operand is itself a memory
+        // ADDRESS, not a register. Intercept before the SSE Store-value width
+        // gate (which still walls the Arg/Call/Return F80 boundaries — LD-4).
+        if (interner.kind(mir.instType(operands[0])) == TypeKind::F80)
+            return lowerF80Store(id);
         // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): width gate on the
         // stored VALUE — memAccessWidthFlags defaults F80/F128 to width 0 =
         // an 8-byte movsd/STUR of a 16-byte value (the Load side has gated
@@ -3182,6 +3918,16 @@ struct Lowerer {
         }
         MirInstId const user = it->second.user;
         if (mir.instOpcode(user) != MirOpcode::Load) return false;
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) / -IEEE128-ARITH (LD-2): an F80
+        // (x87 80-bit) OR F128 (IEEE binary128) load is NEVER foldable. Its
+        // regClass is FPR and its width flags default to 0 (=64), so the probe
+        // below WOULD match a width-64 [symbol] riprel load variant — an 8-byte
+        // scalar read of a 16-byte value (a silent wrong-width miscompile; and
+        // the value cannot live in a scalar float register at all). Keep the lea
+        // so the memory-resident load path (lowerF80Load) reads a GPR base
+        // register for its fldur_q / fld_m80.
+        if (interner.kind(mir.instType(user)) == TypeKind::F80
+            || interner.kind(mir.instType(user)) == TypeKind::F128) return false;
         auto const userOps = mir.instOperands(user);
         if (userOps.size() != 1 || userOps[0].v != gaId.v) return false;
         // Probe the load's class-op mnemonic for a [symbol] variant at
@@ -3847,74 +4593,199 @@ struct Lowerer {
             return;
         }
 
-        // Resolve every arg operand's register FIRST (the hoist discipline:
-        // a mid-build bail-out must not leave a partial operand list dangling).
-        // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): an operand whose
-        // defining MIR op is `ByValueStackArg` is the by-value-aggregate stack-arg
-        // carrier — its (already-resolved) register holds the temp ADDRESS and it
-        // expands to TWO LIR operands (the address Reg + a `ByValueStackAgg` size
-        // marker). For a normal operand it's a single Reg. We resolve all the regs
-        // up front, then build `ops` (so the partial-list hazard can't happen).
-        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
-        std::vector<LirReg> argRegs;
-        argRegs.reserve(operands.size());
-        for (std::size_t i = firstArgIdx; i < operands.size(); ++i) {
-            std::optional<LirReg> const r = regForValue(operands[i]);
-            if (!r.has_value()) return;
-            argRegs.push_back(*r);
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the long-double call
+        // boundary. An F128 value arg is marshalled into a physical v-register
+        // (AAPCS64, NOT operand-listed — lir_callconv never sees it, exactly like
+        // the LD-2 softcall's hand-placed args); an F80/F128 RESULT is captured
+        // from st0/v0 AFTER the call. F80 ARGS ride the existing ByValueStackArg
+        // carriers (SysV stack) unchanged — no F80 arg code here. The callee is
+        // ALWAYS operands[0] (a GlobalAddr → SymbolRef, else the callee reg);
+        // args are operands[1..].
+        TypeId const resultTy = mir.instType(id);
+        TypeKind const resultKind =
+            resultTy.valid() ? interner.kind(resultTy) : TypeKind::Void;
+        bool const resultIsF80  = resultKind == TypeKind::F80;
+        bool const resultIsF128 = resultKind == TypeKind::F128;
+        bool const isVoid = !resultTy.valid() || resultKind == TypeKind::Void;
+        auto const poisonIfValueResult = [&] {
+            if (!isVoid) poisonValue(id);
+        };
+        // Pre-scan the args: an F128 arg MIXED with a non-F128 FPR (F32/F64) arg
+        // is unsupported — the NSRN interleaving between hand-placed v-registers
+        // and lir_callconv-placed d-registers is not modeled. Fail loud (never a
+        // silent register skew; the witness signatures are all-F128 or F128+GPR).
+        bool sawF128Arg = false, sawNonF128Fpr = false;
+        for (std::size_t i = 1; i < operands.size(); ++i) {
+            TypeKind const ak = interner.kind(mir.instType(operands[i]));
+            if (ak == TypeKind::F128) sawF128Arg = true;
+            else if (ak == TypeKind::F32 || ak == TypeKind::F64) sawNonF128Fpr = true;
+        }
+        if (sawF128Arg && sawNonF128Fpr) {
+            reportUnsupported(MirOpcode::Call, id);
+            poisonIfValueResult();
+            return;
         }
 
-        // Build the LIR operand list.
-        // Direct: [SymbolRef(sym), arg0, arg1, ...]
-        // Indirect-via-extern: [SymbolRef(sym), arg0, arg1, ...] —
-        //     same shape; the SymbolRef tags an extern (resolved to
-        //     IAT slot RVA at link time; the opcode encoding
-        //     dereferences it).
-        // Indirect (fn-pointer): [callee_reg, arg0, arg1, ...]
-        //     (FC4 c2 — materialized as `call <reg>` by lir_callconv
-        //     against the schema's `["reg"]` encoding variant).
-        // A by-value-stack aggregate arg expands to [..., addrReg, ByValueStackAgg].
+        auto const* cc = target.callingConvention(0);
+
+        // Reserve the long-double RESULT home BEFORE marshalling/the call (the
+        // LD-2 softcall order): the home-address vreg is a GPR live across the
+        // call — regalloc parks it callee-saved — ready for the result capture
+        // IMMEDIATELY after the call (fstp_m80/fstur_q adjacency; st0/v0 survive
+        // the call, invisible/non-allocatable).
+        std::optional<std::uint32_t> resultSlotIndex;
+        std::optional<LirReg>        resultHomeAddr;
+        if (resultIsF80 || resultIsF128) {
+            resultSlotIndex = emitF80ScratchSlot(
+                kF80StorageBytes,
+                resultIsF80 ? "MIR F80 call result" : "MIR F128 call result");
+            if (!resultSlotIndex.has_value()) { poisonValue(id); return; }
+            resultHomeAddr = emitLeaFrameSlot(*resultSlotIndex);
+            if (!resultHomeAddr.has_value()) { poisonValue(id); return; }
+        }
+
+        // Build the operand list + collect the F128 arg marshals. Resolve every
+        // reg FIRST (the hoist discipline). Direct: [SymbolRef(sym), args...];
+        // indirect: [callee_reg, args...]. A by-value-stack aggregate carrier
+        // (an F80/SysV arg, or a stacked struct) expands to (addrReg,
+        // ByValueStackAgg). An F128 arg is collected for the v-register burst,
+        // NOT operand-listed; `nsrn` tracks each F128 arg's shared FPR ordinal.
         std::vector<LirOperand> ops;
-        ops.reserve(argRegs.size() + 2);
+        ops.reserve(operands.size() + 2);
         if (calleeIsGlobalAddr) {
             ops.push_back(LirOperand::makeSymbolRef(calleeSym.v));
+        } else {
+            std::optional<LirReg> const callee = regForValue(operands[0]);
+            if (!callee.has_value()) return;
+            ops.push_back(LirOperand::makeReg(*callee));
         }
-        for (std::size_t k = 0; k < argRegs.size(); ++k) {
-            MirInstId const operandMir = operands[firstArgIdx + k];
-            ops.push_back(LirOperand::makeReg(argRegs[k]));
+        std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, vrOrd)
+        std::uint32_t nsrn = 0;
+        for (std::size_t i = 1; i < operands.size(); ++i) {
+            MirInstId const operandMir = operands[i];
+            TypeKind const ak = interner.kind(mir.instType(operandMir));
+            if (ak == TypeKind::F128) {
+                if (cc == nullptr || nsrn >= cc->argVrs.size()) {
+                    reportUnsupported(MirOpcode::Call, id);
+                    poisonIfValueResult();
+                    return;
+                }
+                auto const vrOrd = target.registerByName(cc->argVrs[nsrn]);
+                if (!vrOrd.has_value()) {
+                    reportUnsupported(MirOpcode::Call, id);
+                    poisonIfValueResult();
+                    return;
+                }
+                std::optional<LirReg> const home = regForValue(operandMir);
+                if (!home.has_value()) return;
+                f128Marshals.emplace_back(*home, *vrOrd);
+                ++nsrn;
+                continue;
+            }
+            std::optional<LirReg> const r = regForValue(operandMir);
+            if (!r.has_value()) return;
+            ops.push_back(LirOperand::makeReg(*r));
             if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
-                // The preceding Reg is the aggregate's temp address; this marker
-                // carries the byte size + the exhaust class (the MIR op's payload,
-                // per the shared kByValueStackArg* encoding) so lir_callconv reserves
-                // ceil(size / outgoingSlot) overflow slots + byte-copies the temp into
-                // the outgoing area instead of register-passing it, AND clamps the
-                // exhausted arg-cursor (AAPCS64) so a later same-class arg also stacks.
+                // The preceding Reg is the aggregate/F80 temp address; this marker
+                // carries the byte size + exhaust class (the MIR op's payload, per
+                // the shared kByValueStackArg* encoding) so lir_callconv reserves
+                // ceil(size / outgoingSlot) overflow slots + byte-copies the temp
+                // into the outgoing area instead of register-passing it, AND clamps
+                // the exhausted arg-cursor (AAPCS64) so a later same-class arg stacks.
                 std::uint32_t const bvPayload = mir.instPayload(operandMir);
                 ops.push_back(LirOperand::makeByValueStackAgg(
                     bvPayload & kByValueStackArgSizeMask,
                     static_cast<std::uint8_t>(
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
+            } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
+                ++nsrn;   // a non-F128 FPR arg consumes an NSRN slot too
             }
         }
 
-        // Result class follows MIR's result type. Void-returning calls
-        // produce an invalid result vreg (no value).
-        TypeId const resultTy = mir.instType(id);
-        bool const isVoid = !resultTy.valid()
-                         || interner.kind(resultTy) == TypeKind::Void;
-        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's
-        // variadic-payload bits (isVariadic + fixedOperandCount) to the
-        // LIR Call so the post-regalloc ML7 materialize pass can
-        // emit the platform's variadic-call setup (SysV `mov al,
-        // <xmm-arg-count>` etc.). Non-variadic calls keep payload=0.
+        // Marshal each F128 arg into its physical v-register in a TIGHT burst
+        // immediately before the call (all home addresses already resolved) —
+        // preserving the LD-2 marshal→call adjacency so the BL's caller-saved
+        // clobber of the aliased d-regs protects a live double.
+        std::optional<std::uint16_t> vrLoadOp;
+        if (!f128Marshals.empty()) {
+            vrLoadOp = classOp(LirRegClass::VR, RegClassOp::Load);
+            if (!vrLoadOp.has_value()) {
+                reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+                                     "MIR F128 call arg marshal");
+                poisonIfValueResult();
+                return;
+            }
+        }
+        for (auto const& [home, vrOrd] : f128Marshals) {
+            LirReg const argPhys = makePhysicalReg(vrOrd, LirRegClass::VR);
+            std::array<LirOperand, 3> ldOps{
+                LirOperand::makeReg(home),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*vrLoadOp, argPhys, ldOps);
+        }
+
+        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's variadic-payload
+        // bits (isVariadic + fixedOperandCount) to the LIR Call so the post-
+        // regalloc ML7 materialize pass can emit the platform's variadic-call
+        // setup. Non-variadic calls keep payload=0.
         std::uint32_t const payload = mir.instPayload(id);
+
+        if (resultIsF80) {
+            // SysV x87: the F80 return is in st0. Emit the call (no result reg),
+            // then fstp_m80 [home] IMMEDIATELY captures st0 into the home reserved
+            // above (pop). st0 survives the call (invisible to regalloc; nothing
+            // between the call and fstp touches the x87 stack). This UN-WALLS the
+            // former FC17.9(e) F80 Call-result boundary gate.
+            emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
+            if (!emitX87MemOp(MnemonicSlot::FstpM80, *resultHomeAddr,
+                              "MIR F80 call result")) { poisonValue(id); return; }
+            allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
+            return;
+        }
+        if (resultIsF128) {
+            // AAPCS64: the binary128 return is in v0 (returnVrs[0]). Emit the call
+            // (no result reg), then fstur_q [home] <- v0 into the home reserved
+            // above; the value IS its home address (allocaSlotIndex_ → consumers
+            // rematerialize it). UN-WALLS the former F128 Call-result gate.
+            if (cc == nullptr || cc->returnVrs.empty()) {
+                reportUnsupported(MirOpcode::Call, id);
+                poisonValue(id);
+                return;
+            }
+            auto const vrOrd = target.registerByName(cc->returnVrs[0]);
+            auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+            if (!storeOp.has_value()) {
+                reportMissingClassOp(LirRegClass::VR, RegClassOp::Store,
+                                     "MIR F128 call result");
+                poisonValue(id);
+                return;
+            }
+            if (!vrOrd.has_value()) {
+                reportUnsupported(MirOpcode::Call, id);
+                poisonValue(id);
+                return;
+            }
+            emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
+            LirReg const resPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(resPhys),
+                LirOperand::makeReg(*resultHomeAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps);
+            allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
+            return;
+        }
         if (isVoid) {
             emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
             return;
         }
-        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary width
-        // gate on the RESULT — an F80/F128-returning call would otherwise
-        // move the return register through 64-bit plumbing (see lowerArg).
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary width gate
+        // on the RESULT — an F16 (unencoded-FPR) result would otherwise move the
+        // return register through 64-bit plumbing. F80/F128 handled above.
         if (!requireEncodedFloatWidth(id, resultTy, "MIR Call result")) return;
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(callSlot), result, ops, payload);
@@ -6032,10 +6903,65 @@ struct Lowerer {
         // register (cycle-broken) before the ret. Carry every operand as a reg.
         std::vector<LirOperand> ops;
         ops.reserve(operands.size());
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a LOCAL per-class VR return
+        // ordinal for a multi-piece binary128-HFA return (each F128 piece → the
+        // next returnVrs register). Mirrors the caller-side fprRet counter.
+        std::uint32_t vrRet = 0;
         for (MirInstId const operand : operands) {
+            TypeKind const opk = interner.kind(mir.instType(operand));
+            // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a `long double` RETURN
+            // operand is placed into its physical return register HERE (its
+            // memory-resident home is loaded into st0 / v{k}); push NO Reg
+            // operand, so `ops` stays empty for a pure long-double return →
+            // lir_callconv's return-capture loop is a no-op → the epilogue + bare
+            // `ret` leaves the value in st0/v0 exactly as the ABI requires. This
+            // UN-WALLS the former FC17.9(e) F80/F128 Return-operand boundary gate.
+            if (opk == TypeKind::F80) {
+                // SysV x87: fld_m80 [home] pushes the F80 onto st0 BEFORE the
+                // GPR-only epilogue lir_callconv inserts ahead of the `ret`
+                // (st0 survives it — the x87 stack is invisible to regalloc).
+                std::optional<LirReg> const home = regForValue(operand);
+                if (!home.has_value()) return false;
+                if (!emitX87MemOp(MnemonicSlot::FldM80, *home,
+                                  "MIR F80 Return operand")) return false;
+                continue;
+            }
+            if (opk == TypeKind::F128) {
+                // AAPCS64: fldur_q v{returnVrs[k]} <- [home]. The physical
+                // VR write survives to the assembler (no LIR DCE; VR is
+                // non-allocatable) → v0 holds the return at `ret`.
+                auto const* cc = target.callingConvention(0);
+                if (cc == nullptr || vrRet >= cc->returnVrs.size()) {
+                    reportUnsupported(MirOpcode::Return, id);
+                    return false;
+                }
+                auto const vrOrd = target.registerByName(cc->returnVrs[vrRet]);
+                if (!vrOrd.has_value()) {
+                    reportUnsupported(MirOpcode::Return, id);
+                    return false;
+                }
+                auto const loadOp = classOp(LirRegClass::VR, RegClassOp::Load);
+                if (!loadOp.has_value()) {
+                    reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+                                         "MIR F128 Return operand");
+                    return false;
+                }
+                std::optional<LirReg> const home = regForValue(operand);
+                if (!home.has_value()) return false;
+                LirReg const retPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+                std::array<LirOperand, 3> ldOps{
+                    LirOperand::makeReg(*home),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(0),
+                };
+                emitInst(*loadOp, retPhys, ldOps);
+                ++vrRet;
+                continue;
+            }
             // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary
-            // width gate on the RETURN operand — the return-register move is
-            // plain plumbing with no producer gate of its own (see lowerArg).
+            // width gate on the RETURN operand — an F16 (unencoded FPR) return-
+            // register move is plain plumbing with no producer gate of its own
+            // (see lowerArg). F80/F128 are handled above.
             if (!requireEncodedFloatWidth(id, mir.instType(operand),
                                           "MIR Return operand")) return false;
             std::optional<LirReg> const v = regForValue(operand);
@@ -6705,6 +7631,38 @@ struct Lowerer {
             for (std::uint32_t i = 0; i < n; ++i) {
                 MirInstId const inst = mir.blockInstAt(mb, i);
                 if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
+                // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE (LD-1): an F80/F128
+                // (`long double`) phi — a long double crossing a control-flow
+                // JOIN (`cond ? a : b`, a loop-carried long double, or a
+                // mem2reg-promoted F80 local in release) — is NOT yet lowered.
+                // An F80 value is MEMORY-resident (its SSA value is the
+                // GPR-held ADDRESS of its memory home, never an FPR register),
+                // so a phi needs a MEMORY-HOME merge (an fld/fstp copy into a
+                // common home on each edge), NOT the FPR-class edge-move
+                // `regClassFor(inst)` (FPR) would mint below — that would emit
+                // a class-inconsistent `fld [xmm]` MISCOMPILE. Until the merge
+                // lands, WALL it LOUD (poison → the tierClean gate turns this
+                // into a clean fail-loud, no binary), NOT a silent miscompile —
+                // the same discipline as the F80 call-boundary walls. LD-1
+                // realizes STRAIGHT-LINE long double arithmetic only. This
+                // catch-all covers BOTH phi sources (ternary + mem2reg).
+                if (auto const k = interner.kind(mir.instType(inst));
+                    k == TypeKind::F80 || k == TypeKind::F128) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "long double (F80/F128) control-flow merge (phi, inst "
+                        "{}) is not yet lowered — a `long double` value crossing "
+                        "a control-flow join (`cond ? a : b`, a loop-carried "
+                        "long double) needs the memory-home merge "
+                        "(D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE). LD-1 realizes "
+                        "straight-line long double arithmetic.",
+                        inst.v);
+                    reporter.report(std::move(d));
+                    poisonValue(inst);
+                    continue;
+                }
                 // Cycle 3d FPR plumbing: phi result class follows the
                 // phi's MIR result type. An F64-typed phi (ternary
                 // join on doubles, loop-carried float) must use an
@@ -6930,55 +7888,65 @@ struct Lowerer {
         // a scope live in ONE parent function, so their funcIndex agrees; we key on
         // the begin block's owning function.
         buildSehScopeDescriptors();
-        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: gather each function's max local
-        // alignment. Read once from MIR (types + the Alloca effective-alignment
-        // channel are still present here) and keyed by SymbolId so it survives the
-        // downstream LIR rebuilds. SPARSE: only a function with a local whose
-        // effective alignment EXCEEDS the target's machine WORD (GPR register
-        // width) gets an entry — an alignment ≤ word is always satisfied (every
-        // ABI's post-prologue frame is ≥ word-aligned), so those functions need no
-        // frame-layout attention. The frame layout itself re-decides pad-vs-gate
-        // from the true slot width; this threshold only bounds the list size and
-        // must never MISS a function that could need a pad (hence "> word", the
-        // complete set of alignments the word-aligned base cannot guarantee).
-        std::uint32_t gprWidth = 0;
-        for (auto const& reg : target.registers())
-            if (static_cast<LirRegClass>(reg.regClass) == LirRegClass::GPR
-                && reg.widthBytes > gprWidth)
-                gprWidth = reg.widthBytes;
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN per-alloca alignment list — built
+        // BELOW from the FROZEN LIR (not MIR), see the harvest comment there.
         std::vector<FuncLocalAlignment> funcLocalAlignments;
-        for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
-            MirFuncId const mf = mir.funcAt(fi);
-            std::uint32_t maxLocalAlign = 0;
-            // Per-alloca effective alignment in MIR scan order (== the LIR alloca
-            // placement order; MIR→LIR is block-for-block 1:1). Collected for the
-            // #2 per-alloca frame-slot alignment; the callconv indexes it by the
-            // alloca's scan position. 0 = an alloca that recorded no over-alignment
-            // (a scalar whose natural alignment is ≤ word — its alignUp is a no-op).
-            std::vector<std::uint32_t> perAllocaAlign;
-            std::uint32_t const bc = mir.funcBlockCount(mf);
-            for (std::uint32_t bi = 0; bi < bc; ++bi) {
-                MirBlockId const blk = mir.funcBlockAt(mf, bi);
-                std::uint32_t const ic = mir.blockInstCount(blk);
-                for (std::uint32_t ii = 0; ii < ic; ++ii) {
-                    MirInstId const inst = mir.blockInstAt(blk, ii);
-                    if (mir.instOpcode(inst) == MirOpcode::Alloca) {
-                        std::uint32_t const a = mir.instPayload2(inst);
-                        maxLocalAlign = std::max(maxLocalAlign, a);
-                        perAllocaAlign.push_back(a);
-                    }
-                }
-            }
-            if (maxLocalAlign > gprWidth)
-                funcLocalAlignments.push_back(
-                    FuncLocalAlignment{mir.funcSymbol(mf), maxLocalAlign,
-                                       std::move(perAllocaAlign)});
-        }
         Lir frozen = std::move(lir).finish();
         // Ensure lirToMir spans every LIR inst slot (any trailing
         // slots without recorded sources default to InvalidMirInst).
         if (lirToMir.size() < frozen.nodeCount()) {
             lirToMir.resize(frozen.nodeCount());
+        }
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: gather each function's per-alloca
+        // EFFECTIVE alignment in LIR SCAN ORDER (the order callconv's frame
+        // layout walks). Harvested from the FROZEN LIR — NOT MIR — because since
+        // D-CSUBSET-LONG-DOUBLE-X87-ARITH the LIR alloca set is a SUPERSET of the
+        // MIR one: the F80 lowering synthesizes extra body-local scratch allocas
+        // (an x87 arithmetic RESULT home / the F80→int slot) that have no MIR
+        // alloca, so a MIR scan would under-count and trip callconv's loud
+        // list-length invariant. Each LIR alloca's alignment comes from its MIR
+        // source (via lirToMir → the Alloca's instPayload2 effective-alignment
+        // channel); a SYNTHETIC scratch alloca (whose source is not a MIR Alloca)
+        // has natural alignment ≤ word → 0 (its alignUp is a no-op). SPARSE: only
+        // a function with an over-aligned local (maxLocalAlign > the GPR word)
+        // gets an entry. For a 1:1 MIR↔LIR alloca function (every case before
+        // this cycle) this is byte-identical to the prior MIR scan.
+        std::uint32_t gprWidth = 0;
+        for (auto const& reg : target.registers())
+            if (static_cast<LirRegClass>(reg.regClass) == LirRegClass::GPR
+                && reg.widthBytes > gprWidth)
+                gprWidth = reg.widthBytes;
+        if (auto const allocaOpId = opcode(MnemonicSlot::Alloca);
+            allocaOpId.has_value()) {
+            std::uint32_t const lfnCount =
+                static_cast<std::uint32_t>(frozen.moduleFuncCount());
+            for (std::uint32_t fi = 0; fi < lfnCount; ++fi) {
+                LirFuncId const fn = frozen.funcAt(fi);
+                std::uint32_t maxLocalAlign = 0;
+                std::vector<std::uint32_t> perAllocaAlign;
+                std::uint32_t const bc = frozen.funcBlockCount(fn);
+                for (std::uint32_t bi = 0; bi < bc; ++bi) {
+                    LirBlockId const blk = frozen.funcBlockAt(fn, bi);
+                    std::uint32_t const ic = frozen.blockInstCount(blk);
+                    for (std::uint32_t ii = 0; ii < ic; ++ii) {
+                        LirInstId const inst = frozen.blockInstAt(blk, ii);
+                        if (frozen.instOpcode(inst) != *allocaOpId) continue;
+                        std::uint32_t a = 0;
+                        if (inst.v < lirToMir.size()) {
+                            MirInstId const src = lirToMir[inst.v];
+                            if (src.valid()
+                                && mir.instOpcode(src) == MirOpcode::Alloca)
+                                a = mir.instPayload2(src);
+                        }
+                        maxLocalAlign = std::max(maxLocalAlign, a);
+                        perAllocaAlign.push_back(a);
+                    }
+                }
+                if (maxLocalAlign > gprWidth)
+                    funcLocalAlignments.push_back(
+                        FuncLocalAlignment{frozen.funcSymbol(fn), maxLocalAlign,
+                                           std::move(perAllocaAlign)});
+            }
         }
         // Designated initializers prevent a future field reorder
         // from silently rebinding the positional `{}` for
@@ -6990,7 +7958,12 @@ struct Lowerer {
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
             .signMaskConstants    = std::move(signMaskConstants_),
             .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
-            .externImports        = {},
+            // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the extern imports the
+            // F128 softcall verb MINTED during this lowering walk (empty for
+            // every module without an F128 softcall). `lowerToLir`'s tail
+            // APPENDS the caller-supplied externImports after these, so the two
+            // compose (the pre-wired propagation chain to the linker).
+            .externImports        = std::move(newWideFloatExterns_),
             .funcLocalAlignments  = std::move(funcLocalAlignments),
             .ok                   = !hadError()
         };
@@ -7038,7 +8011,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<ExternCallDispatch> externCallDispatch,
                           std::optional<DataImportBinding> dataImportBinding,
                           std::optional<TlsAccessInfo> tlsAccess,
-                          std::span<MirSehScope const> sehScopes) {
+                          std::span<MirSehScope const> sehScopes,
+                          std::optional<std::string> wideFloatSoftcallLibrary) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -7051,8 +8025,13 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // thread-local access block — `lowerGlobalAddr`'s TLS arm reads it;
     // nullopt + a thread-local access = fail-loud
     // (K_FormatLacksThreadLocalSupport, no silent process-shared alias).
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): also pass the active
+    // format's F128 softcall runtime library — the F128 softcall verb
+    // binds each minted extern to it; nullopt + an F128 softcall =
+    // fail-loud (no unbound extern).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, dataImportBinding, tlsAccess, sehScopes};
+              externCallDispatch, dataImportBinding, tlsAccess, sehScopes,
+              std::move(wideFloatSoftcallLibrary)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

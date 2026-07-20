@@ -18,12 +18,18 @@
     { "name": "_gmtime64_s",  "signature": "fn(ptr<void>, ptr<void>) -> i32",                "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ],
   "typedefs": [
-    { "name": "time_t", "type": "i64" },
+    { "name": "time_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
     { "name": "clock_t", "variants": [
       { "when": { "format": "elf" },   "type": "i64" },
       { "when": { "format": "macho" }, "type": "u64" }
     ] },
-    { "name": "size_t", "type": "u64" }
+    { "name": "size_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] }
   ],
   "constants": [
     { "name": "NULL", "value": 0, "type": "i64" }
@@ -44,7 +50,7 @@
             { "name": "tm_wday",   "type": "i32" },
             { "name": "tm_yday",   "type": "i32" },
             { "name": "tm_isdst",  "type": "i32" },
-            { "name": "tm_gmtoff", "type": "i64" },
+            { "name": "tm_gmtoff", "type": "i64 \"long\"" },
             { "name": "tm_zone",   "type": "ptr<char>" }
           ]
         },
@@ -60,7 +66,7 @@
             { "name": "tm_wday",   "type": "i32" },
             { "name": "tm_yday",   "type": "i32" },
             { "name": "tm_isdst",  "type": "i32" },
-            { "name": "tm_gmtoff", "type": "i64" },
+            { "name": "tm_gmtoff", "type": "i64 \"long\"" },
             { "name": "tm_zone",   "type": "ptr<char>" }
           ]
         },

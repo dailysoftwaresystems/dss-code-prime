@@ -1028,6 +1028,124 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsInit) {
         << "`int* p = 0;` initializer is a null pointer constant";
 }
 
+// ── D-CSUBSET-POINTER-COMPAT-ADDRESSOF-INITIALIZER — an address-of expression
+//    used as a pointer variable's INITIALIZER (`T *p = &obj;`) must run the SAME
+//    C 6.5.16.1 pointer-compatibility check (isAssignable) that the assignment
+//    form (`p = &obj;`) and the pointer-variable-init form (`T *p = q;`) already
+//    run. Pre-fix, ONLY the address-of INITIALIZER escaped the check.
+//
+//    Root cause: c-subset's varDecl is declarator-mode, so a scalar initializer's
+//    type is derived by a stamped-`typeAt` walk down the single-child wrapper
+//    chain (pass2Post). An address-of expression node carries NO stamped type on
+//    that chain, so the walk yielded InvalidType, the isAssignable gate
+//    (`initTy.valid()`) was skipped, and an INCOMPATIBLE pointee (`char* <- &long`)
+//    was SILENTLY accepted. The fix re-derives a scalar (non-brace) initializer's
+//    type via subtreeType WITH the declaration's scope when the stamped walk finds
+//    nothing, so `&obj` types as Ptr<pointee> and reaches the existing check. The
+//    brace-init-list form is explicitly excluded (its per-element checks live in
+//    the HIR lowering; a DFS would surface an element's type and false-fire). ──
+
+// (a) INCOMPATIBLE object pointee, char* target: `char *p = &a` where `a` is
+// `long`. The pointee `long` is NOT compatible with `char`, so C 6.5.16.1
+// requires a diagnostic. Exactly ONE S_TypeMismatch.
+// RED-ON-DISABLE: revert the subtreeType-with-scope fallback (stamped-walk only)
+// -> `&a` types as InvalidType, the isAssignable gate is skipped, and this count
+// drops to 0 (the silent-accept bug this anchor closes).
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleCharFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { long a; char *p = &a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "char* <- &long (incompatible object pointee) INITIALIZER must fail "
+           "loud — the address-of initializer runs the same C 6.5.16.1 check the "
+           "assignment form `p = &a` already runs";
+}
+
+// (b) INCOMPATIBLE object pointee, int* target: `int *p = &a` where `a` is `long`
+// (distinct integer types, distinct pointee). Exactly ONE S_TypeMismatch.
+// RED-ON-DISABLE: same as (a) — pre-fix this silently accepted.
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { long a; int *p = &a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "int* <- &long (incompatible object pointee) INITIALIZER must fail loud";
+}
+
+// (c) LEGAL address-of initializers must STAY CLEAN. Each is a conversion the
+// existing isAssignable already admits — the fix only makes the check REACH the
+// address-of initializer, it does NOT change the rule:
+//   void* <- &long   (C 6.3.2.3 — void* takes any object pointer)
+//   char* <- &char   (identical pointee)
+//   long* <- &long   (identical pointee)
+//   int*  <- &int    (identical pointee)
+// GREEN-BOTH-WAYS: these are clean pre- AND post-fix; the guard is that the
+// tightening did not over-reach into a legal object-pointer init.
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfLegalFormsStayClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) {\n"
+        "  long a; char c; int i;\n"
+        "  void *vp = &a;\n"   // void* <- any object pointer — legal (C 6.3.2.3)
+        "  char *cp = &c;\n"   // char* <- &char (same pointee) — legal
+        "  long *lp = &a;\n"   // long* <- &long (same pointee) — legal
+        "  int  *ip = &i;\n"   // int*  <- &int  (same pointee) — legal
+        "  return (vp != 0) + (cp != 0) + (lp != 0) + (ip != 0);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "void*<-&obj, and same-pointee &-inits (char/long/int) must ALL stay "
+           "accepted — the fix must not over-tighten a legal object-pointer init";
+}
+
+// (d) A string-literal initializer of a char* (`char *p = "hi";`) is a legal
+// array-to-pointer init and must STAY CLEAN — the fix must not disturb it (the
+// stamped walk already finds the literal's array type; subtreeType agrees).
+TEST(SemanticAnalyzerCSubset, PtrInitFromStringLiteralStaysClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { char *p = \"hi\"; return p != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "`char *p = \"hi\";` is a legal string-literal pointer init — the "
+           "address-of-initializer tightening must not touch it";
+}
+
+// (e) PARITY: the address-of INITIALIZER form and the pointer-VARIABLE
+// initializer form must reject an incompatible pointee IDENTICALLY. In one TU,
+// `char *p = &a;` (address-of init) AND `char *q = lp;` (pointer-var init, where
+// `lp` is `long*`) each fire — exactly TWO S_TypeMismatch, proving the address-of
+// initializer is no longer the lone unchecked init position.
+// RED-ON-DISABLE: pre-fix only the pointer-VARIABLE init fires -> count is 1.
+TEST(SemanticAnalyzerCSubset, PtrInitAddressOfAndPointerVarRejectIdentically) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) {\n"
+        "  long a; long *lp = &a;\n"   // long* <- &long — legal (no mismatch)
+        "  char *p = &a;\n"            // char* <- &long — mismatch #1 (address-of init)
+        "  char *q = lp;\n"            // char* <- long* — mismatch #2 (pointer-var init)
+        "  return (p != 0) + (q != 0);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 2u)
+        << "the address-of initializer AND the pointer-variable initializer must "
+           "each reject the char* <- long-pointee pair — two S_TypeMismatch, not one";
+}
+
 // 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
 // initial F1 fix used arity-based `OperatorTable.lookup(tk, Prefix)`,
 // which would have incorrectly matched binary-arithmetic operator
@@ -9300,10 +9418,13 @@ TEST(SemanticAnalyzerCSubset, LongDoubleUndeclaredAxisFailsLoud) {
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleIsDoubleOnF64Axis) {
-    // The f64 axis (pe64 / apple-arm64): `long double` COLLAPSES to F64 —
-    // assignment-compatible with `double` in BOTH directions (the LLP64
-    // long==int identity-collapse precedent), so the whole double machinery
-    // serves it with zero new codegen.
+    // The f64 axis (pe64 / apple-arm64): `long double` has double's
+    // REPRESENTATION (F64). It remains a DISTINCT TYPE
+    // (D-LANG-TYPE-IDENTITY-VOCABULARY — identity is the vocabulary entry,
+    // never the core), and the conversion between the two is a LEGAL IMPLICIT
+    // conversion in both directions, so the whole double machinery serves it
+    // with zero new codegen (the same-representation conversion re-tags; it
+    // emits no Cast).
     auto model = analyzeWithLongDoubleAxis(
         {"int main(void) { long double x; double d; x = d; d = x; x = 1.5; }\n"},
         LongDoubleFormat::F64);
@@ -9363,22 +9484,32 @@ TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble)
            "F80, not F64";
 }
 
-TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldRefusedOnWalledAxis) {
-    // IMPORTANT-5 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval
-    // fold gate. F80/F128 are NOT host-backed (floatKindInfo.hostBacked ==
-    // false) — folding `20.0L + 22.0L` at the host's binary64 would bake a
-    // silently-rounded constant for any value needing >53 mantissa bits. The
-    // gate refuses at applyBinaryFloat, so the constexpr initializer is NOT a
-    // compile-time constant on a walled axis (loud), while the SAME source on
-    // the f64 axis folds exactly (long double IS binary64 there).
+TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldSucceedsOnWalledAxis) {
+    // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval fold gate
+    // is RELAXED. F80/F128 now fold at TRUE target precision via the
+    // `WideFloatValue` soft-float kernel, so `constexpr long double k = 20.0L +
+    // 22.0L;` IS a valid compile-time constant on EVERY long-double axis — no
+    // `S_ConstexprNonConstantInitializer`. INVERTED from the former refusal pin
+    // (which asserted the walled axis walled the fold). The x87-80 (F80) axis:
     auto walled = analyzeWithLongDoubleAxis(
         {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
         LongDoubleFormat::X87_80);
     EXPECT_EQ(countCode(walled.diagnostics(),
-                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
-        << "F80 constexpr arithmetic must REFUSE the host-double fold "
-           "(hostBacked==false) — a clean analysis here means the fold gate "
-           "is bypassed and a binary64-rounded constant was baked";
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "F80 constexpr arithmetic must now FOLD (LD-3 target-precision kernel) "
+           "— a non-constant diagnostic here means the fold gate is still walled";
+    EXPECT_FALSE(walled.hasErrors())
+        << "the x87-80 constexpr long double fold must analyze clean";
+
+    // The ieee128 (F128) sibling — the SAME source folds via the binary128 kernel.
+    auto ieee128 = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::Ieee128);
+    EXPECT_EQ(countCode(ieee128.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "F128 constexpr arithmetic must fold (LD-3 binary128 kernel)";
+    EXPECT_FALSE(ieee128.hasErrors())
+        << "the ieee128 constexpr long double fold must analyze clean";
 
     auto f64 = analyzeWithLongDoubleAxis(
         {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},

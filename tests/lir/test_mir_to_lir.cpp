@@ -19,6 +19,8 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/object_format_schema.hpp"  // TLS C1: the shipped-format tlsAccess reject pins
 #include "lir/lir.hpp"
+#include "lir/lir_liveness.hpp"   // LD-2 regalloc-aliasing witness (analyzeLiveness)
+#include "lir/lir_regalloc.hpp"   // LD-2 regalloc-aliasing witness (allocateRegisters)
 #include "lir/lir_verifier.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
@@ -4439,17 +4441,15 @@ TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
                                      ::dss::MirOpcode::FDiv);
     EXPECT_FALSE(probe128.ok);
     EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
-    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 (x87 80-bit) is the third
-    // genuinely-unencoded FPR width — an ARITHMETIC op over it must wall at
-    // the SAME width guard (its real x87 codegen is D-CSUBSET-LONG-DOUBLE-
-    // X87-ARITH, still deferred). The arithmetic producers already gated it
-    // by construction (regClassForCoreType(F80)==FPR, not F32/F64); this arm
-    // pins that alongside the F16/F128 siblings.
-    auto probe80 = lowerBinaryProbe(::dss::TypeKind::F80,
-                                    ::dss::MirOpcode::FMul);
-    EXPECT_FALSE(probe80.ok)
-        << "F80 arithmetic must wall — no x87 scalar encodings this cycle";
-    EXPECT_TRUE(sawAnchor(probe80.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 is NO LONGER in the
+    // walled set here — x87 80-bit arithmetic now LOWERS to the fld/fXXXp/fstp
+    // memory sequence. lowerBinaryProbe cannot witness that cleanly (its F80
+    // ARGS + F80 RETURN still wall — LD-4 — so probe.ok would be false for the
+    // WRONG reason); the strict lowering witness is
+    // F80ArithmeticAndStoreLowerToX87Sequence below, and the surviving
+    // Arg/Call/Return F80 boundary walls are the four
+    // F80*Boundary*FailLoud pins. Only F16/F128 remain genuinely unencoded
+    // (asserted above).
 }
 
 // ══ FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the four CALL-BOUNDARY
@@ -4497,28 +4497,33 @@ namespace {
     return probe;
 }
 
-// int f(long double x, long double* p) { *p = x; return 0; }  — the STORE-value
-// gate (mirrors buildF64StoreMir with F80). The Arg gate co-fires on arg0, so
-// this pin keys on the "MIR Store value" context.
+// void f(long double* pv, long double* pd) { *pd = *pv; }  — the STORE-value
+// LOWERING witness (D-CSUBSET-LONG-DOUBLE-X87-ARITH, LD-1). An F80 store is a
+// memory→memory copy (fld_m80 [*pv]; fstp_m80 [*pd]); both operands are
+// POINTERS (GPR class → no F80 Arg wall), so the F80 store + F80 load are the
+// only F80 sites and the function lowers cleanly. Red-on-disable: revert the
+// lowerStore F80 interception and the requireEncodedFloatWidth("MIR Store
+// value") gate walls it again → probe.ok flips to false.
 [[nodiscard]] GuardProbe lowerF80StoreProbe() {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const f80  = interner.primitive(::dss::TypeKind::F80);
-    auto const ptrT = interner.pointer(f80);
-    auto const i32  = interner.primitive(::dss::TypeKind::I32);
-    std::array<::dss::TypeId, 2> params{f80, ptrT};
-    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const ptrT  = interner.pointer(f80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
-    ::dss::MirInstId const v = mb.addArg(0, f80);
-    ::dss::MirInstId const p = mb.addArg(1, ptrT);
-    std::array<::dss::MirInstId, 2> storeOps{v, p};
+    ::dss::MirInstId const pv = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pd = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> loadOps{pv};
+    ::dss::MirInstId const val =
+        mb.addInst(::dss::MirOpcode::Load, loadOps, f80);
+    std::array<::dss::MirInstId, 2> storeOps{val, pd};
     (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
-    ::dss::MirLiteralValue zero; zero.value = std::int64_t{0};
-    zero.core = ::dss::TypeKind::I32;
-    mb.addReturn(mb.addConst(zero, i32));
+    mb.addReturn(std::nullopt);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
     auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
@@ -4577,61 +4582,1267 @@ namespace {
 }
 } // namespace
 
-TEST(MirToLir, F80ArgBoundaryWallsFailLoud) {
+TEST(MirToLir, F80ArgLowersToRecvByValueStackParam) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): INVERTED from the FC17.9(e) Arg
+    // WALL. A SysV x87 F80 PARAMETER is MEMORY-class — received on the incoming
+    // stack. It now LOWERS to a `recv_by_value_stack_param` (the incoming home
+    // ADDRESS, the memory-resident model), NOT the width-gated FPR `arg` move.
+    // Red-on-disable: revert the lowerArg F80 interception → the Arg width gate
+    // re-walls it (probe.ok flips false, "MIR Arg" fires).
     auto probe = lowerF80ArgProbe();
-    EXPECT_FALSE(probe.ok)
-        << "an F80 PARAMETER is the sole F80 site here — the Arg gate must "
-           "wall it (else 64-bit plumbing of a 16-byte value)";
-    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Arg"))
-        << "the Arg-boundary wall must fire with its own context string";
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    EXPECT_TRUE(probe.ok)
+        << "an F80 parameter must lower to a stack receive: "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Arg"))
+        << "the Arg width wall must NOT fire for F80 any more";
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const recvOp = (*target)->opcodeByMnemonic("recv_by_value_stack_param");
+    ASSERT_TRUE(recvOp.has_value());
+    Lir const& lir = probe.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawRecv = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i)
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *recvOp) sawRecv = true;
+    EXPECT_TRUE(sawRecv)
+        << "the F80 param must materialize its incoming home via "
+           "recv_by_value_stack_param (the memory-resident receive)";
 }
 
-TEST(MirToLir, F80StoreValueBoundaryWallsFailLoud) {
+TEST(MirToLir, F80StoreValueLowersToX87Copy) {
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): INVERTED from the FC17.9(e)
+    // Store-value WALL. An F80 store is now a real fld_m80/fstp_m80 memory copy
+    // — it LOWERS (no F80 arg pollutes this probe), and the Store-value width
+    // wall no longer fires. The other three boundary sites (Arg/Call/Return)
+    // stay walled below (LD-4).
     auto probe = lowerF80StoreProbe();
-    EXPECT_FALSE(probe.ok);
-    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Store value"))
-        << "the Store-value wall must fire — memAccessWidthFlags defaults F80 "
-           "to width 0 = an 8-byte movsd of a 16-byte value";
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    EXPECT_TRUE(probe.ok)
+        << "an F80 store (pointer args, no F80 boundary) must lower to the "
+           "x87 fld_m80/fstp_m80 copy: "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Store value"))
+        << "the Store-value width wall must NOT fire for F80 any more "
+           "(red-on-disable: reverting the store interception re-walls it)";
+    // The copy is exactly fld_m80 [value] then fstp_m80 [dest].
+    auto storeTarget = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(storeTarget.has_value());
+    Lir const& lir = probe.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const fldOp  = (*storeTarget)->opcodeByMnemonic("fld_m80");
+    auto const fstpOp = (*storeTarget)->opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(fldOp.has_value() && fstpOp.has_value());
+    bool sawCopy = false;
+    for (std::uint32_t i = 1; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *fstpOp
+            && lir.instOpcode(lir.blockInstAt(bb, i - 1)) == *fldOp) {
+            sawCopy = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawCopy)
+        << "the F80 store must emit an fld_m80 immediately followed by fstp_m80";
 }
 
-TEST(MirToLir, F80CallResultBoundaryWallsFailLoud) {
+TEST(MirToLir, F80CallResultLowersToFstp80AfterCall) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): INVERTED from the FC17.9(e)
+    // Call-result WALL. A call RETURNING long double now LOWERS — the SysV x87
+    // return is in st0, captured by an `fstp_m80 [home]` emitted IMMEDIATELY after
+    // the call (ADJACENCY: st0 survives the GPR-only teardown, and nothing may
+    // touch the x87 stack between the call and the pop). Red-on-disable: revert
+    // the lowerCall F80-result arm → the Call-result width gate re-walls it.
     auto probe = lowerF80CallResultProbe();
-    EXPECT_FALSE(probe.ok)
-        << "a call RETURNING long double is the sole F80 site here — the "
-           "Call-result gate must wall it";
-    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Call result"))
-        << "the Call-result wall must fire with its own context string";
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    EXPECT_TRUE(probe.ok)
+        << "a call returning long double must lower (st0 → fstp_m80 capture): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Call result"))
+        << "the Call-result width wall must NOT fire for F80 any more";
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const fstpOp = (*target)->opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(callOp.has_value() && fstpOp.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawCapture = false;
+    for (std::uint32_t i = 1; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *fstpOp
+            && lir.instOpcode(lir.blockInstAt(bb, i - 1)) == *callOp) {
+            sawCapture = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawCapture)
+        << "the F80 call result must be captured by an fstp_m80 IMMEDIATELY "
+           "following the call (the st0 return convention)";
 }
 
-TEST(MirToLir, F80ReturnOperandBoundaryWallsFailLoud) {
+TEST(MirToLir, F80ReturnOperandLowersToFld80BeforeBareRet) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): INVERTED from the FC17.9(e)
+    // Return-operand WALL. `long double f(long double x){return x;}` now LOWERS —
+    // the return operand is placed into st0 by an `fld_m80 [home]` BEFORE the
+    // GPR-only epilogue, and the `ret` carries NO reg operand (the value is
+    // already in st0). Red-on-disable: revert the lowerReturn F80 arm → the
+    // Return-operand width gate re-walls it.
     auto probe = lowerF80ReturnProbe();
-    EXPECT_FALSE(probe.ok);
-    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Return operand"))
-        << "the Return-operand wall must fire — the return-register move is "
-           "plain plumbing with no producer gate of its own";
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    EXPECT_TRUE(probe.ok)
+        << "long double f(long double){return x;} must lower (fld_m80 → st0): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Return operand"))
+        << "the Return-operand width wall must NOT fire for F80 any more";
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const fldOp = (*target)->opcodeByMnemonic("fld_m80");
+    auto const retOp = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fldOp.has_value() && retOp.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // ADJACENCY: an fld_m80 loads the return into st0 BEFORE the ret; the ret
+    // carries no Reg operand (ops empty → lir_callconv's return-capture is a
+    // no-op → epilogue + bare ret, value already in st0).
+    std::optional<std::uint32_t> retIdx;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i)
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *retOp) { retIdx = i; break; }
+    ASSERT_TRUE(retIdx.has_value());
+    bool fldBeforeRet = false;
+    for (std::uint32_t i = 0; i < *retIdx; ++i)
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *fldOp) fldBeforeRet = true;
+    EXPECT_TRUE(fldBeforeRet)
+        << "the F80 return must emit an fld_m80 (push st0) before the ret";
+    // The ret carries no register operand for a long-double return.
+    bool retHasReg = false;
+    for (auto const& op : lir.instOperands(lir.blockInstAt(bb, *retIdx)))
+        if (op.kind == LirOperandKind::Reg) retHasReg = true;
+    EXPECT_FALSE(retHasReg)
+        << "a long-double return leaves the value in st0 — the ret has no reg operand";
+}
+
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE (LD-1 x87 review fix): an F80 phi — a
+// `long double` crossing a control-flow JOIN (`cond ? a : b`) — must WALL LOUD,
+// NOT miscompile. The memory-resident F80 model makes an F80 SSA value a
+// GPR-held address; without the prepassAllocatePhis F80/F128 wall the phi is
+// allocated FPR-class and the edge-move emits a class-inconsistent `fld [xmm]`
+// (the silent miscompile the review caught). This builds the SAME diamond CFG
+// that lowers cleanly for an F64 phi (see the FprPhi test above) but with F80,
+// consuming the phi via an in-function FPToSI + int return so the ONLY F80 site
+// is the phi itself. Red-on-disable: removing the F80/F128 wall makes lowerToLir
+// SUCCEED (the miscompile).
+TEST(MirToLir, F80PhiControlMergeWallsFailLoud) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    auto const ptrF80 = interner.pointer(f80);
+    std::array<::dss::TypeId, 1> params{boolT};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
+    ::dss::MirBlockId const elseB = mb.createBlock(::dss::StructCfMarker::IfElse);
+    ::dss::MirBlockId const join  = mb.createBlock(::dss::StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, thenB, elseB);
+    ::dss::MirLiteralValue lvOne;  lvOne.value = 1.0;  lvOne.core = ::dss::TypeKind::F80;
+    ::dss::MirLiteralValue lvTwo;  lvTwo.value = 2.0;  lvTwo.core = ::dss::TypeKind::F80;
+    (void)mb.addGlobal(f80, ::dss::SymbolId{500}, mb.literalPoolAdd(lvOne),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    (void)mb.addGlobal(f80, ::dss::SymbolId{501}, mb.literalPoolAdd(lvTwo),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    mb.beginBlock(thenB);
+    ::dss::MirInstId const addrOne = mb.addGlobalAddr(::dss::SymbolId{500}, ptrF80);
+    std::array<::dss::MirInstId, 1> loadOneOps{addrOne};
+    ::dss::MirInstId const valOne = mb.addInst(::dss::MirOpcode::Load, loadOneOps, f80);
+    mb.addBr(join);
+    mb.beginBlock(elseB);
+    ::dss::MirInstId const addrTwo = mb.addGlobalAddr(::dss::SymbolId{501}, ptrF80);
+    std::array<::dss::MirInstId, 1> loadTwoOps{addrTwo};
+    ::dss::MirInstId const valTwo = mb.addInst(::dss::MirOpcode::Load, loadTwoOps, f80);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    ::dss::MirInstId const phi = mb.addPhi(f80);
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{valOne, thenB});
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{valTwo, elseB});
+    std::array<::dss::MirInstId, 1> cvtOps{phi};
+    ::dss::MirInstId const asInt = mb.addInst(::dss::MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(asInt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F80 phi (long double control-flow merge) must WALL loud, not "
+           "miscompile — the SAME diamond that lowers for an F64 phi must fail "
+           "for F80 (memory-resident: the phi would mint a class-inconsistent "
+           "fld [xmm])";
+    bool sawMerge = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("control-flow merge") != std::string::npos
+            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
+            sawMerge = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawMerge)
+        << "the F80 phi wall must fire with the control-merge diagnostic";
+}
+
+// ══ D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 arithmetic LOWERS to the fixed
+// x87 memory sequence ═══════════════════════════════════════════════════════
+//
+// The strict LOWERING pin. Hand-built MIR for
+//   void f(long double* pa, long double* pb, long double* pr) {
+//       *pr = (*pa) * (*pb);
+//   }
+// All F80 sites are IN-FUNCTION (two F80 Loads through pointer args, one F80
+// FMul, one F80 Store) — no F80 call boundary — so the whole function lowers.
+// The FMul must emit exactly `fld_m80 ; fld_m80 ; fmulp ; fstp_m80` (push a,
+// push b, st1*st0, pop-store the fresh home), and the Store its own
+// fld_m80/fstp_m80 copy. Red-on-disable: revert the FMul interception and the
+// requireEncodedFloatWidth("MIR FMul") gate walls it → lowerToLir fails.
+TEST(MirToLir, F80ArithmeticAndStoreLowerToX87Sequence) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const ptrT  = interner.pointer(f80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(2, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, f80);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, f80);
+    std::array<::dss::MirInstId, 2> mulOps{va, vb};
+    ::dss::MirInstId const prod =
+        mb.addInst(::dss::MirOpcode::FMul, mulOps, f80);
+    std::array<::dss::MirInstId, 2> stOps{prod, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "F80 FMul + Load + Store must lower on the x87-80 axis: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const fldOp   = (*target)->opcodeByMnemonic("fld_m80");
+    auto const fstpOp  = (*target)->opcodeByMnemonic("fstp_m80");
+    auto const fmulpOp = (*target)->opcodeByMnemonic("fmulp");
+    ASSERT_TRUE(fldOp.has_value() && fstpOp.has_value()
+                && fmulpOp.has_value());
+
+    // Locate the fmulp and pin its neighbours: [fld_m80, fld_m80, fmulp,
+    // fstp_m80]. (Address materialization — alloca/lea_frame_slot — precedes
+    // the two flds; the four x87 ops themselves are contiguous.)
+    std::optional<std::uint32_t> fmulpIdx;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *fmulpOp) {
+            fmulpIdx = i;
+            break;
+        }
+    }
+    ASSERT_TRUE(fmulpIdx.has_value()) << "the F80 FMul must emit an fmulp";
+    ASSERT_GE(*fmulpIdx, 2u);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *fmulpIdx - 1)), *fldOp)
+        << "fmulp must be immediately preceded by the second push (fld_m80)";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *fmulpIdx - 2)), *fldOp)
+        << "and by the first push (fld_m80)";
+    ASSERT_LT(*fmulpIdx + 1, lir.blockInstCount(bb));
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *fmulpIdx + 1)), *fstpOp)
+        << "fmulp must be immediately followed by the result store (fstp_m80)";
+
+    // The Store copies the home → *pr: a further fld_m80/fstp_m80 pair.
+    std::uint32_t fstpCount = 0;
+    std::uint32_t fldCount  = 0;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *fstpOp) ++fstpCount;
+        if (op == *fldOp)  ++fldCount;
+    }
+    EXPECT_EQ(fldCount, 3u)
+        << "two pushes for the FMul + one for the Store copy";
+    EXPECT_EQ(fstpCount, 2u)
+        << "the FMul result store + the Store copy";
+}
+
+// ══ D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): IEEE binary128 arithmetic
+// LOWERS to a config'd softfloat libcall ══════════════════════════════════
+//
+// The F128 sibling of the F80 x87 suite above. arm64-ELF `long double` is IEEE
+// binary128; its arithmetic realizes as a CALL to a libgcc softfloat helper
+// (__addtf3 …) with the operands marshalled into the config'd physical arg
+// registers (v0/v1) and the result captured to a fresh 16-byte home — the
+// memory-resident model of F80, one axis over. These pins prove: (a) the
+// contiguous fldur_q/fldur_q/call/fstur_q sequence, (b) the fixtfsi / extenddftf2
+// conversion shapes, (c) once-only extern injection, (d) the config-row-ABSENCE
+// gate (RED-on-disable), (e) the still-firing LD-4 boundary walls + the phi
+// wall, and (f) the v0/d0 regalloc-aliasing safety.
+
+namespace {
+// The arm64-ELF lowering context the driver threads for
+// arm64:elf64-aarch64-linux-exec: direct-plt extern dispatch + the libgcc
+// softcall library. (A bare `lowerToLir(m, target, interner, rep)` would pass
+// nullopt for both — the F128 softcall would then fail loud for want of a
+// runtime binding, which is exactly test #7's x86_64 path.)
+[[nodiscard]] ::dss::MirToLirResult
+lowerF128Arm64(::dss::Mir const& m, ::dss::TargetSchema const& target,
+               ::dss::TypeInterner const& interner,
+               ::dss::DiagnosticReporter& rep) {
+    std::vector<::dss::ExternImport> noExterns;
+    return ::dss::lowerToLir(
+        m, target, interner, rep, std::move(noExterns),
+        ::dss::ExternCallDispatch::DirectPlt,
+        /*dataImportBinding=*/std::nullopt, /*tlsAccess=*/std::nullopt,
+        /*sehScopes=*/{},
+        /*wideFloatSoftcallLibrary=*/std::optional<std::string>("libgcc_s.so.1"));
+}
+
+// void f(long double* pa, long double* pb, long double* pr) {
+//     *pr = (*pa) OP (*pb);
+// } — all F128 sites IN-FUNCTION (two F128 Loads through pointer args, one F128
+// binary op, one F128 Store), no F128 call boundary, so the whole function
+// lowers.
+[[nodiscard]] ::dss::Mir
+buildF128BinaryArith(::dss::TypeInterner& interner, ::dss::MirOpcode op) {
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(2, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, f128);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, f128);
+    std::array<::dss::MirInstId, 2> abOps{va, vb};
+    ::dss::MirInstId const r = mb.addInst(op, abOps, f128);
+    std::array<::dss::MirInstId, 2> stOps{r, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    return std::move(mb).finish();
+}
+
+// Index of the FIRST inst in block `bb` whose opcode == `op` and whose sole
+// SymbolRef operand names symbol `symV`, or nullopt.
+[[nodiscard]] std::optional<std::uint32_t>
+findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                 std::uint16_t callOp, std::uint32_t symV) {
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) != callOp) continue;
+        auto const ops = lir.instOperands(inst);
+        if (ops.size() == 1 && ops[0].kind == ::dss::LirOperandKind::SymbolRef
+            && ops[0].symbolV == symV) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+} // namespace
+
+TEST(MirToLir, F128AddLowersToSoftcallSequence) {
+    // Table-drive the four commutative/non-commutative binary ops. Each must
+    // lower to the CONTIGUOUS softcall sequence:
+    //   fldur_q(v0)<-[pa] ; fldur_q(v1)<-[pb] ; call(__Xtf3) ; fstur_q([home])<-v0
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    ASSERT_TRUE(fldurQ.has_value() && fsturQ.has_value() && callOp.has_value());
+    auto const v0Ord = (*target)->registerByName("v0");
+    auto const v1Ord = (*target)->registerByName("v1");
+    ASSERT_TRUE(v0Ord.has_value() && v1Ord.has_value());
+
+    struct Case { ::dss::MirOpcode op; char const* helper; };
+    std::array<Case, 4> const cases{{
+        {::dss::MirOpcode::FAdd, "__addtf3"},
+        {::dss::MirOpcode::FSub, "__subtf3"},
+        {::dss::MirOpcode::FMul, "__multf3"},
+        {::dss::MirOpcode::FDiv, "__divtf3"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildF128BinaryArith(interner, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": F128 arith must lower to the softcall sequence: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        // The minted extern for the helper.
+        std::optional<std::uint32_t> helperSym;
+        for (auto const& e : result.externImports)
+            if (e.mangledName == c.helper) helperSym = e.symbol.v;
+        ASSERT_TRUE(helperSym.has_value())
+            << c.helper << ": softcall extern not injected";
+
+        Lir const& lir = result.lir;
+        LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+        auto const callIdx = findCallToSymbol(lir, bb, *callOp, *helperSym);
+        ASSERT_TRUE(callIdx.has_value()) << c.helper << ": call site not found";
+        ASSERT_GE(*callIdx, 2u);
+        // The two immediately-preceding insts are the v0/v1 operand marshals.
+        auto const m0 = lir.blockInstAt(bb, *callIdx - 2);
+        auto const m1 = lir.blockInstAt(bb, *callIdx - 1);
+        EXPECT_EQ(lir.instOpcode(m0), *fldurQ) << c.helper;
+        EXPECT_EQ(lir.instOpcode(m1), *fldurQ) << c.helper;
+        LirReg const r0 = lir.instResult(m0);
+        LirReg const r1 = lir.instResult(m1);
+        EXPECT_TRUE(r0.isPhysical && r0.regClass() == LirRegClass::VR);
+        EXPECT_TRUE(r1.isPhysical && r1.regClass() == LirRegClass::VR);
+        EXPECT_EQ(r0.id, *v0Ord) << c.helper << ": first operand -> v0";
+        EXPECT_EQ(r1.id, *v1Ord) << c.helper << ": second operand -> v1";
+        // The immediately-following inst is the result store of physical v0.
+        ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
+        auto const st = lir.blockInstAt(bb, *callIdx + 1);
+        EXPECT_EQ(lir.instOpcode(st), *fsturQ) << c.helper;
+        auto const stOps = lir.instOperands(st);
+        ASSERT_GE(stOps.size(), 1u);
+        EXPECT_TRUE(stOps[0].kind == LirOperandKind::Reg
+                    && stOps[0].reg.isPhysical
+                    && stOps[0].reg.regClass() == LirRegClass::VR
+                    && stOps[0].reg.id == *v0Ord)
+            << c.helper << ": the result store must store physical v0";
+    }
+}
+
+TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
+    // int g(long double* p) { return (int)(*p); } — the F128->int32 conversion:
+    //   fldur_q(v0)<-[p] ; call(__fixtfsi) ; mov(result, x0) width-32.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 1> params{ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const p = mb.addArg(0, ptrT);
+    std::array<::dss::MirInstId, 1> ldOps{p};
+    ::dss::MirInstId const v = mb.addInst(::dss::MirOpcode::Load, ldOps, f128);
+    std::array<::dss::MirInstId, 1> cvtOps{v};
+    ::dss::MirInstId const n = mb.addInst(::dss::MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(n);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "F128 (int) conversion must lower to __fixtfsi: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    std::optional<std::uint32_t> helperSym;
+    for (auto const& e : result.externImports)
+        if (e.mangledName == "__fixtfsi") helperSym = e.symbol.v;
+    ASSERT_TRUE(helperSym.has_value()) << "__fixtfsi extern not injected";
+
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const movOp  = (*target)->opcodeByMnemonic("mov");
+    auto const x0Ord  = (*target)->registerByName("x0");
+    ASSERT_TRUE(fldurQ.has_value() && callOp.has_value() && movOp.has_value()
+                && x0Ord.has_value());
+    auto const callIdx = findCallToSymbol(lir, bb, *callOp, *helperSym);
+    ASSERT_TRUE(callIdx.has_value());
+    ASSERT_GE(*callIdx, 1u);
+    // The operand marshal is a single fldur_q into v0 (the F128 source).
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *callIdx - 1)), *fldurQ);
+    // The following inst is the int32 capture: mov result <- x0 (physical).
+    ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
+    auto const cap = lir.blockInstAt(bb, *callIdx + 1);
+    EXPECT_EQ(lir.instOpcode(cap), *movOp);
+    auto const capOps = lir.instOperands(cap);
+    ASSERT_GE(capOps.size(), 1u);
+    EXPECT_TRUE(capOps[0].kind == LirOperandKind::Reg
+                && capOps[0].reg.isPhysical
+                && capOps[0].reg.regClass() == LirRegClass::GPR
+                && capOps[0].reg.id == *x0Ord)
+        << "the int32 result must be captured from physical x0";
+    // The captured result is GPR (an int32).
+    EXPECT_EQ(lir.instResult(cap).regClass(), LirRegClass::GPR);
+}
+
+TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
+    // void g(double d, long double* pr) { *pr = (long double)d; } — the
+    // double->F128 widen: fmov(d0)<-src ; call(__extenddftf2) ; fstur_q([home])<-v0.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> params{f64, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const d  = mb.addArg(0, f64);
+    ::dss::MirInstId const pr = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> extOps{d};
+    ::dss::MirInstId const wide = mb.addInst(::dss::MirOpcode::FPExt, extOps, f128);
+    std::array<::dss::MirInstId, 2> stOps{wide, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "double->long double widen must lower to __extenddftf2: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    std::optional<std::uint32_t> helperSym;
+    for (auto const& e : result.externImports)
+        if (e.mangledName == "__extenddftf2") helperSym = e.symbol.v;
+    ASSERT_TRUE(helperSym.has_value()) << "__extenddftf2 extern not injected";
+
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const fmovOp = (*target)->opcodeByMnemonic("fmov");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const d0Ord  = (*target)->registerByName("d0");
+    ASSERT_TRUE(fmovOp.has_value() && fsturQ.has_value() && callOp.has_value()
+                && d0Ord.has_value());
+    auto const callIdx = findCallToSymbol(lir, bb, *callOp, *helperSym);
+    ASSERT_TRUE(callIdx.has_value());
+    ASSERT_GE(*callIdx, 1u);
+    // The operand marshal is an fmov of the double source into physical d0
+    // (an FPR-class arg register, NOT a v-register — the config row says d0).
+    auto const marshal = lir.blockInstAt(bb, *callIdx - 1);
+    EXPECT_EQ(lir.instOpcode(marshal), *fmovOp);
+    LirReg const marshalDst = lir.instResult(marshal);
+    EXPECT_TRUE(marshalDst.isPhysical && marshalDst.regClass() == LirRegClass::FPR
+                && marshalDst.id == *d0Ord)
+        << "the double source must be fmov'd into physical d0";
+    // The following inst stores the physical v0 result to the F128 home.
+    ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *callIdx + 1)), *fsturQ);
+}
+
+TEST(MirToLir, F128SoftcallInjectsExternImportOnce) {
+    // TWO F128 FAdds (over the same helper) must inject EXACTLY ONE __addtf3
+    // extern (dedup within the CU), whose SymbolId is distinct from every
+    // block/user symbol.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(2, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, f128);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, f128);
+    std::array<::dss::MirInstId, 2> ab1{va, vb};
+    ::dss::MirInstId const s1 = mb.addInst(::dss::MirOpcode::FAdd, ab1, f128);
+    std::array<::dss::MirInstId, 2> ab2{s1, vb};
+    ::dss::MirInstId const s2 = mb.addInst(::dss::MirOpcode::FAdd, ab2, f128);
+    std::array<::dss::MirInstId, 2> stOps{s2, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    std::uint32_t addCount = 0;
+    std::uint32_t addtf3SymV = 0;
+    for (auto const& e : result.externImports) {
+        if (e.mangledName == "__addtf3") { ++addCount; addtf3SymV = e.symbol.v; }
+    }
+    EXPECT_EQ(addCount, 1u)
+        << "two F128 adds must inject the __addtf3 import EXACTLY once (CU dedup)";
+    EXPECT_EQ(result.externImports.size(), 1u)
+        << "only the one softcall helper should be imported";
+    // The minted extern SymbolId must not collide with any function/global
+    // symbol (SymbolId{1} is the function). It is minted past the high-water.
+    EXPECT_NE(addtf3SymV, 1u);
+    EXPECT_GT(addtf3SymV, 1u);
+    EXPECT_EQ(result.externImports[0].libraryPath, "libgcc_s.so.1");
+    EXPECT_TRUE(result.externImports[0].version.empty())
+        << "the softcall import binds the default version (unversioned)";
+    EXPECT_FALSE(result.externImports[0].isData);
+}
+
+TEST(MirToLir, F128ArithmeticFailsLoudWithoutConfigRow) {
+    // RED-ON-DISABLE #1 (the load-bearing agnosticism condition): the SAME F128
+    // FAdd MIR against x86_64 — which declares F128 but has NO wideFloatSoftcalls
+    // rows — must FAIL LOUD via the encoded-width gate, NOT lower. This proves
+    // the softcall path is gated on the ABSENCE of a config row (not an arch
+    // check): remove the `if (wideFloatSoftcall(Add))` guard and this reds
+    // (x86_64 would try to softcall with no config → crash / wrong lowering).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->wideFloatSoftcall(::dss::WideFloatOp::Add), nullptr)
+        << "x86_64 must declare NO F128 softcall row (the fall-through premise)";
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildF128BinaryArith(interner, ::dss::MirOpcode::FAdd);
+    ::dss::DiagnosticReporter rep;
+    // Lower on x86_64 with the DEFAULTS (no softcall library) — the config-row
+    // absence alone must gate it.
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "F128 arith on a target with no softcall row must fail loud, "
+           "not silently take the softcall path";
+    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the fall-through must hit the encoded-width gate";
+}
+
+namespace {
+// F128 twins of the F80 call-boundary probes — lowered WITH the arm64 softcall
+// config ACTIVE. D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4) UN-WALLS these: an
+// F128 param/call-result/return now lowers to the AAPCS64 v-register boundary
+// (fstur_q/fldur_q), the memory-resident model extended to user calls. The three
+// tests below are the positive lowering pins (INVERTED from the LD-2 walls).
+[[nodiscard]] GuardProbe lowerF128ArgProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128  = interner.primitive(::dss::TypeKind::F128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 1> params{f128};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    (void)mb.addArg(0, f128);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = lowerF128Arm64(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+[[nodiscard]] GuardProbe lowerF128CallResultProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128  = interner.primitive(::dss::TypeKind::F128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    auto const ptrT  = interner.pointer(voidT);
+    auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT,
+                                    ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
+    std::array<::dss::MirInstId, 1> callOps{callee};
+    (void)mb.addInst(::dss::MirOpcode::Call, callOps, f128);   // F128 result
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = lowerF128Arm64(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+[[nodiscard]] GuardProbe lowerF128ReturnProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    std::array<::dss::TypeId, 1> params{f128};
+    auto const sig = interner.fnSig(params, f128, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const x = mb.addArg(0, f128);
+    mb.addReturn(x);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = lowerF128Arm64(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+} // namespace
+
+TEST(MirToLir, F128ArgLowersToEntryVRegisterSpill) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): INVERTED from the F128 Arg WALL.
+    // An AAPCS64 binary128 PARAMETER arrives in v0 and is SPILLED to a memory home
+    // at entry (fstur_q [home] <- v0, the memory-resident model). Red-on-disable:
+    // revert the lowerArg F128 interception → the Arg width gate re-walls it.
+    auto probe = lowerF128ArgProbe();
+    EXPECT_TRUE(probe.ok)
+        << "an F128 parameter must lower to the entry v-register spill: "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Arg"))
+        << "the Arg width wall must NOT fire for F128 any more";
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const v0Ord  = (*target)->registerByName("v0");
+    ASSERT_TRUE(fsturQ.has_value() && v0Ord.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawSpill = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) != *fsturQ) continue;
+        auto const ops = lir.instOperands(inst);   // fstur_q [home] <- v0
+        if (!ops.empty() && ops[0].kind == LirOperandKind::Reg
+            && ops[0].reg.isPhysical && ops[0].reg.regClass() == LirRegClass::VR
+            && ops[0].reg.id == *v0Ord)
+            sawSpill = true;
+    }
+    EXPECT_TRUE(sawSpill)
+        << "the F128 param must spill physical v0 to its home via fstur_q";
+}
+
+TEST(MirToLir, F128CallResultLowersToFsturQAfterCall) {
+    // INVERTED from the F128 Call-result WALL. A call RETURNING binary128 now
+    // LOWERS — the v0 return is captured by fstur_q [home] <- v0 IMMEDIATELY after
+    // the call (ADJACENCY). Red-on-disable: revert the lowerCall F128-result arm.
+    auto probe = lowerF128CallResultProbe();
+    EXPECT_TRUE(probe.ok)
+        << "a call returning long double must lower (v0 → fstur_q): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Call result"))
+        << "the Call-result width wall must NOT fire for F128 any more";
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const v0Ord  = (*target)->registerByName("v0");
+    ASSERT_TRUE(callOp.has_value() && fsturQ.has_value() && v0Ord.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawCapture = false;
+    for (std::uint32_t i = 1; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) != *fsturQ) continue;
+        if (lir.instOpcode(lir.blockInstAt(bb, i - 1)) != *callOp) continue;
+        auto const ops = lir.instOperands(lir.blockInstAt(bb, i));
+        if (!ops.empty() && ops[0].kind == LirOperandKind::Reg
+            && ops[0].reg.isPhysical && ops[0].reg.id == *v0Ord)
+            sawCapture = true;
+    }
+    EXPECT_TRUE(sawCapture)
+        << "the F128 call result must be captured by fstur_q [home] <- v0 "
+           "IMMEDIATELY after the call";
+}
+
+TEST(MirToLir, F128ReturnOperandLowersToFldurQBeforeBareRet) {
+    // INVERTED from the F128 Return-operand WALL. `long double f(long double x)
+    // {return x;}` now LOWERS — the return operand is loaded into v0 by fldur_q
+    // v0,[home] BEFORE the bare ret (no reg operand). Red-on-disable: revert the
+    // lowerReturn F128 arm.
+    auto probe = lowerF128ReturnProbe();
+    EXPECT_TRUE(probe.ok)
+        << "long double f(long double){return x;} must lower (fldur_q v0): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(probe.rep, "MIR Return operand"))
+        << "the Return-operand width wall must NOT fire for F128 any more";
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const retOp  = (*target)->opcodeByMnemonic("ret");
+    auto const v0Ord  = (*target)->registerByName("v0");
+    ASSERT_TRUE(fldurQ.has_value() && retOp.has_value() && v0Ord.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<std::uint32_t> retIdx;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i)
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *retOp) { retIdx = i; break; }
+    ASSERT_TRUE(retIdx.has_value());
+    bool fldurBeforeRet = false;
+    for (std::uint32_t i = 0; i < *retIdx; ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) != *fldurQ) continue;
+        LirReg const res = lir.instResult(inst);
+        if (res.isPhysical && res.regClass() == LirRegClass::VR
+            && res.id == *v0Ord)
+            fldurBeforeRet = true;
+    }
+    EXPECT_TRUE(fldurBeforeRet)
+        << "the F128 return must load [home] into physical v0 (fldur_q) before ret";
+    bool retHasReg = false;
+    for (auto const& op : lir.instOperands(lir.blockInstAt(bb, *retIdx)))
+        if (op.kind == LirOperandKind::Reg) retHasReg = true;
+    EXPECT_FALSE(retHasReg)
+        << "a long-double return leaves the value in v0 — the ret has no reg operand";
+}
+
+TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the CALLER-side F128 arg marshal.
+    //   void g(long double* pa, long double* pb, long double* pr) {
+    //       *pr = add(*pa, *pb);   // add: long double(long double,long double)
+    //   }
+    // The two F128 args are marshalled into v0/v1 (fldur_q burst) IMMEDIATELY
+    // before the call — NOT operand-listed — and the F128 result is captured from
+    // v0 (fstur_q) IMMEDIATELY after (the LD-2 marshal→call adjacency).
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> calleeParams{f128, f128};
+    auto const calleeSig =
+        interner.fnSig(calleeParams, f128, ::dss::CallConv::CcSysV);
+    auto const calleePtr = interner.pointer(calleeSig);
+    std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(2, ptrT);
+    std::array<::dss::MirInstId, 1> la{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, la, f128);
+    std::array<::dss::MirInstId, 1> lb{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lb, f128);
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, calleePtr);
+    std::array<::dss::MirInstId, 3> callOps{callee, va, vb};
+    ::dss::MirInstId const r = mb.addInst(::dss::MirOpcode::Call, callOps, f128);
+    std::array<::dss::MirInstId, 2> st{r, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, st, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "a user call with two F128 args + F128 result must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const v0Ord  = (*target)->registerByName("v0");
+    auto const v1Ord  = (*target)->registerByName("v1");
+    ASSERT_TRUE(fldurQ.has_value() && fsturQ.has_value() && callOp.has_value()
+                && v0Ord.has_value() && v1Ord.has_value());
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const callIdx = findCallToSymbol(lir, bb, *callOp, 2u);
+    ASSERT_TRUE(callIdx.has_value()) << "the direct user call to add must be found";
+    ASSERT_GE(*callIdx, 2u);
+    // The two immediately-preceding insts are the v0/v1 arg marshals (fldur_q).
+    auto const m0 = lir.blockInstAt(bb, *callIdx - 2);
+    auto const m1 = lir.blockInstAt(bb, *callIdx - 1);
+    EXPECT_EQ(lir.instOpcode(m0), *fldurQ);
+    EXPECT_EQ(lir.instOpcode(m1), *fldurQ);
+    EXPECT_TRUE(lir.instResult(m0).isPhysical
+                && lir.instResult(m0).regClass() == LirRegClass::VR
+                && lir.instResult(m0).id == *v0Ord)
+        << "first F128 arg → v0";
+    EXPECT_TRUE(lir.instResult(m1).isPhysical
+                && lir.instResult(m1).regClass() == LirRegClass::VR
+                && lir.instResult(m1).id == *v1Ord)
+        << "second F128 arg → v1";
+    // The immediately-following inst is the result capture (fstur_q [home] <- v0).
+    ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
+    auto const cap = lir.blockInstAt(bb, *callIdx + 1);
+    EXPECT_EQ(lir.instOpcode(cap), *fsturQ);
+    auto const capOps = lir.instOperands(cap);
+    ASSERT_GE(capOps.size(), 1u);
+    EXPECT_TRUE(capOps[0].kind == LirOperandKind::Reg
+                && capOps[0].reg.isPhysical && capOps[0].reg.id == *v0Ord)
+        << "the result store captures physical v0";
+}
+
+TEST(MirToLir, DoubleArgDoesNotAliasF128ArgVRegisterAtEntry) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the novel ENTRY-side aliasing
+    // case (the cross-class regalloc pin). A `double` arg sharing a signature with
+    // an AAPCS64 F128 arg must land in a register that does NOT alias the F128
+    // arg's incoming v-register (v{k} shares hwEncoding with d{k}) — else the F128
+    // entry spill `fstur_q [home] <- v{k}` would read whatever regalloc put in the
+    // aliased d-register. The shared NGRN/NSRN counter gives them DIFFERENT
+    // ordinals (double NSRN 0 → d0/hwEnc 0; F128 NSRN 1 → v1/hwEnc 1), so their
+    // physical registers never share an encoding. Runs the REAL regalloc.
+    //   void f(double d, long double ld, double* pd, long double* pld) {
+    //       *pd = d; *pld = ld;   // both live PAST the entry spill
+    //   }
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const pdT  = interner.pointer(f64);
+    auto const pldT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 4> params{f64, f128, pdT, pldT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const d   = mb.addArg(0, f64);    // FPR NSRN 0 → d0
+    ::dss::MirInstId const ld  = mb.addArg(1, f128);   // FPR NSRN 1 → v1 (aliases d1)
+    ::dss::MirInstId const pd  = mb.addArg(0, pdT);    // GPR ord 0 → x0
+    ::dss::MirInstId const pld = mb.addArg(1, pldT);   // GPR ord 1 → x1
+    std::array<::dss::MirInstId, 2> sd{d, pd};
+    (void)mb.addInst(::dss::MirOpcode::Store, sd, ::dss::InvalidType);
+    std::array<::dss::MirInstId, 2> sld{ld, pld};
+    (void)mb.addInst(::dss::MirOpcode::Store, sld, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    // ld's incoming v-register is v1 (NSRN 1) — grab its hwEncoding.
+    auto const v1Ord = (*target)->registerByName("v1");
+    ASSERT_TRUE(v1Ord.has_value());
+    auto const* v1Info = (*target)->registerInfo(*v1Ord);
+    ASSERT_NE(v1Info, nullptr);
+    std::uint16_t const v1Enc = v1Info->hwEncoding;
+
+    // Find the double's arg vreg: the FPR-class `arg` op (ld's F128 arg lowered to
+    // fstur_q, NOT an `arg` op, so the sole FPR `arg` is the double).
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    std::optional<LirReg> dVreg;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) == *argOp
+            && lir.instResult(inst).regClass() == LirRegClass::FPR) {
+            dVreg = lir.instResult(inst);
+            break;
+        }
+    }
+    ASSERT_TRUE(dVreg.has_value()) << "the double must materialize an FPR arg vreg";
+
+    ::dss::DiagnosticReporter regallocRep;
+    LirLiveness const lv = analyzeLiveness(lir);
+    LirAllocation const alloc =
+        allocateRegisters(lir, **target, lv, /*ccIndex=*/0, regallocRep);
+    ASSERT_TRUE(alloc.ok());
+    ASSERT_EQ(alloc.perFunc.size(), 1u);
+    auto const* a = alloc.perFunc[0].forVReg(dVreg->id);
+    ASSERT_NE(a, nullptr);
+    if (!a->isSpilled()) {
+        auto const* dInfo = (*target)->registerInfo(
+            static_cast<std::uint16_t>(a->physReg().id));
+        ASSERT_NE(dInfo, nullptr);
+        EXPECT_NE(dInfo->hwEncoding, v1Enc)
+            << "the double must NOT land in a d-register aliasing the F128 arg's "
+               "v-register (its entry spill reads that physical register)";
+    }
+}
+
+TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4) compose check:
+    //   void g(long double* pa,*pb,*pc,*pr) { *pr = add(*pa,*pb) + *pc; }
+    // A USER Call returning F128 (LD-4: v-register marshal + fstur_q capture)
+    // FEEDS an F128 FAdd (LD-2 softcall __addtf3). Both are memory-resident: the
+    // call-result's home feeds the softcall via regForValue unchanged; the
+    // softcall's OWN bare-[SymbolRef] Call never re-enters the user-call F128 arm.
+    // Neither reopens the other's wall.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> calleeParams{f128, f128};
+    auto const calleeSig =
+        interner.fnSig(calleeParams, f128, ::dss::CallConv::CcSysV);
+    auto const calleePtr = interner.pointer(calleeSig);
+    std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pc = mb.addArg(2, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(3, ptrT);
+    std::array<::dss::MirInstId, 1> la{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, la, f128);
+    std::array<::dss::MirInstId, 1> lb{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lb, f128);
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, calleePtr);
+    std::array<::dss::MirInstId, 3> callOps{callee, va, vb};
+    ::dss::MirInstId const callRes =
+        mb.addInst(::dss::MirOpcode::Call, callOps, f128);   // USER call → F128
+    std::array<::dss::MirInstId, 1> lc{pc};
+    ::dss::MirInstId const vc = mb.addInst(::dss::MirOpcode::Load, lc, f128);
+    std::array<::dss::MirInstId, 2> addOps{callRes, vc};
+    ::dss::MirInstId const sum =
+        mb.addInst(::dss::MirOpcode::FAdd, addOps, f128);    // softcall __addtf3
+    std::array<::dss::MirInstId, 2> st{sum, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, st, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "a user long-double Call feeding an F128 softcall FAdd must compose: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    // The softcall injected __addtf3; the user call is a direct call to symbol 2.
+    bool sawAddtf3 = false;
+    for (auto const& e : result.externImports)
+        if (e.mangledName == "__addtf3") sawAddtf3 = true;
+    EXPECT_TRUE(sawAddtf3)
+        << "the F128 FAdd must still lower to the __addtf3 softcall (unchanged)";
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    EXPECT_TRUE(findCallToSymbol(lir, bb, *callOp, 2u).has_value())
+        << "the user call to `add` (symbol 2) must be present alongside the softcall";
+}
+
+TEST(MirToLir, F128PhiControlMergeWallsFailLoud) {
+    // The F128 twin of F80PhiControlMergeWallsFailLoud: an F128 phi (a `long
+    // double` crossing a control-flow join) must WALL loud in prepassAllocatePhis
+    // (the generic F80||F128 wall), even with the softcall config active — the
+    // softcall realizes straight-line arithmetic, not a memory-home phi merge.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128   = interner.primitive(::dss::TypeKind::F128);
+    auto const i32    = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT  = interner.primitive(::dss::TypeKind::Bool);
+    auto const ptrF128 = interner.pointer(f128);
+    std::array<::dss::TypeId, 3> params{boolT, ptrF128, ptrF128};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
+    ::dss::MirBlockId const elseB = mb.createBlock(::dss::StructCfMarker::IfElse);
+    ::dss::MirBlockId const join  = mb.createBlock(::dss::StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const cond = mb.addArg(0, boolT);
+    ::dss::MirInstId const pa   = mb.addArg(1, ptrF128);
+    ::dss::MirInstId const pb   = mb.addArg(2, ptrF128);
+    mb.addCondBr(cond, thenB, elseB);
+    mb.beginBlock(thenB);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const valOne = mb.addInst(::dss::MirOpcode::Load, laOps, f128);
+    mb.addBr(join);
+    mb.beginBlock(elseB);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const valTwo = mb.addInst(::dss::MirOpcode::Load, lbOps, f128);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    ::dss::MirInstId const phi = mb.addPhi(f128);
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{valOne, thenB});
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{valTwo, elseB});
+    std::array<::dss::MirInstId, 1> cvtOps{phi};
+    ::dss::MirInstId const asInt = mb.addInst(::dss::MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(asInt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = lowerF128Arm64(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F128 phi (long double control-flow merge) must WALL loud";
+    bool sawMerge = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("control-flow merge") != std::string::npos
+            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
+            sawMerge = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawMerge)
+        << "the F128 phi wall must fire with the control-merge diagnostic";
+}
+
+TEST(MirToLir, F128StoreLowersToGprPairCopy) {
+    // void f(long double* pv, long double* pd) { *pd = *pv; } — an F128 store is
+    // a memory->memory copy of the 16-byte datum as TWO 8-byte GPR words at
+    // offsets 0 and 8 (no VR needed): ldr tmp,[pv,#off]; str tmp,[pd,#off].
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f128  = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT  = interner.pointer(f128);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pv = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pd = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> loadOps{pv};
+    ::dss::MirInstId const val = mb.addInst(::dss::MirOpcode::Load, loadOps, f128);
+    std::array<::dss::MirInstId, 2> storeOps{val, pd};
+    (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F128 store (pointer args) must lower to the GPR pair copy: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const gprLoad  = (*target)->opcodeByMnemonic("load");
+    auto const gprStore = (*target)->opcodeByMnemonic("store");
+    ASSERT_TRUE(gprLoad.has_value() && gprStore.has_value());
+    // Collect the (load,store) offset pairs. Expect two: offset 0 and offset 8.
+    std::vector<std::int32_t> loadOffs;
+    std::vector<std::int32_t> storeOffs;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        auto const ops  = lir.instOpcode(inst);
+        if (ops == *gprLoad) {
+            auto const o = lir.instOperands(inst);
+            for (auto const& op : o)
+                if (op.kind == LirOperandKind::MemOffset) loadOffs.push_back(op.offset);
+        } else if (ops == *gprStore) {
+            auto const o = lir.instOperands(inst);
+            for (auto const& op : o)
+                if (op.kind == LirOperandKind::MemOffset) storeOffs.push_back(op.offset);
+        }
+    }
+    ASSERT_EQ(loadOffs.size(), 2u) << "two GPR-word loads (offsets 0 and 8)";
+    ASSERT_EQ(storeOffs.size(), 2u) << "two GPR-word stores (offsets 0 and 8)";
+    EXPECT_EQ(loadOffs[0], 0);
+    EXPECT_EQ(loadOffs[1], 8);
+    EXPECT_EQ(storeOffs[0], 0);
+    EXPECT_EQ(storeOffs[1], 8);
+}
+
+TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
+    // Risk-C net (the v0/d0 aliasing safety): a `double` LIVE ACROSS the F128
+    // softcall must NOT be assigned d0/d1 — the BL's caller-saved clobber of
+    // v0-v7 (aliasing d0-d7) is what keeps it off them. This runs the REAL
+    // regalloc and inspects the post-regalloc assignment.
+    //   double f(long double* pa, long double* pb, long double* pr, double d) {
+    //       *pr = (*pa) + (*pb);   // the softcall (a `call`, isCall=true)
+    //       return d;              // d must survive the call
+    //   }
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const f128 = interner.primitive(::dss::TypeKind::F128);
+    auto const ptrT = interner.pointer(f128);
+    std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, f64};
+    auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(2, ptrT);
+    ::dss::MirInstId const d  = mb.addArg(3, f64);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, f128);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, f128);
+    std::array<::dss::MirInstId, 2> abOps{va, vb};
+    ::dss::MirInstId const sum = mb.addInst(::dss::MirOpcode::FAdd, abOps, f128);
+    std::array<::dss::MirInstId, 2> stOps{sum, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(d);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    // Find the LIR `arg` inst for arg-index 3 (the double d) and its result vreg.
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    std::optional<LirReg> dVreg;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) == *argOp && lir.instPayload(inst) == 3u) {
+            dVreg = lir.instResult(inst);
+            break;
+        }
+    }
+    ASSERT_TRUE(dVreg.has_value() && dVreg->regClass() == LirRegClass::FPR)
+        << "the double arg must materialize an FPR-class vreg";
+
+    // Run the real regalloc (aapcs64 = cc index 0) and inspect the assignment.
+    LirLiveness const lv = analyzeLiveness(lir);
+    ::dss::DiagnosticReporter regallocRep;
+    LirAllocation const alloc =
+        allocateRegisters(lir, **target, lv, /*ccIndex=*/0, regallocRep);
+    ASSERT_TRUE(alloc.ok()) << "regalloc must succeed";
+    ASSERT_EQ(alloc.perFunc.size(), 1u);
+    auto const* a = alloc.perFunc[0].forVReg(dVreg->id);
+    ASSERT_NE(a, nullptr) << "the double vreg must have an assignment";
+    // A value live across a call must not sit in a caller-saved arg register.
+    auto const d0Ord = (*target)->registerByName("d0");
+    auto const d1Ord = (*target)->registerByName("d1");
+    ASSERT_TRUE(d0Ord.has_value() && d1Ord.has_value());
+    ASSERT_FALSE(a->isSpilled())
+        << "the double should get a callee-saved d-reg (d8-d15), not spill";
+    LirReg const phys = a->physReg();
+    EXPECT_NE(phys.id, *d0Ord)
+        << "a double live across the F128 softcall must NOT be in d0 (the "
+           "softcall's v0 scratch aliases it) — the BL caller-saved clobber "
+           "must have pushed it to a callee-saved register";
+    EXPECT_NE(phys.id, *d1Ord)
+        << "likewise not d1 (aliases the softcall's v1 scratch)";
 }
 
 // ══ C99 _Complex (D-CSUBSET-COMPLEX / design test #11): long-double-complex
-// ARITHMETIC walls loud on an x87-80 axis ═══════════════════════════════════
+// ARITHMETIC LOWERS on the x87-80 axis ══════════════════════════════════════
 //
-// `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT. Its
-// decl/layout/sizeof work (the semantic + layout pins), but its VALUE arithmetic
-// emits componentwise F80 float ops — which MUST hit the SAME
-// requireEncodedFloatWidth wall every scalar F80 op hits (no new wall; the
-// long-double arithmetic deferral D-CSUBSET-LONG-DOUBLE-X87-ARITH covers the
-// complex element by construction). This drives the REAL pipeline end-to-end —
-// c-subset source (analyze on the X87_80 axis, the driver's
-// effectiveLongDoubleFormat) → HIR → MIR (materializeComplexBinaryOp emits the
-// F80 component ops) → MIR→LIR (the wall) — NOT a hand-built MIR. The
-// red-on-disable for the wall itself was demonstrated in the long-double cycle;
-// this pin asserts the COMPLEX element rides it: compile must FAIL with
-// L_UnsupportedLoweringForOpcode carrying the D-TARGET-ENCODING-WIDTH-GUARD
-// anchor, never a silently mis-encoded 8-byte op over a 16-byte component.
-TEST(MirToLir, LongDoubleComplexArithmeticWallsLoudOnX87Axis) {
+// `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT.
+// `materializeComplexBinaryOp` emits its addition COMPONENTWISE — plain F80
+// Load/FAdd/Store over the element type — so with D-CSUBSET-LONG-DOUBLE-X87-
+// ARITH (LD-1) landing the scalar x87 memory sequence, the complex LOCAL
+// arithmetic RIDES it for free and now LOWERS (an fld/fld/faddp/fstp per
+// component). This is a REALIZED path, not a walled one — the componentwise
+// scalar ops are individually correct, so the complex result is correct.
+//
+// INVERTED from the FC17.9(e) wall pin (its premise, "F80 components have no
+// scalar float encoding this cycle", is exactly what LD-1 removes). The
+// out-of-scope surface that STAYS walled is the AGGREGATE ABI (classifyAggregate
+// — a `long double _Complex` PASSED or RETURNED across a call boundary), which
+// this local `long double _Complex s = ga + gb;` does not exercise (LD-3/LD-4).
+// Drives the REAL pipeline end-to-end (source → analyze on the X87_80 axis →
+// HIR → MIR → LIR); red-on-disable: revert the F80 FAdd interception and the
+// componentwise adds wall again → lir.ok flips false.
+TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value());
     UnitBuilder builder{*loaded};
@@ -4664,28 +5875,32 @@ TEST(MirToLir, LongDoubleComplexArithmeticWallsLoudOnX87Axis) {
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg);
     ASSERT_TRUE(mir.ok)
-        << "MIR lowering emits the componentwise F80 ops cleanly (the wall is "
-           "the LIR width gate, not MIR): "
+        << "MIR lowering emits the componentwise F80 ops: "
         << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);
     DiagnosticReporter lirReporter;
     auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
-    EXPECT_FALSE(lir.ok)
-        << "long-double-complex ARITHMETIC must wall loud on the x87-80 axis — "
-           "its F80 components have no scalar float encoding this cycle "
-           "(D-CSUBSET-LONG-DOUBLE-X87-ARITH); a clean lowering means an 8-byte "
-           "op silently mis-encoded a 16-byte component";
-    EXPECT_TRUE(sawAnchor(lirReporter, "D-TARGET-ENCODING-WIDTH-GUARD"))
-        << "the wall must be the encoded-float-width guard, with its anchor";
-    bool sawWallCode = false;
-    for (auto const& d : lirReporter.all()) {
-        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode) {
-            sawWallCode = true;
-            break;
+    ASSERT_TRUE(lir.ok)
+        << "long-double-complex LOCAL arithmetic must LOWER on the x87-80 axis — "
+           "its F80 components ride the LD-1 x87 memory sequence: "
+        << (lirReporter.all().empty() ? "" : lirReporter.all()[0].actual);
+    // Structural witness: the componentwise adds realized as x87 `faddp` (the
+    // real re + im additions). Scan every function/block for it.
+    auto const faddpOp = (*target)->opcodeByMnemonic("faddp");
+    ASSERT_TRUE(faddpOp.has_value());
+    std::uint32_t faddpCount = 0;
+    Lir const& L = lir.lir;
+    for (std::uint32_t fi = 0; fi < L.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = L.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < L.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = L.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < L.blockInstCount(blk); ++i) {
+                if (L.instOpcode(L.blockInstAt(blk, i)) == *faddpOp)
+                    ++faddpCount;
+            }
         }
     }
-    EXPECT_TRUE(sawWallCode)
-        << "the wall must carry L_UnsupportedLoweringForOpcode (the fail-loud "
-           "diagnostic), not a silent ok=false";
+    EXPECT_EQ(faddpCount, 2u)
+        << "complex addition is two componentwise F80 adds (re + im) → two faddp";
 }
 
 // ══ TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm ══

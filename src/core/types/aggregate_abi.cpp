@@ -40,18 +40,30 @@ struct LeafField {
         || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
-// FC17.9(e) (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI): an F80/F128 leaf makes the
-// whole aggregate UNCLASSIFIABLE this cycle — fail loud (nullopt), never guess.
-// The real rules diverge from every implemented path: SysV classes an x87
-// eightbyte pair X87/X87UP → the WHOLE aggregate goes MEMORY (a naive
-// float-kind join would classify it SSE → XMM pieces; a non-join classifies it
-// INTEGER → a silent 2-GPR by-value pass, ABI-divergent at FFI). AAPCS64
-// treats binary128 as a fundamental FP member (a Q-register HFA) — a piece
-// width no register-move tier realizes. Both realize with their arithmetic
-// arcs (D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH).
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) leaf
+// forces the SysV x87 MEMORY class. SysV classes an x87 eightbyte pair
+// X87/X87UP → the WHOLE aggregate goes MEMORY (ByReference) regardless of size
+// (a naive float-kind join would classify it SSE → XMM pieces; a non-join
+// classifies it INTEGER → a silent 2-GPR by-value pass, ABI-divergent at FFI).
+// Used by the SysV arm to force ByReference. (AAPCS64 uses the narrower
+// `hasF80Leaf` — its binary128 leaf is a legitimate Q-register HFA.)
 [[nodiscard]] bool hasLongDoubleClassLeaf(std::vector<LeafField> const& leaves) noexcept {
     for (LeafField const& f : leaves) {
         if (f.kind == TypeKind::F80 || f.kind == TypeKind::F128) return true;
+    }
+    return false;
+}
+
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): an F80 (x87 80-bit) leaf ONLY.
+// On AAPCS64 a binary128 (F128) leaf is a valid HFA member (a Q-register piece,
+// elem=16), so it falls through to the HFA math below; but an F80 leaf can only
+// arise from a hand-built type on this axis (arm64 `long double` is F128 by
+// construction, never x87), and x87 extended has NO AAPCS64 fundamental-FP
+// register class — so an F80 leaf refuses classification (fail loud, never a
+// guessed 8-byte FPR piece over a 16-byte x87 value).
+[[nodiscard]] bool hasF80Leaf(std::vector<LeafField> const& leaves) noexcept {
+    for (LeafField const& f : leaves) {
+        if (f.kind == TypeKind::F80) return true;
     }
     return false;
 }
@@ -154,9 +166,13 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
         std::vector<LeafField> leaves;
         if (!collectLeaves(aggTy, 0, in, lp, dm, leaves))
             return std::nullopt;
-        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI: F80/F128 leaves → fail loud
-        // (see hasLongDoubleClassLeaf — a binary128 HFA needs Q-reg pieces).
-        if (hasLongDoubleClassLeaf(leaves)) return std::nullopt;
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): an F80 leaf still fails
+        // loud (x87 extended has no AAPCS64 register class); an F128 (binary128)
+        // leaf now FALLS THROUGH to the HFA math below — `isFloatKind`/
+        // `scalarByteSize` already handle F128 (elem=16, count=size/16), so a
+        // binary128 member is a 16-byte Q-register HFA piece (v0..v7) and a
+        // 2-binary128 aggregate is a 2-piece HFA.
+        if (hasF80Leaf(leaves)) return std::nullopt;
         // HFA element homogeneity: every leaf is the SAME float kind. The member
         // COUNT is size/elem (NOT the leaf count) so a union of N floats — whose
         // members overlap to one element — is a 1-member HFA, while a struct/array
@@ -209,13 +225,19 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
     std::vector<LeafField> leaves;
     if (!collectLeaves(aggTy, 0, in, lp, dm, leaves))
         return std::nullopt;
-    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI: F80/F128 leaves → fail loud (see
-    // hasLongDoubleClassLeaf — SysV classes x87 eightbytes X87/X87UP → the
-    // aggregate goes MEMORY, which no arm below models; classifying INTEGER
-    // would silently 2-GPR-pass it). Win64BySize needs NO arm: its formats
-    // declare the f64 axis (long double ≡ F64, so no F80/F128 leaf can form)
-    // and its by-size rule sends any 16-byte aggregate ByReference anyway.
-    if (hasLongDoubleClassLeaf(leaves)) return std::nullopt;
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) leaf
+    // forces the SysV x87 MEMORY class → the WHOLE aggregate goes BY REFERENCE
+    // (X87/X87UP → MEMORY regardless of size). This is the same hidden-pointer
+    // pass path a >16B aggregate already takes (inheriting D-FC7's sret /
+    // by-ref-arg realization — §2.6-1, pre-existing), NOT the SSE/INTEGER
+    // eightbyte merge below (which would silently 2-GPR-pass or XMM-pass a
+    // 16-byte x87 value). Win64BySize needs NO arm: its formats declare the f64
+    // axis (long double ≡ F64, so no F80/F128 leaf can form) and its by-size
+    // rule sends any 16-byte aggregate ByReference anyway.
+    if (hasLongDoubleClassLeaf(leaves)) {
+        out.kind = AbiPassing::Kind::ByReference;
+        return out;
+    }
 
     std::size_t const n = static_cast<std::size_t>((size + 7) / 8);   // 1 or 2
     // Each eightbyte is SSE iff EVERY scalar field overlapping it is float; any

@@ -34,6 +34,7 @@ using detail::isFloatKind;
 using detail::isFloatValue;
 using detail::makeBoolLiteral;
 using detail::narrowToFloatWidth;
+using detail::toWideFloatOperand;
 using detail::valueFitsInIntTarget;
 using detail::wrapToIntTarget;
 
@@ -261,26 +262,40 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
 
     // Float → Bool: nonzero (incl. NaN/inf) → true; ±0 → false.
     if (sourceFloat && toK == TypeKind::Bool) {
+        // LD-3: an F80/F128 source folds truthiness via isZero (asDouble nullopts
+        // for the WideFloatValue arm — a `*asDouble` deref would be UB).
+        if (auto const* wf = std::get_if<WideFloatValue>(&inner.value->value)) {
+            return ok(makeBoolLiteral(wf->isZero() ? 0 : 1));
+        }
         double const dv = *asDouble(*inner.value);
         return ok(makeBoolLiteral(dv != 0.0 ? 1 : 0));
     }
 
-    // Float → Float: convert via host. F32 needs an actual
-    // narrowing round-trip (otherwise the stored `double` would
-    // diverge from the IEEE-754 single-precision value the runtime
-    // produces); F64 is identity; F16 / F80 / F128 (every kind whose
-    // floatKindInfo.hostBacked is false — F80 joined with FC17.9(e)) have no
-    // host backing and refuse — storing a `double` under `core = F16` would
-    // violate the `HirLiteralValue::core` ↔ variant-arm contract
-    // (the value-bits wouldn't be the actual half/x87-ext/quad). Lifting them
-    // requires a soft-float helper, deferred (long double: the per-format
-    // D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION arc).
+    // Float → Float: convert via host. F32 needs an actual narrowing round-trip
+    // (otherwise the stored `double` would diverge from the IEEE-754 single-
+    // precision value the runtime produces); F64 is identity; F16 has no host
+    // backing on the `double` arm and refuses.
     if (sourceFloat && targetFloat) {
+        // LD-3: an F80/F128 TARGET carries a WideFloatValue at true precision.
+        // Widen a `double` leaf (exact) or pass a same-kind WideFloatValue through
+        // (a cross-kind F80↔F128 cast — unreachable in valid C — refuses loud).
+        if (WideFloatValue::isSupportedKind(toK)) {
+            auto w = toWideFloatOperand(*inner.value, toK);
+            if (!w.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            HirLiteralValue folded;
+            folded.core  = toK;
+            folded.value = *w;
+            return ok(std::move(folded));
+        }
+        // Target is F16/F32/F64. An F80/F128 SOURCE narrows via the kernel's
+        // round-to-nearest-even toDouble (then narrowToFloatWidth for F16/F32).
         auto info = floatKindInfo(toK);
         if (!info.has_value() || !info->hostBacked) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
-        double const dv = *asDouble(*inner.value);
+        double const dv = (std::get_if<WideFloatValue>(&inner.value->value) != nullptr)
+            ? std::get<WideFloatValue>(inner.value->value).toDouble()
+            : *asDouble(*inner.value);
         HirLiteralValue folded;
         folded.core  = toK;
         folded.value = narrowToFloatWidth(dv, info->bits);
@@ -289,9 +304,20 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
 
     // Int → Float: host conversion (precision-loss for huge ints is
     // IEEE 754-defined behaviour; runtime path produces the same
-    // bits). F16 / F80 / F128 refuse for the same reason as float→float
-    // (no host backing — the hostBacked gate below).
+    // bits). F16 refuses (no host backing on the `double` arm).
     if (!sourceFloat && targetFloat) {
+        // LD-3: int → F80/F128 is ALWAYS exact (any int64 fits the 64/113-bit
+        // significand — unlike int → binary64), so it folds via the kernel's
+        // exact `fromInt64`, NEVER through a lossy host `double`. (No lossy-knob
+        // check: the conversion cannot lose precision.)
+        if (WideFloatValue::isSupportedKind(toK)) {
+            auto iv = asInt64(*inner.value);
+            if (!iv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            HirLiteralValue folded;
+            folded.core  = toK;
+            folded.value = WideFloatValue::fromInt64(*iv, toK);
+            return ok(std::move(folded));
+        }
         auto info = floatKindInfo(toK);
         if (!info.has_value() || !info->hostBacked) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
@@ -316,6 +342,27 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     if (sourceFloat) {
         auto target = intKindInfo(toK);
         if (!target.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        // LD-3: an F80/F128 source truncates via the kernel's toInt64 — the range
+        // check is done AT THE OPERAND'S OWN PRECISION (never narrow-to-double
+        // first; the 2^63 boundary would flip sign). nullopt = NaN / inf / out-of-
+        // int64-range → refuse with Overflow, exactly as the double path below.
+        if (auto const* wf = std::get_if<WideFloatValue>(&inner.value->value)) {
+            auto iv = wf->toInt64();
+            if (!iv.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            if (toK == TypeKind::Bool) return ok(makeBoolLiteral(*iv));
+            HirLiteralValue folded;
+            folded.core = toK;
+            if (target->bits >= 64 && !target->isSigned && *iv < 0) {
+                return fail(ConstEvalFailure::Overflow, expr);
+            }
+            if (valueFitsInIntTarget(*iv, *target)) {
+                folded.value = *iv;
+                return ok(std::move(folded));
+            }
+            if (options.refuseOnOverflow) return fail(ConstEvalFailure::Overflow, expr);
+            folded.value = wrapToIntTarget(*iv, *target);
+            return ok(std::move(folded));
+        }
         double const dv = *asDouble(*inner.value);
         // NaN / inf: refuse with Overflow unless we can constructively
         // claim a value. We cannot; refuse regardless of the knob.

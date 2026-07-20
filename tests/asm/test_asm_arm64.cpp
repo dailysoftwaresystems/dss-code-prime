@@ -1216,6 +1216,45 @@ TEST(Arm64Encoder, StoreSturEncodes) {
     EXPECT_EQ(bytes[3], 0xF8);
 }
 
+TEST(Arm64Encoder, FldurQEncodesLdurQImmediate) {
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): fldur_q v0, [X1, #0] ->
+    // LDUR Q0, [X1, #0]. Fixed word 0x3CC00000.
+    //   Rt(rd) = Q0 (0) at bits 0..4  -> 0x00
+    //   Rn     = X1 (1) at bits 5..9  -> 0x20
+    //   Imm9   = 0      at bits 12..20 -> 0
+    // word = 0x3CC00020; LE: 20 00 C0 3C. (Assembler-confirmed against the
+    // shipped fstur_q pin STUR Q0,[X1] = 0x3C800020.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fldurQ = (*s)->opcodeByMnemonic("fldur_q");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fldurQ.has_value() && retOp.has_value());
+    auto const v0Ord = (*s)->registerByName("v0");
+    ASSERT_TRUE(v0Ord.has_value());
+    LirReg const q0 = makePhysicalReg(static_cast<std::uint32_t>(*v0Ord),
+                                      LirRegClass::VR);
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0)
+    };
+    (void)b.addInst(*fldurQ, q0, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x3C);
+}
+
 TEST(Arm64Encoder, AddImm12Encodes) {
     // add SP, SP, #16 → ADD SP, SP, #16. Base 0x91000000.
     //   Rd = SP (31) at 0..4 → 0x1F, Rn = SP (31) at 5..9 → 0x3E0,

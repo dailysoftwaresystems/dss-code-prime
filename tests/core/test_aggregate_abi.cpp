@@ -70,37 +70,74 @@ TEST(AggregateAbiSysV, TwoLongs_TwoGprEightbytes) {
     EXPECT_EQ(r->pieces[1].widthBytes, 8u);
 }
 
-// FC17.9(e) (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI): an F80/F128 LEAF makes the
-// aggregate UNCLASSIFIABLE this cycle — nullopt (fail loud), never a guessed
-// class. The dangerous wrong answers this pins against: SysV would need the
-// X87/X87UP → MEMORY rule (a float-kind join would say SSE; a non-join says
-// INTEGER = a silent 2-GPR by-value pass, ABI-divergent at FFI); AAPCS64 would
-// need Q-register HFA pieces. Both realize with their arithmetic arcs.
-TEST(AggregateAbiSysV, LongDoubleLeafStructIsNulloptFailLoud) {
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) LEAF forces
+// the SysV x87 MEMORY class → the WHOLE aggregate goes BY REFERENCE (X87/X87UP →
+// MEMORY, regardless of size). INVERTED from the FC17.9(e) nullopt-fail-loud pin:
+// the real rule is now modeled. NOT the SSE/INTEGER eightbyte merge (a float-kind
+// join would say SSE → XMM pieces; a non-join says INTEGER = a silent 2-GPR pass,
+// ABI-divergent at FFI). Inherits the pre-existing D-FC7 hidden-pointer path.
+TEST(AggregateAbiSysV, LongDoubleLeafStructIsByReference) {
     auto ti = makeInterner(1);
     auto r80 = classifySysV(structOf(ti, "LD", {ti.primitive(TypeKind::F80)}), ti);
-    EXPECT_FALSE(r80.has_value())
-        << "an F80 (x87 long double) leaf must refuse classification — the "
-           "SysV X87/X87UP MEMORY rule is not modeled; any classified answer "
-           "here is a silent ABI miscompile";
+    ASSERT_TRUE(r80.has_value());
+    EXPECT_EQ(r80->kind, AbiPassing::Kind::ByReference)
+        << "an F80 (x87 long double) leaf → the SysV MEMORY class (ByReference)";
+    EXPECT_TRUE(r80->pieces.empty())
+        << "a ByReference pass carries NO register pieces (a hidden pointer)";
     auto r128 = classifySysV(structOf(ti, "LQ", {ti.primitive(TypeKind::F128)}), ti);
-    EXPECT_FALSE(r128.has_value())
-        << "an F128 (binary128) leaf must refuse classification too";
+    ASSERT_TRUE(r128.has_value());
+    EXPECT_EQ(r128->kind, AbiPassing::Kind::ByReference)
+        << "an F128 (binary128) leaf → MEMORY too (X87/X87UP → the whole agg)";
     // Nested: the leaf walk must see THROUGH an inner struct.
     TypeId const inner = structOf(ti, "In", {ti.primitive(TypeKind::F80)});
     auto nested = classifySysV(structOf(ti, "Out", {inner}), ti);
-    EXPECT_FALSE(nested.has_value())
-        << "a NESTED F80 leaf must also refuse — the check is leaf-deep";
+    ASSERT_TRUE(nested.has_value());
+    EXPECT_EQ(nested->kind, AbiPassing::Kind::ByReference)
+        << "a NESTED F80 leaf → MEMORY — the check is leaf-deep";
 }
 
-TEST(AggregateAbiAapcs64, LongDoubleLeafStructIsNulloptFailLoud) {
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): AAPCS64 — a binary128 (F128) leaf is
+// a legitimate HFA member (a 16-byte Q-register piece), so it now CLASSIFIES to an
+// HFA (INVERTED from the FC17.9(e) nullopt pin). An F80 (x87) leaf still refuses
+// (no AAPCS64 x87 register class) — see F80LeafStructStillRefuses below.
+TEST(AggregateAbiAapcs64, Binary128LeafStructIsHfaFpr) {
     auto ti = makeInterner(1);
-    TypeId const s = structOf(ti, "LQ", {ti.primitive(TypeKind::F128)});
+    // Single binary128 member → a 1-element HFA in ONE Q-register (v0): a 16-byte
+    // Fpr piece at offset 0 (NEVER an 8-byte piece — that would move 8 of 16 bytes).
+    TypeId const s1 = structOf(ti, "LQ", {ti.primitive(TypeKind::F128)});
+    auto r1 = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s1, ti,
+                                kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r1->pieces.size(), 1u);
+    EXPECT_EQ(r1->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r1->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r1->pieces[0].widthBytes, 16u)
+        << "a binary128 HFA piece is 16 bytes (a full Q-register), never 8";
+    // Two binary128 members → a 2-element HFA in v0/v1: two 16-byte Fpr pieces.
+    TypeId const s2 = structOf(ti, "LQ2",
+        {ti.primitive(TypeKind::F128), ti.primitive(TypeKind::F128)});
+    auto r2 = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s2, ti,
+                                kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r2->pieces.size(), 2u) << "a 2-binary128 aggregate = a 2-piece HFA";
+    EXPECT_EQ(r2->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r2->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r2->pieces[0].widthBytes, 16u);
+    EXPECT_EQ(r2->pieces[1].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r2->pieces[1].byteOffset, 16u);
+    EXPECT_EQ(r2->pieces[1].widthBytes, 16u);
+}
+
+TEST(AggregateAbiAapcs64, F80LeafStructStillRefuses) {
+    auto ti = makeInterner(1);
+    TypeId const s = structOf(ti, "LD", {ti.primitive(TypeKind::F80)});
     EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s, ti,
-                                   kNatural16, DataModel::Lp64)
-                     .has_value())
-        << "AAPCS64: a binary128 member is a Q-register HFA — no realized "
-           "piece width; must refuse, never emit an 8-byte FPR piece";
+                                   kNatural16, DataModel::Lp64).has_value())
+        << "AAPCS64: an x87 F80 leaf has no fundamental-FP register class — must "
+           "refuse (F80 only arises from a hand-built type here; arm64 long double "
+           "is F128), never emit an 8-byte FPR piece over a 16-byte x87 value";
 }
 
 // {int,float} = 8 bytes, one eightbyte holding an int(0..3) AND a float(4..7) →
@@ -148,25 +185,38 @@ TEST(AggregateAbiSysV, DoubleComplex_TwoFprEightbytes) {
     EXPECT_EQ(rf->pieces[0].cls, AbiPieceClass::Fpr);
 }
 
-// long double _Complex (F80/F128 element) — on AAPCS64 the leaf walk runs BEFORE the
-// size rule (an HFA is not size-capped), so an F80/F128 leaf trips
-// hasLongDoubleClassLeaf → refuse (nullopt), exactly like a struct with a long-double
-// member. On SysV a 32-byte long-double-complex is MEMORY (ByReference) by the >16B
-// rule (which runs first) — a VALID by-reference pass (the value moves correctly; the
-// long-double VALUE arithmetic walls loud separately at the component ops).
-TEST(AggregateAbiAapcs64, LongDoubleComplexIsNulloptFailLoud) {
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): long double _Complex (F80/F128
+// element). A `_Complex` is ABI-passed as struct{re, im} (2 leaves). On AAPCS64 a
+// binary128 _Complex → 2 binary128 leaves @0/@16 → a 2-element HFA (v0/v1, two
+// 16-byte Fpr pieces) — INVERTED from the FC17.9(e) refusal. An F80-element complex
+// → 2 F80 leaves → still refuses (no AAPCS64 x87 register class). On SysV a 32-byte
+// long-double-complex is MEMORY (ByReference) by the >16B rule (which runs first) —
+// a VALID by-reference pass (the value moves; VALUE arithmetic walls at the ops).
+TEST(AggregateAbiAapcs64, Binary128ComplexIsTwoPieceHfa) {
+    auto ti = makeInterner(1);
+    TypeId const cq = ti.complex(ti.primitive(TypeKind::F128));
+    auto r = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cq, ti,
+                               kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 2u) << "a binary128 _Complex = a 2-element HFA";
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r->pieces[0].widthBytes, 16u);
+    EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[1].byteOffset, 16u) << "imag leaf at elemSize=16";
+    EXPECT_EQ(r->pieces[1].widthBytes, 16u);
+}
+
+TEST(AggregateAbiAapcs64, F80ComplexStillRefusesAndSysVIsByReference) {
     auto ti = makeInterner(1);
     TypeId const cld = ti.complex(ti.primitive(TypeKind::F80));
     EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cld, ti,
                                    kNatural16, DataModel::Lp64).has_value())
-        << "AAPCS64: an F80-element complex has F80 leaves → must refuse (the "
-           "long-double leaf wall runs before the size rule for HFAs)";
-    TypeId const cq = ti.complex(ti.primitive(TypeKind::F128));
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cq, ti,
-                                   kNatural16, DataModel::Lp64).has_value())
-        << "AAPCS64: a binary128-element complex likewise refuses";
-    // SysV: a 32-byte long-double-complex is MEMORY (ByReference) — valid, not a
-    // refusal (the >16B rule runs first; the value moves, arithmetic walls elsewhere).
+        << "AAPCS64: an F80-element complex has F80 leaves → must refuse (no x87 "
+           "register class), never a guessed piece";
+    // SysV: a 32-byte long-double-complex is MEMORY (ByReference) — the >16B rule
+    // runs first (the value moves; arithmetic walls elsewhere).
     auto sysv = classifySysV(cld, ti);
     ASSERT_TRUE(sysv.has_value());
     EXPECT_EQ(sysv->kind, AbiPassing::Kind::ByReference);

@@ -72,6 +72,21 @@ namespace {
          |  static_cast<std::uint32_t>(b[off + 3]);
 }
 
+// The COFF 2nd linker member is little-endian.
+[[nodiscard]] std::uint32_t readU32LE(std::span<std::uint8_t const> b,
+                                      std::size_t off) {
+    return  static_cast<std::uint32_t>(b[off + 0])
+         | (static_cast<std::uint32_t>(b[off + 1]) <<  8)
+         | (static_cast<std::uint32_t>(b[off + 2]) << 16)
+         | (static_cast<std::uint32_t>(b[off + 3]) << 24);
+}
+[[nodiscard]] std::uint16_t readU16LE(std::span<std::uint8_t const> b,
+                                      std::size_t off) {
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint32_t>(b[off + 0])
+        | (static_cast<std::uint32_t>(b[off + 1]) << 8));
+}
+
 // A raw ar_hdr field as text (trailing spaces stripped -- the reader's rstrip).
 [[nodiscard]] std::string field(std::span<std::uint8_t const> b,
                                 std::size_t off, std::size_t len) {
@@ -205,6 +220,73 @@ TEST(ArWriter, RoundTripThroughC161Reader) {
     EXPECT_EQ(arch->symbols[0].memberIndex, 0u);
     EXPECT_EQ(arch->symbols[1].name, "dss_data");
     EXPECT_EQ(arch->symbols[1].memberIndex, 0u);
+    EXPECT_EQ(arch->symbols[0].memberOffset, arch->members[0].headerOffset);
+}
+
+// -- COFF `.lib` 2nd linker member (D-FF1-AR-COFF-WRITER, c169) ----------------
+
+TEST(ArWriter, CoffSecondLinkerMemberBytePins) {
+    ArMemberInput m = w1Member();   // 1 member, symbols "dss_lib_answer","dss_data"
+    DiagnosticReporter rep;
+    auto lib = writeArArchive(std::span<ArMemberInput const>{&m, 1}, rep,
+                              dss::link::format::ArArchiveFlavor::Coff);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // The 1st "/" armap is the SAME big-endian SysV structure (size 36), but its
+    // member offsets now point PAST the inserted 2nd member: the object member
+    // header sits at 8 + (60+36) + (60+40) = 204.
+    EXPECT_EQ(field(lib, 8, 16), "/");
+    EXPECT_EQ(field(lib, 8 + 48, 10), "36");
+    constexpr std::uint32_t kMemberHdrOff = 204u;
+    EXPECT_EQ(readU32BE(lib, 68), 2u);                    // BE symbol count
+    EXPECT_EQ(readU32BE(lib, 72), kMemberHdrOff);         // BE offset[0]
+    EXPECT_EQ(readU32BE(lib, 76), kMemberHdrOff);         // BE offset[1]
+
+    // The COFF 2nd linker member "/" at 104 (8 + 60+36), payload size 40 =
+    // memberCount(4) + offsets(4) + symbolCount(4) + indices(2*2) + names(24).
+    constexpr std::size_t k2nd = 104u;
+    EXPECT_EQ(field(lib, k2nd, 16), "/");
+    EXPECT_EQ(field(lib, k2nd + 48, 10), "40");
+    constexpr std::size_t p = k2nd + 60u;                 // payload at 164
+    EXPECT_EQ(readU32LE(lib, p + 0), 1u);                 // LE memberCount
+    EXPECT_EQ(readU32LE(lib, p + 4), kMemberHdrOff);      // LE member offset[0]
+    EXPECT_EQ(readU32LE(lib, p + 8), 2u);                 // LE symbolCount
+    // Indices (u16 LE) in SORTED name order: "dss_data" then "dss_lib_answer"
+    // ('d' < 'l' at index 4) -- both defined by the 1-based member index 1.
+    EXPECT_EQ(readU16LE(lib, p + 12), 1u);
+    EXPECT_EQ(readU16LE(lib, p + 14), 1u);
+    // The SORTED NUL-terminated name blob (distinct from the 1st armap's
+    // appearance-order blob -- the red-on-disable for the sort).
+    std::string const blob{reinterpret_cast<char const*>(&lib[p + 16]), 24};
+    EXPECT_EQ(blob, std::string("dss_data\0dss_lib_answer\0", 24));
+
+    // The object member lands at 204; the archive ends at 204 + 60 + 20 = 284.
+    EXPECT_EQ(field(lib, kMemberHdrOff, 16), "lib.o/");
+    EXPECT_EQ(lib.size(), 284u);
+}
+
+TEST(ArWriter, CoffLibRoundTripsThroughC161Reader) {
+    // A COFF `.lib` has TWO "/" linker members; the c161 reader must use the
+    // FIRST (big-endian SysV armap) and SKIP the second (MS little-endian) --
+    // else it mis-reads the LE payload as BE. The member list + symbols must
+    // match the SysV archive exactly (the 2nd member is a pure index, not an
+    // object). Red-on-disable: LAST-"/"-wins would parse the LE 2nd member as a
+    // BE armap -> a bogus huge count -> corrupt.
+    ArMemberInput m = w1Member();
+    DiagnosticReporter wrep;
+    auto lib = writeArArchive(std::span<ArMemberInput const>{&m, 1}, wrep,
+                              dss::link::format::ArArchiveFlavor::Coff);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(lib, "libdsslib.lib", rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 1u) << "the 2nd '/' index member is NOT an object";
+    EXPECT_EQ(arch->members[0].name, "lib.o");
+    ASSERT_EQ(arch->symbols.size(), 2u);
+    EXPECT_EQ(arch->symbols[0].name, "dss_lib_answer");
+    EXPECT_EQ(arch->symbols[0].memberIndex, 0u);
+    EXPECT_EQ(arch->symbols[1].name, "dss_data");
     EXPECT_EQ(arch->symbols[0].memberOffset, arch->members[0].headerOffset);
 }
 
@@ -425,4 +507,49 @@ TEST(ArWriter, DISABLED_WriteRealArchivesForWslWitness) {
             << "errs=" << rep.errorCount();
         std::cout << "[witness] wrote " << p.string() << "\n";
     }
+}
+
+// -- COFF `.lib` native-toolchain witness (DISABLED; run out-of-band) ----------
+//
+// Bundles a REAL `cl.exe`-produced COFF `.obj` (read from $DSS_COFF_OBJ; its
+// comma-separated exported symbols in $DSS_COFF_SYMS) into a DSS-written COFF
+// `.lib` at $DSS_COFF_LIB. DISABLED so CI stays hermetic; the driver script
+// (scratchpad) then runs `dumpbin /ARCHIVEMEMBERS` + `link.exe main.obj
+// dsslib.lib` -> exit 42, proving native `link.exe` consumes the DSS `.lib` via
+// the 2nd linker member. Run explicitly:
+//   test_ar_writer --gtest_also_run_disabled_tests \
+//                  --gtest_filter='*WriteCoffLibForNativeWitness*'
+TEST(ArWriter, DISABLED_WriteCoffLibForNativeWitness) {
+    char const* objPath = std::getenv("DSS_COFF_OBJ");
+    char const* symsEnv = std::getenv("DSS_COFF_SYMS");
+    char const* libPath = std::getenv("DSS_COFF_LIB");
+    ASSERT_NE(objPath, nullptr) << "set DSS_COFF_OBJ to a cl.exe .obj";
+    ASSERT_NE(symsEnv, nullptr) << "set DSS_COFF_SYMS to the comma-separated exports";
+    ASSERT_NE(libPath, nullptr) << "set DSS_COFF_LIB to the output .lib path";
+
+    std::ifstream in(objPath, std::ios::binary);
+    ASSERT_TRUE(in) << "cannot open " << objPath;
+    std::vector<std::uint8_t> obj((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+    ASSERT_FALSE(obj.empty());
+
+    std::vector<std::string> syms;
+    std::string cur;
+    for (char const c : std::string{symsEnv}) {
+        if (c == ',') { if (!cur.empty()) syms.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) syms.push_back(cur);
+    ASSERT_FALSE(syms.empty());
+
+    ArMemberInput m{"lib.obj", std::move(obj), syms};
+    DiagnosticReporter rep;
+    auto lib = writeArArchive(std::span<ArMemberInput const>{&m, 1}, rep,
+                              dss::link::format::ArArchiveFlavor::Coff);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(lib.empty());
+    std::ofstream out(libPath, std::ios::binary);
+    out.write(reinterpret_cast<char const*>(lib.data()),
+              static_cast<std::streamsize>(lib.size()));
+    std::cout << "[witness] wrote " << libPath << " (" << lib.size() << " bytes)\n";
 }

@@ -1,5 +1,5 @@
 {
-  "$comment": "FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis, runtime-witnessed on the f64-axis formats where `long double` IS `double` (pe64 x86_64 MSVC + Apple arm64 — the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves it with zero new codegen). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (f64-axis identity guard), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The x87-80/ieee128 formats are deliberately ABSENT — long double VALUE ops wall loud there until D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH land; that walled behavior is pinned in the unit suites (the F80 arithmetic-wall arm + the four call-boundary walls F80{Arg,StoreValue,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp, the constexpr fold-gate refusal in the semantic + const_eval suites), not by a runtime arm here. exit = (int)(20.0L + 22.0L) = 42.",
+  "$comment": "FC17.9(e) + D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1) + -IEEE128-ARITH (LD-2) + -AGGREGATE-ABI (LD-4): the per-format long-double axis, runtime-witnessed on ALL THREE axes AND across USER CALL BOUNDARIES. f64-axis (pe64 x86_64 MSVC + Apple arm64): the axis collapses the typeSpecifiers row to F64, so the whole double CC serves `long double` (incl. the scalar `add` and by-value `struct S`) with zero new codegen. x87-80 axis (elf64 x86_64 linux): `long double` is the 80-bit x87 extended type — arithmetic runs on the REAL x87 FPU (fld/fld/faddp/fstp, LD-1); the scalar `add` passes its args on the x87 STACK (ByValueStackArg + recv_by_value_stack_param) and returns in st0 (fstp_m80/fld_m80, LD-4); the by-value `struct S` goes BY REFERENCE (the SysV x87 MEMORY class, LD-4). ieee128 axis (elf64 aarch64 linux, qemu): `long double` is IEEE binary128 — arithmetic lowers to __addtf3 (LD-2); the scalar `add` passes/returns in v-registers (fldur_q/fstur_q, LD-4); the by-value `struct S` is a 1-element binary128 HFA (v0, LD-4). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (the `>= sizeof(double)` guard holds on all axes: equal on f64, 16-vs-8 on x87-80/ieee128), (int) conversion, a SCALAR long-double call boundary (`add`), and a BY-VALUE struct-with-long-double-leaf boundary (`add_s`). Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The boundary LOWERING is pinned in the unit suites ({F80,F128}{Arg,CallResult,ReturnOperand}Lowers* in tests/lir/test_mir_to_lir.cpp — INVERTED from the LD-2 walls); the still-walled F80/F128 PHI merge stays fail-loud (F80/F128PhiControlMergeWallsFailLoud). exit = (int)(20.0L + 22.0L) = 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -9,6 +9,17 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "main.exe",
       "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
     },
     {
       "spec": "arm64:macho64-arm64-darwin-exec",

@@ -1,39 +1,69 @@
 {
-  "$comment": "Neutral shipped <stdint.h> (C99 7.18) — exact-width, minimum-width, fastest-minimum-width, pointer-width, and greatest-width integer typedefs expressed as language-NEUTRAL hir-text aliases, injected by the semantic phase (a C `.h` would be C-syntax TEXT and couple the shipped config to C; see README + limits.json). FIRST real consumer of the FC14 typedef-injection path. The pointer-width forms (intptr_t/uintptr_t) and the greatest-width forms (intmax_t/uintmax_t) are 8 bytes on EVERY current DSS target — all are 64-bit, and LP64 + LLP64 agree on pointer width (only `long` differs, which stdint does not expose) — so they are u64/i64. An ILP32 target would make them 4-byte: deferred D-FFI-STDINT-PTR-WIDTH-ILP32. The fastest-minimum-width forms are implementation-defined; mapping them to their exact-width minimum (int_fast16_t -> i16) is conforming (>= N bits) and keeps SQLite's self-contained amalgamation internally consistent. No `symbols` (no link surface). â c82 (shell.c `N==INT64_MIN ? INT64_MAX : -N`): the FIRST slice of the C99 7.18.2 limit macros ships on `constants` â INT64_MIN/INT64_MAX, width-exact, target-INDEPENDENT, typed i64 (7.18.2.1p3: the type after promotion). The constants decoder reads `value` via get<int64_t> behind an is_number_integer check, so -9223372036854775808 / 9223372036854775807 round-trip EXACTLY (nlohmann parses the sign inline as number_integer_t â no double transit). UINT64_MAX is deliberately ABSENT: 18446744073709551615 exceeds number_integer_t and needs the decoder's unsigned arm first. D-FFI-STDINT-LIMIT-MACROS stays open for the full set. The C99 7.18.4 `*_C` integer-CONSTANT macros (INT64_C/UINT64_C/INTMAX_C/… as `v##ULL` etc.) ARE shipped (c39 D-FFI-STDINT-CONSTANT-MACROS) — universal `ULL`/`LL`/`U` suffixes are >=64-bit on EVERY DSS target (LP64 + LLP64), so no per-target branching; `unsigned long long` satisfies the `uint_least64_t` width the standard requires. SQLite uses UINT64_C heavily for 64-bit bitmask constants.",
+  "$comment": "Neutral shipped <stdint.h> (C99 7.18) — exact-width, minimum-width, fastest-minimum-width, pointer-width, and greatest-width integer typedefs expressed as language-NEUTRAL hir-text aliases, injected by the semantic phase (a C `.h` would be C-syntax TEXT and couple the shipped config to C; see README + limits.json). FIRST real consumer of the FC14 typedef-injection path. The pointer-width forms (intptr_t/uintptr_t) and the greatest-width forms (intmax_t/uintmax_t) are 8 bytes on EVERY current DSS target — all are 64-bit, and LP64 + LLP64 agree on pointer width (only `long` differs, which stdint does not expose) — so they are u64/i64. An ILP32 target would make them 4-byte: deferred D-FFI-STDINT-PTR-WIDTH-ILP32. The fastest-minimum-width forms are implementation-defined; mapping them to their exact-width minimum (int_fast16_t -> i16) is conforming (>= N bits) and keeps SQLite's self-contained amalgamation internally consistent. No `symbols` (no link surface). â c82 (shell.c `N==INT64_MIN ? INT64_MAX : -N`): the FIRST slice of the C99 7.18.2 limit macros ships on `constants` â INT64_MIN/INT64_MAX, width-exact, target-INDEPENDENT, typed i64 (7.18.2.1p3: the type after promotion). The constants decoder reads `value` via get<int64_t> behind an is_number_integer check, so -9223372036854775808 / 9223372036854775807 round-trip EXACTLY (nlohmann parses the sign inline as number_integer_t â no double transit). UINT64_MAX is deliberately ABSENT: 18446744073709551615 exceeds number_integer_t and needs the decoder's unsigned arm first. D-FFI-STDINT-LIMIT-MACROS stays open for the full set. The C99 7.18.4 `*_C` integer-CONSTANT macros (INT64_C/UINT64_C/INTMAX_C/… as `v##ULL` etc.) ARE shipped (c39 D-FFI-STDINT-CONSTANT-MACROS) — universal `ULL`/`LL`/`U` suffixes are >=64-bit on EVERY DSS target (LP64 + LLP64), so no per-target branching; `unsigned long long` satisfies the `uint_least64_t` width the standard requires. SQLite uses UINT64_C heavily for 64-bit bitmask constants. * D-LANG-TYPE-IDENTITY-VOCABULARY: the 64-bit aliases are no longer a bare `u64`/`i64`. C defines each as an ALIAS of a standard NAMED type, and WHICH name is DATA-MODEL-dependent - `uint64_t`/`uintptr_t`/`uintmax_t`/`size_t` ARE `unsigned long` on LP64 and `unsigned long long` on LLP64 (glibc vs mingw/MSVC spell them exactly so); `int64_t`/`intmax_t`/`ptrdiff_t` likewise `long` / `long long`. A bare core mints the ANONYMOUS representative, which since type identity was split off representation is a THIRD type matching NEITHER named entry: `stdc_count_ones((uint64_t)x)` fell out of <stdbit.h>'s 5-way `_Generic`, and `unsigned long long *p = &u64var;` became a bare S_TypeMismatch. Each therefore carries the `when:{dataModel}` variant selector (the THIRD target axis, alongside arch/format) plus the hir-text vocabulary tag - the SAME 8-byte core on both models, a different IDENTITY. No ILP32 arm is declared: an ILP32 target needs 4-byte intptr/ptrdiff/size widths anyway (D-FFI-STDINT-PTR-WIDTH-ILP32, still open), so 0 variants match there and a reference fails LOUD as an undefined type rather than silently binding a wrong width.",
   "header": "stdint.h",
   "standard": "c99",
   "typedefs": [
     { "name": "int8_t",          "type": "i8"  },
     { "name": "int16_t",         "type": "i16" },
     { "name": "int32_t",         "type": "i32" },
-    { "name": "int64_t",         "type": "i64" },
+    { "name": "int64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
     { "name": "uint8_t",         "type": "u8"  },
     { "name": "uint16_t",        "type": "u16" },
     { "name": "uint32_t",        "type": "u32" },
-    { "name": "uint64_t",        "type": "u64" },
+    { "name": "uint64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] },
 
     { "name": "int_least8_t",    "type": "i8"  },
     { "name": "int_least16_t",   "type": "i16" },
     { "name": "int_least32_t",   "type": "i32" },
-    { "name": "int_least64_t",   "type": "i64" },
+    { "name": "int_least64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
     { "name": "uint_least8_t",   "type": "u8"  },
     { "name": "uint_least16_t",  "type": "u16" },
     { "name": "uint_least32_t",  "type": "u32" },
-    { "name": "uint_least64_t",  "type": "u64" },
+    { "name": "uint_least64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] },
 
     { "name": "int_fast8_t",     "type": "i8"  },
     { "name": "int_fast16_t",    "type": "i16" },
     { "name": "int_fast32_t",    "type": "i32" },
-    { "name": "int_fast64_t",    "type": "i64" },
+    { "name": "int_fast64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
     { "name": "uint_fast8_t",    "type": "u8"  },
     { "name": "uint_fast16_t",   "type": "u16" },
     { "name": "uint_fast32_t",   "type": "u32" },
-    { "name": "uint_fast64_t",   "type": "u64" },
+    { "name": "uint_fast64_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] },
 
-    { "name": "intptr_t",        "type": "i64" },
-    { "name": "uintptr_t",       "type": "u64" },
-    { "name": "intmax_t",        "type": "i64" },
-    { "name": "uintmax_t",       "type": "u64" }
+    { "name": "intptr_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
+    { "name": "uintptr_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] },
+    { "name": "intmax_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "i64 \"long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "i64 \"long long\"" }
+    ] },
+    { "name": "uintmax_t", "variants": [
+        { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
+        { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" }
+    ] }
   ],
   "macros": [
     { "name": "INT8_C",    "params": ["v"], "replacement": "v"      },

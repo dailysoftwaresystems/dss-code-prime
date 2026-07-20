@@ -515,6 +515,17 @@ private:
             default: { // primitives (and any unexpected kind)
                 std::string_view const p = primName(in.kind(t));
                 if (!p.empty()) out_ += p; else { report("unprintable type kind"); out_ += '?'; }
+                // D-LANG-TYPE-IDENTITY-VOCABULARY: emit the vocabulary tag when the
+                // primitive carries one, so the text round-trip preserves IDENTITY
+                // and not merely representation. Anonymous primitives (every core
+                // whose C spelling is its own representation) print exactly as
+                // before — zero churn for existing dumps.
+                std::string_view const vocab = in.vocabularyName(t);
+                if (!vocab.empty()) {
+                    out_ += " \"";
+                    out_ += vocab;
+                    out_ += '"';
+                }
                 return;
             }
         }
@@ -953,6 +964,18 @@ private:
             for (std::uint64_t l : bi->limbs()) out_ += std::format(" {}", l);
             return;
         }
+        if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION) folded F80/F128 value:
+            // `wfloat <bits> <hi> <lo>` — the format bit-width (80|128, a STABLE
+            // semantic discriminator, NOT the version-fragile TypeKind ordinal) plus
+            // the pack() bit pattern, read back via WideFloatValue::fromPacked (a
+            // lossless bit-exact round-trip; pack ∘ fromPacked is identity, pinned in
+            // test_wide_float_value).
+            WideFloatValue::Packed const p = wf->pack();
+            int const bits = (wf->kind() == TypeKind::F128) ? 128 : 80;
+            out_ += std::format("wfloat {} {} {}", bits, p.hi, p.lo);
+            return;
+        }
     }
 
     void appendOpName(std::uint32_t payload) {
@@ -1361,6 +1384,16 @@ private:
             for (std::uint64_t i = 0; i < nLimbs; ++i) limbs.push_back(takeInt());
             v.value = BitIntValue(std::move(limbs),
                                   static_cast<std::uint32_t>(width), sgn != 0);
+        }
+        else if (tag == "wfloat") {
+            // LD-3: `wfloat <bits> <hi> <lo>` — the inverse of appendLiteralValue's
+            // pack() serialization; the bit-width (80|128) selects the F80 vs F128
+            // unpack layout via WideFloatValue::fromPacked.
+            std::uint64_t const bits = takeInt();
+            std::uint64_t const hi   = takeInt();
+            std::uint64_t const lo   = takeInt();
+            TypeKind const k = (bits == 128) ? TypeKind::F128 : TypeKind::F80;
+            v.value = WideFloatValue::fromPacked(lo, hi, k);
         }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
@@ -1941,7 +1974,20 @@ private:
         if (!peekIs(Tk::Ident)) { malformed("expected a type"); return InvalidType; }
         std::string kw = lex_.take().text;
         if (kw == "invalid") return InvalidType;
-        if (auto p = primFromName(kw)) return interner_.primitive(*p);
+        if (auto p = primFromName(kw)) {
+            // D-LANG-TYPE-IDENTITY-VOCABULARY: an OPTIONAL quoted VOCABULARY TAG
+            // after the core (`u64 "unsigned long long"`, the `struct "N"` naming
+            // precedent). The bare core spells the ANONYMOUS representative of
+            // that representation — which is what `int`/`unsigned`/`short`/`char`
+            // are, so every existing spelling is unchanged. A type whose C
+            // identity is distinct from its representation (`long`, `long long`,
+            // `long double` and their unsigned forms) MUST carry the tag here or
+            // the text round-trip silently re-collapses it onto the anonymous
+            // type — and an FFI descriptor's pointer parameter would reject the
+            // very C type it models (`ptr<u64>` vs a user's `unsigned long long*`).
+            if (peekIs(Tk::Str)) return interner_.primitive(*p, lex_.take().text);
+            return interner_.primitive(*p);
+        }
         auto wrap1 = [&](TypeId (TypeInterner::*fn)(TypeId)) -> TypeId {
             expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::RAngle, "'>'"); return (interner_.*fn)(e);
         };

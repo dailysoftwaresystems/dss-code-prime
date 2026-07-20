@@ -9,12 +9,12 @@
     { "name": "BOOL",      "type": "i32" },
     { "name": "INT",       "type": "i32" },
     { "name": "UINT",      "type": "u32" },
-    { "name": "LONG",      "type": "i32" },
-    { "name": "ULONG",     "type": "u32" },
-    { "name": "DWORD",     "type": "u32" },
-    { "name": "ULONGLONG", "type": "u64" },
-    { "name": "ULONG64",   "type": "u64" },
-    { "name": "SIZE_T",    "type": "u64" },
+    { "name": "LONG",      "type": "i32 \"long\"" },
+    { "name": "ULONG",     "type": "u32 \"unsigned long\"" },
+    { "name": "DWORD",     "type": "u32 \"unsigned long\"" },
+    { "name": "ULONGLONG", "type": "u64 \"unsigned long long\"" },
+    { "name": "ULONG64",   "type": "u64 \"unsigned long long\"" },
+    { "name": "SIZE_T",    "type": "u64 \"unsigned long long\"" },
     { "name": "BYTE",      "type": "u8" },
     { "name": "WORD",      "type": "u16" },
     { "name": "WCHAR",     "type": "u16" },
@@ -32,41 +32,41 @@
     { "name": "LPWSTR",    "type": "ptr<u16>" },
     { "name": "LPCWSTR",   "type": "ptr<u16>" },
     { "name": "LPHANDLE",  "type": "ptr<ptr<void>>" },
-    { "name": "LPDWORD",   "type": "ptr<u32>" },
+    { "name": "LPDWORD",   "type": "ptr<u32 \"unsigned long\">" },
     { "name": "LPBOOL",    "type": "ptr<i32>" },
     { "name": "LPSECURITY_ATTRIBUTES", "type": "ptr<void>" },
     { "name": "GET_FILEEX_INFO_LEVELS", "type": "i32" },
-    { "name": "FILETIME",  "type": "struct \"FILETIME\" { u32, u32 }" },
-    { "name": "LPFILETIME", "type": "ptr<struct \"FILETIME\" { u32, u32 }>" },
-    { "name": "LARGE_INTEGER",  "type": "struct \"LARGE_INTEGER\" { i64 }" },
+    { "name": "FILETIME",  "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+    { "name": "LPFILETIME", "type": "ptr<struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }>" },
+    { "name": "LARGE_INTEGER",  "type": "struct \"LARGE_INTEGER\" { i64 \"long long\" }" },
     { "name": "PLARGE_INTEGER", "type": "ptr<void>" },
-    { "name": "OVERLAPPED",  "type": "struct \"OVERLAPPED\" { u64, u64, u32, u32, ptr<void> }" },
+    { "name": "OVERLAPPED",  "type": "struct \"OVERLAPPED\" { u64 \"unsigned long long\", u64 \"unsigned long long\", u32 \"unsigned long\", u32 \"unsigned long\", ptr<void> }" },
     { "name": "LPOVERLAPPED", "type": "ptr<void>" },
-    { "name": "SYSTEM_INFO", "type": "struct \"SYSTEM_INFO\" { u32, u32, ptr<void>, ptr<void>, u64, u32, u32, u32, u16, u16 }" },
+    { "name": "SYSTEM_INFO", "type": "struct \"SYSTEM_INFO\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u64 \"unsigned long long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u16, u16 }" },
     { "name": "LPSYSTEM_INFO", "type": "ptr<void>" },
-    { "name": "WIN32_FILE_ATTRIBUTE_DATA", "type": "struct \"WIN32_FILE_ATTRIBUTE_DATA\" { u32, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, u32, u32 }" },
+    { "name": "WIN32_FILE_ATTRIBUTE_DATA", "type": "struct \"WIN32_FILE_ATTRIBUTE_DATA\" { u32 \"unsigned long\", struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, u32 \"unsigned long\", u32 \"unsigned long\" }" },
     { "name": "SRWLOCK",           "type": "struct \"SRWLOCK\" { ptr<void> }" },
     { "name": "PSRWLOCK",          "type": "ptr<void>" },
-    { "name": "CRITICAL_SECTION",  "type": "struct \"CRITICAL_SECTION\" { ptr<void>, i32, i32, ptr<void>, ptr<void>, u64 }" },
+    { "name": "CRITICAL_SECTION",  "type": "struct \"CRITICAL_SECTION\" { ptr<void>, i32 \"long\", i32 \"long\", ptr<void>, ptr<void>, u64 \"unsigned long long\" }" },
     { "name": "PCRITICAL_SECTION", "type": "ptr<void>" },
     { "name": "LPCRITICAL_SECTION","type": "ptr<void>" },
     { "name": "CONDITION_VARIABLE", "type": "struct \"CONDITION_VARIABLE\" { ptr<void> }" },
     { "name": "PCONDITION_VARIABLE", "type": "ptr<void>" },
-    { "name": "LONGLONG", "type": "i64" },
+    { "name": "LONGLONG", "type": "i64 \"long long\"" },
     { "name": "SHORT", "type": "i16" },
     { "name": "COORD", "type": "struct \"COORD\" { i16, i16 }" },
     { "name": "SMALL_RECT", "type": "struct \"SMALL_RECT\" { i16, i16, i16, i16 }" },
     { "name": "SYSTEMTIME", "type": "struct \"SYSTEMTIME\" { u16, u16, u16, u16, u16, u16, u16, u16 }" },
     { "name": "LPSYSTEMTIME", "type": "ptr<void>" },
-    { "name": "ULARGE_INTEGER", "type": "struct \"ULARGE_INTEGER\" { u64 @0, u32 @0, u32 @4 }" },
-    { "name": "WIN32_FIND_DATAW", "type": "struct \"WIN32_FIND_DATAW\" { u32, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, u32, u32, u32, u32, arr<u16, 260>, arr<u16, 14> }" },
+    { "name": "ULARGE_INTEGER", "type": "struct \"ULARGE_INTEGER\" { u64 \"unsigned long long\" @0, u32 \"unsigned long\" @0, u32 \"unsigned long\" @4 }" },
+    { "name": "WIN32_FIND_DATAW", "type": "struct \"WIN32_FIND_DATAW\" { u32 \"unsigned long\", struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }, u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", arr<u16, 260>, arr<u16, 14> }" },
     { "name": "LPWIN32_FIND_DATAW", "type": "ptr<void>" },
     { "name": "CONSOLE_SCREEN_BUFFER_INFO", "type": "struct \"CONSOLE_SCREEN_BUFFER_INFO\" { struct \"COORD\" { i16, i16 }, struct \"COORD\" { i16, i16 }, u16, struct \"SMALL_RECT\" { i16, i16, i16, i16 }, struct \"COORD\" { i16, i16 } }" },
-    { "name": "ULONG_PTR", "type": "u64" },
+    { "name": "ULONG_PTR", "type": "u64 \"unsigned long long\"" },
     { "name": "PCONTEXT", "type": "ptr<void>" },
     { "name": "PEXCEPTION_RECORD", "type": "ptr<void>" },
-    { "name": "EXCEPTION_RECORD", "type": "struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }" },
-    { "name": "EXCEPTION_POINTERS", "type": "struct \"EXCEPTION_POINTERS\" { ptr<struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }>, ptr<void> }" },
+    { "name": "EXCEPTION_RECORD", "type": "struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }" },
+    { "name": "EXCEPTION_POINTERS", "type": "struct \"EXCEPTION_POINTERS\" { ptr<struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }>, ptr<void> }" },
     { "name": "PEXCEPTION_POINTERS", "type": "ptr<void>" },
     { "name": "LPEXCEPTION_POINTERS", "type": "ptr<void>" }
   ],
@@ -74,37 +74,37 @@
     {
       "name": "FILETIME",
       "fields": [
-        { "name": "dwLowDateTime",  "type": "u32" },
-        { "name": "dwHighDateTime", "type": "u32" }
+        { "name": "dwLowDateTime",  "type": "u32 \"unsigned long\"" },
+        { "name": "dwHighDateTime", "type": "u32 \"unsigned long\"" }
       ]
     },
     {
       "name": "LARGE_INTEGER",
       "fields": [
-        { "name": "QuadPart", "type": "i64" }
+        { "name": "QuadPart", "type": "i64 \"long long\"" }
       ]
     },
     {
       "name": "OVERLAPPED",
       "fields": [
-        { "name": "Internal",     "type": "u64" },
-        { "name": "InternalHigh", "type": "u64" },
-        { "name": "Offset",       "type": "u32" },
-        { "name": "OffsetHigh",   "type": "u32" },
+        { "name": "Internal",     "type": "u64 \"unsigned long long\"" },
+        { "name": "InternalHigh", "type": "u64 \"unsigned long long\"" },
+        { "name": "Offset",       "type": "u32 \"unsigned long\"" },
+        { "name": "OffsetHigh",   "type": "u32 \"unsigned long\"" },
         { "name": "hEvent",       "type": "ptr<void>" }
       ]
     },
     {
       "name": "SYSTEM_INFO",
       "fields": [
-        { "name": "dwOemId",                     "type": "u32" },
-        { "name": "dwPageSize",                  "type": "u32" },
+        { "name": "dwOemId",                     "type": "u32 \"unsigned long\"" },
+        { "name": "dwPageSize",                  "type": "u32 \"unsigned long\"" },
         { "name": "lpMinimumApplicationAddress", "type": "ptr<void>" },
         { "name": "lpMaximumApplicationAddress", "type": "ptr<void>" },
-        { "name": "dwActiveProcessorMask",       "type": "u64" },
-        { "name": "dwNumberOfProcessors",        "type": "u32" },
-        { "name": "dwProcessorType",             "type": "u32" },
-        { "name": "dwAllocationGranularity",     "type": "u32" },
+        { "name": "dwActiveProcessorMask",       "type": "u64 \"unsigned long long\"" },
+        { "name": "dwNumberOfProcessors",        "type": "u32 \"unsigned long\"" },
+        { "name": "dwProcessorType",             "type": "u32 \"unsigned long\"" },
+        { "name": "dwAllocationGranularity",     "type": "u32 \"unsigned long\"" },
         { "name": "wProcessorLevel",             "type": "u16" },
         { "name": "wProcessorRevision",          "type": "u16" }
       ]
@@ -112,12 +112,12 @@
     {
       "name": "WIN32_FILE_ATTRIBUTE_DATA",
       "fields": [
-        { "name": "dwFileAttributes", "type": "u32" },
-        { "name": "ftCreationTime",   "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "ftLastAccessTime", "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "ftLastWriteTime",  "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "nFileSizeHigh",    "type": "u32" },
-        { "name": "nFileSizeLow",     "type": "u32" }
+        { "name": "dwFileAttributes", "type": "u32 \"unsigned long\"" },
+        { "name": "ftCreationTime",   "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "ftLastAccessTime", "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "ftLastWriteTime",  "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "nFileSizeHigh",    "type": "u32 \"unsigned long\"" },
+        { "name": "nFileSizeLow",     "type": "u32 \"unsigned long\"" }
       ]
     },
     {
@@ -136,11 +136,11 @@
       "name": "CRITICAL_SECTION",
       "fields": [
         { "name": "DebugInfo",      "type": "ptr<void>" },
-        { "name": "LockCount",      "type": "i32" },
-        { "name": "RecursionCount", "type": "i32" },
+        { "name": "LockCount",      "type": "i32 \"long\"" },
+        { "name": "RecursionCount", "type": "i32 \"long\"" },
         { "name": "OwningThread",   "type": "ptr<void>" },
         { "name": "LockSemaphore",  "type": "ptr<void>" },
-        { "name": "SpinCount",      "type": "u64" }
+        { "name": "SpinCount",      "type": "u64 \"unsigned long long\"" }
       ]
     },
     {
@@ -175,22 +175,22 @@
     {
       "name": "ULARGE_INTEGER",
       "fields": [
-        { "name": "QuadPart", "type": "u64", "offset": 0 },
-        { "name": "LowPart",  "type": "u32", "offset": 0 },
-        { "name": "HighPart", "type": "u32", "offset": 4 }
+        { "name": "QuadPart", "type": "u64 \"unsigned long long\"", "offset": 0 },
+        { "name": "LowPart",  "type": "u32 \"unsigned long\"", "offset": 0 },
+        { "name": "HighPart", "type": "u32 \"unsigned long\"", "offset": 4 }
       ]
     },
     {
       "name": "WIN32_FIND_DATAW",
       "fields": [
-        { "name": "dwFileAttributes", "type": "u32" },
-        { "name": "ftCreationTime", "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "ftLastAccessTime", "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "ftLastWriteTime", "type": "struct \"FILETIME\" { u32, u32 }" },
-        { "name": "nFileSizeHigh", "type": "u32" },
-        { "name": "nFileSizeLow", "type": "u32" },
-        { "name": "dwReserved0", "type": "u32" },
-        { "name": "dwReserved1", "type": "u32" },
+        { "name": "dwFileAttributes", "type": "u32 \"unsigned long\"" },
+        { "name": "ftCreationTime", "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "ftLastAccessTime", "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "ftLastWriteTime", "type": "struct \"FILETIME\" { u32 \"unsigned long\", u32 \"unsigned long\" }" },
+        { "name": "nFileSizeHigh", "type": "u32 \"unsigned long\"" },
+        { "name": "nFileSizeLow", "type": "u32 \"unsigned long\"" },
+        { "name": "dwReserved0", "type": "u32 \"unsigned long\"" },
+        { "name": "dwReserved1", "type": "u32 \"unsigned long\"" },
         { "name": "cFileName", "type": "arr<u16, 260>" },
         { "name": "cAlternateFileName", "type": "arr<u16, 14>" }
       ]
@@ -208,18 +208,18 @@
     {
       "name": "EXCEPTION_RECORD",
       "fields": [
-        { "name": "ExceptionCode", "type": "u32" },
-        { "name": "ExceptionFlags", "type": "u32" },
+        { "name": "ExceptionCode", "type": "u32 \"unsigned long\"" },
+        { "name": "ExceptionFlags", "type": "u32 \"unsigned long\"" },
         { "name": "ExceptionRecord", "type": "ptr<void>" },
         { "name": "ExceptionAddress", "type": "ptr<void>" },
-        { "name": "NumberParameters", "type": "u32" },
-        { "name": "ExceptionInformation", "type": "arr<u64, 15>" }
+        { "name": "NumberParameters", "type": "u32 \"unsigned long\"" },
+        { "name": "ExceptionInformation", "type": "arr<u64 \"unsigned long long\", 15>" }
       ]
     },
     {
       "name": "EXCEPTION_POINTERS",
       "fields": [
-        { "name": "ExceptionRecord", "type": "ptr<struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }>" },
+        { "name": "ExceptionRecord", "type": "ptr<struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }>" },
         { "name": "ContextRecord", "type": "ptr<void>" }
       ]
     }
@@ -247,7 +247,7 @@
 
     { "name": "SwitchToThread",             "signature": "fn() -> i32",                    "kind": "function", "linkage": "external" },
     { "name": "ExitThread",                 "signature": "fn(u32) -> void",                "kind": "function", "linkage": "external" },
-    { "name": "GetExitCodeThread",          "signature": "fn(ptr<void>, ptr<u32>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "GetExitCodeThread",          "signature": "fn(ptr<void>, ptr<u32 \"unsigned long\">) -> i32", "kind": "function", "linkage": "external" },
     { "name": "GetCurrentThread",           "signature": "fn() -> ptr<void>",              "kind": "function", "linkage": "external" },
 
     { "name": "CreateThread",               "signature": "fn(ptr<void>, u64, ptr<void>, ptr<void>, u32, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
@@ -256,8 +256,8 @@
 
     { "name": "CreateFileW",             "signature": "fn(ptr<u16>, u32, u32, ptr<void>, u32, u32, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "DeleteFileW",             "signature": "fn(ptr<u16>) -> i32",                             "kind": "function", "linkage": "external" },
-    { "name": "ReadFile",                "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "WriteFile",               "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "ReadFile",                "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32 \"unsigned long\">, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "WriteFile",               "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32 \"unsigned long\">, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "SetFilePointerEx",        "signature": "fn(ptr<void>, i64, ptr<void>, u32) -> i32",       "kind": "function", "linkage": "external" },
     { "name": "SetEndOfFile",            "signature": "fn(ptr<void>) -> i32",                            "kind": "function", "linkage": "external" },
     { "name": "FlushFileBuffers",        "signature": "fn(ptr<void>) -> i32",                            "kind": "function", "linkage": "external" },
@@ -314,8 +314,8 @@
     { "name": "FindClose", "signature": "fn(ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "GetStdHandle", "signature": "fn(u32) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "GetConsoleScreenBufferInfo", "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "WriteConsoleW", "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "GetConsoleMode", "signature": "fn(ptr<void>, ptr<u32>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "WriteConsoleW", "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32 \"unsigned long\">, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "GetConsoleMode", "signature": "fn(ptr<void>, ptr<u32 \"unsigned long\">) -> i32", "kind": "function", "linkage": "external" },
     { "name": "SetConsoleMode", "signature": "fn(ptr<void>, u32) -> i32", "kind": "function", "linkage": "external" },
     { "name": "GetSystemTime", "signature": "fn(ptr<void>) -> void", "kind": "function", "linkage": "external" },
     { "name": "SystemTimeToFileTime", "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
@@ -326,8 +326,8 @@
     { "name": "GetCurrentProcess", "signature": "fn() -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "DebugBreak", "signature": "fn() -> void", "kind": "function", "linkage": "external" },
     { "name": "LoadLibraryA", "signature": "fn(ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
-    { "name": "RtlLookupFunctionEntry", "signature": "fn(u64, ptr<u64>, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
-    { "name": "RaiseException", "signature": "fn(u32, u32, u32, ptr<u64>) -> void", "kind": "function", "linkage": "external" },
+    { "name": "RtlLookupFunctionEntry", "signature": "fn(u64, ptr<u64 \"unsigned long long\">, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "RaiseException", "signature": "fn(u32, u32, u32, ptr<u64 \"unsigned long long\">) -> void", "kind": "function", "linkage": "external" },
     { "name": "VirtualAlloc", "signature": "fn(ptr<void>, u64, u32, u32) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "VirtualFree", "signature": "fn(ptr<void>, u64, u32) -> i32", "kind": "function", "linkage": "external" }
   ],

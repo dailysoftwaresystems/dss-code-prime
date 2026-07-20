@@ -50,6 +50,11 @@ HirLiteralValue toHirLiteral(MirLiteralValue const& src) {
             // bail means a BitInt Const never reaches `tryFold`, but the bridge must
             // still round-trip it losslessly for any other consumer.
             dst.value = arm;
+        } else if constexpr (std::is_same_v<T, WideFloatValue>) {
+            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the folded F80/F128
+            // wide-float value is the SAME host type in both pools — copy directly
+            // (NEVER monostate). Round-trips losslessly for the globals byte-emitter.
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -76,6 +81,10 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
         } else if constexpr (std::is_same_v<T, BitIntValue>) {
             // C4b (I1+C2): the `_BitInt` bit-precise value copies directly between
             // the structurally-parallel pools (NEVER monostate).
+            dst.value = arm;
+        } else if constexpr (std::is_same_v<T, WideFloatValue>) {
+            // LD-3: the folded F80/F128 wide-float value copies directly between the
+            // structurally-parallel pools (NEVER monostate).
             dst.value = arm;
         } else {
             dst.value = arm;

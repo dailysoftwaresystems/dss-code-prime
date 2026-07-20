@@ -1555,6 +1555,117 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── wideFloatSoftcalls (LD-2, D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH —
+    // optional) ────────────────────────────────────────────────────
+    // Per-`WideFloatOp` softfloat-libcall rows: {op, helperSymbol,
+    // argRegisters[], resultRegister}. `op` resolves via wideFloatOpFromName;
+    // an unknown op / a duplicate op row / a missing helperSymbol fail loud
+    // (mirroring the registerClassOps duplicate rejection above). The arg /
+    // result register NAMES are resolved to ordinals in validate() (the
+    // register table is fully parsed by then) — an unresolvable name fails
+    // there. A target that omits the section keeps every row `!declared`, so
+    // the F128 engine verb falls through to the encoded-width wall.
+    if (doc.contains("wideFloatSoftcalls")) {
+        if (!doc.at("wideFloatSoftcalls").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/wideFloatSoftcalls",
+                      "'wideFloatSoftcalls' must be an array");
+        } else {
+            auto const& rows = doc.at("wideFloatSoftcalls");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/wideFloatSoftcalls/{}", i),
+                              "wideFloatSoftcalls entry must be an object");
+                    continue;
+                }
+                if (!r.contains("op") || !r.at("op").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/wideFloatSoftcalls/{}/op", i),
+                              "missing or non-string 'op'");
+                    continue;
+                }
+                auto const op = wideFloatOpFromName(r.at("op").get<std::string>());
+                if (!op.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/wideFloatSoftcalls/{}/op", i),
+                              "expected one of add/sub/mul/div/to_i32/from_f64");
+                    continue;
+                }
+                auto& row = data.wideFloatSoftcalls[static_cast<std::size_t>(*op)];
+                if (row.declared) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/wideFloatSoftcalls/{}/op", i),
+                              std::format("duplicate wideFloatSoftcalls row for "
+                                          "op '{}'", wideFloatOpName(*op)));
+                    continue;
+                }
+                if (!r.contains("helperSymbol")
+                    || !r.at("helperSymbol").is_string()
+                    || r.at("helperSymbol").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/wideFloatSoftcalls/{}/helperSymbol", i),
+                              "missing or empty 'helperSymbol' — the runtime "
+                              "library symbol the op lowers to a CALL of");
+                    continue;
+                }
+                row.declared     = true;
+                row.helperSymbol = r.at("helperSymbol").get<std::string>();
+                if (r.contains("argRegisters")) {
+                    if (!r.at("argRegisters").is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/wideFloatSoftcalls/{}/argRegisters", i),
+                                  "'argRegisters' must be an array of register names");
+                    } else {
+                        for (auto const& s : r.at("argRegisters")) {
+                            if (!s.is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("/wideFloatSoftcalls/{}/argRegisters", i),
+                                          "each argRegisters entry must be a register-name string");
+                                continue;
+                            }
+                            row.argRegisterNames.push_back(s.get<std::string>());
+                        }
+                    }
+                }
+                if (!r.contains("resultRegister")
+                    || !r.at("resultRegister").is_string()
+                    || r.at("resultRegister").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/wideFloatSoftcalls/{}/resultRegister", i),
+                              "missing or empty 'resultRegister' register name");
+                    continue;
+                }
+                row.resultRegisterName = r.at("resultRegister").get<std::string>();
+            }
+        }
+    }
+
+    // ── wideFloatSoftcallLibraryByFormat (LD-2 — optional) ─────────
+    // Flat object-format-key → DT_NEEDED library string (e.g.
+    // {"elf":"libgcc_s.so.1"}). The LIR lowerer resolves the ACTIVE format's
+    // entry and binds each minted softcall extern to it. Mirrors the
+    // condCodeEncoding object-of-scalars shape (arbitrary keys here).
+    if (doc.contains("wideFloatSoftcallLibraryByFormat")) {
+        auto const& lib = doc.at("wideFloatSoftcallLibraryByFormat");
+        if (!lib.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/wideFloatSoftcallLibraryByFormat",
+                      "must be an object mapping object-format key → library string");
+        } else {
+            for (auto it = lib.begin(); it != lib.end(); ++it) {
+                if (!it.value().is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/wideFloatSoftcallLibraryByFormat/{}", it.key()),
+                              "library value must be a string");
+                    continue;
+                }
+                data.wideFloatSoftcallLibraryByFormat.emplace(
+                    it.key(), it.value().get<std::string>());
+            }
+        }
+    }
+
     // ── callingConventions (cycle 2b — optional) ───────────────────
     if (doc.contains("callingConventions")) {
         if (!doc.at("callingConventions").is_array()) {
@@ -1604,6 +1715,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readStringArray(c, i, "argFprs",     cc.argFprs);
                 readStringArray(c, i, "returnGprs",  cc.returnGprs);
                 readStringArray(c, i, "returnFprs",  cc.returnFprs);
+                // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
+                // arg/return register lists (empty on non-ieee128 targets).
+                readStringArray(c, i, "argVrs",      cc.argVrs);
+                readStringArray(c, i, "returnVrs",   cc.returnVrs);
                 readStringArray(c, i, "callerSaved", cc.callerSaved);
                 readStringArray(c, i, "calleeSaved", cc.calleeSaved);
                 std::string const ccPath = std::format("/callingConventions/{}", i);
@@ -2181,6 +2296,44 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                      ir.inputNames,  "inputRoles");
         resolveRoles(ir.outputRoleNames, ir.outputRoleOrdinals,
                      ir.outputNames, "outputRoles");
+    }
+
+    // ── wideFloatSoftcall register resolution (LD-2, mirrors the
+    // implicit-register role resolution above) ────────────────────
+    // Now that the register table is fully parsed, resolve each declared
+    // softcall's arg/result register NAMES → ordinals into the mutable
+    // `data`. An unresolvable name fails loud (C_MalformedJson) exactly as a
+    // role naming an unknown register does — the F128 softcall lowering reads
+    // the ordinals directly and must never index a name that has no register.
+    for (std::size_t oi = 0; oi < data.wideFloatSoftcalls.size(); ++oi) {
+        auto& row = data.wideFloatSoftcalls[oi];
+        if (!row.declared) continue;
+        auto const opName = wideFloatOpName(static_cast<WideFloatOp>(oi));
+        row.argRegisterOrdinals.clear();
+        row.argRegisterOrdinals.reserve(row.argRegisterNames.size());
+        for (auto const& argName : row.argRegisterNames) {
+            auto it = data.registerIndex.find(argName);
+            if (it == data.registerIndex.end()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/wideFloatSoftcalls/{}/argRegisters", opName),
+                          std::format("wideFloatSoftcalls op '{}': argRegister "
+                                      "'{}' does not resolve to any declared "
+                                      "register", opName, argName));
+                continue;
+            }
+            row.argRegisterOrdinals.push_back(
+                static_cast<std::uint16_t>(it->second));
+        }
+        auto rit = data.registerIndex.find(row.resultRegisterName);
+        if (rit == data.registerIndex.end()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/wideFloatSoftcalls/{}/resultRegister", opName),
+                      std::format("wideFloatSoftcalls op '{}': resultRegister "
+                                  "'{}' does not resolve to any declared "
+                                  "register", opName, row.resultRegisterName));
+        } else {
+            row.resultRegisterOrdinal = static_cast<std::uint16_t>(rit->second);
+        }
     }
 
     // ── Cross-field invariants (validate after per-field parse) ───

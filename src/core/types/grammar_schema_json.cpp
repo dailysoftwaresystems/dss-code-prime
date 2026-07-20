@@ -6781,14 +6781,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 && key != "coreByDataModel"
                                 && key != "coreByLongDoubleFormat"
                                 && key != "complex"
+                                && key != "name" && key != "rank"
                                 && key.rfind("$", 0) != 0) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'typeSpecifiers' field "
                                                       "'{}' — expected 'tokens', 'core', "
                                                       "'coreByDataModel', "
-                                                      "'coreByLongDoubleFormat', or "
-                                                      "'complex'", key));
+                                                      "'coreByLongDoubleFormat', "
+                                                      "'complex', 'name', or 'rank'",
+                                                      key));
                             }
                         }
                         if (!entry.contains("tokens") || !entry.at("tokens").is_array()
@@ -6855,6 +6857,47 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             rule.complex = entry.at("complex").get<bool>();
                         }
+                        // D-LANG-TYPE-IDENTITY-VOCABULARY: the optional `name`
+                        // (vocabulary identity tag) + `rank` (C 6.3.1.1
+                        // conversion rank). An EMPTY name is rejected rather
+                        // than treated as absent — "" would read as "declared
+                        // anonymous", an ambiguity the interner's empty-name
+                        // sentinel makes indistinguishable from the default.
+                        // A `rank` WITHOUT a `name` can never be consulted (the
+                        // tie-break is name-keyed), so it is a knob that lies.
+                        if (entry.contains("name")) {
+                            if (!entry.at("name").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/name",
+                                          "'name' must be a string");
+                                continue;
+                            }
+                            rule.name = entry.at("name").get<std::string>();
+                            if (rule.name.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/name",
+                                          "'name' must be non-empty — omit the key "
+                                          "for an anonymous type-specifier row");
+                                continue;
+                            }
+                        }
+                        if (entry.contains("rank")) {
+                            if (!entry.at("rank").is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/rank",
+                                          "'rank' must be an integer");
+                                continue;
+                            }
+                            rule.rank = entry.at("rank").get<int>();
+                            if (rule.name.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/rank",
+                                          "'rank' requires a 'name' — conversion rank "
+                                          "is keyed by the vocabulary entry, so a rank "
+                                          "on an anonymous row is never consulted");
+                                continue;
+                            }
+                        }
                         // Canonicalize: sort the (kind, name) pairs by kind id
                         // so lookup is order-free (C's specifier multiset).
                         {
@@ -6896,8 +6939,64 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                   "earlier row", i));
                             continue;
                         }
+                        // D-LANG-TYPE-IDENTITY-VOCABULARY: cross-row consistency.
+                        // A vocabulary name is ONE type, so every row spelling it
+                        // (`long`, `long int`, `signed long`, `signed long int`)
+                        // must resolve to the SAME representation on EVERY axis and
+                        // carry the SAME rank — otherwise one spelling would intern
+                        // a different width under the same identity, which the
+                        // interner cannot represent and no consumer could detect.
+                        // `complex` is DELIBERATELY excluded: plain and `_Complex`
+                        // `long double` legitimately share the name (the `_Complex`
+                        // row's core IS the shared element type).
+                        if (!rule.name.empty()) {
+                            bool axesOk = true;
+                            for (auto const& prior : cfg.typeSpecifiers) {
+                                if (prior.name != rule.name) continue;
+                                if (prior.core == rule.core
+                                    && prior.rank == rule.rank
+                                    && prior.coreByDataModel == rule.coreByDataModel
+                                    && prior.coreByLongDoubleFormat
+                                           == rule.coreByLongDoubleFormat) {
+                                    continue;
+                                }
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics, path,
+                                    std::format(
+                                        "'typeSpecifiers[{}]' declares vocabulary name "
+                                        "'{}' with a different core / coreByDataModel / "
+                                        "coreByLongDoubleFormat / rank than an earlier "
+                                        "row sharing that name — one vocabulary entry "
+                                        "is one type and must have one representation",
+                                        i, rule.name));
+                                axesOk = false;
+                                break;
+                            }
+                            if (!axesOk) continue;
+                        }
                         cfg.typeSpecifiers.push_back(std::move(rule));
                     }
+                }
+            }
+
+            // ── D-LANG-TYPE-IDENTITY-VOCABULARY: derive builtinTypes' tags ──
+            //
+            // `builtinTypes` is the TEXT-keyed path to the same types the
+            // keyword-multiset `typeSpecifiers` table resolves. Its vocabulary
+            // tag is DERIVED here from the SINGLE-TOKEN row that resolves the
+            // same keyword, never authored independently — two hand-written
+            // tables would eventually disagree, and a disagreement means `long`
+            // is one type through the keyword path and another through the
+            // typedef-style path (two TypeIds for one C type, silently).
+            for (auto& bt : cfg.builtinTypes) {
+                if (bt.extension.has_value()) continue;
+                auto const lex = data.lexemeTable.find(bt.name);
+                if (lex == data.lexemeTable.end() || lex->second.size() != 1) continue;
+                SchemaTokenId const kindId = lex->second.front().id;
+                for (auto const& row : cfg.typeSpecifiers) {
+                    if (row.tokens.size() != 1 || row.tokens[0].v != kindId.v) continue;
+                    bt.vocabularyName = row.name;
+                    break;
                 }
             }
 
@@ -6971,6 +7070,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // "long double" LITERAL rule at the base core.
                                 out.coreByLongDoubleFormat =
                                     row.coreByLongDoubleFormat;
+                                // D-LANG-TYPE-IDENTITY-VOCABULARY: and the
+                                // identity tag, for the same reason one tier up.
+                                out.vocabularyName = row.name;
                                 return true;
                             }
                         }
@@ -6983,6 +7085,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (bt.name == words.front() && !bt.extension.has_value()) {
                             out.core            = bt.core;
                             out.coreByDataModel = bt.coreByDataModel;
+                            out.vocabularyName  = bt.vocabularyName;
                             return true;
                         }
                     }
@@ -7621,6 +7724,115 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                     }
                     if (ok) cfg.arithmeticConversions = std::move(ac);
+                }
+            }
+
+            // ── D-LANG-TYPE-IDENTITY-VOCABULARY: synthesizedTypes ──────
+            //
+            // WHICH VOCABULARY ENTRY each ENGINE-SYNTHESIZED standard type
+            // resolves to, PER DATA MODEL:
+            //
+            //   "synthesizedTypes": {
+            //     "sizeof":            { "LP64": "unsigned long", … },
+            //     "alignof":           { … },
+            //     "pointerDifference": { "LP64": "long", … } }
+            //
+            // The ROLE keys are a CLOSED ENGINE vocabulary — the engine knows
+            // that `sizeof` yields C's `size_t`, but must NOT know that
+            // `size_t` is SPELLED "unsigned long" on LP64 and "unsigned long
+            // long" on LLP64. That spelling is pure language+target data, and
+            // it is resolved HERE through the SAME `resolveTypeName` the
+            // literal ladder uses, so the runtime consumer only ever carries a
+            // resolved (core, vocabulary tag) pair — never a name to compare.
+            //
+            // Absent ⇒ every consumer keeps its historic ANONYMOUS core, so a
+            // language with no block (toy / tsql) is byte-identical. A DECLARED
+            // role must cover EVERY data model in the closed enum: a role that
+            // silently had no entry for the ACTIVE target would fall back to
+            // the anonymous core on exactly that one model — the silent
+            // wrong-arm defect this block exists to remove, re-introduced
+            // per-target.
+            if (sem.contains("synthesizedTypes")) {
+                json const& obj = sem.at("synthesizedTypes");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/synthesizedTypes",
+                              "'synthesizedTypes' must be an object mapping a "
+                              "closed engine ROLE to a per-data-model type name");
+                } else {
+                    // Read ONE role's `{ dataModel: typeName }` map. Every clause
+                    // fails loud: an unknown data-model key, a non-string /
+                    // unresolvable type name, or a missing data model.
+                    auto const readRole =
+                        [&](std::string const& role, SynthesizedTypeRule& out) {
+                        std::string const rolePath =
+                            "/semantics/synthesizedTypes/" + role;
+                        json const& models = obj.at(role);
+                        if (!models.is_object() || models.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, rolePath,
+                                      std::format("'{}' must be a non-empty object "
+                                                  "keyed by data-model name", role));
+                            return;
+                        }
+                        SynthesizedTypeRule rule;
+                        bool roleOk = true;
+                        for (auto const& [key, val] : models.items()) {
+                            if (key.rfind("$", 0) == 0) continue;   // comment key
+                            auto const dm = dataModelFromName(key);
+                            if (!dm.has_value()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          rolePath + "/" + key,
+                                          std::format("unknown data-model key '{}'",
+                                                      key));
+                                roleOk = false;
+                                continue;
+                            }
+                            if (!val.is_string() || val.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          rolePath + "/" + key,
+                                          "each entry must be a non-empty type-name "
+                                          "string");
+                                roleOk = false;
+                                continue;
+                            }
+                            DataModelTypeRef ref;
+                            if (!resolveTypeName(val.get<std::string>(),
+                                                 rolePath + "/" + key, ref)) {
+                                roleOk = false;   // resolveTypeName already reported
+                                continue;
+                            }
+                            rule.byDataModel.emplace(*dm, std::move(ref));
+                        }
+                        // Full coverage of the closed data-model enum — see the
+                        // block comment. Listed explicitly so ADDING a data model
+                        // fails every language declaring the role, loudly.
+                        for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64,
+                                                   DataModel::Ilp32}) {
+                            if (rule.byDataModel.contains(dm)) continue;
+                            coll.emit(DiagnosticCode::C_MissingField, rolePath,
+                                      std::format("'{}' declares no entry for data "
+                                                  "model '{}' — a declared role must "
+                                                  "cover EVERY data model, else it "
+                                                  "silently falls back to an "
+                                                  "anonymous core on that target",
+                                                  role, dataModelName(dm)));
+                            roleOk = false;
+                        }
+                        if (roleOk) out = std::move(rule);
+                    };
+                    for (auto const& [key, _] : obj.items()) {
+                        if (key.rfind("$", 0) == 0) continue;
+                        if (key == "sizeof")                 readRole(key, cfg.sizeofResultType);
+                        else if (key == "alignof")           readRole(key, cfg.alignofResultType);
+                        else if (key == "pointerDifference") readRole(key, cfg.pointerDifferenceType);
+                        else {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/synthesizedTypes/" + key,
+                                      std::format("unknown synthesized-type role '{}' "
+                                                  "— expected 'sizeof', 'alignof', or "
+                                                  "'pointerDifference'", key));
+                        }
+                    }
                 }
             }
 
@@ -8706,6 +8918,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'name' is required and must be a string");
                             continue;
                         }
+                        // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-
+                        // LOUD). Without it a mis-spelled or misplaced knob loads
+                        // clean and does NOTHING — the exact "knob that lies" this
+                        // same loader rejects two screens up ('rank' requires a
+                        // 'name'; 'signature' and 'params'/'result' are mutually
+                        // exclusive). `$`-prefixed keys are the codebase-wide
+                        // documentation convention, never a role.
+                        static constexpr std::array<std::string_view, 7>
+                            kBuiltinFnKeys{"name", "signature",
+                                           "signatureByDataModel", "params",
+                                           "result", "variadic", "lowering"};
+                        {
+                            bool keysOk = true;
+                            for (auto it = entry.begin(); it != entry.end(); ++it) {
+                                if (!it.key().empty() && it.key().front() == '$')
+                                    continue;
+                                bool known = false;
+                                for (auto const& k : kBuiltinFnKeys) {
+                                    if (it.key() == k) { known = true; break; }
+                                }
+                                if (known) continue;
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          std::format("{}/{}", path, it.key()),
+                                          std::format("unknown key '{}' in "
+                                                      "'builtinFunctions' (typo "
+                                                      "discriminator)", it.key()));
+                                keysOk = false;
+                            }
+                            if (!keysOk) continue;
+                        }
                         // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): a FULL type-text
                         // `signature` (pointer-bearing params) is the ALTERNATIVE
                         // to the scalar params/result axis — exactly one of the
@@ -8728,6 +8970,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             BuiltinFunctionMapping m;
                             m.name          = entry.at("name").get<std::string>();
                             m.signatureText = entry.at("signature").get<std::string>();
+                            // D-LANG-TYPE-IDENTITY-VOCABULARY: the OPTIONAL
+                            // per-data-model signature override (same key name +
+                            // shape as the shipped-lib reader's). Keys are the
+                            // closed data-model vocabulary; an unknown key fails
+                            // loud rather than silently never applying.
+                            if (entry.contains("signatureByDataModel")) {
+                                json const& byDm = entry.at("signatureByDataModel");
+                                if (!byDm.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/signatureByDataModel",
+                                              "'signatureByDataModel' must be an "
+                                              "object keyed by data-model name");
+                                    continue;
+                                }
+                                bool dmOk = true;
+                                for (auto const& [key, val] : byDm.items()) {
+                                    auto const dm = dataModelFromName(key);
+                                    if (!dm.has_value()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/signatureByDataModel/" + key,
+                                                  std::format("unknown data-model key "
+                                                              "'{}'", key));
+                                        dmOk = false;
+                                        continue;
+                                    }
+                                    if (!val.is_string()
+                                        || val.get<std::string>().empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/signatureByDataModel/" + key,
+                                                  "each override must be a non-empty "
+                                                  "signature string");
+                                        dmOk = false;
+                                        continue;
+                                    }
+                                    m.signatureTextByDataModel.emplace(
+                                        *dm, val.get<std::string>());
+                                }
+                                if (!dmOk) continue;
+                            }
                             if (entry.contains("variadic")) {
                                 if (!entry.at("variadic").is_boolean()) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -8756,6 +9037,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 m.lowering = *lw;
                             }
                             cfg.builtinFunctions.push_back(std::move(m));
+                            continue;
+                        }
+                        // D-LANG-TYPE-IDENTITY-VOCABULARY: `signatureByDataModel`
+                        // is an override OF `signature` — the scalar
+                        // `params`/`result` form has nothing for it to override,
+                        // and this branch never reads it. Declaring both loaded
+                        // CLEAN and SILENTLY DID NOTHING, which is exactly the
+                        // knob-that-lies the `signature`-vs-`params` rejection
+                        // above exists to prevent. Same fail-loud, same wording.
+                        if (entry.contains("signatureByDataModel")) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/signatureByDataModel",
+                                      "'signatureByDataModel' and 'params'/'result' "
+                                      "are mutually exclusive — it overrides the "
+                                      "'signature' form, which this entry does not "
+                                      "declare");
                             continue;
                         }
                         if (!entry.contains("result") || !entry.at("result").is_string()) {

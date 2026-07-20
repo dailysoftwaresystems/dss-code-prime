@@ -331,6 +331,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_ArtifactProfileNotSupported:  return "D_ArtifactProfileNotSupported";
         case DiagnosticCode::D_ArtifactProfileFormatMismatch: return "D_ArtifactProfileFormatMismatch";
         case DiagnosticCode::D_DefineRequiresPreprocess:     return "D_DefineRequiresPreprocess";
+        case DiagnosticCode::D_StaticLibFatArchiveUnsupported: return "D_StaticLibFatArchiveUnsupported";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
@@ -372,6 +373,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedMacroVariantAmbiguous";
         case DiagnosticCode::F_FfiResolveLibrarySymbolAbsent:
             return "F_FfiResolveLibrarySymbolAbsent";
+        case DiagnosticCode::F_ShippedTypeIdentityConflict:
+            return "F_ShippedTypeIdentityConflict";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

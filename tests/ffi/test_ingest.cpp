@@ -25,18 +25,26 @@
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_node.hpp"
 #include "link/object_format_schema.hpp"
+#include "byte_emit.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <vector>
 
 using namespace dss;
 using namespace dss::ffi;
 using dss::test_support::Location;
 using dss::test_support::ScratchDir;
+using dss::test_support::appU16;
+using dss::test_support::appU32;
+using dss::test_support::appU64;
 namespace fs = std::filesystem;
 
 namespace {
@@ -59,6 +67,110 @@ struct Built {
     HirNodeId const root = b.makeModule(std::array{ef});
     Built out{std::move(b).finish(root), ef, SymbolId{kExternSymV}};
     return out;
+}
+
+// ── D-FF1-READER-SONAME (c171) consumer fixture ────────────────────
+//
+// `ingest()` consumes `IngestionSource` (a binary path / header), NOT raw
+// `ImportSurface` rows — there is no row-injection seam. So to witness the
+// consumer's soname-PREFER logic end-to-end we synthesize a real ELF `.so`
+// (the canonical DT_SONAME carrier), write it to a scratch file, and feed it
+// via `BinaryLibrarySource`. This is a minimal single-export sibling of
+// `tests/ffi/test_binary_reader.cpp`'s `buildMinimalElf64` (which lives in a
+// sibling TU's anonymous namespace and cannot be shared); it reuses the shared
+// `byte_emit` primitives and emits an optional `.dynamic`/DT_SONAME the same
+// way. Layout: Ehdr(64) | .dynstr | .dynsym | .shstrtab | [.dynamic] | SHT.
+[[nodiscard]] std::vector<std::uint8_t>
+buildElfSo(std::string const& exportName, std::string const& soname) {
+    bool const hasDynamic = !soname.empty();
+    std::vector<std::uint8_t> b;
+    b.resize(64, 0);  // Ehdr placeholder
+
+    // .dynstr: NUL sentinel, exportName, [soname].
+    std::vector<std::uint8_t> dynstr;
+    dynstr.push_back(0);
+    std::uint32_t const nameStrOff = static_cast<std::uint32_t>(dynstr.size());
+    for (char c : exportName) dynstr.push_back(static_cast<std::uint8_t>(c));
+    dynstr.push_back(0);
+    std::uint32_t sonameStrOff = 0;
+    if (hasDynamic) {
+        sonameStrOff = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : soname) dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    std::uint64_t const dynstrOff = b.size();
+    b.insert(b.end(), dynstr.begin(), dynstr.end());
+
+    // .dynsym: STN_UNDEF slot (24 zero bytes) + one global STT_FUNC export.
+    while (b.size() % 8 != 0) b.push_back(0);
+    std::uint64_t const dynsymOff = b.size();
+    for (int i = 0; i < 24; ++i) b.push_back(0);           // slot 0 = STN_UNDEF
+    appU32(b, nameStrOff);                                 // st_name
+    b.push_back(static_cast<std::uint8_t>((1u << 4) | 2u));// STB_GLOBAL|STT_FUNC
+    b.push_back(0);                                        // st_other = STV_DEFAULT
+    appU16(b, 1);                                          // st_shndx
+    appU64(b, 0x1000);                                     // st_value
+    appU64(b, 0);                                          // st_size
+    std::uint64_t const dynsymSize = b.size() - dynsymOff;
+
+    // .shstrtab
+    std::uint64_t const shstrtabOff = b.size();
+    b.push_back(0);
+    auto pushName = [&](char const* s) -> std::uint32_t {
+        std::uint32_t off = static_cast<std::uint32_t>(b.size() - shstrtabOff);
+        for (char const* p = s; *p; ++p) b.push_back(static_cast<std::uint8_t>(*p));
+        b.push_back(0);
+        return off;
+    };
+    std::uint32_t const nDynstr   = pushName(".dynstr");
+    std::uint32_t const nDynsym   = pushName(".dynsym");
+    std::uint32_t const nShstrtab = pushName(".shstrtab");
+    std::uint32_t const nDynamic  = hasDynamic ? pushName(".dynamic") : 0u;
+    std::uint64_t const shstrtabSize = b.size() - shstrtabOff;
+
+    // .dynamic (DT_SONAME + DT_NULL), only when a soname is requested.
+    std::uint64_t dynamicOff = 0, dynamicSize = 0;
+    if (hasDynamic) {
+        while (b.size() % 8 != 0) b.push_back(0);
+        dynamicOff = b.size();
+        appU64(b, 14); appU64(b, sonameStrOff);  // DT_SONAME (tag 14)
+        appU64(b, 0);  appU64(b, 0);             // DT_NULL
+        dynamicSize = b.size() - dynamicOff;
+    }
+
+    // Section header table.
+    while (b.size() % 8 != 0) b.push_back(0);
+    std::uint64_t const shtOff = b.size();
+    auto writeShdr = [&](std::uint32_t name, std::uint32_t type,
+                         std::uint64_t off, std::uint64_t size,
+                         std::uint32_t link, std::uint64_t entsize) {
+        appU32(b, name); appU32(b, type);
+        appU64(b, 0); appU64(b, 0);        // flags, addr
+        appU64(b, off); appU64(b, size);
+        appU32(b, link); appU32(b, 0);     // link, info
+        appU64(b, 1); appU64(b, entsize);  // addralign, entsize
+    };
+    writeShdr(0, 0, 0, 0, 0, 0);                               // NULL
+    writeShdr(nDynstr, 3, dynstrOff, dynstr.size(), 0, 0);     // .dynstr (STRTAB)
+    writeShdr(nDynsym, 11, dynsymOff, dynsymSize, 1, 24);      // .dynsym (DYNSYM)
+    writeShdr(nShstrtab, 3, shstrtabOff, shstrtabSize, 0, 0);  // .shstrtab
+    if (hasDynamic)
+        writeShdr(nDynamic, 6, dynamicOff, dynamicSize, 1, 16);// .dynamic (DYNAMIC)
+
+    // Ehdr.
+    b[0] = 0x7F; b[1] = 'E'; b[2] = 'L'; b[3] = 'F';
+    b[4] = 2;   // ELFCLASS64
+    b[5] = 1;   // ELFDATA2LSB
+    b[6] = 1;   // EV_CURRENT
+    b[16] = 3;  // ET_DYN
+    b[18] = 62; // EM_X86_64
+    b[20] = 1;
+    std::memcpy(&b[40], &shtOff, 8);                        // e_shoff
+    b[52] = 64;                                             // e_ehsize
+    b[58] = 64;                                             // e_shentsize
+    b[60] = static_cast<std::uint8_t>(hasDynamic ? 5 : 4); // e_shnum
+    b[62] = 3;                                              // e_shstrndx
+    return b;
 }
 
 } // namespace
@@ -543,6 +655,67 @@ TEST(FfiIngest, BinaryLibrarySourceImportNameDefaultsEmptyAndCarries) {
     IngestionSource src{b};
     ASSERT_TRUE(std::holds_alternative<BinaryLibrarySource>(src));
     EXPECT_EQ(std::get<BinaryLibrarySource>(src).importName, "libdsslib.so");
+}
+
+// ── D-FF1-READER-SONAME (c171): ingest() prefers the embedded soname ──
+//
+// The consumer binds `meta.importLibrary = row.soname.empty() ? libraryPath
+// : row.soname` (and `meta.soname = row.soname`). We witness both arms by
+// feeding a real ELF `.so`: the source's `importName` ("widget-basename.so",
+// the c162 driver override that stands in for the file basename) is what
+// `libraryPath` becomes, so an embedded DT_SONAME must WIN over even that
+// explicit override. RED-ON-DISABLE on BOTH: drop the prefer and the PREFER
+// phase reads "widget-basename.so"; the FALLBACK phase proves the empty-soname
+// row still resolves to the basename.
+TEST(FfiIngest, IngestPrefersSonameOverBasenameForImportLibrary) {
+    ScratchDir scratch{Location::Temp, "ff5-soname"};
+    auto const dir = scratch.path();
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+
+    // Build a `.so` exporting `puts` (optionally carrying `soname`), write it
+    // to a scratch file, run ingest() with `importName` = "widget-basename.so"
+    // + a matching `puts` extern, and return the resolved FfiMetadata.
+    auto runIngest = [&](std::string const& fileName,
+                         std::string const& soname) -> FfiMetadata {
+        auto const path = dir / fileName;
+        {
+            auto const bytes = buildElfSo("puts", soname);
+            std::ofstream out{path, std::ios::binary};
+            out.write(reinterpret_cast<char const*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        TypeInterner ti = makeInterner();
+        auto built = buildModuleWithExtern(ti);
+        HirFfiMap ffi{built.hir};
+        DiagnosticReporter rep;
+        std::array sources{IngestionSource{
+            BinaryLibrarySource{path, "widget-basename.so"}}};
+        std::array externs{ExternDeclRef{built.externNode, "puts"}};
+        auto result = ingest(sources, externs, **target, **format, ffi, rep);
+        EXPECT_TRUE(result.ok()) << "rep.errorCount=" << rep.errorCount();
+        EXPECT_EQ(result.externsAnnotated, 1u);
+        auto const* meta = ffi.tryGet(built.externNode);
+        EXPECT_NE(meta, nullptr);
+        return meta ? *meta : FfiMetadata{};
+    };
+
+    // PREFER: the embedded DT_SONAME beats even the importName override.
+    FfiMetadata const preferred = runIngest("libwidget.so", "libwidget.so.2");
+    EXPECT_EQ(preferred.importLibrary, "libwidget.so.2")
+        << "the embedded DT_SONAME must be PREFERRED over the basename override";
+    EXPECT_EQ(preferred.soname, "libwidget.so.2");
+    EXPECT_EQ(preferred.mangledName, "puts");  // ELF: no decoration
+
+    // FALLBACK: no DT_SONAME ⇒ importLibrary falls back to the basename
+    // (the overridden libraryPath), and soname stays empty.
+    FfiMetadata const fallback = runIngest("libplain.so", "");
+    EXPECT_EQ(fallback.importLibrary, "widget-basename.so")
+        << "with no DT_SONAME, importLibrary must fall back to the basename";
+    EXPECT_TRUE(fallback.soname.empty());
 }
 
 // ── FF3 (resolveAbi) gate: bad (target, format) pair fails ingest ─

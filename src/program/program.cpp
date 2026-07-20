@@ -366,6 +366,64 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         cuMirs.push_back(std::move(*cuMir));
     }
 
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): static-library output ──
+    //
+    // A `container: archive` format produces an `ar` STATIC LIBRARY (`.a`/
+    // `.lib`): each CU lowers to its OWN relocatable member (NO cross-CU
+    // merge — an archive PACKAGES separate objects; the FINAL foreign linker
+    // pulls + merges only the members it needs), then `linkAndWriteStaticArchive`
+    // bundles them (threading the ecosystem's `ar` flavor — SysV `.a` for
+    // ELF/Mach-O, COFF `.lib` for PE). Dispatched on the FORMAT's declared
+    // container (the §B format-container decision, user Option 1), NEVER the
+    // artifactProfile (`artifact_profile.hpp`'s standing veto). `outPath`
+    // already carries the `.a`/`.lib` extension (the outputExtension archive
+    // arm) and `enforceArtifactProfileFormat` already validated the project's
+    // `staticlib` profile against this format's served set.
+    if ((*formatR)->isStaticArchive()) {
+        // Bundling INPUT static archives' members into this new library (a
+        // merged "fat" archive) is unbuilt — fail loud rather than silently
+        // omit them. Dynamic `--resolve-library` libs stayed on the per-CU
+        // FFI path (a member MAY reference libc externs — resolved at the
+        // FINAL link against the library, not here).
+        if (!staticArchives.empty()) {
+            std::string names;
+            for (auto const& a : staticArchives) {
+                if (!names.empty()) names += ", ";
+                names += a.generic_string();
+            }
+            emitDriver(reporter, DiagnosticCode::D_StaticLibFatArchiveUnsupported,
+                       "building a static library (container: archive) does not "
+                       "yet bundle input `--resolve-library` static archives into "
+                       "the output (a merged/\"fat\" archive is the unbuilt "
+                       "D-FF1-STATICLIB-FAT-ARCHIVE): " + names
+                       + ". Remove the static archive(s), or link them at the "
+                         "FINAL image build instead.");
+            return false;
+        }
+        std::string const memberExt =
+            (*formatR)->kind() == ObjectFormatKind::Pe ? ".obj" : ".o";
+        std::vector<AssembledModule> members;
+        std::vector<std::string>     memberNames;
+        members.reserve(cuMirs.size());
+        memberNames.reserve(cuMirs.size());
+        for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+            auto mod = lowerCuMirToAssembly(cuMirs[i], (*formatR)->processArgs(),
+                                            (*formatR)->kind(), reporter);
+            if (!mod) return false;  // back-half tier failure already reported
+            members.push_back(std::move(*mod));
+            // Member file name: distinct + valid `ar` name. The armap
+            // (symbol → member index) drives a linker's member selection, so
+            // the name is cosmetic; a lone CU takes `<stem><ext>`, multiple
+            // CUs disambiguate by index.
+            memberNames.push_back(
+                cuMirs.size() == 1
+                    ? std::string{sourceStem} + memberExt
+                    : std::string{sourceStem} + "_" + std::to_string(i) + memberExt);
+        }
+        return linkAndWriteStaticArchive(members, memberNames,
+                                         **targetR, **formatR, outPath, reporter);
+    }
+
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
@@ -555,6 +613,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // D-CSUBSET-BITFIELD-ABI-EXACT: resolve + pass the FORMAT-determined bit-field
     // strategy (gnu_packed / msvc_straddle) so a bit-field global in the merged
     // whole-program image is laid out byte-ABI-exact for the active format.
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the F128 softcall
+    // runtime library here (the merge lower body has no ObjectFormatKind in
+    // scope) — exactly where externCallDispatch is pre-resolved from the
+    // format. Empty = the format declares none (nullopt → F128 softcall fails
+    // loud).
+    std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary(
+        objectFormatKindName((*formatR)->kind()));
+    std::optional<std::string> wideFloatSoftcallLibrary =
+        wfLib.empty() ? std::nullopt
+                      : std::optional<std::string>(std::string(wfLib));
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
@@ -565,6 +633,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      // format's thread-local access block.
                                      (*formatR)->tlsAccess(),
                                      std::move(sehScopes),
+                                     std::move(wideFloatSoftcallLibrary),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links

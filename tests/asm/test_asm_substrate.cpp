@@ -17,6 +17,7 @@
 
 #include "asm/asm.hpp"
 #include "asm_test_support.hpp"
+#include "core/types/wide_float_value.hpp"   // LD-3: folded F80/F128 global bytes
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -1194,6 +1195,62 @@ TEST(AsmDataSection, BitIntGlobalFailsLoud) {
     EXPECT_GE(rn.errors, 1u) << "a narrow _BitInt data-global must also fail loud";
     EXPECT_NE(rn.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
         << "the narrow arm emits the SAME explicit deferral diagnostic";
+}
+
+// ── LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): folded F80/F128 global
+// bytes. A const-folded `long double` global carries a `WideFloatValue` pool arm;
+// the globals emitter routes it through `appendWideFloatBits` (checked BEFORE the
+// `double` arm), producing the EXACT 16-byte x87/binary128 slot. These pins are
+// the asm-tier red-on-disable check that the folded arm emits the oracle bytes;
+// the sibling `unfolded double still works` pin proves the additive branch did
+// NOT disturb the pre-existing `appendF80Extended` widen path. ──────────────────
+
+// A folded F80 global (20.0L + 22.0L = 42.0L via the kernel) emits the exact x87
+// extended bytes: significand 0xa8.. (1.3125), exponent 0x4004 (e=5), +6 pad.
+TEST(AsmDataSection, FoldedF80GlobalEmitsWideFloatBytes) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue v;
+    v.core  = TypeKind::F80;
+    v.value = *WideFloatValue::add(WideFloatValue::fromDouble(20.0, TypeKind::F80),
+                                   WideFloatValue::fromDouble(22.0, TypeKind::F80));
+    auto const r = lowerOneAggGlobal(ti, ti.primitive(TypeKind::F80), std::move(v),
+                                     kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{0,0,0,0,0,0,0,0xa8,0x04,0x40,0,0,0,0,0,0};
+    EXPECT_EQ(r.items[0].bytes, expect) << "folded F80 42.0L rodata bytes (appendWideFloatBits)";
+}
+
+// A folded F128 global emits the exact binary128 bytes: frac top 0x50 (.0101),
+// exponent 0x4004.
+TEST(AsmDataSection, FoldedF128GlobalEmitsWideFloatBytes) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue v;
+    v.core  = TypeKind::F128;
+    v.value = *WideFloatValue::add(WideFloatValue::fromDouble(20.0, TypeKind::F128),
+                                   WideFloatValue::fromDouble(22.0, TypeKind::F128));
+    auto const r = lowerOneAggGlobal(ti, ti.primitive(TypeKind::F128), std::move(v),
+                                     kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{0,0,0,0,0,0,0,0,0,0,0,0,0,0x50,0x04,0x40};
+    EXPECT_EQ(r.items[0].bytes, expect) << "folded F128 42.0L rodata bytes (appendWideFloatBits)";
+}
+
+// Regression: an UNFOLDED F80 leaf (the `double` pool arm — the LD-1 widen path)
+// STILL emits via appendF80Extended. RED if adding the WideFloatValue branch
+// swallowed the double arm. 42.0 is exact, so the bytes match the folded case.
+TEST(AsmDataSection, UnfoldedDoubleF80GlobalStillWidens) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue v;
+    v.core  = TypeKind::F80;
+    v.value = 42.0;   // the pre-existing `double` arm (unfolded l-suffixed leaf)
+    auto const r = lowerOneAggGlobal(ti, ti.primitive(TypeKind::F80), std::move(v),
+                                     kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{0,0,0,0,0,0,0,0xa8,0x04,0x40,0,0,0,0,0,0};
+    EXPECT_EQ(r.items[0].bytes, expect) << "unfolded double-arm F80 still widens (appendF80Extended)";
 }
 
 // A CONST initialized global stays read-only `.rodata`. RED if the section

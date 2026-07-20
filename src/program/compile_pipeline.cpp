@@ -16,7 +16,9 @@
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
+#include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
+#include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
 #include "link/linker.hpp"
 #include "link/writer.hpp"
 #include "lir/lir_2addr_legalize.hpp"
@@ -709,6 +711,13 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // module). Threaded into MIR→LIR, which emits the
                          // SehScopeDescriptors this body then binds post-assemble.
                          std::vector<MirSehScope>                    sehScopes,
+                         // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the active
+                         // format's F128 softfloat-helper runtime library
+                         // (libgcc_s.so.1 on elf-arm64), threaded into MIR→LIR
+                         // exactly like the extern-dispatch/TLS blocks (nullopt =
+                         // this leg has no F128 softcall binding; an F128 softcall
+                         // then fails loud). Resolved per-leg by each wrapper.
+                         std::optional<std::string>                  wideFloatSoftcallLibrary,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -725,7 +734,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           externCallDispatch,
                           dataImportBinding,
                           tlsAccess,
-                          sehScopes);
+                          sehScopes,
+                          std::move(wideFloatSoftcallLibrary));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1300,6 +1310,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return r ? dss::ffi::applyCMangling(r->name, fmtKind) : std::string{};
     };
 
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's
+    // F128 softcall runtime library inline (fmtKind + the CU's target are both
+    // in scope here — no new CuMirModule field needed). Empty = the format
+    // declares none (nullopt → an F128 softcall fails loud).
+    std::string_view const wfLib =
+        cuMir.target->wideFloatSoftcallLibrary(objectFormatKindName(fmtKind));
+    std::optional<std::string> wideFloatSoftcallLibrary =
+        wfLib.empty() ? std::nullopt
+                      : std::optional<std::string>(std::string(wfLib));
+
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
@@ -1307,7 +1327,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -1336,6 +1356,12 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::optional<DataImportBinding> dataImportBinding,
                       std::optional<TlsAccessInfo> tlsAccess,
                       std::vector<MirSehScope> sehScopes,
+                      // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
+                      // softcall runtime library, pre-resolved one level up in
+                      // program.cpp (no ObjectFormatKind in scope here — the
+                      // merge path resolves it near **formatR, exactly as
+                      // externCallDispatch is pre-resolved there).
+                      std::optional<std::string> wideFloatSoftcallLibrary,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -1350,7 +1376,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, tlsAccess,
-        std::move(sehScopes), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -1494,8 +1520,38 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         // with the client or another member (the monotonic minter never repeats).
         CompilationUnitId const memberCu =
             substrate::mintMonotonicId<CompilationUnitId>();
-        auto member_mod = elf::readRelocatableObject(
-            memberBytes, target, format, reporter, memberCu);
+        // Dispatch the member read by the format's object-format KIND -- the
+        // relocatable-object reader is per-format (ELF ET_REL c164 / Mach-O
+        // MH_OBJECT c168). A format with no reader arm fails loud rather than
+        // silently mis-parsing a member with the wrong reader (agnostic:
+        // switch on the schema-declared kind, never a format-name branch).
+        std::optional<AssembledModule> member_mod;
+        switch (format.kind()) {
+            case ObjectFormatKind::Elf:
+                member_mod = elf::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            case ObjectFormatKind::MachO:
+                member_mod = macho::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            case ObjectFormatKind::Pe:
+                member_mod = pe::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            default: {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link member reader: object format '{}' (kind {}) "
+                    "has no relocatable-object reader -- cannot pull archive "
+                    "members for this format.",
+                    format.name(), objectFormatKindName(format.kind()));
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
+        }
         // Consume the reader's optional as the read-success signal -- NOT
         // `ok()`, which is a tautology for reader output AND false for a
         // data-only member (see elf_object_reader.hpp).
@@ -1609,7 +1665,18 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
             memberNames[i], std::move(image.bytes), std::move(exported)});
     }
 
-    auto const archive = link::format::writeArArchive(members, reporter);
+    // c169/c171 (D-FF1-AR-COFF-WRITER + D-FF1-AR-STATICLIB-DRIVER-WIRING):
+    // the archive FLAVOR is the format ecosystem's `ar` variant — Microsoft
+    // COFF (`.lib`: adds the little-endian 2nd linker member a link.exe
+    // consumer requires) for PE, GNU/System V (`.a`) for ELF + Mach-O.
+    // Derived from `format.kind()` (the closed enum, the existing agnostic
+    // dispatch axis), never a format-name branch. Without this a PE static
+    // library would ship SysV-only and MS link.exe could not resolve its
+    // members (the c169 default was SysV; c171 threads the real flavor).
+    auto const flavor = (format.kind() == ObjectFormatKind::Pe)
+                            ? link::format::ArArchiveFlavor::Coff
+                            : link::format::ArArchiveFlavor::SysV;
+    auto const archive = link::format::writeArArchive(members, reporter, flavor);
     if (!tierClean(reporter, entry)) {
         return false;   // a writer fail-loud belt fired (name/size/offset).
     }

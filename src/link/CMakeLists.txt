@@ -8,7 +8,9 @@ add_library(link OBJECT
     format/elf.cpp
     format/elf_object_reader.cpp
     format/pe.cpp
+    format/coff_object_reader.cpp
     format/macho.cpp
+    format/macho_object_reader.cpp
     format/macho_chained_fixups.cpp
     format/macho_codesign.cpp
     format/spirv.cpp

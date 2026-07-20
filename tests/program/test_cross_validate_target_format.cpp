@@ -384,3 +384,36 @@ TEST(CrossValidateTargetFormat, ShippedX86_64MachOMatches) {
     DiagnosticReporter rep;
     EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
 }
+
+// -- c171 cross-arch variant-parity formats: shipped pairs cross-validate --
+// The arm64 .so + arm64 PIE cross-validate against the arm64 target;
+// the x86_64 .dylib against the x86_64 target. Mirrors ShippedArm64PairsClean
+// / ShippedX86_64MachOMatches -- the machine code (elf.machine / macho.cputype)
+// must unify with the target's ISA row.
+
+TEST(CrossValidateTargetFormat, ShippedArm64DynMatches) {
+    auto target = TargetSchema::loadShipped("arm64");
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-dyn");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(CrossValidateTargetFormat, ShippedArm64PieMatches) {
+    auto target = TargetSchema::loadShipped("arm64");
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-pie");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(CrossValidateTargetFormat, ShippedX86_64DylibMatches) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    auto format = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-dylib");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}

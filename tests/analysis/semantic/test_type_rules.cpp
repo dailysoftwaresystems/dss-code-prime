@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+
 using namespace dss;
 
 // ── compile-time invariants ───────────────────────────────────────────────
@@ -437,6 +439,110 @@ TEST(TypeRules, UsualArithmeticCommonTypeBitInt) {
     ResolvedArithmeticRules off;
     off.minRank = TypeKind::I32;
     EXPECT_FALSE(usualArithmeticCommonType(in, b20s, b40s, off).valid());
+}
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY + C 6.3.2.1p2: the usual arithmetic conversions
+// yield the UNQUALIFIED type. The float branch used to return the WINNING OPERAND
+// VERBATIM, so a `volatile`/`_Atomic` skin rode into the common type — and since a
+// qualifier CHANGE is the one thing the same-representation re-tag refuses, the
+// coercion then materialized a synthetic Cast that lowers to a REAL `Bitcast`.
+// Reachable exactly where two DISTINCT float vocabulary entries share a core: the
+// f64 long-double axis (pe64 / apple-arm64), where `long double` IS F64.
+//
+// RED-ON-DISABLE: with the verbatim return this returns the qualified operand, so
+// `qualifierBits` is non-zero and the TypeId is the operand's own.
+TEST(TypeRules, UsualArithmeticCommonTypeDropsQualifiersOnTheFloatBranch) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    // The language declares `long double` a NAMED entry out-ranking `double`;
+    // on an f64 axis both resolve to the SAME core.
+    in.declareVocabularyRank("long double", 3);
+    TypeId const dbl    = in.primitive(TypeKind::F64);                  // `double`
+    TypeId const ld     = in.primitive(TypeKind::F64, "long double");
+    TypeId const vld    = in.volatileQualified(ld);
+    TypeId const aLd    = in.atomicQualified(ld);
+
+    for (TypeId const qualified : {vld, aLd}) {
+        // Both operand orders — the winner is picked by declared RANK, and the
+        // result must be the bare, UNQUALIFIED `long double` either way.
+        for (auto const [a, b] : {std::pair{dbl, qualified}, std::pair{qualified, dbl}}) {
+            TypeId const got = usualArithmeticCommonType(in, a, b, rules);
+            EXPECT_EQ(got.v, ld.v)
+                << "the common type is the bare `long double` vocabulary entry";
+            EXPECT_EQ(in.qualifierBits(got), 0u)
+                << "C 6.3.2.1p2: the usual arithmetic conversions yield the "
+                   "UNQUALIFIED type — a skin here becomes a spurious Bitcast";
+        }
+    }
+    // The mixed float/integer arm takes the same path (the float side wins).
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    EXPECT_EQ(usualArithmeticCommonType(in, vld, i32, rules).v, ld.v);
+    EXPECT_EQ(usualArithmeticCommonType(in, i32, vld, rules).v, ld.v);
+    // And the UNNAMED control is byte-identical to the historic behavior — in
+    // BOTH orders. `(dbl, volatileQualified(dbl))` alone would be vacuous: the
+    // pre-fix branch was `fa >= fb ? a : b`, which on an equal float rank returns
+    // the LEFT operand, so putting the plain `double` on the left passes even
+    // with the fix reverted. The qualified operand must lead for the anonymous
+    // case to be pinned at all.
+    for (auto const [a, b] : {std::pair{dbl, in.volatileQualified(dbl)},
+                              std::pair{in.volatileQualified(dbl), dbl}}) {
+        TypeId const got = usualArithmeticCommonType(in, a, b, rules);
+        EXPECT_EQ(got.v, dbl.v)
+            << "an anonymous same-core pair still yields the bare primitive";
+        EXPECT_EQ(in.qualifierBits(got), 0u)
+            << "C 6.3.2.1p2 applies to the UNNAMED case too — the skin must not "
+               "ride into the common type just because no vocabulary entry is "
+               "involved";
+    }
+}
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY + C 6.3.2.1p2, the COMPLEX arm. The `_Complex`
+// branch runs BEFORE the float branch and used to build `interner.complex(elem)`
+// from an operand taken VERBATIM — so the SAME qualifier skin rode into the
+// element. `volatileDouble + complexF64` (the qualified operand FIRST, the order
+// the `rea >= reb` tie resolves toward) yielded `Complex<volatile f64>`.
+//
+// RED-ON-DISABLE: with the verbatim element this returns a complex whose element
+// carries the qualifier, so it is a DIFFERENT TypeId from `complex(f64)`.
+TEST(TypeRules, UsualArithmeticCommonTypeDropsQualifiersOnTheComplexBranch) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    in.declareVocabularyRank("long double", 3);
+    TypeId const dbl  = in.primitive(TypeKind::F64);
+    TypeId const ld   = in.primitive(TypeKind::F64, "long double");
+    TypeId const cf64 = in.complex(dbl);
+    TypeId const cld  = in.complex(ld);
+    TypeId const i32  = in.primitive(TypeKind::I32);
+
+    // A qualified REAL operand, both orders — the element must be the bare f64.
+    for (TypeId const q : {in.volatileQualified(dbl), in.atomicQualified(dbl)}) {
+        for (auto const [a, b] : {std::pair{q, cf64}, std::pair{cf64, q}}) {
+            TypeId const got = usualArithmeticCommonType(in, a, b, rules);
+            ASSERT_EQ(in.kind(got), TypeKind::Complex);
+            EXPECT_EQ(got.v, cf64.v)
+                << "the complex element is the UNQUALIFIED f64 (C 6.3.2.1p2)";
+            EXPECT_EQ(in.qualifierBits(in.complexElement(got)), 0u);
+        }
+    }
+    // A qualified COMPLEX operand — the skin is on the complex itself.
+    for (auto const [a, b] : {std::pair{in.volatileQualified(cf64), dbl},
+                              std::pair{dbl, in.volatileQualified(cf64)}}) {
+        TypeId const got = usualArithmeticCommonType(in, a, b, rules);
+        EXPECT_EQ(got.v, cf64.v);
+    }
+    // Identity is preserved through the element, and the equal-core tie is broken
+    // by declared RANK exactly as the real float branch does: `long double` wins
+    // over `double` on an f64 axis, in BOTH orders.
+    for (auto const [a, b] : {std::pair{cld, dbl}, std::pair{dbl, cld}}) {
+        EXPECT_EQ(usualArithmeticCommonType(in, a, b, rules).v, cld.v)
+            << "`_Complex long double` + `double` on an f64 axis is "
+               "`_Complex long double`, not `_Complex double`";
+    }
+    // A real INTEGER operand still takes the complex's element, unqualified.
+    EXPECT_EQ(usualArithmeticCommonType(in, in.volatileQualified(cf64), i32,
+                                        rules).v, cf64.v);
 }
 
 // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.8 / design test #7): the usual arithmetic

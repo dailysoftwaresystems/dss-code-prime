@@ -273,6 +273,16 @@ lowerToLir(Mir const&          mir,
            // block ids). Each is translated to LIR block ids + emitted as a
            // `SehScopeDescriptor` on the result. Empty for every module without a
            // `__try`; a non-SEH module never reaches the translation.
-           std::span<MirSehScope const> sehScopes = {});
+           std::span<MirSehScope const> sehScopes = {},
+           // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE object
+           // format's F128 softfloat-helper runtime library (`libgcc_s.so.1`
+           // on elf-arm64), resolved from `TargetSchema::wideFloatSoftcall-
+           // Library(formatKey)` one level up. The F128 softcall verb binds
+           // each auto-injected extern (__addtf3 …) to it. `std::nullopt` =
+           // the format declares none: an F128 softcall then fails loud (no
+           // unbound extern) — the F64-axis / x87-80-axis formats never reach
+           // it (they collapse or use the inline x87 sequence). Defaults to
+           // nullopt; only F128-softcall-bearing modules consume it.
+           std::optional<std::string> wideFloatSoftcallLibrary = std::nullopt);
 
 } // namespace dss

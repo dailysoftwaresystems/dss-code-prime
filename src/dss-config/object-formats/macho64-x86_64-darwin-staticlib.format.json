@@ -1,0 +1,60 @@
+{
+  "$comment": "STATIC LIBRARY (`ar` archive of relocatable members) for macho64-x86_64-darwin. c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING). IDENTICAL to the `macho64-x86_64-darwin` relocatable format -- its Mach-O MH_OBJECT x86_64 members are written by the SAME relocatable writer + the same sections[]/relocations[] rows -- PLUS exactly `container: \"archive\"` + `artifactProfiles: [\"staticlib\"]` + the `-staticlib` name. The archive framing itself is FORMAT-BLIND (src/link/format/ar.cpp): the SysV `.a` armap for ELF/Mach-O, the Microsoft `.lib` 2nd linker member for PE (flavor threaded from kind() in linkAndWriteStaticArchive). No writer code is format-specific to the archive. Kept in sync with the relocatable sibling by hand: any section/reloc change there must mirror here.",
+  "dssObjectFormatVersion": 1,
+  "format": {
+    "name": "macho64-x86_64-darwin-staticlib",
+    "version": "1.0",
+    "kind": "macho"
+  },
+  "$containerComment": "D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): `container: archive` marks this as a STATIC-LIBRARY format. The driver (compileOneTarget) dispatches on THIS field -- never the artifactProfile name (the artifact_profile.hpp veto) -- routing each CU's relocatable member (.o) into ONE `ar` archive via linkAndWriteStaticArchive. This is the user's Option-1 format-container decision: output SHAPE stays 100% format-driven (cli->exec, lib->shared, staticlib->archive), exactly as elf.type / pe.type / macho.filetype select the single-file shapes.",
+  "container": "archive",
+  "$artifactProfilesComment": "This format SERVES the `staticlib` artifact profile (plan 06). It is the FIRST format to declare it -- the bare relocatable sibling serves NO profile (a `.o` is an internal cross-CU intermediate / a static-archive member, never a project's final artifact). enforceArtifactProfileFormat validates a `staticlib` project against this set.",
+  "artifactProfiles": [
+    "staticlib"
+  ],
+  "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LP64",
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: macOS/Darwin (Apple x86_64 + arm64) uses the generic LSB-first bit-field allocation. Apple's enumerated arm64 ABI divergences from generic AAPCS64 are char/wchar_t signedness, long double=double, va_list, the red zone, the stack argument area, and empty-struct handling — NOT bit-field packing — so Mach-O shares gnu_packed. Byte-ABI-exact to clang, confirmed by the macOS CI cross-compile-compare leg (the only runtime witness for Apple).",
+  "bitFieldStrategy": "gnu_packed",
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: macOS x86_64 `long double` = x87 80-bit, 16/16 (SysV). See macho64-x86_64-darwin-exec.",
+  "longDoubleFormat": "x87-80",
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_X86_64 (0x01000007 — CPU_ARCH_ABI64 bit OR'd with x86 ABI type 7). cpusubtype = CPU_SUBTYPE_X86_64_ALL (3). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set: the cycle-1 walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety (silent-failure-hunter HIGH-1 convergence). The flag will return when the substrate emits per-function subsections — anchored at plan 14 §3.1 D-LK3-2.",
+    "cputype": 16777223,
+    "cpusubtype": 3,
+    "filetype": "object",
+    "flags": 0
+  },
+  "sections": [
+    {
+      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes. PE's substrate `type` field repurposed for Mach-O section_64.flags.",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 4,
+      "entrySize": 0
+    }
+  ],
+  "relocations": [
+    {
+      "$comment": "32-bit PC-relative call/jmp. r_type = X86_64_RELOC_BRANCH (2), r_pcrel = 1, r_length = 2 (4 bytes). Mach-O `relocation_info.r_info` packs bits 28..31=r_type, 27=r_extern, 25..26=r_length, 24=r_pcrel, 0..23=r_symbolnum. The walker emits the static portion of r_info from this nativeId (type+length+pcrel = 0x25000000) and ORs in r_extern + r_symbolnum at emit time. `kind` = 1 matches x86_64.target.json's `rel32`. Mach-O has no Rela addend column — addends live in the patch bytes (the assembler writes 0; the linker computes target_va - (rip_after) - 0 since BRANCH is rip-relative).",
+      "name": "X86_64_RELOC_BRANCH",
+      "kind": 1,
+      "nativeId": 620756992
+    },
+    {
+      "$comment": "Absolute 64-bit. r_type = X86_64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 3 (8 bytes). nativeId = (0<<28)|(3<<25)|(0<<24) = 0x06000000. `kind` = 2 matches x86_64.target.json's `abs64`.",
+      "name": "X86_64_RELOC_UNSIGNED_8",
+      "kind": 2,
+      "nativeId": 100663296
+    },
+    {
+      "$comment": "Absolute 32-bit. r_type = X86_64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 2 (4 bytes). nativeId = (0<<28)|(2<<25)|(0<<24) = 0x04000000. `kind` = 3 matches x86_64.target.json's `abs32`.",
+      "name": "X86_64_RELOC_UNSIGNED_4",
+      "kind": 3,
+      "nativeId": 67108864
+    }
+  ]
+}

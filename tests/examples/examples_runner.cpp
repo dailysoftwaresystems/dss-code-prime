@@ -125,10 +125,34 @@ namespace {
     return {};
 }
 
+// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one PREREQUISITE artifact a
+// target build depends on — a LIBRARY the runner builds FIRST, then threads
+// into the dependent build's `--resolve-library` (the c162 reader-consumer
+// surface). PER-TARGET (on `ExampleTarget`) so one example can express the
+// round-trip on each platform with a matching library format (a PE `.lib` for
+// the pe64 target, an ELF `.a` for the elf64 target, ...). `sources` are file
+// names in the SAME example dir (copied to the scratch build dir like the main
+// sources); `spec` is the library's own `<target>:<format>` (typically a
+// `-staticlib` or `-dyn`/`-dll` format); `artifact` is its output file name
+// (e.g. "dsslib.lib" / "libdsslib.a"). `multiCu` selects compileUnits vs
+// compileFiles for the library, exactly as the top-level example does.
+struct DependsOnArtifact {
+    std::vector<std::string> sources;
+    bool                     multiCu = false;
+    std::string              spec;
+    std::string              artifact;
+};
+
 struct ExampleTarget {
     std::string                  spec;
     std::string                  artifact;
     std::vector<std::string>     runOn;  // host OS names allowed to spawn
+    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): prerequisite LIBRARY artifacts
+    // this target links against. The runner builds each FIRST (into the same
+    // scratch out dir) and passes their output paths to the dependent build's
+    // `--resolve-library` (`Program::setResolveLibraries`). Empty (the
+    // default) ⇒ a plain single-artifact build (every pre-c171 example).
+    std::vector<DependsOnArtifact> dependsOn;
     // D-LK10-ENTRY-ARM64: optional emulator command (e.g.
     // "qemu-aarch64") used when the target arch differs from the host
     // arch. Empty ⇒ native execution only (the pre-V2-1 default).
@@ -359,6 +383,35 @@ struct ExampleManifest {
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
+        // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
+        // library artifacts this target links against (built FIRST, threaded
+        // into `--resolve-library`).
+        if (t.contains("dependsOn")) {
+            if (!t.at("dependsOn").is_array()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target 'dependsOn' must be an array";
+                return m;
+            }
+            for (auto const& d : t.at("dependsOn")) {
+                DependsOnArtifact dep;
+                dep.spec     = d.value("spec", "");
+                dep.artifact = d.value("artifact", "");
+                dep.multiCu  = d.value("multiCu", false);
+                if (d.contains("sources") && d.at("sources").is_array()) {
+                    for (auto const& s : d.at("sources")) {
+                        if (s.is_string()) dep.sources.push_back(s.get<std::string>());
+                    }
+                }
+                if (dep.sources.empty() || dep.spec.empty()
+                 || dep.artifact.empty()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " target 'dependsOn' entry needs non-empty "
+                                     "'sources', 'spec', and 'artifact'";
+                    return m;
+                }
+                et.dependsOn.push_back(std::move(dep));
+            }
+        }
         m.targets.push_back(std::move(et));
     }
     // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER. Manifest shape — each arm
@@ -535,9 +588,61 @@ compileAndRunArm(fs::path const& exampleDir,
     scratch.useAsCwd();
     auto const outDir = scratch.path() / "out";
 
+    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
+    // artifact FIRST (into the same out dir), then thread their paths into the
+    // dependent build's `--resolve-library`. A dep build failure poisons the
+    // arm with the SAME strict compile-side checks as the main build.
+    std::vector<fs::path> resolveLibs;
+    for (auto const& dep : t.dependsOn) {
+        std::vector<std::string> depSrcPaths;
+        depSrcPaths.reserve(dep.sources.size());
+        for (auto const& s : dep.sources) {
+            auto const sp = scratch.path() / s;
+            if (!fs::exists(sp)) {
+                ADD_FAILURE() << "dependsOn source '" << s
+                              << "' not found in example dir "
+                              << exampleDir.generic_string();
+                armResult.status = ArmStatus::Poisoned;
+                return armResult;
+            }
+            depSrcPaths.push_back(sp.generic_string());
+        }
+        Program            depProg;
+        DiagnosticReporter depRep;
+        depProg.setOutputDir(outDir);
+        int const depRc = dep.multiCu
+            ? depProg.compileUnits(depSrcPaths, m.language, {dep.spec}, depRep)
+            : depProg.compileFiles(depSrcPaths, m.language, {dep.spec}, depRep);
+        if (depRc != 0 || depRep.errorCount() != 0u) {
+            std::ostringstream depDump;
+            for (auto const& d : depRep.all()) {
+                depDump << "\n  " << diagnosticCodeName(d.code)
+                        << " (severity=" << static_cast<int>(d.severity)
+                        << "): " << d.actual;
+            }
+            ADD_FAILURE() << "dependsOn library build failed for spec="
+                          << dep.spec << " (dependent target=" << t.spec
+                          << ", arm=" << armLabel << ")" << depDump.str();
+            armResult.status = ArmStatus::Poisoned;
+            return armResult;
+        }
+        auto const depArtifact = outDir / dep.artifact;
+        if (!fs::exists(depArtifact)) {
+            ADD_FAILURE() << "dependsOn artifact missing at "
+                          << depArtifact.generic_string()
+                          << " (spec=" << dep.spec << ")";
+            armResult.status = ArmStatus::Poisoned;
+            return armResult;
+        }
+        resolveLibs.push_back(depArtifact);
+    }
+
     Program            prog;
     DiagnosticReporter rep;
     prog.setOutputDir(outDir);
+    if (!resolveLibs.empty()) {
+        prog.setResolveLibraries(resolveLibs);
+    }
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
     }

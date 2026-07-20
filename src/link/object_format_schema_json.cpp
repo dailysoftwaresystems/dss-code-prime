@@ -288,6 +288,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): OPTIONAL `container` ──
+    //
+    // The output PACKAGING axis ("single" / "archive"). `archive` marks a
+    // static-library format whose driver output is an `ar` bundle of
+    // relocatable members (`.a`/`.lib`) — the driver routes it to
+    // `linkAndWriteStaticArchive`, dispatching on this field (never the
+    // artifactProfile name — the standing agnosticism veto). OPTIONAL:
+    // absent ⇒ ObjectFormatContainer::Single (one standalone file), so
+    // every pre-c171 format is byte-identical. A wrong spelling is a HARD
+    // error — a typo can never silently pick a packaging (the dataModel
+    // discipline). Unlike `bitFieldStrategy`, `single` (the default) IS a
+    // selectable spelling: there is no sentinel value to reject.
+    if (doc.contains("container")) {
+        if (!doc.at("container").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/container",
+                      "'container' must be a string ('single' or 'archive')");
+        } else {
+            auto const s = doc.at("container").get<std::string>();
+            auto const c = objectFormatContainerFromName(s);
+            if (!c) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/container",
+                          std::format("unknown container '{}' — expected "
+                                      "'single' or 'archive'", s));
+            } else {
+                data.container = *c;
+            }
+        }
+    }
+
     // ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): OPTIONAL `longDoubleFormat` ──
     //
     // The per-format `long double` representation axis ("f64" / "x87-80" /

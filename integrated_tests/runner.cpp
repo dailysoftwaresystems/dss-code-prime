@@ -158,6 +158,17 @@ void check(std::string const& description, bool condition,
 #endif
 }
 
+// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one prerequisite LIBRARY artifact a
+// target build depends on — built FIRST, then threaded into the dependent
+// build's `--resolve-library`. Mirrors the in-process examples_runner's
+// `DependsOnArtifact` so BOTH corpus harnesses accept the same manifests.
+struct DependsOnArtifact {
+    std::vector<std::string> sources;
+    bool                     multiCu = false;
+    std::string              spec;
+    std::string              artifact;
+};
+
 struct ExampleTarget {
     std::string              spec;
     std::string              artifact;
@@ -171,6 +182,11 @@ struct ExampleTarget {
     // is 2 on pe64, 4 on elf/mach-o). Absent ⇒ the manifest `exitCode` applies.
     // Mirrors the in-process examples_runner so BOTH corpus harnesses agree.
     std::optional<std::int64_t> exitCodeOverride;
+    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): prerequisite library artifacts
+    // this target links against (built FIRST, threaded into `--resolve-library`).
+    // Empty (the default) ⇒ a plain single-artifact build. Mirrors the
+    // in-process examples_runner.
+    std::vector<DependsOnArtifact> dependsOn;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -318,6 +334,34 @@ struct ExampleManifest {
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
+        // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
+        // library artifacts (mirrors the in-process examples_runner).
+        if (t.contains("dependsOn")) {
+            if (!t.at("dependsOn").is_array()) {
+                std::cerr << "  target 'dependsOn' must be an array in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            for (auto const& d : t.at("dependsOn")) {
+                DependsOnArtifact dep;
+                dep.spec     = d.value("spec", "");
+                dep.artifact = d.value("artifact", "");
+                dep.multiCu  = d.value("multiCu", false);
+                if (d.contains("sources") && d.at("sources").is_array()) {
+                    for (auto const& s : d.at("sources")) {
+                        if (s.is_string()) dep.sources.push_back(s.get<std::string>());
+                    }
+                }
+                if (dep.sources.empty() || dep.spec.empty()
+                 || dep.artifact.empty()) {
+                    std::cerr << "  target 'dependsOn' entry needs non-empty "
+                                 "'sources', 'spec', and 'artifact' in "
+                              << path.generic_string() << "\n";
+                    return false;
+                }
+                et.dependsOn.push_back(std::move(dep));
+            }
+        }
         out.targets.push_back(std::move(et));
     }
     return true;
@@ -368,6 +412,36 @@ void runExampleViaCli(std::string const& compiler,
     auto const outDir =
         outputBase / "ex" / exampleName / specDir;
     fs::create_directories(outDir);
+
+    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
+    // artifact FIRST (into the same out dir) via a separate CLI invocation,
+    // then thread its path into the dependent build's `--resolve-library`.
+    // Mirrors the in-process examples_runner; a dep build failure is a test
+    // failure (the dependent build could not resolve its externs otherwise).
+    std::string resolveArgs;
+    for (auto const& dep : target->dependsOn) {
+        std::string depCompileArgs;
+        for (auto const& s : dep.sources) {
+            depCompileArgs += " " + quote((exampleDir / s).string());
+        }
+        auto const depLog = outDir / (dep.artifact + ".buildlog");
+        std::string const depCmd = quote(compiler)
+            + " --compile"   + depCompileArgs
+            + " --language " + m.language
+            + " --target "   + dep.spec
+            + " --output "   + quote(outDir.string())
+            + " > " + quote(depLog.string()) + " 2>&1";
+        int const depRc = std::system(shellWrap(depCmd).c_str());
+        auto const depArtifact = outDir / dep.artifact;
+        bool const depOk = (depRc == 0) && fs::exists(depArtifact)
+                        && fs::file_size(depArtifact) > 0u;
+        check(exampleName + ": dependsOn library " + dep.spec + " built ("
+              + depArtifact.generic_string() + ", buildlog: "
+              + depLog.generic_string() + ")", depOk);
+        if (!depOk) return;
+        resolveArgs += " --resolve-library " + quote(depArtifact.string());
+    }
+
     // Build the CLI invocation. The compiler binary path may
     // contain spaces (Visual Studio tooling drops it under
     // "C:\Program Files (x86)\..."); quote both the binary AND
@@ -387,6 +461,7 @@ void runExampleViaCli(std::string const& compiler,
         + " --compile"   + compileArgs
         + " --language " + m.language
         + " --target "   + target->spec
+        + resolveArgs
         + " --output "   + quote(outDir.string())
         + " > " + quote(cliLog.string()) + " 2>&1";
 

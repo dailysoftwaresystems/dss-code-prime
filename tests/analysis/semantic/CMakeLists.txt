@@ -27,6 +27,19 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
 dss_add_test(NAME analysis/semantic/test_fc3_width_semantics
              SOURCES test_fc3_width_semantics.cpp)
 
+# D-LANG-TYPE-IDENTITY-VOCABULARY: type identity comes from the language
+# vocabulary entry, representation from the target core — the `_Generic`
+# distinctness pins, the same-representation conversion pins, the pointer-
+# incompatibility tightening, the name-keyed conversion rank, and the loader's
+# vocabulary-consistency fail-louds.
+dss_add_test(NAME analysis/semantic/test_type_identity_vocabulary
+             SOURCES test_type_identity_vocabulary.cpp)
+target_include_directories(dss_analysis_semantic_test_type_identity_vocabulary
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+# Perturbs the SHIPPED c-subset JSON (the loader accept/reject matrix).
+target_link_libraries(dss_analysis_semantic_test_type_identity_vocabulary
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 # FC4 c1: the C-declarator engine substrate against a SYNTHETIC schema —
 # the `declarators` role-block loader matrix (M1), the shared name-
 # extraction walk (M2), the declarator-inversion fold (M3), and the

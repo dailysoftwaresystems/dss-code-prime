@@ -33,6 +33,11 @@
 
 namespace dss {
 
+// D-LANG-TYPE-IDENTITY-VOCABULARY: `HirBuilder::retagType` verifies its
+// same-representation precondition against the interner. Forward-declared (not
+// included) so this widely-pulled header does not gain the type lattice.
+class TypeInterner;
+
 class DSS_EXPORT Hir {
 public:
     using Arena = substrate::ArenaContainer<detail::HirNode, HirNodeId, HirModuleId>;
@@ -275,6 +280,43 @@ public:
     [[nodiscard]] std::uint32_t payload(HirNodeId id) const {
         return arena_.at(id).payload;
     }
+    // Mid-build TYPE read — the sibling of `kind`/`payload` above.
+    [[nodiscard]] TypeId typeId(HirNodeId id) const {
+        return arena_.at(id).typeId;
+    }
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: re-tag a node's TYPE IDENTITY in place,
+    // WITHOUT changing its representation. The ONE sanctioned exception to the
+    // read-only rule above, and deliberately narrow: `newType` MUST have the
+    // same representation as the node's current type (caller-proven via
+    // `TypeInterner::sameRepresentation`), so no shape invariant, literal-pool
+    // core, or lowering decision can observe the change — only type IDENTITY
+    // does.
+    //
+    // Needed because a same-representation conversion (`long l = someInt;` under
+    // LLP64; `return 0;` from a `long` function) is the C 6.3.1.3p1 IDENTITY
+    // conversion: it must change no bits. Materializing it as a `Cast` would
+    // emit a real `MirOpcode::Bitcast` that did not exist before identity was
+    // split off representation, and leaving the node's own type stale would
+    // instead fail the MIR terminator / store type checks, which compare
+    // TypeIds exactly. Re-tagging satisfies both: zero new nodes, exact types.
+    //
+    // Every clause of that precondition is CHECKED here, never trusted to a
+    // caller's comment (fail-loud `abort`, the `addParent` double-attach
+    // precedent) — an in-place mutation of a frozen-by-convention arena is
+    // exactly the kind of aliasing whose safety argument must be MECHANICAL:
+    //   * same REPRESENTATION (`TypeInterner::sameRepresentation`) and the same
+    //     QUALIFIER mask — a representation or volatile/_Atomic change would be
+    //     observable by layout / access lowering, i.e. a silent miscompile;
+    //   * an ARITHMETIC-CORE primitive on both sides — the vocabulary tag is a
+    //     scalar-identity concept, and a struct/pointer retag would alias a
+    //     shape the operand accessors already read;
+    //   * the node is still UNPARENTED — the ONLY structural reason aliasing is
+    //     safe here is that HIR is tree-shaped and every `coerce` input is
+    //     freshly minted, so no already-attached parent can have baked a
+    //     decision on the old tag.
+    // Defined out-of-line so `TypeInterner` stays a forward declaration: this
+    // header is pulled by most of the HIR tier and must not gain the interner.
+    void retagType(HirNodeId id, TypeId newType, TypeInterner const& interner);
     [[nodiscard]] std::span<HirNodeId const>
     children(HirNodeId id) const;
     // Sub-structure accessors for `pathTerminates`-style passes that

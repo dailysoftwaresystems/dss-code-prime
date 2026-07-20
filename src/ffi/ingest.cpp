@@ -353,15 +353,32 @@ ingest(std::span<IngestionSource const> sources,
         meta.mangledName   = linkerName;
         meta.linkage       = toFfiLinkage(matched.row.linkage);
         meta.visibility    = toFfiVisibility(matched.row.visibility);
-        meta.importLibrary = matched.row.libraryPath;
+        // D-FF1-READER-SONAME (c171): PREFER the binary's OWN embedded identity
+        // (ELF DT_SONAME / Mach-O LC_ID_DYLIB install name / PE export DllName,
+        // extracted by the FF1 readers into `row.soname`) as the recorded
+        // import library — it is exactly what a real linker records as the
+        // DT_NEEDED / LC_LOAD_DYLIB / import DllName the LOADER resolves at
+        // runtime. Falls back to the reader's `libraryPath` label (the c162
+        // driver-supplied basename stand-in, `BinaryLibrarySource.importName`)
+        // when the binary declares no soname. This COMPLETES the "honest
+        // stand-in until FF1 extracts them" transition the c162 importName
+        // override documented (ingest.hpp). The linker's DT_NEEDED is emitted
+        // from `ExternImport.libraryPath` == this field, so preferring the
+        // soname HERE is what makes the runtime dependency correct.
+        meta.importLibrary = matched.row.soname.empty()
+                                 ? matched.row.libraryPath
+                                 : matched.row.soname;
         // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the required symbol
         // version (parity with the FF5 source-decl path). Dormant today
         // (FF1 is the binary-reader ingestion path), but a versioned
         // ExternDeclRef routed here must not silently drop its version.
         meta.version = std::string{ext.version};
-        // `soname` left empty — FF1 doesn't yet populate
-        // DT_SONAME / Mach-O install_name; that's a future
-        // refinement of `ImportSurface`.
+        // The raw embedded soname, at its semantic home (the DT_SONAME of
+        // `importLibrary`). Populated now that the FF1 readers extract it;
+        // `ExternImport` carries no separate soname yet, so DT_NEEDED rides
+        // `importLibrary` above (a distinct ExternImport.soname path is the
+        // future refinement, not needed for the runtime-correct dependency).
+        meta.soname = matched.row.soname;
 
         ffiMap.set(ext.node, std::move(meta));
         ++result.externsAnnotated;

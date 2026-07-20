@@ -1045,6 +1045,16 @@ enum class DiagnosticCode : std::uint16_t {
     // the user asked for; fail loud instead (a language without a preprocessor
     // has no -D semantics).
     D_DefineRequiresPreprocess    = 0xD012,
+    // c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING): a `--resolve-library` STATIC
+    // archive was passed while the target format's output is itself a static
+    // library (`container: archive`). Bundling input archives' members INTO a
+    // new static library (a "fat"/merged archive, à la `libtool`) is a real
+    // but UNBUILT feature (D-FF1-STATICLIB-FAT-ARCHIVE); silently dropping the
+    // input archive would produce a library missing the members the user asked
+    // for. Fail loud instead. (Dynamic `--resolve-library` libraries — for a
+    // member's extern FFI surface — are still accepted; only INPUT static
+    // archives hit this.)
+    D_StaticLibFatArchiveUnsupported = 0xD013,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -2216,6 +2226,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   spelling, #include the header that declares it, or add the defining
     //   library to `--resolve-library`. (D-FF1-READER-CONSUMER, c162.)
     F_FfiResolveLibrarySymbolAbsent = 0x5022,
+    // F_ShippedTypeIdentityConflict: two shipped descriptors resolved for the
+    //   SAME compile target declare the same struct/union TAG NAME (or the same
+    //   typedef NAME) as DIFFERENT types — OR a descriptor spells a vocabulary
+    //   identity tag (`i64 "long"`) whose width contradicts what the ACTIVE
+    //   LANGUAGE gives that name under the active data model. Both are
+    //   SILENT-MISCOMPILE surfaces the per-file reader structurally cannot see:
+    //   descriptor injection is FIRST-WINS BY NAME and only the WINNER gets a
+    //   `compositeScopeByType` field scope, so a divergent second declaration
+    //   interns a SECOND TypeId whose members are unreachable — the user gets an
+    //   INCLUDE-ORDER-DEPENDENT `S000D member access '.' requires a
+    //   composite-typed operand` (`struct timeval` spelled `{i64, i64}` in
+    //   sys/resource.json but `{i64 "long", i64 "long"}` in sys/time.json), and a
+    //   tag whose width the data model cannot produce is a PHANTOM type matching
+    //   no `_Generic` association and no pointer of that spelling (`ssize_t` as
+    //   `i64 "long"` on LLP64). Remediation: make every declaration of the name
+    //   byte-identical per target (per-format / per-dataModel `variants` when the
+    //   type genuinely diverges). Member of `kUnsuppressableCodes`.
+    //   (D-LANG-TYPE-IDENTITY-VOCABULARY, 2026-07-20.)
+    F_ShippedTypeIdentityConflict = 0x5023,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

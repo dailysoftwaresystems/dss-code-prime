@@ -3,7 +3,9 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,7 +20,9 @@ namespace dss::link::format {
 
 namespace {
 
+using detail::appendU16LE;
 using detail::appendU32BE;
+using detail::appendU32LE;
 using detail::emit;
 
 constexpr std::size_t kArHdrSize = 60;
@@ -28,6 +32,9 @@ constexpr char kArMagic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', '\n'};
 constexpr std::uint64_t kMaxArFieldSize = 9999999999ull;   // 10^10 - 1
 // The largest member-header offset the SysV armap's 32-bit BE offsets can name.
 constexpr std::uint64_t kMaxArmapOffset = 0xFFFFFFFFull;
+// The COFF 2nd linker member's per-symbol member index is a u16 (1-based), so a
+// COFF `.lib` names at most 65535 members.
+constexpr std::uint64_t kMaxCoffMembers = 0xFFFFull;
 
 // A member name <= this many bytes stores inline as "name/" (name + the GNU
 // short-name terminator '/', fitting the 16-byte ar_hdr name field); a longer
@@ -95,7 +102,17 @@ nextHeaderOffset(std::uint64_t off, std::uint64_t payloadLen) noexcept {
 
 std::vector<std::uint8_t>
 writeArArchive(std::span<ArMemberInput const> members,
-               DiagnosticReporter&            reporter) {
+               DiagnosticReporter&            reporter,
+               ArArchiveFlavor                flavor) {
+    bool const coff = (flavor == ArArchiveFlavor::Coff);
+    if (coff && members.size() > kMaxCoffMembers) {
+        emit(reporter, DiagnosticCode::K_ArchiveFieldOverflow,
+             "ar writer: a COFF `.lib` names members with a u16 index, but the "
+             "archive has " + std::to_string(members.size()) + " members (> "
+             "65535) -- the COFF 2nd linker member cannot index them "
+             "(D-FF1-AR-COFF-WRITER)");
+        return {};
+    }
     // -- Validate member names + size fields; classify short vs long names. --
     // A long-named member (name > 15 bytes) records its real name in the "//"
     // table and its ar_hdr name field becomes "/N" (N = byte offset into "//").
@@ -160,6 +177,7 @@ writeArArchive(std::span<ArMemberInput const> members,
     // a NUL-terminated name blob. The offsets are back-filled once the layout
     // is known (below); here we gather the count + names + owning member index.
     std::vector<std::size_t> symbolMember;   // owning member index per armap symbol
+    std::vector<std::string> symbolName;     // parallel: the symbol name (COFF sort)
     std::vector<std::uint8_t> armapNameBlob;
     for (std::size_t mi = 0; mi < members.size(); ++mi) {
         for (std::string const& sym : members[mi].exportedSymbols) {
@@ -181,6 +199,7 @@ writeArArchive(std::span<ArMemberInput const> members,
                 }
             }
             symbolMember.push_back(mi);
+            symbolName.push_back(sym);
             for (char const c : sym)
                 armapNameBlob.push_back(static_cast<std::uint8_t>(c));
             armapNameBlob.push_back(0u);   // NUL terminator
@@ -204,13 +223,44 @@ writeArArchive(std::span<ArMemberInput const> members,
         return {};
     }
 
+    // -- COFF 2nd linker member (Microsoft LITTLE-endian SORTED index). --
+    // Payload: u32 memberCount + u32 member-header-offset x memberCount + u32
+    // symbolCount + u16 1-based member index x symbolCount (in SORTED symbol
+    // order) + the SORTED NUL-terminated name blob. Built from the SAME exported
+    // symbols as the 1st armap; `link.exe` PREFERS this member. `sortedOrder`
+    // permutes [0,symbolCount) into ascending name order.
+    std::vector<std::size_t> sortedOrder;
+    std::uint64_t secondMemberSize = 0;
+    if (coff) {
+        sortedOrder.resize(symbolCount);
+        std::iota(sortedOrder.begin(), sortedOrder.end(), std::size_t{0});
+        std::sort(sortedOrder.begin(), sortedOrder.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return symbolName[a] < symbolName[b];
+                  });
+        // The sorted name blob is the SAME bytes as armapNameBlob (same names +
+        // NUL terminators, reordered), so its size is armapNameBlob.size().
+        secondMemberSize = 4ull + 4ull * static_cast<std::uint64_t>(members.size())
+                         + 4ull + 2ull * static_cast<std::uint64_t>(symbolCount)
+                         + static_cast<std::uint64_t>(armapNameBlob.size());
+        if (secondMemberSize > kMaxArFieldSize) {
+            emit(reporter, DiagnosticCode::K_ArchiveFieldOverflow,
+                 "ar writer: the COFF 2nd linker member payload exceeds the "
+                 "10-digit ASCII ar_hdr size field (D-FF1-AR-COFF-WRITER)");
+            return {};
+        }
+    }
+
     // -- Compute each member's header offset (the layout pass). --
-    // Order: magic (8) -> "/" armap -> "//" long-name table (iff any) -> the
-    // member objects. Each member offset is deterministic from the sizes ahead
-    // of it, so the armap offsets can be filled before emission.
+    // Order: magic (8) -> "/" 1st armap -> [COFF only] "/" 2nd linker member ->
+    // "//" long-name table (iff any) -> the member objects. Each member offset
+    // is deterministic from the sizes ahead of it, so the armap offsets (BOTH
+    // linker members') can be filled before emission.
     bool const emitLongTable = !longNameTable.empty();
     std::uint64_t off = sizeof(kArMagic);
-    off = nextHeaderOffset(off, armapSize);            // past the "/" armap
+    off = nextHeaderOffset(off, armapSize);            // past the 1st "/" armap
+    if (coff)
+        off = nextHeaderOffset(off, secondMemberSize); // past the COFF 2nd "/" member
     if (emitLongTable)
         off = nextHeaderOffset(off, longNameTable.size());   // past the "//" table
     std::vector<std::uint64_t> memberHeaderOffset;
@@ -244,6 +294,32 @@ writeArArchive(std::span<ArMemberInput const> members,
         }
         armap.insert(armap.end(), armapNameBlob.begin(), armapNameBlob.end());
         emitMember(out, "/", "0", armap);
+    }
+
+    // COFF 2nd linker member (mode 0, name "/"): the Microsoft LITTLE-endian
+    // sorted symbol->member index. Emitted immediately after the 1st armap so
+    // `link.exe` finds it; the member offsets already account for its presence.
+    if (coff) {
+        std::vector<std::uint8_t> second;
+        second.reserve(static_cast<std::size_t>(secondMemberSize));
+        appendU32LE(second, static_cast<std::uint32_t>(members.size()));   // memberCount
+        for (std::size_t mi = 0; mi < members.size(); ++mi) {
+            appendU32LE(second, static_cast<std::uint32_t>(memberHeaderOffset[mi]));
+        }
+        appendU32LE(second, static_cast<std::uint32_t>(symbolCount));       // symbolCount
+        // Per-symbol 1-based member index, in SORTED symbol order (the member's
+        // position in the offset array above + 1).
+        for (std::size_t i = 0; i < symbolCount; ++i) {
+            std::size_t const owner = symbolMember[sortedOrder[i]];
+            appendU16LE(second, static_cast<std::uint16_t>(owner + 1u));
+        }
+        // The SORTED NUL-terminated name blob (ascending symbol name order).
+        for (std::size_t i = 0; i < symbolCount; ++i) {
+            std::string const& nm = symbolName[sortedOrder[i]];
+            for (char const c : nm) second.push_back(static_cast<std::uint8_t>(c));
+            second.push_back(0u);
+        }
+        emitMember(out, "/", "0", second);
     }
 
     // "//" GNU long-name table (mode 0), iff any member name needed it.

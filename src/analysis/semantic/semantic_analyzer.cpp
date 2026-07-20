@@ -28,6 +28,10 @@
 #include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
 #include "core/types/wide_string_encode.hpp"  // C 6.4.5: encodeWideString (wide/UTF code-unit count, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
+// D-LANG-TYPE-IDENTITY-VOCABULARY: the CROSS-descriptor identity invariant. The
+// per-file reader sees ONE descriptor and cannot know a sibling spells the same
+// tag differently; this CU-wide accumulator can, and fails loud.
+#include "ffi/shipped_type_consistency.hpp"
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
@@ -613,6 +617,33 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+// C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION / -GENERIC-RESULT-TYPE-DEDUCTION):
+// the ONE generic-selection chokepoint. Given a `_Generic` node and its ALREADY-
+// COMPUTED controlling type, decide which association WINS from the typed/
+// `default` associations, so BOTH tiers type the selection from its winner rather
+// than its controlling expression: `subtreeType` (Pass 1.5 — `auto` inference /
+// array-dim `sizeof`) and `pass2Post` (Pass 2). It does NOT call `subtreeType`
+// for the controlling type — the caller supplies it (subtreeType types it on its
+// own work-stack, pass2Post at top level) so a controlling-nested `_Generic`
+// never host-recurses (D-PARSE-DEEP-NEST-RECURSION-MEMORY). FULLY SILENT: it
+// resolves each association type-name only to match, then rolls the reporter back
+// (the `_BitInt`/typeof-bitfield constraint diagnostics fire UNCONDITIONALLY and
+// bypass the dedup window, so a bare resolve would multi-emit) — pass2Post's
+// stamp-loop resolve is the SOLE emitter. Returns the winner + the typed
+// associations' type-nodes (pass2Post re-resolves them LOUD to stamp + fail loud).
+// Defined below subtreeType (mutual recursion; both are forward-declared here).
+struct GenericSelection {
+    NodeId selected{};                // matched-or-default result-expr, or Invalid
+    int    matchCount = 0;            // typed-association matches (ambiguity check)
+    NodeId defaultExpr{};             // first `default:` result-expr, or Invalid
+    bool   anyBadType = false;        // a value-in-type-position was rejected
+    bool   controllingResolved = false;   // the controlling type resolved (no-match guard)
+    std::vector<NodeId> typedAssocTypeNodes;   // pass2Post re-resolves (loud) + stamps
+};
+[[nodiscard]] GenericSelection
+selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId node, ScopeId scope,
+                         TypeId controllingType);
 // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the ONE literal-typing chokepoint
 // (extracted from pass2Post — defined alongside it below), forward-declared so
 // the Pass-1.5 inference arm can PRE-STAMP an initializer's literal leaves
@@ -926,6 +957,23 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
     }
 }
 
+// D-LANG-TYPE-IDENTITY-VOCABULARY: the ONE seam every ENGINE-SYNTHESIZED
+// standard type mints through (`sizeof`/`_Alignof` → C's `size_t`; a
+// same-pointee `p - q` → `ptrdiff_t`). The language config declares WHICH
+// vocabulary entry serves the role under the active data model; the engine only
+// carries the resolved (core, tag) pair here — it never sees a name to compare,
+// so no site branches on a spelling. An UNDECLARED role falls back to
+// `historicCore` as an ANONYMOUS primitive, which is byte-for-byte what these
+// sites did before the block existed (and what every non-C schema still gets).
+[[nodiscard]] TypeId synthesizedType(TypeInterner& interner,
+                                     SynthesizedTypeRule const& rule,
+                                     DataModel dm, TypeKind historicCore) {
+    if (auto const r = rule.resolve(dm)) {
+        return interner.primitive(r->first, r->second);
+    }
+    return interner.primitive(historicCore);
+}
+
 // Fill `idx` from `cfg` (the owning schema's semantics). Interns the schema's
 // builtin types into the shared CU lattice (idempotent). Called once per
 // distinct schema in the CU (HR11).
@@ -991,9 +1039,13 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             continue;
         }
         // FC3 c1: the ACTIVE data model's override (if declared) wins —
-        // c-subset's `long` is I64 base / I32 under LLP64.
+        // c-subset's `long` is I64 base / I32 under LLP64. The vocabulary tag
+        // (loader-DERIVED from the matching typeSpecifiers row) supplies the
+        // IDENTITY, so the text-keyed path and the keyword path intern the
+        // SAME TypeId for `long` (D-LANG-TYPE-IDENTITY-VOCABULARY).
         idx.builtinTypeIds[bt.name] =
-            s.lattice.interner().primitive(bt.resolveCore(s.dataModel));
+            s.lattice.interner().primitive(bt.resolveCore(s.dataModel),
+                                           bt.vocabularyName);
     }
     for (auto const& lt : cfg.literalTypes) {
         // A string-literal row carries an ELEMENT core (Char) + a per-occurrence
@@ -1032,9 +1084,25 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
         // genuine Complex TypeId at EVERY type position (decl/param/member/cast/
         // sizeof funnel through this table). The element rode the same resolveCore
         // axis, so `long double _Complex`'s element is F80/F128/F64 for free.
-        TypeId const elemTy = s.lattice.interner().primitive(*resolved);
+        // D-LANG-TYPE-IDENTITY-VOCABULARY: identity comes from the row's
+        // VOCABULARY name, representation from the resolved core. The two axes
+        // are independent, so a target that gives `long` and `int` (LLP64) or
+        // `long double` and `double` (f64 axis) the same core still yields two
+        // DISTINCT TypeIds. A `complex` row's name rides its ELEMENT (the
+        // Complex wrapper is structural), which is exactly what keeps
+        // `long double _Complex` distinct from `double _Complex`.
+        TypeId const elemTy =
+            s.lattice.interner().primitive(*resolved, ts.name);
         idx.typeSpecifierSets[std::move(key)] =
             ts.complex ? s.lattice.interner().complex(elemTy) : elemTy;
+    }
+    // The C 6.3.1.1 conversion rank of each NAMED vocabulary entry — the
+    // usual-arithmetic-conversions tie-break for two operands that share a core
+    // but not an identity. Declared once per index build; the loader's cross-row
+    // consistency check guarantees every row spelling a name agrees on its rank.
+    for (auto const& ts : cfg.typeSpecifiers) {
+        if (ts.name.empty()) continue;
+        s.lattice.interner().declareVocabularyRank(ts.name, ts.rank);
     }
 }
 
@@ -1233,8 +1301,11 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // The width is a shared-CST const-expr (the array-dim / alignas /
                 // static_assert evaluator). A width diagnostic is UNSUPPRESSABLE and
                 // is emitted regardless of `emitOnMiss` (a global's head resolves
-                // that way) so the fail-loud is never silently dropped; the reporter's
-                // recent-duplicate window collapses a Pass-1.5 + Pass-2 double-visit.
+                // that way) so the fail-loud is never silently dropped. Because
+                // unsuppressable codes BYPASS the reporter dedup window, a re-typing
+                // caller that resolves this type-name in Pass 1.5 AND Pass 2 (cast /
+                // compound-literal / `_Generic` association) must roll its Pass-1.5
+                // resolve back or this fires twice — see those chokepoints.
                 auto const emitWidth = [&](DiagnosticCode code, std::string msg) {
                     ParseDiagnostic d;
                     d.code     = code;
@@ -1525,9 +1596,12 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 // UNCONDITIONAL (C 6.7.2.5 constraint): a bit-field
                                 // operand is always ill-formed. Emitted even under
                                 // emitOnMiss=false (a global's head resolves that
-                                // way) so the fail-loud is never silently dropped;
-                                // the reporter's recent-duplicate window collapses a
-                                // Pass-1.5 + Pass-2 double-visit to one diagnostic.
+                                // way) so the fail-loud is never silently dropped.
+                                // Unsuppressable codes BYPASS the reporter dedup
+                                // window, so a Pass-1.5+Pass-2 re-typing caller
+                                // (cast / compound-literal / `_Generic` association)
+                                // must roll its Pass-1.5 resolve back to avoid a
+                                // double emit — see those chokepoints.
                                 ParseDiagnostic d;
                                 d.code     =
                                     DiagnosticCode::S_TypeofBitfieldOperand;
@@ -6925,7 +6999,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                         s.dataModel, *magnitude);
                     switch (r.status) {
                         case IntegerLadderStatus::Typed:
-                            litTy = s.lattice.interner().primitive(r.kind);
+                            litTy = s.lattice.interner().primitive(r.kind,
+                                                                   r.vocabularyName);
                             break;
                         case IntegerLadderStatus::TooLarge:
                             fits = false;
@@ -7002,7 +7077,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                     s.reporter.report(std::move(d));
                     return;
                 }
-                litTy = s.lattice.interner().primitive(fk.kind);
+                litTy = s.lattice.interner().primitive(fk.kind, fk.vocabularyName);
             }
             // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
             // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
@@ -7469,12 +7544,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // castTypeRef child through the SAME type resolver casts use (so the HIR
         // lowering's `resolveStampedTypeBelow` recovers the SIZED type); the VALUE
         // form (`sizeof e`) leaves its operand typed normally. BOTH forms stamp the
-        // node `size_t` (U64) — the result type for enclosing checks. The operand
-        // is UNEVALUATED (C 6.5.3.4); only its type matters. NOTE: U64 is correct
-        // for LP64 + LLP64 (both 64-bit `size_t`); a future ILP32 target wants a
-        // 32-bit `size_t` here — track under D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-
-        // WIDTH (the FOLDED VALUE is already per-target-correct: the MIR layout
-        // engine reads `dataModel`; and `(int)sizeof(...)` is the idiom anyway).
+        // node `size_t` — the result type for enclosing checks. The operand is
+        // UNEVALUATED (C 6.5.3.4); only its type matters. D-LANG-TYPE-IDENTITY-
+        // VOCABULARY: `size_t` is C's NAMED alias (`unsigned long` on LP64,
+        // `unsigned long long` on LLP64), declared per data model in
+        // `semantics.synthesizedTypes` and resolved through `synthesizedType`. A
+        // bare anonymous U64 here matched NEITHER named entry, so
+        // `_Generic(sizeof(int), unsigned long: 1, unsigned long long: 2,
+        // default: 0)` silently took `default`. The core still comes from the
+        // TARGET (both current models make it 64-bit), so this also carries the
+        // ILP32 width for free once such a target exists.
         if (cfg.sizeofTypeRule.valid() && rule.v == cfg.sizeofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.sizeofTypeChild < kids.size()) {
@@ -7483,15 +7562,18 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.sizeofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
         // C11/C23 6.5.3.4: `_Alignof(T)` typing — an ADDITIVE mirror of the sizeof
         // TYPE arm. Resolves + stamps its castTypeRef child through the SAME type
         // resolver (so the HIR lowering's `resolveStampedTypeBelow` recovers the
-        // queried type) and stamps the node size_t (U64). Type-name form ONLY (no
-        // value arm — `_Alignof(expr)` is a constraint violation the binder
-        // rejects at type-resolve). U64 is correct for LP64 + LLP64; see the
-        // sizeof arm's note on a future ILP32 `size_t`.
+        // queried type) and stamps the node `size_t` (the SAME declared vocabulary
+        // entry the sizeof arm mints — C 6.5.3.4p5). Type-name form ONLY (no value
+        // arm — `_Alignof(expr)` is a constraint violation the binder rejects at
+        // type-resolve).
         if (cfg.alignofTypeRule.valid() && rule.v == cfg.alignofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.alignofTypeChild < kids.size()) {
@@ -7500,7 +7582,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (queried.valid()) s.nodeToType.set(typeNode, queried);
                 // queried invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.alignofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
         if (cfg.sizeofValueRule.valid() && rule.v == cfg.sizeofValueRule.v) {
             // c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): stamp the VALUE-form
@@ -7523,7 +7608,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
                 break;  // the single operand child
             }
-            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.sizeofResultType, s.dataModel,
+                                             TypeKind::U64));
         }
 
         // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
@@ -7876,12 +7964,50 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // member literal's type and false-fire
                         // S_TypeMismatch against the aggregate.
                         TypeId initTy = InvalidType;
+                        NodeId walkEnd{};
                         for (NodeId walk = initNode; walk.valid();) {
+                            walkEnd = walk;
                             initTy = s.typeAt(walk);
                             if (initTy.valid()) break;
                             auto wk = visibleChildren(tree, walk);
                             if (wk.size() != 1) break;
                             walk = wk[0];
+                        }
+                        // D-CSUBSET-POINTER-COMPAT-ADDRESSOF-INITIALIZER: the
+                        // stamped-`typeAt` walk above finds a type only when one is
+                        // STAMPED on the single-child wrapper chain — a leaf
+                        // identifier (the pointer-VARIABLE init `T *p = q`), a
+                        // literal, a Pass-2-stamped subexpression. An ADDRESS-OF
+                        // initializer (`T *p = &obj`) carries NO stamped type there:
+                        // the walk descends to the `&obj` unary node, which is
+                        // multi-child (`&` + operand) and un-stamped, so the walk
+                        // stops with `initTy` Invalid and the isAssignable gate
+                        // below was SILENTLY skipped — an incompatible pointee
+                        // (`char* <- &long`) slipped through while the SAME pair via
+                        // assignment (`p = &obj`) or a pointer variable (`T *p = q`)
+                        // was already rejected. Re-derive a SCALAR (non-brace)
+                        // initializer's type via `subtreeType` WITH `here` (this
+                        // declaration's scope) — the SAME typer the assignment /
+                        // pointer-variable-init / call-arg / return sites use — so
+                        // `&obj`'s operand resolves by scope and combineUnary yields
+                        // Ptr<pointee>, reaching the check. The rule is UNCHANGED
+                        // (isAssignable still decides — void*/qualifier/null/string
+                        // admissions are byte-identical); only the address-of
+                        // initializer now REACHES it. The brace-init-list form is
+                        // EXCLUDED: its per-element checks live in the HIR brace-init
+                        // lowering (contextually typed by the declared type), and
+                        // `subtreeType` would DFS into the braces and surface an
+                        // element literal's type — false-firing S_TypeMismatch
+                        // against the aggregate (the exact hazard the stamped walk
+                        // was written to avoid).
+                        bool const walkEndIsBraceInit =
+                            walkEnd.valid()
+                            && tree.kind(walkEnd) == NodeKind::Internal
+                            && s.idx().braceInitListRule.valid()
+                            && tree.rule(walkEnd).v
+                                   == s.idx().braceInitListRule.v;
+                        if (!initTy.valid() && !walkEndIsBraceInit) {
+                            initTy = subtreeType(s, tree, initNode, here);
                         }
                         // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, DEFERRED):
                         // the natural init form `int (*p)[n] = b` does NOT compile — the
@@ -8285,102 +8411,37 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (k == NodeKind::Internal
         && cfg.genericRule.valid()
         && tree.rule(node).v == cfg.genericRule.v) {
-        auto& in = s.lattice.interner();
-        auto kids = visibleChildren(tree, node);
+        // Type the controlling expression ONCE, at top level (subtreeType is a
+        // flat work-stack internally — a controlling-nested `_Generic` never host-
+        // recurses), then run the shared selection chokepoint on that type. The
+        // helper is FULLY SILENT; pass2Post owns every side effect it is free of —
+        // the loud assoc-type resolves + stamps, the ambiguous/no-match
+        // diagnostics, and the node/selectedExpr stamps.
+        auto genericKids = visibleChildren(tree, node);
+        TypeId const ctrlTy = cfg.genericControlChild < genericKids.size()
+            ? subtreeType(s, tree, genericKids[cfg.genericControlChild], here)
+            : InvalidType;
+        GenericSelection const sel =
+            selectGenericAssociation(s, cfg, tree, node, here, ctrlTy);
 
-        // (1) The controlling expression's type, lvalue-converted.
-        TypeId ctrlTy = InvalidType;
-        if (cfg.genericControlChild < kids.size()) {
-            ctrlTy = subtreeType(s, tree, kids[cfg.genericControlChild], here);
-        }
-        TypeId const ctrlConv = ctrlTy.valid() ? in.stripVolatile(ctrlTy)
-                                               : InvalidType;
-
-        // (2) Walk the associations. Each association child is a `genericAssoc`
-        // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc`
-        // ([castTypeRef, ':', assignmentExpr]) or a `genericDefaultAssoc`
-        // ([default, ':', assignmentExpr]) — the parser keeps the alt wrapper, so
-        // descend through it to the inner alternative to classify. (A grammar that
-        // referenced the two alternatives directly would skip the wrapper; the
-        // descent handles BOTH shapes, so it is robust to that grammar choice.)
-        NodeId matchedExpr = InvalidNode;   // the winning typed assoc's result expr
-        int    matchCount  = 0;             // typed matches (for the ambiguity check)
-        NodeId defaultExpr = InvalidNode;   // the `default:` result expr, if present
-        bool   anyBadType  = false;         // a value-in-type-position was rejected
-
-        // Resolve an association child to its inner typed/default node: descend
-        // through the `genericAssoc` umbrella (its sole internal child is the
-        // chosen alternative), else the child IS already a typed/default node.
-        auto innerAssoc = [&](NodeId assoc) -> NodeId {
-            RuleId const r = tree.rule(assoc);
-            bool const isInner =
-                (cfg.genericTypedAssocRule.valid()
-                 && r.v == cfg.genericTypedAssocRule.v)
-                || (cfg.genericDefaultAssocRule.valid()
-                    && r.v == cfg.genericDefaultAssocRule.v);
-            if (isInner) return assoc;
-            if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
-                for (NodeId c : visibleChildren(tree, assoc)) {
-                    if (tree.kind(c) == NodeKind::Internal) return c;
-                }
-            }
-            return InvalidNode;
-        };
-
-        for (NodeId assocChild : kids) {
-            if (tree.kind(assocChild) != NodeKind::Internal) continue;
-            NodeId const assoc = innerAssoc(assocChild);
-            if (!assoc.valid()) continue;   // not an association child
-            RuleId const assocRule = tree.rule(assoc);
-            bool const isTyped =
-                cfg.genericTypedAssocRule.valid()
-                && assocRule.v == cfg.genericTypedAssocRule.v;
-            bool const isDefault =
-                cfg.genericDefaultAssocRule.valid()
-                && assocRule.v == cfg.genericDefaultAssocRule.v;
-            if (!isTyped && !isDefault) continue;
-
-            // The result expression is the LAST internal child (the assignmentExpr
-            // after the ':'); the typed form's FIRST internal child is the type.
-            NodeId typeNode{}, exprNode{};
-            for (NodeId c : visibleChildren(tree, assoc)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
-                exprNode = c;   // keep last internal child as the result expr
-            }
-
-            if (isDefault) {
-                // Two `default`s are a constraint violation (6.5.1.1p2); the
-                // exactly-one-default enforcement is pinned as a deferral — keep
-                // the FIRST default's expression here.
-                if (!defaultExpr.valid()) defaultExpr = exprNode;
-                continue;
-            }
-
-            // Typed association: resolve + stamp its castTypeRef (fail loud on a
-            // value in type position — S_UnknownType), then match.
-            TypeId assocTy = InvalidType;
-            if (typeNode.valid()) {
-                assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
-                if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
-                else                 anyBadType = true;   // diagnostic already emitted
-            }
-            if (assocTy.valid() && ctrlConv.valid()
-                && sameType(in.stripVolatile(assocTy), ctrlConv)) {
-                ++matchCount;
-                if (!matchedExpr.valid()) matchedExpr = exprNode;
-            }
+        // Re-resolve each typed association's type-name LOUD (the helper's resolves
+        // were rolled back) — this is the SOLE emitter of the assoc-type
+        // constraint diagnostics (S_UnknownType for a value in type position, the
+        // `_BitInt`/typeof-bitfield family) and stamps the valid ones, exactly as
+        // the single pre-chokepoint walk did.
+        for (NodeId const typeNode : sel.typedAssocTypeNodes) {
+            TypeId const assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+            if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
         }
 
-        // (3) Resolve the selection + stamp / fail loud. A bad controlling type or
-        // a rejected association type-name already emitted its own diagnostic; only
-        // CASCADE-SUPPRESS the no-match report in that case (never a double error),
+        // Resolve the selection + fail loud. C 6.5.1.1p2 requires EXACTLY ONE
+        // typed match or the `default`. A bad controlling type or a rejected
+        // association type-name already emitted its own diagnostic; only CASCADE-
+        // SUPPRESS the no-match report in that case (never a double error),
         // exactly like the va_arg invalid-type path.
-        NodeId selected = matchCount == 1 ? matchedExpr
-                        : matchCount == 0 ? defaultExpr
-                        : InvalidNode;   // >1 typed match: ambiguous (handled below)
+        NodeId const selected = sel.selected;
 
-        if (matchCount > 1) {
+        if (sel.matchCount > 1) {
             // FC17.9(e) (D-CSUBSET-LONG-DOUBLE-GENERIC-DISTINCT): on an
             // f64-axis format `double:` and `long double:` associations BOTH
             // intern F64 → matchCount 2 lands HERE — LOUD (the LLP64
@@ -8396,7 +8457,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.actual   = "_Generic controlling type matches more than one "
                          "association";
             s.reporter.report(std::move(d));
-        } else if (!selected.valid() && ctrlConv.valid() && !anyBadType) {
+        } else if (!selected.valid() && sel.controllingResolved
+                   && !sel.anyBadType) {
             // No typed match AND no default — and the failure is NOT a cascade
             // from an unresolved controlling type / bad association type-name.
             ParseDiagnostic d;
@@ -9317,16 +9379,20 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             }
             // c40 (D-CSUBSET-POINTER-SUBTRACTION): mirror cst_to_hir's
             // combineBinary — `p - q` (both Ptr<T>, same pointee) is ptrdiff_t
-            // (I64) so it passes as a numeric function ARGUMENT. This is the
+            // so it passes as a numeric function ARGUMENT. This is the
             // asymmetry the cycle fixes: a `long n = a - b;` init-check skips the
             // binary node (no error), but a call-arg's `isAssignable(I64param, …)`
-            // saw Ptr<T> → S_TypeMismatch; now it sees I64. Same-pointee only.
+            // saw Ptr<T> → S_TypeMismatch; now it sees the integer. Same-pointee
+            // only. D-LANG-TYPE-IDENTITY-VOCABULARY: `ptrdiff_t` is C's NAMED
+            // alias (`long` on LP64, `long long` on LLP64), declared per data
+            // model — a bare anonymous I64 matches NEITHER in a `_Generic`.
             if (*op == HirOpKind::Sub
                 && lt.valid() && rt.valid()
                 && interner.kind(lt) == TypeKind::Ptr
                 && interner.kind(rt) == TypeKind::Ptr
                 && interner.operands(lt)[0] == interner.operands(rt)[0]) {
-                return interner.primitive(TypeKind::I64);
+                return synthesizedType(interner, sem.pointerDifferenceType,
+                                       s.dataModel, TypeKind::I64);
             }
             // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
             // the commutative add form) is a POINTER, not the integer. `p + n`
@@ -9513,7 +9579,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     struct Frame {
         NodeId node;
         enum class Kind : std::uint8_t {
-            Binary, Unary, Postfix, Ternary, Wrapper
+            Binary, Unary, Postfix, Ternary, Wrapper, Generic
         } kind;
         std::uint8_t           phase;
         NodeId                  n0;     // binary lhs / unary operand / postfix base
@@ -9542,13 +9608,21 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         //    fallthrough would return the PRE-cast type — `sizeof((char)x)` would
         //    fold the wrong size. ──
         if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
-            result = interner.primitive(TypeKind::U64); return;        // size_t
+            // `size_t` — the SAME declared vocabulary entry Pass 2's sizeof arms
+            // stamp (D-LANG-TYPE-IDENTITY-VOCABULARY); a divergence here would
+            // give a Pass-1.5 `sizeof` a different TypeId than the same
+            // expression re-typed in Pass 2.
+            result = synthesizedType(interner, sem.sizeofResultType, s.dataModel,
+                                     TypeKind::U64);
+            return;
         }
-        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t (U64) — an ADDITIVE mirror of
-        // the sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
+        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t — an ADDITIVE mirror of the
+        // sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
         // read as its pre-alignof type).
         if (hirCfg.alignofRule.valid() && r.v == hirCfg.alignofRule.v) {
-            result = interner.primitive(TypeKind::U64); return;        // size_t
+            result = synthesizedType(interner, sem.alignofResultType, s.dataModel,
+                                     TypeKind::U64);
+            return;
         }
         // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule
         // whose Identifier child is a LABEL name, never typed as an expression).
@@ -9559,21 +9633,35 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             it != s.idx().castByRule.end()) {
             auto const& cr = sem.castRules[it->second];
             auto const kids = visibleChildren(tree, node);
-            // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType diag.
-            result = (cr.typeChild >= kids.size())
-                ? InvalidType
-                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                                  kids[cr.typeChild], scope, /*emitOnMiss=*/false);
+            if (cr.typeChild >= kids.size()) { result = InvalidType; return; }
+            // This Pass-1.5 resolve must be NET-SILENT: emitOnMiss=false silences
+            // S_UnknownType, but the `_BitInt`/typeof-bitfield constraint
+            // diagnostics fire UNCONDITIONALLY and BYPASS the reporter dedup window
+            // — so a bare resolve here double-emits against the Pass-2 cast arm's
+            // loud re-resolve. Roll the reporter back (the same chokepoint the
+            // _Generic association resolve uses): the resolved TypeId + benign
+            // interner/nodeToType side effects persist; the Pass-2 cast arm is the
+            // SOLE emitter (it re-resolves loud, and a FAILED resolve returns
+            // InvalidType WITHOUT stamping the cast node, so the re-resolve runs).
+            auto& mut = const_cast<EngineState&>(s);
+            auto const snap = mut.reporter.snapshotForRollback();
+            result = resolveTypeNode(mut, sem, tree, kids[cr.typeChild], scope,
+                                     /*emitOnMiss=*/false);
+            mut.reporter.truncateTo(snap);
             return;
         }
         if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
             it != s.idx().compoundLiteralByRule.end()) {
             auto const& cl = sem.compoundLiteralRules[it->second];
             auto const kids = visibleChildren(tree, node);
-            result = (cl.typeChild >= kids.size())
-                ? InvalidType
-                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                                  kids[cl.typeChild], scope, /*emitOnMiss=*/false);
+            if (cl.typeChild >= kids.size()) { result = InvalidType; return; }
+            // NET-SILENT, same rationale + rollback as the cast arm above (the
+            // Pass-2 compound-literal arm re-resolves loud as the sole emitter).
+            auto& mut = const_cast<EngineState&>(s);
+            auto const snap = mut.reporter.snapshotForRollback();
+            result = resolveTypeNode(mut, sem, tree, kids[cl.typeChild], scope,
+                                     /*emitOnMiss=*/false);
+            mut.reporter.truncateTo(snap);
             return;
         }
         // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
@@ -9623,6 +9711,27 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             if (operands.size() != 3) { result = InvalidType; return; }
             work.push_back(Frame{node, Frame::Kind::Ternary, 0, {}, {}, nullptr,
                                  std::move(operands), 0, {}});
+            return;
+        }
+        // C11/C23 6.5.1.1p3 (D-CSUBSET-GENERIC-RESULT-TYPE-DEDUCTION): a generic
+        // selection's type IS the SELECTED association's result-expression type,
+        // NOT the controlling expression's. Pass 2 stamps this node with the
+        // winner's type, but Pass 1.5 types it BEFORE that stamp exists — so
+        // without this arm the node would fall through to the transparent-wrapper
+        // fallback below and take its FIRST visible child = the CONTROLLING
+        // expression (the silent wrong-width bug). Type it on THIS work-stack via
+        // a multi-phase Generic frame (mirroring Ternary): phase 0 types the
+        // controlling child, phase 1 picks the winner from that type + types the
+        // winner, phase 2 yields the winner's type. Both a controlling-nested AND
+        // a winner-nested `_Generic` stay on the stack — ZERO host recursion
+        // (D-PARSE-DEEP-NEST-RECURSION-MEMORY). `n0` carries the controlling child.
+        if (sem.genericRule.valid() && r.v == sem.genericRule.v) {
+            std::vector<NodeId> gkids;
+            for (NodeId c : visibleChildren(tree, node)) gkids.push_back(c);
+            NodeId const ctrlChild = sem.genericControlChild < gkids.size()
+                ? gkids[sem.genericControlChild] : InvalidNode;
+            work.push_back(Frame{node, Frame::Kind::Generic, 0, ctrlChild, {},
+                                 nullptr, {}, 0, {}});
             return;
         }
         // ── transparent / operand wrapper: pass the inner expression's type
@@ -9691,9 +9800,142 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 else { ++f.idx; f.phase = 0; }             // try the next child
             }
             break;
+        case Frame::Kind::Generic:
+            if (f.phase == 0) {
+                // Type the controlling expression on THIS work-stack (flat — a
+                // controlling-nested `_Generic` re-enters here, never host-recurses).
+                f.phase = 1; NodeId n = f.n0; enter(n);
+            } else if (f.phase == 1) {
+                // `result` now holds the controlling type. Pick the winner WITHOUT
+                // recursion (the helper takes the controlling type as a param), then
+                // type the winner on this work-stack too.
+                NodeId const genericNode = f.node;
+                GenericSelection const gs = selectGenericAssociation(
+                    s, sem, tree, genericNode, scope, result);
+                if (!gs.selected.valid()) { work.pop_back(); result = InvalidType; }
+                else { f.phase = 2; NodeId n = gs.selected; enter(n); }
+            } else {
+                // `result` holds the winner's type — the selection's type.
+                work.pop_back();
+            }
+            break;
         }
     }
     return result;
+}
+
+// The ONE generic-selection chokepoint (forward-declared above). Extracted from
+// pass2Post's association walk so `subtreeType` (Pass 1.5) and `pass2Post`
+// (Pass 2) agree on the winner. It does NOT call subtreeType (the caller supplies
+// the controlling type — no host recursion for a controlling-nested `_Generic`)
+// and is FULLY SILENT (its association resolves are rolled back — pass2Post's
+// stamp-loop is the sole emitter).
+GenericSelection
+selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId node, ScopeId scope,
+                         TypeId controllingType) {
+    GenericSelection sel;
+    // The const_cast is subtreeType's exact discipline — the interner memoizes,
+    // resolveTypeNode(emitOnMiss=false) may mint a forward tag, and the reporter
+    // snapshot/rollback below runs on this handle; none mutates a const object
+    // (every caller owns a non-const EngineState).
+    EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
+    TypeInterner& in = mutS.lattice.interner();
+    auto kids = visibleChildren(tree, node);
+
+    // (1) The controlling type is supplied by the caller (typed on its OWN
+    // work-stack / at top level), lvalue-converted here (top-level volatile
+    // stripped — the isAssignable precedent). The helper never re-types it, so a
+    // controlling-nested `_Generic` never host-recurses.
+    TypeId const ctrlConv = controllingType.valid()
+        ? in.stripVolatile(controllingType) : InvalidType;
+    sel.controllingResolved = ctrlConv.valid();
+
+    // (2) Walk the associations. Each association child is a `genericAssoc`
+    // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc` or a
+    // `genericDefaultAssoc`; descend through the wrapper to the inner
+    // alternative (robust to a grammar that references the alternatives directly).
+    NodeId matchedExpr = InvalidNode;
+    auto innerAssoc = [&](NodeId assoc) -> NodeId {
+        RuleId const r = tree.rule(assoc);
+        bool const isInner =
+            (cfg.genericTypedAssocRule.valid()
+             && r.v == cfg.genericTypedAssocRule.v)
+            || (cfg.genericDefaultAssocRule.valid()
+                && r.v == cfg.genericDefaultAssocRule.v);
+        if (isInner) return assoc;
+        if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
+            for (NodeId c : visibleChildren(tree, assoc)) {
+                if (tree.kind(c) == NodeKind::Internal) return c;
+            }
+        }
+        return InvalidNode;
+    };
+
+    // The association type-name resolves are FULLY SILENT: resolveTypeNode's own
+    // S_UnknownType respects emitOnMiss=false, but the `_BitInt`/typeof-bitfield
+    // constraint diagnostics fire UNCONDITIONALLY and BYPASS the reporter dedup
+    // window (diagnostic_reporter.cpp) — so a bare resolve here would multi-emit
+    // against pass2Post's stamp-loop re-resolve (and Pass 1.5's auto call). Roll
+    // the reporter back afterwards: the resolved TypeIds (for matching) and the
+    // benign interner/nodeToType side effects persist; every diagnostic is
+    // dropped. pass2Post re-resolves LOUD (its stamp-loop) as the SOLE emitter.
+    auto const diagSnapshot = mutS.reporter.snapshotForRollback();
+
+    for (NodeId assocChild : kids) {
+        if (tree.kind(assocChild) != NodeKind::Internal) continue;
+        NodeId const assoc = innerAssoc(assocChild);
+        if (!assoc.valid()) continue;   // not an association child
+        RuleId const assocRule = tree.rule(assoc);
+        bool const isTyped =
+            cfg.genericTypedAssocRule.valid()
+            && assocRule.v == cfg.genericTypedAssocRule.v;
+        bool const isDefault =
+            cfg.genericDefaultAssocRule.valid()
+            && assocRule.v == cfg.genericDefaultAssocRule.v;
+        if (!isTyped && !isDefault) continue;
+
+        // The result expression is the LAST internal child (the assignmentExpr
+        // after the ':'); the typed form's FIRST internal child is the type-name.
+        NodeId typeNode{}, exprNode{};
+        for (NodeId c : visibleChildren(tree, assoc)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
+            exprNode = c;   // keep last internal child as the result expr
+        }
+
+        if (isDefault) {
+            // Two `default`s are a constraint violation; keep the FIRST here
+            // (the exactly-one-default enforcement is pinned separately).
+            if (!sel.defaultExpr.valid()) sel.defaultExpr = exprNode;
+            continue;
+        }
+
+        // Typed association: resolve its type-name (rolled back below) to match
+        // + record its type-node for pass2Post's loud re-resolve; a value in type
+        // position leaves the type Invalid → anyBadType (no-match cascade guard).
+        TypeId assocTy = InvalidType;
+        if (typeNode.valid()) {
+            assocTy = resolveTypeNode(mutS, cfg, tree, typeNode, scope,
+                                      /*emitOnMiss=*/false);
+            sel.typedAssocTypeNodes.push_back(typeNode);
+            if (!assocTy.valid()) sel.anyBadType = true;
+        }
+        if (assocTy.valid() && ctrlConv.valid()
+            && sameType(in.stripVolatile(assocTy), ctrlConv)) {
+            ++sel.matchCount;
+            if (!matchedExpr.valid()) matchedExpr = exprNode;
+        }
+    }
+
+    mutS.reporter.truncateTo(diagSnapshot);   // drop every resolve diagnostic
+
+    // (3) Resolve the selection: exactly-one typed match wins, else the
+    // `default:`; >1 typed match is ambiguous (InvalidNode — pass2Post reports).
+    sel.selected = sel.matchCount == 1 ? matchedExpr
+                 : sel.matchCount == 0 ? sel.defaultExpr
+                 : InvalidNode;
+    return sel;
 }
 
 // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): search the
@@ -10152,8 +10394,39 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // or malformed text (parseTypeFromText already reported the detail).
             TypeId fnTy = InvalidType;
             if (!bf.signatureText.empty()) {
-                fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
-                                         s.lattice.registry(), s.reporter);
+                // D-LANG-TYPE-IDENTITY-VOCABULARY: decode EVERY declared
+                // per-data-model override, not just the active one — a malformed
+                // override under an inactive model would otherwise lurk until
+                // that model is first compiled (the shipped-lib
+                // `signatureByDataModel` anti-lurking rule). The ACTIVE model's
+                // text, when declared, is the one that binds.
+                bool decodeFailed = false;
+                for (auto const& [dm, text] : bf.signatureTextByDataModel) {
+                    TypeId const t = parseTypeFromText(text, s.lattice.interner(),
+                                                       s.lattice.registry(),
+                                                       s.reporter);
+                    bool const bad =
+                        !t.valid()
+                        || s.lattice.interner().kind(t) != TypeKind::FnSig;
+                    if (bad) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::C_InvalidSemantics;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "builtin function '{}': 'signatureByDataModel.{}' must "
+                            "decode to a function type, got '{}'",
+                            bf.name, dataModelName(dm), text);
+                        s.reporter.report(std::move(d));
+                        decodeFailed = true;
+                        continue;
+                    }
+                    if (dm == s.dataModel) fnTy = t;
+                }
+                if (decodeFailed) continue;
+                if (!fnTy.valid()) {
+                    fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
+                                             s.lattice.registry(), s.reporter);
+                }
                 if (!fnTy.valid()
                  || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
                     ParseDiagnostic d;
@@ -10507,6 +10780,54 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // descriptor `struct stat` does NOT collide with the ordinary `stat`
         // function, so tag first-wins dedup uses its own set.
         std::unordered_set<std::string> injectedTags;
+
+        // ── D-LANG-TYPE-IDENTITY-VOCABULARY: the CROSS-DESCRIPTOR invariant ──
+        //
+        // Both dedup sets above are FIRST-WINS BY NAME, and only the winner gets
+        // a `compositeScopeByType` field scope. So two descriptors declaring one
+        // tag DIFFERENTLY (the `struct timeval` that `sys/time.json` spells
+        // `{i64 "long", i64 "long"}` and `sys/resource.json` once spelled
+        // `{i64, i64}`) intern TWO TypeIds, and whichever loses the race has
+        // UNREACHABLE members — an include-order-dependent `S000D`. The per-file
+        // reader structurally cannot catch it; this accumulator can, and does,
+        // BEFORE the first-wins skip silently swallows the divergence.
+        //
+        // The checker also verifies that every vocabulary tag a descriptor
+        // spells has the width THIS LANGUAGE gives that name under the active
+        // data model — a `i64 "long"` on LLP64 is a phantom pair no source
+        // spelling can produce. The vocabulary is handed over as opaque
+        // (name → core) rows resolved HERE from the active schemas' own
+        // `typeSpecifiers`; the checker never sees a spelling it can branch on.
+        //
+        // A name two schemas of a MIXED-language CU resolve DIFFERENTLY is
+        // dropped rather than guessed — the descriptor is neutral, so there is
+        // no single language to hold it to.
+        std::vector<std::pair<std::string, TypeKind>> vocabRows;
+        {
+            std::unordered_map<std::string, TypeKind> byName;
+            std::unordered_set<std::string>           ambiguous;
+            for (GrammarSchema const* sch : distinctSchemas) {
+                for (auto const& ts : sch->semantics().typeSpecifiers) {
+                    if (ts.name.empty()) continue;
+                    auto const core = ts.resolveCore(s.dataModel, s.longDoubleFormat);
+                    if (!core.has_value()) continue;   // unrealized on this axis
+                    auto const [it, fresh] = byName.try_emplace(ts.name, *core);
+                    if (!fresh && it->second != *core) ambiguous.insert(ts.name);
+                }
+            }
+            vocabRows.reserve(byName.size());
+            for (auto& [name, core] : byName) {
+                if (ambiguous.contains(name)) continue;
+                vocabRows.emplace_back(name, core);
+            }
+        }
+        std::vector<ffi::VocabularyCore> vocabulary;
+        vocabulary.reserve(vocabRows.size());
+        for (auto const& [name, core] : vocabRows) {
+            vocabulary.push_back(ffi::VocabularyCore{name, core});
+        }
+        ffi::ShippedTypeConsistency typeConsistency{s.lattice.interner(),
+                                                    vocabulary, s.activeFormat};
         for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
             std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
@@ -10574,6 +10895,16 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.reporter.report(std::move(d));
                 continue;   // unavailable for this target — inject nothing
             }
+
+            // D-LANG-TYPE-IDENTITY-VOCABULARY: cross-descriptor consistency, run
+            // AFTER the availability gate (a header that does not exist on this
+            // target contributes no declarations) and BEFORE injection (so the
+            // ROOT CAUSE is reported instead of the downstream member-access
+            // failure). Reports and CONTINUES: the error delta already aborts
+            // the pipeline, and injecting anyway keeps the historic first-wins
+            // behavior for every other name in the descriptor rather than
+            // cascading a wall of "undefined symbol".
+            (void)typeConsistency.add(desc->header, *desc, s.reporter);
 
             for (auto const& sym : desc->symbols) {
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.

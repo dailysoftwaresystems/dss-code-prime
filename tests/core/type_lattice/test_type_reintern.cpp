@@ -419,3 +419,82 @@ TEST(TypeReintern, PackedFlagSurvivesReintern) {
     ASSERT_EQ(l->fieldOffsets.size(), 2u);
     EXPECT_EQ(l->fieldOffsets[1], 1u);
 }
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY: a primitive's VOCABULARY TAG must survive
+// re-intern. RED-ON-DISABLE: the reintern primitive arm is
+// `dst.primitive(kind, src.name(srcId))`; reverting it to `dst.primitive(kind)`
+// drops the tag on EVERY primitive that crosses a CU / static-link-merge / text
+// round-trip — silently re-collapsing `long` onto `int` (LLP64) and `long`
+// onto `long long` (LP64) at exactly the boundary the front-end just fixed.
+TEST(TypeReintern, VocabularyNameSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    // Three types with the SAME representation (I64) and three identities.
+    const TypeId anon     = src.primitive(TypeKind::I64);
+    const TypeId longT    = src.primitive(TypeKind::I64, "long");
+    const TypeId longLong = src.primitive(TypeKind::I64, "long long");
+    ASSERT_NE(anon.v, longT.v);
+    ASSERT_NE(longT.v, longLong.v);
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+
+    const TypeId hAnon     = reinternType(src, anon, host, remap);
+    const TypeId hLong     = reinternType(src, longT, host, remap);
+    const TypeId hLongLong = reinternType(src, longLong, host, remap);
+
+    // All three stay THREE distinct host types with their tags intact.
+    EXPECT_EQ(hi.name(hAnon), "");
+    EXPECT_EQ(hi.name(hLong), "long");
+    EXPECT_EQ(hi.name(hLongLong), "long long");
+    EXPECT_NE(hAnon.v, hLong.v);
+    EXPECT_NE(hLong.v, hLongLong.v);
+    EXPECT_NE(hAnon.v, hLongLong.v);
+    // ... and the representation is untouched on every one.
+    EXPECT_EQ(hi.kind(hAnon), TypeKind::I64);
+    EXPECT_EQ(hi.kind(hLong), TypeKind::I64);
+    EXPECT_EQ(hi.kind(hLongLong), TypeKind::I64);
+
+    // A DERIVED type carries the tag through its operands (the FFI-pointer and
+    // struct-field shapes): `long *` and `long long *` stay distinct in the host.
+    const TypeId hpLong     = reinternType(src, src.pointer(longT), host, remap);
+    const TypeId hpLongLong = reinternType(src, src.pointer(longLong), host, remap);
+    EXPECT_NE(hpLong.v, hpLongLong.v)
+        << "two pointers whose pointees differ only by vocabulary entry must NOT "
+           "collapse in the host lattice";
+    ASSERT_EQ(hi.operands(hpLong).size(), 1u);
+    EXPECT_EQ(hi.name(hi.operands(hpLong)[0]), "long");
+}
+
+// The 2-CU shape the whole-program / static-link merge actually runs: TWO source
+// interners folded into ONE host lattice. The same vocabulary entry from both CUs
+// must CANONICALIZE to one host TypeId, while entries that merely share a
+// representation must stay distinct.
+TEST(TypeReintern, TwoCompilationUnitsUnifyVocabularyInOneHost) {
+    TypeInterner cu1{CompilationUnitId{1}};
+    TypeInterner cu2{CompilationUnitId{2}};
+    const TypeId cu1Long     = cu1.primitive(TypeKind::I64, "long");
+    const TypeId cu1LongLong = cu1.primitive(TypeKind::I64, "long long");
+    const TypeId cu2Long     = cu2.primitive(TypeKind::I64, "long");
+    const TypeId cu2Anon     = cu2.primitive(TypeKind::I64);
+
+    TypeLattice host{CompilationUnitId{99}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap1;
+    std::unordered_map<std::uint32_t, TypeId> remap2;
+
+    const TypeId h1Long     = reinternType(cu1, cu1Long, host, remap1);
+    const TypeId h1LongLong = reinternType(cu1, cu1LongLong, host, remap1);
+    const TypeId h2Long     = reinternType(cu2, cu2Long, host, remap2);
+    const TypeId h2Anon     = reinternType(cu2, cu2Anon, host, remap2);
+
+    EXPECT_EQ(h1Long.v, h2Long.v)
+        << "the SAME vocabulary entry from two CUs must canonicalize to ONE host "
+           "TypeId — otherwise a merged program would hold two `long` types";
+    EXPECT_NE(h1Long.v, h1LongLong.v);
+    EXPECT_NE(h1Long.v, h2Anon.v)
+        << "a named entry must never collapse onto the anonymous representative "
+           "of its core just because it crossed a CU boundary";
+    EXPECT_EQ(hi.name(h1Long), "long");
+    EXPECT_EQ(hi.name(h2Anon), "");
+}

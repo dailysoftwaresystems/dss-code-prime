@@ -2034,3 +2034,84 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     MirVerifier verifier{merged->mir, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "the merged + pthread-shim module must verify";
 }
+
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: vocabulary identity survives the merge ──
+//
+// A whole-program / static-link merge folds N per-CU interners into ONE host
+// lattice. If the re-intern walker rebuilt primitives from the TypeKind alone it
+// would DROP the vocabulary tag, silently re-collapsing `long` onto `int` (LLP64)
+// and `long` onto `long long` (LP64) at exactly the boundary the front-end split
+// them at — a cross-CU type-identity miscompile invisible to any single-CU test.
+//
+// CU0's `f` returns `long *`; CU1's `g` returns `long long *`. Under LP64 both
+// pointees are I64, so the two return types are distinguishable ONLY by the
+// vocabulary tag. RED-ON-DISABLE: revert type_reintern's primitive arm to
+// `dst.primitive(kind)` and the two host pointer types become ONE.
+TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
+    auto buildPtrReturner = [](TypeInterner& in, char const* vocab,
+                               SymbolId sym, Mir& out) -> TypeId {
+        TypeId const elem = in.primitive(TypeKind::I64, vocab);
+        TypeId const ptr  = in.pointer(elem);
+        TypeId const sig  = in.fnSig({}, ptr, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(sig, sym);
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirLiteralValue nullp;
+        nullp.value = std::uint64_t{0};
+        nullp.core  = TypeKind::Ptr;
+        mb.addReturn(mb.addConst(nullp, ptr));
+        out = std::move(mb).finish();
+        return ptr;
+    };
+
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeInterner in1{CompilationUnitId{2}};
+    Mir mir0;
+    Mir mir1;
+    TypeId const cu0Ptr = buildPtrReturner(in0, "long",      SymbolId{100}, mir0);
+    TypeId const cu1Ptr = buildPtrReturner(in1, "long long", SymbolId{50},  mir1);
+    // Fixture precondition: within their own CUs the two are already distinct.
+    ASSERT_EQ(in0.kind(in0.operands(cu0Ptr)[0]), TypeKind::I64);
+    ASSERT_EQ(in1.kind(in1.operands(cu1Ptr)[0]), TypeKind::I64);
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{100, "main"}}), {}},
+        MergeCuInput{&mir1, &in1, namerOf({{50, "g"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{88}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    auto const& hi = merged->host.interner();
+    auto const fMain = findFuncByName(mm, merged->symbolNames, "main");
+    auto const fG    = findFuncByName(mm, merged->symbolNames, "g");
+    ASSERT_TRUE(fMain.has_value());
+    ASSERT_TRUE(fG.has_value());
+
+    auto returnedPointee = [&](MirFuncId fn) {
+        MirInstId const c = mm.blockInstAt(mm.funcEntry(fn), 0);
+        EXPECT_EQ(mm.instOpcode(c), MirOpcode::Const);
+        TypeId const ty = mm.instType(c);
+        EXPECT_EQ(ty.arenaTag, 88u) << "must be HOST-interned";
+        EXPECT_EQ(hi.kind(ty), TypeKind::Ptr);
+        return hi.operands(ty)[0];
+    };
+    TypeId const p0 = returnedPointee(*fMain);
+    TypeId const p1 = returnedPointee(*fG);
+
+    EXPECT_EQ(hi.kind(p0), TypeKind::I64);
+    EXPECT_EQ(hi.kind(p1), TypeKind::I64) << "representation is identical";
+    EXPECT_EQ(hi.name(p0), "long");
+    EXPECT_EQ(hi.name(p1), "long long");
+    EXPECT_NE(p0.v, p1.v)
+        << "two vocabulary entries sharing a representation must stay TWO types "
+           "in the merged host lattice — a collapse here is a cross-CU identity "
+           "miscompile no single-CU test can see";
+
+    MirVerifier verifier{mm, &hi};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}

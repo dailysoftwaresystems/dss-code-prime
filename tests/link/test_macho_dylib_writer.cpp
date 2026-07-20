@@ -1157,3 +1157,128 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
     })");
     ASSERT_FALSE(r.has_value());
 }
+
+// -- (8) c171: the x86_64 .dylib variant-parity sibling -----------
+//
+// macho64-x86_64-darwin-dylib is the config-only mirror of the arm64
+// dylib above: EVERY dylib divergence in macho.cpp is FILETYPE-keyed
+// (never cputype-keyed), so MH_DYLIB routes the x86_64 target through
+// the SAME encodeExecDynamic substrate. There is NO macOS-x86_64 CI
+// leg (macos-latest is Apple Silicon), so this ships with STRUCTURAL
+// byte-pins ONLY -- the writer emits it correctly, proven here at the
+// byte level. Mirrors HeaderPinsDylibShape with the x86_64 arch fields
+// (cputype 0x01000007, __text at segmentPageSize 0x1000).
+
+namespace {
+
+[[nodiscard]] Loaded loadShippedDylibX86_64() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-dylib");
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(macho64-x86_64-darwin-dylib) failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+
+// The x86_64 mirror of makeExportModule: exported fn `_dss_add`
+// (0xC3 ret) + exported int global `_dss_global` + a LOCAL helper
+// that must NOT export. Mach-O names arrive PRE-MANGLED (leading `_`).
+[[nodiscard]] AssembledModule makeX86_64ExportModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledFunction loc;
+    loc.symbol = SymbolId{2};
+    loc.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(loc));
+    AssembledData d;
+    d.symbol    = SymbolId{3};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {7, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_dss_add",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "_hidden_helper",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{3}, "_dss_global",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+} // namespace
+
+TEST(MachoDylibWriterX86_64, HeaderPinsDylibShape) {
+    auto loaded = loadShippedDylibX86_64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const bytes = encodeDylib(makeX86_64ExportModule(), loaded);
+    ASSERT_GE(bytes.size(), 32u);
+
+    // mach_header_64: magic / cputype = CPU_TYPE_X86_64 (0x01000007 =
+    // 16777223) / filetype = MH_DYLIB (6) / flags =
+    // MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS =
+    // 0x100085 (NO MH_PIE -- an executable-only flag; same value as the
+    // arm64 dylib).
+    EXPECT_EQ(readU32LE(bytes, 0), 0xFEEDFACFu);
+    EXPECT_EQ(readU32LE(bytes, 4), 0x01000007u) << "cputype x86_64";
+    EXPECT_EQ(readU32LE(bytes, 12), 6u) << "filetype MH_DYLIB";
+    EXPECT_EQ(readU32LE(bytes, 24), 0x100085u);
+
+    // LC_ID_DYLIB present, name offset 24, the configured install name.
+    auto const idLc = findLoadCommand(bytes, kLcIdDylib);
+    ASSERT_TRUE(idLc.has_value());
+    EXPECT_EQ(readU32LE(bytes, *idLc + 8), 24u);   // lc_str offset
+    std::string const name(
+        reinterpret_cast<char const*>(&bytes[*idLc + 24]));
+    EXPECT_EQ(name, "@rpath/libdss.dylib");
+
+    // NO LC_MAIN, NO LC_LOAD_DYLINKER, NO __PAGEZERO (a dylib is
+    // base-0; dyld slides the whole image).
+    EXPECT_FALSE(findLoadCommand(bytes, kLcMain).has_value());
+    EXPECT_FALSE(findLoadCommand(bytes, kLcLoadDylinker).has_value());
+    EXPECT_FALSE(findSegment(bytes, "__PAGEZERO").has_value());
+
+    // __TEXT is the FIRST segment at vmaddr 0 (base-0 image), and
+    // __text sits at VA 0x1000 = one x86_64 segment page (header page).
+    auto const textSeg = findSegment(bytes, "__TEXT");
+    ASSERT_TRUE(textSeg.has_value());
+    EXPECT_EQ(readU64LE(bytes, *textSeg + 24), 0u);        // vmaddr
+    auto const textSec = findSection(bytes, "__TEXT", "__text");
+    ASSERT_TRUE(textSec.has_value());
+    EXPECT_EQ(readU64LE(bytes, *textSec + 32), 0x1000u);   // addr
+
+    // A code signature IS emitted (ad-hoc SHA-256 -- KEPT on x86_64 for
+    // symmetry with the arm64 dylib + modern ld64, though x86_64 macOS
+    // does not require it).
+    EXPECT_TRUE(findLoadCommand(bytes, kLcCodeSignature).has_value())
+        << "the x86_64 dylib must carry an ad-hoc code signature";
+
+    // The exported FUNCTION is findable in the export trie (dlsym's
+    // exact lookup); the LOCAL helper is not.
+    auto const di = readDyldInfo(bytes);
+    ASSERT_TRUE(di.found);
+    ASSERT_GT(di.exportSize, 0u);
+    std::span<std::uint8_t const> const trie{bytes.data() + di.exportOff,
+                                             di.exportSize};
+    auto const fn = trieWalk(trie, "_dss_add");
+    ASSERT_TRUE(fn.has_value())
+        << "_dss_add must be exported via the LC_DYLD_INFO export trie";
+    EXPECT_EQ(fn->address, 0x1000u) << "fn[0] at __text VA (base-0)";
+    EXPECT_FALSE(trieWalk(trie, "_hidden_helper").has_value());
+}

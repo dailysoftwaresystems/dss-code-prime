@@ -15,14 +15,14 @@
         {
           "when": { "format": "elf" },
           "fields": [
-            { "name": "tv_sec",  "type": "i64" },
-            { "name": "tv_usec", "type": "i64" }
+            { "name": "tv_sec",  "type": "i64 \"long\"" },
+            { "name": "tv_usec", "type": "i64 \"long\"" }
           ]
         },
         {
           "when": { "format": "macho" },
           "fields": [
-            { "name": "tv_sec",  "type": "i64" },
+            { "name": "tv_sec",  "type": "i64 \"long\"" },
             { "name": "tv_usec", "type": "i32" }
           ]
         }

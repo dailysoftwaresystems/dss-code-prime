@@ -176,3 +176,29 @@ TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
     TargetSpec spec{"x86_64", "synthetic-unknown"};
     EXPECT_EQ(spec.outputExtension(synth), "");
 }
+
+// ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the static-library arm ──────
+//
+// A `container: archive` format outputs an `ar` static library, whose
+// extension is the ecosystem convention — `.a` (ELF / Mach-O) vs the
+// Microsoft `.lib` (PE) — resolved BEFORE the kind switch (so a staticlib
+// format never leaks its member's `.o`/`.obj`).
+
+TEST(TargetSpec, StaticLibExtensionDotAForElfMachO) {
+    auto elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-staticlib");
+    ASSERT_TRUE(elf.has_value());
+    TargetSpec elfSpec{"x86_64", "elf64-x86_64-linux-staticlib"};
+    EXPECT_EQ(elfSpec.outputExtension(**elf), ".a");
+
+    auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-staticlib");
+    ASSERT_TRUE(macho.has_value());
+    TargetSpec machoSpec{"arm64", "macho64-arm64-darwin-staticlib"};
+    EXPECT_EQ(machoSpec.outputExtension(**macho), ".a");
+}
+
+TEST(TargetSpec, StaticLibExtensionDotLibForPe) {
+    auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(pe.has_value());
+    TargetSpec peSpec{"x86_64", "pe64-x86_64-windows-staticlib"};
+    EXPECT_EQ(peSpec.outputExtension(**pe), ".lib");
+}

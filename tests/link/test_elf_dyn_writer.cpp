@@ -1257,3 +1257,237 @@ TEST(ElfDynWriter, RelocBearingRodataFailsLoudOnDynArm) {
     }
     EXPECT_TRUE(saw);
 }
+
+// -- c171: the ARM64 .so + ARM64 PIE variant-parity siblings ------
+//
+// The arm64 shared-library family (elf64-aarch64-linux-dyn / -pie) is
+// the config-only mirror of the x86_64 .so/PIE above: the same
+// `encodeElfExecDynamic` substrate, its machine-parameterized arms
+// (machine 183, R_AARCH64_RELATIVE = 1027, the 16-byte ADRP+LDR+BR PLT
+// stub) already exercised by the aarch64 exec writer. These structural
+// byte-pins prove the shipped JSONs drive that substrate to a correct
+// ET_DYN image (EM_AARCH64, base-0) and the PIE sub-shape (ET_DYN +
+// PT_INTERP + DF_1_PIE + non-zero e_entry). Reuses the x86_64 suite's
+// ELF parsing helpers (readSections / readDynsyms / hashLookup /
+// readRelaDyn / readDynamic) -- the byte layout is arch-agnostic.
+
+namespace {
+
+// arm64 `RET` (0xD65F03C0) as LE bytes -- a real single-instruction body.
+[[nodiscard]] std::vector<std::uint8_t> arm64RetBytes() {
+    return {0xC0, 0x03, 0x5F, 0xD6};
+}
+
+[[nodiscard]] Loaded loadShippedElfImageArm64(std::string_view formatName) {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("arm64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(arm64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped(formatName);
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(" << formatName << ") failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+
+[[nodiscard]] Loaded loadShippedDynArm64() {
+    return loadShippedElfImageArm64("elf64-aarch64-linux-dyn");
+}
+[[nodiscard]] Loaded loadShippedPieArm64() {
+    return loadShippedElfImageArm64("elf64-aarch64-linux-pie");
+}
+
+// One exported function `dss_add` (arm64 ret body) + one exported int
+// global `dss_global` (.data {7,0,0,0}) + one LOCAL (static) function
+// that must NOT export -- the arm64 mirror of makeExportModule.
+[[nodiscard]] AssembledModule makeArm64ExportModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = arm64RetBytes();
+    mod.functions.push_back(std::move(fn));
+    AssembledFunction loc;
+    loc.symbol = SymbolId{2};
+    loc.bytes  = arm64RetBytes();
+    mod.functions.push_back(std::move(loc));
+    AssembledData d;
+    d.symbol    = SymbolId{3};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {7, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_add",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "hidden_helper",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{3}, "dss_global",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+// One exported function `dss_dispatch` + a RELRO fn-ptr table {&fn} --
+// the const table slot carries an abs64 (kind 4 on the arm64 schema)
+// reloc to the function; the dyn image must emit R_AARCH64_RELATIVE.
+[[nodiscard]] AssembledModule makeArm64FnPtrTableModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = arm64RetBytes();
+    mod.functions.push_back(std::move(fn));
+    AssembledData tab;
+    tab.symbol    = SymbolId{5};
+    tab.section   = DataSectionKind::RelRoConst;
+    tab.bytes     = std::vector<std::uint8_t>(8, 0);
+    tab.alignment = Alignment::of<8>();
+    Relocation rel;
+    rel.offset = 0;
+    rel.target = SymbolId{1};
+    rel.kind   = RelocationKind{4};   // abs64 (arm64.target.json)
+    rel.addend = 0;
+    tab.relocations.push_back(rel);
+    mod.dataItems.push_back(std::move(tab));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_dispatch",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tab",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+// One user fn `movz x0,#42; ret` -- the linker prepends the `_start`
+// trampoline (keyed on the pie schema's processExit) exactly as on the
+// ET_EXEC arm.
+[[nodiscard]] AssembledModule makeArm64UserEntryModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x40, 0x05, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "main",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+} // namespace
+
+TEST(ElfDynWriterArm64, HeaderPinsEtDynMachine183ZeroEntryExport) {
+    auto loaded = loadShippedDynArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeArm64ExportModule();
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // e_type = ET_DYN (3), e_machine = EM_AARCH64 (183), e_entry = 0.
+    EXPECT_EQ(readU16LE(bytes, 16), 3u) << "e_type must be ET_DYN";
+    EXPECT_EQ(readU16LE(bytes, 18), 183u) << "e_machine must be EM_AARCH64";
+    EXPECT_EQ(readU64LE(bytes, 24), 0u) << "e_entry must be 0 for a .so";
+    // The exported function is FINDABLE in .dynsym via the SysV hash
+    // chain (the exact lookup ld.so performs); the LOCAL helper is not.
+    auto const secs = readSections(bytes);
+    auto const syms = readDynsyms(bytes, secs);
+    ASSERT_GE(syms.size(), 3u) << "STN_UNDEF + dss_add + dss_global";
+    auto const fnIdx = hashLookup(bytes, secs, syms, "dss_add");
+    ASSERT_TRUE(fnIdx.has_value())
+        << "dss_add must be exported + findable via the SysV hash chain";
+    EXPECT_EQ(syms[*fnIdx].info, 0x12u) << "STB_GLOBAL<<4 | STT_FUNC";
+    EXPECT_NE(syms[*fnIdx].shndx, 0u) << "defined (real section), not UND";
+    EXPECT_TRUE(hashLookup(bytes, secs, syms, "dss_global").has_value());
+    EXPECT_FALSE(hashLookup(bytes, secs, syms, "hidden_helper").has_value());
+}
+
+TEST(ElfDynWriterArm64, FnPtrTableSlotEmitsAarch64Relative) {
+    auto loaded = loadShippedDynArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeArm64FnPtrTableModule();
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    auto const secs = readSections(bytes);
+    auto const rela = readRelaDyn(bytes, secs);
+    // AArch64 ELF psABI 4.6.3: R_AARCH64_RELATIVE = 1027 (0x403).
+    // RED-ON-DISABLE: dropping the RELATIVE emission empties this.
+    constexpr std::uint32_t kRAarch64Relative = 1027;
+    std::vector<RelaRow> relatives;
+    for (auto const& r : rela) {
+        if (r.type == kRAarch64Relative) relatives.push_back(r);
+    }
+    ASSERT_EQ(relatives.size(), 1u)
+        << "one abs64 fn-ptr slot -> exactly one R_AARCH64_RELATIVE";
+    EXPECT_EQ(relatives[0].sym, 0u) << "RELATIVE rows carry no symbol";
+    // The function sits at the base-relative .text VA (0x1000 =
+    // pageAlign); the addend must be that base-relative target.
+    EXPECT_EQ(relatives[0].addend, 0x1000) << "r_addend = base-relative fn VA";
+    // DT_RELA / DT_RELASZ cover the row.
+    auto const dyn = readDynamic(bytes, secs);
+    ASSERT_TRUE(dynValue(dyn, kDtRela).has_value());
+    auto const relasz = dynValue(dyn, kDtRelasz);
+    ASSERT_TRUE(relasz.has_value());
+    EXPECT_EQ(*relasz, 24u);
+}
+
+TEST(ElfPieWriterArm64, HeaderPinsEtDynDf1PieInterpNonZeroEntry) {
+    auto loaded = loadShippedPieArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeArm64UserEntryModule();
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(image.ok());
+    ASSERT_FALSE(image.bytes.empty());
+    auto const& bytes = image.bytes;
+    // The trampoline was prepended EXACTLY ONCE (1 user fn + 1).
+    EXPECT_EQ(image.expectedFuncCount, 2u)
+        << "linker must prepend the _start trampoline exactly once "
+           "(processExit-keyed, same condition as ET_EXEC)";
+    // e_type stays ET_DYN -- a PIE is not a new object type; machine 183.
+    EXPECT_EQ(readU16LE(bytes, 16), 3u) << "e_type must be ET_DYN";
+    EXPECT_EQ(readU16LE(bytes, 18), 183u) << "e_machine must be EM_AARCH64";
+    // e_entry: NON-zero, BASE-RELATIVE -- the trampoline sits at
+    // functions[0] = the start of .text = pageAlign (base-0 image).
+    EXPECT_EQ(readU64LE(bytes, 24), 0x1000u)
+        << "e_entry = the trampoline's base-relative VA (.text head)";
+    // PT_INTERP present, carrying the aarch64 loader path.
+    std::uint64_t const phoff = readU64LE(bytes, 32);
+    std::uint16_t const phnum = readU16LE(bytes, 56);
+    std::size_t nInterp = 0;
+    std::uint64_t interpVaddr = 0, interpFilesz = 0;
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::uint64_t const off = phoff + i * 56ull;
+        if (readU32LE(bytes, off) == kPtInterp) {
+            ++nInterp;
+            interpVaddr  = readU64LE(bytes, off + 16);
+            interpFilesz = readU64LE(bytes, off + 32);
+        }
+    }
+    EXPECT_EQ(nInterp, 1u) << "PT_INTERP present (the kernel maps ld.so)";
+    auto const secs = readSections(bytes);
+    Shdr const* interp = findSection(secs, ".interp");
+    ASSERT_NE(interp, nullptr);
+    EXPECT_EQ(interp->addr, interpVaddr);
+    EXPECT_EQ(interp->size, interpFilesz);
+    EXPECT_EQ(readCStr(bytes, interp->offset), "/lib/ld-linux-aarch64.so.1");
+    // DT_FLAGS_1 = DF_1_NOW | DF_1_PIE (0x08000001) -- the "executable,
+    // not library" ET_DYN marker readelf keys its PIE label on.
+    auto const dyn = readDynamic(bytes, secs);
+    auto const flags1 = dynValue(dyn, kDtFlags1);
+    ASSERT_TRUE(flags1.has_value());
+    EXPECT_EQ(*flags1, kDf1Now | kDf1Pie)
+        << "DT_FLAGS_1 must be NOW | PIE (0x08000001)";
+}

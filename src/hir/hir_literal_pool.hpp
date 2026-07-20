@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/bit_int_value.hpp"            // BitIntValue (C23 _BitInt const-fold arm)
+#include "core/types/wide_float_value.hpp"         // WideFloatValue (LD-3 F80/F128 const-fold arm)
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 #include "core/types/strong_ids.hpp"               // TypeId (HirAddressValue.pointeeType)
 
@@ -91,7 +92,19 @@ struct HirLiteralValue {
     //     `std::uint64_t` at source-decode time; the const-eval engine
     //     may also produce values in `std::int64_t` after arithmetic.
     //     Consumers MUST accept either arm for unsigned cores.
-    //   - `core` ∈ float kinds (F16..F128): held in `double`.
+    //   - `core` ∈ float kinds (F16..F64): held in `double`.
+    //   - `core` ∈ {F80, F128}: held in EITHER the `double` arm OR the
+    //     `WideFloatValue` arm — LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION).
+    //     An UNFOLDED F80/F128 literal LEAF stays in the `double` arm (the widen
+    //     double→WideFloatValue is always EXACT, 53-bit ⊆ 64/113-bit, so a leaf
+    //     need not be promoted). A FOLDED arithmetic RESULT (or an explicit widen
+    //     via a cast) is carried in the `WideFloatValue` arm at TRUE 80/128-bit
+    //     precision — NEVER the `double` arm (a binary64-rounded value under an
+    //     F80/F128 core would silently mis-bind >53-bit-mantissa results). ★
+    //     Consumers reading an F80/F128 value MUST check BOTH arms (const-eval's
+    //     `toWideFloatOperand` + asm.cpp's `get_if<WideFloatValue>`-before-`double`
+    //     branch); the new arm fails loud by construction on any un-updated
+    //     consumer (`get_if<double>` → nullptr forces an explicit handle-or-refuse).
     //   - `core == Char` with a STRING literal: held in `std::string`
     //     (the node's typeId is Array<Char,N+1>; disambiguate char-vs-
     //     string by the variant arm, NOT by `core` which is identical
@@ -111,7 +124,7 @@ struct HirLiteralValue {
     //     container value from this arm; the wide path fills limbs from it.
     //   - `core == Void`: held as `std::monostate` (decode failure).
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
-                 HirAggregateValue, HirAddressValue, BitIntValue> value;
+                 HirAggregateValue, HirAddressValue, BitIntValue, WideFloatValue> value;
     TypeKind core = TypeKind::Void;
 };
 

@@ -1847,6 +1847,121 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit `long double` FLD — load an m80 extended-real from memory and PUSH it onto st0. Intel SDM: DB /5 FLD m80fp (\"Push m80fp onto the FPU register stack\"). THE MODEL (zero regalloc changes): the x87 stack (st0-7) is INVISIBLE to the flat linear-scan allocator — an F80 value lives in MEMORY (a fresh body-local `alloca` home / a global / the source address), and every F80 op is a FIXED memory→memory instruction sequence (fld;fld;fXXXp;fstp) that starts+ends with an EMPTY stack, using st0/st1 as transient scratch — exactly the idiv implicit-RAX/RDX precedent. ONE base+disp32 memory variant mirroring movsd_load's [base,membase,memoffset] form: operand[0] = the ADDRESS register (modrm.rm.mem → mod=10 + disp32), [1]=MemBase(scale), [2]=MemOffset(disp). modrmRegExt=5 fills ModR/M.reg with the /5 opcode-extension digit; there is NO register RESULT (the push target st0 is implicit), so the encoder emits `DB /5 [modrm 0b10_101_rrr] disp32`. result:none + hasSideEffects — the x87-stack mutation must never be reordered or DCE'd (fld feeds the following fXXXp/fstp only through the implicit stack, which no vreg dep expresses). NO rip-relative variant: an F80 address is ALWAYS materialized into a GPR base first (globalAddrRiprelFoldsIntoLoad walls the fold for F80), so the base+disp form serves every site.",
+      "mnemonic": "fld_m80", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [219], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit FSTP — POP st0 and store it as an m80 extended-real to memory. Intel SDM: DB /7 FSTP m80fp (\"Copy ST(0) to m80fp and pop the register stack\"). The closing move of every F80 op's memory→memory sequence (fld;fld;fXXXp;fstp [dst]) and the second half of an F80 value copy (fld [src];fstp [dst]). Same base+disp memory operand shape as fld_m80 — operand[0]=address reg (modrm.rm.mem), [1]=MemBase(scale), [2]=MemOffset(disp); the STORED value is the implicit st0 (NO value operand, unlike movsd_store's 4-op [value,base,membase,memoffset]). modrmRegExt=7 = the /7 digit → `DB /7 [modrm 0b10_111_rrr] disp32`. result:none + hasSideEffects (writes memory + pops the stack).",
+      "mnemonic": "fstp_m80", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [219], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): FADDP ST(1),ST(0) = DE C1 (Intel SDM: \"Add ST(0) to ST(1), store result in ST(1), and pop the register stack\" — the DE C0+i family, i=1). A BARE 2-byte fixed opcode, ZERO operands, no ModR/M (st1/st0 are implicit). Emitted between the two fld_m80 pushes and the fstp_m80: after `fld a; fld b` the stack is st1=a, st0=b, so FADDP leaves st0 = a+b (commutative — direction irrelevant). result:none + hasSideEffects (mutates + pops the implicit x87 stack; must stay ordered relative to the surrounding fld/fstp).",
+      "mnemonic": "faddp", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [222, 193] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): FSUBP ST(1),ST(0) = DE E9 (Intel SDM: \"Subtract ST(0) from ST(1), store result in ST(1), and pop the register stack\" — the DE E8+i family, i=1 → ST(1) ← ST(1) − ST(0)). DIRECTION CRUX: the lowering pushes a THEN b (`fld a; fld b` → st1=a, st0=b), so FSUBP computes st1−st0 = a−b — exactly C's `a - b`. NOT the reversed FSUBRP (DE E1 = ST(0)−ST(1) = b−a). NB the encoder emits the raw BYTES DE E9, so the historical GAS AT&T fsubp/fsubrp mnemonic swap does not apply here. Bare 2-byte fixed opcode, 0 operands. result:none + hasSideEffects.",
+      "mnemonic": "fsubp", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [222, 233] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): FMULP ST(1),ST(0) = DE C9 (Intel SDM: \"Multiply ST(1) by ST(0), store result in ST(1), and pop the register stack\" — the DE C8+i family, i=1). After `fld a; fld b` the stack is st1=a, st0=b → st0 = a*b (commutative). Bare 2-byte fixed opcode, 0 operands. result:none + hasSideEffects.",
+      "mnemonic": "fmulp", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [222, 201] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): FDIVP ST(1),ST(0) = DE F9 (Intel SDM: \"Divide ST(1) by ST(0), store result in ST(1), and pop the register stack\" — the DE F8+i family, i=1 → ST(1) ← ST(1) / ST(0)). DIRECTION CRUX: after `fld a; fld b` (st1=a, st0=b), FDIVP computes st1/st0 = a/b — exactly C's `a / b`. NOT the reversed FDIVRP (DE F1 = ST(0)/ST(1) = b/a). Raw-byte encoding (DE F9), so the GAS mnemonic swap is irrelevant. Bare 2-byte fixed opcode, 0 operands. result:none + hasSideEffects.",
+      "mnemonic": "fdivp", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [222, 249] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): FISTTP m32int = DB /1 (Intel SDM: \"Store ST(0) with TRUNCATION to m32int and pop the register stack\"). The F80→int conversion tail (FPToSI from long double): `fld_m80 [src]; fisttp_m32 [slot]; mov r32,[slot]`. FISTTP is SSE3 (universally present on every x86_64 CPU and under qemu) and truncates toward zero WITHOUT touching the x87 control word — the C cast's round-toward-zero semantics for free (the strict-baseline fldcw/fistp/fldcw alternative needs a control-word rodata const + 2 extra ops). Same base+disp memory operand shape as fld_m80/fstp_m80; modrmRegExt=1 = the /1 digit. result:none + hasSideEffects (writes m32 + pops st0). m64int (DD /1, for `(long long)ld`) is a later slice — this row serves the (int) cast.",
+      "mnemonic": "fisttp_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [219], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
       "mnemonic": "fpcvt", "result": "value",
       "minOperands": 1, "maxOperands": 1,

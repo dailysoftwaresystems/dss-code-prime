@@ -25,6 +25,10 @@ target_include_directories(ffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # surface cohesive; only the CMake target placement differs.
 add_library(ffi_shipped OBJECT
     shipped_lib_descriptor.cpp
+    # D-LANG-TYPE-IDENTITY-VOCABULARY: the CROSS-descriptor invariant the
+    # per-file reader structurally cannot enforce (it sees one descriptor at a
+    # time). Same dependency envelope as the reader — core + hir only.
+    shipped_type_consistency.cpp
 )
 
 target_include_directories(ffi_shipped PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

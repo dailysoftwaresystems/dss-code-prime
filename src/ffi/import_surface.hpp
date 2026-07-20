@@ -84,7 +84,17 @@ enum class SymbolLinkage : std::uint8_t {
 // itself instead of the HIR node).
 struct DSS_EXPORT ImportSurface {
     std::string      mangledName;   // on-binary symbol name (verbatim)
-    std::string      libraryPath;   // owning binary's path/soname
+    std::string      libraryPath;   // owning binary's path (or caller label)
+    // D-FF1-READER-SONAME (c171): the library's EMBEDDED, loader-resolvable
+    // identity — ELF DT_SONAME / Mach-O LC_ID_DYLIB install_name / PE export-
+    // directory DllName. EMPTY when the binary declares none (a `.so` built
+    // without `-Wl,-soname`, a relocatable object, an FF2 header row). The
+    // consumer (`ingest()`) PREFERS this over the file basename when binding
+    // an extern's owning library (`meta.importLibrary`), mirroring what a real
+    // linker records as DT_NEEDED / LC_LOAD_DYLIB / the import DllName; the
+    // basename stays the fallback. Same binary-wide-per-row shape as
+    // `libraryPath` (every row of one binary carries the same value).
+    std::string      soname;
     SymbolKind       kind       = SymbolKind::NoType;
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;

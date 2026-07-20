@@ -222,7 +222,15 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         case TypeKind::F80: case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
         case TypeKind::NullptrT:   // C23 nullptr_t: operand-less primitive scalar
-            result = dst.primitive(kind);
+            // D-LANG-TYPE-IDENTITY-VOCABULARY: carry the VOCABULARY TAG across the
+            // boundary. Rebuilding from the kind alone would drop it on EVERY
+            // primitive reintern — silently re-collapsing `long` onto `int` (and
+            // `long double` onto `double`) the moment a type crosses a CU / static
+            // -link merge / text round-trip, exactly the identity-from-representation
+            // defect this split removes. `src.name()` is generic: it returns "" for
+            // every kind that never populates the slot, so an anonymous primitive
+            // round-trips bit-identically through the 2-arg overload.
+            result = dst.primitive(kind, src.name(srcId));
             break;
 
         // ── single-operand indirections: operands=[inner] ──

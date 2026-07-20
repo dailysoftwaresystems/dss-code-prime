@@ -930,6 +930,18 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // signatures decode. Mutually exclusive with params/result (fail-loud at
     // decode if both are present); must decode to an FnSig (fail-loud else).
     std::string           signatureText;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: OPTIONAL per-data-model REPLACEMENT for
+    // `signatureText` — the exact shape (and JSON key name) the shipped-lib
+    // reader's `signatureByDataModel` already uses. A platform intrinsic can
+    // carry a parameter C spells with a NAMED type whose vocabulary entry is
+    // data-model-dependent: `_InterlockedCompareExchange` takes a `LONG*`, i.e.
+    // `long*`, which is a 32-bit `long` on the LLP64 platform the intrinsic
+    // belongs to. A single FIXED signature cannot say that without lying on the
+    // other model, so the base text stays the model-agnostic one and each
+    // declared model overrides it. EAGER: every declared override is decoded at
+    // the injection site regardless of which model is active, so a malformed
+    // INACTIVE override fails on EVERY target (anti-lurking).
+    std::unordered_map<DataModel, std::string> signatureTextByDataModel;
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this
@@ -1074,6 +1086,13 @@ struct DSS_EXPORT BuiltinTypeMapping {
     // Loader rejects unknown data-model keys + non-core values; mutually
     // exclusive with `extension` (an extension type has no width to vary).
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the vocabulary identity tag this name
+    // interns under (empty = the anonymous representative of its core). NOT
+    // authored in the JSON — the loader DERIVES it from the single-token
+    // `typeSpecifiers` row that resolves the same keyword, so the text-keyed and
+    // keyword-multiset paths can never disagree about whether `long` is a
+    // distinct named type.
+    std::string vocabularyName;
     // The mapping's effective core under the active data model.
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
@@ -1101,9 +1120,38 @@ struct DSS_EXPORT BuiltinTypeMapping {
 // (LLP64 long → I32). The loader rejects: duplicate multisets across
 // rows, unknown token-kind names, unknown core names, unknown data-model
 // keys, and empty token lists.
+// D-LANG-TYPE-IDENTITY-VOCABULARY: two ORTHOGONAL axes. This table is the
+// LANGUAGE axis — it declares the type VOCABULARY as NAMED entries. The
+// TARGET axis (`core` / `coreByDataModel` / `coreByLongDoubleFormat`) declares
+// each entry's REPRESENTATION. `name` is what the engine interns identity on,
+// so `long` stays a different type from `int` even where a data model gives
+// them the same core, and `long double` stays different from `double` on an
+// f64 axis. IDENTITY IS NEVER DERIVED FROM REPRESENTATION.
+//
+// Declare `name` ONLY on rows whose type can COLLIDE with another named entry
+// under some target axis. `int`/`short`/`unsigned int`/`unsigned short`/
+// `float`/`double`/`bool`/`void`/plain `char` deliberately stay UNNAMED: they
+// must remain the ANONYMOUS representative of their core, because integer
+// promotion and enum-underlying synthesis independently re-mint anonymous
+// primitives of those kinds — naming `int` would make a promoted `char + char`
+// stop matching a declared `int`.
 struct DSS_EXPORT TypeSpecifierRule {
     std::vector<SchemaTokenId> tokens;       // SORTED multiset key
     std::vector<std::string>   tokenNames;   // source spellings, for diagnostics
+    // The vocabulary identity tag; EMPTY (the default) = today's anonymous
+    // behavior, identity == the core alone. Every row sharing a name must
+    // resolve to the SAME representation on every axis (loader-enforced), so a
+    // name can never mean two widths.
+    std::string                name;
+    // C 6.3.1.1 conversion RANK of this vocabulary entry (`long long` > `long`
+    // > `int`; `long double` > `double` > `float`). Rank is defined by the type
+    // NAME, not its width — with a width-derived rank `someInt + someLong` on
+    // LLP64 (both I32) yields the wrong NAME, observable through `_Generic`.
+    // 0 = undeclared, which is also the rank of every anonymous primitive; a
+    // named entry therefore always out-ranks the anonymous representative of
+    // its own kind. Only meaningful with a `name` (loader rejects rank alone).
+    // Used ONLY as the tie-break between two operands of the SAME kind.
+    int                        rank = 0;
     TypeKind                   core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
     // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-longDoubleFormat override —
@@ -1163,6 +1211,12 @@ struct DSS_EXPORT TypeSpecifierRule {
 struct DSS_EXPORT DataModelTypeRef {
     std::string name;                        // source spelling, for diagnostics
     TypeKind    core = TypeKind::Void;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY: the resolved row's vocabulary tag,
+    // copied at load. WITHOUT it a literal ladder candidate would mint the
+    // ANONYMOUS primitive of the core and silently type `20L` as `int`-identity
+    // on LP64 (same I64 core as `long`) — the knob-that-lies again, one tier
+    // down. Empty = the candidate resolves to an anonymous primitive.
+    std::string vocabularyName;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
     // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): copied from the resolved
     // typeSpecifiers row at load (the "long double" float-literal rule) —
@@ -1187,6 +1241,44 @@ struct DSS_EXPORT DataModelTypeRef {
             if (ldf == LongDoubleFormat::None) return std::nullopt;
         }
         return resolveCore(dm);
+    }
+};
+
+// ── D-LANG-TYPE-IDENTITY-VOCABULARY: an ENGINE-SYNTHESIZED standard type ──
+//
+// A handful of types are minted by the ENGINE, not spelled by the source:
+// `sizeof`/`_Alignof` yield C's `size_t`, and `p - q` yields `ptrdiff_t`. C
+// defines each as an ALIAS of a standard NAMED type — and WHICH name is
+// DATA-MODEL-dependent: `size_t` IS `unsigned long` on LP64 and `unsigned long
+// long` on LLP64. Before identity was split off representation that did not
+// matter (everything 64-bit unsigned was one TypeId); now an ANONYMOUS U64 is a
+// THIRD thing matching NEITHER named entry, so `_Generic(sizeof(int), unsigned
+// long: 1, unsigned long long: 2, default: 0)` silently takes `default`.
+//
+// So the ENGINE must not hardcode a core here. Each row maps a DATA MODEL to a
+// `typeSpecifiers` VOCABULARY entry, resolved at LOAD through the same
+// `DataModelTypeRef` machinery `integerLiteralTyping` uses — the engine never
+// sees, compares, or branches on the name's SPELLING, it just carries the
+// resolved (core, tag) pair to `TypeInterner::primitive`. Representation still
+// comes from the TARGET (the named entry's own `coreByDataModel`), so the two
+// axes stay independent.
+//
+// UNDECLARED (`byDataModel` empty) ⇒ the consumer keeps its historic anonymous
+// core, so every language that ships no rows (toy / tsql) is byte-identical. A
+// DECLARED role must cover EVERY data model in the closed enum (loader-enforced)
+// — a role that silently had no entry for the active target would fall back to
+// the anonymous core, i.e. re-introduce the exact defect on that one model.
+struct DSS_EXPORT SynthesizedTypeRule {
+    std::unordered_map<DataModel, DataModelTypeRef> byDataModel;
+    [[nodiscard]] bool declared() const noexcept { return !byDataModel.empty(); }
+    // The (core, vocabularyName) this role resolves to under `dm`; nullopt when
+    // undeclared. The name is a view into this rule and outlives every call.
+    [[nodiscard]] std::optional<std::pair<TypeKind, std::string_view>>
+    resolve(DataModel dm) const {
+        auto const it = byDataModel.find(dm);
+        if (it == byDataModel.end()) return std::nullopt;
+        return std::pair<TypeKind, std::string_view>{
+            it->second.resolveCore(dm), it->second.vocabularyName};
     }
 };
 
@@ -1491,6 +1583,14 @@ struct DSS_EXPORT SemanticConfig {
     // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
     RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
     std::uint32_t alignofTypeChild = 0;
+    // D-LANG-TYPE-IDENTITY-VOCABULARY (`semantics.synthesizedTypes`): the
+    // VOCABULARY ENTRY each engine-synthesized standard type resolves to, per
+    // data model. `sizeof`/`_Alignof` yield C's `size_t`; a same-pointee
+    // `p - q` yields `ptrdiff_t`. Undeclared ⇒ the historic anonymous core
+    // (U64 / I64) — see `SynthesizedTypeRule`.
+    SynthesizedTypeRule sizeofResultType;
+    SynthesizedTypeRule alignofResultType;
+    SynthesizedTypeRule pointerDifferenceType;
     // C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof`/`typeof_unqual` typing. Both are
     // TYPE-SPECIFIERS resolving to the operand's type. `typeofTypeRule` = the
     // TYPE-NAME operand form (`typeof ( type-name )`, whose `typeofOperandChild`
