@@ -3410,6 +3410,56 @@ TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
     EXPECT_TRUE(el);
 }
 
+// SQLite testfixture test_syscall.c: errno.json ships ENOMEM + EDEADLK as REAL
+// constants the test_syscall.c error-name map consumes. ENOMEM AGREES across all
+// three formats (12 — flat, in the low block); EDEADLK DIVERGES (elf 35 / macho
+// 11 / pe 36 — Linux asm-generic/errno.h vs Darwin sys/errno.h vs ucrt errno.h),
+// so it carries per-format `variants` that must decode to the ACTIVE format's
+// number. RED-ON-DISABLE: remove ENOMEM (or either EDEADLK variant), or perturb a
+// value, and the matching per-format EXPECT below fails — a wrong errno number is
+// a silent interop miscompile in the test corpus.
+TEST(ShippedLibDescriptor, RealErrnoEnomemEdeadlkPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto constFor = [&](ObjectFormatKind fmt, char const* name,
+                        std::int64_t& valueOut, TypeKind& kindOut) -> bool {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "errno.json", interner, typeReg, fmt);
+        if (!desc) return false;
+        for (auto const& c : desc->constants) {
+            if (c.name == name) {
+                valueOut = c.value;
+                kindOut  = interner.kind(c.type);
+                return true;
+            }
+        }
+        return false;
+    };
+    struct Case { ObjectFormatKind fmt; char const* name; std::int64_t edeadlk; };
+    Case const cases[] = {
+        { ObjectFormatKind::Elf,   "elf",   35 },
+        { ObjectFormatKind::MachO, "macho", 11 },
+        { ObjectFormatKind::Pe,    "pe",    36 },
+    };
+    for (auto const& tc : cases) {
+        std::int64_t v = -1;
+        TypeKind     k = TypeKind::Void;
+        // ENOMEM: flat, 12 on every format.
+        ASSERT_TRUE(constFor(tc.fmt, "ENOMEM", v, k))
+            << "ENOMEM missing for format " << tc.name;
+        EXPECT_EQ(v, 12) << "ENOMEM for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "ENOMEM type for " << tc.name;
+        // EDEADLK: per-format variant.
+        v = -1;
+        k = TypeKind::Void;
+        ASSERT_TRUE(constFor(tc.fmt, "EDEADLK", v, k))
+            << "EDEADLK missing for format " << tc.name;
+        EXPECT_EQ(v, tc.edeadlk) << "EDEADLK for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "EDEADLK type for " << tc.name;
+    }
+}
+
 // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): windows.json models ULARGE_INTEGER as an
 // explicit-offset OVERLAP struct {QuadPart u64@0, LowPart u32@0, HighPart u32@4} —
 // the FILETIME→time idiom (shell.c writes the two u32 halves, reads the u64 whole).
