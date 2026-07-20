@@ -7964,12 +7964,50 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // member literal's type and false-fire
                         // S_TypeMismatch against the aggregate.
                         TypeId initTy = InvalidType;
+                        NodeId walkEnd{};
                         for (NodeId walk = initNode; walk.valid();) {
+                            walkEnd = walk;
                             initTy = s.typeAt(walk);
                             if (initTy.valid()) break;
                             auto wk = visibleChildren(tree, walk);
                             if (wk.size() != 1) break;
                             walk = wk[0];
+                        }
+                        // D-CSUBSET-POINTER-COMPAT-ADDRESSOF-INITIALIZER: the
+                        // stamped-`typeAt` walk above finds a type only when one is
+                        // STAMPED on the single-child wrapper chain — a leaf
+                        // identifier (the pointer-VARIABLE init `T *p = q`), a
+                        // literal, a Pass-2-stamped subexpression. An ADDRESS-OF
+                        // initializer (`T *p = &obj`) carries NO stamped type there:
+                        // the walk descends to the `&obj` unary node, which is
+                        // multi-child (`&` + operand) and un-stamped, so the walk
+                        // stops with `initTy` Invalid and the isAssignable gate
+                        // below was SILENTLY skipped — an incompatible pointee
+                        // (`char* <- &long`) slipped through while the SAME pair via
+                        // assignment (`p = &obj`) or a pointer variable (`T *p = q`)
+                        // was already rejected. Re-derive a SCALAR (non-brace)
+                        // initializer's type via `subtreeType` WITH `here` (this
+                        // declaration's scope) — the SAME typer the assignment /
+                        // pointer-variable-init / call-arg / return sites use — so
+                        // `&obj`'s operand resolves by scope and combineUnary yields
+                        // Ptr<pointee>, reaching the check. The rule is UNCHANGED
+                        // (isAssignable still decides — void*/qualifier/null/string
+                        // admissions are byte-identical); only the address-of
+                        // initializer now REACHES it. The brace-init-list form is
+                        // EXCLUDED: its per-element checks live in the HIR brace-init
+                        // lowering (contextually typed by the declared type), and
+                        // `subtreeType` would DFS into the braces and surface an
+                        // element literal's type — false-firing S_TypeMismatch
+                        // against the aggregate (the exact hazard the stamped walk
+                        // was written to avoid).
+                        bool const walkEndIsBraceInit =
+                            walkEnd.valid()
+                            && tree.kind(walkEnd) == NodeKind::Internal
+                            && s.idx().braceInitListRule.valid()
+                            && tree.rule(walkEnd).v
+                                   == s.idx().braceInitListRule.v;
+                        if (!initTy.valid() && !walkEndIsBraceInit) {
+                            initTy = subtreeType(s, tree, initNode, here);
                         }
                         // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, DEFERRED):
                         // the natural init form `int (*p)[n] = b` does NOT compile — the

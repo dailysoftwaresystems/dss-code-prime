@@ -1028,6 +1028,124 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsInit) {
         << "`int* p = 0;` initializer is a null pointer constant";
 }
 
+// ── D-CSUBSET-POINTER-COMPAT-ADDRESSOF-INITIALIZER — an address-of expression
+//    used as a pointer variable's INITIALIZER (`T *p = &obj;`) must run the SAME
+//    C 6.5.16.1 pointer-compatibility check (isAssignable) that the assignment
+//    form (`p = &obj;`) and the pointer-variable-init form (`T *p = q;`) already
+//    run. Pre-fix, ONLY the address-of INITIALIZER escaped the check.
+//
+//    Root cause: c-subset's varDecl is declarator-mode, so a scalar initializer's
+//    type is derived by a stamped-`typeAt` walk down the single-child wrapper
+//    chain (pass2Post). An address-of expression node carries NO stamped type on
+//    that chain, so the walk yielded InvalidType, the isAssignable gate
+//    (`initTy.valid()`) was skipped, and an INCOMPATIBLE pointee (`char* <- &long`)
+//    was SILENTLY accepted. The fix re-derives a scalar (non-brace) initializer's
+//    type via subtreeType WITH the declaration's scope when the stamped walk finds
+//    nothing, so `&obj` types as Ptr<pointee> and reaches the existing check. The
+//    brace-init-list form is explicitly excluded (its per-element checks live in
+//    the HIR lowering; a DFS would surface an element's type and false-fire). ──
+
+// (a) INCOMPATIBLE object pointee, char* target: `char *p = &a` where `a` is
+// `long`. The pointee `long` is NOT compatible with `char`, so C 6.5.16.1
+// requires a diagnostic. Exactly ONE S_TypeMismatch.
+// RED-ON-DISABLE: revert the subtreeType-with-scope fallback (stamped-walk only)
+// -> `&a` types as InvalidType, the isAssignable gate is skipped, and this count
+// drops to 0 (the silent-accept bug this anchor closes).
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleCharFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { long a; char *p = &a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "char* <- &long (incompatible object pointee) INITIALIZER must fail "
+           "loud — the address-of initializer runs the same C 6.5.16.1 check the "
+           "assignment form `p = &a` already runs";
+}
+
+// (b) INCOMPATIBLE object pointee, int* target: `int *p = &a` where `a` is `long`
+// (distinct integer types, distinct pointee). Exactly ONE S_TypeMismatch.
+// RED-ON-DISABLE: same as (a) — pre-fix this silently accepted.
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { long a; int *p = &a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "int* <- &long (incompatible object pointee) INITIALIZER must fail loud";
+}
+
+// (c) LEGAL address-of initializers must STAY CLEAN. Each is a conversion the
+// existing isAssignable already admits — the fix only makes the check REACH the
+// address-of initializer, it does NOT change the rule:
+//   void* <- &long   (C 6.3.2.3 — void* takes any object pointer)
+//   char* <- &char   (identical pointee)
+//   long* <- &long   (identical pointee)
+//   int*  <- &int    (identical pointee)
+// GREEN-BOTH-WAYS: these are clean pre- AND post-fix; the guard is that the
+// tightening did not over-reach into a legal object-pointer init.
+TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfLegalFormsStayClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) {\n"
+        "  long a; char c; int i;\n"
+        "  void *vp = &a;\n"   // void* <- any object pointer — legal (C 6.3.2.3)
+        "  char *cp = &c;\n"   // char* <- &char (same pointee) — legal
+        "  long *lp = &a;\n"   // long* <- &long (same pointee) — legal
+        "  int  *ip = &i;\n"   // int*  <- &int  (same pointee) — legal
+        "  return (vp != 0) + (cp != 0) + (lp != 0) + (ip != 0);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "void*<-&obj, and same-pointee &-inits (char/long/int) must ALL stay "
+           "accepted — the fix must not over-tighten a legal object-pointer init";
+}
+
+// (d) A string-literal initializer of a char* (`char *p = "hi";`) is a legal
+// array-to-pointer init and must STAY CLEAN — the fix must not disturb it (the
+// stamped walk already finds the literal's array type; subtreeType agrees).
+TEST(SemanticAnalyzerCSubset, PtrInitFromStringLiteralStaysClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { char *p = \"hi\"; return p != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "`char *p = \"hi\";` is a legal string-literal pointer init — the "
+           "address-of-initializer tightening must not touch it";
+}
+
+// (e) PARITY: the address-of INITIALIZER form and the pointer-VARIABLE
+// initializer form must reject an incompatible pointee IDENTICALLY. In one TU,
+// `char *p = &a;` (address-of init) AND `char *q = lp;` (pointer-var init, where
+// `lp` is `long*`) each fire — exactly TWO S_TypeMismatch, proving the address-of
+// initializer is no longer the lone unchecked init position.
+// RED-ON-DISABLE: pre-fix only the pointer-VARIABLE init fires -> count is 1.
+TEST(SemanticAnalyzerCSubset, PtrInitAddressOfAndPointerVarRejectIdentically) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) {\n"
+        "  long a; long *lp = &a;\n"   // long* <- &long — legal (no mismatch)
+        "  char *p = &a;\n"            // char* <- &long — mismatch #1 (address-of init)
+        "  char *q = lp;\n"            // char* <- long* — mismatch #2 (pointer-var init)
+        "  return (p != 0) + (q != 0);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 2u)
+        << "the address-of initializer AND the pointer-variable initializer must "
+           "each reject the char* <- long-pointee pair — two S_TypeMismatch, not one";
+}
+
 // 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
 // initial F1 fix used arity-based `OperatorTable.lookup(tk, Prefix)`,
 // which would have incorrectly matched binary-arithmetic operator
