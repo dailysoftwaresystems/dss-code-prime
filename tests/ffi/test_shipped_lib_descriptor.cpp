@@ -1497,7 +1497,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 64u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs
+    ASSERT_EQ(desc->symbols.size(), 65u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1519,7 +1519,11 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           // C22 (D-FFI-TCL-DESCRIPTOR): test6's 2 (Tcl_AttemptRealloc
                           // = fn(char*,u32)->char*; Tcl_UtfToLower = fn(char*)->i32) +
                           // test_vfs's 1 (Tcl_AppendObjToObj = fn(Tcl_Obj*,Tcl_Obj*)->void)
-                          "Tcl_AttemptRealloc", "Tcl_UtfToLower", "Tcl_AppendObjToObj"})
+                          "Tcl_AttemptRealloc", "Tcl_UtfToLower", "Tcl_AppendObjToObj",
+                          // C27 (D-FFI-TCL-DESCRIPTOR): test_quota's Tcl_ObjGetVar2
+                          // = Tcl_Obj *fn(Tcl_Interp*, Tcl_Obj*, Tcl_Obj*, int) — the
+                          // GET twin of Tcl_ObjSetVar2 (one fewer param, no newValuePtr).
+                          "Tcl_ObjGetVar2"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
     // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
