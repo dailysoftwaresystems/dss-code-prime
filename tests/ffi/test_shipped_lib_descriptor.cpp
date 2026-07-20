@@ -1497,7 +1497,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 65u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota
+    ASSERT_EQ(desc->symbols.size(), 67u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1523,7 +1523,12 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           // C27 (D-FFI-TCL-DESCRIPTOR): test_quota's Tcl_ObjGetVar2
                           // = Tcl_Obj *fn(Tcl_Interp*, Tcl_Obj*, Tcl_Obj*, int) — the
                           // GET twin of Tcl_ObjSetVar2 (one fewer param, no newValuePtr).
-                          "Tcl_ObjGetVar2"})
+                          "Tcl_ObjGetVar2",
+                          // C28 (D-FFI-TCL-DESCRIPTOR): test1's Tcl_GetDouble
+                          // = fn(Tcl_Interp*, char*, f64*)->i32 (the Tcl_GetInt double-out
+                          // sibling) + Tcl_DStringAppend = fn(Tcl_DString*, char*, i32)->char*
+                          // (the Tcl_DStringAppendElement sibling); both exported T (nm -D).
+                          "Tcl_GetDouble", "Tcl_DStringAppend"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
     // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
@@ -1579,6 +1584,17 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         ASSERT_EQ(dsv->params->size(), 1u);
         EXPECT_EQ((*dsv->params)[0], "dsPtr");
         EXPECT_EQ(dsv->replacement, "((dsPtr)->string)");
+        // C28 (D-FFI-TCL-DESCRIPTOR): Tcl_DStringLength — the LENGTH twin of
+        // Tcl_DStringValue (tcl.h:1014 `#define Tcl_DStringLength(dsPtr) ((dsPtr)->length)`),
+        // reading the Tcl_DString `length` field modeled in C13 (NO new struct layout).
+        // test1.c:23893. RED-ON-DISABLE: remove it and the shipped_tcl_dstring example's
+        // Tcl_DStringLength read fails to resolve (S0001).
+        auto const* dsl = macro("Tcl_DStringLength");
+        ASSERT_NE(dsl, nullptr) << "Tcl_DStringLength must be a macro";
+        ASSERT_TRUE(dsl->params.has_value());
+        ASSERT_EQ(dsl->params->size(), 1u);
+        EXPECT_EQ((*dsl->params)[0], "dsPtr");
+        EXPECT_EQ(dsl->replacement, "((dsPtr)->length)");
     }
 
     // C13: Tcl_DString gains its REAL named layout so Tcl_DStringValue's `->string` read
@@ -1702,6 +1718,20 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             }
         }
         EXPECT_TRUE(sawConst) << "tcl.json must define the CONST compat macro";
+
+        // C28 (D-FFI-TCL-DESCRIPTOR): the 3 new object-macro constants test1.c uses —
+        // TCL_EVAL_DIRECT=0x040000 (Tcl_EvalObjEx flags @:25561), TCL_LEAVE_ERR_MSG=0x200
+        // (Tcl_GetVar2Ex flags @:29874), TCL_LINK_STRING=4 (Tcl_LinkVar type @:9404).
+        // Value-pinned (a wrong replacement fails loud here; the shipped_tcl_dstring
+        // example also value-checks them at runtime, returning 4/5/6 instead of 42).
+        auto macroRepl = [&](std::string_view name) -> std::string {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return m.replacement;
+            return "<absent>";
+        };
+        EXPECT_EQ(macroRepl("TCL_EVAL_DIRECT"), "262144");
+        EXPECT_EQ(macroRepl("TCL_LEAVE_ERR_MSG"), "512");
+        EXPECT_EQ(macroRepl("TCL_LINK_STRING"), "4");
     }
 }
 
