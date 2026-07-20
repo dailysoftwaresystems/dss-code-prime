@@ -1327,7 +1327,8 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsInit) {
 // BEHAVIOR (float-zero rejects), NOT the gate in isolation — removing the gate
 // leaves it green via the const-fold backstop. The gate is defense-in-depth that
 // additionally excludes a Char/Bool-typed fold the const-fold step would otherwise
-// fold to 0 (consistent with DSS typing comparisons as Bool, not C's int).
+// fold to 0 (e.g. a bare `_Bool`/`char`-typed constant — NOT a comparison, which
+// now types as C's int per D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE).
 TEST(SemanticAnalyzerCSubset, FloatZeroRejectsAsPointerArg) {
     auto cu = buildShippedUnit("c-subset", {
         "extern void f(void* p);\n"
@@ -7374,14 +7375,32 @@ TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 }
 
-// `bool b = nullptr;` is rejected — nullptr→bool is DEFERRED (the c-subset has no
-// scalar→bool conversion; D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it stays consistent
-// with `bool b = 0;` (also a mismatch) rather than admit-then-fail-at-codegen.
-TEST(SemanticAnalyzerCSubset, NullptrToBoolFailsLoud) {
+// `bool b = nullptr;` now CONVERTS to false — C23 6.3.2.3.2 (nullptr -> bool =
+// false), realized once the general scalar->bool conversion landed
+// (D-CSUBSET-NULLPTR-BOOL-CONVERSION closed via `scalarConvertsToBool`). Was a
+// DEFERRED S_TypeMismatch; the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]] fix (a
+// comparison now types `int`) forced the general scalar->bool arm, and
+// nullptr->bool falls out as the NullptrT case.
+TEST(SemanticAnalyzerCSubset, NullptrToBoolConverts) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "nullptr -> bool converts to false (C23 6.3.2.3.2), no longer deferred";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// `bool b = 0;` (a scalar zero) CONVERTS to false via the general scalar->bool
+// conversion (C 6.3.1.2). Pre-D-CSUBSET-NULLPTR-BOOL-CONVERSION this was itself an
+// S_TypeMismatch (the c-subset had NO scalar->bool path — the very inconsistency
+// that kept nullptr->bool deferred); now both assign.
+TEST(SemanticAnalyzerCSubset, ScalarZeroToBoolConverts) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = 0; return b; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "scalar 0 -> bool converts to false (C 6.3.1.2)";
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // The fail-loud operator gate: nullptr in arithmetic (`nullptr + 1`) is rejected —
@@ -8789,11 +8808,12 @@ TEST(SemanticAnalyzerCSubset, AutoFileScopeAndQualifiedStayLoudParseErrors) {
 // pinned EXACTLY for each non-decaying initializer class the arm passes
 // through unchanged — a struct variable (aggregates infer by value, no
 // decay), an enumerator (the enum TYPE, not its underlying int), a
-// comparison (Bool — promoteComparisons), a char variable (Char, not the
-// promoted int), and an unsuffixed float literal (F64 per C 6.4.4.2). All
-// in ONE unit so the block also witnesses the inferred objects USED
-// together (member access through the inferred struct, arithmetic across
-// the rest).
+// comparison (I32 — a comparison RESULT type is C's `int`, C 6.5.8p6, sourced
+// config-drivenly by subtreeType; D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE), a char
+// variable (Char, not the promoted int), and an unsuffixed float literal (F64
+// per C 6.4.4.2). All in ONE unit so the block also witnesses the inferred
+// objects USED together (member access through the inferred struct, arithmetic
+// across the rest).
 TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     auto model = analyzeShipped("c-subset", {
         "struct S { int x; };\n"
@@ -8825,8 +8845,11 @@ TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     EXPECT_EQ(kindOf("e"), TypeKind::Enum)
         << "an enumerator infers the ENUM type (enumConvertsToArith covers "
            "its uses; the type itself stays Enum)";
-    EXPECT_EQ(kindOf("b"), TypeKind::Bool)
-        << "a comparison infers Bool (promoteComparisons)";
+    EXPECT_EQ(kindOf("b"), TypeKind::I32)
+        << "a comparison infers int (C 6.5.8p6: the RESULT type of a relational "
+           "operator is int, sourced config-drivenly — "
+           "D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE; the i1/Bool SSA carrier is the "
+           "separate machine-tier concern)";
     EXPECT_EQ(kindOf("c"), TypeKind::Char)
         << "a char VARIABLE infers Char (the symbol's type, not the "
            "promoted int)";

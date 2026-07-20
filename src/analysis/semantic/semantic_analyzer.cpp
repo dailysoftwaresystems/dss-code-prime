@@ -8047,7 +8047,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -8095,7 +8095,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -8220,7 +8220,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                              /*intConvertsToFloat=*/cfg.intConvertsToFloat,
                                              /*floatConvertsToInt=*/cfg.floatConvertsToInt,
                                              /*charArrayFromStringLiteralInit=*/false,
-                                             /*bitIntConversions=*/cfg.bitIntConversions)
+                                             /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                             && !admitsNullPointerConstant(
                                    s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
                             ParseDiagnostic d;
@@ -8776,7 +8776,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -9342,6 +9342,43 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         }
         return interner.commonType(a, b);
     };
+    // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: the C RESULT type of a
+    // comparison/logical operator is `int` (6.5.8p6 relational, 6.5.9p3
+    // equality, 6.5.13p3 `&&`, 6.5.14p3 `||`, 6.5.3.3p5 `!`) — NOT the 1-byte
+    // Bool the operand-carrier lowering emits. Sourced CONFIG-DRIVENLY, never a
+    // hardcoded I32: integer-promote Bool through the resolved
+    // `arithmeticConversions` engine — Bool is in the language's promote set
+    // (`alsoPromote`), so it lands on the config's `minRankType` (C's `int`). This
+    // is the SEMANTIC (language) type the type-oracle reports for sizeof / auto /
+    // _Generic / call-arg checking; the CST→HIR tier keeps the i1/Bool SSA carrier
+    // (a machine detail, widened on use) — a DELIBERATE divergence, exactly like
+    // char→i32, documented at D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE.
+    // A language with NO arithmeticConversions block (toy/tsql) has no `int` to
+    // name → the legacy Bool result is preserved byte-identically.
+    auto const comparisonResultType = [&]() -> TypeId {
+        if (arith.has_value()) {
+            TypeId const p = integerPromotedType(interner, boolType(), *arith);
+            if (p.valid()) return p;
+        }
+        return boolType();
+    };
+    // D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT: the EXACT semantic-tier mirror
+    // of cst_to_hir's c72 unary-promotion arm (D-CSUBSET-32BIT-ALU-FORMS) — unary
+    // `+`/`-`/`~` on a sub-int operand yield the INTEGER-PROMOTED operand type
+    // (C 6.5.3.3p2/p3/p4), so `sizeof(+c)`/`(-c)`/`(~c)` fold to sizeof(int) and
+    // `(-sh)` to sizeof(int). Config-driven via `integerPromotedType` (a no-op on
+    // float/pointer/≥int); Bool is EXCLUDED byte-identically to the CST→HIR tier
+    // (its native narrow forms are not gated) so the two typers cannot drift.
+    // Falls back to the raw operand type when a language declares no arithmetic
+    // block (toy/tsql — no promotion vocabulary to apply).
+    auto const promotedUnaryType = [&](TypeId ot) -> TypeId {
+        if (arith.has_value() && ot.valid()
+            && interner.kind(ot) != TypeKind::Bool) {
+            TypeId const p = integerPromotedType(interner, ot, *arith);
+            if (p.valid()) return p;
+        }
+        return ot;
+    };
     auto const& hirCfg = tree.schema().hirLowering();
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
@@ -9380,12 +9417,19 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     //    already-typed child results, so no recursion) ──
     auto const combineBinary =
         [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
-        if (e->target == "LogicalAnd" || e->target == "LogicalOr") return boolType();
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: `&&`/`||` yield C's `int`
+        // (6.5.13p3 / 6.5.14p3), config-driven — the SSA carrier stays i1/Bool by
+        // design (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE).
+        if (e->target == "LogicalAnd" || e->target == "LogicalOr")
+            return comparisonResultType();
         if (e->target == "Comma")  return rt;                       // value of RHS
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
-            if (isComparison(*op)) return boolType();
+            // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: a relational/equality result
+            // is C's `int` (6.5.8p6 / 6.5.9p3), config-driven (comparisonResultType);
+            // the i1/Bool SSA carrier is the deliberate machine-tier divergence.
+            if (isComparison(*op)) return comparisonResultType();
             // Shift result type follows the config verb `shiftResult` via the
             // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
             // — the SAME function cst_to_hir's combineBinary uses.
@@ -9452,14 +9496,22 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
         // type, so the two tiers agree.
         if (e->target == "PreInc" || e->target == "PreDec") return ot;
-        // c12 (C 6.5.3.3p2): unary `+` yields the INTEGER-PROMOTED operand value.
-        // Like Neg/BitNot the type is operand-preserving here (sub-int values live
-        // promoted in 32-bit regs — the lazy-consumer model — so the carried type
-        // is the operand's; the CST→HIR tier lowers `+x` to the operand itself).
-        if (e->target == "Pos") return ot;
+        // c12 (C 6.5.3.3p2) + D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT: unary
+        // `+` yields the INTEGER-PROMOTED operand type (the value already lives
+        // promoted in a 32-bit reg — the lazy-consumer model), so `sizeof(+c)`
+        // folds to sizeof(int). The EXACT semantic-tier mirror of cst_to_hir's c72
+        // arm via `promotedUnaryType` (config-driven; Bool excluded, float/ptr/≥int
+        // pass through) — so this oracle and the HIR tier cannot drift.
+        if (e->target == "Pos") return promotedUnaryType(ot);
         auto const op = coreOpFromNameSem(e->target);
-        if (op.has_value() && *op == HirOpKind::Not) return boolType();
-        return ot;   // Neg / BitNot are type-preserving
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: logical `!` is `(E == 0)`, whose C
+        // result type is `int` (6.5.3.3p5) — config-driven, NOT the Bool carrier
+        // (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE keeps the i1 SSA).
+        if (op.has_value() && *op == HirOpKind::Not) return comparisonResultType();
+        // Neg / BitNot yield the INTEGER-PROMOTED operand type (C 6.5.3.3p3/p4) —
+        // the same c72 mirror as `+` (sizeof(-c)/(~c) → sizeof(int), sizeof(-sh) →
+        // sizeof(int)); D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT.
+        return promotedUnaryType(ot);
     };
     auto const combinePostfix =
         [&](NodeId node, HirOperatorEntry const* e, TypeId bt) -> TypeId {
@@ -10208,7 +10260,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

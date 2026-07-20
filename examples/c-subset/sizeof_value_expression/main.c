@@ -16,7 +16,11 @@
  * RED-ON-DISABLE (audit-witnessed): rows 1/2/4/5/6/11 mis-size (r01=8
  * r02=8 r04=336 r05=1 r06=1 r11=100; ArraySize collapses to 1) — rows
  * 8/13 happened to coincide pre-fix (q->c was Pass-2-stamped; *q is 8=8).
- * => 42. NOTE: members are `double` (8 bytes on EVERY target) — `long`
+ * => 42. Rows 16-26 + the two _Static_asserts extend the grid to the OPERATOR-
+ * RESULT type (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-
+ * UNARY-PROMOTION-DRIFT): a comparison/logical result is int (4) and a unary
+ * +/-/~ on a sub-int operand promotes to int (4); rows 24-26 pin the runtime
+ * values. NOTE: members are `double` (8 bytes on EVERY target) — `long`
  * would be 4 on pe64/LLP64 and break the grid's expected sizes. */
 struct Big { double a, b, c, d, e, f; };        /* 48 bytes, all targets */
 struct WithInt { int i; char c; };              /* 8 bytes */
@@ -28,6 +32,15 @@ int main(void) {
     struct WithInt s;
     struct WithInt *q = &s;
     char buf[100];
+    char cc = 3;
+    short sh = 7;
+    /* Compile-time pins (target-INDEPENDENT — the result type equals `int`, whose
+     * width is sizeof(int) on ANY data model, never a hardcoded 4). RED-ON-DISABLE:
+     * revert the subtreeType comparison/unary arms and BOTH fail to compile. */
+    _Static_assert(sizeof(1 < 2) == sizeof(int),
+                   "a comparison result type is int (C 6.5.8p6)");
+    _Static_assert(sizeof(-cc) == sizeof(int),
+                   "unary - integer-promotes a sub-int operand to int (C 6.5.3.3)");
     if (sizeof(*p) != 48) return 1;                        /* deref */
     if (sizeof(p[0]) != 48) return 2;                      /* index via ptr */
     if (sizeof(table) != 336) return 3;                    /* whole array */
@@ -43,5 +56,22 @@ int main(void) {
     if (sizeof(*q) != 8) return 13;                        /* deref small */
     if (sizeof p != 8) return 14;                          /* bare ident */
     if (sizeof(s) != 8) return 15;                         /* bare struct */
+    /* c-subset (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-
+     * UNARY-PROMOTION-DRIFT): a comparison/logical RESULT is C's int (4) and a
+     * unary +/-/~ on a sub-int operand integer-PROMOTES to int (4) — subtreeType
+     * now reports the LANGUAGE type, not the 1-byte i1/Bool carrier / the raw
+     * sub-int operand. Rows 24-26 witness the runtime VALUE (1/0/2). RED-ON-DISABLE:
+     * pre-fix rows 16-22 => 1, row 23 => 2 (sizeof the raw Bool/char/short). */
+    if (sizeof(itab[0] < itab[1]) != 4) return 16;         /* relational -> int  */
+    if (sizeof(cc == 0) != 4) return 17;                   /* equality   -> int  */
+    if (sizeof(cc && sh) != 4) return 18;                  /* logical && -> int  */
+    if (sizeof(!cc) != 4) return 19;                       /* logical !  -> int  */
+    if (sizeof(-cc) != 4) return 20;                       /* unary - : char  -> int */
+    if (sizeof(~cc) != 4) return 21;                       /* unary ~ : char  -> int */
+    if (sizeof(+cc) != 4) return 22;                       /* unary + : char  -> int */
+    if (sizeof(-sh) != 4) return 23;                       /* unary - : short -> int */
+    if ((1 < 2) != 1) return 24;                           /* value: true  -> 1 */
+    if ((3 < 2) != 0) return 25;                           /* value: false -> 0 */
+    if ((1 < 2) + (1 < 2) != 2) return 26;                 /* two int comparisons add */
     return 42;
 }

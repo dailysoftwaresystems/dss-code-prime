@@ -377,7 +377,8 @@ TEST(TypeRules, NullptrTAssignsToPointerWhenEnabled) {
     // nullptr → any pointer (object or, in the shipped surface, function pointer)
     EXPECT_TRUE(isAssignable(in, voidPtr, nptr, on));
     EXPECT_TRUE(isAssignable(in, intPtr,  nptr, on));
-    // nullptr → int / bool are NOT admitted
+    // nullptr → int is NEVER admitted; nullptr → bool needs `scalarConvertsToBool`
+    // (defaulted OFF here — see ScalarConvertsToBoolWhenGated for the gated-ON case).
     EXPECT_FALSE(isAssignable(in, intT,  nptr, on));
     EXPECT_FALSE(isAssignable(in, boolT, nptr, on));
     // ONE-WAY: nothing converts TO nullptr_t
@@ -395,9 +396,11 @@ TEST(TypeRules, NullptrTInertWhenDisabled) {
     EXPECT_FALSE(isAssignable(in, voidPtr, nptr, off));
 }
 
-// Explicit cast: `(T*)nullptr` is castable; `(int)nullptr` / `(bool)nullptr` are
-// NOT, and nothing casts TO nullptr_t (the one-way constraint holds for casts too).
-TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
+// Explicit cast: `(T*)nullptr` AND `(bool)nullptr` are castable; `(int)nullptr`
+// (a non-bool arithmetic target) is NOT, and nothing casts TO nullptr_t (the
+// one-way constraint holds for casts too). `(bool)nullptr` -> false — C23 6.3.2.3.2
+// (D-CSUBSET-NULLPTR-BOOL-CONVERSION; nullptr lowers to 0, which truncates false).
+TEST(TypeRules, NullptrTExplicitCastToPointerOrBool) {
     auto in = makeInterner();
     TypeId const nptr    = in.primitive(TypeKind::NullptrT);
     TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
@@ -405,9 +408,49 @@ TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
     TypeId const intT    = in.primitive(TypeKind::I32);
     EXPECT_TRUE(isExplicitCastable(in, voidPtr, nptr));    // (void*)nullptr
     EXPECT_FALSE(isExplicitCastable(in, intT,  nptr));     // (int)nullptr  — rejected
-    EXPECT_FALSE(isExplicitCastable(in, boolT, nptr));     // (bool)nullptr — deferred
+    EXPECT_TRUE(isExplicitCastable(in, boolT, nptr));      // (bool)nullptr — C23, -> false
     EXPECT_FALSE(isExplicitCastable(in, nptr, voidPtr));   // nothing → nullptr_t
     EXPECT_FALSE(isExplicitCastable(in, nptr, intT));
+}
+
+// C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION): with `scalarConvertsToBool` ON, a
+// scalar (arithmetic / Char / pointer / nullptr) is assignable INTO a `_Bool` lhs;
+// OFF (the default), every one reverts to a mismatch — the flag genuinely gates the
+// behavior (a non-C schema keeps `_Bool` strict). A non-scalar source (Void here,
+// standing in for struct/union/FnSig — all rank-0, non-pointer) stays LOUD either
+// way. This is the MIRROR of the boolWidensToArith arm (Bool rhs -> arith lhs).
+TEST(TypeRules, ScalarConvertsToBoolWhenGated) {
+    auto in = makeInterner();
+    TypeId const boolT   = in.primitive(TypeKind::Bool);
+    TypeId const intT    = in.primitive(TypeKind::I32);
+    TypeId const dblT    = in.primitive(TypeKind::F64);
+    TypeId const charT   = in.primitive(TypeKind::Char);
+    TypeId const nptr    = in.primitive(TypeKind::NullptrT);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const voidT   = in.primitive(TypeKind::Void);
+    SemanticConfig::PointerConversionRules pr;
+    auto asg = [&](TypeId lhs, TypeId rhs, bool gate) {
+        return isAssignable(in, lhs, rhs, pr,
+            /*boolWidensToArith=*/false, /*charConvertsToArith=*/false,
+            /*enumConvertsToArith=*/false, /*intCrossSignednessConverts=*/false,
+            /*intSameSignednessNarrows=*/false, /*intConvertsToFloat=*/false,
+            /*floatConvertsToInt=*/false, /*charArrayFromStringLiteralInit=*/false,
+            /*bitIntConversions=*/false, /*scalarConvertsToBool=*/gate);
+    };
+    // Gated ON: scalar -> Bool admitted for arithmetic / char / pointer / nullptr.
+    EXPECT_TRUE(asg(boolT, intT,    true));
+    EXPECT_TRUE(asg(boolT, dblT,    true));
+    EXPECT_TRUE(asg(boolT, charT,   true));
+    EXPECT_TRUE(asg(boolT, voidPtr, true));
+    EXPECT_TRUE(asg(boolT, nptr,    true));
+    // Gated OFF (default): every one reverts to a mismatch (red-on-disable).
+    EXPECT_FALSE(asg(boolT, intT,    false));
+    EXPECT_FALSE(asg(boolT, dblT,    false));
+    EXPECT_FALSE(asg(boolT, charT,   false));
+    EXPECT_FALSE(asg(boolT, voidPtr, false));
+    EXPECT_FALSE(asg(boolT, nptr,    false));
+    // A genuinely-incompatible (non-scalar) source stays LOUD even gated ON.
+    EXPECT_FALSE(asg(boolT, voidT,   true));
 }
 
 // ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────

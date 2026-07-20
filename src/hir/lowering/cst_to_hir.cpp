@@ -590,6 +590,46 @@ struct Lowerer {
                 }
             }
         }
+        // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION / scalar->_Bool): a scalar
+        // (arithmetic non-Bool / Enum / pointer, incl. a `nullptr` already lowered
+        // to an integer 0 above) assigned to a `_Bool` lhs converts by the `!= 0`
+        // truthiness test (0 -> false, any nonzero -> true), NOT a value-truncating
+        // Cast — `_Bool b = 2` MUST be true, but a `Cast -> MIR Trunc(2 -> Bool)`
+        // keeps only the low bit (false). REUSE the ONE truthiness chokepoint
+        // `coerceCondition` (the exact shape `if(x)` lowers) so the assignment and
+        // condition paths cannot drift. An Enum bridges to its underlying integer
+        // first (coerceCondition's arithmetic predicate excludes Enum); a `nullptr`
+        // is already an I32 0 here, so `Ne(0,0)` -> false as C requires. The
+        // semantic tier admits this via isAssignable's `scalarConvertsToBool` arm;
+        // coerce REALIZES it. Placed BEFORE the enum / int->ptr / arithmetic-core
+        // arms so a `_Bool` target never materializes the low-bit-truncating Cast.
+        if (tk == TypeKind::Bool
+            && ((isArithmeticCore(ck) && ck != TypeKind::Bool)
+                || ck == TypeKind::Enum || ck == TypeKind::Ptr)) {
+            E scalar = child;
+            if (ck == TypeKind::Enum) {
+                auto const scals = interner.scalars(child.type);
+                if (!scals.empty())
+                    scalar = coerce(child,
+                        interner.primitive(static_cast<TypeKind>(scals[0])));
+            }
+            E const asBool = coerceCondition(scalar, NodeId{});
+            if (asBool.type.valid()
+                && interner.kind(asBool.type) == TypeKind::Bool) {
+                // Alias the synthetic truthiness node to the operand's span
+                // (coerce's provenance mechanism — coerceCondition's own track()
+                // no-ops on the invalid anchor passed here).
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({asBool.id, it->second});
+                        break;
+                    }
+                }
+                return asBool;
+            }
+            // coerceCondition declined (e.g. a Ptr under a language without the
+            // null-pointer-constant flag) — fall through so the mismatch stays LOUD.
+        }
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): when
         // the source expression is an integer-literal in a pointer-
         // typed context and the active language admits null-pointer-
@@ -3393,6 +3433,14 @@ struct Lowerer {
         // semantics) — each non-Bool scalar operand takes the truthiness
         // `Ne(operand, 0)` test (C99 6.5.13p3 / 6.5.14p3 "compares
         // unequal to 0"), never a value-truncating Cast.
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): the RESULT type here is the i1/Bool SSA CARRIER (a
+        // machine detail, widened to int on any arithmetic use). C's LANGUAGE
+        // result type is `int` (6.5.13p3 / 6.5.14p3) and the SEMANTIC type-oracle
+        // (subtreeType, D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports exactly that
+        // for sizeof/auto/_Generic. The two are different PROPERTIES by design —
+        // like char→i32; flipping this carrier to a full int would reintroduce the
+        // rejected global-flip codegen cost with no language-visible gain.
         if (e.target == "LogicalAnd" || e.target == "LogicalOr") {
             E const lb = coerceCondition(lhs, anchor);
             E const rb = coerceCondition(rhs, anchor);
@@ -3597,6 +3645,12 @@ struct Lowerer {
         // alias (`long` on LP64, `long long` on LLP64), declared per data model
         // in `semantics.synthesizedTypes`. The historic bare I64 was ANONYMOUS,
         // so it matched NEITHER named entry in a `_Generic`.
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): a relational/equality result is the i1/Bool SSA
+        // CARRIER here (a machine detail, widened on use). C's LANGUAGE result
+        // type is `int` (6.5.8p6 / 6.5.9p3); the SEMANTIC type-oracle
+        // (subtreeType, D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports `int` for
+        // sizeof/auto/_Generic. Different PROPERTIES by design — like char→i32.
         TypeId const result = isComparison(*op) ? boolType()
                             : ptrSub      ? synthesizedType(sem.pointerDifferenceType,
                                                             TypeKind::I64)
@@ -3865,6 +3919,12 @@ struct Lowerer {
                 promotedTy = p;
             }
         }
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): logical `!` (`(E == 0)`) results in the i1/Bool SSA
+        // CARRIER here (a machine detail, widened on use). C's LANGUAGE result type
+        // is `int` (6.5.3.3p5); the SEMANTIC type-oracle (subtreeType,
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports `int` for sizeof/auto/
+        // _Generic. `-`/`~` (Neg/BitNot) keep `promotedTy` — the promoted operand.
         TypeId const result = (*op == HirOpKind::Not) ? boolType() : promotedTy;
         return {track(builder.addParent(HirKind::UnaryOp, std::array{unOperand.id},
                                         result, encodeOp(*op)), node), result};

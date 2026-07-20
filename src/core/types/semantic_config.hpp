@@ -2067,6 +2067,20 @@ struct DSS_EXPORT SemanticConfig {
     // distinct from the integer ranks. Closes D-CSUBSET-ENUM-INT-CONVERSION.
     bool enumConvertsToArith = false;
 
+    // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION): a scalar value converts INTO a
+    // `_Bool` lhs in an assignment context — `_Bool b = 5;` / `_Bool b = ptr;` /
+    // `_Bool b = nullptr;` / `_Bool b = (a<b);` — yielding 0 if it compares equal to
+    // 0, else 1. Read by `isAssignable`'s scalar->Bool arm (init / assignment /
+    // call-arg / return), which admits an arithmetic (int rank / float / Char /
+    // Enum) OR pointer OR nullptr rhs into a Bool lhs. The HIR `coerce()` realizes
+    // it as the `!= 0` truthiness test (the SAME condition-materialization `if(x)`
+    // uses — NOT a low-bit-truncating Cast), so the post-coerce verifier (default
+    // false) stays strict. Default false -> a non-C schema (toy/tsql) keeps `_Bool`
+    // strict. The MIRROR of `boolWidensToArith` (Bool rhs -> arith lhs). Closes the
+    // scalar->bool gap the D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE fix unmasked (once
+    // `a<b` types `int`, `_Bool b = (a<b)` needs this arm).
+    bool scalarConvertsToBool = false;
+
     // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed↔unsigned
     // implicit conversion in an ASSIGNMENT context — `int x = u;`, `x = u;`,
     // `return i;` from an int-returning fn with an unsigned `i`, `f(u)` to an int

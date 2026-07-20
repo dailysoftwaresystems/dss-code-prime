@@ -9615,6 +9615,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.enumConvertsToArith = v.get<bool>();
                 }
             }
+            // C 6.3.1.2 scalar->_Bool implicit assignment conversion (read by
+            // `isAssignable`'s scalar->Bool arm; D-CSUBSET-NULLPTR-BOOL-CONVERSION).
+            // Opt-in (default false → a non-C schema keeps `_Bool` strict).
+            if (sem.contains("scalarConvertsToBool")) {
+                auto const& v = sem.at("scalarConvertsToBool");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/scalarConvertsToBool",
+                              "'scalarConvertsToBool' must be a boolean");
+                } else {
+                    cfg.scalarConvertsToBool = v.get<bool>();
+                }
+            }
             // C 6.3.1.3/6.5.16.1 signed↔unsigned implicit assignment conversion (read
             // by `isAssignable`'s cross-signedness arm). Opt-in (default false → a
             // non-C schema keeps signed/unsigned strictly distinct).

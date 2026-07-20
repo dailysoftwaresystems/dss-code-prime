@@ -210,7 +210,8 @@ namespace detail::type_rules {
     bool                                               intConvertsToFloat = false,
     bool                                               floatConvertsToInt = false,
     bool                                               charArrayFromStringLiteralInit = false,
-    bool                                               bitIntConversions = false) noexcept {
+    bool                                               bitIntConversions = false,
+    bool                                               scalarConvertsToBool = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -303,26 +304,46 @@ namespace detail::type_rules {
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
         return true;
     }
-    // A Bool value WIDENS into any arithmetic slot (C99 6.3.1.2 — `_Bool`
-    // promotes to `int`; a comparison/logical result `Bool` flowing into an
-    // int/float lhs, e.g. `int f(){ return a < b; }`, `int x = a && b;`).
-    // The complete semantic-tier expression typer (`subtreeType`) now types
-    // `a < b` as Bool, so this check actually runs; admitting it makes the
-    // semantic tier AGREE with the HIR `coerce()` (which materializes the
-    // Bool→int Cast). Gated on `boolWidensToArith` so ONLY the pre-coerce
-    // semantic checks admit it — the post-coerce verifier stays strict. This
-    // is the ASSIGNMENT direction only — `Bool` stays out of `isArithmetic`
-    // (above), so binary PROMOTION (`bool + bool`) is unaffected. c48
-    // (D-CSUBSET-BOOL-CHAR-WIDENING): when `charConvertsToArith` also treats
-    // `char` (interned as `TypeKind::Char`, outside the int RANKS) as an
-    // arithmetic slot, a Bool widens into a `char` lhs too — `char c = (a==b);`,
-    // the sqlite `p->nFloor = (p->D==31)` shape. Arithmetic `char = a-b` already
-    // worked via the `charConvertsToArith` arm below (int→char); only the
-    // Bool-RESULT (comparison/logical) flowing into a plain `char` was missed.
+    // An ACTUAL `_Bool` value WIDENS into an arithmetic slot (C99 6.3.1.2 —
+    // `_Bool` promotes to `int`): `int n = flag;`, `f(flag)` to an int/float
+    // param, `char c = flag;`. (A comparison/logical RESULT no longer reaches
+    // here as a Bool — since D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE the semantic
+    // typer `subtreeType` types `a < b` / `a && b` / `!a` as C's `int`, so those
+    // route through the ordinary int arms above; this arm now serves the
+    // remaining GENUINE `_Bool`-typed operands — a `_Bool` variable / a
+    // `_Bool`-returning call.) Gated on `boolWidensToArith` so ONLY the
+    // pre-coerce semantic checks admit it — the post-coerce verifier stays
+    // strict (the HIR `coerce()` materializes the Bool→int Cast). ASSIGNMENT
+    // direction only — `Bool` stays out of `isArithmetic` (above), so binary
+    // PROMOTION (`bool + bool`) is unaffected. c48 (D-CSUBSET-BOOL-CHAR-WIDENING):
+    // when `charConvertsToArith` also treats `char` (interned as `TypeKind::Char`,
+    // outside the int RANKS) as an arithmetic slot, a `_Bool` widens into a `char`
+    // lhs too — `char c = flag;` (the sqlite `p->nFloor = (p->D==31)` shape once
+    // the RHS is an actual Bool). The MIRROR direction (a scalar INTO a `_Bool`
+    // lhs) is the `scalarConvertsToBool` arm just below.
     if (boolWidensToArith && rk == TypeKind::Bool
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
             || floatRank(lk) != 0
             || (charConvertsToArith && lk == TypeKind::Char))) {
+        return true;
+    }
+    // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION / scalar->_Bool): the MIRROR of
+    // the arm above — ANY scalar value converts INTO a `_Bool` lhs (the result is
+    // 0 if the value compares equal to 0, else 1). An arithmetic (int rank / float
+    // / Char / Enum) OR pointer OR `nullptr` rhs is admitted; the HIR `coerce()`
+    // materializes it as the `!= 0` truthiness test — NOT a low-bit-truncating
+    // Cast (so `_Bool b = 2` is true) — reusing the ONE condition-materialization
+    // chokepoint `coerceCondition`. Gated on `scalarConvertsToBool` (a non-C
+    // schema keeps `_Bool` strict; the post-coerce verifier — default false —
+    // stays strict too). Genuinely-INCOMPATIBLE sources (struct / union / void /
+    // FnSig — all rank-0 and non-pointer) are NOT admitted -> they stay a loud
+    // reject. Was the c48-masked gap the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]]
+    // fix unmasked: once `a < b` types `int`, `_Bool b = (a<b)` needs this arm.
+    if (scalarConvertsToBool && lk == TypeKind::Bool
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
+            || floatRank(rk) != 0
+            || rk == TypeKind::Char || rk == TypeKind::Enum
+            || rk == TypeKind::Ptr  || rk == TypeKind::NullptrT)) {
         return true;
     }
     // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
@@ -634,13 +655,15 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     // C23 (D-CSUBSET-NULLPTR): `nullptr` (a NullptrT operand) casts explicitly to
-    // any POINTER target (`(T*)nullptr`). Restricted to a Ptr target ONLY — a cast
-    // to an arithmetic type (`(int)nullptr`) is NOT sanctioned by C23, and NO arm
-    // admits NullptrT as the cast TARGET (the one-way constraint holds for casts
-    // too). `(bool)nullptr` is DEFERRED with the implicit nullptr→bool conversion
-    // (D-CSUBSET-NULLPTR-BOOL-CONVERSION — the c-subset has no scalar→bool path).
-    // nullptr lowers to the integer-0 null const → the existing null-const path.
-    if (ok == TypeKind::NullptrT && tk == TypeKind::Ptr) {
+    // any POINTER target (`(T*)nullptr`) AND to `_Bool` (`(bool)nullptr` -> false,
+    // C23 6.3.2.3.2). A cast to a non-bool arithmetic type (`(int)nullptr`) is NOT
+    // sanctioned by C23, and NO arm admits NullptrT as the cast TARGET (the one-way
+    // constraint holds for casts too). Ungated, like the sibling Ptr arm — NullptrT
+    // only exists in a nullptr-declaring schema, so this is inert elsewhere. nullptr
+    // lowers to the integer-0 null const, so `(bool)nullptr` truncates 0 -> false
+    // correctly (D-CSUBSET-NULLPTR-BOOL-CONVERSION, the explicit-cast face).
+    if (ok == TypeKind::NullptrT
+        && (tk == TypeKind::Ptr || tk == TypeKind::Bool)) {
         return true;
     }
     return false;
