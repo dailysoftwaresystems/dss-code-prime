@@ -98,6 +98,8 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 ### ★ Go-forward priority queue — 2026-07-20 full-plan sweep (compile-speed reframed)
 
 > **Sweep finding (reconcile-to-truth):** the user's LEAD priority "make compiling faster first" is **largely already satisfied** — the O(n²)/parallelism/resolver + release-optimizer compile-speed wins all landed. The queue below re-ranks what remains so we **address all** of full-C23 + the important deferrals. Each tier = one or more `/dss-cycle` cycles; anchor ids resolve in `_deferred-anchor-registry.md`. The four blocks (A/B/C below) are the detailed source; this is the prioritized reading of them.
+>
+> **★ User-decided execution order (2026-07-20, post-rebase onto #47):** (0) rebase this branch onto main #47 [static linking + long double F80/F128 + type identity] ✅ → (1) re-check + fix the correctness silent-miscompiles (Tier 2) → (2) compile-speed levers `D-PERF-2`/`-3` (Tier 1) → (3) finish the sqlite testfixture arc → 44/44 (Tier 0) → (4) FC18 (Tier 3) in a **NEW PR**; every other item stays in PR #46. The tiers below are the catalog; this line is the execution sequence, run via `/dss-cycle` in `/loop` until done.
 
 - **Tier 0 — IN FLIGHT (the standing `/loop` goal "all sqlite units green")** — SQLite testfixture TCL-FFI arc (`D-FFI-TCL-DESCRIPTOR`, row **TF**). At C32, CLEAN **40/44** `test*.c`, at the §B wall.
   - **C33** — fn-ptr ↔ object-ptr conversion allowance (gcc/POSIX, LP64-well-defined; user-approved 2026-07-20) → `test_md5` CLEAN → **41/44**.
