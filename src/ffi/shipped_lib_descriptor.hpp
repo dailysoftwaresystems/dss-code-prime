@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -354,10 +355,28 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // loud on read). AGNOSTIC: a config-declared set the resolver tests membership
     // against — never an `if (format == ...)`. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
     std::vector<std::string>   availableObjectFormats;
+    // Optional `includes` — the transitive sibling headers this descriptor
+    // `#include`s in the real world (D-FFI-DESCRIPTOR-INCLUDES). When a TU
+    // `#include`s the parent header (so DSS resolves THIS descriptor), DSS ALSO
+    // resolves + injects each declared sibling descriptor's surface into that TU
+    // — modeling the real transitive `#include` graph a flat descriptor cannot
+    // carry (real `tcl.h` `#include`s `<stdio.h>`, so tcl.json declares
+    // `includes:["stdio.h"]` and a `<tcl.h>` user reaches FILE/fopen/…). Each
+    // entry is a header NAME resolved by the SAME `<stem>.json` convention as a
+    // source `#include <…>` (`resolveSystemDescriptor`): "stdio.h"→stdio.json,
+    // "sys/uio.h"→sys/uio.json (subdir-preserving, extension-agnostic). EMPTY/
+    // absent ⇒ no transitive edges (every existing descriptor is untouched —
+    // pure back-compat). Fully generic: any descriptor may declare `includes`;
+    // the engine walks a config-declared graph via `forEachDescriptorInClosure`
+    // with NO `if (name==…)` and no source/target/format identity branch.
+    std::vector<std::string>     includes;    // transitive sibling header names
     // The full neutral surface a header provides. A descriptor must declare AT
     // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
     // no-op artifact and fails loud); a header may legitimately carry only
-    // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix.
+    // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix. (`includes`
+    // above does NOT count toward "declares something" — an includes-only
+    // umbrella descriptor is out of scope this cycle; add it here when a real
+    // umbrella-header consumer lands.)
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
     std::vector<ShippedFloatConstant> floatConstants; // named float constants (folded; c52)
@@ -473,6 +492,52 @@ readShippedLibAvailability(std::filesystem::path const& path,
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
 readShippedLibTypedefNames(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
+
+// Read ONLY the `includes` surface (the transitive sibling-header NAMES) from the
+// descriptor at `path`, WITHOUT a TypeInterner — the interner-free sibling of
+// `readShippedLibMacros`/`readShippedLibAvailability` for the two tiers that have
+// `systemDirs` (the preprocessor macro-splice + the import resolver) and no
+// interner. Returns the declared header-name list (EMPTY when the descriptor
+// declares no `includes` — the common case, every existing descriptor);
+// std::nullopt + `F_ShippedLibDescriptorMalformed` on a malformed `includes` field
+// (not an array, or a non-string / empty entry). Validated through the SAME shared
+// decode as the full `readShippedLibDescriptor` read, so the interner-free and
+// interned reads never drift (the `readShippedLibMacros` lock-step precedent).
+// (D-FFI-DESCRIPTOR-INCLUDES)
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibIncludes(std::filesystem::path const& path,
+                       DiagnosticReporter&          reporter);
+
+// Walk the transitive shipped-descriptor closure rooted at `startPath`, invoking
+// `visit(path)` once for EACH DISTINCT descriptor in the closure, PARENT-FIRST (a
+// descriptor before the siblings its `includes` declares). The SHARED cycle-safe
+// walker both `systemDirs`-bearing tiers use (the preprocessor macro-splice + the
+// import resolver typed-surface record), so the two can never disagree on the
+// transitive set. (D-FFI-DESCRIPTOR-INCLUDES)
+//
+//   * CYCLE / DIAMOND SAFE: a single DFS keyed on the WEAKLY-CANONICAL descriptor
+//     path in `visited` — the SAME key the semantic `readDescriptors` dedup +
+//     `cachedDescriptorJson` cache use. A path is visited AT MOST ONCE, so A→B→A
+//     terminates at the second A and a diamond's shared leaf is visited once. The
+//     recursion is bounded by the finite shipped-descriptor count. `visited` is
+//     in/out: pass ONE shared set across multiple roots (the import resolver's
+//     CU-wide set — a sibling reached from two parents or also included directly
+//     is recorded once) or a fresh set per root (the preprocessor's per-call set).
+//   * `includes` is read interner-free with a THROWAWAY reporter: a malformed
+//     `includes` FIELD is surfaced by the semantic `readShippedLibDescriptor` that
+//     reads the SAME descriptor (the import resolver records a ref per closure
+//     descriptor) — never silent, never double-reported here.
+//   * An `includes` entry that resolves to NO descriptor on `systemDirs` (a typo
+//     `stdioo.h`) invokes `onUnresolvedInclude(headerName)` — a config error the
+//     caller surfaces LOUD (the import resolver positions an
+//     `F_ShippedHeaderNotFound` on the `#include` line; this is the ONLY tier that
+//     can catch it, since the interner-less semantic tier has no `systemDirs`).
+DSS_EXPORT void forEachDescriptorInClosure(
+    std::filesystem::path const&                            startPath,
+    std::span<std::filesystem::path const>                  systemDirs,
+    std::unordered_set<std::string>&                        visited,
+    std::function<void(std::filesystem::path const&)> const& visit,
+    std::function<void(std::string const&)> const&           onUnresolvedInclude);
 
 // True iff a header carrying availability set `availableObjectFormats` is
 // available on object-format `fmt`. EMPTY set ⇒ available on EVERY format

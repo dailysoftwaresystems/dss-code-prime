@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-DESCRIPTOR-INCLUDES (SQLite testfixture arc, C32 2026-07-20): the RUN witness for the TRANSITIVE shipped-header #include graph. main.c does `#include <tcl.h>` with NO direct `#include <stdio.h>` — the entire stdio surface it uses (FILE typedef, fopen/fwrite/fread/fseek/fclose/remove, SEEK_SET) arrives ONLY through tcl.json's `includes:[stdio.h]` transitive edge (real tcl.h #includes <stdio.h>; DSS resolves tcl.json, walks its includes closure, injects stdio.json's surface alongside tcl's — the flat-descriptor FILE §B fix, exactly the sqlite src/test_md5.c → tclsqlite.h → <tcl.h> path). 42 is reconstructed from two bytes round-tripped through a REAL file (fwrite then fread) so no optimizer pass can fold it away; Tcl_CreateInterp/DeleteInterp exercise the PARENT descriptor in the same TU (proving parent + transitive child coexist + grounding NEEDED libtcl8.6.so). ELF-ONLY: tcl.json is availableObjectFormats:[elf] so a pe64/macho target fails the <tcl.h> availability gate at compile (loud) — mirrors every shipped_tcl_* witness; only x86_64-linux RUNS (libtcl present; the ubuntu x86_64 CI legs install libtcl8.6, native-arm64 arch-gates/skips, windows/macos compile-only-skip via runOn). RED-ON-DISABLE: remove tcl.json's `includes` field -> FILE/fopen/... no longer injected -> main.c fails to compile with S0001 on `FILE *f;`.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

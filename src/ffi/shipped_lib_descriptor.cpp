@@ -2,6 +2,7 @@
 
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/include_path_resolve.hpp"   // resolveSystemDescriptor (the `includes` closure walk)
 #include "core/types/object_format_kind.hpp"     // objectFormatKindFromName (library-map key vocabulary)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"            // InvalidType
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>       // std::getenv (DSS_CONFIG_ROOT discovery)
 #include <fstream>
+#include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
 #include <optional>
 #include <span>
@@ -585,6 +587,48 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     }
 }
 
+// Decode the optional `includes` array (the transitive sibling-header NAMES, plan
+// D-FFI-DESCRIPTOR-INCLUDES) into `out`. Each entry must be a NON-EMPTY string (a
+// header NAME later resolved via `resolveSystemDescriptor`'s `<stem>.json`
+// convention by the closure walker — this decode does NOT resolve or validate
+// existence, only shape). Absent/empty ⇒ no transitive edges (back-compat). Shared
+// chokepoint: the full interned read AND the fast interner-free
+// `readShippedLibIncludes` (the preprocessor + import-resolver tiers) both decode
+// through this, so they can never drift (the `decodeShippedMacros`/
+// `decodeShippedAvailability` lock-step precedent). Content-blind: whether a name
+// resolves to a real descriptor is the walker's concern (it alone has systemDirs).
+void decodeShippedIncludes(json const& doc, std::string const& pathStr,
+                           DiagnosticReporter& reporter,
+                           std::vector<std::string>& out) {
+    if (!doc.contains("includes")) return;
+    if (!doc.at("includes").is_array()) {
+        emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                    + "': 'includes' must be an array of header-name "
+                                      "strings, e.g. [\"stdio.h\"]");
+        return;
+    }
+    for (auto const& v : doc.at("includes")) {
+        if (!v.is_string() || v.get<std::string>().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                        + "': every 'includes' entry must be a non-empty "
+                                          "header-name string (e.g. \"stdio.h\")");
+            continue;
+        }
+        out.push_back(v.get<std::string>());
+    }
+}
+
+// The weakly-canonical descriptor-path KEY shared by the closure walker's visited
+// set, the semantic `readDescriptors` dedup, and `cachedDescriptorJson` — so all
+// three agree that "the same descriptor" is the same path. Falls back to
+// `lexically_normal` when the file can't be canonicalized (mirrors the two
+// existing call sites verbatim).
+[[nodiscard]] std::string descriptorPathKey(std::filesystem::path const& path) {
+    std::error_code ec;
+    auto const canon = std::filesystem::weakly_canonical(path, ec);
+    return (ec ? path.lexically_normal() : canon).string();
+}
+
 // Decode a struct `fields` JSON array (non-empty, each `{name,type}`) into
 // `outFields` + the parallel `outFieldTypes`. Each field type decodes via the ONE
 // `parseTypeFromText` codec; a duplicate field name or an undecodable type FAILS
@@ -836,6 +880,15 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     decodeShippedAvailability(doc, path.generic_string(), reporter,
                               out.availableObjectFormats);
 
+    // (2.6) Optional `includes` — the transitive sibling-header NAMES
+    // (D-FFI-DESCRIPTOR-INCLUDES). Decoded through the SHARED chokepoint so this
+    // interned read + the interner-free `readShippedLibIncludes` (the closure
+    // walker's source) can never drift. Resolution/existence of each name is the
+    // walker's concern (it alone carries `systemDirs`) — HERE we only validate
+    // shape (non-empty strings). A malformed `includes` field fails the read via
+    // the errorCount delta below (never a partial import).
+    decodeShippedIncludes(doc, path.generic_string(), reporter, out.includes);
+
     // (3) `symbols` array — OPTIONAL. A header may carry only `constants`
     // (e.g. <limits.h>, all `#define`s, no linkable symbols) or only
     // `typedefs`; the "declares SOMETHING" requirement is enforced across
@@ -858,8 +911,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "availableObjectFormats",
-                             "symbols", "constants", "floatConstants", "typedefs",
-                             "structs", "macros", "$comment"});
+                             "includes", "symbols", "constants", "floatConstants",
+                             "typedefs", "structs", "macros", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -1891,6 +1944,71 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
     }
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ no typedef surface (the oracle learns nothing new)
+}
+
+std::optional<std::vector<std::string>>
+readShippedLibIncludes(std::filesystem::path const& path,
+                       DiagnosticReporter&          reporter) {
+    // Interner-FREE `includes` read for the two `systemDirs`-bearing tiers (the
+    // preprocessor macro-splice + the import resolver), which have no interner.
+    // Decodes through the SAME `decodeShippedIncludes` chokepoint as the full read,
+    // so the interner-free and interned reads validate identically (the
+    // `readShippedLibMacros`/`readShippedLibAvailability` lock-step precedent). No
+    // `header`/typed-surface gate — the semantic read owns those (this stays no
+    // STRICTER than the full read). std::nullopt on a broken JSON / malformed
+    // `includes`; EMPTY ⇒ the descriptor declares no `includes` (the common case).
+    std::size_t const errBefore = reporter.errorCount();
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
+    std::vector<std::string> out;
+    decodeShippedIncludes(doc, path.generic_string(), reporter, out);
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;  // empty ⇒ no transitive edges
+}
+
+void forEachDescriptorInClosure(
+    std::filesystem::path const&                             startPath,
+    std::span<std::filesystem::path const>                   systemDirs,
+    std::unordered_set<std::string>&                         visited,
+    std::function<void(std::filesystem::path const&)> const& visit,
+    std::function<void(std::string const&)> const&           onUnresolvedInclude) {
+    // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
+    // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
+    // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
+    // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
+    // recursion is bounded by the finite shipped-descriptor count — no fixpoint
+    // iteration, a single DFS is complete + terminating.
+    std::string const key = descriptorPathKey(startPath);
+    if (!visited.insert(key).second) return;   // already in the closure
+
+    // PARENT FIRST — visit this descriptor before the siblings its `includes`
+    // declares (so the caller records/splices parent-before-transitive-child; the
+    // semantic first-wins dedup then lets the named parent's surface beat a
+    // transitively-included sibling's on any name collision).
+    visit(startPath);
+
+    // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
+    // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
+    // that reads the SAME descriptor (the import resolver records a ref per closure
+    // descriptor) — never silent, never double-reported here (the
+    // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
+    // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
+    DiagnosticReporter throwaway;
+    auto const includes = readShippedLibIncludes(startPath, throwaway);
+    if (!includes) return;
+    for (std::string const& headerName : *includes) {
+        // Resolve each sibling by the SAME `<stem>.json` funnel a source
+        // `#include <h>` uses (so the transitive edge and a direct include agree
+        // byte-for-byte). An entry that resolves to NO descriptor is a config error
+        // — the caller surfaces it LOUD (this is the ONLY tier that can, since the
+        // interner-less semantic tier has no systemDirs). Continue past it so one
+        // typo does not swallow the rest of the closure.
+        auto const childPath = resolveSystemDescriptor(headerName, systemDirs);
+        if (!childPath) { onUnresolvedInclude(headerName); continue; }
+        forEachDescriptorInClosure(*childPath, systemDirs, visited, visit,
+                                   onUnresolvedInclude);   // DFS recurse
+    }
 }
 
 bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectFormats,

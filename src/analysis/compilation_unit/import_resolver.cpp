@@ -8,6 +8,7 @@
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/tree_visitor.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"   // forEachDescriptorInClosure (transitive `includes`)
 
 #include <cctype>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace dss {
@@ -223,6 +225,14 @@ private:
         struct Edge { TreeId source; NodeId node; SourceSpan span; TreeId target; };
         std::vector<Edge> edges;
 
+        // D-FFI-DESCRIPTOR-INCLUDES: the CU-wide visited set for the transitive
+        // shipped-descriptor closure walk. SHARED across every direct angle
+        // `#include <h>` in the CU (across all trees) so a sibling reached from
+        // two parents — or also included directly — is recorded ONCE, and a
+        // descriptor cycle terminates. Keyed on the weakly-canonical descriptor
+        // path (the SAME key the semantic readDescriptors dedup uses).
+        std::unordered_set<std::string> systemVisited;
+
         // Index-based loop: include-following appends to context.trees, and we
         // re-derive context.trees[i] each iteration (stable across reallocation)
         // rather than holding a Tree reference across loadFile.
@@ -311,11 +321,33 @@ private:
                     auto const resolved = resolveSystemDescriptor(
                         directive.filename, context.systemDirs);
                     if (!resolved) { unresolved(); continue; }
-                    // Carry the include directive's span + buffer so the per-target
-                    // SEMANTIC availability gate can position its diagnostic on the
-                    // `#include` line (the format isn't known until semantic time).
-                    context.shippedLibDescriptors.push_back(
-                        ShippedDescriptorRef{*resolved, directive.span, sourceBuffer});
+                    // D-FFI-DESCRIPTOR-INCLUDES: record a ShippedDescriptorRef for
+                    // the resolved descriptor AND for every sibling its `includes`
+                    // transitively declares — via the SHARED cycle-safe closure
+                    // walker (so this typed-surface tier and the preprocessor
+                    // macro-splice can never disagree on the transitive set). Each
+                    // ref carries the SAME `#include` directive span+buffer so any
+                    // deferred per-target diagnostic points at the user's include
+                    // line. Parent-FIRST record order → the semantic first-wins
+                    // dedup lets the named parent beat a transitively-included
+                    // sibling on any name collision. The semantic injection loop is
+                    // UNCHANGED — it just receives more refs. An `includes` entry
+                    // that resolves to no descriptor is the SAME hard
+                    // F_ShippedHeaderNotFound as a direct miss, positioned on this
+                    // `#include` line (this tier alone has systemDirs to catch it).
+                    ffi::forEachDescriptorInClosure(
+                        *resolved, context.systemDirs, systemVisited,
+                        [&](std::filesystem::path const& descPath) {
+                            context.shippedLibDescriptors.push_back(
+                                ShippedDescriptorRef{descPath, directive.span,
+                                                     sourceBuffer});
+                        },
+                        [&](std::string const& missingHeader) {
+                            reportDriver(context.diagnostics,
+                                         DiagnosticCode::F_ShippedHeaderNotFound,
+                                         DiagnosticSeverity::Error, sourceBuffer,
+                                         directive.span, missingHeader);
+                        });
                     continue;
                 }
 

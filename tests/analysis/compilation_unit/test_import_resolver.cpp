@@ -330,6 +330,101 @@ TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
 }
 
+// D-FFI-DESCRIPTOR-INCLUDES: an angle `#include <parent.h>` whose descriptor
+// declares `includes:["child.h"]` records a ShippedDescriptorRef for BOTH the
+// parent AND the transitively-included child (parent-FIRST), so the semantic phase
+// injects the child's typed surface too — the flat-descriptor FILE §B fix, exercised
+// host-portably (no libtcl/elf; just the recorded refs). RED-ON-DISABLE: revert the
+// closure walk to a single-ref push → only parent.json is recorded → the child's
+// symbols never inject (test_md5's FILE class stays S0001).
+TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <parent.h>\nint main() { return 0; }\n");
+    auto parent = sysDir.write("parent.json",
+        R"({ "header": "parent.h", "includes": ["child.h"],
+             "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
+    auto child = sysDir.write("child.json",
+        R"({ "header": "child.h",
+             "symbols": [ { "name": "cfn", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 2u)
+        << "the parent's `includes` must record the transitive child ref too";
+    std::error_code ec;
+    auto const got0 = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
+    auto const got1 = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[1].path, ec);
+    EXPECT_EQ(got0, std::filesystem::weakly_canonical(parent, ec))
+        << "parent recorded FIRST (parent-wins on a name collision)";
+    EXPECT_EQ(got1, std::filesystem::weakly_canonical(child, ec))
+        << "the transitively-included child recorded second";
+    // Both refs carry the SAME `#include <parent.h>` directive span+buffer (so a
+    // deferred per-target diagnostic points at the user's include line).
+    EXPECT_EQ(cu.shippedLibDescriptors()[0].buffer.v,
+              cu.shippedLibDescriptors()[1].buffer.v);
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES fail-loud: an `includes` entry that resolves to NO
+// descriptor is the SAME hard F_ShippedHeaderNotFound as a direct miss, positioned
+// on the parent `#include` line (the import resolver is the ONLY tier with
+// systemDirs to catch it). RED-ON-DISABLE: drop the onUnresolvedInclude arm → a
+// typo'd transitive include is silently swallowed.
+TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <parent.h>\nint main() { return 0; }\n");
+    // parent resolves, but its `includes` names a header with NO descriptor.
+    sysDir.write("parent.json",
+        R"({ "header": "parent.h", "includes": ["stdioo.h"],
+             "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+        << "an unresolvable `includes` entry must fire F_ShippedHeaderNotFound";
+    // The parent still records its own ref (the closure records the parent before
+    // hitting the unresolvable child).
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "the parent is still recorded; only the missing transitive child errors";
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES cycle-safety at the CU level: parent<->child mutual
+// `includes` records each descriptor EXACTLY ONCE and TERMINATES (the CU-wide
+// visited-set). RED-ON-DISABLE: drop the visited-set guard → infinite recursion.
+TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <pa.h>\nint main() { return 0; }\n");
+    sysDir.write("pa.json",
+        R"({ "header": "pa.h", "includes": ["pb.h"],
+             "symbols": [ { "name": "af", "signature": "fn() -> i32" } ] })");
+    sysDir.write("pb.json",
+        R"({ "header": "pb.h", "includes": ["pa.h"],
+             "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+    // Terminated (we got here) + each descriptor recorded exactly once.
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 2u)
+        << "a cyclic includes graph records each descriptor exactly once + terminates";
+}
+
 // The quote form does NOT search the system dir, and the angle form does
 // NOT search includeDirs — the two paths are distinct (config-driven by
 // pathToken vs systemPathToken, no language branch).

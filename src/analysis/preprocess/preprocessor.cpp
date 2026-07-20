@@ -580,36 +580,20 @@ struct SynthBuilder {
         if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
         auto descPath = resolveSystemDescriptor(headerName, systemDirs);
         if (!descPath) return SystemMacroSplice::NotAvailable;
-        // If the descriptor declares this header unavailable on the active
+        // If the PARENT descriptor declares this header unavailable on the active
         // object-format, treat it EXACTLY like "no descriptor on the path" — the
         // semantic gate then fails loud + `__has_include` returns false, so all
-        // three descriptor consumers stay consistent (c9 MUST-FIX-3).
+        // three descriptor consumers stay consistent (c9 MUST-FIX-3). This drives
+        // the NotAvailable return (the caller leaves the include verbatim).
         if (activeFormat.has_value()
             && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
             return SystemMacroSplice::NotAvailable;
         }
-        DiagnosticReporter macroRep;
-        // Pass the active object-format so a per-FORMAT macro variant selects the
-        // right replacement; nullopt ⇒ a variants-only macro is not injected.
-        auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
-        if (!macros) {
-            // Malformed descriptor: report ONLY on a confidently-live include (see
-            // the `reportMalformed` note above). A dead/uncertain branch stays
-            // silent — dead-branch inertness — while the include is left verbatim by
-            // the caller (Malformed != Spliced) and elided by the authoritative pass.
-            if (reportMalformed) {
-                emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
-                       SourceSpan::empty(0),
-                       std::string{"shipped-header descriptor malformed (macros): "}
-                           + descPath->generic_string());
-            }
-            return SystemMacroSplice::Malformed;
-        }
-        for (auto const& macro : *macros) {
-            // Reconstruct the neutral macro as a `#define` line; the downstream
-            // tokenizer + handleDefine build the MacroDef with the proven
-            // function-like / param / redefinition machinery (an identical
-            // re-define on a double-include is idempotent).
+        // Reconstruct one neutral macro as a `#define` line into `out`; the
+        // downstream tokenizer + handleDefine build the MacroDef with the proven
+        // function-like / param / redefinition machinery (an identical re-define on
+        // a double-include is idempotent).
+        auto const spliceMacro = [&out](ffi::ShippedMacro const& macro) {
             std::string def = "#define " + macro.name;
             if (macro.params.has_value()) {
                 def += "(";
@@ -631,6 +615,58 @@ struct SynthBuilder {
             }
             def += "\n";
             out.append(def);
+        };
+        // D-FFI-DESCRIPTOR-INCLUDES: splice the PARENT's macros AND every
+        // transitively-included sibling's, via the SHARED cycle-safe closure walker
+        // (so this macro chokepoint and the import-resolver typed-surface record can
+        // never disagree on the transitive set). Parent-FIRST; each descriptor is
+        // independently gated by the SAME per-format availability check. The
+        // PARENT's macro read drives the return value (Malformed/Spliced) exactly as
+        // pre-closure. A sibling that is format-unavailable, malformed, or an
+        // unresolvable `includes` entry contributes no macros and is SILENT here —
+        // the import-resolver + semantic tiers read the SAME closure and own those
+        // loud diagnostics (F_ShippedLibDescriptorMalformed / F_ShippedHeaderNotFound,
+        // positioned on the `#include` line), mirroring the pre-closure `macroRep`
+        // throwaway discipline (dead-branch inertness preserved). On elf tcl→stdio
+        // this splices tcl.json's macros + stdio.json's (elf: zero — stdio's macros
+        // are pe/macho stdin/stdout/stderr variants), so no elf delta; the path is
+        // exercised for correctness on the other formats.
+        bool parentMacrosMalformed = false;
+        bool sawParent = false;
+        std::unordered_set<std::string> visited;   // per-call (a splice is one root)
+        ffi::forEachDescriptorInClosure(
+            *descPath, systemDirs, visited,
+            [&](fs::path const& p) {
+                bool const isParent = !sawParent;
+                sawParent = true;
+                // Per-descriptor availability (the parent already passed; a sibling
+                // absent on this format contributes no macros — mirrors today's
+                // single-descriptor behavior applied to each closure member).
+                if (activeFormat.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(p, *activeFormat)) {
+                    return;
+                }
+                DiagnosticReporter macroRep;   // throwaway — malformed surfaced downstream
+                // Pass the active object-format so a per-FORMAT macro variant selects
+                // the right replacement; nullopt ⇒ a variants-only macro is not injected.
+                auto macros = ffi::readShippedLibMacros(p, macroRep, activeFormat);
+                if (!macros) { if (isParent) parentMacrosMalformed = true; return; }
+                for (auto const& macro : *macros) spliceMacro(macro);
+            },
+            [&](std::string const&) { /* import resolver owns F_ShippedHeaderNotFound */ });
+
+        if (parentMacrosMalformed) {
+            // Malformed PARENT descriptor: report ONLY on a confidently-live include
+            // (the `reportMalformed` note above). A dead/uncertain branch stays
+            // silent — dead-branch inertness — while the include is left verbatim by
+            // the caller (Malformed != Spliced) and elided by the authoritative pass.
+            if (reportMalformed) {
+                emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"shipped-header descriptor malformed (macros): "}
+                           + descPath->generic_string());
+            }
+            return SystemMacroSplice::Malformed;
         }
         return SystemMacroSplice::Spliced;
     }

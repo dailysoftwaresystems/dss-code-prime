@@ -4075,8 +4075,15 @@ TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
         "#include <io.h>\n"
         "int main() { puts(\"hi\"); return 0; }\n");
     ASSERT_EQ(cu->trees().size(), 1u);
-    // Two directives → two recorded descriptor paths (deduped at injection).
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 2u);
+    // Two directives resolving to the SAME descriptor → ONE recorded path
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups at RECORD time — a descriptor reached twice, whether transitively or,
+    // as here, directly-included-twice, is recorded once). The semantic injection
+    // loop's own canonical-path `readDescriptors` dedup already collapsed the
+    // second ref pre-change, so injections + diagnostics are byte-identical; only
+    // the redundant ref is no longer stored. RED-ON-DISABLE of the whole path stays
+    // the injection assertions below (puts minted exactly once).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);
@@ -4120,8 +4127,12 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
         "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     ASSERT_EQ(cu->trees().size(), 1u) << "descriptors are not parsed Trees";
-    // Six directives → six recorded paths (dup repeated); deduped at injection.
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 6u);
+    // Six directives, but `dup` is included TWICE → FIVE distinct recorded paths
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups the repeated `dup` at RECORD time; the semantic loop's canonical-path
+    // dedup already collapsed it pre-change, so the injection result below is
+    // byte-identical — only the redundant `dup` ref is no longer stored).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 5u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);

@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace dss;
@@ -503,6 +505,199 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     ASSERT_TRUE(macros.has_value());   // NOT nullopt — header absence is not an error
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_TRUE(macros->empty());      // no `macros` key -> nothing injected
+}
+
+// ── D-FFI-DESCRIPTOR-INCLUDES: the transitive shipped-header `#include` graph ──
+//
+// A descriptor may declare `"includes": ["stdio.h"]` — the sibling headers it
+// transitively `#include`s. `readShippedLibDescriptor` populates `.includes`, the
+// interner-free `readShippedLibIncludes` returns the same (lock-step), and
+// `forEachDescriptorInClosure` walks the closure cycle-safe.
+
+// (a) `includes` decodes on BOTH the interned full read AND the interner-free read.
+// RED-ON-DISABLE: drop the `decodeShippedIncludes` call in readShippedLibDescriptor
+// (or the readShippedLibIncludes impl) → `.includes` empty / nullopt.
+TEST(ShippedLibDescriptor, IncludesSurfaceDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "parent.json", R"JSON({
+        "header": "parent.h",
+        "includes": ["stdio.h", "sys/uio.h"],
+        "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->includes.size(), 2u);
+    EXPECT_EQ(desc->includes[0], "stdio.h");
+    EXPECT_EQ(desc->includes[1], "sys/uio.h");
+    // Interner-FREE read returns the identical list (the walker's source).
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_FALSE(rep2.hasErrors());
+    ASSERT_EQ(inc->size(), 2u);
+    EXPECT_EQ(inc->at(0), "stdio.h");
+    EXPECT_EQ(inc->at(1), "sys/uio.h");
+}
+
+// Absent `includes` ⇒ empty (back-compat — every existing descriptor untouched).
+TEST(ShippedLibDescriptor, IncludesAbsentIsEmpty) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "noinc.json", R"JSON({
+        "header": "noinc.h", "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_TRUE(desc->includes.empty());
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_TRUE(inc->empty());
+}
+
+// (a') A malformed `includes` field FAILS LOUD (F_ShippedLibDescriptorMalformed) on
+// BOTH reads — a non-array shape AND a non-string / empty entry. RED-ON-DISABLE:
+// drop the shape validation in decodeShippedIncludes → the malformed field is
+// silently accepted.
+TEST(ShippedLibDescriptor, IncludesMalformedFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // Non-array.
+    {
+        auto const path = writeTemp(dir, "badinc1.json", R"JSON({
+            "header": "b.h", "includes": "stdio.h",
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+        // The interner-free read stays in lock-step (same code, nullopt).
+        DiagnosticReporter rep2;
+        auto inc = readShippedLibIncludes(path, rep2);
+        EXPECT_FALSE(inc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep2, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+    // Non-string entry.
+    {
+        auto const path = writeTemp(dir, "badinc2.json", R"JSON({
+            "header": "b.h", "includes": [123],
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+}
+
+// (b) ★ CYCLE SAFETY (the correctness must): two temp descriptors a.json(includes:[b])
+// + b.json(includes:[a]) — a CYCLE. forEachDescriptorInClosure must visit each
+// EXACTLY ONCE and TERMINATE (a broken visited-set would infinite-loop / OOM).
+TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h", "includes": ["b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "includes": ["a.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    // Terminated (we got here) + each descriptor visited exactly once.
+    ASSERT_EQ(order.size(), 2u);
+    EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
+    EXPECT_EQ(order[1], "b");   // then its include
+    EXPECT_TRUE(unresolved.empty());
+}
+
+// (b') DIAMOND (a→b, a→c, b→d, c→d): the shared leaf `d` is visited ONCE, and every
+// descriptor is visited parent-before-child.
+TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "da.json", R"JSON({
+        "header": "da.h", "includes": ["db.h", "dc.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "db.json", R"JSON({
+        "header": "db.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dc.json", R"JSON({
+        "header": "dc.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "cf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dd.json", R"JSON({
+        "header": "dd.h", "symbols": [ { "name": "df", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const&) {});
+    ASSERT_EQ(order.size(), 4u);        // each of a/b/c/d visited exactly once
+    EXPECT_EQ(order[0], "da");          // parent first (the DFS root)
+    // The shared leaf `dd` appears exactly once (the diamond dedup — this is the
+    // load-bearing property; a broken visited-set would visit it twice).
+    EXPECT_EQ(std::count(order.begin(), order.end(), std::string{"dd"}), 1);
+    // Parent-before-child holds for every TRAVERSED edge (a DFS: `dd` is reached
+    // through `db`'s descent, so `dd` is visited BEFORE `dc` even starts — the
+    // `dc→dd` edge is pruned by the visited-set, NOT re-traversed. So the honest
+    // invariants are: da precedes every other node, and db precedes dd).
+    auto idx = [&](std::string const& s) {
+        return std::find(order.begin(), order.end(), s) - order.begin();
+    };
+    EXPECT_LT(idx("da"), idx("db"));
+    EXPECT_LT(idx("da"), idx("dc"));
+    EXPECT_LT(idx("da"), idx("dd"));
+    EXPECT_LT(idx("db"), idx("dd"));   // dd is db's child, reached first via db
+}
+
+// (c) FAIL-LOUD: an `includes` entry that resolves to NO descriptor on systemDirs
+// invokes `onUnresolvedInclude` with the offending header name (the import resolver
+// turns this into a positioned F_ShippedHeaderNotFound). RED-ON-DISABLE: drop the
+// `if (!childPath) onUnresolvedInclude(...)` arm → a typo'd include is silently
+// swallowed.
+TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "typo.json", R"JSON({
+        "header": "typo.h", "includes": ["stdioo.h"],
+        "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        path, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    ASSERT_EQ(order.size(), 1u);        // only the parent (the typo has no descriptor)
+    EXPECT_EQ(order[0], "typo");
+    ASSERT_EQ(unresolved.size(), 1u);   // the unresolvable entry was surfaced
+    EXPECT_EQ(unresolved[0], "stdioo.h");
 }
 
 // ── structs surface (named-field aggregate; the struct-body mechanism) ────────
@@ -1463,6 +1658,14 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(desc->library.at("elf"), "libtcl8.6.so");   // TCL's SONAME
     ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
     EXPECT_EQ(desc->availableObjectFormats[0], "elf");    // elf-only in C1
+
+    // C32 (D-FFI-DESCRIPTOR-INCLUDES): tcl.json declares the transitive `#include`
+    // of <stdio.h> (real tcl.h #includes it), so a `#include <tcl.h>` TU also gets
+    // stdio.json's FILE/fopen/… surface (the flat-descriptor FILE §B fix; sqlite
+    // test_md5.c's path). RED-ON-DISABLE: remove tcl.json's `includes` field → this
+    // pin fails AND the shipped_tcl_transitive_stdio example S0001s on `FILE *f;`.
+    ASSERT_EQ(desc->includes.size(), 1u);
+    EXPECT_EQ(desc->includes[0], "stdio.h");
 
     // The two opaque handles (modeled like stdio.json's FILE — struct types) +
     // the C4 ClientData typedef (void* — a Ptr, not a struct).

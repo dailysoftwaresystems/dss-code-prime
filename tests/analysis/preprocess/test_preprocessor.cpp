@@ -3487,6 +3487,71 @@ TEST(Preprocessor, DeadBranchMalformedShippedDescriptorStaysSilent) {
     fs::remove_all(sysdir, ec);
 }
 
+// D-FFI-DESCRIPTOR-INCLUDES: the preprocessor macro-splice walks the TRANSITIVE
+// descriptor closure. A parent descriptor declaring `includes:["child.h"]` where
+// the CHILD ships a macro -> `#include <parent.h>` splices the CHILD's macro too,
+// so a use of the child macro expands. RED-ON-DISABLE: revert the closure walk in
+// spliceSystemDescriptorMacros to a single-descriptor read -> only parent.json's
+// macros (none here) splice -> CHILD_MAC stays a bare undefined identifier.
+TEST(Preprocessor, AngleIncludeSplicesTransitiveSiblingMacros) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_transitive_sys";
+    fs::create_directories(sysdir, ec);
+    // parent.json declares NO macros of its own — only the `includes` edge.
+    { std::ofstream(sysdir / "parent.json", std::ios::binary)
+          << "{ \"header\": \"parent.h\", \"includes\": [\"child.h\"], "
+             "\"symbols\": [ { \"name\": \"pfn\", \"signature\": \"fn() -> i32\" } ] }\n"; }
+    // child.json ships the macro reached transitively.
+    { std::ofstream(sysdir / "child.json", std::ios::binary)
+          << "{ \"header\": \"child.h\", \"macros\": ["
+             "{ \"name\": \"CHILD_MAC\", \"replacement\": \"42\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <parent.h>\nint v = CHILD_MAC;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has42 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "42") has42 = true;
+        if (l == "CHILD_MAC") hasBareMac = true;
+    }
+    EXPECT_TRUE(has42)
+        << "a transitively-included sibling descriptor's macro must be spliced by "
+           "the closure walk (CHILD_MAC -> 42 via parent.h's includes:[child.h])";
+    EXPECT_FALSE(hasBareMac)
+        << "CHILD_MAC must NOT survive unexpanded (the transitive #define was spliced)";
+    fs::remove_all(sysdir, ec);
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES: an `includes` CYCLE (parent<->child) must TERMINATE in
+// the preprocessor splice (the shared visited-set), not infinite-loop. RED-ON-DISABLE:
+// drop the visited-set guard in forEachDescriptorInClosure -> this hangs / OOMs.
+TEST(Preprocessor, AngleIncludeCyclicIncludesTerminate) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = fs::temp_directory_path() / "dss_ppangle_cyclic_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "pa.json", std::ios::binary)
+          << "{ \"header\": \"pa.h\", \"includes\": [\"pb.h\"], \"macros\": ["
+             "{ \"name\": \"PA_MAC\", \"replacement\": \"40\" } ] }\n"; }
+    { std::ofstream(sysdir / "pb.json", std::ios::binary)
+          << "{ \"header\": \"pb.h\", \"includes\": [\"pa.h\"], \"macros\": ["
+             "{ \"name\": \"PB_MAC\", \"replacement\": \"2\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <pa.h>\nint v = PA_MAC + PB_MAC;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has40 = false, has2 = false;
+    for (auto const& l : lexs) {
+        if (l == "40") has40 = true;
+        if (l == "2") has2 = true;
+    }
+    EXPECT_TRUE(has40 && has2)
+        << "a cyclic includes graph must terminate AND splice both descriptors' "
+           "macros exactly once (the closure visited-set)";
+    fs::remove_all(sysdir, ec);
+}
+
 // AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by
 // the CONFIG conditional words, not a hard-coded "if". Rebind `ifDirective` to
 // "whenever" and reload: a quote-`#include` inside `#whenever 0` must STILL be
