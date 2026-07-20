@@ -929,3 +929,232 @@ TEST(Fc3Stdbit, GenericUnsignedLongRoutesByDataModel) {
                "before identity was split off representation";
     }
 }
+
+// ── D-CSUBSET-GENERIC-RESULT-TYPE-DEDUCTION (C23 6.5.1.1p3) ──────────────────
+// A generic selection's TYPE and value are those of its SELECTED association —
+// NOT the controlling expression's. Pass-2 (`pass2Post`) always stamps the node
+// with the winner's type, but Pass-1.5 (`subtreeType`, driving `auto` inference
+// and array-dimension `sizeof` folding) runs FIRST and, without a dedicated
+// `_Generic` arm, fell through to the transparent-wrapper fallback and took the
+// node's FIRST visible child = the CONTROLLING expression. That is the silent
+// wrong-width bug: the VALUE was right (Pass-2 lowers only the winner) but every
+// TYPE-directed use — `sizeof`, an `auto`/`typeof` binding's storage width, a
+// nested `_Generic` dispatching on the result — saw the controlling type.
+//
+// Each pin below is RED on the pre-fix code (the asserted value is the WINNER's;
+// the pre-fix code yields the controlling expression's). `selectedGenericArms`
+// (the pass2Post `selectedGenericExpr` record) is GREEN either way — selection
+// was always correct; only the Pass-1.5 result TYPE was wrong — so it isolates
+// the bug to result-type deduction rather than arm selection.
+
+// The mechanism-proof, directly on `subtreeType(_Generic)`: `sizeof` of the
+// selection folds to the SELECTED `char` arm (1), not the controlling `long`
+// (8). RED-on-disable: revert the subtreeType `_Generic` case and this folds
+// through the wrapper fallback to the controlling `long` → 8.
+TEST(Fc3GenericResultType, SizeofFoldsSelectedNotControlling) {
+    auto m = analyzeWithArithMutation(
+        "long x;\n"
+        "char arr[sizeof(_Generic((x), long: (char)1, default: (double)2))];\n",
+        [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 1)
+        << "sizeof(_Generic) is the SELECTED (char) arm = 1, not controlling long = 8";
+}
+
+// The `auto` binding takes the winner's type. `long` controlling → `long:` arm
+// → `(short)1` → the object is `short` (I16), not the controlling `long` (I64).
+TEST(Fc3GenericResultType, AutoBindsSelectedArmType) {
+    auto m = analyzeCSubset(
+        "int f(long x){ auto r = _Generic((x), long: (short)1, default: (double)2);"
+        " return (int)sizeof(r); }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"(short)1"}))
+        << "the long: arm wins (selection is correct even on the pre-fix code)";
+    EXPECT_EQ(kindOf(m, "r"), TypeKind::I16)
+        << "auto r takes the SELECTED short arm's type, not the controlling long";
+}
+
+// The winner's result type equals NEITHER the controlling type NOR any arm's
+// type-name: `long` controlling selects the `long:` arm whose RESULT is the
+// double literal `1.0` (F64). Pre-fix the whole selection collapses to the
+// controlling `long` (I64).
+TEST(Fc3GenericResultType, AutoBindsWinnerResultNotControllingWhenDistinct) {
+    auto m = analyzeCSubset(
+        "int f(long x){ auto r = _Generic((x), int: 1.0f, long: 1.0, default: (char)1);"
+        " return (int)r; }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"1.0"}));
+    EXPECT_EQ(kindOf(m, "r"), TypeKind::F64)
+        << "auto r takes the winning long: arm's F64 result, not the controlling long";
+}
+
+// Nested: the OUTER _Generic's controlling expression is an INNER _Generic. The
+// inner selects `(signed char)1` → the inner types as `signed char` (fixed) /
+// `long` (pre-fix). The outer then matches `signed char:` → `(short)7` (I16,
+// fixed) — where the pre-fix nesting collapses through both wrappers to the
+// innermost controlling `long` (I64). Exercises `subtreeType` driving a
+// `_Generic` in controlling position AND the work-stack result drive.
+TEST(Fc3GenericResultType, NestedGenericInControllingPosition) {
+    auto m = analyzeCSubset(
+        "int f(long x){ auto r = _Generic(\n"
+        "    _Generic((x), long: (signed char)1, default: (double)2),\n"
+        "    signed char: (short)7, long: (double)9, default: (int)0);\n"
+        "  return (int)r; }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(kindOf(m, "r"), TypeKind::I16)
+        << "inner types as signed char → outer picks `signed char:` → (short)7 (I16); "
+           "the pre-fix controlling-type deduction collapses to the innermost long (I64)";
+}
+
+// The task's literal work-stack shape: an inner `_Generic`'s result feeds a
+// `sizeof` that is the CONTROLLING expression of an outer `_Generic`. The whole
+// thing must type + select through the work-stack without host-recursion
+// blowup; the inner fold (observed via a sibling array dim) is red-on-disable.
+TEST(Fc3GenericResultType, GenericResultFeedsSizeofInOuterControllingExpr) {
+    auto m = analyzeWithArithMutation(
+        "long x;\n"
+        "char inner[sizeof(_Generic((x), long: (char)1, default: (double)2))];\n"
+        "int outer = _Generic(sizeof(_Generic((x), long: (char)1, default: (double)2)),\n"
+        "                     unsigned long: 1, default: 0);\n",
+        [](nlohmann::json&) {}, DataModel::Lp64);
+    EXPECT_FALSE(m.hasErrors())
+        << "the nested _Generic-in-controlling-sizeof must type + select cleanly";
+    EXPECT_EQ(arrayDimOf(m, "inner"), 1)
+        << "the inner _Generic selects (char)1 → sizeof 1, not the controlling long 8";
+}
+
+// Refactor-guard pins: the shared-selection chokepoint must keep pass2Post's
+// diagnostics. GREEN before AND after the fix (pass2Post owns these) — they fail
+// only if the refactor drops the diagnostic path.
+TEST(Fc3GenericResultType, NoMatchStillDiagnosesFromPass2) {
+    auto m = analyzeCSubset(
+        "int f(double d){ return _Generic((d), int: 1, char: 2); }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 1u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
+}
+
+TEST(Fc3GenericResultType, AmbiguousStillDiagnosesFromPass2) {
+    // Two associations naming the SAME type both match the int controlling type.
+    auto m = analyzeCSubset(
+        "int f(int v){ return _Generic((v), int: 1, int: 2); }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 1u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+}
+
+// The same diagnostics must also fire EXACTLY ONCE in an `auto` context — where
+// Pass 1.5's subtreeType selection runs BEFORE pass2Post. If a future refactor
+// moved the S_Generic* emits into the shared (dual-called) helper, these would
+// double. Red-on-disable guards for the diagnostic-ownership boundary.
+TEST(Fc3GenericResultType, AutoNoMatchDiagnosesExactlyOnce) {
+    auto m = analyzeCSubset(
+        "int f(long x){ auto r = _Generic((x), int: 1, char: 2); return 0; }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 1u);
+}
+
+TEST(Fc3GenericResultType, AutoAmbiguousDiagnosesExactlyOnce) {
+    auto m = analyzeCSubset(
+        "int f(double d){ auto r = _Generic((d), double: 1, double: 2); return 0; }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 1u);
+}
+
+// FINDING 2 (adversarial-review regression): the `_BitInt`/typeof-bitfield
+// constraint diagnostics fire UNCONDITIONALLY (regardless of emitOnMiss) and
+// BYPASS the reporter dedup window. A `_BitInt(0)` association type-name is
+// resolved by the shared selection helper (for matching) AND by pass2Post's
+// stamp-loop (to emit + stamp) AND — in an `auto` context — by Pass 1.5's
+// selection: without the helper's snapshot/rollback that is 2 emits (non-auto)
+// or 3 (auto). It must be EXACTLY 1: only pass2Post's stamp-loop resolve emits.
+TEST(Fc3GenericResultType, BitIntAssocDiagnosesExactlyOnceNonAuto) {
+    auto m = analyzeCSubset(
+        "int f(int v){ return _Generic((v), int: 1, _BitInt(0): 2); }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_BitIntWidthNotPositive), 1u)
+        << "the helper's silent resolve is rolled back; only pass2Post emits";
+}
+
+TEST(Fc3GenericResultType, BitIntAssocDiagnosesExactlyOnceAuto) {
+    auto m = analyzeCSubset(
+        "int f(int v){ auto r = _Generic((v), int: 1, _BitInt(0): 2); return r; }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_BitIntWidthNotPositive), 1u)
+        << "Pass 1.5's selection resolve is ALSO rolled back — no third emit";
+}
+
+// FINDING 1 (D-PARSE-DEEP-NEST-RECURSION-MEMORY): a _Generic whose CONTROLLING
+// expression is itself a _Generic types on subtreeType's FLAT work-stack (the
+// multi-phase Generic frame — phase 0 enters the controlling child on the same
+// stack), never a host-recursive selectGenericAssociation→subtreeType chain. This
+// pin drives 150 nested controlling _Generics through that path and asserts the
+// whole selection types correctly (every level selects its `int:` arm → int).
+//
+// WHY THIS IS A CORRECTNESS PIN, NOT A CRASH PIN. A hard-crash red-on-disable
+// witness for the controlling axis is not achievable in the unit harness: the
+// recursive-descent PARSER (buildShippedUnit, 1 MiB main-thread stack — the CLI
+// builds CUs on a 64 MiB worker, D-PARSE-DEEP-FRONTEND-STACK) co-recurses on
+// controlling-nested _Generic and overflows at ~250 levels, and MEASUREMENT shows
+// the reverted host-recursive frame ALSO survives to that same ~250 floor (it does
+// NOT crash below the parser) — so the two forms are co-limited and no crash
+// window exists here. The regression is instead guarded by (1) the STRUCTURAL
+// work-stack integration — phase 0 enters the control child on the outer stack, so
+// subtreeType carries O(1) host stack for ANY controlling depth by construction —
+// and (2) the end-to-end CLI compile of deep controlling nests on the 64 MiB
+// worker. A crashing unit test (aborting the whole harness) would be worse than
+// none, so this pin asserts CORRECTNESS through deep nesting rather than a crash.
+TEST(Fc3GenericResultType, ControllingNestedGenericDeepStaysFlat) {
+    constexpr int kDepth = 150;
+    std::string expr = "x";
+    for (int level = 0; level < kDepth; ++level) {
+        expr = "_Generic(" + expr + ", int: 1, default: 0)";
+    }
+    auto m = analyzeCSubset(
+        "int f(int x){ auto r = " + expr + "; return r; }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(kindOf(m, "r"), TypeKind::I32)
+        << "every controlling-nested level selects its int: arm → int";
+}
+
+// The SELECTED arm of a _Generic is itself a _Generic (the WINNER axis). `long x`
+// → the outer `long:` arm wins, and its result IS an inner _Generic whose `long:`
+// arm wins → `(short)7` → short. So `r` types as short/I16, typed through phase 2's
+// enter(selected) on the SAME work-stack. Red-on-disable: reverting the frame
+// collapses through the transparent-wrapper fallback to the controlling `long`
+// (I64), so the winner-nested type is lost exactly like the controlling case.
+TEST(Fc3GenericResultType, WinnerNestedGenericTypesAsInnerWinner) {
+    auto m = analyzeCSubset(
+        "int f(long x){ auto r = _Generic((x), "
+        "long: _Generic((x), long: (short)7, default: (int)9), default: (double)2);"
+        " return (int)r; }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(kindOf(m, "r"), TypeKind::I16)
+        << "outer long: wins → inner _Generic → inner long: wins → (short)7 → short";
+}
+
+// F4 (adversarial review, PRE-EXISTING — same class as Finding 2, outside
+// _Generic): subtreeType's CAST and COMPOUND-LITERAL arms resolve the type-name
+// in Pass 1.5 (auto inference / fold), Pass 2 re-resolves, and the unsuppressable
+// `_BitInt`/typeof-bitfield constraint codes BYPASS the reporter dedup window — so
+// a `_BitInt(0)` type-name emitted S_BitIntWidthNotPositive TWICE. The Pass-1.5
+// resolve now rolls the reporter back (same chokepoint as the _Generic association
+// resolve), leaving the Pass-2 arm the SOLE emitter. RED-on-disable: 2 without the
+// rollback (the Pass-1.5 arm's own unsuppressable emit) → 1 with it.
+TEST(Fc3ReTypingBitInt, CastBitIntZeroDiagnosesExactlyOnce) {
+    auto m = analyzeCSubset(
+        "int f(int x){ auto r = (_BitInt(0))x; return 0; }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_BitIntWidthNotPositive), 1u)
+        << "the Pass-1.5 cast resolve is rolled back; only Pass 2 emits";
+}
+
+TEST(Fc3ReTypingBitInt, CompoundLiteralBitIntZeroDiagnosesExactlyOnce) {
+    auto m = analyzeCSubset(
+        "int f(void){ auto r = (_BitInt(0)){0}; return 0; }\n");
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_BitIntWidthNotPositive), 1u)
+        << "the Pass-1.5 compound-literal resolve is rolled back; only Pass 2 emits";
+}

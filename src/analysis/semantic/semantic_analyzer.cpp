@@ -617,6 +617,33 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+// C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION / -GENERIC-RESULT-TYPE-DEDUCTION):
+// the ONE generic-selection chokepoint. Given a `_Generic` node and its ALREADY-
+// COMPUTED controlling type, decide which association WINS from the typed/
+// `default` associations, so BOTH tiers type the selection from its winner rather
+// than its controlling expression: `subtreeType` (Pass 1.5 — `auto` inference /
+// array-dim `sizeof`) and `pass2Post` (Pass 2). It does NOT call `subtreeType`
+// for the controlling type — the caller supplies it (subtreeType types it on its
+// own work-stack, pass2Post at top level) so a controlling-nested `_Generic`
+// never host-recurses (D-PARSE-DEEP-NEST-RECURSION-MEMORY). FULLY SILENT: it
+// resolves each association type-name only to match, then rolls the reporter back
+// (the `_BitInt`/typeof-bitfield constraint diagnostics fire UNCONDITIONALLY and
+// bypass the dedup window, so a bare resolve would multi-emit) — pass2Post's
+// stamp-loop resolve is the SOLE emitter. Returns the winner + the typed
+// associations' type-nodes (pass2Post re-resolves them LOUD to stamp + fail loud).
+// Defined below subtreeType (mutual recursion; both are forward-declared here).
+struct GenericSelection {
+    NodeId selected{};                // matched-or-default result-expr, or Invalid
+    int    matchCount = 0;            // typed-association matches (ambiguity check)
+    NodeId defaultExpr{};             // first `default:` result-expr, or Invalid
+    bool   anyBadType = false;        // a value-in-type-position was rejected
+    bool   controllingResolved = false;   // the controlling type resolved (no-match guard)
+    std::vector<NodeId> typedAssocTypeNodes;   // pass2Post re-resolves (loud) + stamps
+};
+[[nodiscard]] GenericSelection
+selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId node, ScopeId scope,
+                         TypeId controllingType);
 // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the ONE literal-typing chokepoint
 // (extracted from pass2Post — defined alongside it below), forward-declared so
 // the Pass-1.5 inference arm can PRE-STAMP an initializer's literal leaves
@@ -1274,8 +1301,11 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // The width is a shared-CST const-expr (the array-dim / alignas /
                 // static_assert evaluator). A width diagnostic is UNSUPPRESSABLE and
                 // is emitted regardless of `emitOnMiss` (a global's head resolves
-                // that way) so the fail-loud is never silently dropped; the reporter's
-                // recent-duplicate window collapses a Pass-1.5 + Pass-2 double-visit.
+                // that way) so the fail-loud is never silently dropped. Because
+                // unsuppressable codes BYPASS the reporter dedup window, a re-typing
+                // caller that resolves this type-name in Pass 1.5 AND Pass 2 (cast /
+                // compound-literal / `_Generic` association) must roll its Pass-1.5
+                // resolve back or this fires twice — see those chokepoints.
                 auto const emitWidth = [&](DiagnosticCode code, std::string msg) {
                     ParseDiagnostic d;
                     d.code     = code;
@@ -1566,9 +1596,12 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 // UNCONDITIONAL (C 6.7.2.5 constraint): a bit-field
                                 // operand is always ill-formed. Emitted even under
                                 // emitOnMiss=false (a global's head resolves that
-                                // way) so the fail-loud is never silently dropped;
-                                // the reporter's recent-duplicate window collapses a
-                                // Pass-1.5 + Pass-2 double-visit to one diagnostic.
+                                // way) so the fail-loud is never silently dropped.
+                                // Unsuppressable codes BYPASS the reporter dedup
+                                // window, so a Pass-1.5+Pass-2 re-typing caller
+                                // (cast / compound-literal / `_Generic` association)
+                                // must roll its Pass-1.5 resolve back to avoid a
+                                // double emit — see those chokepoints.
                                 ParseDiagnostic d;
                                 d.code     =
                                     DiagnosticCode::S_TypeofBitfieldOperand;
@@ -8340,102 +8373,37 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (k == NodeKind::Internal
         && cfg.genericRule.valid()
         && tree.rule(node).v == cfg.genericRule.v) {
-        auto& in = s.lattice.interner();
-        auto kids = visibleChildren(tree, node);
+        // Type the controlling expression ONCE, at top level (subtreeType is a
+        // flat work-stack internally — a controlling-nested `_Generic` never host-
+        // recurses), then run the shared selection chokepoint on that type. The
+        // helper is FULLY SILENT; pass2Post owns every side effect it is free of —
+        // the loud assoc-type resolves + stamps, the ambiguous/no-match
+        // diagnostics, and the node/selectedExpr stamps.
+        auto genericKids = visibleChildren(tree, node);
+        TypeId const ctrlTy = cfg.genericControlChild < genericKids.size()
+            ? subtreeType(s, tree, genericKids[cfg.genericControlChild], here)
+            : InvalidType;
+        GenericSelection const sel =
+            selectGenericAssociation(s, cfg, tree, node, here, ctrlTy);
 
-        // (1) The controlling expression's type, lvalue-converted.
-        TypeId ctrlTy = InvalidType;
-        if (cfg.genericControlChild < kids.size()) {
-            ctrlTy = subtreeType(s, tree, kids[cfg.genericControlChild], here);
-        }
-        TypeId const ctrlConv = ctrlTy.valid() ? in.stripVolatile(ctrlTy)
-                                               : InvalidType;
-
-        // (2) Walk the associations. Each association child is a `genericAssoc`
-        // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc`
-        // ([castTypeRef, ':', assignmentExpr]) or a `genericDefaultAssoc`
-        // ([default, ':', assignmentExpr]) — the parser keeps the alt wrapper, so
-        // descend through it to the inner alternative to classify. (A grammar that
-        // referenced the two alternatives directly would skip the wrapper; the
-        // descent handles BOTH shapes, so it is robust to that grammar choice.)
-        NodeId matchedExpr = InvalidNode;   // the winning typed assoc's result expr
-        int    matchCount  = 0;             // typed matches (for the ambiguity check)
-        NodeId defaultExpr = InvalidNode;   // the `default:` result expr, if present
-        bool   anyBadType  = false;         // a value-in-type-position was rejected
-
-        // Resolve an association child to its inner typed/default node: descend
-        // through the `genericAssoc` umbrella (its sole internal child is the
-        // chosen alternative), else the child IS already a typed/default node.
-        auto innerAssoc = [&](NodeId assoc) -> NodeId {
-            RuleId const r = tree.rule(assoc);
-            bool const isInner =
-                (cfg.genericTypedAssocRule.valid()
-                 && r.v == cfg.genericTypedAssocRule.v)
-                || (cfg.genericDefaultAssocRule.valid()
-                    && r.v == cfg.genericDefaultAssocRule.v);
-            if (isInner) return assoc;
-            if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
-                for (NodeId c : visibleChildren(tree, assoc)) {
-                    if (tree.kind(c) == NodeKind::Internal) return c;
-                }
-            }
-            return InvalidNode;
-        };
-
-        for (NodeId assocChild : kids) {
-            if (tree.kind(assocChild) != NodeKind::Internal) continue;
-            NodeId const assoc = innerAssoc(assocChild);
-            if (!assoc.valid()) continue;   // not an association child
-            RuleId const assocRule = tree.rule(assoc);
-            bool const isTyped =
-                cfg.genericTypedAssocRule.valid()
-                && assocRule.v == cfg.genericTypedAssocRule.v;
-            bool const isDefault =
-                cfg.genericDefaultAssocRule.valid()
-                && assocRule.v == cfg.genericDefaultAssocRule.v;
-            if (!isTyped && !isDefault) continue;
-
-            // The result expression is the LAST internal child (the assignmentExpr
-            // after the ':'); the typed form's FIRST internal child is the type.
-            NodeId typeNode{}, exprNode{};
-            for (NodeId c : visibleChildren(tree, assoc)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
-                exprNode = c;   // keep last internal child as the result expr
-            }
-
-            if (isDefault) {
-                // Two `default`s are a constraint violation (6.5.1.1p2); the
-                // exactly-one-default enforcement is pinned as a deferral — keep
-                // the FIRST default's expression here.
-                if (!defaultExpr.valid()) defaultExpr = exprNode;
-                continue;
-            }
-
-            // Typed association: resolve + stamp its castTypeRef (fail loud on a
-            // value in type position — S_UnknownType), then match.
-            TypeId assocTy = InvalidType;
-            if (typeNode.valid()) {
-                assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
-                if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
-                else                 anyBadType = true;   // diagnostic already emitted
-            }
-            if (assocTy.valid() && ctrlConv.valid()
-                && sameType(in.stripVolatile(assocTy), ctrlConv)) {
-                ++matchCount;
-                if (!matchedExpr.valid()) matchedExpr = exprNode;
-            }
+        // Re-resolve each typed association's type-name LOUD (the helper's resolves
+        // were rolled back) — this is the SOLE emitter of the assoc-type
+        // constraint diagnostics (S_UnknownType for a value in type position, the
+        // `_BitInt`/typeof-bitfield family) and stamps the valid ones, exactly as
+        // the single pre-chokepoint walk did.
+        for (NodeId const typeNode : sel.typedAssocTypeNodes) {
+            TypeId const assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+            if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
         }
 
-        // (3) Resolve the selection + stamp / fail loud. A bad controlling type or
-        // a rejected association type-name already emitted its own diagnostic; only
-        // CASCADE-SUPPRESS the no-match report in that case (never a double error),
+        // Resolve the selection + fail loud. C 6.5.1.1p2 requires EXACTLY ONE
+        // typed match or the `default`. A bad controlling type or a rejected
+        // association type-name already emitted its own diagnostic; only CASCADE-
+        // SUPPRESS the no-match report in that case (never a double error),
         // exactly like the va_arg invalid-type path.
-        NodeId selected = matchCount == 1 ? matchedExpr
-                        : matchCount == 0 ? defaultExpr
-                        : InvalidNode;   // >1 typed match: ambiguous (handled below)
+        NodeId const selected = sel.selected;
 
-        if (matchCount > 1) {
+        if (sel.matchCount > 1) {
             // FC17.9(e) (D-CSUBSET-LONG-DOUBLE-GENERIC-DISTINCT): on an
             // f64-axis format `double:` and `long double:` associations BOTH
             // intern F64 → matchCount 2 lands HERE — LOUD (the LLP64
@@ -8451,7 +8419,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.actual   = "_Generic controlling type matches more than one "
                          "association";
             s.reporter.report(std::move(d));
-        } else if (!selected.valid() && ctrlConv.valid() && !anyBadType) {
+        } else if (!selected.valid() && sel.controllingResolved
+                   && !sel.anyBadType) {
             // No typed match AND no default — and the failure is NOT a cascade
             // from an unresolved controlling type / bad association type-name.
             ParseDiagnostic d;
@@ -9572,7 +9541,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     struct Frame {
         NodeId node;
         enum class Kind : std::uint8_t {
-            Binary, Unary, Postfix, Ternary, Wrapper
+            Binary, Unary, Postfix, Ternary, Wrapper, Generic
         } kind;
         std::uint8_t           phase;
         NodeId                  n0;     // binary lhs / unary operand / postfix base
@@ -9626,21 +9595,35 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             it != s.idx().castByRule.end()) {
             auto const& cr = sem.castRules[it->second];
             auto const kids = visibleChildren(tree, node);
-            // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType diag.
-            result = (cr.typeChild >= kids.size())
-                ? InvalidType
-                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                                  kids[cr.typeChild], scope, /*emitOnMiss=*/false);
+            if (cr.typeChild >= kids.size()) { result = InvalidType; return; }
+            // This Pass-1.5 resolve must be NET-SILENT: emitOnMiss=false silences
+            // S_UnknownType, but the `_BitInt`/typeof-bitfield constraint
+            // diagnostics fire UNCONDITIONALLY and BYPASS the reporter dedup window
+            // — so a bare resolve here double-emits against the Pass-2 cast arm's
+            // loud re-resolve. Roll the reporter back (the same chokepoint the
+            // _Generic association resolve uses): the resolved TypeId + benign
+            // interner/nodeToType side effects persist; the Pass-2 cast arm is the
+            // SOLE emitter (it re-resolves loud, and a FAILED resolve returns
+            // InvalidType WITHOUT stamping the cast node, so the re-resolve runs).
+            auto& mut = const_cast<EngineState&>(s);
+            auto const snap = mut.reporter.snapshotForRollback();
+            result = resolveTypeNode(mut, sem, tree, kids[cr.typeChild], scope,
+                                     /*emitOnMiss=*/false);
+            mut.reporter.truncateTo(snap);
             return;
         }
         if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
             it != s.idx().compoundLiteralByRule.end()) {
             auto const& cl = sem.compoundLiteralRules[it->second];
             auto const kids = visibleChildren(tree, node);
-            result = (cl.typeChild >= kids.size())
-                ? InvalidType
-                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                                  kids[cl.typeChild], scope, /*emitOnMiss=*/false);
+            if (cl.typeChild >= kids.size()) { result = InvalidType; return; }
+            // NET-SILENT, same rationale + rollback as the cast arm above (the
+            // Pass-2 compound-literal arm re-resolves loud as the sole emitter).
+            auto& mut = const_cast<EngineState&>(s);
+            auto const snap = mut.reporter.snapshotForRollback();
+            result = resolveTypeNode(mut, sem, tree, kids[cl.typeChild], scope,
+                                     /*emitOnMiss=*/false);
+            mut.reporter.truncateTo(snap);
             return;
         }
         // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
@@ -9690,6 +9673,27 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             if (operands.size() != 3) { result = InvalidType; return; }
             work.push_back(Frame{node, Frame::Kind::Ternary, 0, {}, {}, nullptr,
                                  std::move(operands), 0, {}});
+            return;
+        }
+        // C11/C23 6.5.1.1p3 (D-CSUBSET-GENERIC-RESULT-TYPE-DEDUCTION): a generic
+        // selection's type IS the SELECTED association's result-expression type,
+        // NOT the controlling expression's. Pass 2 stamps this node with the
+        // winner's type, but Pass 1.5 types it BEFORE that stamp exists — so
+        // without this arm the node would fall through to the transparent-wrapper
+        // fallback below and take its FIRST visible child = the CONTROLLING
+        // expression (the silent wrong-width bug). Type it on THIS work-stack via
+        // a multi-phase Generic frame (mirroring Ternary): phase 0 types the
+        // controlling child, phase 1 picks the winner from that type + types the
+        // winner, phase 2 yields the winner's type. Both a controlling-nested AND
+        // a winner-nested `_Generic` stay on the stack — ZERO host recursion
+        // (D-PARSE-DEEP-NEST-RECURSION-MEMORY). `n0` carries the controlling child.
+        if (sem.genericRule.valid() && r.v == sem.genericRule.v) {
+            std::vector<NodeId> gkids;
+            for (NodeId c : visibleChildren(tree, node)) gkids.push_back(c);
+            NodeId const ctrlChild = sem.genericControlChild < gkids.size()
+                ? gkids[sem.genericControlChild] : InvalidNode;
+            work.push_back(Frame{node, Frame::Kind::Generic, 0, ctrlChild, {},
+                                 nullptr, {}, 0, {}});
             return;
         }
         // ── transparent / operand wrapper: pass the inner expression's type
@@ -9758,9 +9762,142 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 else { ++f.idx; f.phase = 0; }             // try the next child
             }
             break;
+        case Frame::Kind::Generic:
+            if (f.phase == 0) {
+                // Type the controlling expression on THIS work-stack (flat — a
+                // controlling-nested `_Generic` re-enters here, never host-recurses).
+                f.phase = 1; NodeId n = f.n0; enter(n);
+            } else if (f.phase == 1) {
+                // `result` now holds the controlling type. Pick the winner WITHOUT
+                // recursion (the helper takes the controlling type as a param), then
+                // type the winner on this work-stack too.
+                NodeId const genericNode = f.node;
+                GenericSelection const gs = selectGenericAssociation(
+                    s, sem, tree, genericNode, scope, result);
+                if (!gs.selected.valid()) { work.pop_back(); result = InvalidType; }
+                else { f.phase = 2; NodeId n = gs.selected; enter(n); }
+            } else {
+                // `result` holds the winner's type — the selection's type.
+                work.pop_back();
+            }
+            break;
         }
     }
     return result;
+}
+
+// The ONE generic-selection chokepoint (forward-declared above). Extracted from
+// pass2Post's association walk so `subtreeType` (Pass 1.5) and `pass2Post`
+// (Pass 2) agree on the winner. It does NOT call subtreeType (the caller supplies
+// the controlling type — no host recursion for a controlling-nested `_Generic`)
+// and is FULLY SILENT (its association resolves are rolled back — pass2Post's
+// stamp-loop is the sole emitter).
+GenericSelection
+selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId node, ScopeId scope,
+                         TypeId controllingType) {
+    GenericSelection sel;
+    // The const_cast is subtreeType's exact discipline — the interner memoizes,
+    // resolveTypeNode(emitOnMiss=false) may mint a forward tag, and the reporter
+    // snapshot/rollback below runs on this handle; none mutates a const object
+    // (every caller owns a non-const EngineState).
+    EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
+    TypeInterner& in = mutS.lattice.interner();
+    auto kids = visibleChildren(tree, node);
+
+    // (1) The controlling type is supplied by the caller (typed on its OWN
+    // work-stack / at top level), lvalue-converted here (top-level volatile
+    // stripped — the isAssignable precedent). The helper never re-types it, so a
+    // controlling-nested `_Generic` never host-recurses.
+    TypeId const ctrlConv = controllingType.valid()
+        ? in.stripVolatile(controllingType) : InvalidType;
+    sel.controllingResolved = ctrlConv.valid();
+
+    // (2) Walk the associations. Each association child is a `genericAssoc`
+    // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc` or a
+    // `genericDefaultAssoc`; descend through the wrapper to the inner
+    // alternative (robust to a grammar that references the alternatives directly).
+    NodeId matchedExpr = InvalidNode;
+    auto innerAssoc = [&](NodeId assoc) -> NodeId {
+        RuleId const r = tree.rule(assoc);
+        bool const isInner =
+            (cfg.genericTypedAssocRule.valid()
+             && r.v == cfg.genericTypedAssocRule.v)
+            || (cfg.genericDefaultAssocRule.valid()
+                && r.v == cfg.genericDefaultAssocRule.v);
+        if (isInner) return assoc;
+        if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
+            for (NodeId c : visibleChildren(tree, assoc)) {
+                if (tree.kind(c) == NodeKind::Internal) return c;
+            }
+        }
+        return InvalidNode;
+    };
+
+    // The association type-name resolves are FULLY SILENT: resolveTypeNode's own
+    // S_UnknownType respects emitOnMiss=false, but the `_BitInt`/typeof-bitfield
+    // constraint diagnostics fire UNCONDITIONALLY and BYPASS the reporter dedup
+    // window (diagnostic_reporter.cpp) — so a bare resolve here would multi-emit
+    // against pass2Post's stamp-loop re-resolve (and Pass 1.5's auto call). Roll
+    // the reporter back afterwards: the resolved TypeIds (for matching) and the
+    // benign interner/nodeToType side effects persist; every diagnostic is
+    // dropped. pass2Post re-resolves LOUD (its stamp-loop) as the SOLE emitter.
+    auto const diagSnapshot = mutS.reporter.snapshotForRollback();
+
+    for (NodeId assocChild : kids) {
+        if (tree.kind(assocChild) != NodeKind::Internal) continue;
+        NodeId const assoc = innerAssoc(assocChild);
+        if (!assoc.valid()) continue;   // not an association child
+        RuleId const assocRule = tree.rule(assoc);
+        bool const isTyped =
+            cfg.genericTypedAssocRule.valid()
+            && assocRule.v == cfg.genericTypedAssocRule.v;
+        bool const isDefault =
+            cfg.genericDefaultAssocRule.valid()
+            && assocRule.v == cfg.genericDefaultAssocRule.v;
+        if (!isTyped && !isDefault) continue;
+
+        // The result expression is the LAST internal child (the assignmentExpr
+        // after the ':'); the typed form's FIRST internal child is the type-name.
+        NodeId typeNode{}, exprNode{};
+        for (NodeId c : visibleChildren(tree, assoc)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
+            exprNode = c;   // keep last internal child as the result expr
+        }
+
+        if (isDefault) {
+            // Two `default`s are a constraint violation; keep the FIRST here
+            // (the exactly-one-default enforcement is pinned separately).
+            if (!sel.defaultExpr.valid()) sel.defaultExpr = exprNode;
+            continue;
+        }
+
+        // Typed association: resolve its type-name (rolled back below) to match
+        // + record its type-node for pass2Post's loud re-resolve; a value in type
+        // position leaves the type Invalid → anyBadType (no-match cascade guard).
+        TypeId assocTy = InvalidType;
+        if (typeNode.valid()) {
+            assocTy = resolveTypeNode(mutS, cfg, tree, typeNode, scope,
+                                      /*emitOnMiss=*/false);
+            sel.typedAssocTypeNodes.push_back(typeNode);
+            if (!assocTy.valid()) sel.anyBadType = true;
+        }
+        if (assocTy.valid() && ctrlConv.valid()
+            && sameType(in.stripVolatile(assocTy), ctrlConv)) {
+            ++sel.matchCount;
+            if (!matchedExpr.valid()) matchedExpr = exprNode;
+        }
+    }
+
+    mutS.reporter.truncateTo(diagSnapshot);   // drop every resolve diagnostic
+
+    // (3) Resolve the selection: exactly-one typed match wins, else the
+    // `default:`; >1 typed match is ambiguous (InvalidNode — pass2Post reports).
+    sel.selected = sel.matchCount == 1 ? matchedExpr
+                 : sel.matchCount == 0 ? sel.defaultExpr
+                 : InvalidNode;
+    return sel;
 }
 
 // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): search the
