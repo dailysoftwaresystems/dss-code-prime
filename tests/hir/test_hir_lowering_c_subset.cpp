@@ -5447,6 +5447,62 @@ TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
     }
 }
 
+// c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): unary `*` applied to an ARRAY operand
+// decays the array to Ptr<elem> (C 6.3.2.1p3 — the SAME law as c59's additive
+// decay) BEFORE the Deref types its result. `derefResultType` is Ptr-only (the
+// law SHARED with the semantic-tier typer), so pre-fix `*(arrayName)` reached it
+// as a raw Array → InvalidType → a TYPELESS Deref → H0001 (the sqlite
+// getVarint32(zBuf,…) test3.c:474 blocker; `zBuf` is `unsigned char zBuf[100]`).
+// `arrayName[0]` (Index → indexResultType types an Array base) and `*(arrayName
+// + 0)` (c59) already lowered — this is the DIRECT-deref-of-an-array hole. This
+// pin names the HIR tier: the Deref is TYPED as the element and its operand is
+// the synthetic Array→Ptr decay Cast. The corpus witness (examples/c-subset/
+// array_decay_deref) proves the VALUES end-to-end on every run leg. RED-ON-
+// DISABLE: revert the combineUnaryOp Deref decay arm → the operand stays a raw
+// Array Ref and the Deref is typeless (both asserts flip; the file no longer
+// lowers clean).
+TEST(HirLoweringCSubset, DerefOfArrayOperandDecaysToPointer) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { int a[4]; a[0] = 7; return *(a); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 1u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 1u);
+    HirNodeId const ret = stmts.back();
+    auto const rv = res->hir.returnValue(ret);
+    ASSERT_TRUE(rv.has_value()) << "the last statement is `return *(a);`";
+    HirNodeId const deref = *rv;
+    // `*(a)` is a Deref TYPED as the element (int → I32), NOT the pre-fix
+    // TYPELESS node the HirVerifier reported as H0001.
+    ASSERT_EQ(res->hir.kind(deref), HirKind::Deref) << "`*(a)` lowers to a Deref";
+    TypeId const dt = res->hir.typeId(deref);
+    ASSERT_TRUE(dt.valid())
+        << "the Deref MUST be typed (pre-fix a Deref of an Array was TYPELESS → H0001)";
+    EXPECT_EQ(ti.kind(dt), TypeKind::I32) << "`*(int[4])` yields the element type int";
+    // Its single operand is the synthetic Array→Ptr decay Cast (C 6.3.2.1p3),
+    // Ptr<int>, over the raw Array Ref underneath.
+    auto const kids = res->hir.children(deref);
+    ASSERT_EQ(kids.size(), 1u);
+    HirNodeId const operand = kids[0];
+    ASSERT_EQ(res->hir.kind(operand), HirKind::Cast)
+        << "the Array operand of unary `*` must be wrapped in the coerce decay Cast";
+    TypeId const ct = res->hir.typeId(operand);
+    ASSERT_TRUE(ct.valid());
+    ASSERT_EQ(ti.kind(ct), TypeKind::Ptr) << "the decay Cast carries Ptr<elem>";
+    auto const elem = ti.operands(ct);
+    ASSERT_FALSE(elem.empty());
+    EXPECT_EQ(ti.kind(elem[0]), TypeKind::I32)
+        << "…whose pointee is the ELEMENT type (int)";
+}
+
 // ── c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except frontend ──────────────
 
 // The guarded body, filter expression, and handler body lower to a core

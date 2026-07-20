@@ -1,0 +1,34 @@
+{
+  "$comment": "c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF, fn-pointer-ARRAY facet): `*(tbl)` where tbl is an ARRAY of function pointers decays to Ptr<Ptr<FnSig>> (C 6.3.2.1p3), so `(*(tbl))(x)` == `tbl[0](x)`. BOTH tiers agree the deref is the fn-ptr: cst_to_hir combineUnaryOp decays the array (the FnSig fold reads the DECAYED Ptr and does NOT collapse), and the semantic-tier subtreeType Deref MIRRORS the decay so checkCall resolves the callee. `tbl[i](x)` (Index) already worked (fnptr_array_inferred); THIS is the DIRECT-deref call form. RED-ON-DISABLE (each independently → no compile): revert cst_to_hir Deref decay → `*(tbl)` TYPELESS → H0001; revert semantic-tier Deref decay → callee InvalidType → S0004 S_NotCallable. VALUE-CORRECT + RUNTIME-DRIVEN: tbl[0] is assigned at runtime through the opaque pick() index so (*(tbl)) is not const-folded; tbl[0]=add40 → (*(tbl))(2)=add40(2)=42. Pure c-subset → all 4 targets; pe RUNS on Windows, elf/arm64 RUN on linux/qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

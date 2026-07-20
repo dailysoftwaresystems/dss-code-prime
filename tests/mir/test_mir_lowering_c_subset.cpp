@@ -2483,6 +2483,46 @@ TEST(MirLoweringCSubset, NonStringArrayDecaysToPointerNotFailLoud) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
+// c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): the sqlite getVarint32 fast-path shape —
+// an ARRAY `z` deref'd DIRECTLY (`*(z)`) as the RVALUE of the comma-LEFT
+// assignment `out = (u32)*(z)`, itself the middle operand of a ternary. Pre-fix
+// `*(z)` was a TYPELESS Deref (derefResultType has no Array arm) → H0001 at the
+// HirVerifier → the shape never reached clean MIR. This pins the MIR tier: the
+// full shape LOWERS (hir.ok + mir.ok) and BOTH the array-deref Load (of z[0]) and
+// the comma-LEFT side-effect Store (to `out`) are emitted — the structural guard,
+// on every target leg, that the decay→load lowers and the comma-LEFT side effect
+// is not dropped. The corpus witness (examples/c-subset/array_decay_deref) proves
+// the VALUES (out == 42) end-to-end. RED-ON-DISABLE: revert the combineUnaryOp
+// Deref array-decay → hir.ok flips false (H0001) and this test fails at the first
+// ASSERT.
+TEST(MirLoweringCSubset, DerefOfArrayInCommaTernaryLowersWithLoadAndSideEffectStore) {
+    auto L = lowerCSubset(
+        "typedef unsigned char u8; typedef unsigned int u32;\n"
+        "u32 getv(void) {\n"
+        "    u8 z[4];\n"
+        "    u32 out = 0;\n"
+        "    z[0] = 42;\n"
+        "    u8 n = (u8)((*(z) < (u8)0x80) ? ((out) = (u32)*(z)), 1 : 9);\n"
+        "    return out + (u32)n;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "pre-fix `*(z)` (a DIRECT array deref) was a TYPELESS Deref → H0001: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The array deref `*(z)` reads z[0] → a Load; the comma-LEFT `out = …` side
+    // effect → a Store. Both must survive (a dropped side effect or a lost deref
+    // would remove one).
+    EXPECT_FALSE(collectOps(m, MirOpcode::Load).empty())
+        << "the array-deref `*(z)` must emit a Load of z[0]";
+    EXPECT_FALSE(collectOps(m, MirOpcode::Store).empty())
+        << "the comma-LEFT `out = (u32)*(z)` side effect must emit a Store";
+}
+
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
 // operand being the Arg v and the ptr operand the GEP result.
 TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {

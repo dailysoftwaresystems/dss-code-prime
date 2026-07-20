@@ -3739,6 +3739,32 @@ struct Lowerer {
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
         if (e.target == "Deref") {
+            // c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): C 6.3.2.1p3 — unary `*` is
+            // NOT one of the decay exceptions (sizeof / _Alignof / unary &), so an
+            // ARRAY operand decays to Ptr<elem> FIRST. `*(arrayName)` then
+            // dereferences the first element — identical to `*(arrayName + 0)` (the
+            // c59 additive-decay path) and to `arrayName[0]` (Index, whose
+            // `indexResultType` already types an Array base directly). Without this
+            // the Array kind reached `derefResultType` below, which has NO Array arm
+            // (Ptr-only — the SHARED semantic-tier typer, deliberately left
+            // un-decayed there exactly as c59/c91's additive/condition decays are
+            // cst_to_hir-only) → the Deref came out TYPELESS → H0001 (sqlite
+            // `getVarint32(zBuf,…)`, whose macro derefs the `unsigned char
+            // zBuf[100]` array directly: `(*(A)<(u8)0x80)?((B)=(u32)*(A)),1:…`).
+            // Reuses the ONE `coerce` Array→Ptr decay funnel (the c59/c91/cast
+            // pattern) so the emitted Cast gives MIR a real pointer value AND the
+            // FnSig fold + `derefResultType` below read the DECAYED Ptr. An array of
+            // function pointers `T(*a[])(…)` decays to `Ptr<Ptr<FnSig>>` → the fold
+            // (which requires operand[0] == FnSig) correctly does NOT fire and the
+            // deref yields the function pointer. A degenerate elementless Array
+            // (unreachable) falls through un-decayed → derefResultType InvalidType →
+            // still fails LOUD via H0001 (never a silent typed-wrong Deref).
+            if (operand.type.valid()
+                && interner.kind(operand.type) == TypeKind::Array) {
+                auto const elems = interner.operands(operand.type);
+                if (!elems.empty())
+                    operand = coerce(operand, interner.pointer(elems[0]));
+            }
             // FC4 c2 — C 6.5.3.2p4 designator decay as a lattice law:
             // `*` applied to a function pointer yields the function
             // DESIGNATOR, which (outside sizeof/&) immediately decays

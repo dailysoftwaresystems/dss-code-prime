@@ -9427,7 +9427,24 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     };
     auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
-        if (e->target == "Deref")     return derefResultType(interner, ot);
+        if (e->target == "Deref") {
+            // D-CSUBSET-ARRAY-DECAY-IN-DEREF (C 6.3.2.1p3): an ARRAY operand of
+            // unary `*` decays to Ptr<elem> — MIRROR the cst_to_hir Deref decay so
+            // BOTH tiers agree `*(arr)` has the element type (it is exactly
+            // `arr[0]`, which `indexResultType` already types here). `derefResultType`
+            // itself is Ptr-only (the shared law); without this pre-decay the typer
+            // returned InvalidType for `*(arr)`, so a valid `(*(fnPtrArr))()` could
+            // not resolve its callee → a spurious semantic error on a deref-call.
+            // A PURE type derivation (the semantic tier never rewrites the tree —
+            // the HIR producer emits the actual decay Cast); non-Array operands are
+            // byte-identical to the prior `derefResultType(interner, ot)`.
+            TypeId od = ot;
+            if (ot.valid() && interner.kind(ot) == TypeKind::Array) {
+                auto const elems = interner.operands(ot);
+                if (!elems.empty()) od = interner.pointer(elems[0]);
+            }
+            return derefResultType(interner, od);
+        }
         // FC-F1 (C 6.5.3.1): prefix `++x`/`--x` yields the OPERAND type (a value
         // equal to the post-increment object), exactly as postfix `combinePostfix`
         // does. Explicit here so the type does not rely on the `coreOpFromNameSem`
