@@ -488,6 +488,29 @@ namespace detail::type_rules {
             return true;
         }
     }
+    // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a bare function DESIGNATOR
+    // (`FnSig`, NOT yet decayed to a pointer) assigned/passed to `void*` — the
+    // gcc/POSIX `dlsym` / Tcl `ClientData` idiom (`Tcl_CreateCommand(i, "md5",
+    // MD5DigestToBase16, ...)` hands a bare function name into a `void*`
+    // ClientData parameter). This is the SIBLING of the same-signature
+    // function-to-pointer decay arm just above, but the target is `void*` (an
+    // ERASED pointer) rather than a `Ptr<FnSig>` of the matching signature — so
+    // it is gated on `allowVoidPtrFnConvert`, the SINGLE authoritative gate for
+    // the whole fn<->void* class (Option B). SCOPED STRICTLY to a `Void` lhs
+    // pointee: a designator -> a NON-void object pointer (`char*`, `int*`,
+    // `struct S*`) does NOT match here (lhsElem[0] is not Void) and, with `rk`
+    // == FnSig, matches no Ptr<->Ptr arm below either — it stays a loud reject
+    // regardless of the flag. Function-pointer <-> void* is UB in ISO C but
+    // POSIX-required and representation-identical on LP64/LLP64 (same width,
+    // same bits) -> never a miscompile. The HIR `coerce()` realizes it as the
+    // same FnSig->Ptr Bitcast-over-GlobalAddr the decay above emits.
+    if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
+        auto const lhsElem = interner.operands(lhs);
+        if (!lhsElem.empty()
+            && interner.kind(lhsElem[0]) == TypeKind::Void) {
+            return ptrRules.allowVoidPtrFnConvert;
+        }
+    }
     // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): the two
     // directions of `void*` ↔ `T*` conversion are configured
     // INDEPENDENTLY — they carry different safety characteristics:
@@ -529,10 +552,28 @@ namespace detail::type_rules {
                 interner.kind(rhsElem[0]) == TypeKind::Void;
             // T* → void* direction: lhs is void*, rhs is T* (T != void).
             if (lhsIsVoidPtr && !rhsIsVoidPtr) {
+                // Option-B re-homing (D-LANG-VOIDPTR-FN-CONVERT): when the
+                // NON-void side is a FUNCTION pointer (`Ptr<FnSig> -> void*`),
+                // the whole fn<->void* class routes through the SINGLE
+                // authoritative `allowVoidPtrFnConvert` gate — NOT the generic
+                // object-pointer `implicitToVoidPtr`. For c-subset all three
+                // flags are true (identical behavior); the split lets a
+                // language keep ISO-strict function-pointer typing while still
+                // admitting object `T* -> void*`. An object pointee still uses
+                // `implicitToVoidPtr`.
+                if (interner.kind(rhsElem[0]) == TypeKind::FnSig) {
+                    return ptrRules.allowVoidPtrFnConvert;
+                }
                 return ptrRules.implicitToVoidPtr;
             }
             // void* → T* direction: lhs is T* (T != void), rhs is void*.
             if (!lhsIsVoidPtr && rhsIsVoidPtr) {
+                // Option-B re-homing (mirror): `void* -> Ptr<FnSig>` routes
+                // through the same single fn<->void* gate; an object pointee
+                // uses the generic `implicitFromVoidPtr`.
+                if (interner.kind(lhsElem[0]) == TypeKind::FnSig) {
+                    return ptrRules.allowVoidPtrFnConvert;
+                }
                 return ptrRules.implicitFromVoidPtr;
             }
             // BOTH void: caught by sameType() above (Ptr<Void> ==

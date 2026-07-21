@@ -9496,9 +9496,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (!obj.is_object()) {
                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                               "/semantics/pointerConversions",
-                              "'pointerConversions' must be an object "
-                              "with optional `implicitToVoidPtr` and "
-                              "`implicitFromVoidPtr` boolean fields");
+                              "'pointerConversions' must be an object with "
+                              "optional `implicitToVoidPtr`, "
+                              "`implicitFromVoidPtr`, "
+                              "`nullPointerConstantFromIntegerZero`, "
+                              "`nullPointerConstantFromNullptrT`, and "
+                              "`allowVoidPtrFnConvert` boolean fields");
                 } else {
                     auto readBool = [&](char const* field, bool& out) {
                         if (!obj.contains(field)) return;
@@ -9524,6 +9527,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("nullPointerConstantFromNullptrT",
                              cfg.pointerConversions
                                  .nullPointerConstantFromNullptrT);
+                    // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): implicit
+                    // function-pointer <-> void* (incl. the bare function
+                    // designator -> void* gcc/POSIX dlsym / Tcl ClientData
+                    // idiom). Default false = ISO-strict; c-subset opts in.
+                    readBool("allowVoidPtrFnConvert",
+                             cfg.pointerConversions.allowVoidPtrFnConvert);
                     // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
                     // constant at the HIR tier (Fix 1(a)), so its HIR realization
                     // (coerce→Ptr / ternary / condition) REUSES the integer-0
@@ -9557,7 +9566,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (k != "implicitToVoidPtr" &&
                             k != "implicitFromVoidPtr" &&
                             k != "nullPointerConstantFromIntegerZero" &&
-                            k != "nullPointerConstantFromNullptrT") {
+                            k != "nullPointerConstantFromNullptrT" &&
+                            k != "allowVoidPtrFnConvert") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",
@@ -9566,8 +9576,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "unknown 'pointerConversions' "
                                           "field '{}' — expected one of "
                                           "'implicitToVoidPtr', "
-                                          "'implicitFromVoidPtr', or "
-                                          "'nullPointerConstantFromIntegerZero'",
+                                          "'implicitFromVoidPtr', "
+                                          "'nullPointerConstantFromIntegerZero', "
+                                          "'nullPointerConstantFromNullptrT', or "
+                                          "'allowVoidPtrFnConvert'",
                                           k));
                         }
                     }

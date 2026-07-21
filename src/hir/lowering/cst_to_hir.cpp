@@ -465,7 +465,23 @@ struct Lowerer {
         // is NOT decayed here → it stays a loud mismatch at both tiers.
         if (ck == TypeKind::FnSig && tk == TypeKind::Ptr) {
             auto const ptrElem = interner.operands(target);
-            if (!ptrElem.empty() && ptrElem[0] == child.type) {
+            bool const sameSig =
+                !ptrElem.empty() && ptrElem[0] == child.type;
+            // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a bare function DESIGNATOR
+            // (FnSig) -> `void*` (the gcc/POSIX dlsym / Tcl ClientData idiom),
+            // gated on the single authoritative `allowVoidPtrFnConvert` flag —
+            // MIRRORS the isAssignable admit (admit<->realize parity). Emits the
+            // SAME synthetic FnSig->Ptr Cast as the same-signature decay: MIR
+            // `mapCast` lowers FnSig->Ptr as a representation-free Bitcast over
+            // the GlobalAddr REGARDLESS of the Ptr's pointee, so a `void*`
+            // target needs NO MIR change. Scoped to a Void pointee — a
+            // designator -> a NON-void object pointer is rejected at the
+            // semantic tier and never reaches here.
+            bool const toVoidPtr =
+                !ptrElem.empty()
+                && interner.kind(ptrElem[0]) == TypeKind::Void
+                && sem.pointerConversions.allowVoidPtrFnConvert;
+            if (sameSig || toVoidPtr) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -571,11 +587,23 @@ struct Lowerer {
                 bool admit = false;
                 // T* → void* (toIsVoid && !fromIsVoid)
                 if (toIsVoid && !fromIsVoid) {
-                    admit = sem.pointerConversions.implicitToVoidPtr;
+                    // Option-B re-homing (D-LANG-VOIDPTR-FN-CONVERT): a function
+                    // pointer (`Ptr<FnSig> -> void*`) routes through the single
+                    // fn<->void* gate, MIRRORING isAssignable so admit<->realize
+                    // parity holds (else a post-coerce verifier failure). An
+                    // object pointee uses the generic `implicitToVoidPtr`.
+                    admit = interner.kind(fromElem[0]) == TypeKind::FnSig
+                        ? sem.pointerConversions.allowVoidPtrFnConvert
+                        : sem.pointerConversions.implicitToVoidPtr;
                 }
                 // void* → T* (fromIsVoid && !toIsVoid)
                 else if (fromIsVoid && !toIsVoid) {
-                    admit = sem.pointerConversions.implicitFromVoidPtr;
+                    // Option-B re-homing (mirror): `void* -> Ptr<FnSig>` routes
+                    // through the same single fn<->void* gate; an object pointee
+                    // uses the generic `implicitFromVoidPtr`.
+                    admit = interner.kind(toElem[0]) == TypeKind::FnSig
+                        ? sem.pointerConversions.allowVoidPtrFnConvert
+                        : sem.pointerConversions.implicitFromVoidPtr;
                 }
                 if (admit) {
                     HirNodeId const cast = builder.makeCast(

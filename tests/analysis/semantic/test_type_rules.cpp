@@ -453,6 +453,91 @@ TEST(TypeRules, ScalarConvertsToBoolWhenGated) {
     EXPECT_FALSE(asg(boolT, voidT,   true));
 }
 
+// ── D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3) ─────────────────────────────────────
+// Implicit function-pointer <-> `void*` conversion — the gcc/POSIX dlsym / Tcl
+// ClientData idiom — gated on `allowVoidPtrFnConvert`, the SINGLE authoritative
+// gate for the whole fn<->void* class (Option B). The newly-admitted form is the
+// BARE function DESIGNATOR (`FnSig`, not yet decayed) -> `void*`; the `Ptr<FnSig>`
+// <-> `void*` pointer-to-pointer arms are RE-HOMED onto the same flag. The
+// boundary is Void-pointee-ONLY: a function designator / pointer -> a NON-void
+// object pointer STAYS a loud reject regardless of the flag.
+
+namespace {
+// A bare `int(int)` function signature (a function DESIGNATOR type, NOT yet a
+// pointer) — the un-decayed form the sqlite test_md5 `Tcl_CreateCommand` call
+// passes into a `void*` ClientData parameter.
+TypeId makeIntIntFnSig(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const params[1] = { i32 };
+    return in.fnSig(params, i32, CallConv::CcSysV);
+}
+} // namespace
+
+// (a) + (d): a bare FnSig -> void* ADMITS with the flag on, REJECTS with it off
+// (red-on-disable — the default-false gate genuinely controls the behavior).
+TEST(TypeRules, FnSigToVoidPtrGatedByFlag) {
+    auto in = makeInterner();
+    TypeId const fnSig   = makeIntIntFnSig(in);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    SemanticConfig::PointerConversionRules on;
+    on.allowVoidPtrFnConvert = true;
+    SemanticConfig::PointerConversionRules off;   // defaults false (strict)
+    // `void* p = add40;` (bare designator into void*) — the exact blocker.
+    EXPECT_TRUE(isAssignable(in, voidPtr, fnSig, on))
+        << "bare FnSig -> void* admits when allowVoidPtrFnConvert is on";
+    EXPECT_FALSE(isAssignable(in, voidPtr, fnSig, off))
+        << "RED-ON-DISABLE: reverts to a loud reject when the flag is off";
+}
+
+// (b): the Option-B re-homing — `Ptr<FnSig> -> void*` AND `void* -> Ptr<FnSig>`
+// route through `allowVoidPtrFnConvert`, NOT the generic implicitToVoidPtr /
+// implicitFromVoidPtr. Proven with a config that turns ONLY the fn<->void* gate
+// on (the generic void-ptr flags stay OFF): the conversion still admits, so it
+// cannot be riding the generic flags. With everything off, both reject.
+TEST(TypeRules, VoidPtrFnConvertReHomesPtrToPtrArms) {
+    auto in = makeInterner();
+    TypeId const fnSig   = makeIntIntFnSig(in);
+    TypeId const fnPtr   = in.pointer(fnSig);                       // Ptr<FnSig>
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    SemanticConfig::PointerConversionRules fnOnly;                  // ONLY the fn gate
+    fnOnly.allowVoidPtrFnConvert = true;                           // generic flags stay false
+    SemanticConfig::PointerConversionRules off;                    // all false
+    // Ptr<FnSig> -> void* and void* -> Ptr<FnSig> both admit on the fn gate ALONE.
+    EXPECT_TRUE(isAssignable(in, voidPtr, fnPtr, fnOnly))
+        << "Ptr<FnSig> -> void* rides allowVoidPtrFnConvert, not implicitToVoidPtr";
+    EXPECT_TRUE(isAssignable(in, fnPtr, voidPtr, fnOnly))
+        << "void* -> Ptr<FnSig> rides allowVoidPtrFnConvert, not implicitFromVoidPtr";
+    // RED-ON-DISABLE: with the fn gate off, both revert to a loud reject.
+    EXPECT_FALSE(isAssignable(in, voidPtr, fnPtr, off));
+    EXPECT_FALSE(isAssignable(in, fnPtr, voidPtr, off));
+}
+
+// (c): the FAIL-LOUD boundary — a function designator / function pointer -> a
+// NON-void object pointer (`int*`) STAYS a loud reject regardless of the flag.
+// The new admit is Void-pointee-ONLY; over-admitting here would be a real
+// type-safety hole (a function address reinterpreted as int-typed storage). Even
+// with EVERY void-ptr flag on, a non-void object pointee is out of scope for the
+// fn<->void* class.
+TEST(TypeRules, VoidPtrFnConvertBoundaryStaysLoud) {
+    auto in = makeInterner();
+    TypeId const fnSig  = makeIntIntFnSig(in);
+    TypeId const fnPtr  = in.pointer(fnSig);                        // Ptr<FnSig>
+    TypeId const intPtr = in.pointer(in.primitive(TypeKind::I32));  // int* (non-void)
+    SemanticConfig::PointerConversionRules on;                     // ALL void-ptr flags on
+    on.allowVoidPtrFnConvert = true;
+    on.implicitToVoidPtr     = true;
+    on.implicitFromVoidPtr   = true;
+    SemanticConfig::PointerConversionRules off;
+    // FnSig -> int* : never (the new arm is Void-pointee-only).
+    EXPECT_FALSE(isAssignable(in, intPtr, fnSig, on))
+        << "bare FnSig -> int* stays loud even with every void-ptr flag on";
+    EXPECT_FALSE(isAssignable(in, intPtr, fnSig, off));
+    // Ptr<FnSig> -> int* : two distinct non-void pointees, never implicit.
+    EXPECT_FALSE(isAssignable(in, intPtr, fnPtr, on))
+        << "Ptr<FnSig> -> int* stays loud (distinct non-void pointees)";
+    EXPECT_FALSE(isAssignable(in, intPtr, fnPtr, off));
+}
+
 // ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────
 
 // A `_BitInt(N)` IS arithmetic (ungated shape admission — inert for non-C schemas

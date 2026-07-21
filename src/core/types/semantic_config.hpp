@@ -1977,9 +1977,10 @@ struct DSS_EXPORT SemanticConfig {
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
     //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
-    //     declarators + indirect calls); when the first language
-    //     needs the conversion, another `allowVoidPtrFnConvert: bool`
-    //     opt-in extends this struct.
+    //     declarators + indirect calls). LANDED: the `allowVoidPtrFnConvert`
+    //     opt-in below now gates the whole fn<->void* class (Option B, the
+    //     single authoritative gate) for the gcc/POSIX dlsym / Tcl ClientData
+    //     idiom; c-subset opts in, default false stays ISO-strict.
     //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
     //     step 13.2 audit fold): if a future language needs
     //     per-element-type predicates ("only T* → void* when T ∈
@@ -2038,6 +2039,28 @@ struct DSS_EXPORT SemanticConfig {
         // expression still works via the HIR condition lowering, so nothing real is
         // lost.
         bool nullPointerConstantFromNullptrT = false;
+        // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): implicit function-pointer to/from
+        // `void*` conversion -- INCLUDING the bare function DESIGNATOR (`FnSig`, not
+        // yet decayed) -> `void*` form, the gcc/POSIX `dlsym` / Tcl `ClientData`
+        // idiom (`Tcl_CreateCommand(i, "md5", MD5DigestToBase16, ...)` passes a bare
+        // function name into a `void*` ClientData parameter). Converting between a
+        // function pointer and `void*` is UNDEFINED in ISO C (6.3.2.3 guarantees only
+        // object-pointer to/from `void*`), but POSIX (`dlsym`) REQUIRES it and on
+        // every LP64/LLP64 target a function pointer and `void*` share the SAME
+        // representation and width -- so the conversion is representation-identical
+        // and can NEVER be a miscompile (the HIR realizes it as the same FnSig->Ptr
+        // Bitcast-over-GlobalAddr the function-pointer decay already uses; no MIR
+        // change). This is the SINGLE authoritative gate for the WHOLE fn<->void*
+        // class (Option B): both the bare-designator -> `void*` admit AND the
+        // `Ptr<FnSig>` <-> `void*` pointer-to-pointer arms route through THIS flag
+        // (not the generic object-pointer `implicitToVoidPtr`/`implicitFromVoidPtr`).
+        // Default false = strict (a non-C schema, or a language wanting ISO-strict
+        // function-pointer typing, keeps it rejected). Read by `isAssignable` (admit)
+        // and `coerce()` in `cst_to_hir.cpp` (realize), in lockstep. The boundary is
+        // Void-pointee-ONLY: a function pointer / designator -> a NON-void object
+        // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
+        // this flag.
+        bool allowVoidPtrFnConvert = false;
     };
     PointerConversionRules pointerConversions;
 
