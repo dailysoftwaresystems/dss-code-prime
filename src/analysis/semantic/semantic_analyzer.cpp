@@ -4724,7 +4724,21 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // declaration (c-subset's `extern`) — config-driven, no
                         // rule-name identity. Like a prototype it is a non-defining
                         // declaration that MERGES with an in-TU definition.
-                        bool const isExtern = decl.nonDefiningDeclaration;
+                        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an
+                        // `extern` on a FUNCTION DEFINITION (`extern int f(void){…}`)
+                        // is a DEFINING declaration despite the row's
+                        // `nonDefiningDeclaration` default — the body IS the
+                        // definition. The kindByChild discriminator already upgraded
+                        // effectiveKind to Function (a block tail present), so
+                        // suppress the non-defining marking there: the symbol carries
+                        // a body, collides (not merges) with another definition, and
+                        // CST→HIR lowers a real Function (not an ExternFunction
+                        // import). A prototype/object extern (effectiveKind Variable)
+                        // stays non-defining. Generic — any declarator-mode row that
+                        // is BOTH nonDefiningDeclaration AND kindByChild-Function
+                        // resolves a definition as defining (only externDecl is today).
+                        bool const isExtern = decl.nonDefiningDeclaration
+                            && effectiveKind != DeclarationKind::Function;
                         rec.isExternDeclaration = isExtern;
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
                         // state so a LATER redeclaration sees THIS symbol (as `prior`)

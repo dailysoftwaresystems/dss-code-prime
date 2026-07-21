@@ -1410,6 +1410,77 @@ TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
     EXPECT_EQ(res->hir.kind(decls[2]), HirKind::Function);         // f
 }
 
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+// DEFINITION lowers to a REAL HirKind::Function with an EMITTED body — NOT an
+// ExternFunction import (the pre-cycle mis-lowering, which would DROP the body).
+// It reuses the SAME declarator-mode function lowering topLevelDecl's static/plain
+// definition arm uses. RED-ON-DISABLE: revert lowerExternDeclInto's isFn branch ->
+// addone lowers to a bodyless ExternFunction, this reds.
+TEST(HirLoweringCSubset, ExternFunctionDefinitionLowersToFunctionWithBody) {
+    SemanticModel model = analyzeCSubset(
+        "extern int addone(int x){ return x + 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    ASSERT_EQ(res->hir.kind(decls[0]), HirKind::Function)
+        << "an extern function DEFINITION lowers to a real Function, not an "
+           "ExternFunction import";
+    EXPECT_EQ(res->hir.functionParams(decls[0]).size(), 1u);   // x
+    // The body is EMITTED (`return x + 1;`), never dropped.
+    HirNodeId body = res->hir.functionBody(decls[0]);
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    EXPECT_EQ(res->hir.kind(stmts[0]), HirKind::ReturnStmt)
+        << "the extern function definition's body must be emitted";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION fail-loud (nested function): an `extern` function
+// DEFINITION in BLOCK scope is a nested function (not valid C). It must be rejected
+// loud — NEVER silently hoisted to module scope. RED-ON-DISABLE: drop the block-
+// scope ExternDecl guard -> f is silently hoisted to a module Function.
+TEST(HirLoweringCSubset, NestedExternFunctionDefinitionRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int g(void){ extern int f(void){ return 0; } return 0; }\n");
+    // Fail-loud at SOME tier (never a silent hoist). If the semantic tier already
+    // rejected it, that is fail-loud; otherwise the HIR block-scope guard must.
+    if (model.hasErrors()) { SUCCEED(); return; }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a block-scope extern function DEFINITION (a nested function) must be "
+           "rejected loud, never silently hoisted to module scope";
+    EXPECT_FALSE(r.all().empty());
+    // And no hoisted module Function `f` leaked out.
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    std::size_t moduleFns = 0;
+    for (HirNodeId d : decls)
+        if (res->hir.kind(d) == HirKind::Function) ++moduleFns;
+    EXPECT_LE(moduleFns, 1u) << "only g (or none) — f must NOT be hoisted";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION fail-loud (override + body): the pathological
+// `extern int f(void) "lib" { … }` — a per-declaration library override AND a body
+// — must fail loud (H_ExternDeclMalformed), never a silent body-drop. The string
+// shifts the kindByChild discriminator off the tail (so it is NOT classified as a
+// definition), and the block would otherwise be dropped by the declaration
+// lowering. RED-ON-DISABLE: drop the string+block guard -> the body is silently
+// dropped and f becomes a bodyless ExternFunction import.
+TEST(HirLoweringCSubset, ExternFunctionDefinitionWithLibraryOverrideRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "extern int f(void) \"lib\" { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the form parses + analyzes; the rejection is at lowering";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternDeclMalformed), 1u)
+        << "a library override on a function definition must fail loud, never "
+           "silently drop the body";
+}
+
 TEST(HirLoweringCSubset, ExternGlobalWithInitializerRejectedLoud) {
     // D-FF2-3: `extern int x = 5;` is a contradiction — extern means
     // "storage lives elsewhere"; an init would either redefine the

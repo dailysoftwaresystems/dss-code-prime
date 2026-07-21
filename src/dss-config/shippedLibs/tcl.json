@@ -30,6 +30,7 @@
     { "name": "TCL_STATIC", "replacement": "0" },
     { "name": "NULL",       "replacement": "((void*)0)" },
     { "name": "CONST",      "replacement": "const" },
+    { "name": "EXTERN",     "replacement": "extern" },
     { "name": "TCL_GLOBAL_ONLY",  "replacement": "1" },
     { "name": "TCL_EVAL_GLOBAL",  "replacement": "131072" },
     { "name": "TCL_APPEND_VALUE", "replacement": "4" },

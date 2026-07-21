@@ -4798,6 +4798,31 @@ struct Lowerer {
             // merge) emits no node for that declarator, mirroring the
             // top-level `lowerDeclInto` ExternDecl arm.
             if (k == "ExternDecl") {
+                // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a
+                // FUNCTION DEFINITION (`extern int f(void){…}`) is valid ONLY at file
+                // scope — here it would be a NESTED function (not valid C; DSS does
+                // not synthesize one). Reject it fail-loud (never a silent hoist to
+                // module scope). Detected by the SAME kindByChild body-block
+                // discriminator the file-scope path uses; a plain block-scope extern
+                // DECLARATION (proto/object, EndStatement tail) passes through.
+                if (auto dit = declMap_.find(tree().rule(n).v);
+                    dit != declMap_.end()) {
+                    DeclarationRule const& edecl = sem.declarations[dit->second];
+                    if (edecl.kindByChild) {
+                        NodeId const disc = descendVisibleDecl(
+                            tree(), n, edecl.kindByChild->childPath, edecl);
+                        if (disc.valid()
+                            && tree().kind(disc) == NodeKind::Internal
+                            && tree().rule(disc).v
+                                   == edecl.kindByChild->whenRule.v) {
+                            stmtResult = reportedError(n,
+                                "a function definition may not appear in block scope "
+                                "— `extern` on a function definition is a nested "
+                                "function (not valid C); move it to file scope");
+                            return;
+                        }
+                    }
+                }
                 // D-CSUBSET-EXTERN-MULTI-DECLARATOR: a block-scope extern lowers to N
                 // ExternGlobal/ExternFunction nodes (one per declarator, or none when
                 // absorbed). They carry no runtime code, so route EACH to the module-
@@ -8264,6 +8289,84 @@ struct Lowerer {
         return sem.identifierToken.valid() && tk == sem.identifierToken;
     }
 
+    // FC4 c1 / D-CSUBSET-EXTERN-FN-DEFINITION: lower a DECLARATOR-MODE function
+    // DEFINITION (the kindByChild discriminator matched a body block) to a real
+    // HIR Function. SHARED by `lowerTopLevelInto` (a plain/`static` definition)
+    // and `lowerExternDeclInto` (an `extern int f(void){…}` definition) so the
+    // two never drift — the ONLY difference between them is the declaration row
+    // (which carries the linkage) and it is threaded in via `decl`/`linkAttr`.
+    // `discNode` is the matched kindByChild node (the body block when bodyPath is
+    // empty — the declarator-mode convention: params live in the declarator's fn
+    // suffix, the matched block IS the body). Degrades to an Error node when the
+    // semantic tier already rejected the declarator (no named declarator).
+    [[nodiscard]] HirNodeId
+    lowerDeclaratorModeFunction(NodeId node, DeclarationRule const& decl,
+                                DeclaratorConfig const& dc, NodeId discNode,
+                                LinkageAttr linkAttr) {
+        auto vis = declRoleChildren(tree(), node, decl);
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        std::vector<NodeId> declarators;
+        if (carrier.has_value() && *carrier < vis.size())
+            collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        // The function = the sole named declarator (the semantic tier
+        // enforces exactly-one / named / fn-suffix / no-init via
+        // S_InvalidFunctionDeclarator + S_DeclarationDeclaresNothing;
+        // lowering degrades to an Error node when those fired).
+        NodeId fnName{};
+        for (NodeId d : declarators) {
+            fnName = declaratorNameNode(tree(), d, dc);
+            if (fnName.valid()) break;
+        }
+        if (!fnName.valid()) return errorNode(node);
+        SymbolId const sym = model.symbolAt(fnName);
+        TypeId sig = InvalidType;
+        if (auto const* rec = model.recordFor(sym)) sig = rec->type;
+        // Params live in the fn suffix attached to the NAME's direct
+        // declarator (`int (*f(int a))(int b)` — f's params are `a`;
+        // the outer suffix shapes the return type only).
+        std::vector<HirNodeId> params;
+        NodeId const direct = tree().parent(fnName);
+        if (direct.valid() && tree().kind(direct) == NodeKind::Internal
+            && tree().rule(direct).v == dc.directRule.v) {
+            for (NodeId c : visible(direct)) {
+                if (tree().kind(c) == NodeKind::Internal
+                    && isFnSuffixRule(tree().rule(c), dc)) {
+                    collectParams(c, params);
+                    break;
+                }
+            }
+        }
+        NodeId const bodyNode =
+            (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
+                ? descend(discNode, decl.kindByChild->bodyPath)
+                : discNode;
+        TypeId const savedReturn = currentReturnType_;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
+        auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
+        if (bodyNode.valid()) prescanLabels(bodyNode);
+        HirNodeId body = bodyNode.valid()
+            ? lowerStmt(bodyNode)
+            : track(builder.makeBlock({}), node);
+        labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
+        currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
+        HirNodeId const fn_ =
+            track(builder.makeFunction(sig, sym.v, params, body), node);
+        recordLinkage(fn_, linkAttr);
+        return fn_;
+    }
+
     // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
     // discriminator matched the block tail) or one Global PER named
     // declarator. Appends to `out` (module decls are a flat list — a
@@ -8304,65 +8407,8 @@ struct Lowerer {
         collectDeclarators(tree(), vis[*carrier], dc, declarators);
 
         if (isFn) {
-            // The function = the sole named declarator (the semantic tier
-            // enforces exactly-one / named / fn-suffix / no-init via
-            // S_InvalidFunctionDeclarator + S_DeclarationDeclaresNothing;
-            // lowering degrades to an Error node when those fired).
-            NodeId fnName{};
-            for (NodeId d : declarators) {
-                fnName = declaratorNameNode(tree(), d, dc);
-                if (fnName.valid()) break;
-            }
-            if (!fnName.valid()) {
-                out.push_back(errorNode(node));
-                return;
-            }
-            SymbolId const sym = model.symbolAt(fnName);
-            TypeId sig = InvalidType;
-            if (auto const* rec = model.recordFor(sym)) sig = rec->type;
-            // Params live in the fn suffix attached to the NAME's direct
-            // declarator (`int (*f(int a))(int b)` — f's params are `a`;
-            // the outer suffix shapes the return type only).
-            std::vector<HirNodeId> params;
-            NodeId const direct = tree().parent(fnName);
-            if (direct.valid() && tree().kind(direct) == NodeKind::Internal
-                && tree().rule(direct).v == dc.directRule.v) {
-                for (NodeId c : visible(direct)) {
-                    if (tree().kind(c) == NodeKind::Internal
-                        && isFnSuffixRule(tree().rule(c), dc)) {
-                        collectParams(c, params);
-                        break;
-                    }
-                }
-            }
-            NodeId const bodyNode =
-                (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
-                    ? descend(discNode, decl.kindByChild->bodyPath)
-                    : discNode;
-            TypeId const savedReturn = currentReturnType_;
-            TypeId const retType =
-                sig.valid() ? interner.fnResult(sig) : InvalidType;
-            currentReturnType_ = retType;
-            auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
-            auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
-            std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
-            labelOrdinals_.clear();
-            caseLabelOrdinals_.clear();
-            nextLabelOrdinal_ = 0;
-            if (bodyNode.valid()) prescanLabels(bodyNode);
-            HirNodeId body = bodyNode.valid()
-                ? lowerStmt(bodyNode)
-                : track(builder.makeBlock({}), node);
-            labelOrdinals_ = std::move(savedLabels);
-            caseLabelOrdinals_ = std::move(savedCaseLabels);
-            nextLabelOrdinal_ = savedNextOrd;
-            currentReturnType_ = savedReturn;
-            body = maybeAppendImplicitReturnZero(node, body, sym, retType,
-                                                 decl);
-            HirNodeId const fn_ =
-                track(builder.makeFunction(sig, sym.v, params, body), node);
-            recordLinkage(fn_, linkAttr);
-            out.push_back(fn_);
+            out.push_back(lowerDeclaratorModeFunction(node, decl, dc,
+                                                      discNode, linkAttr));
             return;
         }
 
@@ -8637,6 +8683,55 @@ struct Lowerer {
         }
         DeclaratorConfig const& dc = *sem.declarators;
         auto vis = declRoleChildren(tree(), node, decl);
+        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+        // DEFINITION (`extern int f(void){…}`) — the kindByChild discriminator
+        // matched a body block (childPath [2,0] resolves to the externDeclTail's
+        // block child). Lower it as a real Function with EXTERNAL linkage (the
+        // externDecl row ignores `extern` by kind, so linkageFrom yields the global
+        // default — external, the C default for a function), reusing the SAME
+        // declarator-mode function lowering topLevelDecl's definition arm uses (a
+        // body is EMITTED — NOT an ExternFunction import). Reached ONLY at file
+        // scope: a block-scope extern function definition (a nested function, not
+        // valid C) is rejected fail-loud upstream (lowerStmtNode's ExternDecl
+        // guard), never routed here.
+        NodeId discNode{};
+        bool isFn = false;
+        if (decl.kindByChild) {
+            discNode = descendVisibleDecl(tree(), node,
+                                          decl.kindByChild->childPath, decl);
+            isFn = discNode.valid()
+                && tree().kind(discNode) == NodeKind::Internal
+                && tree().rule(discNode).v == decl.kindByChild->whenRule.v;
+        }
+        if (isFn) {
+            LinkageAttr const fnLink =
+                linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            out.push_back(lowerDeclaratorModeFunction(node, decl, dc, discNode,
+                                                      fnLink));
+            return;
+        }
+        // D-CSUBSET-EXTERN-FN-DEFINITION fail-loud: a body block on the tail that
+        // was NOT classified as a definition means the pathological
+        // `extern int f(void) "lib" { … }` — a per-declaration library override AND
+        // a body. The preceding stringLiteralExpr shifted the kindByChild childPath
+        // off the tail (isFn false), so the block would otherwise be SILENTLY
+        // DROPPED by the declaration lowering below. Reject it loud (never a silent
+        // body-drop). The externDeclTail is the LAST role child; a body child is the
+        // config's kindByChild `whenRule` (agnostic — no hardcoded `block`).
+        if (decl.kindByChild && !vis.empty()
+            && tree().kind(vis.back()) == NodeKind::Internal) {
+            for (NodeId c : visible(vis.back())) {
+                if (tree().kind(c) == NodeKind::Internal
+                    && tree().rule(c).v == decl.kindByChild->whenRule.v) {
+                    emitH(DiagnosticCode::H_ExternDeclMalformed, node,
+                          "an extern function definition cannot carry a library "
+                          "override — remove the \"…\" library name (a definition "
+                          "supplies its own body; the override is declaration-only)");
+                    out.push_back(errorNode(node));
+                    return;
+                }
+            }
+        }
         if (*decl.declaratorListChild >= vis.size()) {
             // A recovery shape (a malformed extern whose list child is absent).
             // Distinct from the config-bug arm above (D-FF2 H1/H2 split).

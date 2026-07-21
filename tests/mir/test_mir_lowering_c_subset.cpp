@@ -1741,6 +1741,41 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
 // (dropping linkageSpecifierIgnoredNames) and `f`'s Local binding is overwritten
 // Global by last-wins → localCount flips to 0 → RED. A silent linkage
 // externalization of `static __attribute__((noreturn)) void f` is a miscompile.
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` function DEFINITION
+// has EXTERNAL linkage (binding == Global — the C default for a function; `extern`
+// is the default external linkage, ignored-by-kind in the linkage scan), while a
+// `static` definition of the same shape has INTERNAL linkage (binding == Local).
+// Both are called by main so neither is DCE'd. RED-ON-DISABLE: if the extern
+// definition were mis-lowered with internal linkage (or as a bodyless import), the
+// Local/Global counts flip.
+TEST(MirLoweringCSubsetLinkage, ExternFunctionDefinitionHasExternalLinkage) {
+    auto L = lowerCSubset(
+        "extern int ef(int x){ return x + 1; }\n"   // external linkage (Global)
+        "static int sf(int x){ return x + 2; }\n"   // internal linkage (Local)
+        "int main(void){ return ef(0) + sf(0); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 3u) << "ef + sf + main (all reachable)";
+    // Exactly one function is Local — the `static` sf; the `extern` ef and main are
+    // both external (Global). A count != 1 means the extern definition wrongly took
+    // internal linkage (2) or failed to lower as a Function (0).
+    int localCount = 0, globalCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        auto const b = m.funcBinding(m.funcAt(i));
+        if (b == SymbolBinding::Local)  ++localCount;
+        if (b == SymbolBinding::Global) ++globalCount;
+    }
+    EXPECT_EQ(localCount, 1)
+        << "only the `static` sf is internal (Local); the extern definition is not";
+    EXPECT_EQ(globalCount, 2)
+        << "the `extern` function DEFINITION + main are external (Global)";
+}
+
 TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
     for (char const* src : {
              // `static` BEFORE the attribute.

@@ -832,8 +832,77 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
         "                  rule:directDeclarator\n"
         "                    tok:\"x\"\n"
         "            tok:\")\"\n"
-        "  tok:\";\"\n";
+        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): the `;` now rides the
+        // `externDeclTail` wrapper (the `{ block | EndStatement }` alt — the twin of
+        // topLevelDeclTail), so a `block` tail can make externDecl a function
+        // DEFINITION. A prototype takes the EndStatement arm.
+        "  rule:externDeclTail\n"
+        "    tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): `extern` on a FUNCTION
+// DEFINITION — `extern int f(void){ return 0; }` (valid C 6.9.1, symmetric with
+// `static int f(){…}`; the Tcl `EXTERN int Sqlite3_Init(…){…}` shape). The
+// `externDeclTail`'s `block` arm makes it a definition; before this cycle
+// externDecl was declaration-only and P0009'd at the `{`. RED-ON-DISABLE: revert
+// externDeclTail's block arm -> this no longer parses (P0009).
+TEST(ParserCSubsetSmoke, ExternFunctionDefinitionParses) {
+    auto h = loadAndTokenize("extern int f(void){ return 0; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern int f(void){ return 0; }` must parse as a function definition";
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    // The externDeclTail's chosen arm is a `block` (a function-definition body),
+    // NOT an EndStatement token — this is what distinguishes the definition from
+    // the prototype/declaration forms.
+    const NodeId tail = findFirstNodeWithRule(t, "externDeclTail");
+    ASSERT_NE(tail, NodeId{})
+        << "externDecl must carry an externDeclTail wrapper";
+    bool tailHasBlock = false;
+    for (NodeId c : t.children(tail)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "block")
+            tailHasBlock = true;
+    }
+    EXPECT_TRUE(tailHasBlock)
+        << "an extern function DEFINITION's tail is a `block` body, not `;`";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION regression: the DSS per-declaration import-
+// library override (`extern void* g(int) "kernel32.dll";`) still parses — the
+// `{optional stringLiteralExpr}` stays a DIRECT child BEFORE the externDeclTail
+// (so externLibraryOverride's scan is unchanged), and the EndStatement tail rides
+// the wrapper. RED-ON-DISABLE: nest the string inside externDeclTail -> the
+// override lowering would no longer find it as a direct role child.
+TEST(ParserCSubsetSmoke, ExternImportLibraryOverrideParses) {
+    auto h = loadAndTokenize("extern void* g(int) \"kernel32.dll\";");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the import-library override form must still parse";
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+    // The stringLiteralExpr is a DIRECT child of externDecl (not nested in the
+    // tail) — the byte-preserved import-override position.
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    bool directString = false;
+    for (NodeId c : t.children(ext)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "stringLiteralExpr")
+            directString = true;
+    }
+    EXPECT_TRUE(directString)
+        << "the library-override string must stay a DIRECT externDecl child";
 }
 
 // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: a MULTI-declarator `extern` declaration

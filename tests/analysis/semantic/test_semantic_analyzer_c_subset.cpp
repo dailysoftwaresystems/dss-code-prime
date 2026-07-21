@@ -155,6 +155,60 @@ TEST(SemanticAnalyzerCSubset, ExternMultiDeclaratorMintsPerDeclaratorSymbols) {
     EXPECT_EQ(in.kind(rec("arr")->type), TypeKind::Array); // `arr[3]` — an array, not int/ptr
 }
 
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+// DEFINITION (`extern int f(int){…}`) mints a DEFINING Function (a body present),
+// NOT a non-defining declaration — despite externDecl's `nonDefiningDeclaration`
+// default. The kindByChild body-block discriminator upgrades effectiveKind to
+// Function, and the engine suppresses isExtern for a Function-kind declarator. It
+// contrasts with a bare `extern` PROTOTYPE (Variable-kind, isProto, isExtern — a
+// non-defining declaration) and mirrors a `static` DEFINITION (also Function-kind,
+// defining — the linkage difference is a MIR-tier concern, pinned separately).
+// RED-ON-DISABLE: revert externDeclTail's block arm -> `extern int efd(int x){…}`
+// P0009s (assertNoBuilderErrors fails); revert the isExtern-Function guard -> efd
+// becomes isExternDeclaration (this test's EXPECT_FALSE reds).
+TEST(SemanticAnalyzerCSubset, ExternFunctionDefinitionMintsDefiningFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int efd(int x){ return x + 1; }\n"   // extern DEFINITION (a body)
+        "extern int eproto(void);\n"                 // extern PROTOTYPE (no body)
+        "static int sfd(int x){ return x + 1; }\n"   // static DEFINITION (contrast)
+    });
+    assertNoBuilderErrors(*cu);   // red-on-disable: the extern DEFINITION must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    // The extern function DEFINITION: a DEFINING Function (a body present), NOT a
+    // non-defining declaration and NOT a syntactic prototype.
+    auto const* efd = rec("efd");
+    ASSERT_NE(efd, nullptr) << "the extern function definition must mint a symbol";
+    EXPECT_EQ(efd->kind, DeclarationKind::Function)
+        << "`extern int efd(int){…}` is a function DEFINITION (Function-kind)";
+    EXPECT_FALSE(efd->isExternDeclaration)
+        << "a definition is DEFINING — never a non-defining extern declaration";
+    EXPECT_FALSE(efd->isProtoDeclaration)
+        << "a definition (a body) is not a bare prototype";
+    // The bare extern PROTOTYPE: a NON-DEFINING declaration. Pass-1.5 upgrades a
+    // proto's kind to Function (D-CSUBSET-FN-PROTOTYPE) exactly as for a topLevel
+    // proto, so BOTH efd and eproto are Function-kind — the def-vs-declaration
+    // distinction is isProto/isExtern (below), NOT the kind. This is the contrast
+    // that matters: efd is defining (isExtern=false), eproto is not (isExtern=true).
+    auto const* eproto = rec("eproto");
+    ASSERT_NE(eproto, nullptr);
+    EXPECT_TRUE(eproto->isProtoDeclaration)
+        << "the bare `extern int eproto(void);` is a syntactic proto";
+    EXPECT_TRUE(eproto->isExternDeclaration)
+        << "the bare extern prototype is a NON-defining declaration (unlike the "
+           "extern DEFINITION efd, which is defining)";
+    // The `static` DEFINITION: also a DEFINING Function (contrast — same defining
+    // shape at the semantic tier; the internal-vs-external linkage lives at MIR).
+    auto const* sfd = rec("sfd");
+    ASSERT_NE(sfd, nullptr);
+    EXPECT_EQ(sfd->kind, DeclarationKind::Function);
+    EXPECT_FALSE(sfd->isExternDeclaration);
+}
+
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
 // `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
 // `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`

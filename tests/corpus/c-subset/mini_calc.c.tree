@@ -23,7 +23,8 @@ rule:root
                       rule:directDeclarator
                         tok:"fmt"
                 tok:")"
-      tok:";"
+      rule:externDeclTail
+        tok:";"
   rule:topLevel
     rule:topLevelDecl
       rule:topLevelHead
