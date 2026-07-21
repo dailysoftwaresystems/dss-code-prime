@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C34a 2026-07-21): the RUN witness for the REAL Tcl_Obj field layout + Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Builds a real Tcl_Obj via Tcl_NewIntObj(42), Tcl_IncrRefCounts it, then reads obj->refCount (@0, must be 1), obj->typePtr (@24, non-NULL for a typed int obj) and obj->typePtr->name (the 2-level access = the exact sqlite src/test1.c:6182-6183 S000D that C34a clears) — every one of which was S000D on the pre-C34a opaque arr<u64,6> Tcl_Obj blob. Returns Tcl_GetIntFromObj's readback (42). elf-x86_64 only (libtcl8.6); ubuntu x86_64 CI legs run it, native-arm64 arch-gates, win/macos compile-only. RED-ON-DISABLE: revert tcl.json's Tcl_Obj typedef body to arr<u64,6> -> every obj-> field read fails S000D and this example stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-objfields-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-objfields-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

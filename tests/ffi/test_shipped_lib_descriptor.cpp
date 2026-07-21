@@ -1623,6 +1623,101 @@ TEST(ShippedLibDescriptor, ConstantsAndTypedefsDecode) {
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::U64);
 }
 
+// ── Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION): a descriptor spells its
+// OWN typedef BY NAME ────────────────────────────────────────────────────────────
+//
+// The reader resolves a descriptor's typedefs FIRST and threads each resolved
+// `name -> TypeId` into the `namedTypes` span used for the REST of that
+// descriptor's signature / struct-field / constant / later-typedef parses. So a
+// signature can spell `ptr<Widget>` where `Widget` is a typedef the SAME descriptor
+// declares, instead of re-inlining `Widget`'s full struct body at every use (the
+// Tcl_Obj ~45-site ripple this closes). GENERIC + content-blind: no name is
+// special-cased. Pinned on a SYNTHETIC descriptor (independent of tcl.json): a
+// typedef `Widget` = a 2-field struct, a SECOND typedef `WidgetPair` spelling
+// `ptr<Widget>` BY NAME, a `structs` field `ptr<Widget>`, and a symbol
+// `fn(ptr<Widget>) -> i32` — all four must land the ONE interned `Widget` struct.
+// RED-ON-DISABLE: drop the typedef-name threading (pass the bare caller
+// `namedTypes` again) → every by-name `Widget` becomes "unknown type" → read fails.
+TEST(ShippedLibDescriptor, OptionCDescriptorTypedefReferencedByName) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "widget.json", R"({
+        "header": "widget.h",
+        "typedefs": [
+            { "name": "Widget",     "type": "struct \"Widget\" { i32, ptr<char> }" },
+            { "name": "WidgetPair", "type": "struct \"WidgetPair\" { ptr<Widget>, ptr<Widget> }" }
+        ],
+        "structs": [
+            { "name": "Holder", "fields": [ { "name": "w", "type": "ptr<Widget>" } ] }
+        ],
+        "symbols": [
+            { "name": "widget_id", "signature": "fn(ptr<Widget>) -> i32" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value())
+        << "a descriptor referencing its OWN typedef by name must decode";
+    EXPECT_FALSE(rep.hasErrors());
+
+    ASSERT_EQ(desc->typedefs.size(), 2u);
+    ASSERT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
+    TypeId const widget = desc->typedefs[0].type;         // Widget
+    EXPECT_EQ(interner.name(widget), "Widget");
+
+    // WidgetPair's fields are `ptr<Widget>` — the pointee is the SAME interned Widget.
+    ASSERT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
+    auto const pairFields = interner.operands(desc->typedefs[1].type);
+    ASSERT_EQ(pairFields.size(), 2u);
+    ASSERT_EQ(interner.kind(pairFields[0]), TypeKind::Ptr);
+    auto const pairPointee = interner.operands(pairFields[0]);
+    ASSERT_EQ(pairPointee.size(), 1u);
+    EXPECT_EQ(pairPointee[0].v, widget.v)
+        << "a later typedef spelling ptr<Widget> by name must land the same Widget";
+
+    // The symbol signature `fn(ptr<Widget>) -> i32` — the param pointee is Widget.
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->symbols[0].signature), TypeKind::FnSig);
+    auto const params = interner.fnParams(desc->symbols[0].signature);
+    ASSERT_EQ(params.size(), 1u);
+    ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+    auto const symPointee = interner.operands(params[0]);
+    ASSERT_EQ(symPointee.size(), 1u);
+    EXPECT_EQ(symPointee[0].v, widget.v)
+        << "a signature spelling ptr<Widget> by name must land the same Widget";
+
+    // The `structs`-surface field `ptr<Widget>` too — ONE Widget across every surface.
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->structs[0].fields[0].type), TypeKind::Ptr);
+    auto const holderPointee = interner.operands(desc->structs[0].fields[0].type);
+    ASSERT_EQ(holderPointee.size(), 1u);
+    EXPECT_EQ(holderPointee[0].v, widget.v);
+}
+
+// Fail-loud is PRESERVED under Option C: threading the descriptor's OWN typedefs
+// adds ONLY those declared names — it does NOT turn every bare identifier into a
+// valid type. A signature spelling `ptr<Nonesuch>`, where no such typedef exists,
+// still FAILS the read (the identifier fallback is the LAST resort before the
+// unknown-type reject). RED-ON-DISABLE of fail-loud: were the fallback to swallow
+// an unknown name, this malformed descriptor would wrongly decode.
+TEST(ShippedLibDescriptor, OptionCUnknownTypeNameStillFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json", R"({
+        "header": "bad.h",
+        "typedefs": [ { "name": "Widget", "type": "struct \"Widget\" { i32 }" } ],
+        "symbols": [ { "name": "f", "signature": "fn(ptr<Nonesuch>) -> i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value())
+        << "an unknown type name must still fail loud under Option C";
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // ── D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C1): the REAL tcl.json ──────
 //
 // The first brick toward building SQLite's `testfixture` (which links libtcl8.6
@@ -1669,30 +1764,34 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
 
     // The two opaque handles (modeled like stdio.json's FILE — struct types) +
     // the C4 ClientData typedef (void* — a Ptr, not a struct).
-    ASSERT_EQ(desc->typedefs.size(), 9u);
+    // C34a (D-FFI-TCL-DESCRIPTOR + Option C D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION):
+    // +Tcl_ObjType at index 1 (the Tcl_Obj->typePtr pointee; the real Tcl_Obj layout).
+    ASSERT_EQ(desc->typedefs.size(), 10u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
-    EXPECT_EQ(desc->typedefs[1].name, "Tcl_Obj");
-    EXPECT_EQ(desc->typedefs[2].name, "ClientData");
-    EXPECT_EQ(desc->typedefs[3].name, "Tcl_CmdInfo");     // C5 (bare-name type)
-    EXPECT_EQ(desc->typedefs[4].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
-    EXPECT_EQ(desc->typedefs[5].name, "Tcl_CmdProc");     // C8: FUNCTION-TYPE typedef
-    EXPECT_EQ(desc->typedefs[6].name, "Tcl_WideInt");     // C8
-    EXPECT_EQ(desc->typedefs[7].name, "Tcl_DString");     // C8
-    EXPECT_EQ(desc->typedefs[8].name, "Tcl_Channel");     // C8
+    EXPECT_EQ(desc->typedefs[1].name, "Tcl_ObjType");    // C34a: the typePtr pointee
+    EXPECT_EQ(desc->typedefs[2].name, "Tcl_Obj");
+    EXPECT_EQ(desc->typedefs[3].name, "ClientData");
+    EXPECT_EQ(desc->typedefs[4].name, "Tcl_CmdInfo");     // C5 (bare-name type)
+    EXPECT_EQ(desc->typedefs[5].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[6].name, "Tcl_CmdProc");     // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[7].name, "Tcl_WideInt");     // C8
+    EXPECT_EQ(desc->typedefs[8].name, "Tcl_DString");     // C8
+    EXPECT_EQ(desc->typedefs[9].name, "Tcl_Channel");     // C8
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
-    EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
-    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Ptr);     // ClientData = void*
-    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Struct);  // Tcl_CmdInfo
+    EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);  // C34a: Tcl_ObjType
+    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Struct);  // Tcl_Obj (5 real fields)
+    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Ptr);     // ClientData = void*
+    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::Struct);  // Tcl_CmdInfo
     // C8: the two command-proc typedefs are FUNCTION TYPES (used as `Tcl_ObjCmdProc *`
     // = a fn-pointer in 34 of the 44 test TUs); Tcl_WideInt = long long (i64);
     // Tcl_DString = a 216-byte struct (used as a local — the size is load-bearing);
     // Tcl_Channel = an opaque pointer. RED-ON-DISABLE: drop any of these 5 and the
     // shipped_tcl_typedefs example (+ ~13 sqlite test TUs) fail S0006 "undeclared type".
-    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
-    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::FnSig);   // Tcl_CmdProc = fn type
-    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::I64);     // Tcl_WideInt = long long
-    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::Struct);  // Tcl_DString (216-byte)
-    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Ptr);     // Tcl_Channel = opaque ptr
+    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::FnSig);   // Tcl_CmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::I64);     // Tcl_WideInt = long long
+    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Struct);  // Tcl_DString (216-byte)
+    EXPECT_EQ(interner.kind(desc->typedefs[9].type), TypeKind::Ptr);     // Tcl_Channel = opaque ptr
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1834,6 +1933,66 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         EXPECT_EQ(interner.kind(cmdInfo->fields[0].type), TypeKind::I32);  // offset 0
         EXPECT_EQ(cmdInfo->fields[5].name, "deleteProc");
         EXPECT_EQ(interner.kind(cmdInfo->fields[5].type), TypeKind::Ptr);  // a pointer
+        // C34a (D-FFI-TCL-DESCRIPTOR): objProc is now the REAL Tcl_ObjCmdProc fn-ptr
+        // (was ptr<void>) so test1.c:31551 `cmdInfo.objProc(...)` is CALLABLE, not an
+        // opaque void*. ptr<fn(void*, Tcl_Interp*, i32, Tcl_Obj**) -> i32>; still 8
+        // bytes so isNativeObjectProc@0 is unshifted (ZERO ABI change). RED-ON-DISABLE:
+        // revert objProc to ptr<void> and the shipped_tcl_objfields call fails S0004.
+        EXPECT_EQ(cmdInfo->fields[1].name, "objProc");
+        ASSERT_EQ(interner.kind(cmdInfo->fields[1].type), TypeKind::Ptr);
+        auto const objProcPointee = interner.operands(cmdInfo->fields[1].type);
+        ASSERT_EQ(objProcPointee.size(), 1u);
+        EXPECT_EQ(interner.kind(objProcPointee[0]), TypeKind::FnSig);   // ptr-to-FUNCTION
+        EXPECT_EQ(interner.kind(interner.fnResult(objProcPointee[0])), TypeKind::I32);
+    }
+
+    // C34a (D-FFI-TCL-DESCRIPTOR + Option C): the REAL Tcl_Obj layout — a 5-field
+    // struct (was an opaque `arr<u64,6>`), so test1.c:6182-6183 `pVar->typePtr` /
+    // `pVar->typePtr->name` (S000D x2) resolve to a genuine field scope. Pins the
+    // field names/types AND the DERIVED ABI layout: 48 bytes total with typePtr @
+    // offset 24 (natural alignment i32@0, char*@8, i32@16, Tcl_ObjType*@24,
+    // arr<u64,2>@32) — the real LP64 Tcl_Obj, ZERO ABI shift vs the old 48-byte
+    // blob. Tcl_ObjType (the typePtr pointee) is 40 bytes with `name` @ 0 (so
+    // `typePtr->name` resolves). Option C is what lets Tcl_Obj->typePtr spell
+    // `ptr<Tcl_ObjType>` BY NAME: the typedef and the structs-surface tag intern to
+    // ONE type (asserted below), so every `ptr<Tcl_Obj>` signature and a user
+    // `Tcl_Obj *` share this field scope. RED-ON-DISABLE: revert the Tcl_Obj typedef
+    // body to `arr<u64,6>` → these pins AND the shipped_tcl_objfields example fail.
+    {
+        ShippedStruct const* tclObj  = nullptr;
+        ShippedStruct const* objType = nullptr;
+        for (auto const& s : desc->structs) {
+            if (s.name == "Tcl_Obj")     tclObj  = &s;
+            if (s.name == "Tcl_ObjType") objType = &s;
+        }
+        ASSERT_NE(tclObj, nullptr)  << "missing Tcl_Obj struct (C34a real layout)";
+        ASSERT_NE(objType, nullptr) << "missing Tcl_ObjType struct (C34a)";
+        ASSERT_EQ(tclObj->fields.size(), 5u);
+        EXPECT_EQ(tclObj->fields[0].name, "refCount");
+        EXPECT_EQ(interner.kind(tclObj->fields[0].type), TypeKind::I32);
+        EXPECT_EQ(tclObj->fields[3].name, "typePtr");
+        ASSERT_EQ(interner.kind(tclObj->fields[3].type), TypeKind::Ptr);   // Tcl_ObjType*
+        // typePtr points AT the Tcl_ObjType struct (so `typePtr->name` resolves).
+        auto const pointee = interner.operands(tclObj->fields[3].type);
+        ASSERT_EQ(pointee.size(), 1u);
+        EXPECT_EQ(interner.kind(pointee[0]), TypeKind::Struct);
+        EXPECT_EQ(interner.name(pointee[0]), "Tcl_ObjType");
+        // The DERIVED ABI layout: 48 bytes, typePtr (field 3) @ 24.
+        auto objLayout = computeLayout(tclObj->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(objLayout.has_value());
+        EXPECT_EQ(objLayout->size, 48u);
+        EXPECT_EQ(objLayout->fieldOffsets[3], 24u);   // typePtr @ 24 (the crux)
+        // Tcl_ObjType: `name` @ 0, 40 bytes.
+        ASSERT_EQ(objType->fields.size(), 5u);
+        EXPECT_EQ(objType->fields[0].name, "name");
+        auto otLayout = computeLayout(objType->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(otLayout.has_value());
+        EXPECT_EQ(otLayout->size, 40u);
+        EXPECT_EQ(otLayout->fieldOffsets[0], 0u);
+        // Option C identity: the Tcl_Obj / Tcl_ObjType TYPEDEFS and the structs-
+        // surface TAGS are the SAME interned type (define once, reference by name).
+        EXPECT_EQ(tclObj->typeId.v,  desc->typedefs[2].type.v);   // Tcl_Obj
+        EXPECT_EQ(objType->typeId.v, desc->typedefs[1].type.v);   // Tcl_ObjType
     }
 
     // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).

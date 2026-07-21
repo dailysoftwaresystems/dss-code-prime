@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>       // std::getenv (DSS_CONFIG_ROOT discovery)
+#include <deque>         // std::deque (Option C: address-stable typedef-name backing)
 #include <fstream>
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
@@ -914,6 +915,172 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                              "includes", "symbols", "constants", "floatConstants",
                              "typedefs", "structs", "macros", "$comment"});
 
+    // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-
+    // RESOLUTION). A descriptor's own typedefs are decoded BEFORE its symbols /
+    // constants / structs, and each resolved `name -> TypeId` is threaded into the
+    // working `mergedNamedTypes` so a later signature, struct field, or typedef can
+    // spell an earlier descriptor typedef BY NAME (`ptr<Tcl_Obj>`) instead of
+    // re-inlining its full `struct "Tcl_Obj" {…}` body — collapsing the ~45-site
+    // ripple a body change would otherwise force (the Tcl_Obj layout arc). Seeded
+    // with the CALLER's bindings (the c82 `va_list` alias), then EACH typedef is
+    // appended as it resolves, so a typedef may reference an EARLIER typedef (array
+    // order IS the dependency order; a genuinely-unknown name still fails loud at
+    // the identifier fallback — fail-loud preserved). Content-blind + agnostic: NO
+    // name is special-cased and there is NO source-language / CPU / object-format
+    // branch — the same generic merge every descriptor gets. `typedefNameStore`
+    // (a std::deque, whose elements never move) gives each appended binding's
+    // `name` view STABLE backing, so growing `mergedNamedTypes` never dangles.
+    std::deque<std::string>       typedefNameStore;
+    std::vector<NamedTypeBinding> mergedNamedTypes(namedTypes.begin(), namedTypes.end());
+    if (doc.contains("typedefs")) {
+        if (!doc.at("typedefs").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'typedefs' must be an array");
+            return std::nullopt;
+        }
+        json const& typedefs = doc.at("typedefs");
+        out.typedefs.reserve(typedefs.size());
+        std::size_t tidx = 0;
+        for (auto const& t : typedefs) {
+            std::string const at = std::string{"'"} + path.generic_string()
+                + "' typedefs[" + std::to_string(tidx) + "]";
+            ++tidx;
+            if (!t.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, t,
+                                    "typedefs[" + std::to_string(tidx - 1) + "]",
+                                    {"name", "type", "variants"});
+            if (!t.contains("name") || !t.at("name").is_string()
+                || t.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string tname = t.at("name").get<std::string>();
+
+            // Decode the `type` field of a typedef entry/variant (any decodable
+            // type — scalar, pointer, struct ref, fn ptr, OR an EARLIER descriptor
+            // typedef spelled by name via `mergedNamedTypes`) through the ONE codec;
+            // fail loud on a missing/undecodable type. Returns the TypeId, or
+            // InvalidType (the caller skips on invalid). `ctx` is the diag context.
+            auto decodeTypedefType = [&](json const& obj, std::string const& ctx) -> TypeId {
+                if (!obj.contains("type") || !obj.at("type").is_string()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx
+                                                + ": missing or non-string 'type'");
+                    return InvalidType;
+                }
+                std::string const typeText = obj.at("type").get<std::string>();
+                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter,
+                                                    mergedNamedTypes);
+                if (!ty.valid() || ty == InvalidType) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' has a 'type' that failed to decode ('" + typeText
+                                    + "')");
+                    return InvalidType;
+                }
+                return ty;
+            };
+
+            // Exactly ONE of a flat `type` (single, back-compat) or per-target
+            // `variants` (plan 25 extension): the name is INVARIANT; only the
+            // type/width varies per target (e.g. a `wchar_t` that is 32-bit on elf
+            // but 16-bit on pe). Both, or neither, is malformed — fail loud.
+            bool const tHasFlat     = t.contains("type");
+            bool const tHasVariants = t.contains("variants");
+            if (tHasFlat == tHasVariants) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": a typedef must declare EXACTLY one of a flat "
+                                              "'type' (single) or 'variants' (per-target types)");
+                continue;
+            }
+
+            TypeId selType;
+            bool   selected = false;
+
+            if (tHasFlat) {
+                TypeId const tty = decodeTypedefType(t, at);
+                if (tty == InvalidType) continue;
+                selType  = tty;
+                selected = true;
+            } else {
+                // PER-TARGET VARIANTS. Decode EVERY variant's `type` EAGERLY, then
+                // select the variant whose `when` matches the active target.
+                if (!t.at("variants").is_array() || t.at("variants").empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": 'variants' must be a non-empty array");
+                    continue;
+                }
+                std::string const activeFormatName =
+                    activeFormat.has_value()
+                        ? std::string{objectFormatKindName(*activeFormat)}
+                        : std::string{};
+                bool okVariants = true;
+                std::size_t matchCount = 0;
+                std::size_t vidx = 0;
+                for (auto const& vdef : t.at("variants")) {
+                    std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+                    ++vidx;
+                    if (!vdef.is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                    + ": must be an object");
+                        okVariants = false; break;
+                    }
+                    (void)rejectUnknownKeys(reporter, vdef, vat, {"when", "type"});
+                    if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                    + ": missing or non-object 'when' "
+                                                      "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
+                        okVariants = false; break;
+                    }
+                    TypeId const vType = decodeTypedefType(vdef, vat);   // EAGER
+                    if (vType == InvalidType) { okVariants = false; break; }
+                    WhenMatch const wm = matchVariantWhen(
+                        vdef.at("when"), /*allowArch=*/true, vat + ".when",
+                        activeTarget, activeFormat, activeFormatName,
+                        activeDataModelName, reporter);
+                    if (wm == WhenMatch::Error) { okVariants = false; break; }
+                    if (wm == WhenMatch::Match) {
+                        ++matchCount;
+                        if (matchCount == 1) selType = vType;
+                    }
+                }
+                if (!okVariants) continue;
+                if (matchCount > 1) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + at + ": typedef '" + tname
+                                    + "' has " + std::to_string(matchCount)
+                                    + " 'variants' matching the active target (arch='"
+                                    + (activeTarget.has_value() ? std::string{*activeTarget}
+                                                                : std::string{"<none>"})
+                                    + "', format='"
+                                    + (activeFormat.has_value() ? activeFormatName
+                                                                : std::string{"<none>"})
+                                    + "') — exactly one variant may match (refusing an "
+                                      "ambiguous per-target typedef type)");
+                    continue;
+                }
+                selected = (matchCount == 1);   // 0 ⇒ not injected
+            }
+
+            if (!selected) continue;   // no variant matched → inject nothing
+            // Option C: PUBLISH this typedef as a NAME binding for the REST of this
+            // descriptor's parses (symbols / constants / structs + later typedefs).
+            // The name lives in the address-stable `typedefNameStore` so the view
+            // stays valid as `mergedNamedTypes` grows; the binding is appended
+            // BEFORE `tname` is moved into `out.typedefs`.
+            typedefNameStore.push_back(tname);
+            mergedNamedTypes.push_back(
+                NamedTypeBinding{std::string_view{typedefNameStore.back()}, selType});
+            out.typedefs.push_back(ShippedTypedef{std::move(tname), selType});
+        }
+    }
+
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
     // overall read still fails (errorCount delta below) so a malformed
@@ -1201,7 +1368,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
                 std::string const ovText = kv.value().get<std::string>();
                 TypeId const ovSig =
-                    parseTypeFromText(ovText, interner, typeReg, reporter, namedTypes);
+                    parseTypeFromText(ovText, interner, typeReg, reporter, mergedNamedTypes);
                 if (!ovSig.valid() || ovSig == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -1230,7 +1397,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // and the whole read fails via the errorCount delta below). The BASE
         // text is decoded even when an override is active (both must be
         // valid); the EFFECTIVE signature is the active model's.
-        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, namedTypes);
+        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes);
         if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -1242,7 +1409,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
         TypeId sig = baseSig;
         if (effectiveSigText != sigText) {
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, namedTypes);
+            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, mergedNamedTypes);
             // Already validated above; a second-parse failure here would be
             // interner drift — covered by the errorCount delta either way.
             if (!sig.valid() || sig == InvalidType) continue;
@@ -1314,7 +1481,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 // FLAT: decode {value,type} via the shared scalar-constant codec.
                 if (!decodeConstantValueAndType(c, at, cname, interner, typeReg,
                                                 reporter, selValue, selType,
-                                                namedTypes)) {
+                                                mergedNamedTypes)) {
                     continue;
                 }
                 selected = true;
@@ -1355,7 +1522,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     TypeId       vType;
                     if (!decodeConstantValueAndType(vdef, vat, cname, interner, typeReg,
                                                     reporter, vValue, vType,
-                                                    namedTypes)) {
+                                                    mergedNamedTypes)) {
                         okVariants = false; break;
                     }
                     WhenMatch const wm = matchVariantWhen(
@@ -1445,7 +1612,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 continue;
             }
             std::string const typeText = c.at("type").get<std::string>();
-            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
+            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, mergedNamedTypes);
             if (!cty.valid() || cty == InvalidType) {
                 dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                             DiagnosticSeverity::Error,
@@ -1479,148 +1646,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
     }
 
-    // (6) Optional `typedefs` array — the neutral form of a header's `typedef`s
-    // (e.g. `size_t`). Each: required non-empty `name`; required hir-text `type`
-    // (any decodable type — scalar, pointer, struct ref, fn ptr). The semantic
-    // phase injects each as a `DeclarationKind::Type` symbol.
-    if (doc.contains("typedefs")) {
-        if (!doc.at("typedefs").is_array()) {
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + path.generic_string()
-                    + "': 'typedefs' must be an array");
-            return std::nullopt;
-        }
-        json const& typedefs = doc.at("typedefs");
-        out.typedefs.reserve(typedefs.size());
-        std::size_t tidx = 0;
-        for (auto const& t : typedefs) {
-            std::string const at = std::string{"'"} + path.generic_string()
-                + "' typedefs[" + std::to_string(tidx) + "]";
-            ++tidx;
-            if (!t.is_object()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
-                continue;
-            }
-            (void)rejectUnknownKeys(reporter, t,
-                                    "typedefs[" + std::to_string(tidx - 1) + "]",
-                                    {"name", "type", "variants"});
-            if (!t.contains("name") || !t.at("name").is_string()
-                || t.at("name").get<std::string>().empty()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": missing or empty 'name'");
-                continue;
-            }
-            std::string tname = t.at("name").get<std::string>();
-
-            // Decode the `type` field of a typedef entry/variant (any decodable
-            // type — scalar, pointer, struct ref, fn ptr) via the ONE codec; fail
-            // loud on a missing/undecodable type. Returns the TypeId, or InvalidType
-            // (the caller skips on invalid). `ctx` is the diagnostic context.
-            auto decodeTypedefType = [&](json const& obj, std::string const& ctx) -> TypeId {
-                if (!obj.contains("type") || !obj.at("type").is_string()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + ctx
-                                                + ": missing or non-string 'type'");
-                    return InvalidType;
-                }
-                std::string const typeText = obj.at("type").get<std::string>();
-                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
-                if (!ty.valid() || ty == InvalidType) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + ctx + ": typedef '" + tname
-                                    + "' has a 'type' that failed to decode ('" + typeText
-                                    + "')");
-                    return InvalidType;
-                }
-                return ty;
-            };
-
-            // Exactly ONE of a flat `type` (single, back-compat) or per-target
-            // `variants` (plan 25 extension): the name is INVARIANT; only the
-            // type/width varies per target (e.g. a `wchar_t` that is 32-bit on elf
-            // but 16-bit on pe). Both, or neither, is malformed — fail loud.
-            bool const tHasFlat     = t.contains("type");
-            bool const tHasVariants = t.contains("variants");
-            if (tHasFlat == tHasVariants) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": a typedef must declare EXACTLY one of a flat "
-                                              "'type' (single) or 'variants' (per-target types)");
-                continue;
-            }
-
-            TypeId selType;
-            bool   selected = false;
-
-            if (tHasFlat) {
-                TypeId const tty = decodeTypedefType(t, at);
-                if (tty == InvalidType) continue;
-                selType  = tty;
-                selected = true;
-            } else {
-                // PER-TARGET VARIANTS. Decode EVERY variant's `type` EAGERLY, then
-                // select the variant whose `when` matches the active target.
-                if (!t.at("variants").is_array() || t.at("variants").empty()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": 'variants' must be a non-empty array");
-                    continue;
-                }
-                std::string const activeFormatName =
-                    activeFormat.has_value()
-                        ? std::string{objectFormatKindName(*activeFormat)}
-                        : std::string{};
-                bool okVariants = true;
-                std::size_t matchCount = 0;
-                std::size_t vidx = 0;
-                for (auto const& vdef : t.at("variants")) {
-                    std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
-                    ++vidx;
-                    if (!vdef.is_object()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                    + ": must be an object");
-                        okVariants = false; break;
-                    }
-                    (void)rejectUnknownKeys(reporter, vdef, vat, {"when", "type"});
-                    if (!vdef.contains("when") || !vdef.at("when").is_object()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                    + ": missing or non-object 'when' "
-                                                      "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
-                        okVariants = false; break;
-                    }
-                    TypeId const vType = decodeTypedefType(vdef, vat);   // EAGER
-                    if (vType == InvalidType) { okVariants = false; break; }
-                    WhenMatch const wm = matchVariantWhen(
-                        vdef.at("when"), /*allowArch=*/true, vat + ".when",
-                        activeTarget, activeFormat, activeFormatName,
-                        activeDataModelName, reporter);
-                    if (wm == WhenMatch::Error) { okVariants = false; break; }
-                    if (wm == WhenMatch::Match) {
-                        ++matchCount;
-                        if (matchCount == 1) selType = vType;
-                    }
-                }
-                if (!okVariants) continue;
-                if (matchCount > 1) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + at + ": typedef '" + tname
-                                    + "' has " + std::to_string(matchCount)
-                                    + " 'variants' matching the active target (arch='"
-                                    + (activeTarget.has_value() ? std::string{*activeTarget}
-                                                                : std::string{"<none>"})
-                                    + "', format='"
-                                    + (activeFormat.has_value() ? activeFormatName
-                                                                : std::string{"<none>"})
-                                    + "') — exactly one variant may match (refusing an "
-                                      "ambiguous per-target typedef type)");
-                    continue;
-                }
-                selected = (matchCount == 1);   // 0 ⇒ not injected
-            }
-
-            if (!selected) continue;   // no variant matched → inject nothing
-            out.typedefs.push_back(ShippedTypedef{std::move(tname), selType});
-        }
-    }
+    // (6) `typedefs` — resolved EARLY, BEFORE symbols/constants/structs (see the
+    // Option C block just before the `symbols` loop above,
+    // D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Relocated so each typedef's
+    // `name -> TypeId` is threaded into `mergedNamedTypes` and can be spelled BY
+    // NAME (`ptr<Tcl_Obj>`) by every later `parseTypeFromText` call, instead of
+    // re-inlining the full `struct "Tcl_Obj" {…}` body at ~45 sites.
 
     // (6.5) STRUCTS (named-field aggregate types). Each entry interns a struct
     // type (name + positional field types) the semantic phase injects as a TAG +
@@ -1698,7 +1729,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     }
                     if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
                                                reporter, sst.fields, fieldTypes,
-                                               namedTypes)) {
+                                               mergedNamedTypes)) {
                         continue;
                     }
                     selected = true;
@@ -1752,7 +1783,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         std::vector<ShippedField> vFields;
                         std::vector<TypeId>       vFieldTypes;
                         if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
-                                                   reporter, vFields, vFieldTypes, namedTypes)) {
+                                                   reporter, vFields, vFieldTypes, mergedNamedTypes)) {
                             okVariants = false; break;
                         }
 
