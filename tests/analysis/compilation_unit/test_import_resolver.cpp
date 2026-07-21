@@ -460,6 +460,149 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
 }
 
+// ── D-INCLUDE-ANGLE-SOURCE-FALLBACK: angle `#include <h>` real-header fallback ──
+//
+// When an angle header has NO shipped `<stem>.json` descriptor but DOES exist as
+// a real source file on the -I includeDirs, the PP falls back to textually
+// splicing it (byte-for-byte like a quote include), so SQLite ext TUs that
+// angle-include `<sqlite3.h>` / `<sqlite3ext.h>` resolve instead of fataling
+// F_ShippedHeaderNotFound. Descriptors stay first-choice; the fallback fires
+// ONLY on a descriptor miss. The full-CU-pipeline (preprocess+parse+resolve)
+// contract, complementing the PP-surface pins in test_preprocessor.cpp.
+
+// P1: angle `<foo.h>`, NO descriptor, `foo.h` on the -I path -> resolves via the
+// source fallback (textual splice): ONE tree (inlined), the header's symbol
+// present, NO F_ShippedHeaderNotFound, NO descriptor recorded. RED-ON-DISABLE:
+// revert the fallback -> the PP leaves the angle include verbatim -> the
+// post-parse resolver's descriptor lookup misses -> F_ShippedHeaderNotFound.
+TEST(ImportResolver, CSubsetAngleSourceFallbackResolves) {
+    TempDir srcDir;
+    TempDir incDir;   // the -I path (NOT the including file's own dir)
+    auto main = srcDir.write("main.c",
+        "#include <foo.h>\nint main() { return foo(); }\n");
+    incDir.write("foo.h", "int foo(void) { return 7; }\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addIncludeDir(incDir.path());   // -I: the angle source-fallback path
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                         DiagnosticCode::F_ShippedHeaderNotFound))
+        << "an angle header present on the -I path must resolve via the source "
+           "fallback, not fatal F_ShippedHeaderNotFound";
+    // Textual splice: ONE tree (header inlined, not a 2nd tree / a descriptor).
+    ASSERT_EQ(cu.trees().size(), 1u)
+        << "a source-fallback angle include is inlined into the one TU";
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "the includer + inlined header must compile clean";
+    EXPECT_TRUE(cu.crossRefs().empty())
+        << "a textual splice is not a cross-tree edge";
+    EXPECT_TRUE(cu.shippedLibDescriptors().empty())
+        << "a source fallback records NO descriptor (it is not a descriptor)";
+}
+
+// P2: BOTH a `baz.json` descriptor on the systemDir AND a `baz.h` source on the
+// -I path -> the DESCRIPTOR wins (funnel descriptor-first). The descriptor path
+// is recorded; the source decoy is NEVER inlined. RED-ON-DISABLE: flip the funnel
+// to source-first -> no descriptor recorded + the invalid decoy is spliced (tree
+// errors).
+TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
+    TempDir srcDir;
+    TempDir sysDir;
+    TempDir incDir;
+    auto main = srcDir.write("main.c",
+        "#include <baz.h>\nint main() { return 0; }\n");
+    auto descPath = sysDir.write("baz.json",
+        R"({ "library": { "pe": "lib.dll" },
+             "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
+    // A DECOY source header with the same stem on the -I path: it is INVALID C,
+    // so a wrong source-first splice would surface loudly as a tree error.
+    incDir.write("baz.h", "@@@ this is not valid c and must never be inlined @@@\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addIncludeDir(incDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                         DiagnosticCode::F_ShippedHeaderNotFound));
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "descriptor-first: <baz.h> must resolve to baz.json, not the decoy source";
+    std::error_code ec;
+    EXPECT_EQ(std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec),
+              std::filesystem::weakly_canonical(descPath, ec))
+        << "the recorded path must be the descriptor, proving descriptor-first";
+    ASSERT_EQ(cu.trees().size(), 1u)
+        << "the descriptor is NOT inlined as source (no 2nd tree, decoy ignored)";
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "the invalid decoy baz.h must never be spliced (the descriptor won)";
+}
+
+// P3 (C 6.10.2p2): the angle form does NOT search the including file's OWN
+// directory (only the -I includeDirs), UNLIKE quote. A `qux.h` present ONLY in
+// main.c's own dir (not on any -I) is NOT found by `#include <qux.h>` -> hard
+// F_ShippedHeaderNotFound; the SAME header via a QUOTE `#include "qux.h"` DOES
+// resolve. RED-ON-DISABLE: if the fallback wrongly searched the including dir the
+// angle form would resolve and the hard error would vanish.
+TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
+    // Angle: qux.h only in the including file's own dir -> NOT found.
+    {
+        TempDir srcDir;
+        auto main = srcDir.write("main.c",
+            "#include <qux.h>\nint main() { return qux(); }\n");
+        srcDir.write("qux.h", "int qux(void) { return 1; }\n");  // self-dir ONLY
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        // NO addIncludeDir -> the angle form has no -I on which to find qux.h.
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                            DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+            << "angle <qux.h> must NOT search the including dir (C 6.10.2p2)";
+    }
+    // Quote contrast: the SAME self-dir header via "qux.h" DOES resolve.
+    {
+        TempDir srcDir;
+        auto main = srcDir.write("main.c",
+            "#include \"qux.h\"\nint main() { return qux(); }\n");
+        srcDir.write("qux.h", "int qux(void) { return 1; }\n");
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                             DiagnosticCode::F_ShippedHeaderNotFound))
+            << "quote \"qux.h\" DOES search the including dir -> resolves (contrast)";
+        ASSERT_EQ(cu.trees().size(), 1u);
+        EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+            << "the quote include inlines qux.h cleanly";
+    }
+}
+
+// P4: an angle `<none.h>` absent on the systemDir AND every -I includeDir is a
+// hard, unsuppressable F_ShippedHeaderNotFound (fail-loud — never silently
+// accepted). An -I dir IS present but does not contain the header.
+TEST(ImportResolver, CSubsetAngleSourceFallbackTotalMissHardError) {
+    TempDir srcDir;
+    TempDir incDir;   // present but does NOT contain none.h
+    auto main = srcDir.write("main.c",
+        "#include <none.h>\nint main() { return 0; }\n");
+    incDir.write("other.h", "int other(void);\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addIncludeDir(incDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+        << "a total angle miss (no descriptor, no source on any -I) must fail loud";
+}
+
 // ── tsql-subset: cross-statement table-name matching ─────────────────────────
 
 TEST(ImportResolver, TsqlTableReferenceResolvesAcrossFiles) {

@@ -316,8 +316,15 @@ private:
                 // requested extension spelling (`<stdio.h>`, `<stdio>` → `stdio.json`).
                 if (directive.isSystem) {
                     // The `<stem>.json` mapping is the SHARED
-                    // `resolveSystemDescriptor` (FC15c funnel) so this resolution
-                    // and `__has_include(<h>)` agree byte-for-byte.
+                    // `resolveSystemDescriptor` (FC15c funnel). With the preprocessor
+                    // enabled, a confident-live angle SOURCE include (no descriptor,
+                    // real header on -I) is textually spliced + DROPPED by the PP
+                    // before this runs (D-INCLUDE-ANGLE-SOURCE-FALLBACK), so this
+                    // resolver only ever sees `Descriptor` (resolved here) and
+                    // `NotFound` angle directives — its descriptor verdict still agrees
+                    // byte-for-byte with `__has_include`'s; the new SOURCE verdict is
+                    // the PP's alone (a residual uncertain-live source include fails
+                    // loud here via F_ShippedHeaderNotFound below — strictly safer).
                     auto const resolved = resolveSystemDescriptor(
                         directive.filename, context.systemDirs);
                     if (!resolved) { unresolved(); continue; }

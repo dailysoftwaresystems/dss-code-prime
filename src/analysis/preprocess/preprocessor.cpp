@@ -828,21 +828,31 @@ struct SynthBuilder {
             [this, &includingDir](std::string_view filename,
                                   bool isAngle) -> bool {
             if (isAngle) {
-                auto descPath = resolveSystemDescriptor(filename, systemDirs);
-                if (!descPath) return false;
-                if (activeFormat.has_value()
-                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
-                                                             *activeFormat)) {
-                    return false;
+                // D-INCLUDE-ANGLE-SOURCE-FALLBACK + FC15c: resolve EXACTLY as the
+                // angle `#include <h>` arm does, through the SHARED funnel, so
+                // `__has_include(<h>)` and `#include <h>` can never disagree on
+                // existence. Descriptor -> keep the existing per-format availability
+                // verdict (an unavailable-on-this-format descriptor answers 0,
+                // matching the arm that then leaves the include verbatim). Source ->
+                // a real header on the -I path is includable (the arm textually
+                // splices it) -> 1. NotFound -> 0.
+                //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                //   is NOT an include -- it records NOTHING for the reparse-seed oracle
+                //   (a live `#include <h>` seeds via its own splice; a probe with no
+                //   matching include resolves nothing). Left as a pure existence answer.
+                AngleIncludeResolution const ar =
+                    resolveAngleInclude(filename, systemDirs, includeDirs);
+                switch (ar.kind) {
+                    case AngleIncludeKind::Descriptor:
+                        return !(activeFormat.has_value()
+                                 && !ffi::shippedHeaderAvailableForFormat(
+                                        ar.path, *activeFormat));
+                    case AngleIncludeKind::Source:
+                        return true;
+                    case AngleIncludeKind::NotFound:
+                        return false;
                 }
-                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
-                // is NOT an include -- it must not seed. A probe followed by a live
-                // `#include <h>` seeds via the un-gated splice (the sole recorder); a
-                // probe with no matching include (`#if __has_include(<h>)` taken false,
-                // or a bare feature test) resolves NOTHING for the reparse oracle
-                // either, so recording here would make the seed a SUPERSET of the
-                // oracle. Left as a pure existence answer.
-                return true;
+                return false;   // unreachable — every AngleIncludeKind handled above
             }
             return resolveQuote(filename, includingDir).has_value();
         };
@@ -881,8 +891,9 @@ struct SynthBuilder {
 
     void build(std::shared_ptr<SourceBuffer> const& source,
                std::string& out, LineMap& map) {
-        const char dquote  = '"';
-        const char newline = '\n';
+        const char dquote     = '"';
+        const char angleClose = '>';   // the `<h>` closer (source-fallback drop)
+        const char newline    = '\n';
         if (depth > kMaxIncludeDepth) {
             emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
                    SourceSpan::empty(0),
@@ -1177,6 +1188,71 @@ struct SynthBuilder {
                 }
                 std::string const angleName{toks[aBody].text};
                 if (angleName.empty()) continue;
+
+                // D-INCLUDE-ANGLE-SOURCE-FALLBACK: the SHARED angle funnel —
+                // descriptor FIRST (the DSS neutral `<stem>.json` model), else a
+                // REAL source header on the -I includeDirs, else a miss. The SAME
+                // funnel answers `__has_include(<h>)`, so `#include`/`__has_include`
+                // never disagree on existence (FC15c). Descriptor / NotFound both
+                // flow the UNCHANGED macro-splice-or-verbatim path below (Descriptor
+                // keeps the line for the import resolver's typed-surface injection;
+                // NotFound is left verbatim -> the resolver emits the hard
+                // F_ShippedHeaderNotFound). Only Source is new.
+                AngleIncludeResolution const angleRes =
+                    resolveAngleInclude(angleName, systemDirs, includeDirs);
+
+                // SOURCE fallback: a no-descriptor angle header that IS a real source
+                // file on the -I path — splice it TEXTUALLY and DROP the directive,
+                // byte-for-byte like the quote-on-disk arm below, so an angle
+                // `<sqlite3ext.h>` behaves exactly like the quote `"sqlite3ext.h"`
+                // that the 39 clean ext TUs already use (its macros + typedefs inline
+                // into THIS TU; a CrossTreeRef would carry neither). GATED on
+                // includeResolvable() for the SAME P0016 reason as the quote arm: an
+                // EAGER file inline in a dead/uncertain branch is forbidden — left
+                // verbatim, the authoritative pass elides a truly-dead one, and a
+                // wrongly-skipped live one fails loud downstream (never a silent
+                // miscompile). A dead/uncertain-branch source include therefore falls
+                // through to the descriptor arm which (no descriptor) leaves it
+                // verbatim. Mirrors the quote arm's includeStack + circular guard.
+                if (angleRes.kind == AngleIncludeKind::Source
+                    && includeResolvable()) {
+                    const ByteOffset dStart = toks[i].tok.span.start();
+                    // Directive end: past the angle body, consuming the '>' closer if
+                    // it physically follows (mirrors the quote arm's closing-quote
+                    // consume). `toks[aBody]` spans the header name; '>' is next.
+                    ByteOffset dirEnd = toks[aBody].tok.span.end();
+                    if (dirEnd < spliced.size() && spliced[dirEnd] == angleClose) {
+                        ++dirEnd;
+                    }
+                    std::error_code ec;
+                    fs::path canon = fs::weakly_canonical(angleRes.path, ec);
+                    if (ec) canon = angleRes.path;
+                    if (std::find(includeStack.begin(), includeStack.end(), canon)
+                        != includeStack.end()) {
+                        emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"circular include of "} + angleName);
+                        continue;
+                    }
+                    auto headerBuf = SourceBuffer::fromFile(angleRes.path);
+                    if (!headerBuf) {
+                        emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"system include unreadable: "} + angleName);
+                        continue;
+                    }
+                    copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                    includeStack.push_back(canon);
+                    SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
+                                       rep, depth + 1, includeStack, fatal,
+                                       preScanDefinePrefix, resolvedDescriptorsOut};
+                    child.build(headerBuf, out, map);
+                    includeStack.pop_back();
+                    out.push_back(newline);
+                    copiedUpTo = dirEnd;   // DROP the directive — content is inlined
+                    continue;
+                }
+
                 // Splice the descriptor's macros into a LOCAL buffer FIRST (so a
                 // NotAvailable outcome touches neither `out` nor the line-map). On
                 // NotAvailable (no descriptor / unavailable) OR Malformed (already
@@ -1987,30 +2063,37 @@ private:
             [this](std::vector<Token> const& toks) { return expandTokens(toks); };
         PpIsDefined definedCb =
             [this](std::string_view n) { return isDefined(n); };
-        // FC15c: `__has_include` resolves a header EXACTLY as the include
-        // machinery would (Finding 3): quote form = self-dir + includeDirs
-        // (`resolveIncludePath`); angle form = `<stem>.json` on systemDirs
-        // (`resolveSystemDescriptor` -- the SHARED mapping the import resolver
-        // also calls, so the two never disagree).
+        // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
+        // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
+        // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
+        // the SynthBuilder pre-scan callback AND the angle `#include <h>` arm, so
+        // all three route through the SAME `resolveAngleInclude` funnel — a
+        // descriptor / source / miss verdict that can never drift. Quote form =
+        // self-dir + includeDirs (`resolveIncludePath`), unchanged.
         PpHasInclude hasIncludeCb =
             [this](std::string_view filename, bool isAngle) -> bool {
             if (isAngle) {
-                auto descPath = resolveSystemDescriptor(filename, systemDirs_);
-                if (!descPath) return false;  // no descriptor on the path
-                // c9 (Phase-2): per-target truth — when the active object-format is
-                // known, a header whose descriptor excludes it reports NOT available
-                // (agreeing with the `#include` semantic gate + the macro-splice).
-                // nullopt activeFormat_ = pure existence (unchanged pre-c9 behavior).
-                if (activeFormat_.has_value()
-                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
-                                                             *activeFormat_)) {
-                    return false;
+                // Descriptor -> per-target availability (c9: an unavailable-on-this-
+                // format header reports NOT available, agreeing with the `#include`
+                // gate + macro-splice; nullopt activeFormat_ = pure existence).
+                // Source -> a real header on the -I path is includable (the arm
+                // textually splices it) -> 1. NotFound -> 0.
+                //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                //   does NOT seed -- the un-gated angle-`#include` splice is the SOLE
+                //   recorder, so the seed set stays == the finish() oracle's live set.
+                AngleIncludeResolution const ar =
+                    resolveAngleInclude(filename, systemDirs_, includeDirs_);
+                switch (ar.kind) {
+                    case AngleIncludeKind::Descriptor:
+                        return !(activeFormat_.has_value()
+                                 && !ffi::shippedHeaderAvailableForFormat(
+                                        ar.path, *activeFormat_));
+                    case AngleIncludeKind::Source:
+                        return true;
+                    case AngleIncludeKind::NotFound:
+                        return false;
                 }
-                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
-                // does NOT seed (see the SynthBuilder pre-scan callback) -- the
-                // un-gated angle-`#include` splice is the SOLE recorder, so the seed
-                // set stays == the finish() oracle's authoritatively-live set.
-                return true;
+                return false;   // unreachable — every AngleIncludeKind handled above
             }
             return resolveIncludePath(filename, includingDir_, includeDirs_)
                 .has_value();

@@ -2452,6 +2452,81 @@ TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
     fs::remove_all(sysdir, ec);
 }
 
+// D-INCLUDE-ANGLE-SOURCE-FALLBACK (P1 — the PP surface): an angle `#include <h>`
+// with NO `h.json` descriptor but a REAL `h` source header on the -I includeDirs
+// falls back to TEXTUALLY splicing that header (byte-for-byte like a quote
+// include), so its `#define`s AND declarations inline into THIS TU — the crux
+// (a post-parse cross-ref would carry the symbol but NOT the macro). We ship a
+// `foo.h` (a macro + a symbol) on an includeDir, NO systemDir descriptor, and
+// angle-include it. RED-ON-DISABLE: revert the source-fallback arm -> the angle
+// include is left verbatim -> `FOO_OK` never expands (no `7`), `foo_sym` never
+// appears (the header text is absent), and the `#` of the directive survives.
+TEST(Preprocessor, FC15cAngleSourceFallbackSplicesHeaderTextually) {
+    namespace fs = std::filesystem;
+    auto inc = fs::temp_directory_path() / "dss_angle_src_fallback_p1";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "foo.h", std::ios::binary)
+        << "#define FOO_OK 7\nint foo_sym;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <foo.h>\nint u = FOO_OK;\n", r, {inc}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a resolvable angle source fallback must not error";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("foo_sym"))
+        << "the fallback header's declaration must be textually inlined";
+    EXPECT_TRUE(has("7"))
+        << "the fallback header's macro FOO_OK must EXPAND -- proving a textual "
+           "splice, not a symbol-only cross-ref (which carries no macros)";
+    EXPECT_FALSE(has("FOO_OK"))
+        << "FOO_OK must be expanded, not survive as a bare identifier";
+    EXPECT_FALSE(has("#"))
+        << "the angle directive must be consumed (dropped), not left verbatim";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// D-INCLUDE-ANGLE-SOURCE-FALLBACK (P5 — the FC15c parity pin): `__has_include(<h>)`
+// MUST give the SAME answer `#include <h>` would. With `foo.h` on the -I
+// includeDirs and NO descriptor, the source fallback makes `#include <foo.h>`
+// resolve -> `__has_include(<foo.h>)` MUST be 1 (the `yes` branch). A header
+// absent on BOTH paths is 0 (the `no` branch). RED-ON-DISABLE: revert the
+// funnel's Source arm in the `__has_include` callback -> `<foo.h>` answers 0 ->
+// the wrong branch, AND it would then DISAGREE with the now-resolving `#include`
+// -- exactly the FC15c silent-miscompile this parity forbids.
+TEST(Preprocessor, FC15cAngleSourceFallbackHasIncludeParity) {
+    namespace fs = std::filesystem;
+    auto inc = fs::temp_directory_path() / "dss_angle_src_fallback_p5";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "foo.h", std::ios::binary) << "/* x */\n"; }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<foo.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "__has_include(<foo.h>) must be 1 via the source fallback "
+               "(parity with the now-resolving #include <foo.h>)";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<none_xyz.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "__has_include of a header absent on BOTH paths must be 0";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
 // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: `preprocess()` surfaces the
 // weakly-canonical paths of every RESOLVED system descriptor an angle
 // `#include <h>` splices, EXPANDED to the transitive `includes` closure and
