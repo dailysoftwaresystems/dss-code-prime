@@ -1625,10 +1625,20 @@ struct Lowerer {
     // natural home near `classifyLvalue` — so the `AssignCtx` below can embed it.)
     struct Lvalue {
         bool                   simple = true;
-        TypeId                 type{};       // the lvalue's value type
+        TypeId                 type{};       // the lvalue's value type (member: field access type)
         SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
-        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
-        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
+        TypeId                 ptrType{};    // via-ptr only: interner.pointer(member ? container : type)
+        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue-or-aggregate> ]
+        // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field-safe MEMBER lvalue.
+        // When `member`, the temp pointer addresses the CONTAINING AGGREGATE (not
+        // the bit-field sub-unit), and `lvRead`/`lvWrite` reconstruct
+        // `MemberAccess(Deref(ptr), memberFieldIdx)` so the MIR bit-field
+        // read-modify-write chokepoint (`bitfieldPlacementOf`) fires for the
+        // compound/inc-dec/value forms too — not just statement plain-`=`. The
+        // Deref re-types to `containerType`; the reconstructed node's type is `type`.
+        bool                   member = false;
+        std::uint32_t          memberFieldIdx = 0;
+        TypeId                 containerType{};  // the aggregate type (the Deref's result type)
     };
 
     // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
@@ -4338,12 +4348,26 @@ struct Lowerer {
         return {idxNode, result};
     }
 
-    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
-    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
-    // inline `MemberAccess`/`MemberAccessThruPtr` arm. The follower (field-name
-    // subtree) is re-extracted from `node` exactly as `lowerPostfix` built `rest`:
-    // skip the first non-token (the base) and the op token, collect the remainder.
-    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
+    // The resolved FIELD of a member-access postfix node: its declaration-order
+    // `fieldIndex` (the MemberAccess payload), its SymbolRecord (for the anon-
+    // member path + field volatility), and its type. See `resolveMemberField`.
+    struct ResolvedMember {
+        SymbolRecord const* frec = nullptr;
+        std::uint32_t       fieldIndex = 0;
+        TypeId              fieldType{};
+    };
+    // Resolve a member-access postfix node's FIELD. NON-EMITTING and pure: the
+    // SINGLE field-resolution source shared by `combineMember` (the rvalue/
+    // statement member path) and `classifyMemberLvalue` (the bit-field-safe
+    // MUTATION-lvalue path, D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION), so the two
+    // can never disagree on which field / index a member names. The follower
+    // (field-name subtree) is re-extracted from `node` exactly as `lowerPostfix`
+    // built `rest`: skip the first non-token (the base) and the op token, collect
+    // the remainder. Returns nullopt on any miss (no follower leaf, unresolved
+    // symbol, missing record, or a non-field binding) — the caller decides whether
+    // that is a diagnostic (combineMember) or a silent fall-through to the generic
+    // lvalue path (classifyMemberLvalue).
+    [[nodiscard]] std::optional<ResolvedMember> resolveMemberField(NodeId node) {
         std::vector<NodeId> rest;
         {
             bool baseSeen = false;
@@ -4353,6 +4377,43 @@ struct Lowerer {
                 rest.push_back(c);
             }
         }
+        // Locate the field-name token inside the follower subtree (c-subset's
+        // `memberFollower = {sequence: [Identifier]}`). Robust against a future
+        // schema that wraps the name: scan for a real token first, fall back to
+        // the first visible child if the follower is all Internal.
+        NodeId const followerN = rest.empty() ? NodeId{} : rest.front();
+        NodeId fieldNameN{};
+        if (followerN.valid()) {
+            for (NodeId c : visible(followerN)) {
+                if (isToken(c)) { fieldNameN = c; break; }
+                if (!fieldNameN.valid()) fieldNameN = c;
+            }
+        }
+        if (!fieldNameN.valid()) return std::nullopt;
+        SymbolId const fieldSym = model.symbolAt(fieldNameN);
+        if (!fieldSym.valid()) return std::nullopt;
+        auto const* frec = model.recordFor(fieldSym);
+        if (frec == nullptr) return std::nullopt;
+        // Defensive: the resolved symbol must be a field of a composite type.
+        // Pass 2's member-access path always binds to a field (struct-scope
+        // lookup), but a future Pass-2 recovery path that falls back to
+        // enclosing-scope lookup could mis-bind to a non-field symbol whose
+        // `fieldIndex` is just declaration-order noise. Reject it here rather than
+        // emit a structurally-valid but semantically-wrong MemberAccess.
+        if (!frec->scope.valid() || frec->kind != DeclarationKind::Variable)
+            return std::nullopt;
+        // Field type: prefer the semantic-phase-propagated type on the field-name
+        // node; fall back to the symbol record's type.
+        TypeId fieldType = model.typeAt(fieldNameN);
+        if (!fieldType.valid()) fieldType = frec->type;
+        return ResolvedMember{frec, frec->fieldIndex, fieldType};
+    }
+
+    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
+    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
+    // inline `MemberAccess`/`MemberAccessThruPtr` arm; the field resolution now
+    // lives in the shared `resolveMemberField`.
+    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
         // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
         // already resolved the field's SymbolId (via the `memberAccesses`
         // facet) and propagated its type to both the field-name leaf and
@@ -4363,48 +4424,16 @@ struct Lowerer {
         // handles both forms, downstream MIR sees uniform GEP-after-load
         // patterns.
         if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
-            // Locate the field-name token inside the follower subtree
-            // (c-subset's `memberFollower = {sequence: [Identifier]}`). Robust
-            // against a future schema that wraps the name (e.g. bracketed
-            // identifiers): scan for a real token first, fall back to the
-            // first visible child if the follower is all Internal.
-            NodeId followerN = rest.empty() ? NodeId{} : rest.front();
-            NodeId fieldNameN{};
-            if (followerN.valid()) {
-                for (NodeId c : visible(followerN)) {
-                    if (isToken(c)) { fieldNameN = c; break; }
-                    if (!fieldNameN.valid()) fieldNameN = c;
-                }
+            auto const rf = resolveMemberField(node);
+            if (!rf) {
+                return exprError(node, "member access did not resolve to a field "
+                                       "(missing field-name leaf, unresolved "
+                                       "symbol, no record, or a non-field binding "
+                                       "— a semantic-phase miss)");
             }
-            if (!fieldNameN.valid()) {
-                return exprError(node, "member access has no field-name leaf");
-            }
-            SymbolId const fieldSym = model.symbolAt(fieldNameN);
-            if (!fieldSym.valid()) {
-                return exprError(node, "member access field did not resolve "
-                                       "to a symbol (semantic phase miss)");
-            }
-            auto const* frec = model.recordFor(fieldSym);
-            if (frec == nullptr) {
-                return exprError(node, "member access field SymbolId has no record");
-            }
-            // Defensive: the resolved symbol must be a field of a composite
-            // type. Pass 2's member-access path always binds to a field
-            // (struct-scope lookup), but a future Pass-2 recovery path that
-            // falls back to enclosing-scope lookup could mis-bind to a
-            // non-field symbol whose `fieldIndex` is just declaration-order
-            // noise. Catch it here rather than emitting a structurally-valid
-            // but semantically-wrong MemberAccess with a bogus index.
-            if (!frec->scope.valid()
-                || frec->kind != DeclarationKind::Variable) {
-                return exprError(node, "member access resolved to a non-field "
-                                       "symbol (semantic-phase mis-binding)");
-            }
-            std::uint32_t const fieldIndex = frec->fieldIndex;
-            // Field type: prefer the semantic-phase-propagated type on the
-            // field-name node; fall back to the symbol record's type.
-            TypeId fieldType = model.typeAt(fieldNameN);
-            if (!fieldType.valid()) fieldType = frec->type;
+            std::uint32_t const fieldIndex = rf->fieldIndex;
+            TypeId const fieldType = rf->fieldType;
+            SymbolRecord const* const frec = rf->frec;
             HirNodeId object = base.id;
             // The CONTAINER's resolved type — the object whose member is taken.
             // `s.a` ⇒ `base.type`; `p->a` ⇒ the Deref's pointee type. Carries the
@@ -5441,7 +5470,12 @@ struct Lowerer {
             Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
             return lv;
         }
-        E target = lowerExpr(peelToCore(operandN));
+        NodeId const core = peelToCore(operandN);
+        // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a member ++/-- (`bf.a++`,
+        // `--p->a`) routes through the aggregate-address + MemberAccess
+        // reconstruction so a bit-field inc/dec is a read-modify-write.
+        if (auto m = classifyMemberLvalue(core)) return m;
+        E target = lowerExpr(core);
         // An addressable lvalue lowers to Deref (`*p`), Index (`a[i]`), or
         // MemberAccess (`s.f`/`s->f`). Anything else — Literal, BinaryOp, UnaryOp,
         // Call, Cast, SeqExpr — is an rvalue with no modifiable object.
@@ -6802,27 +6836,139 @@ struct Lowerer {
 
     // (`struct Lvalue` is defined up near `ExprFrame`/`AssignCtx`, which embeds it.)
 
-    [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) {
+    // The HIR node denoting the lvalue itself — used as a fresh rvalue READ or as
+    // an assign TARGET. `simple` → `Ref(sym)`. via-ptr non-member → `Deref(ptr)`.
+    // via-ptr MEMBER → `MemberAccess(Deref(ptr), fieldIdx)` reconstructed so the
+    // MIR bit-field chokepoint fires (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION); a
+    // NON-bit-field member reconstructs to the SAME MemberAccess a plain `s.x = v`
+    // uses, i.e. a plain scalar store/load — unaffected. Each call mints FRESH
+    // nodes (HIR is a strict single-parent tree), all referencing the ONE temp
+    // pointer bound in `prep`, so the base's side effects run exactly once.
+    [[nodiscard]] HirNodeId lvNode(Lvalue const& lv) {
         if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
-        return builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
+        HirNodeId const base = builder.makeDeref(
+            builder.makeRef(lv.ptrType, lv.sym.v),
+            lv.member ? lv.containerType : lv.type, HirFlags::Synthetic);
+        if (!lv.member) return base;
+        return builder.makeMemberAccess(base, lv.memberFieldIdx, lv.type, HirFlags::Synthetic);
     }
+    [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) { return lvNode(lv); }
     [[nodiscard]] HirNodeId lvWrite(Lvalue const& lv, HirNodeId value) {
-        HirNodeId target = lv.simple
-            ? builder.makeRef(lv.type, lv.sym.v)
-            : builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
-        return builder.makeAssignStmt(target, value);
+        return builder.makeAssignStmt(lvNode(lv), value);
     }
 
-    // Classify an lvalue CST. A plain variable → simple (no prep). Anything else
-    // (index / deref) → via a temp pointer bound in `prep`. nullopt when the
-    // lvalue can't be lowered (no resolved type / not an addressable form).
+    // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: classify a MEMBER lvalue so a
+    // bit-field MUTATION in any position other than statement plain-`=` (a
+    // value-position `(bf.a = v)`, a compound `bf.a += 1`, an inc/dec `bf.a++`)
+    // reaches the MIR bit-field read-modify-write chokepoint (`bitfieldPlacementOf`
+    // → `emitBitfieldInsert`/`emitBitfieldExtract`), which only fires when the
+    // store/load TARGET is a `MemberAccess` node. The generic complex-lvalue path
+    // binds `&(bf.a)` (a sub-unit address) into a temp pointer and emits a plain
+    // `*p` Deref — losing the MemberAccess, so the unit takes a full-width store
+    // that clobbers packed neighbours and skips truncation. This classifier binds
+    // the CONTAINING AGGREGATE's address instead (`p = &base` for `.`, or the base
+    // pointer itself for `->`; the struct IS addressable, a bit-field sub-unit is
+    // NOT) and marks the lvalue so `lvRead`/`lvWrite` reconstruct
+    // `MemberAccess(Deref(p), field)` — routing BOTH statement and value forms
+    // through the ONE existing RMW chokepoint. A NON-bit-field member reconstructs
+    // to the SAME MemberAccess a plain `s.x = v` uses (a plain scalar store) — so
+    // it is behaviour-preserving. The base is lowered EXACTLY once, so its side
+    // effects (`arr[i++].a`, `f()->a`) run once. Returns nullopt (→ the generic
+    // path, whose behaviour is unchanged) for a non-member lvalue, an anonymous-
+    // member field (which needs intermediate hops the single-MemberAccess
+    // reconstruction cannot synthesize), an array-arrow base, or an unresolved
+    // member — none of which regress. Field resolution + the container-volatility
+    // qualification mirror `combineMember` EXACTLY (shared `resolveMemberField` +
+    // `volatileQualifiedAccess`), so the reconstructed node is byte-identical to
+    // the rvalue/statement member access.
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: FAIL LOUD when a BIT-FIELD is
+    // mutated (compound / inc-dec / value position) through a base the single-field
+    // reconstruction cannot address — an anonymous-member hop chain or an array-arrow
+    // decay. Returning nullopt into the generic via-ptr path would silently
+    // full-unit-store (clobber neighbours + skip truncation); the emitted error makes
+    // the HIR tier unclean so the compile aborts (`tierClean`, compile_pipeline.cpp)
+    // — never a wrong binary. NON-bit-field members through the same bases stay on the
+    // (correct) generic scalar-store path; statement plain-`=` never routes here.
+    [[nodiscard]] std::optional<Lvalue> bitfieldBaseUnsupported(NodeId core) {
+        emitH(DiagnosticCode::S_BitfieldMutationUnsupportedBase, core,
+              "bit-field compound-assignment / increment / value-position mutation "
+              "through an anonymous member or an array-arrow base is not yet "
+              "supported (the read-modify-write cannot address the packed allocation "
+              "unit here) — use a named member, or a plain `=` statement");
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<Lvalue> classifyMemberLvalue(NodeId core) {
+        NodeId baseN{}, subscriptN{};
+        HirOperatorEntry const* e = nullptr;
+        if (postfixFlattenPlan(core, baseN, subscriptN, e) != PostfixFlatten::Member)
+            return std::nullopt;
+        auto const rf = resolveMemberField(core);
+        if (!rf) return std::nullopt;                       // unresolved → generic (fail-loud there)
+        // D5.1: a bit-field field carries a resolved `: width` on its record — the
+        // detector for the fail-loud residual below (container-independent, so it
+        // works through an anonymous-member chain the generic path can't reconstruct).
+        bool const isBitfield = rf->frec->bitFieldWidth.has_value();
+        if (!rf->frec->anonAncestorPath.empty())            // anon-member hop chain
+            return isBitfield ? bitfieldBaseUnsupported(core) : std::nullopt;
+        bool const thruPtr = (e->target == "MemberAccessThruPtr");
+        E const base = lowerExpr(baseN);                    // the aggregate / pointer, lowered ONCE
+        if (!base.type.valid()) return std::nullopt;
+        TypeId containerType{}, ptrType{};
+        HirNodeId aggPtr{};
+        if (thruPtr) {
+            // `p->field`: the aggregate pointer IS the base value. An ARRAY-arrow
+            // base (c82 arrow-decay) can't be addressed by this reconstruction: a
+            // bit-field there FAILS LOUD (else a silent full-unit store), a
+            // non-bit-field defers to the (correct) generic path.
+            if (interner.kind(base.type) != TypeKind::Ptr
+                || interner.operands(base.type).empty()
+                || !interner.operands(base.type)[0].valid()) {
+                if (isBitfield && interner.kind(base.type) == TypeKind::Array)
+                    return bitfieldBaseUnsupported(core);
+                return std::nullopt;
+            }
+            containerType = interner.operands(base.type)[0];
+            ptrType       = base.type;                      // Ptr<container>
+            aggPtr        = base.id;
+        } else {
+            // `obj.field`: bind the CONTAINING AGGREGATE's address.
+            containerType = base.type;
+            ptrType       = interner.pointer(containerType);
+            aggPtr        = builder.makeAddressOf(base.id, ptrType, HirFlags::Synthetic);
+        }
+        // The field ACCESS type — container-volatility-qualified EXACTLY as
+        // combineMember computes it (so `volatileFlagForType` at the MIR site flags
+        // a `volatile`-container member's RMW). A `volatile`-declared FIELD's own
+        // storage rides `fieldType`'s top-level VolatileQual through this too.
+        TypeId const accessType = volatileQualifiedAccess(rf->fieldType, containerType);
+        if (!accessType.valid()) return std::nullopt;
+        Lvalue lv;
+        lv.simple         = false;
+        lv.member         = true;
+        lv.type           = accessType;
+        lv.containerType  = containerType;
+        lv.memberFieldIdx = rf->fieldIndex;
+        lv.ptrType        = ptrType;
+        lv.sym            = freshSymbol();
+        lv.prep.push_back(builder.makeVarDecl(ptrType, lv.sym.v, aggPtr, HirFlags::Synthetic));
+        return lv;
+    }
+
+    // Classify an lvalue CST. A plain variable → simple (no prep). A MEMBER access
+    // → the aggregate-address + MemberAccess reconstruction (bit-field-safe; see
+    // `classifyMemberLvalue`). Anything else (index / deref) → via a temp pointer
+    // bound in `prep`. nullopt when the lvalue can't be lowered (no resolved type /
+    // not an addressable form).
     [[nodiscard]] std::optional<Lvalue> classifyLvalue(NodeId exprCst) {
         if (auto s = simpleLvalue(exprCst)) {
             Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
             if (!lv.type.valid()) return std::nullopt;
             return lv;
         }
-        E target = lowerExpr(peelToCore(exprCst));
+        NodeId const core = peelToCore(exprCst);
+        if (auto m = classifyMemberLvalue(core)) return m;
+        E target = lowerExpr(core);
         if (!target.type.valid()) return std::nullopt;
         Lvalue lv;
         lv.simple  = false;

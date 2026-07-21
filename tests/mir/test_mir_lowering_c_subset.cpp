@@ -2229,6 +2229,62 @@ TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
     EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
 }
 
+// D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field MUTATION in ANY position
+// other than statement plain-`=` — a VALUE-position `(bf.a = v)` / `(bf.a += 1)` /
+// `(bf.a++)` / `(++bf.a)` AND a STATEMENT compound / inc-dec `bf.a += 1;` /
+// `bf.a++;` / `--bf.a;` — must take the READ-MODIFY-WRITE of the allocation unit,
+// NOT a full-unit Store. Before the fix, classifyLvalue / classifyIncDecLvalue
+// bound `&(bf.a)` into a temp pointer and emitted a plain `*p` Deref target, which
+// fell to `emitScalarStore` (a bare full-unit Store — clobbering packed neighbours
+// and skipping truncation). The fix binds the CONTAINING AGGREGATE's address and
+// reconstructs `MemberAccess(Deref(p), field)`, so BOTH forms present a
+// MemberAccess to the ONE RMW chokepoint. `a` sits at bitOffset 4 (after `pad:4`)
+// so the insert MUST Shl by 4; the clear+mask are two Ands and the merge is an Or.
+// RED-ON-DISABLE: revert the classifyMemberLvalue aggregate-address reconstruction
+// and each of these functions loses its Or/Shl (a bare full-unit Store returns).
+TEST(MirLoweringCSubset, BitFieldMutationValueAndCompoundFormsAreReadModifyWrite) {
+    auto L = lowerCSubset(
+        "struct S { unsigned pad : 4; unsigned a : 3; unsigned b : 5; };\n"
+        "unsigned v_assign  (struct S* p, unsigned v){ unsigned x=(p->a =v); return x; }\n"
+        "unsigned v_compound(struct S* p)            { unsigned x=(p->a+=1); return x; }\n"
+        "unsigned v_postinc (struct S* p)            { unsigned x=(p->a++ ); return x; }\n"
+        "unsigned v_preinc  (struct S* p)            { unsigned x=(++p->a ); return x; }\n"
+        "void     s_compound(struct S* p)            { p->a += 1; }\n"
+        "void     s_postinc (struct S* p)            { p->a++;    }\n"
+        "void     s_predec  (struct S* p)            { --p->a;    }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Count an opcode across ALL blocks of a function (a value-position SeqExpr
+    // stays straight-line, but count broadly to be robust to any block split).
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        int n = 0;
+        auto const fn = m.funcAt(fnIdx);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i)
+                if (m.instOpcode(m.blockInstAt(blk, i)) == op) ++n;
+        }
+        return n;
+    };
+    char const* names[7] = {"v_assign", "v_compound", "v_postinc", "v_preinc",
+                            "s_compound", "s_postinc", "s_predec"};
+    for (std::uint32_t fn = 0; fn < 7; ++fn) {
+        EXPECT_GE(countIn(fn, MirOpcode::Or), 1)
+            << names[fn] << ": bit-field mutation must OR the inserted field (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::Shl), 1)
+            << names[fn] << ": bit-field mutation must Shl the value to bitOffset (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::And), 2)
+            << names[fn] << ": RMW clears the field AND masks the value";
+    }
+    // The VALUE-position forms additionally read the STORED (truncated) value back
+    // via the extract path (LShr by bitOffset 4 + And mask) for the SeqExpr yield —
+    // NOT the un-truncated full unit. v_assign (fn 0) is the canonical `x=(bf.a=v)`.
+    EXPECT_GE(countIn(0, MirOpcode::LShr), 1)
+        << "value-position `=` yields the extracted (truncated) stored value";
+}
+
 // FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a bit-field on a 64-BIT BASE
 // (`unsigned long long` / `long long` → a 64-bit allocation unit) now
 // COMPILES + LOWERS end-to-end. Before FC8 the semantic analyzer

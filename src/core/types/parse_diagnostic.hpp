@@ -922,6 +922,20 @@ enum class DiagnosticCode : std::uint16_t {
     // to turn a dropped `asm(...)` into a silent non-emission. Renders error[S0057].
     S_InlineAsmNonEmptyTemplate = 0xE057,
 
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: a bit-field MUTATION in a
+    // compound / inc-dec / value position through a base form the single-field
+    // reconstruction cannot address — a field reached via an ANONYMOUS struct/union
+    // member (needs the intermediate MemberAccess hop chain) or an ARRAY-arrow base
+    // (`sarr->bf`, C 6.3.2.1p3 decay). The bit-field-safe `classifyMemberLvalue`
+    // reconstruction (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->`
+    // bases only; these residual bases would otherwise fall to the generic via-ptr
+    // path, whose full-unit store CLOBBERS packed neighbours + skips truncation — a
+    // silent miscompile. FAIL LOUD instead (statement plain-`=` stays correct via
+    // `lowerAssign`; use a named member, or split the mutation). NON-bit-field
+    // members through the same bases are unaffected (they take the correct generic
+    // scalar store). Renders error[S0058].
+    S_BitfieldMutationUnsupportedBase = 0xE058,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

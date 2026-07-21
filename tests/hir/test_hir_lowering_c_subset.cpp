@@ -2405,6 +2405,85 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+// D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the bit-field-safe reconstruction
+// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->` bit-field
+// mutation; a bit-field reached through an ANONYMOUS-member hop chain or an
+// ARRAY-arrow base cannot be addressed by the single-field lvalue, so a
+// compound/inc-dec/value mutation there FAILS LOUD (S_BitfieldMutationUnsupportedBase)
+// rather than silently full-unit-store via the generic via-ptr path (which would
+// clobber the packed neighbour + skip truncation). Statement plain-`=` stays correct
+// (lowerAssign never routes through classifyMemberLvalue), and NON-bit-field members
+// through the same bases are unaffected. RED-ON-DISABLE: drop the `isBitfield`
+// fail-loud arms in classifyMemberLvalue → the anon/array-arrow bit-field mutation
+// silently lowers (0 S0058) into the neighbour-clobbering full-unit store.
+TEST(HirLoweringCSubset, AnonAndArrowBitfieldMutationFailsLoud) {
+    // (1) compound `+=` on an ANON-struct bit-field → fail loud.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
+            << "anon-member bit-field compound mutation must fail loud, not silently "
+               "full-unit-store";
+    }
+    // (2) inc-dec on an anon bit-field (statement + value) → fail loud.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a++; }\n"
+            "unsigned g(struct O* o) { return (++o->a); }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 2u)
+            << "anon-member bit-field inc/dec (statement + value) must both fail loud";
+    }
+    // (3) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT (compiles,
+    //     no fail-loud — it routes through lowerAssign, not classifyMemberLvalue).
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a = 3; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << "statement plain-`=` on an anon bit-field must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "statement plain-`=` on an anon bit-field is correct — no fail-loud";
+    }
+    // (4) a NON-bit-field anon member compound-assign is UNAFFECTED (generic path).
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { int x; int y; }; };\n"
+            "void f(struct O* o) { o->x += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "a non-bit-field anon member takes the correct generic scalar store";
+    }
+    // (5) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay) → fail loud;
+    //     a NON-bit-field array-arrow member is unaffected.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct S { unsigned a : 4; unsigned b : 4; };\n"
+            "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
+            << "array-arrow bit-field compound mutation must fail loud";
+    }
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct S { int a; int b; };\n"
+            "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "a non-bit-field array-arrow member is unaffected";
+    }
+}
+
 // HR cycle C: an int-typed `return expr;` whose expr type is non-int (e.g.
 // a comparison that produces Bool) gets a `Cast(_, int)` wrapper inserted
 // by the coercion pass. Pins the return-type-threading + coerce mechanism.
