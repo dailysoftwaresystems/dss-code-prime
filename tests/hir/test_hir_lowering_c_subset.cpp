@@ -2239,6 +2239,75 @@ TEST(HirLoweringCSubset, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
 }
 
+// ── D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE ───────────────────────────────
+//
+// `pathTerminates` decides a block's termination by its LAST REACHABLE statement,
+// not its literal last child. A trailing dead statement AFTER a real terminator
+// (the `MACRO(...);` null-statement idiom that lowers `;` to an empty Block placed
+// AFTER the `return`) previously made the body read as fall-through → a spurious
+// H_VerifierFailure (H0003) that gcc/clang never emit. These pins assert the four
+// CLEAN shapes emit ZERO H_VerifierFailure. Red-on-disable: revert the Block case
+// to `return !kids.empty() && pathTerminates(src, kids.back())` and every case
+// here goes RED (the empty trailing Block reads as non-terminating).
+[[nodiscard]] std::size_t hirVerifierFailures(std::string src) {
+    SemanticModel model = analyzeCSubset(std::move(src));
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    return countCode(r, DiagnosticCode::H_VerifierFailure);
+}
+
+TEST(HirLoweringCSubset, DeadTailAfterTerminatorDoesNotReadAsFallThrough) {
+    // The minimal trailing null statement — `int m(void){ return 0; ; }`.
+    EXPECT_EQ(hirVerifierFailures("int m(void){ return 0; ; }"), 0u)
+        << "a `;` after `return 0;` (empty trailing Block) must NOT read as "
+           "fall-through — the block terminates at its last REACHABLE statement";
+    // The RECOVER_VFS_WRAPPER shape: every path returns via the if/else, then a
+    // trailing `;` (the `MACRO(...);` null statement) follows the `return rc;`.
+    EXPECT_EQ(hirVerifierFailures(
+                  "int w(int x){ int rc=0; if(x){rc=1;}else{rc=2;} return rc; ; }"),
+              0u)
+        << "trailing `;` after the real terminator must not spuriously fall through";
+    // General precision: a dead NON-label call after a return — `return 0; d2();`.
+    EXPECT_EQ(hirVerifierFailures("int d2(void); int d(void){ return 0; d2(); }"), 0u)
+        << "dead non-label code after a terminator makes later positions "
+           "unreachable — the block still terminates";
+    // Both if/else arms return, then a dead trailing `;`.
+    EXPECT_EQ(hirVerifierFailures("int e(int x){ if(x){return 1;}else{return 2;} ; }"), 0u)
+        << "a both-arms-return if terminates; a trailing `;` does not undo that";
+}
+
+// The negative miscompile-pins: genuine fall-through MUST still fail loud
+// (H_VerifierFailure). These stay RED when the fix is present (they are the
+// behavior that must NOT change) — and are how a WRONG fix is caught.
+TEST(HirLoweringCSubset, GenuineFallThroughStillFailsLoudIncludingNestedLabel) {
+    // A non-void function that just calls a void fn and falls off the end.
+    EXPECT_GE(hirVerifierFailures("void foo(void); int g(int x){ foo(); }"), 1u)
+        << "a genuine fall-through must still emit H_VerifierFailure";
+    // An `if` with no `else` — the then-arm may be skipped, so control falls off.
+    EXPECT_GE(hirVerifierFailures("int h(int x){ if(x) return 1; }"), 1u)
+        << "if-without-else does not terminate on the fall-through path";
+    // A direct fall-through THROUGH a label: `goto L` may reach `L:` which then
+    // falls off the end. The label re-establishes reachability at the dead tail.
+    EXPECT_GE(hirVerifierFailures("int lbl(int x){ if(x) goto L; return 0; L: ; }"), 1u)
+        << "a labeled statement after the terminator is a goto re-entry point — "
+           "the block can still fall through via the label";
+    // ★ THE NESTED-LABEL SOUNDNESS GUARD (the audit's mandatory addition). The
+    // dead tail is an `if` whose BODY contains the label `L:`. `goto L` can re-
+    // enter that nested label and then fall off the end — a GENUINE fall-through.
+    // Only the `subtreeContainsLabel` (deep) reachability reset catches this; the
+    // UNSOUND version (reset only at a DIRECT LabelStmt child) would see the `if`
+    // as a plain dead child, keep `reachable=false`, and WRONGLY accept the body
+    // (a silent miscompile). This pin goes RED against the unsound version.
+    EXPECT_GE(hirVerifierFailures(
+                  "int nested(int x){ if(x) goto L; return 0; if(x){ L: ; } }"),
+              1u)
+        << "a label nested inside a dead-tail statement is still a goto re-entry "
+           "point — the block genuinely falls through and must fail loud";
+}
+
 // VLA C5 (D-CSUBSET-VLA, C99 6.8.6.1p1): a `goto` that jumps INTO the scope of a
 // variable-length array, bypassing its declaration, is FAILED LOUD at HIR verify
 // (H_VlaJumpIntoScope). `goto L` sits BEFORE `int a[n]`; `L:` sits AFTER it, so
