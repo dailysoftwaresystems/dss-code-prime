@@ -5638,6 +5638,135 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
         << "the prototype is upgraded to a callable Function symbol";
 }
 
+// ── C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE) — a `T x;` where T is a function TYPE
+// (via a typedef) declares a function PROTOTYPE (C 6.7 / 6.9.1p2). This is
+// SQLite test_thread.c's `static Tcl_ObjCmdProc sqlthread_proc;` shape. ──
+//
+// (g) A bare function-typedef declaration + its definition MERGE — exactly like a
+// syntactic `int f(int);` proto. Zero diagnostics, one surviving Function symbol
+// (the definition; the typedef proto absorbed). RED-ON-DISABLE: revert the Pass-1
+// candidate flag + the Pass-1.5 upgrade → the bare `static Fn foo;` is minted an
+// OBJECT → S_InvalidFunctionDeclarator (S0018) at the proto AND, because the
+// object-category clashes with the Function definition, S_RedeclaredSymbol (S0002)
+// at the definition → hasErrors() flips true and countSurvivingFns drops.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "static int foo(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a function-typedef prototype + its definition must merge (C 6.9.1p2)";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u)
+        << "exactly one surviving Function symbol for foo (the definition)";
+}
+
+// (h) The test_thread shape end-to-end: the bare function-typedef proto is
+// forward-CALLED before its definition (as Tcl_CreateObjCommand takes
+// `sqlthread_proc` above its body). Zero diagnostics; the call resolves to the
+// upgraded Function symbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeForwardCallResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "int use(void){return foo(41);}\n"
+        "static int foo(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward call through a function-typedef prototype is legal";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u);
+}
+
+// (i) FAIL-LOUD: a bare typedef-headed object whose type is NOT a function still
+// collides with a same-name function definition. `MyInt foo;` (a real object) then
+// `int foo(int){…}` is a genuine object-vs-function clash — the Pass-1 optimistic
+// merge is a CANDIDATE only; the post-1.5 sweep sees `foo`'s type is not a FnSig
+// and emits the DEFERRED, PRECISE S_RedeclaredSymbol. RED-ON-DISABLE: drop the
+// post-1.5 non-FnSig re-check → the clash STILL fails loud, but via the generic
+// type-compat check as S_IncompatibleRedeclaration instead — so the specific
+// S_RedeclaredSymbol count drops to 0 and this assertion flips red. Exactly one
+// S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefObjectVsFunctionCollisionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyInt;\n"
+        "MyInt foo;\n"
+        "int foo(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef-OBJECT redeclared as a function must fail loud (S0002), not "
+           "be silently accepted as a prototype";
+}
+
+// (j) FAIL-LOUD (no over-broadening): a function-TYPED struct FIELD is not a
+// prototype (a field can never be a function) — it still rejects with
+// S_InvalidFunctionDeclarator. Pass 1 flags ONLY object-declaration rows as
+// candidates, never a struct field, so the S0018 fail-loud is preserved.
+TEST(SemanticAnalyzerCSubset, FnTypedefFunctionTypedStructFieldRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "struct S { Fn f; };\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u)
+        << "a function-typed struct field is not a prototype and must fail loud";
+}
+
+// (k) A function-POINTER OBJECT (`Fn *fp;` — a decorated declarator) is NOT a
+// prototype candidate: its declared type is Ptr<FnSig>, not FnSig. It stays a data
+// object, so a same-name function is a genuine (immediate) collision. Pins that the
+// candidate detection excludes decorated declarators (a star), never treating a
+// function-pointer global as a function.
+TEST(SemanticAnalyzerCSubset, FnTypedefPointerObjectIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn *fp;\n"
+        "int fp(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a function-pointer object redeclared as a function is a collision";
+}
+
+// (l) FAIL-LOUD (F2 hardening): an illegal function-returning-function whose
+// fn-suffix hides behind a redundant-paren group (`Fn (f)(int);` — C 6.7.6.3p1) is
+// NOT a bare prototype. The multi-level UPWARD walk in `declaratorIsUndecoratedName`
+// sees the group-enclosing `directRule`'s `(int)` suffix and rejects the candidate,
+// so the declaration takes the normal path and fails loud
+// (S_InvalidFunctionDeclarator). RED-ON-DISABLE: revert the walk to the single-level
+// check → the group-wrapped suffix escapes → `f` is mis-flagged a candidate, upgraded
+// to a Function proto, and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
+TEST(SemanticAnalyzerCSubset, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (f)(int);\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an illegal function-returning-function (fn-suffix behind a group) must "
+           "fail loud, never be silently accepted as a prototype";
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u);
+}
+
+// (m) A redundant grouping paren that adds NO suffix (`Fn (g);` ≡ `Fn g;`) is still
+// an undecorated bare declarator, so it remains a valid function-typedef prototype
+// and MERGES with its definition. Pins that the upward walk ADMITS pure grouping
+// (rejecting only a group that CARRIES a decoration, as in (l)) — a walk that
+// blanket-rejected any group would spuriously fail this legal proto.
+TEST(SemanticAnalyzerCSubset, FnTypedefRedundantParenGroupIsAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (g);\n"
+        "int g(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a redundant-paren bare declarator is still a prototype (no suffix)";
+    EXPECT_EQ(countSurvivingFns(model, "g"), 1u);
+}
+
 // FC16 (D-CSUBSET-NORETURN): the surviving Function symbol named `name` is
 // noreturn (its `isNoreturn` bit). Mirrors `countSurvivingFns` — the `!isAbsorbedProto`
 // filter isolates the single callable record a call resolves to.

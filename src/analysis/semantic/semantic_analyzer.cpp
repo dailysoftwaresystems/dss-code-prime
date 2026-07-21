@@ -433,6 +433,91 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
     return false;
 }
 
+// C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): is `nameNode` the name of an
+// UNDECORATED declarator — a plain identifier with NO pointer layer and NO array
+// or function suffix at ANY enclosing level — so its declared type is EXACTLY the
+// declaration head's type? Per the declarator grammar (`declaratorRule :=
+// pointerLayer* directRule`, `directRule := (nameToken | groupRule) suffix*`), a
+// bare `name` is: the name's parent is the `directRule` carrying ONLY the name
+// token (no Internal child — a fn/array suffix or a group base are all Internal),
+// AND every enclosing level up to the declaration row carries no decoration —
+// checked by the upward walk below. A star / array / fn-suffix makes the declared
+// type a Ptr / Array / function-returning form that is NOT the head type verbatim,
+// so this returns false — precisely excluding a function-POINTER object
+// (`Fn *fp;`) and an illegal function-returning-function (`Fn (f)(int);`, whose
+// fn-suffix hides behind a redundant-paren group) from the prototype path, while
+// still admitting a bare redundant grouping (`Fn (f);` ≡ `Fn f;`, no suffix).
+[[nodiscard]] bool
+declaratorIsUndecoratedName(Tree const& tree, NodeId nameNode,
+                            DeclaratorConfig const& dc) {
+    NodeId const direct = tree.parent(nameNode);
+    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
+        || tree.rule(direct) != dc.directRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Internal) return false;   // a suffix / group
+    }
+    // Walk the declarator chain UPWARD from the name: the declared type equals the
+    // head type verbatim ONLY if NO pointer layer and NO array/function suffix
+    // decorates the name at ANY enclosing level — INCLUDING through redundant
+    // parenthesis groups. A `declaratorRule` carrying a pointer layer (`Fn *fp;`),
+    // or an enclosing `directRule` whose parenthesized-group base carries a suffix
+    // (`Fn (f)(int);` — an illegal function-returning-function, C 6.7.6.3p1), makes
+    // the declared type a Ptr / function-returning form, NOT the head type. A
+    // single-level check sees only the name's own `declaratorRule` and lets a
+    // group-wrapped suffix (`(f)(int)`) escape — silently mis-accepted as a bare
+    // prototype (a swallowed S0018). The alternating chain is
+    // directRule → declaratorRule → (groupRule → directRule → declaratorRule)* →
+    // {initDeclaratorRule | decl row}: at each `declaratorRule` any Internal child
+    // other than the declarator we ascended from is a pointer layer; at each
+    // enclosing `directRule` (reached through a group) any such child is a suffix.
+    NodeId cur = direct;
+    while (true) {
+        NodeId const p = tree.parent(cur);
+        if (!p.valid() || tree.kind(p) != NodeKind::Internal) break;
+        RuleId const pr = tree.rule(p);
+        if (pr == dc.declaratorRule || pr == dc.directRule) {
+            for (NodeId c : visibleChildren(tree, p)) {
+                if (tree.kind(c) == NodeKind::Internal && c.v != cur.v) return false;
+            }
+            cur = p;
+        } else if (pr == dc.groupRule) {
+            cur = p;   // a pure grouping level carries no decoration of its own
+        } else {
+            break;     // exited the declarator subtree (initDeclarator / decl row)
+        }
+    }
+    return true;
+}
+
+// C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): does the declaration HEAD (the
+// type-specifier prefix `headNode`) name a type via a type-name IDENTIFIER — i.e.
+// a POTENTIAL typedef alias (`Fn` / `Tcl_ObjCmdProc`), as opposed to a builtin
+// keyword specifier (`int`, `unsigned long`, `struct S`)? A typedef name is an
+// identifier token; builtin specifiers and struct/union/enum tags are keyword
+// tokens (a tag's name identifier is nested under a composite-specifier, not the
+// bare head). Bounded DFS for the first identifier token (the VLA head-alias
+// extraction shape). A false positive is harmless: the post-1.5 FnSig gate is the
+// precise arbiter; this only keeps a plainly-builtin-typed declaration (`int x;`)
+// off the deferral path so its collisions stay byte-identical.
+[[nodiscard]] bool
+headNamesPotentialTypedef(Tree const& tree, NodeId headNode,
+                          SchemaTokenId identifierToken) {
+    if (!headNode.valid() || !identifierToken.valid()) return false;
+    std::vector<NodeId> stk{headNode};
+    for (int guard = 0; guard < 4096 && !stk.empty(); ++guard) {
+        NodeId const cur = stk.back();
+        stk.pop_back();
+        if (tree.kind(cur) == NodeKind::Token) {
+            if (tree.tokenKind(cur) == identifierToken) return true;
+            continue;
+        }
+        for (NodeId c : visibleChildren(tree, cur)) stk.push_back(c);
+    }
+    return false;
+}
+
 // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): is `directNode` (a `directRule` node) a
 // NAME-bearing direct declarator — i.e. does it have a direct visible child that
 // is the declarator NAME token (`int f(int)` / `int f(int){…}`)? A function
@@ -4219,7 +4304,27 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     };
     bool const sameCategory = category(priorRec) == category(s.symbols.at(newId));
     bool const bothDefinitions = !priorNonDef && !newNonDef;
-    if (sameCategory && !bothDefinitions) {
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): a `maybeFnTypedefProto` CANDIDATE (a
+    // bare typedef-headed object declaration, e.g. `Tcl_ObjCmdProc foo;`) meeting a
+    // GENUINE function of the same name is PROVISIONALLY a function prototype +
+    // its definition (C 6.7 / 6.9.1p2) — but the candidate's function-ness is not
+    // yet resolved (Pass 1). Route it through the SAME proto/def MERGE path (so the
+    // definition wins the binding and the candidate is absorbed) and VERIFY after
+    // Pass 1.5: the merged-decl sweep re-checks the candidate's resolved type and,
+    // if it is NOT a function signature, emits the deferred S_RedeclaredSymbol
+    // (a genuine object-vs-function clash). Deliberately ONE genuine function + ONE
+    // candidate — NEVER candidate-vs-candidate (two bare typedef-headed objects are
+    // ambiguous OBJECTS that keep the ordinary same-category tentative-merge path,
+    // never a function proto merge). `category()` is intentionally left unchanged so
+    // an object-object typedef merge is byte-identical.
+    bool const priorIsFn = priorRec.kind == DeclarationKind::Function
+                           || priorRec.isProtoDeclaration;
+    bool const newIsFn = s.symbols.at(newId).kind == DeclarationKind::Function
+                         || s.symbols.at(newId).isProtoDeclaration;
+    bool const crossFnVarMerge =
+        (priorIsFn && s.symbols.at(newId).maybeFnTypedefProto)
+        || (newIsFn && priorRec.maybeFnTypedefProto);
+    if ((sameCategory || crossFnVarMerge) && !bothDefinitions) {
         // TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): a thread-storage
         // specifier "shall be present in the declaration of every declared
         // name with thread storage duration" — an OBJECT merge pair that
@@ -4503,6 +4608,38 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             && cfg.declarators.has_value()
                             && !declaratorHasInitializer(tree, *cfg.declarators,
                                                          dNode);
+                        // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): a bare
+                        // UNDECORATED-name object declaration whose head is a
+                        // type-NAME (a potential typedef) is a CANDIDATE function
+                        // prototype — `T x;` declares a FUNCTION when T is a
+                        // function type (C 6.7 / 6.9.1p2). The head type is not
+                        // resolved until Pass 1.5 (and a shipped-descriptor typedef
+                        // is not even in scope during Pass 1), so the function-ness
+                        // is verified there; here we only FLAG the candidate so a
+                        // same-name definition MERGES with it (via `category()`)
+                        // instead of a premature cross-category collision. Gated to
+                        // object-declaration rows (a declarator LIST, no bit-field
+                        // suffix) so a struct field / parameter is never a candidate;
+                        // a syntactic `name()` proto (already `isProto`) and an
+                        // initialized declarator (a proto has no initializer) are
+                        // excluded.
+                        bool maybeFnTypedefProto = false;
+                        if (effectiveKind == DeclarationKind::Variable
+                            && !isProto
+                            && cfg.declarators.has_value()
+                            && decl.declaratorListChild.has_value()
+                            && !decl.bitfieldSuffix.has_value()
+                            && !declaratorHasInitializer(tree, *cfg.declarators,
+                                                         dNode)
+                            && declaratorIsUndecoratedName(tree, nameNode,
+                                                           *cfg.declarators)) {
+                            NodeId const headNode =
+                                (decl.headChild.has_value()
+                                 && *decl.headChild < kids.size())
+                                    ? kids[*decl.headChild] : NodeId{};
+                            maybeFnTypedefProto = headNamesPotentialTypedef(
+                                tree, headNode, cfg.identifierToken);
+                        }
                         SymbolRecord rec;
                         rec.name         = name;
                         rec.scope        = bindScope;
@@ -4582,6 +4719,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             rec.isThreadLocal = true;
                         }
                         rec.isProtoDeclaration = isProto;
+                        rec.maybeFnTypedefProto = maybeFnTypedefProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
                         // declaration (c-subset's `extern`) — config-driven, no
                         // rule-name identity. Like a prototype it is a non-defining
@@ -5950,21 +6088,34 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         } else if (isFnSig
                                    && s.symbols.at(sym).kind
                                           == DeclarationKind::Variable) {
-                            // A bare function-TYPED object declaration — a C
-                            // function PROTOTYPE (`int f(int);`). D-CSUBSET-FN-
-                            // PROTOTYPE: a prototype IS a function declaration —
-                            // it is callable (forward / mutual recursion) and a
-                            // later definition MERGES with it (Pass 1 recorded
-                            // the merge). UPGRADE its kind to Function so Pass 2
-                            // resolves a call through it, and emit NOTHING. A
-                            // function-TYPED Variable that is NOT a prototype
-                            // (`isProtoDeclaration` false — e.g. a malformed
-                            // function-pointer form whose suffix landed on the
-                            // name) still fails loud: a silent FnSig-typed data
-                            // global would miscompile.
-                            if (s.symbols.at(sym).isProtoDeclaration) {
-                                s.symbols.at(sym).kind =
-                                    DeclarationKind::Function;
+                            // A bare function-TYPED declaration is a C function
+                            // PROTOTYPE (C 6.7 / 6.9.1p2: `T x;` where T is a
+                            // function type declares a FUNCTION). This holds
+                            // whether the function-ness is SYNTACTIC (`int f(int);`
+                            // — the name carries a `()` suffix, isProtoDeclaration
+                            // set in Pass 1) OR comes from the declared TYPE via a
+                            // typedef (`Fn foo;` / a shipped-descriptor
+                            // `Tcl_ObjCmdProc foo;` — flagged `maybeFnTypedefProto`
+                            // in Pass 1, its FnSig resolved only HERE). C34c:
+                            // `isFnSig` means the declared type IS a function
+                            // signature — NEVER a function POINTER (that is
+                            // Ptr<FnSig>, isFnSig false) — so this is UNAMBIGUOUSLY
+                            // a function declaration. UPGRADE its kind to Function
+                            // (so Pass 2 resolves a call through it and a later
+                            // definition MERGES — D-CSUBSET-FN-PROTOTYPE) and mark
+                            // it a proto so category()/HIR treat it as a
+                            // non-defining function declaration; emit NOTHING.
+                            //
+                            // A FnSig-typed Variable that is NEITHER a syntactic
+                            // proto NOR a typedef candidate — e.g. a function-typed
+                            // STRUCT FIELD (`struct S { Fn f; };`, which Pass 1 does
+                            // not flag) — still fails loud: a function-typed member
+                            // is not a prototype and would otherwise miscompile.
+                            auto& symRec = s.symbols.at(sym);
+                            if (symRec.isProtoDeclaration
+                                || symRec.maybeFnTypedefProto) {
+                                symRec.kind = DeclarationKind::Function;
+                                symRec.isProtoDeclaration = true;
                             } else {
                                 emitInvalidFn(nameNode,
                                               "function prototype declarations "
@@ -11275,6 +11426,45 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             auto const& sRec = s.symbols.at(survivor);
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;
+            // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): the absorbed side was a
+            // `maybeFnTypedefProto` CANDIDATE that Pass 1 OPTIMISTICALLY merged
+            // with a same-name GENUINE function (the survivor, kind Function) —
+            // its function-ness was unresolved then. Verify now: if the
+            // candidate's resolved type is NOT a function signature, it is a
+            // genuine object-vs-function clash (`MyInt foo; int foo(){}`), so the
+            // merge was wrong — emit the DEFERRED S_RedeclaredSymbol at the
+            // candidate (byte-identical to the Pass-1 collision this replaced) and
+            // skip the signature sweep below (which would mis-report a signature
+            // mismatch). Gated on the survivor being a real Function so two legal
+            // tentative typedef-OBJECTS (`typedef int Fn; Fn foo; Fn foo;`, both
+            // candidates, survivor stays Variable) are untouched. A candidate that
+            // DID resolve to a FnSig is a real prototype and falls through to the
+            // ordinary signature-compat check.
+            if (aRec.maybeFnTypedefProto
+                && sRec.kind == DeclarationKind::Function
+                && s.lattice.interner().kind(aRec.type) != TypeKind::FnSig) {
+                auto aTreeIt = treeById.find(aRec.tree.v);
+                if (aTreeIt != treeById.end()) {
+                    Tree const& aTree = *aTreeIt->second;
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = aTree.source().id();
+                    d.span     = aTree.span(aRec.declNode);
+                    d.actual   = aRec.name;
+                    auto sTreeIt = treeById.find(sRec.tree.v);
+                    if (sTreeIt != treeById.end()) {
+                        Tree const& sTree = *sTreeIt->second;
+                        d.related.push_back(RelatedLocation{
+                            sTree.source().id(),
+                            sTree.span(sRec.declNode),
+                            "previously declared here",
+                        });
+                    }
+                    s.reporter.report(std::move(d));
+                }
+                continue;
+            }
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the

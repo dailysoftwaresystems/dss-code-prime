@@ -160,6 +160,23 @@ struct DSS_EXPORT SymbolRecord {
     // function POINTER (`int (*fp)(int)`) does NOT set this — its suffix sits on
     // the outer declarator, not the name's direct declarator. Default false.
     bool            isProtoDeclaration = false;
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): TRUE iff this symbol was minted from a
+    // bare, UNDECORATED-name object declaration whose head is a TYPE-NAME reference
+    // (a potential typedef) — e.g. `Fn foo;` / `Tcl_ObjCmdProc foo;`. Such a
+    // declaration IS a function PROTOTYPE (C 6.7 / 6.9.1p2: `T x;` where T is a
+    // function type declares a function) WHEN that type-name resolves to a function
+    // type — but the function-ness is unknowable in Pass 1 (a shipped-descriptor
+    // typedef is not injected until AFTER Pass 1, and user typedefs resolve their
+    // type only in Pass 1.5). So Pass 1 marks the declaration a CANDIDATE: it is
+    // treated as Function-category for a same-name redeclaration merge (so a proto +
+    // its definition MERGE instead of colliding), and Pass 1.5 upgrades it to a real
+    // Function proto once the type resolves to a FnSig. The post-1.5 sweep VERIFIES:
+    // if the resolved type is NOT a function (a genuine object-vs-function clash such
+    // as `MyInt foo; int foo(){}`), the deferred S_RedeclaredSymbol fires there.
+    // Distinct from `isProtoDeclaration` (a SYNTACTIC `name()` proto, known in
+    // Pass 1); only ever set on an object-declaration row (never a struct field or a
+    // parameter). Default false.
+    bool            maybeFnTypedefProto = false;
     // D-CSUBSET-FN-PROTOTYPE: a proto / redundant function redeclaration that a
     // SURVIVING declaration superseded (proto→def: the proto is absorbed and the
     // definition wins the binding; def→proto / proto→proto: the new redundant

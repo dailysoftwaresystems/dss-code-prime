@@ -1897,7 +1897,10 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     // indices 3-6 (Tcl_HashKey UNION + Tcl_HashTable/Entry/Search structs), inserted
     // right after Tcl_Obj so they spell ptr<Tcl_Obj> by name (Option C) and
     // Tcl_HashEntry spells Tcl_HashKey by name — the C4-C8 typedefs shift to 7-13.
-    ASSERT_EQ(desc->typedefs.size(), 14u);
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE / D-FFI-TCL-DESCRIPTOR): +3 thread/event/
+    // time typedefs at indices 14-16 (Tcl_ThreadId opaque ptr, Tcl_Event + Tcl_Time
+    // structs) for sqlite src/test_thread.c — the FINAL testfixture TU (44/44).
+    ASSERT_EQ(desc->typedefs.size(), 17u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_ObjType");    // C34a: the typePtr pointee
     EXPECT_EQ(desc->typedefs[2].name, "Tcl_Obj");
@@ -1912,6 +1915,9 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(desc->typedefs[11].name, "Tcl_WideInt");    // C8
     EXPECT_EQ(desc->typedefs[12].name, "Tcl_DString");    // C8
     EXPECT_EQ(desc->typedefs[13].name, "Tcl_Channel");    // C8
+    EXPECT_EQ(desc->typedefs[14].name, "Tcl_ThreadId");   // C34c: opaque thread handle
+    EXPECT_EQ(desc->typedefs[15].name, "Tcl_Event");      // C34c: the event base struct
+    EXPECT_EQ(desc->typedefs[16].name, "Tcl_Time");       // C34c: {sec,usec}
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);  // C34a: Tcl_ObjType
     EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Struct);  // Tcl_Obj (5 real fields)
@@ -1931,6 +1937,12 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(interner.kind(desc->typedefs[11].type), TypeKind::I64);    // Tcl_WideInt = long long
     EXPECT_EQ(interner.kind(desc->typedefs[12].type), TypeKind::Struct); // Tcl_DString (216-byte)
     EXPECT_EQ(interner.kind(desc->typedefs[13].type), TypeKind::Ptr);    // Tcl_Channel = opaque ptr
+    // C34c: Tcl_ThreadId = opaque `struct Tcl_ThreadId_ *` (a Ptr); Tcl_Event +
+    // Tcl_Time are structs (Tcl_Event = 2 ptrs = 16B; Tcl_Time = {i64 sec, i64 usec}
+    // = 16B). RED-ON-DISABLE: drop any and sqlite test_thread.c fails S0006.
+    EXPECT_EQ(interner.kind(desc->typedefs[14].type), TypeKind::Ptr);    // Tcl_ThreadId
+    EXPECT_EQ(interner.kind(desc->typedefs[15].type), TypeKind::Struct); // Tcl_Event
+    EXPECT_EQ(interner.kind(desc->typedefs[16].type), TypeKind::Struct); // Tcl_Time
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1938,7 +1950,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 74u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc
+    ASSERT_EQ(desc->symbols.size(), 82u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL TU
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1979,7 +1991,14 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           "Tcl_FirstHashEntry", "Tcl_NextHashEntry", "Tcl_DeleteHashEntry",
                           // C34b: test_malloc's list constructor (the sole non-hash
                           // residual once the hash cluster lands; exported T).
-                          "Tcl_NewListObj"})
+                          "Tcl_NewListObj",
+                          // C34c (D-FFI-TCL-DESCRIPTOR): the 8 EXPORTED thread/event/
+                          // time functions (nm -D `T`-verified) sqlite test_thread.c
+                          // needs — the FINAL testfixture TU (44/44). RED-ON-DISABLE:
+                          // drop one → test_thread S0001s on the thread API.
+                          "Tcl_CreateThread", "Tcl_JoinThread", "Tcl_ExitThread",
+                          "Tcl_GetCurrentThread", "Tcl_ThreadAlert",
+                          "Tcl_ThreadQueueEvent", "Tcl_DoOneEvent", "Tcl_GetTime"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C34b: Tcl_GetHashKey/Tcl_GetHashValue/Tcl_SetHashValue are MACROS in real tcl.h,
     // ABSENT from libtcl8.6.so's nm -D — so they must NOT be eager-imported symbols
