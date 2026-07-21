@@ -1900,7 +1900,11 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE / D-FFI-TCL-DESCRIPTOR): +3 thread/event/
     // time typedefs at indices 14-16 (Tcl_ThreadId opaque ptr, Tcl_Event + Tcl_Time
     // structs) for sqlite src/test_thread.c — the FINAL testfixture TU (44/44).
-    ASSERT_EQ(desc->typedefs.size(), 17u);
+    // C37 (D-FFI-TCL-DESCRIPTOR + Option C): +2 channel typedefs at indices 17-18
+    // (Tcl_ChannelTypeVersion opaque ptr for the TCL_CHANNEL_VERSION_5 macro cast,
+    // Tcl_ChannelType the 17-field channel-driver vtable struct) for the testfixture
+    // MAIN harness tclsqlite-ex.c (its `static Tcl_ChannelType IncrblobChannelType={...}`).
+    ASSERT_EQ(desc->typedefs.size(), 19u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_ObjType");    // C34a: the typePtr pointee
     EXPECT_EQ(desc->typedefs[2].name, "Tcl_Obj");
@@ -1918,6 +1922,8 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(desc->typedefs[14].name, "Tcl_ThreadId");   // C34c: opaque thread handle
     EXPECT_EQ(desc->typedefs[15].name, "Tcl_Event");      // C34c: the event base struct
     EXPECT_EQ(desc->typedefs[16].name, "Tcl_Time");       // C34c: {sec,usec}
+    EXPECT_EQ(desc->typedefs[17].name, "Tcl_ChannelTypeVersion"); // C37: opaque ptr
+    EXPECT_EQ(desc->typedefs[18].name, "Tcl_ChannelType");        // C37: driver vtable
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);  // C34a: Tcl_ObjType
     EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Struct);  // Tcl_Obj (5 real fields)
@@ -1943,6 +1949,10 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(interner.kind(desc->typedefs[14].type), TypeKind::Ptr);    // Tcl_ThreadId
     EXPECT_EQ(interner.kind(desc->typedefs[15].type), TypeKind::Struct); // Tcl_Event
     EXPECT_EQ(interner.kind(desc->typedefs[16].type), TypeKind::Struct); // Tcl_Time
+    // C37: Tcl_ChannelTypeVersion is an opaque pointer (the `struct Tcl_ChannelTypeVersion_ *`
+    // cast target of TCL_CHANNEL_VERSION_5); Tcl_ChannelType is the 17-field driver struct.
+    EXPECT_EQ(interner.kind(desc->typedefs[17].type), TypeKind::Ptr);    // Tcl_ChannelTypeVersion
+    EXPECT_EQ(interner.kind(desc->typedefs[18].type), TypeKind::Struct); // Tcl_ChannelType
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1950,7 +1960,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 82u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL TU
+    ASSERT_EQ(desc->symbols.size(), 111u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL src/test*.c TU; C37: +29 exported fns (82 -> 111) for the testfixture MAIN harness tclsqlite-ex.c + Tcl_GetCharLength for test_recover — 23 channel/dict/NRE/misc (tier 1) + 6 more the tier-1 fixes UNMASKED (Tcl_FindExecutable/Tcl_NRCallObjProc/Tcl_NRCreateCommand/Tcl_PkgProvide/Tcl_SetSystemEncoding/Tcl_TranslateFileName). Tcl_IsShared + TCL_VERSION are macros, NOT symbols — asserted below
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1998,7 +2008,27 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           // drop one → test_thread S0001s on the thread API.
                           "Tcl_CreateThread", "Tcl_JoinThread", "Tcl_ExitThread",
                           "Tcl_GetCurrentThread", "Tcl_ThreadAlert",
-                          "Tcl_ThreadQueueEvent", "Tcl_DoOneEvent", "Tcl_GetTime"})
+                          "Tcl_ThreadQueueEvent", "Tcl_DoOneEvent", "Tcl_GetTime",
+                          // C37 (D-FFI-TCL-DESCRIPTOR): the 23 EXPORTED channel/dict/NRE/
+                          // misc functions (nm -D `T`-verified) the testfixture MAIN harness
+                          // tclsqlite-ex.c needs + Tcl_GetCharLength for ext/recover/
+                          // test_recover.c. Tcl_IsShared is a MACRO (nm -D ABSENT), asserted
+                          // below — NOT in this list. RED-ON-DISABLE: drop one → tclsqlite-ex
+                          // (or test_recover) S0001s on that symbol.
+                          "Tcl_Alloc", "Tcl_Close", "Tcl_CreateChannel", "Tcl_DictObjPut",
+                          "Tcl_DictObjRemove", "Tcl_GetChannelName", "Tcl_GetVersion",
+                          "Tcl_GetsObj", "Tcl_GlobalEval", "Tcl_NRAddCallback",
+                          "Tcl_NREvalObj", "Tcl_NewDictObj", "Tcl_OpenFileChannel",
+                          "Tcl_RegisterChannel", "Tcl_SetBooleanObj", "Tcl_SetChannelOption",
+                          "Tcl_SetIntObj", "Tcl_SetObjLength", "Tcl_SetWideIntObj",
+                          "Tcl_UnregisterChannel", "Tcl_UnsetVar2", "Tcl_VarEval",
+                          "Tcl_GetCharLength",
+                          // C37 tier 2: the 6 EXPORTED functions the tier-1 fixes UNMASKED
+                          // (the front-end had suppressed these downstream S0001s until the
+                          // earlier undeclared identifiers in the same declarations resolved).
+                          // All nm -D `T`. RED-ON-DISABLE: drop one → tclsqlite-ex.c S0001s.
+                          "Tcl_FindExecutable", "Tcl_NRCallObjProc", "Tcl_NRCreateCommand",
+                          "Tcl_PkgProvide", "Tcl_SetSystemEncoding", "Tcl_TranslateFileName"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C34b: Tcl_GetHashKey/Tcl_GetHashValue/Tcl_SetHashValue are MACROS in real tcl.h,
     // ABSENT from libtcl8.6.so's nm -D — so they must NOT be eager-imported symbols
@@ -2007,6 +2037,13 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     EXPECT_EQ(sym("Tcl_GetHashKey"), nullptr)   << "Tcl_GetHashKey is a macro, not a symbol";
     EXPECT_EQ(sym("Tcl_GetHashValue"), nullptr) << "Tcl_GetHashValue is a macro, not a symbol";
     EXPECT_EQ(sym("Tcl_SetHashValue"), nullptr) << "Tcl_SetHashValue is a macro, not a symbol";
+    // C37: Tcl_IsShared is a pure tcl.h field-poking macro, ABSENT from libtcl8.6.so's
+    // nm -D — so it must NOT be an eager-imported symbol (that would break every tcl
+    // binary's LOAD 127, the C9 refcount precedent). It ships as a `macros` entry
+    // (`((objPtr)->refCount > 1)`), asserted in the macro block below.
+    EXPECT_EQ(sym("Tcl_IsShared"), nullptr) << "Tcl_IsShared is a macro, not a symbol";
+    // C37 tier 2: TCL_VERSION is a tcl.h string macro (nm -D ABSENT), likewise NOT a symbol.
+    EXPECT_EQ(sym("TCL_VERSION"), nullptr) << "TCL_VERSION is a macro, not a symbol";
     // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
     // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
     // (`Tcl_NewByteArrayObj(const unsigned char*, int)` /
@@ -2093,6 +2130,16 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             << "the REAL Tcl_GetHashKey reads the key.string union member";
         EXPECT_NE(ghk->replacement.find("(tablePtr)->keyType"), std::string::npos)
             << "the REAL Tcl_GetHashKey dispatches on tablePtr->keyType (not a sidestep)";
+        // C37 (D-FFI-TCL-DESCRIPTOR): Tcl_IsShared is a pure tcl.h field-poking macro
+        // (nm -D ABSENT), shipped as the non-TCL_MEM_DEBUG build form reading the real
+        // Tcl_Obj refCount field modeled in C34a (fail-loud-correct; the C13 refcount-macro
+        // precedent). RED-ON-DISABLE: remove it → tclsqlite-ex.c S0001s on Tcl_IsShared.
+        auto const* shared = macro("Tcl_IsShared");
+        ASSERT_NE(shared, nullptr) << "Tcl_IsShared must ship as a macro (absent from nm -D)";
+        ASSERT_TRUE(shared->params.has_value());
+        ASSERT_EQ(shared->params->size(), 1u);
+        EXPECT_EQ((*shared->params)[0], "objPtr");
+        EXPECT_EQ(shared->replacement, "((objPtr)->refCount > 1)");
     }
 
     // C13: Tcl_DString gains its REAL named layout so Tcl_DStringValue's `->string` read
@@ -2189,6 +2236,47 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         // surface TAGS are the SAME interned type (define once, reference by name).
         EXPECT_EQ(tclObj->typeId.v,  desc->typedefs[2].type.v);   // Tcl_Obj
         EXPECT_EQ(objType->typeId.v, desc->typedefs[1].type.v);   // Tcl_ObjType
+    }
+
+    // C37 (D-FFI-TCL-DESCRIPTOR + Option C): the Tcl_ChannelType channel-driver vtable —
+    // the S0006 struct tclsqlite-ex.c needs for `static Tcl_ChannelType IncrblobChannelType
+    // = {...}` (a 15-element positional aggregate initializer, so the FULL layout is needed
+    // to type-check it — not lazily opaque). Pins the field names/types AND the DERIVED ABI
+    // layout, offsetof-verified vs /usr/include/tcl8.6/tcl.h: 136 bytes, 17 fields all
+    // 8-byte pointers (typeName ptr<char>@0, version @8, closeProc @16, wideSeekProc @112,
+    // threadActionProc @120, truncateProc @128). The 15 proc fields are OPAQUE ptr<void>
+    // (the initializer assigns real driver-function designators via the C33 fn-ptr->void*
+    // leniency). RED-ON-DISABLE: drop the struct → tclsqlite-ex.c S0006s on Tcl_ChannelType;
+    // change a field's slot → the offset pins fail.
+    {
+        ShippedStruct const* chan = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_ChannelType") chan = &s;
+        ASSERT_NE(chan, nullptr) << "missing Tcl_ChannelType struct (C37)";
+        ASSERT_EQ(chan->fields.size(), 17u);
+        EXPECT_EQ(chan->fields[0].name, "typeName");
+        EXPECT_EQ(interner.kind(chan->fields[0].type), TypeKind::Ptr);   // const char*
+        EXPECT_EQ(chan->fields[1].name, "version");
+        EXPECT_EQ(interner.kind(chan->fields[1].type), TypeKind::Ptr);   // opaque version ptr
+        EXPECT_EQ(chan->fields[2].name, "closeProc");
+        EXPECT_EQ(interner.kind(chan->fields[2].type), TypeKind::Ptr);   // opaque driver-proc
+        EXPECT_EQ(chan->fields[14].name, "wideSeekProc");
+        EXPECT_EQ(chan->fields[15].name, "threadActionProc");
+        EXPECT_EQ(chan->fields[16].name, "truncateProc");
+        EXPECT_EQ(interner.kind(chan->fields[16].type), TypeKind::Ptr);
+        // The DERIVED ABI layout (offsetof-verified vs tcl.h): 136 bytes, all 8-byte ptrs.
+        auto chanLayout = computeLayout(chan->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(chanLayout.has_value());
+        EXPECT_EQ(chanLayout->size, 136u);
+        EXPECT_EQ(chanLayout->fieldOffsets[1], 8u);     // version @ 8
+        EXPECT_EQ(chanLayout->fieldOffsets[2], 16u);    // closeProc @ 16
+        EXPECT_EQ(chanLayout->fieldOffsets[14], 112u);  // wideSeekProc @ 112
+        EXPECT_EQ(chanLayout->fieldOffsets[15], 120u);  // threadActionProc @ 120
+        EXPECT_EQ(chanLayout->fieldOffsets[16], 128u);  // truncateProc @ 128
+        // Option C identity: the Tcl_ChannelType typedef (index 18) and the structs-surface
+        // tag intern to ONE type (define once, reference by name — Tcl_CreateChannel's
+        // `const Tcl_ChannelType*` param spells it by name).
+        EXPECT_EQ(chan->typeId.v, desc->typedefs[18].type.v);
     }
 
     // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
@@ -2290,6 +2378,22 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         EXPECT_EQ(macroRepl("TCL_EVAL_DIRECT"), "262144");
         EXPECT_EQ(macroRepl("TCL_LEAVE_ERR_MSG"), "512");
         EXPECT_EQ(macroRepl("TCL_LINK_STRING"), "4");
+        // C37 (D-FFI-TCL-DESCRIPTOR): the 7 new object-macro constants tclsqlite-ex.c uses
+        // (tcl.h-exact, value-pinned so a wrong replacement fails loud) — the Tcl completion
+        // codes (used at TCL_BREAK/CONTINUE/RETURN sites), the channel-mode masks
+        // (TCL_READABLE|TCL_WRITABLE flags @ createIncrblobChannel), and TCL_CHANNEL_VERSION_5
+        // (the cast seeding the Tcl_ChannelType `version` field in the static initializer).
+        EXPECT_EQ(macroRepl("TCL_BREAK"),    "3");
+        EXPECT_EQ(macroRepl("TCL_CONTINUE"), "4");
+        EXPECT_EQ(macroRepl("TCL_RETURN"),   "2");
+        EXPECT_EQ(macroRepl("TCL_READABLE"), "(1<<1)");
+        EXPECT_EQ(macroRepl("TCL_WRITABLE"), "(1<<2)");
+        EXPECT_EQ(macroRepl("TCL_CLOSE_WRITE"), "(1<<2)");
+        EXPECT_EQ(macroRepl("TCL_CHANNEL_VERSION_5"), "((Tcl_ChannelTypeVersion) 0x5)");
+        // C37 tier 2: TCL_VERSION is a tcl.h string macro (nm -D ABSENT), reached via
+        // PACKAGE_VERSION expansion at the Tcl_PkgProvide site. Value-pinned (the C string
+        // literal "8.6", surrounding quotes included in the replacement text).
+        EXPECT_EQ(macroRepl("TCL_VERSION"), "\"8.6\"");
     }
 }
 
