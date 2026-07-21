@@ -332,6 +332,27 @@ struct DSS_EXPORT ShippedStruct {
     TypeId                    typeId;   // interned struct type (set on decode)
 };
 
+// One decoded UNION — the neutral form of a header's `union tag { … };` with
+// NAMED members (e.g. the `key` union inside Tcl_HashEntry: the real
+// `Tcl_GetHashKey` macro reads `h->key.oneWordValue` / `h->key.string`). The
+// SIBLING of `ShippedStruct`: the semantic phase interns the union type
+// (`TypeKind::Union` — every member overlaid at OFFSET 0, C 6.7.2.1) and injects
+// a field scope + `compositeScopeByType` entry so `unionValue.member` resolves,
+// MIRRORING the struct field-scope injection. This surface exists because the
+// hir-text `union "N" { T,… }` spelling carries member TYPES positionally but NO
+// names — so, exactly like `structs`, the member names live HERE. `typeId` is the
+// interned union type (name + positional member types), byte-identical to the
+// same-spelled `union "N" {…}` used by-name in a struct field (Option C).
+//
+// Members overlay at offset 0 by union semantics — a `ShippedField.offset` is
+// REJECTED on a union member (an explicit-offset overlapping layout is the c107
+// STRUCT channel, `D-FFI-DESCRIPTOR-UNION-OVERLAY`, not this). (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+struct DSS_EXPORT ShippedUnion {
+    std::string               name;     // the union tag, e.g. "Tcl_HashKey"
+    std::vector<ShippedField> fields;   // named members, decl order (all @0)
+    TypeId                    typeId;   // interned union type (set on decode)
+};
+
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
 // provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
@@ -383,6 +404,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
     std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
+    std::vector<ShippedUnion>    unions;      // named-member unions (tag + field scope; all @0)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's

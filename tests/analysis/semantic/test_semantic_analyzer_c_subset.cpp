@@ -3966,6 +3966,62 @@ TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
 
+// C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): a shipped struct with a
+// UNION-typed field → `e.key.member` resolves to the member type. The union's
+// member NAMES get a `compositeScopeByType` field scope injected (the NEW mechanism
+// mirroring struct-field injection), so the nested `structValue.unionField.member`
+// access resolves — the exact shape of the real `Tcl_GetHashKey` macro's
+// `h->key.oneWordValue` / `h->key.string`. RED-ON-DISABLE: remove the `desc->unions`
+// injection loop in semantic_analyzer.cpp and `e.key.oneWordValue` fails
+// S_NotAComposite (the union value has no member scope).
+TEST(SemanticAnalyzerCSubset, ShippedUnionFieldMemberResolves) {
+    ScratchDir sysDir{Location::Temp, "c34b-union"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk.json",
+        R"JSON({ "header": "hk.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" },
+                 { "name": "Ent",  "type": "struct \"Ent\" { ptr<void>, KeyU }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ],
+             "structs": [ { "name": "Ent", "fields": [
+                 { "name": "cd",  "type": "ptr<void>" },
+                 { "name": "key", "type": "KeyU" } ] } ] })JSON",
+        "#include <hk.h>\n"
+        "int main(void) { Ent e; void *p = e.key.oneWordValue; char *q = e.key.str;"
+        " return (p != 0) + (q != 0); }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "e.key (a union value) must have a member scope so .oneWordValue resolves";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "oneWordValue/str resolve as union members";
+}
+
+// The fail-loud pin: an UNKNOWN union member is rejected. The union member scope IS
+// registered (so this is NOT a non-composite miss), but the member name is absent →
+// S_UndeclaredIdentifier, never a silent wrong-but-runs access.
+TEST(SemanticAnalyzerCSubset, ShippedUnknownUnionMemberFailsLoud) {
+    ScratchDir sysDir{Location::Temp, "c34b-union-bad"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk2.json",
+        R"JSON({ "header": "hk2.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ] })JSON",
+        "#include <hk2.h>\n"
+        "int main(void) { KeyU u; void *p = u.noSuchMember; return p != 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "KeyU IS a composite (union member scope registered) — not a non-composite miss";
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "an unknown union member must fail loud";
+}
+
 // GOAL-2: a user decl of a name WINS over a descriptor constant of the same
 // name — and the skip is SELECTIVE (a different descriptor constant the user
 // does NOT declare is still injected). The descriptor declares CHAR_BIT

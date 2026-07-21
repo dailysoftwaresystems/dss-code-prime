@@ -913,7 +913,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "availableObjectFormats",
                              "includes", "symbols", "constants", "floatConstants",
-                             "typedefs", "structs", "macros", "$comment"});
+                             "typedefs", "structs", "unions", "macros", "$comment"});
 
     // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-
     // RESOLUTION). A descriptor's own typedefs are decoded BEFORE its symbols /
@@ -1078,6 +1078,84 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             mergedNamedTypes.push_back(
                 NamedTypeBinding{std::string_view{typedefNameStore.back()}, selType});
             out.typedefs.push_back(ShippedTypedef{std::move(tname), selType});
+        }
+    }
+
+    // (3.union) UNIONS — the named-member sibling of `structs`, resolved right
+    // after typedefs (so a member may spell an earlier typedef by name, e.g.
+    // `ptr<Tcl_Obj>`) and BEFORE symbols/structs (so a later signature or struct
+    // FIELD may spell a union BY NAME, e.g. `Tcl_HashEntry.key : "Tcl_HashKey"`).
+    // Each union interns as `TypeKind::Union` — every member overlaid at OFFSET 0
+    // (C 6.7.2.1) — and the semantic phase injects a member field scope +
+    // `compositeScopeByType` entry so `unionValue.member` resolves (the NEW
+    // mechanism the real `Tcl_GetHashKey` macro's `h->key.oneWordValue` needs).
+    // The name is PUBLISHED into `mergedNamedTypes` (Option C, mirroring the
+    // typedef loop) so this surface alone suffices to reference a union by name.
+    // (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+    if (doc.contains("unions")) {
+        if (!doc.at("unions").is_array()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
+                                        + "': 'unions' must be an array");
+        } else {
+            std::size_t uidx = 0;
+            for (auto const& udef : doc.at("unions")) {
+                std::string const at =
+                    "'" + path.generic_string() + "' unions[" + std::to_string(uidx) + "]";
+                ++uidx;
+                if (!udef.is_object()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                    continue;
+                }
+                (void)rejectUnknownKeys(reporter, udef,
+                                        "unions[" + std::to_string(uidx - 1) + "]",
+                                        {"name", "fields"});
+                if (!udef.contains("name") || !udef.at("name").is_string()
+                    || udef.at("name").get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": missing or empty 'name'");
+                    continue;
+                }
+                std::string const uname = udef.at("name").get<std::string>();
+                if (!udef.contains("fields") || !udef.at("fields").is_array()
+                    || udef.at("fields").empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": 'fields' must be a non-empty array");
+                    continue;
+                }
+                ShippedUnion ust;
+                ust.name = uname;
+                std::vector<TypeId> memberTypes;
+                if (!decodeStructFieldList(udef.at("fields"), at, interner, typeReg,
+                                           reporter, ust.fields, memberTypes,
+                                           mergedNamedTypes)) {
+                    continue;
+                }
+                // A union member has NO explicit byte offset — every member overlays
+                // at 0 by union semantics. An explicit `offset` here is a config
+                // confusion with the c107 explicit-offset STRUCT overlay channel;
+                // fail loud rather than silently drop it.
+                bool badOffset = false;
+                for (auto const& fld : ust.fields) {
+                    if (fld.offset.has_value()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": a union member must not declare an "
+                                                      "'offset' (every member overlays at 0; an "
+                                                      "explicit-offset overlapping layout is the "
+                                                      "'structs' channel)");
+                        badOffset = true;
+                        break;
+                    }
+                }
+                if (badOffset) continue;
+                ust.typeId = interner.unionType(uname, memberTypes);
+                // Option C: publish the union NAME so a later surface (structs
+                // field, signature, typedef) can spell it by name. Address-stable
+                // backing via `typedefNameStore` (the deque never moves an element).
+                typedefNameStore.push_back(uname);
+                mergedNamedTypes.push_back(
+                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, ust.typeId});
+                out.unions.push_back(std::move(ust));
+            }
         }
     }
 
@@ -1882,17 +1960,20 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         return doc.contains(key) && doc.at(key).is_array() && !doc.at(key).empty();
     };
     bool const declaredStructs        = declaresArray("structs");
+    bool const declaredUnions         = declaresArray("unions");
     bool const declaredConstants      = declaresArray("constants");
     bool const declaredTypedefs       = declaresArray("typedefs");
     bool const declaredMacroVariants  = declaresArray("macros");
     if (out.symbols.empty() && out.constants.empty() && out.floatConstants.empty()
-        && out.typedefs.empty() && out.structs.empty() && out.macros.empty()
-        && !declaredStructs && !declaredConstants && !declaredTypedefs
-        && !declaredMacroVariants) {
+        && out.typedefs.empty() && out.structs.empty() && out.unions.empty()
+        && out.macros.empty()
+        && !declaredStructs && !declaredUnions && !declaredConstants
+        && !declaredTypedefs && !declaredMacroVariants) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "
-                  "'constants', 'floatConstants', 'typedefs', 'structs', or 'macros'");
+                  "'constants', 'floatConstants', 'typedefs', 'structs', 'unions', "
+                  "or 'macros'");
         return std::nullopt;
     }
 

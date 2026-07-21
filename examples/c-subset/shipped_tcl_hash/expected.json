@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION (SQLite testfixture arc, C34b 2026-07-21): the RUN witness for the Tcl hash cluster (Tcl_HashTable/Tcl_HashEntry/Tcl_HashSearch) + hash API + the REAL Tcl_GetHashKey macro, which reads the `key` UNION member `it->key.oneWordValue` — the NEW named-member union injection. Builds a ONE_WORD_KEYS table on real libtcl8.6, round-trips a clientData (42) via Tcl_Set/GetHashValue and a key pointer via Tcl_GetHashKey, iterates via Tcl_First/NextHashEntry. elf-x86_64 only (libtcl8.6); ubuntu x86_64 CI legs run it, native-arm64 arch-gates, win/macos compile-only. RED-ON-DISABLE: remove the `desc->unions` member-scope injection in semantic_analyzer.cpp -> the `it->key.oneWordValue` read in Tcl_GetHashKey fails S_NotAComposite and this example stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-hash-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-hash-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

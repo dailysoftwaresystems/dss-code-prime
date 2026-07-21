@@ -790,6 +790,133 @@ TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ── unions surface (named-member union; the union-body mechanism, C34b) ───────
+//
+// A `unions` entry decodes into a ShippedUnion with named members + an interned
+// UNION TypeId (TypeKind::Union — every member overlaid at offset 0). The SIBLING
+// of `structs`: member names live HERE because the hir-text `union "N" { T,… }`
+// spelling carries member TYPES positionally but no names.
+// (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+TEST(ShippedLibDescriptor, UnionsSurfaceParsed) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "u.json", R"JSON({
+        "header": "u.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" },
+                { "name": "words",        "type": "arr<i32, 1>" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    EXPECT_EQ(desc->unions[0].name, "keyU");
+    ASSERT_EQ(desc->unions[0].fields.size(), 3u);
+    EXPECT_EQ(desc->unions[0].fields[0].name, "oneWordValue");
+    EXPECT_EQ(desc->unions[0].fields[1].name, "string");
+    EXPECT_EQ(desc->unions[0].fields[2].name, "words");
+    ASSERT_TRUE(desc->unions[0].typeId.valid());
+    // The interned type is a UNION (member-overlay semantics), not a struct.
+    EXPECT_EQ(interner.kind(desc->unions[0].typeId), TypeKind::Union);
+    auto const ops = interner.operands(desc->unions[0].typeId);
+    ASSERT_EQ(ops.size(), 3u);
+    EXPECT_EQ(interner.kind(ops[0]), TypeKind::Ptr);   // ptr<void>
+}
+
+// A unions-ONLY descriptor is VALID — the ≥1-surface check counts unions.
+// RED-ON-DISABLE: without `out.unions.empty()` (+ !declaredUnions) in the gate,
+// this fails-loud as "declares nothing".
+TEST(ShippedLibDescriptor, UnionsOnlyDescriptorIsValid) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uo.json", R"JSON({
+        "header": "uo.h",
+        "unions": [ { "name": "u", "fields": [ { "name": "a", "type": "i32" } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+}
+
+// A union member must NOT carry an explicit `offset` — every member overlays at 0
+// by union semantics (an explicit-offset overlapping layout is the c107 `structs`
+// channel). RED-ON-DISABLE: drop the offset-reject loop and the `@4` member is
+// silently accepted (then laid out at 0 anyway — a wrong-but-runs surface).
+TEST(ShippedLibDescriptor, UnionMemberOffsetFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubad.json", R"JSON({
+        "header": "ub.h",
+        "unions": [ { "name": "u", "fields": [
+            { "name": "a", "type": "i32" },
+            { "name": "b", "type": "i32", "offset": 4 } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A union member with an undecodable type fails loud (the F_ShippedLibUnsupportedType
+// path, shared with structs via decodeStructFieldList).
+TEST(ShippedLibDescriptor, UnionMemberBadTypeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubt.json",
+        R"({ "header": "ub.h", "unions": [ { "name": "u",
+             "fields": [ { "name": "a", "type": "not_a_type" } ] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// Option C: a `unions` entry PUBLISHES its name so a later `structs` FIELD spells
+// the union BY NAME (`Entry.key : "keyU"`) — the field resolves to the SAME
+// interned union TypeId (so a member scope on that union resolves `entry.key.member`).
+// RED-ON-DISABLE: drop the mergedNamedTypes publish in the unions decode and the
+// struct field's `keyU` fails to decode (F_ShippedLibUnsupportedType).
+TEST(ShippedLibDescriptor, UnionReferencedByNameInStructField) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uref.json", R"JSON({
+        "header": "ur.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" } ] }
+        ],
+        "structs": [
+            { "name": "Entry", "fields": [
+                { "name": "clientData", "type": "ptr<void>" },
+                { "name": "key",        "type": "keyU" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[0].fields[1].name, "key");
+    EXPECT_EQ(desc->structs[0].fields[1].type, desc->unions[0].typeId)
+        << "the by-name union field must intern to the same union TypeId";
+    EXPECT_EQ(interner.kind(desc->structs[0].fields[1].type), TypeKind::Union);
+}
+
 // ── per-target struct VARIANTS (per-target byte layout; plan 25) ─────────────
 //
 // A `structs` entry may declare per-target `variants` (each `when:{arch?,format?}`
@@ -1766,32 +1893,44 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     // the C4 ClientData typedef (void* — a Ptr, not a struct).
     // C34a (D-FFI-TCL-DESCRIPTOR + Option C D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION):
     // +Tcl_ObjType at index 1 (the Tcl_Obj->typePtr pointee; the real Tcl_Obj layout).
-    ASSERT_EQ(desc->typedefs.size(), 10u);
+    // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): +4 hash-cluster typedefs at
+    // indices 3-6 (Tcl_HashKey UNION + Tcl_HashTable/Entry/Search structs), inserted
+    // right after Tcl_Obj so they spell ptr<Tcl_Obj> by name (Option C) and
+    // Tcl_HashEntry spells Tcl_HashKey by name — the C4-C8 typedefs shift to 7-13.
+    ASSERT_EQ(desc->typedefs.size(), 14u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_ObjType");    // C34a: the typePtr pointee
     EXPECT_EQ(desc->typedefs[2].name, "Tcl_Obj");
-    EXPECT_EQ(desc->typedefs[3].name, "ClientData");
-    EXPECT_EQ(desc->typedefs[4].name, "Tcl_CmdInfo");     // C5 (bare-name type)
-    EXPECT_EQ(desc->typedefs[5].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
-    EXPECT_EQ(desc->typedefs[6].name, "Tcl_CmdProc");     // C8: FUNCTION-TYPE typedef
-    EXPECT_EQ(desc->typedefs[7].name, "Tcl_WideInt");     // C8
-    EXPECT_EQ(desc->typedefs[8].name, "Tcl_DString");     // C8
-    EXPECT_EQ(desc->typedefs[9].name, "Tcl_Channel");     // C8
+    EXPECT_EQ(desc->typedefs[3].name, "Tcl_HashKey");    // C34b: the key UNION
+    EXPECT_EQ(desc->typedefs[4].name, "Tcl_HashTable");  // C34b
+    EXPECT_EQ(desc->typedefs[5].name, "Tcl_HashEntry");  // C34b
+    EXPECT_EQ(desc->typedefs[6].name, "Tcl_HashSearch"); // C34b
+    EXPECT_EQ(desc->typedefs[7].name, "ClientData");
+    EXPECT_EQ(desc->typedefs[8].name, "Tcl_CmdInfo");     // C5 (bare-name type)
+    EXPECT_EQ(desc->typedefs[9].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[10].name, "Tcl_CmdProc");    // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[11].name, "Tcl_WideInt");    // C8
+    EXPECT_EQ(desc->typedefs[12].name, "Tcl_DString");    // C8
+    EXPECT_EQ(desc->typedefs[13].name, "Tcl_Channel");    // C8
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);  // C34a: Tcl_ObjType
     EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Struct);  // Tcl_Obj (5 real fields)
-    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Ptr);     // ClientData = void*
-    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::Struct);  // Tcl_CmdInfo
+    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Union);   // C34b: Tcl_HashKey UNION
+    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::Struct);  // C34b: Tcl_HashTable
+    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::Struct);  // C34b: Tcl_HashEntry
+    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::Struct);  // C34b: Tcl_HashSearch
+    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::Ptr);     // ClientData = void*
+    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Struct);  // Tcl_CmdInfo
     // C8: the two command-proc typedefs are FUNCTION TYPES (used as `Tcl_ObjCmdProc *`
     // = a fn-pointer in 34 of the 44 test TUs); Tcl_WideInt = long long (i64);
     // Tcl_DString = a 216-byte struct (used as a local — the size is load-bearing);
     // Tcl_Channel = an opaque pointer. RED-ON-DISABLE: drop any of these 5 and the
     // shipped_tcl_typedefs example (+ ~13 sqlite test TUs) fail S0006 "undeclared type".
-    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
-    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::FnSig);   // Tcl_CmdProc = fn type
-    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::I64);     // Tcl_WideInt = long long
-    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Struct);  // Tcl_DString (216-byte)
-    EXPECT_EQ(interner.kind(desc->typedefs[9].type), TypeKind::Ptr);     // Tcl_Channel = opaque ptr
+    EXPECT_EQ(interner.kind(desc->typedefs[9].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[10].type), TypeKind::FnSig);  // Tcl_CmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[11].type), TypeKind::I64);    // Tcl_WideInt = long long
+    EXPECT_EQ(interner.kind(desc->typedefs[12].type), TypeKind::Struct); // Tcl_DString (216-byte)
+    EXPECT_EQ(interner.kind(desc->typedefs[13].type), TypeKind::Ptr);    // Tcl_Channel = opaque ptr
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1799,7 +1938,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 67u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1
+    ASSERT_EQ(desc->symbols.size(), 74u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1830,8 +1969,25 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           // = fn(Tcl_Interp*, char*, f64*)->i32 (the Tcl_GetInt double-out
                           // sibling) + Tcl_DStringAppend = fn(Tcl_DString*, char*, i32)->char*
                           // (the Tcl_DStringAppendElement sibling); both exported T (nm -D).
-                          "Tcl_GetDouble", "Tcl_DStringAppend"})
+                          "Tcl_GetDouble", "Tcl_DStringAppend",
+                          // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the 6
+                          // EXPORTED hash functions (nm -D `T`-verified) test_malloc.c
+                          // needs — Tcl_GetHashKey/Value are ABSENT (macros, asserted
+                          // below), NOT symbols. RED-ON-DISABLE: drop one → test_malloc
+                          // S0001s on the hash API.
+                          "Tcl_InitHashTable", "Tcl_DeleteHashTable", "Tcl_CreateHashEntry",
+                          "Tcl_FirstHashEntry", "Tcl_NextHashEntry", "Tcl_DeleteHashEntry",
+                          // C34b: test_malloc's list constructor (the sole non-hash
+                          // residual once the hash cluster lands; exported T).
+                          "Tcl_NewListObj"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+    // C34b: Tcl_GetHashKey/Tcl_GetHashValue/Tcl_SetHashValue are MACROS in real tcl.h,
+    // ABSENT from libtcl8.6.so's nm -D — so they must NOT be eager-imported symbols
+    // (that would break every tcl binary's LOAD, the C9 refcount precedent). They ship
+    // as `macros` (asserted in the macro block below).
+    EXPECT_EQ(sym("Tcl_GetHashKey"), nullptr)   << "Tcl_GetHashKey is a macro, not a symbol";
+    EXPECT_EQ(sym("Tcl_GetHashValue"), nullptr) << "Tcl_GetHashValue is a macro, not a symbol";
+    EXPECT_EQ(sym("Tcl_SetHashValue"), nullptr) << "Tcl_SetHashValue is a macro, not a symbol";
     // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
     // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
     // (`Tcl_NewByteArrayObj(const unsigned char*, int)` /
@@ -1897,6 +2053,27 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         ASSERT_EQ(dsl->params->size(), 1u);
         EXPECT_EQ((*dsl->params)[0], "dsPtr");
         EXPECT_EQ(dsl->replacement, "((dsPtr)->length)");
+        // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the 3 hash-access macros.
+        // Tcl_Get/SetHashValue read clientData; Tcl_GetHashKey is the REAL tcl.h macro
+        // (fail-loud-correct for EVERY key type) reading the `key` UNION members — NOT
+        // a sidestep. RED-ON-DISABLE: remove the union-member injection and the
+        // key.oneWordValue/key.string reads in this macro body fail S_NotAComposite.
+        auto const* ghv = macro("Tcl_GetHashValue");
+        ASSERT_NE(ghv, nullptr) << "Tcl_GetHashValue must be a macro";
+        EXPECT_EQ(ghv->replacement, "((h)->clientData)");
+        auto const* shv = macro("Tcl_SetHashValue");
+        ASSERT_NE(shv, nullptr) << "Tcl_SetHashValue must be a macro";
+        EXPECT_EQ(shv->replacement, "((h)->clientData = (ClientData) (value))");
+        auto const* ghk = macro("Tcl_GetHashKey");
+        ASSERT_NE(ghk, nullptr) << "Tcl_GetHashKey must be a macro (absent from nm -D)";
+        ASSERT_TRUE(ghk->params.has_value());
+        ASSERT_EQ(ghk->params->size(), 2u);
+        EXPECT_NE(ghk->replacement.find("(h)->key.oneWordValue"), std::string::npos)
+            << "the REAL Tcl_GetHashKey reads the key.oneWordValue union member";
+        EXPECT_NE(ghk->replacement.find("(h)->key.string"), std::string::npos)
+            << "the REAL Tcl_GetHashKey reads the key.string union member";
+        EXPECT_NE(ghk->replacement.find("(tablePtr)->keyType"), std::string::npos)
+            << "the REAL Tcl_GetHashKey dispatches on tablePtr->keyType (not a sidestep)";
     }
 
     // C13: Tcl_DString gains its REAL named layout so Tcl_DStringValue's `->string` read
@@ -2463,6 +2640,90 @@ TEST(ShippedLibDescriptor, RealWindowsExceptionRecordLayout) {
         << "the inline EXCEPTION_RECORD in EXCEPTION_POINTERS.ExceptionRecord "
            "must intern to the same TypeId as the standalone struct — the "
            "p->ExceptionRecord->member resolution depends on it";
+}
+
+// C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the REAL tcl.json hash cluster.
+// Pins the tcl8.6 LP64 layouts the SQLite testfixture hash API depends on
+// (offsetof-verified vs /usr/include/tcl8.6/tcl.h): Tcl_HashTable = 88B with
+// keyType@60 (the Tcl_GetHashKey macro reads tablePtr->keyType), Tcl_HashEntry =
+// 40B with clientData@24 (Tcl_Get/SetHashValue) + the key UNION @32, Tcl_HashSearch
+// = 24B, and the Tcl_HashKey UNION = 8B with every member overlaid at 0. RED-ON-DISABLE:
+// shift any hash field (e.g. staticBuckets → arr<u64,3>) → keyType@60 / sizeof fail.
+TEST(ShippedLibDescriptor, RealTclHashClusterLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const tclPath = shippedRoot / "tcl.json";
+    ASSERT_TRUE(fs::exists(tclPath)) << tclPath.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(tclPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    auto structNamed = [&](std::string_view n) -> ShippedStruct const* {
+        for (auto const& s : desc->structs) if (s.name == n) return &s;
+        return nullptr;
+    };
+    auto layoutOf = [&](TypeId t) {
+        return computeLayout(t, interner, kNatural16, DataModel::Lp64);
+    };
+
+    // Tcl_HashTable: 88B, keyType@60, findProc@64, typePtr@80.
+    auto const* ht = structNamed("Tcl_HashTable");
+    ASSERT_NE(ht, nullptr);
+    ASSERT_EQ(ht->fields.size(), 11u);
+    EXPECT_EQ(ht->fields[7].name, "keyType");
+    auto htL = layoutOf(ht->typeId);
+    ASSERT_TRUE(htL.has_value());
+    EXPECT_EQ(htL->size, 88u);
+    ASSERT_EQ(htL->fieldOffsets.size(), 11u);
+    EXPECT_EQ(htL->fieldOffsets[7], 60u) << "keyType@60 (Tcl_GetHashKey reads it)";
+    EXPECT_EQ(htL->fieldOffsets[8], 64u) << "findProc@64";
+    EXPECT_EQ(htL->fieldOffsets[10], 80u) << "typePtr@80";
+
+    // Tcl_HashEntry: 40B, clientData@24, key@32.
+    auto const* he = structNamed("Tcl_HashEntry");
+    ASSERT_NE(he, nullptr);
+    ASSERT_EQ(he->fields.size(), 5u);
+    EXPECT_EQ(he->fields[3].name, "clientData");
+    EXPECT_EQ(he->fields[4].name, "key");
+    auto heL = layoutOf(he->typeId);
+    ASSERT_TRUE(heL.has_value());
+    EXPECT_EQ(heL->size, 40u);
+    ASSERT_EQ(heL->fieldOffsets.size(), 5u);
+    EXPECT_EQ(heL->fieldOffsets[3], 24u) << "clientData@24 (Tcl_Get/SetHashValue)";
+    EXPECT_EQ(heL->fieldOffsets[4], 32u) << "the key union @32";
+
+    // Tcl_HashSearch: 24B.
+    auto const* hs = structNamed("Tcl_HashSearch");
+    ASSERT_NE(hs, nullptr);
+    auto hsL = layoutOf(hs->typeId);
+    ASSERT_TRUE(hsL.has_value());
+    EXPECT_EQ(hsL->size, 24u);
+
+    // The Tcl_HashKey UNION: 8B, every member @0; members present.
+    ASSERT_EQ(desc->unions.size(), 1u);
+    auto const& uk = desc->unions[0];
+    EXPECT_EQ(uk.name, "Tcl_HashKey");
+    EXPECT_EQ(interner.kind(uk.typeId), TypeKind::Union);
+    ASSERT_EQ(uk.fields.size(), 4u);
+    EXPECT_EQ(uk.fields[0].name, "oneWordValue");
+    EXPECT_EQ(uk.fields[1].name, "string");
+    auto ukL = layoutOf(uk.typeId);
+    ASSERT_TRUE(ukL.has_value());
+    EXPECT_EQ(ukL->size, 8u) << "max(ptr,ptr,arr<i32,1>,ptr) = 8";
+    for (auto off : ukL->fieldOffsets)
+        EXPECT_EQ(off, 0u) << "union members overlay at offset 0";
+
+    // Tcl_HashEntry.key resolves (BY NAME) to the SAME union TypeId — the member
+    // scope injected on that union is what makes `h->key.oneWordValue` resolve.
+    EXPECT_EQ(he->fields[4].type, uk.typeId)
+        << "Tcl_HashEntry.key must intern to the Tcl_HashKey union TypeId";
 }
 
 // c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real

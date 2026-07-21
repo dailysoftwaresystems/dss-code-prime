@@ -11167,6 +11167,45 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 SymbolId const tagId = s.symbols.mint(tag);
                 s.scopes.injectBinding(cuRoot, st.name, tagId, SymbolNamespace::Tag);
             }
+
+            // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the named-member UNION
+            // sibling of the `structs` loop above. A shipped union interns as
+            // `TypeKind::Union` (every member overlaid at offset 0); here we build
+            // its member field scope + register `compositeScopeByType[un.typeId]` so
+            // `unionValue.member` resolves — the mechanism the real `Tcl_GetHashKey`
+            // macro's `h->key.oneWordValue` / `h->key.string` needs. AGNOSTIC (generic
+            // over any union-typed field/member — no name is special-cased) and
+            // FAIL-LOUD (an unknown union member misses this scope → S_UndeclaredField).
+            // Shares `injectedTags` with structs: a union and a struct occupy the ONE
+            // C 6.2.3 tag namespace, so a name collision is first-wins across both.
+            for (auto const& un : desc->unions) {
+                if (!injectedTags.insert(un.name).second) continue;   // first wins (tag ns)
+                ScopeId const memberScope =
+                    s.scopes.pushScope(cuRoot, NodeId{}, InvalidTree);
+                for (std::uint32_t i = 0; i < un.fields.size(); ++i) {
+                    SymbolRecord f;
+                    f.name       = un.fields[i].name;
+                    f.scope      = memberScope;
+                    f.tree       = InvalidTree;   // not a user decl
+                    f.kind       = DeclarationKind::Variable;
+                    f.type       = un.fields[i].type;
+                    f.fieldIndex = i;             // == position in the interned operands
+                    SymbolId const fid = s.symbols.mint(f);
+                    s.scopes.injectBinding(memberScope, un.fields[i].name, fid);
+                }
+                s.compositeScopeByType[un.typeId.v] = memberScope;
+                // The union TAG (C 6.2.3 tag namespace) so a `union tag` reference
+                // resolves; `structScope` links it to its member scope (as structs do).
+                SymbolRecord tag;
+                tag.name        = un.name;
+                tag.scope       = cuRoot;
+                tag.tree        = InvalidTree;
+                tag.kind        = DeclarationKind::Type;
+                tag.type        = un.typeId;
+                tag.structScope = memberScope;
+                SymbolId const tagId = s.symbols.mint(tag);
+                s.scopes.injectBinding(cuRoot, un.name, tagId, SymbolNamespace::Tag);
+            }
         }
     }
 
