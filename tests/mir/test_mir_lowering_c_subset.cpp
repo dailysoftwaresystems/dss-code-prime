@@ -1048,6 +1048,165 @@ TEST(MirLoweringCSubset, GlobalWithFloatArithmeticInitializerFoldsThroughCastToI
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
 }
 
+// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — tryClassifyIntToPtrConst ──
+// An explicit integer-constant→pointer cast in a STATIC/global initializer
+// (`(void*)0x5`) folds to a PLAIN uint64 pointer leaf (core==Ptr) — an ABSOLUTE
+// address, no symbol, no relocation. const-eval refuses the cast-to-pointer, so
+// without the classifier the initializer falls to `runtimeInit`: a SCALAR becomes
+// an init-func store (UINT32_MAX literal + valid initFunc), and an AGGREGATE trips
+// the ConstructAggregate fail-loud (mir.ok == false). Each pin below is therefore
+// RED-ON-DISABLE on the exact wiring it names.
+
+// pin (i): a TOP-LEVEL scalar int→ptr cast folds to a uint64 pointer leaf == 5,
+// core==Ptr, with NO init function. RED-ON-DISABLE: the classifyGlobals scalar-
+// cascade wiring — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
+TEST(MirLoweringCSubset, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
+    auto L = lowerCSubset("static void* p = (void*)0x5;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "the int→ptr cast must fold to a const-init literal, not runtimeInit";
+    EXPECT_FALSE(m.globalInitFunc(g).valid())
+        << "an absolute-address pointer constant needs no __module_init__ store";
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value))
+        << "a folded int→ptr leaf is a plain uint64 (the encoder writes raw LE bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr) << "core==Ptr — pointer-typed, no relocation";
+}
+
+// pin (ii): an ARRAY of int→ptr — `static void* a[] = {(void*)1,(void*)2};` —
+// lowers to an aggregate const-init whose two fields are plain uint64 pointer
+// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the
+// member-loop wiring — the array aggregate would bail to runtimeInit → the
+// ConstructAggregate fail-loud (mir.ok == false).
+TEST(MirLoweringCSubset, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
+    auto L = lowerCSubset("static void* a[] = { (void*)1, (void*)2 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<MirAggregateValue>(lit.value));
+    auto const& agg = std::get<MirAggregateValue>(lit.value);
+    ASSERT_EQ(agg.fields.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[0].value));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[1].value));
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[0].value), 1u);
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[1].value), 2u);
+    EXPECT_EQ(agg.fields[0].core, TypeKind::Ptr);
+    EXPECT_EQ(agg.fields[1].core, TypeKind::Ptr);
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[0].value))
+        << "an absolute integer element must NOT be a relocation";
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[1].value));
+}
+
+// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf.
+// tryClassifyNullPointerConst claims it FIRST (it runs before the int→ptr arm at
+// both sites) and the int→ptr arm would produce the byte-identical leaf anyway, so
+// the standard null-pointer constant is preserved — order intact.
+TEST(MirLoweringCSubset, StaticNullPointerCastStillFoldsToZeroLeaf) {
+    auto L = lowerCSubset("static void* z = (void*)0;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 0u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
+}
+
+// pin (iv): the MIX — `static struct Two X = {"a",(void*)0x5};` — `.a` stays a
+// SYMBOL-ADDRESS (reloc) leaf (the string's link-time rodata address) AND `.b` is
+// a plain uint64 pointer leaf == 5. Guards against the int→ptr arm cannibalizing
+// the symbol-address arm (which runs FIRST in the member loop). RED-ON-DISABLE:
+// the member-loop wiring — `.b` would bail the aggregate to runtimeInit.
+TEST(MirLoweringCSubset, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
+    auto L = lowerCSubset(
+        "struct Two { char* a; void* b; };\n"
+        "static struct Two X = { \"a\", (void*)0x5 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The string literal mints its own rodata global too, so find X by its
+    // aggregate const-init rather than assuming an index.
+    MirAggregateValue const* agg = nullptr;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirAggregateValue>(lit.value)) {
+            agg = &std::get<MirAggregateValue>(lit.value);
+            break;
+        }
+    }
+    ASSERT_NE(agg, nullptr) << "X must lower to a const-init aggregate, not runtimeInit";
+    ASSERT_EQ(agg->fields.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<MirSymbolAddrValue>(agg->fields[0].value))
+        << ".a is a link-time string address — an abs64 RELOCATION leaf, not an int";
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg->fields[1].value))
+        << ".b is the int→ptr absolute-address leaf — a plain uint64 (raw bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(agg->fields[1].value), 5u);
+    EXPECT_EQ(agg->fields[1].core, TypeKind::Ptr);
+}
+
+// pin (v) NEGATIVE: a pure SYMBOL-ADDRESS global — `char* s = "x";` — still routes
+// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer.
+// tryClassifyAsSymbolAddr runs FIRST in the scalar cascade, and the int→ptr arm
+// would nullopt on a non-Cast operand anyway. RED if the int→ptr arm ever swallowed
+// a symbol address (an integer leaf would appear where a reloc belongs).
+TEST(MirLoweringCSubset, StaticStringPointerStaysSymbolAddressNotInteger) {
+    auto L = lowerCSubset("char* s = \"x\";\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    bool foundSymAddr = false;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirSymbolAddrValue>(lit.value)) foundSymAddr = true;
+        EXPECT_FALSE(std::holds_alternative<std::uint64_t>(lit.value) &&
+                     lit.core == TypeKind::Ptr)
+            << "a symbol-address global must not be mis-folded to an absolute integer";
+    }
+    EXPECT_TRUE(foundSymAddr)
+        << "`char* s = \"x\";` must carry a symbol-address reloc leaf";
+}
+
+// pin (vi) BLOCK-SCOPE static (the design-audit's one real correction): a
+// `static void* p = (void*)0x5;` declared INSIDE a function body reaches the SAME
+// classifyGlobals path (static-duration locals lower to module globals) — it folds
+// to the identical uint64 pointer leaf, NOT a runtime store in the function body.
+TEST(MirLoweringCSubset, BlockScopeStaticIntToPtrReachesClassifyGlobals) {
+    auto L = lowerCSubset(
+        "int main(void) { static void* p = (void*)0x5; return (int)(long)p; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Exactly one module global (the block-scope static `p`); its init is the
+    // folded int→ptr leaf, and NO __module_init__ appears for it.
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "a block-scope static int→ptr must fold to a const-init literal";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
+}
+
 // A function writing to a module global lowers the write as
 // `GlobalAddr(sym) → Store(rhs, addr)`. Pins the lvalue-side of the
 // new globals resolution.

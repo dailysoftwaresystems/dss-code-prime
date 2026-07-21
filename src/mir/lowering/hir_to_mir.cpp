@@ -11254,6 +11254,14 @@ struct Lowerer {
                 agg.fields.push_back(std::move(*ip));
                 continue;
             }
+            // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit int-const→
+            // pointer cast member — `(void*)0x5`. AFTER the specific handlers (so the
+            // null-pointer `(void*)0` and the SQLITE_INT_TO_PTR AddressOf-Index shape
+            // are claimed by their own arms first), BEFORE the generic fold fallback.
+            if (auto itp = tryClassifyIntToPtrConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*itp));
+                continue;
+            }
             ConstEvalResult const r =
                 evaluateConstant(hir, interner, literals, child, env, opts);
             if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
@@ -11369,6 +11377,45 @@ struct Lowerer {
         if (!layout) return std::nullopt;
         std::uint64_t const value = static_cast<std::uint64_t>(idxVal)
                                   * static_cast<std::uint64_t>(layout->size);
+        MirLiteralValue leaf;
+        leaf.value = value;
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
+    // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit integer-constant→
+    // pointer cast in a static initializer — `(void*)0x5`, `(T*)0x1000`,
+    // `((Tcl_ChannelTypeVersion)0x5)`. C permits an integer-constant address in a
+    // STATIC-storage pointer initializer (6.6/6.3.2.3); its value IS the integer,
+    // an ABSOLUTE address with NO symbol and NO relocation (gcc/clang emit the same
+    // bytes). const-eval refuses a cast-to-pointer (invariant: "pointer targets
+    // remain non-foldable", const_eval.cpp) so peel the pointer Cast and fold its
+    // INTEGER operand → a plain `uint64_t` leaf (core=Ptr); the encoder's scalar-leaf
+    // arm writes 8 raw LE bytes. Sibling of the null-pointer (c67/c80) and null-base
+    // array-index (c68/c80) classifiers. CONSERVATIVE: fires ONLY on an explicit
+    // Cast whose operand folds to a PLAIN integer (int64/uint64 arm) — a symbol
+    // address (HirAddressValue), an AddressOf/Index (the SQLITE_INT_TO_PTR shape,
+    // claimed by tryClassifyNullBaseIndexConst which runs FIRST), an aggregate, a
+    // float, or a fold-failure all yield nullopt → the earlier symbol-addr path or
+    // the whole-aggregate bail / runtimeInit fail-loud still governs.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyIntToPtrConst(HirNodeId node, EvalEnvironment const& env,
+                             EvalOptions const& opts) {
+        TypeId const ty = hir.typeId(node);
+        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr) return std::nullopt;
+        if (hir.kind(node) != HirKind::Cast) return std::nullopt;   // explicit int→ptr cast only
+        auto kids = hir.children(node);
+        if (kids.size() != 1) return std::nullopt;
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, kids[0], env, opts);
+        if (!r.value.has_value()) return std::nullopt;
+        std::uint64_t value = 0;
+        if (std::holds_alternative<std::int64_t>(r.value->value))
+            value = static_cast<std::uint64_t>(std::get<std::int64_t>(r.value->value));
+        else if (std::holds_alternative<std::uint64_t>(r.value->value))
+            value = std::get<std::uint64_t>(r.value->value);
+        else
+            return std::nullopt;   // not a plain integer (address/aggregate/float) → not this idiom
         MirLiteralValue leaf;
         leaf.value = value;
         leaf.core  = TypeKind::Ptr;
@@ -11513,6 +11560,17 @@ struct Lowerer {
                         // `(void*)&((char*)0)[X]` at file scope: a pointer-
                         // valued INTEGER constant (no symbol, no reloc).
                         pg.constInit = std::move(*ip);
+                    } else if (auto itp = tryClassifyIntToPtrConst(*initN,
+                                                                   env, opts)) {
+                        // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): the
+                        // TOP-LEVEL scalar sibling — `void* p = (void*)0x5;`
+                        // (the tcl.h `((Tcl_ChannelTypeVersion)0x5)` shape).
+                        // const-eval refuses the cast-to-pointer, so the
+                        // explicit int→ptr cast folds to a plain uint64 pointer
+                        // leaf (an ABSOLUTE address, no symbol, no reloc). AFTER
+                        // the null-pointer + null-base-index arms, BEFORE
+                        // runtimeInit — same order as the aggregate member loop.
+                        pg.constInit = std::move(*itp);
                     } else {
                         pg.runtimeInit = *initN;
                     }
