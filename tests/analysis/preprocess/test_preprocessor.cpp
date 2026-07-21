@@ -2452,6 +2452,134 @@ TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
     fs::remove_all(sysdir, ec);
 }
 
+// D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: `preprocess()` surfaces the
+// weakly-canonical paths of every RESOLVED system descriptor an angle
+// `#include <h>` splices, EXPANDED to the transitive `includes` closure and
+// deduped. This is the exact set `parseAndAdd_` harvests typedef NAMES from to
+// seed the first parse (so `(size_t)(x)` commits as a cast without a full-file
+// oracle reparse). EMIT-ONLY: it changes no token output. RED-ON-DISABLE: drop
+// the 581/807/1945 accumulation (or the closure expansion) → the vector is empty
+// / missing the child → the seed never covers the descriptor's typedefs.
+TEST(Preprocessor, DPerf2ResolvedShippedDescriptorsIncludeTransitiveClosure) {
+    namespace fs = std::filesystem;
+    auto sysdir = fs::temp_directory_path() / "dss_dperf2_resolved_desc";
+    fs::create_directories(sysdir);
+    { std::ofstream(sysdir / "parent.json", std::ios::binary)
+        << R"({ "header": "parent.h", "includes": ["child.h"],
+                "typedefs": [ { "name": "ParentT", "type": "i32" } ] })"; }
+    { std::ofstream(sysdir / "child.json", std::ios::binary)
+        << R"({ "header": "child.h",
+                "typedefs": [ { "name": "ChildT", "type": "i32" } ] })"; }
+
+    PreprocessResult r;
+    (void)ppLexemesWithDirs("#include <parent.h>\nint x;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    std::error_code ec;
+    auto const wantParent = fs::weakly_canonical(sysdir / "parent.json", ec);
+    auto const wantChild  = fs::weakly_canonical(sysdir / "child.json", ec);
+    bool sawParent = false;
+    bool sawChild  = false;
+    for (auto const& p : r.resolvedShippedDescriptors) {
+        auto const c = fs::weakly_canonical(p, ec);
+        if (c == wantParent) sawParent = true;
+        if (c == wantChild) sawChild = true;
+    }
+    EXPECT_EQ(r.resolvedShippedDescriptors.size(), 2u)
+        << "the angle include must surface parent.json + the transitive "
+           "child.json, deduped by weakly-canonical path";
+    EXPECT_TRUE(sawParent) << "the parent descriptor must be surfaced";
+    EXPECT_TRUE(sawChild)
+        << "the transitively-included child descriptor must be surfaced";
+
+    fs::remove_all(sysdir, ec);
+}
+
+// D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION (dead-range filter — the effectiveness
+// proof): the recorded seed set is the AUTHORITATIVELY-LIVE one, EQUAL to the
+// finish() oracle's `shippedLibDescriptors`, never a superset. A LIVE angle
+// `#include <h>` IS recorded (its un-gated splice offset lands in a live region);
+// the SAME include inside a `#if 0 … #endif` dead branch is DROPPED (its splice
+// offset lands in an AUTHORITATIVE dead range), so the first-parse seed can never
+// resolve a name the finish() reparse would not. RED-ON-DISABLE: revert the
+// `byteInDeadRegion(off)` skip in `preprocess()`'s closure block -> the dead
+// branch's un-gated splice survives -> the descriptor is surfaced -> the two
+// dead-branch assertions below fail.
+TEST(Preprocessor, DPerf2SeedSetMatchesLiveOracleNotDeadBranch) {
+    namespace fs = std::filesystem;
+    auto sysdir = fs::temp_directory_path() / "dss_dperf2_deadbranch";
+    fs::create_directories(sysdir);
+    // A typedef-only descriptor for `<stddef.h>` (the `size_t` shape). Its typedef
+    // surface is injected SEMANTICALLY, so an angle include does not splice text —
+    // the ONLY trace is the recorded seed entry this test pins.
+    { std::ofstream(sysdir / "stddef.json", std::ios::binary)
+        << R"({ "header": "stddef.h",
+                "typedefs": [ { "name": "size_t", "type": "u64" } ] })"; }
+    std::error_code ec;
+    auto const wantDesc = fs::weakly_canonical(sysdir / "stddef.json", ec);
+
+    auto containsStddef = [&](PreprocessResult const& r) {
+        for (auto const& p : r.resolvedShippedDescriptors) {
+            if (fs::weakly_canonical(p, ec) == wantDesc) return true;
+        }
+        return false;
+    };
+
+    // (1) LIVE include -> the descriptor IS recorded (the seed covers `size_t`, so
+    // the includer's `(size_t)(0)` cast commits on parse 1 without a reparse).
+    PreprocessResult live;
+    (void)ppLexemesWithDirs(
+        "#include <stddef.h>\nint main(){ return (size_t)(0); }\n",
+        live, {}, {sysdir});
+    EXPECT_FALSE(live.diagnostics->hasErrors());
+    EXPECT_TRUE(containsStddef(live))
+        << "a LIVE angle include must record its descriptor for the seed";
+
+    // (2) DEAD include (`#if 0 … #endif`) -> NOT recorded: the un-gated splice
+    // still fires, but its offset is in an authoritative dead range, so the filter
+    // drops it. The finish() oracle would not resolve it either -> seed == oracle.
+    PreprocessResult dead;
+    (void)ppLexemesWithDirs(
+        "#if 0\n#include <stddef.h>\n#endif\nint main(){ return 0; }\n",
+        dead, {}, {sysdir});
+    EXPECT_FALSE(dead.diagnostics->hasErrors());
+    EXPECT_FALSE(containsStddef(dead))
+        << "a dead `#if 0` include must NOT seed -- the finish() oracle would "
+           "not resolve it either";
+    EXPECT_TRUE(dead.resolvedShippedDescriptors.empty())
+        << "the dead-branch TU resolves no LIVE system descriptor";
+
+    // (3) MACRO-GATED dead branch (`#define GATE 0` then `#if GATE` -> the
+    // condition is dead only AFTER macro expansion): the authoritative
+    // MacroExpander records the dead byte range branch-agnostically, so the
+    // un-gated splice's offset is filtered EXACTLY as the `#if 0` case --
+    // locking the seed==oracle guarantee for EVERY dead-branch form, not only
+    // the literal constant one.
+    PreprocessResult macroDead;
+    (void)ppLexemesWithDirs(
+        "#define DSS_GATE 0\n#if DSS_GATE\n#include <stddef.h>\n#endif\n"
+        "int main(){ return 0; }\n",
+        macroDead, {}, {sysdir});
+    EXPECT_FALSE(macroDead.diagnostics->hasErrors());
+    EXPECT_FALSE(containsStddef(macroDead))
+        << "a macro-gated dead include must NOT seed (the dead range is "
+           "branch-agnostic)";
+
+    // (4) LIVE include immediately AFTER a dead `#endif`: the filter is half-open
+    // `[deadStart, deadEnd)`, so a live include at/after the reactivating
+    // directive is KEPT -- never over-filtered into the adjacent live region.
+    PreprocessResult liveAfterDead;
+    (void)ppLexemesWithDirs(
+        "#if 0\n#endif\n#include <stddef.h>\n"
+        "int main(){ return (size_t)(0); }\n",
+        liveAfterDead, {}, {sysdir});
+    EXPECT_FALSE(liveAfterDead.diagnostics->hasErrors());
+    EXPECT_TRUE(containsStddef(liveAfterDead))
+        << "a live include after a dead #endif must still seed";
+
+    fs::remove_all(sysdir, ec);
+}
+
 // FAIL-LOUD (C23 6.10.1p4 well-formedness): every malformed `__has_include`
 // shape -> P_PreprocessorHasInclude (a DISTINCT, positioned diagnostic, never a
 // generic ICE fallthrough). Missing `(`, missing `>`, missing `)`, empty name.

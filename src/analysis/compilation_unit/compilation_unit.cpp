@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -276,7 +277,50 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
         phase.emplace(substrate::CompilePhase::Parse);
-        Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
+        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: seed the binder sketch's global
+        // scope with the LIVE shipped-descriptor typedef NAMES (`size_t` from
+        // <stddef.h>, the stdint widths, …) BEFORE the FIRST parse. Those
+        // typedefs are injected SEMANTICALLY (post-parse), so without this the
+        // includer parsed `(size_t)(expr)` as a CALL and recorded an
+        // AmbiguousTypeNameCandidate -> UnitBuilder::finish() re-tokenized and
+        // re-parsed the WHOLE TU (~0.75s/TU on the SQLite amalgamation) just to
+        // learn the name is a type. Seeding it up front commits the cast on parse
+        // 1 (parser.cpp NameKind::Type) -> no candidate -> no reparse. This reuses
+        // the EXACT channel the finish() oracle reparse already uses
+        // (ParserConfig::seedGlobalTypeNames -> BinderSketch::seedGlobalType); the
+        // reparse is RETAINED as the residual net for in-buffer FORWARD references
+        // (a typedef used before its own definition in the synthesized buffer),
+        // which no descriptor seed can cover. Interner-free NAME harvest over the
+        // descriptors the preprocessor actually resolved (parent + transitive
+        // `includes` closure), deduped by name. A scratch reporter: a malformed
+        // descriptor is reported ONCE by the semantic read, never here.
+        // ORACLE-ALIGNED (D-PERF-2): `pp.resolvedShippedDescriptors` is now the
+        // AUTHORITATIVELY-LIVE descriptor set (the preprocessor drops a splice whose
+        // offset falls in an `#if 0` dead range), EQUAL to the finish() oracle's
+        // `shippedLibDescriptors`. So seeding resolves EXACTLY the names the finish()
+        // reparse would -- never a superset, never a name from a dead-branch include.
+        // ONE-DIRECTIONAL (P0016): a real in-source binding still SHADOWS a seed
+        // (`lookup` scans bindings newest-first; seeds precede every parse-time
+        // record), so seeding only ever turns Unknown -> Type, never overrides a
+        // Value -- it resolves MORE names, never suppresses a diagnostic.
+        ParserConfig cfg = parserConfigFor(*schema);
+        {
+            std::unordered_set<std::string> seen;
+            for (std::filesystem::path const& desc :
+                 pp.resolvedShippedDescriptors) {
+                DiagnosticReporter scratch{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                if (auto names =
+                        ffi::readShippedLibTypedefNames(desc, scratch)) {
+                    for (auto& n : *names) {
+                        if (seen.insert(n).second) {
+                            cfg.seedGlobalTypeNames.push_back(std::move(n));
+                        }
+                    }
+                }
+            }
+        }
+        Parser p{synth, schema, std::move(stream), std::move(cfg),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
         phase.reset();

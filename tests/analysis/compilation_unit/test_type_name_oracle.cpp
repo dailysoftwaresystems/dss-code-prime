@@ -73,9 +73,52 @@ public:
         return path;
     }
 
+    [[nodiscard]] std::filesystem::path const& path() const noexcept {
+        return dir_;
+    }
+
 private:
     std::filesystem::path dir_;
 };
+
+// Normalized structural signature of the subtree rooted at `n`: schema-relative
+// rule/token ids + token spelling, NO spans/NodeIds, EmptySpace leaves skipped.
+// Two subtrees built under the SAME schema compare equal iff they have identical
+// shape + spelling — used to prove a cast resolved by the FIRST-PARSE SEED is
+// structurally IDENTICAL to the SAME cast resolved by the finish() oracle
+// reparse (D-PERF-2 Opt-4 one-directional parity).
+void subtreeSig(Tree const& t, NodeId n, std::string& out) {
+    if (isEmptySpace(t.flags(n))) return;
+    if (t.kind(n) == NodeKind::Token) {
+        out += "T";
+        out += std::to_string(t.tokenKind(n).v);
+        out += ":";
+        out += t.text(n);
+        out += ";";
+        return;
+    }
+    out += "R";
+    out += std::to_string(t.rule(n).v);
+    out += "{";
+    for (NodeId c : t.children(n)) subtreeSig(t, c, out);
+    out += "}";
+}
+
+// Signature of the FIRST `castExpr` subtree in `t` (empty if none).
+[[nodiscard]] std::string firstCastExprSig(Tree const& t) {
+    if (!t.hasSchema()) return {};
+    const auto castRule = t.schema().rules().find("castExpr");
+    if (!castRule.valid()) return {};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == castRule.v) {
+            std::string sig;
+            subtreeSig(t, id, sig);
+            return sig;
+        }
+    }
+    return {};
+}
 
 [[nodiscard]] bool treeHasRule(Tree const& t, std::string_view ruleName) {
     if (!t.hasSchema()) return false;
@@ -213,4 +256,110 @@ TEST(TypeNameOracle, BothDirectionsResolveInlineInOneBuffer) {
     EXPECT_EQ(cu.typeNameReparseCount(), 1u)
         << "an in-buffer forward reference across an inline-include boundary"
            " still uses the oracle";
+}
+
+// ── D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION ─────────────────────────────────────
+//
+// A shipped SYSTEM descriptor's typedefs are injected SEMANTICALLY (post-parse),
+// so an angle `#include <h>` does NOT splice them into the buffer — pre-fix, the
+// includer parsed `(size_t)(expr)` as a CALL, recorded an
+// AmbiguousTypeNameCandidate, and UnitBuilder::finish() re-tokenized + re-parsed
+// the WHOLE TU (~0.75s/TU on SQLite) to learn the name is a type. The fix seeds
+// the LIVE resolved-descriptor typedef NAMES into the binder sketch BEFORE the
+// first parse (parseAndAdd_ harvests pp.resolvedShippedDescriptors), so the cast
+// commits on parse 1 with NO candidate → NO reparse.
+
+// (a) EFFECTIVENESS pin: a shipped-typedef cast `(MyT)(0)` (the `(size_t)(x)`
+// offsetof shape) commits on the FIRST parse → typeNameReparseCount() == 0.
+// RED-ON-DISABLE: revert the parseAndAdd_ seed harvest → the shipped typedef is
+// Unknown at first parse → a candidate is recorded → finish() reparses → the
+// count flips to 1 (the cast still commits via the reparse, so `castExpr` stays;
+// the COUNT is the pin).
+TEST(TypeNameOracle, ShippedTypedefCastSeededOnFirstParseNoReparse) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write(
+        "main.c",
+        "#include <mydefs.h>\n"
+        "int main() { return (MyT)(0); }\n");
+    // A NEUTRAL descriptor: the typedef `MyT` is a typed surface injected
+    // semantically, NOT spliced into the buffer like a quote include's text.
+    sysDir.write(
+        "mydefs.json",
+        R"({ "header": "mydefs.h",
+             "typedefs": [ { "name": "MyT", "type": "i32" } ] })");
+
+    UnitBuilder b{loadShippedSchema("c-subset")};
+    b.addSystemDir(sysDir.path());
+    b.addFile(main);
+    auto cu = std::move(b).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    EXPECT_TRUE(treeHasRule(cu.trees()[0], "castExpr"))
+        << "the seeded shipped typedef must commit the cast on the first parse";
+    EXPECT_EQ(cu.typeNameReparseCount(), 0u)
+        << "seeding the shipped typedef NAME eliminates the full-file reparse";
+    // The descriptor path is still recorded for semantic injection (the seed is
+    // additive, not a replacement for the import-resolver record).
+    EXPECT_EQ(cu.shippedLibDescriptors().size(), 1u);
+}
+
+// (b) Opt-4 PARITY: the SAME cast `(MyT)(0)`, resolved two ways — once by the
+// FIRST-PARSE SEED (shipped descriptor, reparse 0), once by the finish() oracle
+// REPARSE (in-buffer forward reference, reparse 1) — must produce a
+// STRUCTURALLY IDENTICAL cast subtree. This empirically pins the one-directional
+// property: seeding resolves the type EARLIER (fewer reparses) but yields the
+// EXACT tree the reparse would have — it never diverges, suppresses, or
+// reshapes. RED-ON-DISABLE: a seed that mis-committed (e.g. a different operand
+// grouping) would make the two signatures differ.
+TEST(TypeNameOracle, SeededFirstParseCastMatchesReparseCast) {
+    // Path A — resolved by the FIRST-PARSE SEED (shipped typedef), no reparse.
+    TempDir seedSrc;
+    TempDir seedSys;
+    auto seedMain = seedSrc.write(
+        "main.c",
+        "#include <mydefs.h>\n"
+        "int f() { return (MyT)(0); }\n");
+    seedSys.write(
+        "mydefs.json",
+        R"({ "header": "mydefs.h",
+             "typedefs": [ { "name": "MyT", "type": "i32" } ] })");
+    UnitBuilder seedB{loadShippedSchema("c-subset")};
+    seedB.addSystemDir(seedSys.path());
+    seedB.addFile(seedMain);
+    auto seedCu = std::move(seedB).finish();
+
+    // Path B — the SAME cast, but `MyT` is an in-buffer FORWARD reference (typedef
+    // AFTER the use), so the seed cannot cover it and the finish() oracle reparse
+    // resolves it from the union of in-buffer global type names.
+    TempDir reparseSrc;
+    auto reparseMain = reparseSrc.write(
+        "main.c",
+        "int f() { return (MyT)(0); }\n"
+        "typedef int MyT;\n");
+    UnitBuilder reparseB{loadShippedSchema("c-subset")};
+    reparseB.addFile(reparseMain);
+    auto reparseCu = std::move(reparseB).finish();
+
+    ASSERT_EQ(seedCu.trees().size(), 1u);
+    ASSERT_EQ(reparseCu.trees().size(), 1u);
+    EXPECT_FALSE(seedCu.trees()[0].diagnostics().hasErrors());
+    EXPECT_FALSE(reparseCu.trees()[0].diagnostics().hasErrors());
+
+    // The distinguishing precondition: the two paths reached the cast by
+    // DIFFERENT mechanisms (seed vs reparse).
+    EXPECT_EQ(seedCu.typeNameReparseCount(), 0u)
+        << "path A resolves the cast via the first-parse seed";
+    EXPECT_EQ(reparseCu.typeNameReparseCount(), 1u)
+        << "path B resolves the cast via the retained oracle reparse";
+
+    // The parity: identical cast subtree structure + spelling.
+    const std::string seedSig    = firstCastExprSig(seedCu.trees()[0]);
+    const std::string reparseSig = firstCastExprSig(reparseCu.trees()[0]);
+    EXPECT_FALSE(seedSig.empty()) << "path A must contain a castExpr";
+    EXPECT_FALSE(reparseSig.empty()) << "path B must contain a castExpr";
+    EXPECT_EQ(seedSig, reparseSig)
+        << "a cast resolved by the first-parse seed must be structurally"
+           " identical to the same cast resolved by the oracle reparse";
 }

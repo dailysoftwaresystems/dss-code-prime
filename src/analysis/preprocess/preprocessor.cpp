@@ -436,6 +436,19 @@ struct SynthBuilder {
     // `<command-line>`/`<built-in>` prologues the authoritative pass sees, so the
     // pre-scan is more-live only IN LOCKSTEP (P0016 stays closed).
     std::string const& preScanDefinePrefix;
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: sink for every system-descriptor PARENT
+    // this builder (and its recursive children) SPLICES for an angle `#include <h>`
+    // (or the quote->angle fallback), paired with the SYNTH-BUFFER byte offset of
+    // the splice point. The splice is UN-GATED (it fires for every angle include,
+    // dead branch or not -- D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS);
+    // `preprocess()` then DROPS any record whose offset falls in an AUTHORITATIVE
+    // dead range, so the surviving set == the finish() oracle's authoritatively-live
+    // `shippedLibDescriptors`. Shared by reference across every child builder (like
+    // `includeStack` / `fatal`), so a header spliced deep in a quote-include chain
+    // still reaches `preprocess()`. Raw (parent, offset) pairs (dups allowed);
+    // `preprocess()` dead-filters, then expands the transitive `includes` closure +
+    // dedups once into `PreprocessResult`. EMIT-ONLY.
+    std::vector<std::pair<fs::path, ByteOffset>>& resolvedDescriptorsOut;
     // c17: a SynthBuilder-local object-like macro, tracked from LIVE-branch
     // `#define`s so a `#if FOO`/`#if FOO == 1` guard gating a quote-`#include`
     // evaluates with the macro state visible at the include point. Independent
@@ -576,7 +589,8 @@ struct SynthBuilder {
     // the missing macro — the P0016-safe direction), never a silent MISCOMPILE.
     SystemMacroSplice spliceSystemDescriptorMacros(std::string const& headerName,
                                                    std::string& out,
-                                                   bool reportMalformed) {
+                                                   bool reportMalformed,
+                                                   fs::path* resolvedParentOut = nullptr) {
         if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
         auto descPath = resolveSystemDescriptor(headerName, systemDirs);
         if (!descPath) return SystemMacroSplice::NotAvailable;
@@ -589,6 +603,16 @@ struct SynthBuilder {
             && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
             return SystemMacroSplice::NotAvailable;
         }
+        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: this angle `#include <h>` (or the
+        // quote->angle fallback) resolved to a format-available descriptor whose
+        // typedef surface the semantic phase will inject. Hand the resolved PARENT
+        // path back to the CALL SITE, which records it together with the SYNTH-
+        // BUFFER splice offset (only known there, after the verbatim copy of
+        // everything up to the directive) so `preprocess()` can DROP the record if
+        // the AUTHORITATIVE pass proves the include dead. NOTE: `out` here is the
+        // caller's LOCAL splice buffer, NOT the synth buffer -- so the synth offset
+        // cannot be read in this function. EMIT-ONLY.
+        if (resolvedParentOut) *resolvedParentOut = *descPath;
         // Reconstruct one neutral macro as a `#define` line into `out`; the
         // downstream tokenizer + handleDefine build the MacroDef with the proven
         // function-like / param / redefinition machinery (an identical re-define on
@@ -811,6 +835,13 @@ struct SynthBuilder {
                                                              *activeFormat)) {
                     return false;
                 }
+                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                // is NOT an include -- it must not seed. A probe followed by a live
+                // `#include <h>` seeds via the un-gated splice (the sole recorder); a
+                // probe with no matching include (`#if __has_include(<h>)` taken false,
+                // or a bare feature test) resolves NOTHING for the reparse oracle
+                // either, so recording here would make the seed a SUPERSET of the
+                // oracle. Left as a pure existence answer.
                 return true;
             }
             return resolveQuote(filename, includingDir).has_value();
@@ -1155,17 +1186,28 @@ struct SynthBuilder {
                 // resolver still injects the typed surfaces (a typed-only
                 // descriptor splices zero macros but the line is still kept).
                 std::string defs;
+                fs::path    splicedParent;
                 // Splice UNGATED (the authoritative pass arbitrates liveness), but
                 // report a malformed descriptor ONLY on a confidently-live include
                 // (`includeResolvable()`) — restoring the pre-change dead-branch
                 // inertness of that diagnostic.
                 if (spliceSystemDescriptorMacros(angleName, defs,
-                                                 /*reportMalformed=*/includeResolvable())
+                                                 /*reportMalformed=*/includeResolvable(),
+                                                 &splicedParent)
                     != SystemMacroSplice::Spliced) {
                     continue;
                 }
                 const ByteOffset dStart = toks[i].tok.span.start();
                 copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: record the resolved parent +
+                // the SYNTH-BUFFER offset of the splice point (`out.size()` now, after
+                // the verbatim copy up to the directive, before the spliced `#define`s
+                // land -> the offset sits INSIDE the include's conditional region).
+                // `preprocess()` drops this record if the offset lies in an
+                // AUTHORITATIVE dead range, so the seed set matches the finish() oracle
+                // EXACTLY (never a superset). EMIT-ONLY.
+                resolvedDescriptorsOut.push_back(
+                    {splicedParent, static_cast<ByteOffset>(out.size())});
                 out.append(defs);
                 copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
                 continue;
@@ -1218,12 +1260,14 @@ struct SynthBuilder {
                 // NOR a shipped descriptor stays the same hard error as before.
                 if (!filename.empty()) {
                     std::string defs;
+                    fs::path    splicedParent;
                     // This fallback is reached only PAST the quote arm's
                     // `includeResolvable()` gate (below), so the include is
                     // confidently-live here — report a malformed descriptor loud.
                     SystemMacroSplice const sr =
                         spliceSystemDescriptorMacros(filename, defs,
-                                                     /*reportMalformed=*/includeResolvable());
+                                                     /*reportMalformed=*/includeResolvable(),
+                                                     &splicedParent);
                     if (sr != SystemMacroSplice::NotAvailable) {
                         // Malformed already emitted its own error; on Spliced the
                         // macros are in `defs`. Either way rewrite quote→angle:
@@ -1231,6 +1275,14 @@ struct SynthBuilder {
                         // `#include <filename>` in place of the quote bytes.
                         copyVerbatim(spliced, localMap, copiedUpTo, dirStart,
                                      out, map);
+                        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: record the resolved
+                        // parent + the synth-buffer splice offset (`out.size()` after
+                        // the verbatim copy, before the spliced `#define`s). This
+                        // fallback is past `includeResolvable()`, so the branch is
+                        // pre-scan-live; the dead-range filter in `preprocess()` stays
+                        // the authority. EMIT-ONLY.
+                        resolvedDescriptorsOut.push_back(
+                            {splicedParent, static_cast<ByteOffset>(out.size())});
                         out.append(defs);
                         out.append("#include <");
                         out.append(filename);
@@ -1266,7 +1318,8 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
-                               depth + 1, includeStack, fatal, preScanDefinePrefix};
+                               depth + 1, includeStack, fatal, preScanDefinePrefix,
+                               resolvedDescriptorsOut};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -1953,6 +2006,10 @@ private:
                                                              *activeFormat_)) {
                     return false;
                 }
+                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                // does NOT seed (see the SynthBuilder pre-scan callback) -- the
+                // un-gated angle-`#include` splice is the SOLE recorder, so the seed
+                // set stays == the finish() oracle's authoritatively-live set.
                 return true;
             }
             return resolveIncludePath(filename, includingDir_, includeDirs_)
@@ -3528,9 +3585,17 @@ PreprocessResult preprocess(
     // it comes from the AUTHORITATIVE `MacroExpander` pass below (`deadRanges()`),
     // whose liveness sees the full macro table (predefined + header-supplied), so
     // the illegal-char oracle can never diverge from the real branch decision.
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: each system descriptor the SynthBuilder
+    // SPLICES for an angle `#include <h>`, paired with the synth-buffer byte offset
+    // of the splice point. The splice is UN-GATED (it fires for a dead-branch include
+    // too); the closure block below DROPS any pair whose offset lies in an
+    // AUTHORITATIVE dead range (`expander.deadRanges()`), leaving exactly the
+    // authoritatively-live set the finish() oracle's `shippedLibDescriptors` holds.
+    // Threaded by reference into the SynthBuilder (and its recursive children).
+    std::vector<std::pair<fs::path, ByteOffset>> resolvedParents;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          *result.diagnostics, 0, includeStack, result.fatal,
-                         preScanDefinePrefix};
+                         preScanDefinePrefix, resolvedParents};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
@@ -3611,13 +3676,19 @@ PreprocessResult preprocess(
     // suppressed. ALL other tokenizer diagnostics forward unconditionally. The
     // span ids are unchanged (still the prefix buffer), so the later
     // `remapBuffers` re-homes them onto the final synth buffer exactly as before.
+    // A byte offset is in an AUTHORITATIVE dead conditional region (`#if 0 …
+    // #endif`) iff it falls in one of `expander.deadRanges()`. Those ranges are in
+    // synthText coordinates (the expander ran over `prefixBuffer`, built from
+    // `synthText`), so an offset recorded during the synth-buffer build maps
+    // DIRECTLY. SHARED by the illegal-char oracle below AND the descriptor-seed
+    // filter after it (D-PERF-2), so both read the SAME authoritative liveness.
+    auto byteInDeadRegion = [&](ByteOffset b) {
+        for (auto const& [ds, de] : expander.deadRanges()) {
+            if (b >= ds && b < de) return true;
+        }
+        return false;
+    };
     {
-        auto byteInDeadRegion = [&](ByteOffset b) {
-            for (auto const& [ds, de] : expander.deadRanges()) {
-                if (b >= ds && b < de) return true;
-            }
-            return false;
-        };
         for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
             if (d.code == DiagnosticCode::P_IllegalChar
                 && byteInDeadRegion(d.span.start())) {
@@ -3670,6 +3741,38 @@ PreprocessResult preprocess(
         static_cast<ByteOffset>(result.synthBuffer->size()));
     finalTokens.push_back(eof);
     result.tokens = std::move(finalTokens);
+
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: turn the raw splice records into the
+    // authoritatively-live descriptor set the first-parse typedef seed harvests.
+    // (1) DROP any record whose splice offset lies in an AUTHORITATIVE dead range
+    //     (`byteInDeadRegion`) -- the splice is UN-GATED (it fires for a dead-branch
+    //     angle include too, D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS),
+    //     so THIS filter is what makes the surviving set == the finish() oracle's
+    //     authoritatively-live `shippedLibDescriptors` (never a superset -> the seed
+    //     can never resolve a name the reparse would not). An include the pre-scan
+    //     mis-judged dead but the full macro table makes LIVE was still spliced +
+    //     recorded, and its offset is NOT in a dead range, so it is KEPT (C30-safe).
+    // (2) EXPAND each surviving PARENT to its TRANSITIVE `includes` closure and dedup
+    //     CU-wide via the SHARED cycle-safe walker (`forEachDescriptorInClosure`, the
+    //     same one the macro-splice + import-resolver tiers use), so the seed set can
+    //     never disagree with the transitive surface actually injected. ONE `visited`
+    //     set across every parent -> each descriptor appears once, keyed by weakly-
+    //     canonical path. An `includes` entry that resolves to no descriptor is a
+    //     config error the import resolver surfaces LOUD (F_ShippedHeaderNotFound on
+    //     the `#include`); silent here to avoid a double-report.
+    // EMIT-ONLY -- populates a new output field, changes no preprocess behavior.
+    {
+        std::unordered_set<std::string> visited;
+        for (auto const& [parent, off] : resolvedParents) {
+            if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
+            ffi::forEachDescriptorInClosure(
+                parent, systemDirs, visited,
+                [&](fs::path const& p) {
+                    result.resolvedShippedDescriptors.push_back(p);
+                },
+                [](std::string const&) { /* import resolver owns the loud miss */ });
+        }
+    }
 
     return result;
 }

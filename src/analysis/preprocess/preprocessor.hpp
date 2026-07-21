@@ -182,6 +182,25 @@ struct DSS_EXPORT PreprocessResult {
     // no macro expansions).
     std::size_t macroTokenMoves = 0;
 
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: the weakly-canonical paths of the
+    // AUTHORITATIVELY-LIVE shipped system descriptors this preprocess run resolved
+    // -- every angle `#include <h>` (or quote->angle fallback) the SynthBuilder
+    // SPLICED whose splice offset the AUTHORITATIVE macro pass did NOT prove dead,
+    // each expanded to its TRANSITIVE `includes` closure and DEDUPED by weakly-
+    // canonical path. This set EQUALS the finish() oracle's `shippedLibDescriptors`
+    // (built by the import resolver from the SAME authoritatively-live includes),
+    // never a superset. EMIT-ONLY -- it changes no preprocess behavior; it surfaces
+    // which descriptors' SEMANTICALLY-injected typedef surfaces are in scope so
+    // `parseAndAdd_` can SEED their typedef NAMES into the binder sketch's global
+    // scope BEFORE the FIRST parse. A shipped-typedef cast `(size_t)(expr)` then
+    // commits as a CAST on parse 1 (no AmbiguousTypeNameCandidate -> no full-file
+    // oracle reparse in UnitBuilder::finish), and because the set is oracle-aligned
+    // the seed resolves EXACTLY what the reparse would, never a name it would not.
+    // Empty for a TU that resolves no live system descriptor (every non-C language,
+    // any C TU with only quote includes, and a descriptor reached ONLY through a
+    // dead `#if 0` branch).
+    std::vector<std::filesystem::path> resolvedShippedDescriptors;
+
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers
