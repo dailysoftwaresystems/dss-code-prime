@@ -1,0 +1,12 @@
+{
+  "$comment": "SQLite testfixture-link arc (TF-C39, 2026-07-21): RUN witness for shipped <zlib.h> (zlib.json / D-FFI-ZLIB-DESCRIPTOR), the descriptor that clears sqlite ext/misc/zipfile.c's F001A. A real raw-deflate -> inflate round-trip on libz.so.1 (windowBits -15, as zipfile.c) + a crc32 cross-check returns 42 iff byte-exact. Behavioral layout witness: deflateInit2_/inflateInit2_ reject a wrong (int)sizeof(z_stream) (Z_VERSION_ERROR -> returns 1), and deflate/inflate read/write next_in/avail_in/next_out/avail_out/total_out at the ABI offsets (a wrong offset -> returns 6/7/8, never 42). ELF-x86_64 ONLY: the ELF walker emits a DT_NEEDED for libz.so.1 (the D-FFI-MATH-LIBM-DT-NEEDED per-referenced-library mechanism), so the Linux WSL run-green leg + ubuntu CI link and run it. NOT arm64-elf (no aarch64 libz in the /usr/aarch64-linux-gnu qemu sysroot -> a run arm would false-red the WSL gate) and NOT arm64-macho: the Mach-O writer populates loadDylibs ONLY from the format schema's image.installName (libSystem), so it cannot yet emit an LC_LOAD_DYLIB for a non-libSystem import library (/usr/lib/libz.1.dylib) — the Mach-O analog of the ELF DT_NEEDED walker is a separate backend cycle. The DESCRIPTOR is target-agnostic regardless (arm64-elf + macho COMPILE-verify: the front-end accepts zipfile.c+zlib.json and binds the zlib symbols to libz); only the runtime LINK witness is elf-x86_64, exactly as the elf-only tcl.json examples. Release arm runs the optimizer over the (unfoldable) libz calls. RED-ON-DISABLE: delete zlib.json -> undeclared -> compile fails; a broken/unexported import would fail loud at load (127), never silently.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

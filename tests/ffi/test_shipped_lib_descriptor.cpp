@@ -2849,6 +2849,172 @@ TEST(ShippedLibDescriptor, RealTclHashClusterLayout) {
         << "Tcl_HashEntry.key must intern to the Tcl_HashKey union TypeId";
 }
 
+// TF-C39 (D-FFI-ZLIB-DESCRIPTOR, SQLite testfixture-link arc 2026-07-21): the REAL
+// zlib.json. SQLite ext/misc/zipfile.c `#include <zlib.h>` and round-trips ZIP entry
+// payloads through raw deflate; this pins the seed descriptor STRUCTURALLY against
+// the config file so a malformed edit / wrong SONAME / shifted field fails loud here
+// — always-on on every leg (no libz needed to READ the descriptor; the RUN witness
+// is examples/c-subset/zlib_roundtrip, linux-only). z_stream is 14 fields / 112 bytes
+// on LP64, offsetof-verified vs /usr/include/zlib.h 1.3 (NOT 15 fields — the real
+// z_stream_s has 14 members) — a wrong offset would be a silent runtime miscompile
+// (the C37 Tcl_ChannelType lesson), so the KEY offsets are byte-pinned. The
+// eager-import safety invariant is pinned too: deflateInit2/inflateInit2 are function
+// MACROS (nm -D ABSENT from libz — they wrap the `_` forms), so they must be `macros`,
+// NEVER symbols (a function-row would plant an undefined import and break every zlib
+// binary's LOAD 127, the tcl.json Tcl_IsShared precedent); the exported `_` forms ARE
+// the symbols.
+//
+// RED-ON-DISABLE: change zlib.json's elf `library` off "libz.so.1" → the library pin
+// fails; shift a z_stream field (e.g. total_in → i32) → the offset/size pin fails;
+// move deflateInit2 from `macros` to `symbols` → the macro/symbol split pin fails.
+TEST(ShippedLibDescriptor, RealZlibDescriptorLayoutAndLinkSurface) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "zlib.json";
+    ASSERT_TRUE(fs::exists(path)) << "zlib.json not found at " << path.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Decode for the elf x86_64 LP64 target (zlib.json is elf/macho; LP64 on both,
+    // so the layout is identical — no variants).
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                         std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    // Provenance + the DT_NEEDED-driving link targets.
+    EXPECT_EQ(desc->header, "zlib.h");
+    ASSERT_EQ(desc->library.count("elf"), 1u);
+    EXPECT_EQ(desc->library.at("elf"), "libz.so.1");            // zlib SONAME
+    ASSERT_EQ(desc->library.count("macho"), 1u);
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libz.1.dylib");   // macOS install name
+    // Per-format gate: elf + macho available, pe NOT (a pe <zlib.h> fails loud — the
+    // sys-mman.json precedent; witnessed by no pe run arm on the example).
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::MachO));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::Pe));
+
+    // ── z_stream layout: 14 fields / 112 bytes, offsetof-verified vs zlib.h ──
+    ShippedStruct const* zs = nullptr;
+    for (auto const& s : desc->structs) if (s.name == "z_stream") zs = &s;
+    ASSERT_NE(zs, nullptr) << "z_stream struct absent from zlib.json";
+    ASSERT_EQ(zs->fields.size(), 14u) << "z_stream has 14 members (NOT 15)";
+    // field names in ABI order (a rename/reorder here would misresolve `str.next_in`).
+    EXPECT_EQ(zs->fields[0].name,  "next_in");
+    EXPECT_EQ(zs->fields[1].name,  "avail_in");
+    EXPECT_EQ(zs->fields[2].name,  "total_in");
+    EXPECT_EQ(zs->fields[3].name,  "next_out");
+    EXPECT_EQ(zs->fields[4].name,  "avail_out");
+    EXPECT_EQ(zs->fields[5].name,  "total_out");
+    EXPECT_EQ(zs->fields[10].name, "opaque");
+    EXPECT_EQ(zs->fields[11].name, "data_type");
+    EXPECT_EQ(zs->fields[12].name, "adler");
+    EXPECT_EQ(zs->fields[13].name, "reserved");
+    auto const zsL = computeLayout(zs->typeId, interner, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(zsL.has_value());
+    EXPECT_EQ(zsL->size, 112u) << "sizeof(z_stream) LP64 (deflateInit2_ rejects a wrong size)";
+    ASSERT_EQ(zsL->fieldOffsets.size(), 14u);
+    EXPECT_EQ(zsL->fieldOffsets[0],  0u)   << "next_in@0";
+    EXPECT_EQ(zsL->fieldOffsets[1],  8u)   << "avail_in@8";
+    EXPECT_EQ(zsL->fieldOffsets[2],  16u)  << "total_in@16 (pad after avail_in)";
+    EXPECT_EQ(zsL->fieldOffsets[3],  24u)  << "next_out@24";
+    EXPECT_EQ(zsL->fieldOffsets[5],  40u)  << "total_out@40 (pad after avail_out)";
+    EXPECT_EQ(zsL->fieldOffsets[10], 80u)  << "opaque@80";
+    EXPECT_EQ(zsL->fieldOffsets[11], 88u)  << "data_type@88";
+    EXPECT_EQ(zsL->fieldOffsets[12], 96u)  << "adler@96 (pad after data_type)";
+    EXPECT_EQ(zsL->fieldOffsets[13], 104u) << "reserved@104";
+
+    // zalloc/zfree are FUNCTION POINTERS (alloc_func/free_func — the tcl.json
+    // driver-proc-field precedent), NOT lazily-opaque void*.
+    EXPECT_EQ(zs->fields[8].name, "zalloc");
+    ASSERT_EQ(interner.kind(zs->fields[8].type), TypeKind::Ptr);
+    auto const zallocPointee = interner.operands(zs->fields[8].type);
+    ASSERT_EQ(zallocPointee.size(), 1u);
+    EXPECT_EQ(interner.kind(zallocPointee[0]), TypeKind::FnSig) << "zalloc = alloc_func fn-ptr";
+
+    // ── link surface: exactly 9 exported functions; the two Init2 are MACROS ──
+    auto sym = [&](std::string_view name) -> ShippedSymbol const* {
+        for (auto const& s : desc->symbols) if (s.name == name) return &s;
+        return nullptr;
+    };
+    ASSERT_EQ(desc->symbols.size(), 9u);
+    for (auto const* n : {"zlibVersion", "deflate", "deflateEnd", "deflateBound",
+                          "deflateInit2_", "inflate", "inflateEnd", "inflateInit2_",
+                          "crc32"})
+        EXPECT_NE(sym(n), nullptr) << "missing zlib symbol: " << n;
+    // THE eager-import safety split: deflateInit2/inflateInit2 are NOT libz exports
+    // (nm -D ABSENT — they are function-macros over the `_` forms). A function-row
+    // would plant an undefined import and break every zlib binary's LOAD (exit 127,
+    // the C9 refcount / tcl.json Tcl_IsShared precedent). They ship as `macros`;
+    // the exported `_` forms above ARE the symbols.
+    EXPECT_EQ(sym("deflateInit2"), nullptr) << "deflateInit2 is a macro, not a symbol";
+    EXPECT_EQ(sym("inflateInit2"), nullptr) << "inflateInit2 is a macro, not a symbol";
+
+    // crc32 shape: uLong crc32(uLong, const Bytef*, uInt) → fn(u64, ptr<u8>, u32) -> u64.
+    {
+        auto const* s = sym("crc32");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::U64);
+        auto const ps = interner.fnParams(s->signature);
+        ASSERT_EQ(ps.size(), 3u);
+        EXPECT_EQ(interner.kind(ps[0]), TypeKind::U64);   // uLong crc
+        ASSERT_EQ(interner.kind(ps[1]), TypeKind::Ptr);   // const Bytef*
+        auto const bufPointee = interner.operands(ps[1]);
+        ASSERT_EQ(bufPointee.size(), 1u);
+        EXPECT_EQ(interner.kind(bufPointee[0]), TypeKind::U8);
+        EXPECT_EQ(interner.kind(ps[2]), TypeKind::U32);   // uInt len
+    }
+
+    // ── macros: the two function-macros (arity-pinned) + ZLIB_VERSION + Z_* values ──
+    auto macro = [&](std::string_view name) -> ShippedMacro const* {
+        for (auto const& m : desc->macros) if (m.name == name) return &m;
+        return nullptr;
+    };
+    {
+        auto const* di2 = macro("deflateInit2");
+        ASSERT_NE(di2, nullptr) << "deflateInit2 must be present as a macro";
+        ASSERT_TRUE(di2->params.has_value());
+        EXPECT_EQ(di2->params->size(), 6u);   // strm,level,method,windowBits,memLevel,strategy
+        auto const* ii2 = macro("inflateInit2");
+        ASSERT_NE(ii2, nullptr) << "inflateInit2 must be present as a macro";
+        ASSERT_TRUE(ii2->params.has_value());
+        EXPECT_EQ(ii2->params->size(), 2u);   // strm,windowBits
+    }
+    auto macroRepl = [&](std::string_view name) -> std::string {
+        for (auto const& m : desc->macros) if (m.name == name) return m.replacement;
+        return "<absent>";
+    };
+    EXPECT_EQ(macroRepl("ZLIB_VERSION"),       "\"1.3\"");   // deflateInit2_ major-version check
+    EXPECT_EQ(macroRepl("Z_OK"),               "0");
+    EXPECT_EQ(macroRepl("Z_STREAM_END"),       "1");
+    EXPECT_EQ(macroRepl("Z_NO_FLUSH"),         "0");
+    EXPECT_EQ(macroRepl("Z_FINISH"),           "4");
+    EXPECT_EQ(macroRepl("Z_DEFLATED"),         "8");
+    EXPECT_EQ(macroRepl("Z_DEFAULT_STRATEGY"), "0");
+
+    // ── typedefs: Byte/Bytef = u8 (zipfile.c casts (Byte*)/(Bytef*)); z_streamp is
+    // ptr<z_stream> resolved BY NAME (Option C) to the SAME interned struct. ──
+    auto typedefKind = [&](std::string_view name) -> std::optional<TypeKind> {
+        for (auto const& t : desc->typedefs) if (t.name == name) return interner.kind(t.type);
+        return std::nullopt;
+    };
+    ASSERT_TRUE(typedefKind("Byte").has_value());
+    EXPECT_EQ(*typedefKind("Byte"), TypeKind::U8);
+    ASSERT_TRUE(typedefKind("Bytef").has_value());
+    EXPECT_EQ(*typedefKind("Bytef"), TypeKind::U8);
+    TypeId zStreamP{};
+    for (auto const& t : desc->typedefs) if (t.name == "z_streamp") zStreamP = t.type;
+    ASSERT_TRUE(zStreamP.valid()) << "z_streamp typedef absent";
+    ASSERT_EQ(interner.kind(zStreamP), TypeKind::Ptr);
+    auto const spPointee = interner.operands(zStreamP);
+    ASSERT_EQ(spPointee.size(), 1u);
+    EXPECT_EQ(spPointee[0], zs->typeId)
+        << "z_streamp must point at the ONE interned z_stream (Option C by-name)";
+}
+
 // c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
 // windows.json ships the 47 kernel32 file/heap/mmap/library/error/sysinfo/time
 // functions the sqlite os_win VFS calls through its aSyscall[] table — every one an
