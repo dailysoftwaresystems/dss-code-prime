@@ -23,16 +23,31 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "link/format/elf.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
+// TF-C52 (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT): the ELF-writer GOT pin drives a
+// hand-built MIR through the REAL back-half (the same stage order as
+// compile_pipeline.cpp's lowerMirModuleToAssembly) so the emitted `.o`'s GOT
+// reloc nativeIds are asserted — mirrors test_asm_arm64.cpp's runFullPipeline.
+#include "lir/lir_2addr_legalize.hpp"
+#include "lir/lir_callconv.hpp"
+#include "lir/lir_liveness.hpp"
+#include "lir/lir_regalloc.hpp"
+#include "lir/lir_rewrite.hpp"
+#include "lir/lowering/mir_to_lir.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_node.hpp"
+#include "mir/mir_opcode.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -465,6 +480,145 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64) {
         << "undefined extern must carry its real import name";
     EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 0u)   // st_shndx
         << "extern must be SHN_UNDEF";
+}
+
+// ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the emitted-.o GOT-reloc pin ──
+//
+// The SIBLING of the CALL26 test above, for the GOT-ADDRESS case: taking the
+// ADDRESS of an undefined extern as a live VALUE (`return &ext;`) under the
+// `externAddrBinding=got` arm64 relocatable format must, in the emitted ELF
+// `.o`, carry R_AARCH64_ADR_GOT_PAGE (nativeId 311) on the adrp word +
+// R_AARCH64_LD64_GOT_LO12_NC (312) on the ldr word against the SHN_UNDEF
+// extern (real name, addend 0), and NOT the absolute R_AARCH64_ADR_PREL_PG_HI21
+// (275) / ADD_ABS_LO12_NC (277). This is the ONLY pin that drives the GOT
+// materialization through the ELF WRITER — the LIR pin covers routing, the
+// schema pins cover kind-coherence, but a wire→nativeId regression in the
+// emitted object flips only THIS test (otherwise only the qemu witness would
+// catch it). Drives a hand-built MIR through the REAL back-half (MIR→LIR under
+// the got format → regalloc → rewrite → 2-addr → callconv → assemble), the
+// exact stage order of compile_pipeline.cpp's lowerMirModuleToAssembly, then
+// elf::encode.
+// RED-ON-DISABLE: revert the externAddrGotSymbols_ routing arm in
+// mir_to_lir.cpp (or drop externAddrBinding from the format) → the plain
+// absolute ADRP+ADD lea is emitted → the .o carries 275/277, not 311/312 →
+// all four EXPECTs flip.
+TEST(ElfWriter, GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->externAddrBinding().has_value())
+        << "the arm64 relocatable format must declare externAddrBinding=got";
+
+    // MIR: `void* f(void){ return &ext; }` — GlobalAddr(ext) used as a VALUE
+    // (its sole use is the Return → not a callee, not a foldable load → the
+    // value-form GOT arm is reached).
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const sig  = interner.fnSig(std::span<TypeId const>{}, ptrT,
+                                       CallConv::CcAAPCS64);
+    SymbolId const kCaller{10};
+    SymbolId const kExtern{20};
+    MirBuilder mb;
+    mb.addFunction(sig, kCaller);
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const ga = mb.addGlobalAddr(kExtern, ptrT);
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    ExternImport ext;
+    ext.symbol      = kExtern;
+    ext.mangledName = "got_extern_fn";
+    ext.libraryPath = "libc.so.6";
+    ext.isData      = false;  // a FUNCTION extern whose ADDRESS is taken
+
+    DiagnosticReporter rep;
+    std::vector<ExternImport> externs{ext};
+    // FULL back-half WITH the got extern-address binding threaded in — the same
+    // stage order as compile_pipeline.cpp's lowerMirModuleToAssembly.
+    auto lir = lowerToLir(mir, **target, interner, rep, externs,
+                          ExternCallDispatch::DirectPlt,
+                          /*dataImportBinding=*/std::nullopt,
+                          /*tlsAccess=*/std::nullopt,
+                          /*sehScopes=*/{},
+                          /*wideFloatSoftcallLibrary=*/std::nullopt,
+                          /*externAddrBinding=*/ExternAddrBinding::Got);
+    ASSERT_TRUE(lir.ok);
+    auto const liveness = analyzeLiveness(lir.lir);
+    auto const alloc = allocateRegisters(lir.lir, **target, liveness, 0, rep);
+    ASSERT_TRUE(alloc.ok());
+    auto rewritten = rewriteWithAllocation(lir.lir, **target, alloc, rep);
+    ASSERT_TRUE(rewritten.ok);
+    auto legal = legalizeTwoAddress(rewritten.lir, **target, rep);
+    ASSERT_TRUE(legal.ok());
+    auto cc = materializeCallingConvention(legal.lir, **target, alloc, rep);
+    ASSERT_TRUE(cc.ok());
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    auto assembled = assemble(cc.lir, **target, lirToMir, rep);
+    ASSERT_TRUE(assembled.ok());
+    // Complete the module the way the pipeline's LK11a stage would (`assemble`
+    // sets functions + expectedFuncCount; the defined-symbol table + the extern
+    // imports are populated downstream — supplied here, mirroring the sibling).
+    assembled.symbols.push_back(ModuleSymbol{kCaller, "f",
+                                             SymbolBinding::Global,
+                                             SymbolVisibility::Default});
+    assembled.externImports.push_back(ext);
+
+    auto bytes = elf::encode(assembled, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "arm64 ET_REL GOT-address emit must be clean";
+
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.text");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << "an arm64 .o with a GOT-address extern must emit .rela.text";
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const relaOff   = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const relaSize  = readU64LE(bytes, shoff + relaIdx * 64 + 32);
+    std::size_t   const relaCount = static_cast<std::size_t>(relaSize / 24);
+
+    // Scan .rela.text for the GOT pair (311/312) + assert the absolute
+    // page-pair (275/277) is ABSENT for this symbol.
+    bool sawGotPage = false, sawGotLo12 = false, sawAbsPage = false, sawAbsLo12 = false;
+    std::uint64_t gotPageOff = 0, gotLo12Off = 0;
+    std::uint32_t gotPageSym = 0, gotLo12Sym = 0;
+    std::int64_t  gotPageAddend = -1, gotLo12Addend = -1;
+    for (std::size_t i = 0; i < relaCount; ++i) {
+        std::uint64_t const off  = readU64LE(bytes, relaOff + i * 24 + 0);
+        std::uint64_t const info = readU64LE(bytes, relaOff + i * 24 + 8);
+        std::int64_t const  add  = static_cast<std::int64_t>(readU64LE(bytes, relaOff + i * 24 + 16));
+        std::uint32_t const type = static_cast<std::uint32_t>(info);
+        std::uint32_t const sym  = static_cast<std::uint32_t>(info >> 32);
+        if (type == 311u) { sawGotPage = true; gotPageOff = off; gotPageSym = sym; gotPageAddend = add; }
+        if (type == 312u) { sawGotLo12 = true; gotLo12Off = off; gotLo12Sym = sym; gotLo12Addend = add; }
+        if (type == 275u) sawAbsPage = true;
+        if (type == 277u) sawAbsLo12 = true;
+    }
+    EXPECT_TRUE(sawGotPage)
+        << "the adrp word must emit R_AARCH64_ADR_GOT_PAGE (nativeId 311).";
+    EXPECT_TRUE(sawGotLo12)
+        << "the ldr word must emit R_AARCH64_LD64_GOT_LO12_NC (nativeId 312).";
+    EXPECT_FALSE(sawAbsPage)
+        << "NO R_AARCH64_ADR_PREL_PG_HI21 (275) — a foreign default-PIE link "
+           "rejects the absolute page-pair against a preemptible extern.";
+    EXPECT_FALSE(sawAbsLo12)
+        << "NO R_AARCH64_ADD_ABS_LO12_NC (277) for the GOT-address extern.";
+    EXPECT_EQ(gotLo12Off, gotPageOff + 4)
+        << "the ldr (312) sits exactly one word after the adrp (311).";
+    EXPECT_EQ(gotPageAddend, 0) << "GOT-page addend = 0";
+    EXPECT_EQ(gotLo12Addend, 0) << "GOT-lo12 addend = 0";
+    EXPECT_EQ(gotPageSym, gotLo12Sym) << "both GOT relocs name the SAME symbol";
+
+    // Both relocs name the SHN_UNDEF extern carrying its real import name.
+    std::uint32_t const stName = readU32LE(bytes, symtabOff + gotPageSym * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, stName), "got_extern_fn")
+        << "the address-taken extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + gotPageSym * 24 + 6), 0u)   // st_shndx
+        << "the address-taken extern must be SHN_UNDEF";
 }
 
 // ── D-LK-OBJECT-DATA-EXTERN-RELOCATABLE: data extern → PC32, not PLT32 ──

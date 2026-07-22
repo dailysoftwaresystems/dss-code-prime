@@ -283,6 +283,24 @@ lowerToLir(Mir const&          mir,
            // unbound extern) — the F64-axis / x87-80-axis formats never reach
            // it (they collapse or use the inline x87 sequence). Defaults to
            // nullopt; only F128-softcall-bearing modules consume it.
-           std::optional<std::string> wideFloatSoftcallLibrary = std::nullopt);
+           std::optional<std::string> wideFloatSoftcallLibrary = std::nullopt,
+           // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE
+           // object format's extern-ADDRESS materialization binding, read
+           // from `ObjectFormatSchema::externAddrBinding()`. `got` (arm64
+           // ELF relocatable / static-archive member) → an `&extern` used
+           // as a live code-form VALUE (argument / automatic initializer /
+           // returned function pointer, NOT a call, NOT a static-data-item
+           // initializer) materializes through a foreign-linker GOT slot
+           // (`lowerGlobalAddr` emits the `lea_extern_got` adrp:got:+ldr:
+           // got_lo12: macro), so a foreign default-PIE link of the
+           // emitted `.o`/`.a` accepts it. `std::nullopt` → the ordinary
+           // lea (an absolute page-pair on arm64, foreign-PIE-safe only
+           // for a DSS-linked exec; a PC-relative rel32 on x86_64). Only
+           // extern symbols under a `got` format consume it; every other
+           // module is byte-identical. Trailing (like
+           // `wideFloatSoftcallLibrary`) so existing positional callers
+           // are unaffected; the production driver passes the format's
+           // value. Defaults to nullopt.
+           std::optional<ExternAddrBinding> externAddrBinding = std::nullopt);
 
 } // namespace dss

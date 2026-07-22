@@ -1168,6 +1168,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      cuMirs[0].cuId,
                                      /*externCallDispatch=*/std::nullopt,
                                      /*dataImportBinding=*/std::nullopt,
+                                     /*externAddrBinding=*/std::nullopt,
                                      /*tlsAccess=*/std::nullopt,
                                      /*sehScopes=*/{},
                                      /*wideFloatSoftcallLibrary=*/std::nullopt, rep);

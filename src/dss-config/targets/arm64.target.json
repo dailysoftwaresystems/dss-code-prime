@@ -1649,6 +1649,34 @@
       }
     },
     {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-address materialization macro -- `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]`. Loads the RUN-TIME address of an undefined/preemptible extern (function OR data) OUT of a GOT slot the FINAL (foreign) linker synthesizes, so a foreign default-PIE link of the emitted relocatable `.o`/`.a` accepts it (an absolute ADRP+ADD page-pair against a symbol that may bind externally is rejected 'when making a shared object'). A DISTINCT MnemonicSlot (the `tlsbase` precedent), NOT a new `lea` variant -- a `lea` `[symbol]` variant would COLLIDE with the existing absolute ADRP+ADD `[symbol]` lea (ambiguous encoder match); MIR->LIR `lowerGlobalAddr`'s value-form arm emits THIS mnemonic explicitly (keyed on the capability-derived `externAddrGotSymbols_` set) for an `&extern` VALUE. word0 = ADRP Xd, sym@GOTPAGE (0x90000000=2415919104): Rd at bits 0..4 via resultSlot; immlo[30:29]+immhi[23:5] left ZERO -- the adr_got_page reloc (R_AARCH64_ADR_GOT_PAGE) patches the GOT-page delta. word1 = LDR Xd, [Xd, #:got_lo12:sym] (0xF9400000=4181721088, the 64-bit unsigned-offset LDR base shared with `load_u`'s width-64 word): Rt at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots -- the LDR reads the ADRP page-base register into itself); imm12[21:10] left ZERO -- the ld64_got_lo12 reloc (R_AARCH64_LD64_GOT_LO12_NC) patches the scaled slot offset. BYTE-STRUCTURE-IDENTICAL to the ADRP+ADD `lea` `[symbol]` variant (same resultSlot/extraResultSlots threading) except the 2nd word is an LDR (a load, not an add) and the two sym.patch wires carry the GOT relocs. DSS never APPLIES these relocs (the exec_reloc_apply kernel arm fail-loud-refuses); the foreign linker resolves the GOT slot.",
+      "mnemonic":      "lea_extern_got",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "fixedWords": [2415919104, 4181721088] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_got_page" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "ld64_got_lo12" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): integer compare writing the NZCV flags, no GPR result. AArch64 `CMP Xn, Xm` is an alias for `SUBS XZR, Xn, Xm` (subtract-and-set-flags discarding the result into the zero register). Fixed word 0xEB00001F = SUBS (sf=1, op=1, S=1) with Rd=31 (XZR) baked in; Rn at bits 5..9, Rm at bits 16..20. Mirrors x86's `cmp` LIR shape (InvalidLirReg result, 2 reg operands) — ML5 lowerICmp + lowerCondBr emit it before the conditional branch. NO resultSlot (the flags are the implicit output). Reuses the Rn/Rm slots already exercised by the add/sub reg-reg variants.",
       "mnemonic":      "cmp",
       "result":        "none",
@@ -2487,6 +2515,10 @@
     { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 },
     { "$comment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the local-exec thread-pointer-offset pair — the imm12 fields of the `lea` [reg, symbol] ADD/ADD macro. S = the SIGNED tpoff the walker bit-casts into symbolVa (arm64 Variant I ⇒ POSITIVE: alignUp(tcbHeaderBytes 16, p_align) + templateOffset). hi12 = (S+A)>>12 via the NEW Aarch64TprelAddHi12 formula — the pair's RANGE GATE ([0, 0xFFFFFF]; a silent wrap would address the wrong per-thread slot, audit LOW-d). lo12 = (S+A)&0xFFF — the SAME Aarch64AddAbsLo12 formula as add_abs_lo12_nc but a DISTINCT tls-flagged KIND row: the walker's CRIT-1 cross-check keys (target ∈ tlsSymbols) XOR (kind.tls) both directions, so reusing kind 3 for a tpoff patch would either reject loud (tls symbol under a non-tls kind) or — with the flag moved — mis-admit VA patches as tpoffs. `tls: true` is what marks the patched value a tpoff, not a VA.",
       "name": "tls-tprel-hi12",    "kind": 5, "formula": "aarch64_tprel_add_hi12", "tls": true },
-    { "name": "tls-tprel-lo12",    "kind": 6, "formula": "aarch64_add_abs_lo12",   "tls": true }
+    { "name": "tls-tprel-lo12",    "kind": 6, "formula": "aarch64_add_abs_lo12",   "tls": true },
+    { "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-page word of the `lea_extern_got` macro (ADRP of `:got:sym`). `aarch64_adr_got_page` is a REAL non-Linear RelocFormulaKind (so the ET_DYN slide-safe classifier does not mis-treat it as a Linear-absolute-in-.text fixup -- D-LK-DYN-TEXT-ABS-RELOC keys formulaKind==Linear) but DSS never APPLIES it: it is emitted ONLY into a foreign-linked relocatable object, and the `applyExecRelocations` kernel arm is an explicit fail-loud REFUSAL. Non-Linear => widthBytes auto-defaults to 4, pcRelative/addendBias must be absent (the ADRP is PC-relative BY CONSTRUCTION, encoded intrinsically). kind 7 matches both elf64-aarch64-linux{,-staticlib}.format.json's R_AARCH64_ADR_GOT_PAGE (nativeId 311).",
+      "name": "adr_got_page",     "kind": 7, "formula": "aarch64_adr_got_page" },
+    { "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-lo12 word of the `lea_extern_got` macro (LDR of `[x,:got_lo12:sym]`). Same foreign-linked-only / fail-loud-in-kernel discipline as adr_got_page. kind 8 matches both format siblings' R_AARCH64_LD64_GOT_LO12_NC (nativeId 312).",
+      "name": "ld64_got_lo12",    "kind": 8, "formula": "aarch64_ld64_got_lo12" }
   ]
 }

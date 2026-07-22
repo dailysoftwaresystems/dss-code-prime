@@ -467,6 +467,161 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
            "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
 }
 
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got` extern-address
+// format (arm64 ELF relocatable / static-archive member), taking the ADDRESS
+// of an undefined extern as a LIVE code-form VALUE (here `return &abs;` — a
+// function pointer value, NOT a call) must materialize through the arm64
+// GOT-address macro `lea_extern_got` (adrp:got: + ldr:got_lo12: →
+// R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC), NOT the absolute
+// ADRP+ADD `[symbol]` lea (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) a foreign
+// default-PIE link REJECTS ("may bind externally … when making a shared
+// object"). TWO-DIRECTIONAL: (1) the GOT macro IS emitted for the symbol AND
+// (2) NO absolute lea is. RED-ON-DISABLE: revert the `externAddrGotSymbols_`
+// routing arm in `lowerGlobalAddr` → the plain lea path re-emits the absolute
+// `[symbol]` lea (direction 2 fails) and the GOT macro vanishes (direction 1
+// fails). Always-on structural guard for the arm64 libsqlite3.a codegen
+// (runtime witness = the qemu-arm64 default-PIE gcc link of the abs .o).
+TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    // `void* f(void) { return &abs; }` — GlobalAddr(abs) used as a VALUE
+    // (its sole use is the Return, so neither the direct-call fold nor the
+    // riprel-load fold fires; the value-form GOT arm is reached).
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(callerSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    SymbolId const absSym{200};
+    MirInstId const ga = mb.addGlobalAddr(absSym, ptrT);  // &abs
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const leaOp = (*target)->opcodeByMnemonic("lea");
+    auto const gotOp = (*target)->opcodeByMnemonic("lea_extern_got");
+    ASSERT_TRUE(leaOp.has_value());
+    ASSERT_TRUE(gotOp.has_value())
+        << "arm64 must declare the lea_extern_got GOT-address macro (TF-C52).";
+
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = absSym;
+    ei.mangledName = "abs";
+    ei.libraryPath = "libc.so.6";
+    ei.isData      = false;  // a FUNCTION extern whose ADDRESS is taken
+    externs.push_back(ei);
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt,
+                           /*dataImportBinding=*/std::nullopt,
+                           /*tlsAccess=*/std::nullopt,
+                           /*sehScopes=*/{},
+                           /*wideFloatSoftcallLibrary=*/std::nullopt,
+                           /*externAddrBinding=*/ExternAddrBinding::Got);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGotForAbs = false, sawAbsoluteLeaForAbs = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        bool namesAbs = false;
+        for (auto const& o : ops) {
+            if (o.kind == LirOperandKind::SymbolRef && o.symbolV == absSym.v) {
+                namesAbs = true;
+            }
+        }
+        if (!namesAbs) continue;
+        if (op == *gotOp) sawGotForAbs = true;
+        if (op == *leaOp && ops.size() == 1
+            && ops[0].kind == LirOperandKind::SymbolRef) {
+            sawAbsoluteLeaForAbs = true;
+        }
+    }
+    // Direction 1: the GOT macro IS emitted for the address-taken extern.
+    EXPECT_TRUE(sawGotForAbs)
+        << "an &extern VALUE under a `got` format must materialize via the "
+           "lea_extern_got macro (adrp:got:+ldr:got_lo12:) — TF-C52.";
+    // Direction 2: NO absolute [symbol] lea is emitted for it (the reloc a
+    // foreign default-PIE link rejects).
+    EXPECT_FALSE(sawAbsoluteLeaForAbs)
+        << "the absolute ADRP+ADD [symbol] lea (ADR_PREL_PG_HI21 + "
+           "ADD_ABS_LO12_NC) must NOT be emitted for a GOT-address extern — a "
+           "foreign PIE link rejects it. RED-ON-DISABLE: revert the "
+           "externAddrGotSymbols_ routing arm → the absolute lea reappears.";
+}
+
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) NEUTRALITY: with NO
+// externAddrBinding declared (nullopt — the DSS-linked exec / x86_64 shape),
+// the SAME `&abs` value materializes via the ORDINARY absolute `[symbol]` lea
+// and NEVER the GOT macro. Pins that the GOT routing is gated STRICTLY on the
+// capability (nullopt ⇒ byte-identical to the pre-TF-C52 lowering) — a
+// regression that fired the GOT arm unconditionally would flip this red.
+TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(callerSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    SymbolId const absSym{200};
+    MirInstId const ga = mb.addGlobalAddr(absSym, ptrT);
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const leaOp = (*target)->opcodeByMnemonic("lea");
+    auto const gotOp = (*target)->opcodeByMnemonic("lea_extern_got");
+    ASSERT_TRUE(leaOp.has_value());
+    ASSERT_TRUE(gotOp.has_value());
+
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = absSym;
+    ei.mangledName = "abs";
+    ei.libraryPath = "libc.so.6";
+    ei.isData      = false;
+    externs.push_back(ei);
+    // externAddrBinding OMITTED (defaults to nullopt).
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGot = false, sawAbsoluteLea = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        bool namesAbs = false;
+        for (auto const& o : ops) {
+            if (o.kind == LirOperandKind::SymbolRef && o.symbolV == absSym.v) {
+                namesAbs = true;
+            }
+        }
+        if (!namesAbs) continue;
+        if (op == *gotOp) sawGot = true;
+        if (op == *leaOp && ops.size() == 1
+            && ops[0].kind == LirOperandKind::SymbolRef) {
+            sawAbsoluteLea = true;
+        }
+    }
+    EXPECT_TRUE(sawAbsoluteLea)
+        << "with no externAddrBinding the &extern value takes the ordinary "
+           "absolute [symbol] lea.";
+    EXPECT_FALSE(sawGot)
+        << "the GOT macro must NOT fire without externAddrBinding==Got "
+           "(capability-gated, not unconditional).";
+}
+
 // ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
 
 namespace {

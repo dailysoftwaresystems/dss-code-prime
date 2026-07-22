@@ -642,6 +642,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
         format.dataImportBinding(),
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): capture the format's
+        // extern-ADDRESS binding now, for the same reason (the LOWER half's
+        // MIR→LIR GlobalAddr value-form arm routes an `&extern` value
+        // through the arm64 GOT-address macro under `got`).
+        format.externAddrBinding(),
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): capture the format's thread-local
         // access block now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects the TLS access sequence; nullopt =
@@ -705,6 +710,12 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
                          std::optional<DataImportBinding>            dataImportBinding,
+                         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                         // format's extern-ADDRESS binding, threaded into
+                         // MIR→LIR exactly like dataImportBinding (nullopt =
+                         // this leg has no GOT-address model; an `&extern`
+                         // value takes the ordinary lea).
+                         std::optional<ExternAddrBinding>            externAddrBinding,
                          // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                          // thread-local access block, threaded into MIR→LIR
                          // exactly like dataImportBinding (nullopt = this leg
@@ -740,7 +751,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           dataImportBinding,
                           tlsAccess,
                           sehScopes,
-                          std::move(wideFloatSoftcallLibrary));
+                          std::move(wideFloatSoftcallLibrary),
+                          // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
+                          // trailing param on lowerToLir (positional-safe).
+                          externAddrBinding);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1331,6 +1345,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
+        cuMir.externAddrBinding,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
@@ -1359,6 +1374,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding, pre-resolved one
+                      // level up in program.cpp (same shape as
+                      // externCallDispatch / dataImportBinding).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       std::optional<TlsAccessInfo> tlsAccess,
                       std::vector<MirSehScope> sehScopes,
                       // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
@@ -1380,7 +1400,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, dataImportBinding, tlsAccess,
+        externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 

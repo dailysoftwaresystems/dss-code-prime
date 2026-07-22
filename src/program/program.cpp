@@ -756,6 +756,11 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      (*formatR)->dataImportBinding(),
+                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT
+                                     // (TF-C52): the format's extern-ADDRESS
+                                     // binding (`got` on arm64 relocatable /
+                                     // static-archive; nullopt elsewhere).
+                                     (*formatR)->externAddrBinding(),
                                      // TLS C1 (D-CSUBSET-THREAD-LOCAL): the
                                      // format's thread-local access block.
                                      (*formatR)->tlsAccess(),

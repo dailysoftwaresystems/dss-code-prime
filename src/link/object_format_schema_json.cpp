@@ -195,6 +195,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // model (copy relocations) is likewise an ELF/PE/Mach-O
             // dynamic-import notion — dead data on WASM/SPIR-V.
             "dataImportBinding",
+            // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the extern-
+            // ADDRESS materialization binding (GOT-slot page-pair) is
+            // likewise an ELF/PE/Mach-O native-image notion — dead data
+            // on WASM/SPIR-V (they reach imports format-natively).
+            "externAddrBinding",
             // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local access
             // model (segment-register / TEB / TLV descriptor) is an
             // ELF/PE/Mach-O native-image notion — dead data on
@@ -457,6 +462,37 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       s));
             } else {
                 data.dataImportBinding = *b;
+            }
+        }
+    }
+
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): `externAddrBinding`
+    // — the format's extern-ADDRESS materialization binding ("got").
+    // Optional in the JSON (only the arm64 relocatable + static-archive
+    // formats declare it; the DSS-linked exec/pie/dyn formats omit it and
+    // materialize an `&extern` value via the ordinary lea). Present-but-
+    // unknown IS a fail-loud HERE at load (a typo must NOT silently
+    // degrade to "no GOT-address support" — the externCallDispatch /
+    // dataImportBinding discipline).
+    if (doc.contains("externAddrBinding")) {
+        if (!doc.at("externAddrBinding").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/externAddrBinding",
+                      "'externAddrBinding' must be a string (\"got\")");
+        } else {
+            auto const s =
+                doc.at("externAddrBinding").get<std::string>();
+            auto const b = externAddrBindingFromName(s);
+            if (!b.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/externAddrBinding",
+                          std::format("unknown externAddrBinding '{}' "
+                                      "— accepted: \"got\" (ELF "
+                                      "relocatable GOT-slot address via "
+                                      "ADR_GOT_PAGE + LD64_GOT_LO12_NC)",
+                                      s));
+            } else {
+                data.externAddrBinding = *b;
             }
         }
     }

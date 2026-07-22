@@ -24,6 +24,9 @@
   "$externCallDispatchComment": "D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH (mirrors x86_64's D-LK-OBJECT-EXTERN-CALL-RELOCATABLE c141): extern FUNCTION calls in a RELOCATABLE object lower to a PLAIN DIRECT `BL` + a branch relocation against the UNDEFINED extern symbol — the SAME call-site shape as the arm64 exec `direct-plt`, except the FINAL (foreign) linker synthesizes the PLT/veneer and resolves the symbol, not DSS. So `direct-plt` is the right dispatch here too; the machine-NEUTRAL elf.cpp ET_REL writer emits the extern as an SHN_UNDEF `.symtab` entry + a `.rela.text` reloc rather than a DSS-synthesized stub. The undefined-extern CALL reloc is R_AARCH64_CALL26 (283) — and, UNLIKE x86_64 (which needs the PC32→PLT32 `pltNativeId` swap so a foreign `-pie` link routes through a linker PLT), AArch64 has NO distinct PLT-variant branch reloc: `R_AARCH64_CALL26` against an undefined symbol is exactly what gcc/clang emit for `bl printf` in a `.o`, and the linker inserts the veneer/PLT transparently. So the CALL26 reloc row deliberately carries NO `pltNativeId` (the writer emits its plain `nativeId` 283). The arm64 EXEC + macho-arm64-relocatable formats prove this `direct-plt`+CALL26-without-pltNativeId shape.",
   "externCallDispatch": "direct-plt",
 
+  "$externAddrBindingComment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): taking the ADDRESS of an undefined/preemptible extern (function OR data) as a LIVE code-form VALUE -- an argument, an automatic's initializer, a returned function pointer (NOT a call, NOT a static-data-item initializer) -- must materialize THROUGH a GOT slot the FINAL (foreign) linker synthesizes: arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,[x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). This relocatable `.o` is linked by a foreign DEFAULT-PIE toolchain (aarch64-linux-gnu-gcc with no -no-pie); an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) against a symbol that may bind externally is REJECTED ('relocation R_AARCH64_ADR_PREL_PG_HI21 against symbol ... which may bind externally can not be used when making a shared object'). sqlite3.c -> arm64 .o has 3 such residuals (dlsym / sqlite3_search_count / stdout). The GOT indirection is exactly what gcc/clang emit for `&extern` in a default-PIE `.o`. DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) and to the DSS-linked arm64 EXEC (it uses `dataImportBinding: copy-relocation` for data + a direct address for functions) and to the arm64 PIE/dyn formats (the c117 DSS-local __got slot) -- so ONLY the relocatable + static-archive formats declare it. Consumed by MIR->LIR `lowerGlobalAddr`'s value-form arm (keyed on the capability-derived symbol set, never a format/arch identity branch).",
+  "externAddrBinding": "got",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
     "class": "elf64",
@@ -150,6 +153,18 @@
       "name": "R_AARCH64_ABS64",
       "kind": 4,
       "nativeId": 257
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry page (ADRP of `:got:sym`). ELF type R_AARCH64_ADR_GOT_PAGE = 311. `kind` = 7 matches arm64.target.json's `adr_got_page` row (the ADRP word of the `lea_extern_got` macro). Emitted only into this relocatable object; the foreign linker synthesizes the GOT slot + patches the ADRP page-delta. DSS never applies it (the exec_reloc_apply kernel arm fail-loud-refuses).",
+      "name": "R_AARCH64_ADR_GOT_PAGE",
+      "kind": 7,
+      "nativeId": 311
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry low-12 scaled offset (LDR of `[x,:got_lo12:sym]`). ELF type R_AARCH64_LD64_GOT_LO12_NC = 312. `kind` = 8 matches arm64.target.json's `ld64_got_lo12` row (the LDR word of the `lea_extern_got` macro). Paired with R_AARCH64_ADR_GOT_PAGE against the same symbol; the foreign linker patches the scaled GOT-slot offset.",
+      "name": "R_AARCH64_LD64_GOT_LO12_NC",
+      "kind": 8,
+      "nativeId": 312
     }
   ]
 }

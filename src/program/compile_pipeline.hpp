@@ -270,6 +270,14 @@ struct DSS_EXPORT CuMirModule {
     // stdout) materializes its address (got-indirect → lea-of-slot + deref).
     // nullopt iff the format declared none (data imports fail loud at link).
     std::optional<DataImportBinding> dataImportBinding;
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the active object
+    // format's extern-ADDRESS materialization binding (`got`), captured
+    // here for the SAME reason as `dataImportBinding` — the LOWER half's
+    // MIR→LIR GlobalAddr value-form arm routes an `&extern` VALUE through
+    // the arm64 GOT-address macro from it. nullopt iff the format declared
+    // none (the ordinary lea — foreign-PIE-safe only for a DSS exec /
+    // x86_64).
+    std::optional<ExternAddrBinding> externAddrBinding;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the active object format's
     // thread-local access block, captured here for the SAME reason as
     // `dataImportBinding` — the LOWER half's MIR→LIR GlobalAddr lowering
@@ -380,6 +388,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding (nullopt = this leg
+                      // has no GOT-address model — an `&extern` value takes
+                      // the ordinary lea).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                       // thread-local access block (nullopt = this leg has
                       // no TLS machinery — MIR→LIR fails loud on a

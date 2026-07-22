@@ -394,6 +394,36 @@ namespace dss::link::format {
                     writeInst32(inst | bits);
                     break;
                 }
+                case RelocFormulaKind::Aarch64AdrGotPage:
+                case RelocFormulaKind::Aarch64Ld64GotLo12: {
+                    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                    // arm64 GOT-address macro's ADR_GOT_PAGE / LD64_GOT_-
+                    // LO12_NC relocs. These are emitted ONLY into an ELF
+                    // relocatable `.o` / static-archive member — an
+                    // artifact linked by a FOREIGN toolchain (gcc/clang),
+                    // which synthesizes the GOT slot and applies them.
+                    // DSS itself has NO apply consumer: the DSS-linked
+                    // EXEC path materializes an extern's address via
+                    // copy-relocation (data) / a direct address (fn); the
+                    // PIE/dyn path via the c117 DSS-local __got slot (the
+                    // Linear/AddAbsLo12 kernels). So reaching THIS kernel
+                    // with a GOT-address reloc means a DSS exec/dyn image
+                    // is somehow carrying a foreign-link-only reloc — a
+                    // bug. Fail LOUD; a silent S/A/P fabrication here would
+                    // patch a GOT-slot offset the DSS image has no slot
+                    // for (a wrong-address miscompile).
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         prefixStr + ": relocation '" + tri->name
+                             + "' is an arm64 GOT-address reloc "
+                               "(ADR_GOT_PAGE / LD64_GOT_LO12_NC) — DSS "
+                               "does not APPLY these; they are emitted only "
+                               "into a foreign-linked relocatable object "
+                               "and resolved by the final (gcc/clang) "
+                               "linker. Reaching the DSS reloc kernel with "
+                               "one is a bug "
+                               "(D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT).");
+                    return false;
+                }
             }
         }
     }

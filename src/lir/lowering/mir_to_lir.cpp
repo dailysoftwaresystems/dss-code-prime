@@ -350,6 +350,18 @@ enum class MnemonicSlot : std::uint8_t {
     //     st1←st1 OP st0 + pop (0 operands).
     //   FisttpM32 — DB /1 truncating store st0→m32int + pop (the FPToSI tail).
     FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32,
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 GOT-address
+    // macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]` that
+    // materializes an undefined-extern's address as a live code-form
+    // VALUE (so a foreign default-PIE link accepts the emitted `.o`). A
+    // DISTINCT slot (the `tlsbase` precedent), NOT a new `lea` variant — a
+    // `lea` `[symbol]` variant would collide with the absolute ADRP+ADD
+    // `[symbol]` lea. Declared ONLY by arm64 (its target.json `lea_extern_
+    // got` opcode); x86_64 declares none (its cache id stays nullopt), and
+    // an `&extern` value there is already a PIE-safe rel32 lea — the
+    // value-form arm keys on the capability-derived `externAddrGotSymbols_`
+    // set (never an arch/format identity), so x86_64 never reaches it.
+    LeaExternGot,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -470,6 +482,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FmulP,              "fmulp"},
     {MnemonicSlot::FdivP,              "fdivp"},
     {MnemonicSlot::FisttpM32,          "fisttp_m32"},
+    {MnemonicSlot::LeaExternGot,       "lea_extern_got"},  // TF-C52: arm64 GOT-address macro
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -723,6 +736,24 @@ struct Lowerer {
     std::optional<DataImportBinding> dataImportBinding_;
     std::unordered_set<std::uint32_t> externDataGotSymbols_;
 
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
+    // extern-ADDRESS binding + the derived set of extern SymbolIds whose
+    // ADDRESS (as a live code-form VALUE — an argument, an automatic's
+    // initializer, a returned function pointer) must materialize through
+    // a foreign-linker GOT slot (arm64 `adrp:got:` + `ldr:got_lo12:`)
+    // rather than an absolute page-pair lea. Populated at ctor as ALL
+    // extern imports (BOTH data AND function — `&abs` is a function whose
+    // address is taken) when the format declares `externAddrBinding ==
+    // Got`. Distinct from `externDataGotSymbols_` (the Mach-O DSS-local
+    // __got model, data-only): there the __got slot is DSS-bound + reached
+    // via lea+deref; HERE the FOREIGN linker owns the slot, reached via
+    // the arm64 GOT-page relocs of the `lea_extern_got` macro. The two
+    // are mutually exclusive by FORMAT (a format declares dataImportBinding
+    // OR externAddrBinding, never both), so their arms never contend.
+    // Empty for every non-`got` module ⇒ lowering byte-identical.
+    std::optional<ExternAddrBinding> externAddrBinding_;
+    std::unordered_set<std::uint32_t> externAddrGotSymbols_;
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE format's thread-local
     // access block + the ctor-populated set of THREAD-LOCAL SymbolIds
     // (module globals with `MirGlobal.isThreadLocal` + extern imports
@@ -861,6 +892,7 @@ struct Lowerer {
             std::span<ExternImport const> externImports,
             std::optional<ExternCallDispatch> externCallDispatch,
             std::optional<DataImportBinding> dataImportBinding,
+            std::optional<ExternAddrBinding> externAddrBinding,
             std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes,
             std::optional<std::string> wideFloatSoftcallLibrary)
@@ -869,6 +901,7 @@ struct Lowerer {
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
+          externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
@@ -888,6 +921,24 @@ struct Lowerer {
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
                 if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
+            }
+        }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
+        // extern-address format (arm64 ELF relocatable / static-archive
+        // member), an undefined extern's ADDRESS-as-a-VALUE must
+        // materialize through a foreign-linker GOT slot (the
+        // `lea_extern_got` macro), NOT an absolute page-pair lea a foreign
+        // default-PIE link would reject. Collect ALL extern imports —
+        // BOTH data AND function (`&abs` takes a function's address) —
+        // so `lowerGlobalAddr`'s value-form arm routes them (and the
+        // riprel fold is suppressed for them). Populated ONLY under Got;
+        // every other format leaves the set empty ⇒ lowering byte-
+        // identical. (A bare `&extern` used AS A CALLEE still folds to a
+        // plain BL — `globalAddrFoldsIntoDirectCall` runs BEFORE this
+        // arm; only the value/argument use reaches the GOT macro.)
+        if (externAddrBinding_ == ExternAddrBinding::Got) {
+            for (auto const& e : externImports) {
+                externAddrGotSymbols_.insert(e.symbol.v);
             }
         }
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): collect every THREAD-LOCAL
@@ -3900,6 +3951,20 @@ struct Lowerer {
         if (externDataGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
             return false;
         }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): a `got` extern-
+        // address symbol is NEVER foldable, mirroring the c117 arm above.
+        // Its GlobalAddr materializes the address by LOADING a foreign-
+        // linker GOT slot (the `lea_extern_got` adrp:got:+ldr:got_lo12:
+        // macro). Folding a C-level Load into it would collapse to ONE
+        // access returning the GOT slot CONTENTS where the code wanted the
+        // object's VALUE — off by one indirection (the same silent
+        // miscompile the c117 guard closes). On arm64 the GPR-load
+        // mnemonic declares no `[symbol]` riprel variant, so this fold
+        // never fires there anyway (see the comment above) — this guard is
+        // belt-and-braces parity for any target that later did.
+        if (externAddrGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
+            return false;
+        }
         // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5): a THREAD-LOCAL
         // symbol is NEVER foldable. Its address is tp + tpoff(sym) — the
         // walker stores the SIGNED tpoff (bit-cast) into symbolVa[sym],
@@ -4421,6 +4486,41 @@ struct Lowerer {
             // so a mis-typed GlobalAddr can never narrow the pointer load).
             emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
             defineValue(id, objectAddr);
+            return;
+        }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
+        // extern-address format (arm64 ELF relocatable / static-archive
+        // member), an undefined extern's ADDRESS as a live code-form VALUE
+        // materializes through a foreign-linker GOT slot — the arm64
+        // `lea_extern_got` macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:
+        // sym]` (R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC). A
+        // foreign default-PIE link accepts this where it REJECTS the plain
+        // absolute ADRP+ADD page-pair (`lea` below) against a preemptible
+        // symbol ("may bind externally … when making a shared object").
+        // This arm fires ONLY for the value/argument case: a bare `&extern`
+        // used AS A CALLEE already folded to a plain BL above
+        // (globalAddrFoldsIntoDirectCall, ordered BEFORE this — closure
+        // gate #7). ONE opcode emits BOTH words + BOTH GOT relocs; the
+        // foreign linker synthesizes the slot + resolves. The riprel fold
+        // is suppressed for `sym` (globalAddrRiprelFoldsIntoLoad returns
+        // false) so a C-level Load stays a distinct SECOND indirection
+        // (slot → object address → object value). A `got`-declaring format
+        // whose target lacks the macro fails LOUD — never a silent
+        // absolute page-pair a foreign PIE link rejects. The DSS-linked
+        // arm64 EXEC never reaches here (its format declares no
+        // externAddrBinding → the set is empty → the plain lea path, whose
+        // absolute page-pair the DSS linker resolves against a direct VA).
+        if (externAddrGotSymbols_.contains(sym.v)) {
+            auto const gotOp = opcode(MnemonicSlot::LeaExternGot);
+            if (!gotOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::LeaExternGot,
+                                    "MIR GlobalAddr (GOT-address extern value)");
+                return;
+            }
+            LirReg const addrReg = lir.newVReg(cls);
+            std::array<LirOperand, 1> gotOps{LirOperand::makeSymbolRef(sym.v)};
+            emitInst(*gotOp, addrReg, gotOps);
+            defineValue(id, addrReg);
             return;
         }
         LirReg const result = lir.newVReg(cls);
@@ -8057,7 +8157,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<DataImportBinding> dataImportBinding,
                           std::optional<TlsAccessInfo> tlsAccess,
                           std::span<MirSehScope const> sehScopes,
-                          std::optional<std::string> wideFloatSoftcallLibrary) {
+                          std::optional<std::string> wideFloatSoftcallLibrary,
+                          std::optional<ExternAddrBinding> externAddrBinding) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -8075,7 +8176,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // binds each minted extern to it; nullopt + an F128 softcall =
     // fail-loud (no unbound extern).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, dataImportBinding, tlsAccess, sehScopes,
+              externCallDispatch, dataImportBinding, externAddrBinding,
+              tlsAccess, sehScopes,
               std::move(wideFloatSoftcallLibrary)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
