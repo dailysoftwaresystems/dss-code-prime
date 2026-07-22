@@ -136,6 +136,34 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    STOP and report. Do not push.** Self-repair = a mechanical fix obvious from the failure
    (missing include, stale assertion, fold-induced break); if the red implies a design choice
    or reveals a real blocker, it is a **§B gate**, not a repair.
+7. **No un-anchored issue — every issue you come across is ANCHORED *and* HANDLED, never worked
+   around.** The moment a cycle *comes across* ANY issue — a bug, a silent-miscompile risk, a
+   build/gate/CI fragility, a flaky test, a stale doc, a missing guard, a surprising behavior —
+   it is **FORBIDDEN** to leave it un-anchored **or** to route past it with a workaround. This
+   holds **even when the issue is outside the current cycle's scope, and even when its proper
+   fix belongs to a later cycle.** "Not my cycle" / "I'll remember it" / "I excluded the failing
+   test" / "it passes on the other leg" / "green modulo X" is *precisely the trigger to anchor*,
+   never license to drop. Two obligations, BOTH mandatory, BOTH in **this** cycle:
+   - **(a) Anchor it now** — a real registry row in `_deferred-anchor-registry.md` (name +
+     what/why + trigger + closing-work), committed THIS cycle. A prose-only note in a commit
+     message, a chat reply, or a code comment is **NOT** an anchor: an un-anchored issue is
+     invisible to the next cycle, to the anchor guard, and to the plan sweep — so it *will* be
+     silently lost. (If the issue is a live `D-*` you must also cite it in `src`/config; if it is
+     purely infra/docs, the registry row alone suffices.)
+   - **(b) Address it properly** — **FIX it now** if it blocks the cycle's gate, is small, or is
+     within reach (default to fixing); **ELSE** pin it as a genuine **deferred anchor** with an
+     explicit trigger + closing-work (§F/§D) — a later cycle is legitimate ONLY behind a named
+     blocker or an unfired trigger. Either way it is *handled*: NEVER a silent skip, a masked
+     test exclusion, a swallowed error, or a "temporarily disabled" that no anchor tracks.
+   A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
+   on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —
+   it violates §A.2 (no workarounds) and §A.4 (fail loud) as well as this rule. **Motivating
+   catch:** the TF-C51 fat-archive gate hit a real GNU-on-Windows COFF `-Wa,-mbig-obj` scope gap
+   on an *unrelated* test TU (`test_mir_to_lir.cpp`, "file too big"); the first instinct —
+   exclude that test from the Windows leg — was a workaround. Correct handling per §A.7:
+   root-cause → anchor `D-BUILD-GNU-WINDOWS-BIGOBJ-SCOPE` → fix it (project-wide flag) → witness
+   the TU now builds+passes → commit. **An orthogonal issue you merely *found* is still yours to
+   anchor + handle** — the discovery is the obligation.
 
 ---
 
@@ -280,6 +308,11 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
+- **§A.7 issue-anchoring — nothing worked around.** Every issue this cycle *came across* — including
+  out-of-scope / later-cycle ones — is ANCHORED in the registry (this commit) **and** handled (fixed
+  now, or pinned as a deferred anchor with a trigger). If you excluded, disabled, skipped, or
+  "green-modulo"-ed ANYTHING to reach green, it MUST carry an anchor + a proper fix-or-defer decision;
+  a silent workaround is a gate failure, not a pass.
 
 **Any red the cycle cannot self-repair → STOP and report the blocker. Do not push broken.**
 Better to wake the user to "stopped at step N, here is the blocker" than to push something
