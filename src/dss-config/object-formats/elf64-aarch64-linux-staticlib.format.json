@@ -25,6 +25,10 @@
     "bss",
     "relro"
   ],
+
+  "$externCallDispatchComment": "D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH — MIRRORED from the `elf64-aarch64-linux` relocatable sibling (kept in hand-sync per this file's header): a staticlib member is a relocatable ET_REL object, so an extern FUNCTION call in a member lowers to a plain `BL` + an R_AARCH64_CALL26 (283) reloc against the SHN_UNDEF extern that the FINAL linker resolves. `direct-plt` is the dispatch; the CALL26 row carries NO `pltNativeId` (AArch64 has no distinct PLT-variant branch reloc — the linker inserts the veneer for an undefined CALL26 transparently). Without this a member that calls libc failed loud (L_RequiredLirOpcodeMissing), so an arm64 libsqlite3.a could not be built.",
+  "externCallDispatch": "direct-plt",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
     "class": "elf64",

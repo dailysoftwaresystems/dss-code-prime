@@ -3956,6 +3956,41 @@ struct Lowerer {
         return false;
     }
 
+    // D-ML7-2.9: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
+    // slot (operand[0] of a `Call`). `lowerCall` folds the callee's SymbolId
+    // straight into a direct branch (x86 `call rel32` / arm64 `bl` CALL26 + the
+    // undefined-extern reloc) and NEVER reads this GlobalAddr's LEA vreg — so the
+    // LEA is DEAD. Suppress it (skip `lowerGlobalAddr`'s lea emit, exactly like
+    // the riprel-load fold above, via the shared `foldedGlobalAddrs_` set).
+    //   - x86_64: the dead lea is a PIE-safe `rel32`; suppressing it is a pure
+    //     size win.
+    //   - arm64: the dead lea is `adrp`+`add` (absolute page + lo12) against the
+    //     callee. Against an UNDEFINED extern (a relocatable `.o`) those absolute
+    //     relocs are rejected by a foreign PIE link ("may bind externally … when
+    //     making a shared object"); without the lea the direct extern call is a
+    //     PLAIN `bl` (CALL26 only) that the foreign linker resolves via a veneer/
+    //     PLT — the correctness fix that unblocks a default-PIE arm64 `.o`/`.a`.
+    // SINGLE-USE is load-bearing (mirrors the riprel `count != 1` guard): the
+    // `:4655` fold routes the callee symbol into the direct branch EVEN WHEN the
+    // GlobalAddr has OTHER uses (a `&fn` value/argument), so without `count == 1`
+    // a still-needed lea would be dropped → a loud undefined-vreg fail in
+    // `regForValue`. Operand-position-0 excludes a `&fn` passed as an ARGUMENT
+    // (operand ≥ 1) of the call from being mistaken for the callee. TLS/GOT-data
+    // guards are unneeded: a function callee is never a TLS or extern-DATA symbol
+    // (see the `lowerCall` note at :4545).
+    [[nodiscard]] bool globalAddrFoldsIntoDirectCall(MirInstId gaId) {
+        auto const it = mirValueUses_.find(gaId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) {
+            return false;  // zero or multiple users — keep the lea
+        }
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::Call) return false;
+        auto const userOps = mir.instOperands(user);
+        // operand[0] is the callee slot; a GlobalAddr at operand ≥ 1 is a call
+        // ARGUMENT (`f(&g)`), not the callee — keep its lea.
+        return !userOps.empty() && userOps[0].v == gaId.v;
+    }
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm.
     // A thread-local symbol's "address" is per-thread: tp + tpoff(sym),
     // where tp is the thread-pointer register and tpoff is a LINK-TIME
@@ -4332,6 +4367,16 @@ struct Lowerer {
         // single-use guarantee means no other consumer can miss the
         // (never-defined) address vreg.
         if (globalAddrRiprelFoldsIntoLoad(id)) {
+            foldedGlobalAddrs_.insert(id.v);
+            return;
+        }
+        // D-ML7-2.9: the sole consumer is a DIRECT call's callee slot —
+        // `lowerCall` folds the symbol straight into the direct branch and never
+        // reads this lea's vreg, so emit NO lea (dead on every target; on arm64
+        // the absolute adrp+add against an undefined extern would also break a
+        // foreign PIE link). Same `foldedGlobalAddrs_` chokepoint as the riprel
+        // fold, so the (never-defined) address vreg can never be missed.
+        if (globalAddrFoldsIntoDirectCall(id)) {
             foldedGlobalAddrs_.insert(id.v);
             return;
         }

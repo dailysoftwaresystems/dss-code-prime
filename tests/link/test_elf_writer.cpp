@@ -393,6 +393,80 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
     EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
 }
 
+// ── D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH: arm64 undefined extern + CALL26 (no PLT variant) ──
+
+TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64) {
+    // The arm64 relocatable format now declares externCallDispatch=direct-plt — the
+    // sibling of x86_64's ObjectExternCallEmitsUndefImportNameAndPlt32Reloc — so an
+    // arm64 ET_REL object CAN carry an extern import (`bl printf` in a `.o` the FINAL
+    // linker resolves). The extern must appear as an SHN_UNDEF symbol with its real
+    // name; its BL call reloc must be R_AARCH64_CALL26 (283) — NOT a PLT-variant.
+    // AArch64 has no distinct PLT26 reloc: CALL26 against an undefined symbol is
+    // exactly what gcc/clang emit and the foreign linker inserts the veneer/PLT
+    // transparently — so the CALL26 row carries NO pltNativeId, and the writer emits
+    // its plain nativeId 283 (the pltNativeId==0 branch of the reloc-type selection).
+    // This locks in the "no pltNativeId is correct on arm64" decision against drift.
+    // RED-ON-DISABLE: remove externCallDispatch from elf64-aarch64-linux.format.json
+    // -> elf::encode rejects the ET_REL extern (K_FormatLacksImportSupport, errors>0).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0x00, 0x00, 0x00, 0x94};   // BL #0 (0x94000000 LE) → extern
+    caller.relocations.push_back(Relocation{/*offset=*/0u, /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},  // call26
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "caller",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "libc_fn";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "arm64 ET_REL with externCallDispatch must "
+                                       "accept an extern import";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.text");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << "arm64 .o with an extern call must emit .rela.text";
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const relaOff   = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+
+    // The .rela.text reloc: r_offset = 0 (the BL word), type = R_AARCH64_CALL26 (283),
+    // addend = 0 (arm64 branch is instruction-relative — no baked bias, unlike x86_64
+    // rel32's -4). Type 283, NOT a PLT variant, is the crux.
+    EXPECT_EQ(readU64LE(bytes, relaOff + 0), 0u) << "reloc r_offset = the BL word";
+    std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 283u)
+        << "arm64 extern-call reloc must be R_AARCH64_CALL26 (283), not a PLT variant "
+           "(AArch64 has none — the CALL26 row carries no pltNativeId)";
+    std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
+    EXPECT_EQ(addend, 0) << "arm64 CALL26 addend = 0 (no baked bias)";
+
+    // That reloc names the SHN_UNDEF extern carrying its real import name.
+    std::uint32_t const relSymIdx = static_cast<std::uint32_t>(rInfo >> 32);
+    std::uint32_t const extStName = readU32LE(bytes, symtabOff + relSymIdx * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, extStName), "libc_fn")
+        << "undefined extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 0u)   // st_shndx
+        << "extern must be SHN_UNDEF";
+}
+
 // ── D-LK-OBJECT-DATA-EXTERN-RELOCATABLE: data extern → PC32, not PLT32 ──
 
 TEST(ElfWriter, ObjectDataExternRefEmitsUndefNameAndPc32NotPlt32) {

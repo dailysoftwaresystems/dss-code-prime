@@ -3124,18 +3124,17 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
 
     auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
-    // D-LK4-RODATA-PRODUCER (2026-06-02): GlobalAddr now lowers to
-    // `lea result, SymbolRef` (RIP-relative form) instead of the
-    // prior `mov result, SymbolRef`. The lea encoding has a real
-    // 1-operand variant on the assembler side; the prior `mov`
-    // shape tripped `A_NoMatchingEncodingVariant` at assemble time
-    // for any non-call-peepholed use of a GlobalAddr.
-    // The 2nd function `g` must contain:
-    //   - lea result, symbolRef(f)   ← GlobalAddr(f)
-    //   - call calleeReg, argReg     ← the actual Call
+    // D-ML7-2.9 (dead-callee-LEA suppression): a DIRECT call's callee is modeled
+    // as a standalone GlobalAddr(f). `lowerCall` folds f's SymbolId straight into
+    // the `call` (a SymbolRef operand) and NEVER reads the GlobalAddr's lea vreg,
+    // so `globalAddrFoldsIntoDirectCall` now SUPPRESSES that lea (previously it was
+    // emitted and immediately abandoned — a dead def whose bytes + relocs survived
+    // to the object; on arm64 those were an absolute adrp+add that broke a foreign
+    // PIE link against an undefined extern). So `g` must contain the `call` with
+    // the callee folded in, and NO `lea result, symbolRef(f)`.
     LirFuncId const gFn = lir.funcAt(1);
     LirBlockId const entry = lir.funcEntry(gFn);
-    bool foundGlobalAddrLea = false, foundCall = false;
+    bool foundGlobalAddrLea = false, foundCall = false, callFoldsCalleeSymbol = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         auto const op = lir.instOpcode(inst);
@@ -3145,13 +3144,21 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
                 foundGlobalAddrLea = true;
             }
         }
-        if (op == callOp) foundCall = true;
+        if (op == callOp) {
+            foundCall = true;
+            for (auto const& o : lir.instOperands(inst)) {
+                if (o.kind == LirOperandKind::SymbolRef) callFoldsCalleeSymbol = true;
+            }
+        }
     }
-    EXPECT_TRUE(foundGlobalAddrLea)
-        << "GlobalAddr must emit `lea result, symbolRef(symId)` "
-           "(RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02)";
-    EXPECT_TRUE(foundCall)
-        << "Call must emit the `call` opcode";
+    // RED-ON-DISABLE: revert `globalAddrFoldsIntoDirectCall` → the dead callee lea
+    // reappears → this EXPECT_FALSE fails.
+    EXPECT_FALSE(foundGlobalAddrLea)
+        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-ML7-2.9) — "
+           "lowerCall folds the symbol straight into the direct call";
+    EXPECT_TRUE(foundCall) << "Call must emit the `call` opcode";
+    EXPECT_TRUE(callFoldsCalleeSymbol)
+        << "the direct call folds the callee symbol into a SymbolRef operand";
 }
 
 // ── D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold opcode-selection pins ─
