@@ -450,6 +450,31 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
 
+// The members extracted from one-or-more input static archives (parallel):
+// `modules[i]` is a mergeable relocatable object, `names[i]` its `ar` file name.
+struct ExtractedArchiveMembers {
+    std::vector<AssembledModule> modules;
+    std::vector<std::string>     names;   // parallel to `modules`
+};
+
+// Extract EVERY member of each input static `ar` archive (whole-archive), each
+// parsed into a mergeable `AssembledModule` via the same per-format reader the
+// lazy pull uses. Unlike `pullStaticArchiveMembers` (which pulls only the
+// referenced members for an exe/final LINK), this carries ALL members -- a
+// static LIBRARY is a package: a DOWNSTREAM link must be able to pull any of
+// them, so dropping an unreferenced member would silently ship an incomplete
+// library. This is how a merged/"fat" static library bundles the input archives
+// it was handed (D-FF1-STATICLIB-FAT-ARCHIVE): the driver appends these to its
+// own CU-derived members before `linkAndWriteStaticArchive`. Returns `nullopt`
+// (fail loud via `reporter`) on any file-open / archive-parse / member-read
+// failure -- never a silent member omission. An empty `archivePaths` yields an
+// empty result (a valid no-op).
+[[nodiscard]] DSS_EXPORT std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter);
+
 // Link `clientModule` against zero-or-more static `ar` archives, then write the
 // image to `outPath`. When `staticArchives` is empty this is exactly
 // `linkAndWrite({clientModule})` (byte-identical to the pre-c165 path). Otherwise

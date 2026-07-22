@@ -1431,6 +1431,52 @@ bool isArArchiveFile(std::filesystem::path const& path) {
     return true;
 }
 
+// Parse ONE `ar` member's raw bytes back into a mergeable `AssembledModule`,
+// dispatching to the per-FORMAT relocatable-object reader by the object-format
+// KIND (the closed-enum agnostic axis, never a format-name branch). A fresh,
+// process-unique CompilationUnitId is minted per member (the merge keys its
+// symbol index by (cuId, SymbolId), so a member must never share a cuId with the
+// client or another member -- the monotonic minter never repeats). A format whose
+// kind has no reader arm fails loud rather than silently mis-parsing a member with
+// the wrong reader. Consuming the reader's `optional` is the read-success signal
+// -- NOT `module.ok()`, which is a tautology for reader output AND false for a
+// data-only member (see elf_object_reader.hpp). THE single member-read chokepoint
+// shared by BOTH the lazy reference-driven pull (`pullStaticArchiveMembers`, the
+// exe/final-link path) AND the whole-archive extraction (`extractStaticArchive-
+// Members`, the fat-static-library path) -- so a new object format lights up for
+// both by construction (the §A.5 multi-site funnel).
+[[nodiscard]] static std::optional<AssembledModule>
+readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
+                        TargetSchema const&           target,
+                        ObjectFormatSchema const&     format,
+                        DiagnosticReporter&           reporter) {
+    CompilationUnitId const memberCu =
+        substrate::mintMonotonicId<CompilationUnitId>();
+    switch (format.kind()) {
+        case ObjectFormatKind::Elf:
+            return elf::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::MachO:
+            return macho::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::Pe:
+            return pe::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        default: {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "archive member reader: object format '{}' (kind {}) has no "
+                "relocatable-object reader -- cannot pull archive members for "
+                "this format.",
+                format.name(), objectFormatKindName(format.kind()));
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+    }
+}
+
 std::optional<std::vector<AssembledModule>>
 pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          std::span<std::filesystem::path const> archivePaths,
@@ -1520,46 +1566,11 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
             archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
             static_cast<std::size_t>(member.size)};
 
-        // Fresh, process-unique CompilationUnitId per member: the merge keys its
-        // symbol index by (cuId, SymbolId), so a member must never share a cuId
-        // with the client or another member (the monotonic minter never repeats).
-        CompilationUnitId const memberCu =
-            substrate::mintMonotonicId<CompilationUnitId>();
-        // Dispatch the member read by the format's object-format KIND -- the
-        // relocatable-object reader is per-format (ELF ET_REL c164 / Mach-O
-        // MH_OBJECT c168). A format with no reader arm fails loud rather than
-        // silently mis-parsing a member with the wrong reader (agnostic:
-        // switch on the schema-declared kind, never a format-name branch).
-        std::optional<AssembledModule> member_mod;
-        switch (format.kind()) {
-            case ObjectFormatKind::Elf:
-                member_mod = elf::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::MachO:
-                member_mod = macho::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::Pe:
-                member_mod = pe::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            default: {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "static-link member reader: object format '{}' (kind {}) "
-                    "has no relocatable-object reader -- cannot pull archive "
-                    "members for this format.",
-                    format.name(), objectFormatKindName(format.kind()));
-                reporter.report(std::move(d));
-                return std::nullopt;
-            }
-        }
-        // Consume the reader's optional as the read-success signal -- NOT
-        // `ok()`, which is a tautology for reader output AND false for a
-        // data-only member (see elf_object_reader.hpp).
+        // Parse the member back into a mergeable module via the shared
+        // per-format reader chokepoint (fresh cuId minted inside; a format
+        // with no reader arm fails loud there).
+        auto member_mod =
+            readArchiveMemberModule(memberBytes, target, format, reporter);
         if (!member_mod) return std::nullopt;   // member-read fail-loud
 
         // A pulled member's externally-visible definitions satisfy later
@@ -1576,6 +1587,57 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         pulled.push_back(std::move(*member_mod));
     }
     return pulled;
+}
+
+std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter) {
+    ExtractedArchiveMembers out;
+    for (auto const& archivePath : archivePaths) {
+        std::ifstream in(archivePath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "fat-archive: failed to open input static archive '{}' for "
+                "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
+                archivePath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = ffi::readArArchive(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+            archivePath.filename().string(), reporter);
+        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+
+        // EVERY member, in archive order -- a static LIBRARY packages all of its
+        // objects (unlike the LAZY referenced-subset the exe/final-link path
+        // pulls): a downstream link against this library must be able to pull
+        // ANY member, so dropping an unreferenced one would silently ship an
+        // incomplete library. The member name (long-name-expanded by the reader)
+        // is carried verbatim -- cosmetic (the armap selects members by index),
+        // and `ar` permits duplicate member names; a rare empty name (never from
+        // a well-formed archive) is synthesized so the writer's name belt holds.
+        for (auto const& member : arch->members) {
+            std::span<std::uint8_t const> const memberBytes{
+                bytes.data() + static_cast<std::size_t>(member.dataOffset),
+                static_cast<std::size_t>(member.size)};
+            auto member_mod =
+                readArchiveMemberModule(memberBytes, target, format, reporter);
+            if (!member_mod) return std::nullopt;   // member-read fail-loud
+            out.modules.push_back(std::move(*member_mod));
+            out.names.push_back(
+                member.name.empty()
+                    ? ("member_" + std::to_string(out.names.size()) + ".o")
+                    : member.name);
+        }
+    }
+    return out;
 }
 
 bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,

@@ -500,26 +500,6 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        // Bundling INPUT static archives' members into this new library (a
-        // merged "fat" archive) is unbuilt — fail loud rather than silently
-        // omit them. Dynamic `--resolve-library` libs stayed on the per-CU
-        // FFI path (a member MAY reference libc externs — resolved at the
-        // FINAL link against the library, not here).
-        if (!staticArchives.empty()) {
-            std::string names;
-            for (auto const& a : staticArchives) {
-                if (!names.empty()) names += ", ";
-                names += a.generic_string();
-            }
-            emitDriver(reporter, DiagnosticCode::D_StaticLibFatArchiveUnsupported,
-                       "building a static library (container: archive) does not "
-                       "yet bundle input `--resolve-library` static archives into "
-                       "the output (a merged/\"fat\" archive is the unbuilt "
-                       "D-FF1-STATICLIB-FAT-ARCHIVE): " + names
-                       + ". Remove the static archive(s), or link them at the "
-                         "FINAL image build instead.");
-            return false;
-        }
         std::string const memberExt =
             (*formatR)->kind() == ObjectFormatKind::Pe ? ".obj" : ".o";
         std::vector<AssembledModule> members;
@@ -539,6 +519,31 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                 cuMirs.size() == 1
                     ? std::string{sourceStem} + memberExt
                     : std::string{sourceStem} + "_" + std::to_string(i) + memberExt);
+        }
+        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
+        // When this static-library build is also handed INPUT `--resolve-library`
+        // static archives, bundle EVERY member of each INTO this library (a
+        // merged/"fat" archive, à la `libtool -static`). A static library
+        // PACKAGES objects, so all members are carried — NOT the lazy
+        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
+        // link against this library must be able to pull any of them (dropping an
+        // unreferenced member would silently ship an incomplete library). Dynamic
+        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
+        // reference libc externs, resolved at the FINAL link against this
+        // library). Fails loud on any open / parse / member-read error (never a
+        // silent member omission). CU-derived members lead; the input archives'
+        // members follow.
+        if (!staticArchives.empty()) {
+            auto extracted = extractStaticArchiveMembers(
+                std::span<std::filesystem::path const>{staticArchives},
+                **targetR, **formatR, reporter);
+            if (!extracted) return false;  // fail-loud already reported
+            members.reserve(members.size() + extracted->modules.size());
+            memberNames.reserve(memberNames.size() + extracted->names.size());
+            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
+                members.push_back(std::move(extracted->modules[i]));
+                memberNames.push_back(std::move(extracted->names[i]));
+            }
         }
         return linkAndWriteStaticArchive(members, memberNames,
                                          **targetR, **formatR, outPath, reporter);
