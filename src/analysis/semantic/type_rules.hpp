@@ -211,7 +211,20 @@ namespace detail::type_rules {
     bool                                               floatConvertsToInt = false,
     bool                                               charArrayFromStringLiteralInit = false,
     bool                                               bitIntConversions = false,
-    bool                                               scalarConvertsToBool = false) noexcept {
+    bool                                               scalarConvertsToBool = false,
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
+    // `Ptr<B>` where BOTH pointees A,B are integer kinds AND
+    // `interner.sameRepresentation(A,B)` — the shipped-FFI-descriptor abstract
+    // width-based `ptr<i64>` accepting a real C `long long*`/`sqlite3_int64*`/
+    // `long*`(LP64) whose pointee is same-REPRESENTATION but distinct-IDENTITY (the
+    // `_Generic`-splitting NAME differs; the bits do not). Passed `true` ONLY by
+    // `checkCallAgainstSig` at a shipped-descriptor DIRECT call-arg (the boundary the
+    // config gate scopes it to — never native C-to-C, never init/assign/return, never
+    // the fn-pointer/indirect paths). Per-target by construction: on LLP64 `long` is
+    // I32 so `long*` vs `ptr<i64>` FAILS `sameRepresentation`'s kind axis → still
+    // rejected, NO format branch. Identity is UNTOUCHED — this is a COMPAT admission
+    // that the coerce() Ptr→Ptr bitcast realizes, never a TypeId merge.
+    bool                                               ffiDescriptorPointeeIntCompat = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -579,7 +592,40 @@ namespace detail::type_rules {
             // BOTH void: caught by sameType() above (Ptr<Void> ==
             // Ptr<Void> via interning). NEITHER void: distinct typed
             // pointers; fall through to the strict-reject default
-            // below (Ptr<int> → Ptr<float> is NOT implicit).
+            // below (Ptr<int> → Ptr<float> is NOT implicit) — UNLESS the
+            // shipped-descriptor integer-pointee relaxation below admits it.
+        }
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
+        // call-arg boundary ONLY (the sole caller passing this flag true — never
+        // native C-to-C, never init/assign/return), a descriptor's abstract width-
+        // based integer-pointee param (`ptr<i64>`, …) accepts a real C integer
+        // pointer whose pointee is the SAME representation (`long long*` /
+        // `sqlite3_int64*` / `long*`-on-LP64) — the ABI-identical match gcc admits.
+        // Predicate = BOTH pointees are integer kinds (size ∧ signedness ∧ integer-
+        // base-kind, via signedIntRank/unsignedIntRank) AND `sameRepresentation`
+        // (compares kind ∧ extensionKind ∧ operands ∧ scalars, NOT the identity
+        // NAME) — attribute-driven, NO `if(type==long long)`. Per-target by
+        // construction: on LLP64/pe64 `long` is I32, so `long*` vs `ptr<i64>` FAILS
+        // sameRepresentation's kind axis → still rejected, with NO format branch
+        // (Condition 6). A `_BitInt(64)*` fails the extensionKind axis; an
+        // `unsigned long long*` / `double*` / `enum E*` fail the kind/base-kind axes.
+        // Identity is UNTOUCHED — a COMPAT admission the coerce() Ptr→Ptr bitcast
+        // realizes, never a TypeId merge (Condition 1); `_Generic(long:,long long:)`
+        // still distinguishes. Cf. TF-C15/C16/C32 pointer-compat-policy notes +
+        // D-LANG-TYPE-IDENTITY-VOCABULARY / LD-5 (identity nominal).
+        if (ffiDescriptorPointeeIntCompat
+            && !lhsElem.empty() && !rhsElem.empty()) {
+            auto const lpk = interner.kind(lhsElem[0]);
+            auto const rpk = interner.kind(rhsElem[0]);
+            bool const bothInt =
+                (detail::type_rules::signedIntRank(lpk)
+                 || detail::type_rules::unsignedIntRank(lpk))
+                && (detail::type_rules::signedIntRank(rpk)
+                    || detail::type_rules::unsignedIntRank(rpk));
+            if (bothInt
+                && interner.sameRepresentation(lhsElem[0], rhsElem[0])) {
+                return true;
+            }
         }
     }
     // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant

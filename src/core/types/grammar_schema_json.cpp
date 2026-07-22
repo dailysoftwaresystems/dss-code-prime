@@ -9500,8 +9500,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "optional `implicitToVoidPtr`, "
                               "`implicitFromVoidPtr`, "
                               "`nullPointerConstantFromIntegerZero`, "
-                              "`nullPointerConstantFromNullptrT`, and "
-                              "`allowVoidPtrFnConvert` boolean fields");
+                              "`nullPointerConstantFromNullptrT`, "
+                              "`allowVoidPtrFnConvert`, and "
+                              "`ffiDescriptorIntPointeeCompat` boolean fields");
                 } else {
                     auto readBool = [&](char const* field, bool& out) {
                         if (!obj.contains(field)) return;
@@ -9533,6 +9534,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // idiom). Default false = ISO-strict; c-subset opts in.
                     readBool("allowVoidPtrFnConvert",
                              cfg.pointerConversions.allowVoidPtrFnConvert);
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-FFI-
+                    // descriptor call-arg boundary, admit a real C integer pointer
+                    // into a same-representation descriptor `ptr<i64>`-style param.
+                    // Default false = ISO-strict; c-subset opts in.
+                    readBool("ffiDescriptorIntPointeeCompat",
+                             cfg.pointerConversions.ffiDescriptorIntPointeeCompat);
                     // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
                     // constant at the HIR tier (Fix 1(a)), so its HIR realization
                     // (coerce→Ptr / ternary / condition) REUSES the integer-0
@@ -9567,7 +9574,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             k != "implicitFromVoidPtr" &&
                             k != "nullPointerConstantFromIntegerZero" &&
                             k != "nullPointerConstantFromNullptrT" &&
-                            k != "allowVoidPtrFnConvert") {
+                            k != "allowVoidPtrFnConvert" &&
+                            k != "ffiDescriptorIntPointeeCompat") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",
@@ -9578,8 +9586,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "'implicitToVoidPtr', "
                                           "'implicitFromVoidPtr', "
                                           "'nullPointerConstantFromIntegerZero', "
-                                          "'nullPointerConstantFromNullptrT', or "
-                                          "'allowVoidPtrFnConvert'",
+                                          "'nullPointerConstantFromNullptrT', "
+                                          "'allowVoidPtrFnConvert', or "
+                                          "'ffiDescriptorIntPointeeCompat'",
                                           k));
                         }
                     }

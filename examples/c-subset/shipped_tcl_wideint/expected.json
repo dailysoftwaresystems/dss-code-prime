@@ -1,0 +1,14 @@
+{
+  "$comment": "D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (SQLite testfixture arc, TF-C41): RUN witness for the shipped-FFI-descriptor integer-pointee call-arg relaxation. tcl.json models `Tcl_GetWideIntFromObj(Tcl_Interp*, Tcl_Obj*, Tcl_WideInt*)` as `fn(..., ptr<i64>) -> i32` (an abstract width-based pointee). The testfixture calls it as `Tcl_GetWideIntFromObj(interp, obj, &iVal)` with `iVal` a Tcl_WideInt/sqlite3_int64 (typedef long long) -- pre-change DSS rejected the `long long*` arg S0003 (distinct IDENTITY, same REPRESENTATION on LP64; gcc accepts). The relaxation admits the same-representation integer pointer at the shipped-descriptor CALL-ARG boundary ONLY, and libtcl fills the caller's wide int. Here `Tcl_Eval(\"expr 20 + 22\")` yields a wide-int result and `Tcl_GetWideIntFromObj(ip, res, &wide)` has libtcl write 42 into `wide` (sqlite3_int64* into ptr<i64>); the return IS that libtcl-filled value -- value-divergent. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 runs it (libtcl8.6). RED-ON-DISABLE: set pointerConversions.ffiDescriptorIntPointeeCompat=false in c-subset.lang.json -> the &wide argument raises S0003 -> stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-wideint-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-wideint-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -37,6 +37,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -53,6 +54,8 @@
 
 using namespace dss;
 using namespace dss::sem_test;
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
 
 namespace {
 
@@ -180,6 +183,68 @@ constexpr ModelAxis kLlp64{DataModel::Llp64, ObjectFormatKind::Pe, "x86_64",
     std::ifstream in{findShippedSourceConfig(), std::ios::binary};
     EXPECT_TRUE(in.good());
     return nlohmann::json::parse(in);
+}
+
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: a PORTABLE scratch shipped descriptor
+// modeling the `Tcl_GetWideIntFromObj` shape — a function whose pointer parameter
+// is the abstract width-based `ptr<i64>` (NOT `long long*`; the descriptor `i64`
+// is the ANONYMOUS I64, distinct-IDENTITY from every named C `long`/`long long`),
+// plus a `fn() -> ptr<i64>` so a `ptr<i64>` rvalue can be produced for the
+// init/assign/return boundary pins. Written into a caller-owned scratch system dir
+// and reached via `#include <ffiwide.h>`.
+constexpr char const* kFfiWideDescriptorJson = R"JSON({
+  "header": "ffiwide.h",
+  "library": { "pe": "scratchffi.dll", "elf": "libscratchffi.so.1", "macho": "/usr/lib/libscratchffi.dylib" },
+  "symbols": [
+    { "name": "ffi_take_wide", "signature": "fn(ptr<i64>) -> void", "kind": "function", "linkage": "external" },
+    { "name": "ffi_wide_ptr",  "signature": "fn() -> ptr<i64>",     "kind": "function", "linkage": "external" }
+  ]
+})JSON";
+
+// Analyze `mainSrc` against `kFfiWideDescriptorJson` (written into `sysDir`) under
+// the axis `ax`. `flagOn` selects the SHIPPED schema (relaxation enabled) vs a
+// perturbed copy with `pointerConversions.ffiDescriptorIntPointeeCompat=false` —
+// the config red-on-disable axis (the `analyzeWithOverride` perturbation idiom).
+// The ScratchDir must outlive the returned model (the semantic phase reads the
+// descriptor file), so the caller owns it.
+[[nodiscard]] SemanticModel analyzeFfiWide(ScratchDir const& sysDir,
+                                           std::string const& mainSrc,
+                                           ModelAxis ax, bool flagOn = true) {
+    std::ofstream(sysDir.path() / "ffiwide.json", std::ios::binary)
+        << kFfiWideDescriptorJson;
+    auto build = [&](auto const& schema) {
+        UnitBuilder builder{schema};
+        builder.addSystemDir(sysDir.path());
+        builder.setActiveFormat(ax.fmt);
+        builder.addInMemory(mainSrc, "main.c");
+        auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+        assertNoBuilderErrors(*cu);
+        return analyze(cu, ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
+    };
+    if (flagOn) return build(loadShippedSchema("c-subset"));
+    nlohmann::json doc = loadShippedCSubsetJson();
+    doc["semantics"]["pointerConversions"]["ffiDescriptorIntPointeeCompat"] = false;
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<ffi-wide-flag-off>");
+    EXPECT_TRUE(schema.has_value());
+    return build(*schema);
+}
+
+// The pointee TypeId of the injected `ffi_take_wide`'s first parameter (the
+// descriptor `i64`) — for the identity witness (it must NEVER be the same TypeId
+// as a named C `long`/`long long`, only the same REPRESENTATION).
+[[nodiscard]] TypeId ffiTakeWideParamPointee(SemanticModel const& m) {
+    auto const& in = m.lattice().interner();
+    for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+        if (m.symbols()[i].name != "ffi_take_wide") continue;
+        TypeId const fnTy = m.symbols()[i].type;
+        if (!fnTy.valid() || in.kind(fnTy) != TypeKind::FnSig) break;
+        if (in.fnParams(fnTy).empty()) break;
+        TypeId const p0 = in.fnParams(fnTy)[0];
+        if (in.kind(p0) != TypeKind::Ptr) break;
+        return in.operands(p0)[0];
+    }
+    ADD_FAILURE() << "ffi_take_wide not injected as fn(ptr<i64>)";
+    return InvalidType;
 }
 
 // Perturb the shipped `typeSpecifiers` rows and report whether the schema still
@@ -805,6 +870,152 @@ TEST(TypeIdentityVocabulary, WindowsDwordPointerIsUnsignedLongPointer) {
     EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
         << "`unsigned int *` is NOT `DWORD *` — both are u32, and that is "
            "exactly the collapse this change undoes";
+}
+
+// ── D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT ────────────────────────────────
+//
+// A shipped-FFI-descriptor `ptr<i64>` parameter accepts a real C integer pointer
+// of the SAME representation (size ∧ signedness ∧ integer-base-kind) AT THE
+// CALL-ARG BOUNDARY ONLY. Every pin is red-on-disable and scoped: the relaxation
+// admits ONLY a same-representation integer pointer, ONLY at a direct
+// shipped-descriptor call arg, ONLY with the config flag on, and NEVER merges the
+// distinct type identities.
+
+// POSITIVE: `ptr<i64>` accepts `long long*`, a `typedef long long` (the
+// sqlite3_int64 shape), AND `long*` on LP64 (where `long` is I64) — no S0003. And
+// the IDENTITY WITNESS: the admission is a COMPAT match, never a TypeId merge.
+TEST(TypeIdentityVocabulary,
+     FfiDescriptorIntPointeeAdmitsWideIntPointerAtShippedCallArg) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-pos"};
+    std::string const src =
+        "#include <ffiwide.h>\n"
+        "typedef long long sqlite3_int64;\n"
+        "int f(void){\n"
+        "  long long a = 0;     ffi_take_wide(&a);\n"   // long long*  -> ptr<i64>
+        "  sqlite3_int64 b = 0; ffi_take_wide(&b);\n"   // (typedef)*  -> ptr<i64>
+        "  long c = 0;          ffi_take_wide(&c);\n"   // long* (I64 on LP64)
+        "  return (int)(a + b + c); }\n";
+    auto m = analyzeFfiWide(sysDir, src, kLp64);
+    EXPECT_FALSE(m.hasErrors())
+        << "a same-representation integer pointer IS the `ptr<i64>` parameter on LP64";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+
+    // Condition 1: the descriptor `i64` pointee is a DISTINCT TypeId from the
+    // named C `long long` — same REPRESENTATION only (never a merge).
+    auto const& in = m.lattice().interner();
+    TypeId const paramPointee = ffiTakeWideParamPointee(m);
+    TypeId const argPointee   = typeOf(m, "a");   // `long long`
+    ASSERT_TRUE(paramPointee.valid() && argPointee.valid());
+    EXPECT_NE(paramPointee.v, argPointee.v)
+        << "the descriptor `ptr<i64>` pointee must NOT be merged with named `long long`";
+    EXPECT_TRUE(in.sameRepresentation(paramPointee, argPointee))
+        << "... it is admitted purely because the REPRESENTATION matches";
+    EXPECT_EQ(std::string{in.vocabularyName(paramPointee)}, "")
+        << "the descriptor pointee is the ANONYMOUS i64, never a named vocabulary entry";
+    EXPECT_EQ(vocabOf(m, "a"), "long long");
+}
+
+// PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*`
+// REFUSES the `ptr<i64>` parameter — emergent from the data model's `kind`, with
+// no format branch. `long long*` (I64 on both models) is still admitted.
+TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeePerTargetRefusesLongUnderLlp64) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-llp64"};
+    auto bad = analyzeFfiWide(sysDir,
+        "#include <ffiwide.h>\n"
+        "int f(void){ long c = 0; ffi_take_wide(&c); return 0; }\n",
+        kLlp64);
+    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "`long` is 32-bit under LLP64, so `long*` is NOT `ptr<i64>` — still S0003, "
+           "with no format branch (sameRepresentation's kind axis decides)";
+
+    auto ok = analyzeFfiWide(sysDir,
+        "#include <ffiwide.h>\n"
+        "int f(void){ long long a = 0; ffi_take_wide(&a); return 0; }\n",
+        kLlp64);
+    EXPECT_FALSE(ok.hasErrors())
+        << "`long long` is 64-bit on every model — its pointer is the parameter";
+    EXPECT_EQ(countCode(ok.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// PREDICATE NEGATIVES at the shipped boundary (flag on, calleeIsShippedFfi true):
+// the relaxation admits ONLY same-(size ∧ signedness ∧ integer-base-kind) — every
+// other integer/non-integer pointer STILL S0003 (proving the predicate
+// discriminates exactly where it is active).
+TEST(TypeIdentityVocabulary,
+     FfiDescriptorIntPointeePredicateNegativesStillRejectAtShippedBoundary) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-neg"};
+    std::string const src =
+        "#include <ffiwide.h>\n"
+        "enum E { X };\n"
+        "int f(void){\n"
+        "  int p = 0;                ffi_take_wide(&p);\n"    // size: I32 != I64
+        "  unsigned long long q = 0; ffi_take_wide(&q);\n"    // signedness: U64 != I64
+        "  double d = 0;             ffi_take_wide(&d);\n"    // base-kind: F64
+        "  enum E e = X;             ffi_take_wide(&e);\n"    // not an integer kind
+        "  _BitInt(64) w = 0;        ffi_take_wide(&w);\n"    // extensionKind (BitInt)
+        "  return p; }\n";
+    auto m = analyzeFfiWide(sysDir, src, kLp64);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 5u)
+        << "each arg differs on exactly one axis (size / signedness / base-kind / "
+           "kind / extensionKind) — none is a same-representation integer pointer";
+}
+
+// CONDITION 3 (red-on-disable): the relaxation is SCOPED to the call-arg boundary.
+// With the flag ON, the SAME sameRepresentation-distinct integer-pointer mismatch
+// at INIT / ASSIGNMENT / RETURN still S0003 — it never leaks past the call arg.
+TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeScopedToCallArgNotInitAssignReturn) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-scope"};
+    std::string const src =
+        "#include <ffiwide.h>\n"
+        "long long* g_init(void){ long long *p = ffi_wide_ptr(); return p; }\n"   // INIT
+        "void g_assign(void){ long long *p; p = ffi_wide_ptr(); }\n"              // ASSIGN
+        "long long* g_return(void){ return ffi_wide_ptr(); }\n";                  // RETURN
+    auto m = analyzeFfiWide(sysDir, src, kLp64);
+    // `ptr<i64>` (the ffi_wide_ptr result) into a `long long*` slot is a
+    // sameRep-distinct mismatch — admitted at a call ARG, but INIT / ASSIGN /
+    // RETURN keep the strict default-false isAssignable (no leak past the arg).
+    // INIT + ASSIGN report S_TypeMismatch; RETURN has its own S_ReturnTypeMismatch.
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
+        << "INIT + ASSIGN keep the strict assignment reject";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u)
+        << "RETURN keeps the strict return-type reject — the relaxation never leaks "
+           "past the call-arg boundary";
+}
+
+// CONFIG RED-ON-DISABLE: the whole relaxation is gated on
+// `pointerConversions.ffiDescriptorIntPointeeCompat`. Flip it FALSE (schema
+// perturbation) and the very admission above reverts to S0003.
+TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeConfigFlagRedOnDisable) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-flagoff"};
+    std::string const src =
+        "#include <ffiwide.h>\n"
+        "int f(void){ long long a = 0; ffi_take_wide(&a); return 0; }\n";
+    auto on = analyzeFfiWide(sysDir, src, kLp64, /*flagOn=*/true);
+    EXPECT_FALSE(on.hasErrors()) << "flag ON admits the wide-int pointer";
+    EXPECT_EQ(countCode(on.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    auto off = analyzeFfiWide(sysDir, src, kLp64, /*flagOn=*/false);
+    EXPECT_EQ(countCode(off.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "flag OFF reverts to the strict pointer-pointee reject";
+}
+
+// FN-POINTER / INDIRECT: the relaxation fires ONLY at the DIRECT bare-name call.
+// The SAME shipped fn reached through a NON-direct callee (a designator deref —
+// the vehicle here because a typed C fn-pointer cannot spell the descriptor's
+// anonymous `i64` parameter) routes the expression-callee path, which passes
+// calleeIsShippedFfi=false → STILL S0003 even for the `long long*` a direct call
+// admits.
+TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeIndirectCallStaysStrict) {
+    ScratchDir sysDir{Location::Temp, "ffi-wide-indirect"};
+    auto direct = analyzeFfiWide(sysDir,
+        "#include <ffiwide.h>\n"
+        "int f(void){ long long a = 0; ffi_take_wide(&a); return 0; }\n", kLp64);
+    EXPECT_FALSE(direct.hasErrors()) << "the direct bare-name call admits";
+    auto indirect = analyzeFfiWide(sysDir,
+        "#include <ffiwide.h>\n"
+        "int f(void){ long long a = 0; (*ffi_take_wide)(&a); return 0; }\n", kLp64);
+    EXPECT_EQ(countCode(indirect.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a shipped fn reached through a non-direct callee stays strict — the "
+           "relaxation is scoped to the direct-symbol call site";
 }
 
 // ── The f64 float axis: a QUALIFIED named operand still yields the entry ──

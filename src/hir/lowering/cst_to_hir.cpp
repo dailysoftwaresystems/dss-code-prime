@@ -402,7 +402,12 @@ struct Lowerer {
     // (sourceKind, targetKind) pair. The emitted Cast is aliased to its
     // OPERAND's source-map entry so diagnostics anchored at the synthetic
     // Cast still locate to real source.
-    [[nodiscard]] E coerce(E child, TypeId target) {
+    // `srcNode` (default InvalidNode): the CST arg-expression node, threaded ONLY by
+    // `coerceCallArg` for call-arguments (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT).
+    // Every other caller passes InvalidNode → the node-mark-gated FFI Ptr→Ptr arm
+    // below stays inert (guarded on `srcNode.valid()`, so no UnitAttribute routing of
+    // an untagged id). It is used SOLELY to consult `model.isFfiIntPointeeCompat`.
+    [[nodiscard]] E coerce(E child, TypeId target, NodeId srcNode = {}) {
         if (!target.valid() || !child.type.valid()) return child;
         if (child.type == target) return child;
         TypeKind const ck = interner.kind(child.type);
@@ -577,6 +582,32 @@ struct Lowerer {
         // block — file-line citation deliberately omitted to remain
         // stable under future reformatting of the loader TU).
         if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: the semantic analyzer marked
+            // this call-arg node (isFfiIntPointeeCompat) because it admitted a real C
+            // integer pointer into a shipped-descriptor abstract-width integer-pointee
+            // param (`ptr<i64>` vs `long long*` / `sqlite3_int64*` / `long*`-on-LP64)
+            // via `sameRepresentation`, at the call-arg boundary ONLY. REALIZE it as
+            // the SAME synthetic Ptr→Ptr Cast the void arms below emit — HIR→MIR maps
+            // Ptr→Ptr to a no-op Bitcast (no bits change), and the Cast RETYPES the
+            // node to `target` (== the param type) so the post-coerce HIR verifier's
+            // arg==param equality holds (the missing-cast backstop is H_VerifierFailure).
+            // The node-mark is the SINGLE authority — admit⟺realize by construction,
+            // NO re-derivation of the FFI/descriptor decision here (the
+            // `nullPointerConstant` "trust the semantic admission" discipline).
+            // `srcNode` is InvalidNode for every non-call-arg caller, so the
+            // `.valid()` guard keeps this arm inert everywhere else (and avoids
+            // routing an untagged NodeId through the UnitAttribute).
+            if (srcNode.valid() && model.isFfiIntPointeeCompat(srcNode)) {
+                HirNodeId const cast =
+                    builder.makeCast(child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({cast, it->second});
+                        break;
+                    }
+                }
+                return {cast, target};
+            }
             auto const fromElem = interner.operands(child.type);
             auto const toElem   = interner.operands(target);
             if (!fromElem.empty() && !toElem.empty()) {
@@ -962,8 +993,13 @@ struct Lowerer {
     // designator already lowers to the function's address uniformly.
     // Non-Array / valid-param behavior is byte-identical to the prior
     // inline `coerce(arg, paramType)` / pass-through shapes.
-    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType) {
-        if (paramType.valid()) return coerce(arg, paramType);
+    // `argNode` (default InvalidNode): the CST arg-expression node, forwarded to
+    // `coerce` so the D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT node-mark can drive
+    // the Ptr→Ptr bitcast realize. Only the declared-param path forwards it (a
+    // variadic-tail arg with no param type is never FFI-marked — the semantic loop
+    // checks only up to the declared arity).
+    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType, NodeId argNode = {}) {
+        if (paramType.valid()) return coerce(arg, paramType, argNode);
         if (arg.type.valid()
             && interner.kind(arg.type) == TypeKind::Array) {
             auto const elems = interner.operands(arg.type);
@@ -2175,7 +2211,13 @@ struct Lowerer {
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
                     // c79: variadic-tail args (invalid paramType) array-decay
                     // via the shared funnel (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
-                    HirNodeId const a = coerceCallArg(result, paramType).id;
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: pass the in-flight
+                    // arg's CST node (fresh index access — callCtxs may have grown)
+                    // so a shipped-descriptor int-pointee admission realizes its
+                    // Ptr→Ptr bitcast.
+                    HirNodeId const a =
+                        coerceCallArg(result, paramType,
+                                      callCtxs[ctxIdx].argNodes[k]).id;
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
@@ -3101,7 +3143,9 @@ struct Lowerer {
                     // c79: same call-arg funnel as the other three sites
                     // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY); declared params
                     // coerce byte-identically, Array-typed tail args decay.
-                    E const coerced = coerceCallArg(arg, paramType);
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: `a` is the CST arg
+                    // node → realizes a shipped-descriptor int-pointee bitcast.
+                    E const coerced = coerceCallArg(arg, paramType, a);
                     argNode = coerced.id;
                 }
                 args.push_back(argNode);
@@ -5747,7 +5791,9 @@ struct Lowerer {
         if (isBraceInitList(core)) {
             return lowerBraceInit(core, paramType);
         }
-        return coerceCallArg(lowerExpr(argNode), paramType).id;
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: forward the CST `argNode` so a
+        // shipped-descriptor int-pointee admission realizes its Ptr→Ptr bitcast.
+        return coerceCallArg(lowerExpr(argNode), paramType, argNode).id;
     }
 
     // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.

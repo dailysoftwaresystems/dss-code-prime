@@ -491,6 +491,68 @@ namespace {
     };
 }
 
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: lower a program that calls a shipped
+// descriptor's `fn(ptr<i64>)` with a real C `long long*` arg through the FULL
+// pipeline (scratch descriptor on the system path — the lowerAtomicProgram
+// discipline). Used to witness that the admitted call-arg REALIZES as a Ptr→Ptr
+// bitcast (no width op) and that the HIR verifier stays clean (admit⟺realize).
+[[nodiscard]] Lowered lowerFfiWideProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "ffi-wide-mir"};
+    std::ofstream(sysDir.path() / "ffiwide.json", std::ios::binary) << R"JSON({
+        "header": "ffiwide.h",
+        "library": { "elf": "libscratchffi.so.1", "pe": "scratchffi.dll", "macho": "/usr/lib/libscratchffi.dylib" },
+        "symbols": [
+            { "name": "ffi_take_wide", "signature": "fn(ptr<i64>) -> void", "kind": "function", "linkage": "external" }
+        ]
+    })JSON";
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.setActiveFormat(ObjectFormatKind::Elf);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol);
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
 } // namespace
 
 // E2 — the bare-`atomic_int` atomicity pin (audit-a / M1 critical path): a shipped
@@ -4539,6 +4601,62 @@ TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
         << "a signed compare here is the UAC-disabled miscompile shape";
     EXPECT_EQ(countOp(m, MirOpcode::Bitcast), 1u)
         << "the I64 operand's conversion to U64 must be a REAL cast inst";
+}
+
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (realize + verifier backstop): the
+// admitted shipped-descriptor call-arg (`long long*` into a `ptr<i64>` param)
+// REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
+// bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
+// AND the HIR verifier stays clean — because the coerce arm RETYPED the arg node to
+// the param type. If the coerce mark→bitcast arm were neutered, `L.hir->ok` would
+// go FALSE (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param
+// `ptr<i64>`) — so this pin is the automated form of that realize red-on-disable.
+//
+// The witness is at the HIR (where coerce runs): the full MIR lowering of a call to
+// an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
+// (ffiMap=nullptr) does not run, so `L.mir.ok` is not asserted here — the whole
+// program links + runs in `examples/c-subset/shipped_tcl_wideint` (the RUN witness).
+TEST(MirLoweringCSubset, FfiDescriptorIntPointeeArgRealizesAsPtrBitcast) {
+    // A `long long*` PARAMETER (no `= 0` init to add an unrelated width cast) passed
+    // straight into the descriptor's `fn(ptr<i64>)`.
+    auto L = lowerFfiWideProgram(
+        "#include <ffiwide.h>\n"
+        "void f(long long *pa){ ffi_take_wide(pa); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "the shipped-descriptor call-arg relaxation must ADMIT `long long*` "
+           "into `ptr<i64>` (LP64) — no S0003";
+    ASSERT_TRUE(L.hir->ok)
+        << "admit⟺realize: the coerce arm retyped the arg to the param type, so the "
+           "HIR verifier is clean; a missing bitcast would fire H_VerifierFailure";
+
+    // Walk the HIR for the synthetic realize Cast: a Ptr→Ptr where BOTH the result
+    // and the operand are Ptr<I64> — same representation, DISTINCT pointee TypeIds
+    // (the descriptor `ptr<i64>` vs the named `long long*`). Ptr→Ptr proves it is a
+    // bitcast, never an int↔ptr or width conversion.
+    auto const& hir = L.hir->hir;
+    auto const& in  = L.model.lattice().interner();
+    auto const isPtrToI64 = [&](TypeId t) {
+        return t.valid() && in.kind(t) == TypeKind::Ptr
+            && in.kind(in.operands(t)[0]) == TypeKind::I64;
+    };
+    bool foundRealizeCast = false;
+    std::vector<HirNodeId> stack{hir.root()};
+    while (!stack.empty()) {
+        HirNodeId const n = stack.back();
+        stack.pop_back();
+        if (hir.kind(n) == HirKind::Cast) {
+            auto const kids = hir.children(n);
+            if (!kids.empty() && isPtrToI64(hir.typeId(n))
+                && isPtrToI64(hir.typeId(kids[0]))
+                && hir.typeId(n).v != hir.typeId(kids[0]).v) {
+                foundRealizeCast = true;
+            }
+        }
+        for (HirNodeId c : hir.children(n)) stack.push_back(c);
+    }
+    EXPECT_TRUE(foundRealizeCast)
+        << "the admitted arg must realize as a Ptr<I64>→Ptr<I64> Cast (a same-rep, "
+           "distinct-identity bitcast) — never a width op";
 }
 
 // `char + 1` promotes char to int (the `alsoPromote` config row): the

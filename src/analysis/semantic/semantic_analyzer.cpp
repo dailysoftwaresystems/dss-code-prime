@@ -225,7 +225,8 @@ struct EngineState {
           nodeToSymbol{cu},
           nodeToType{cu},
           nodeToSelectedExpr{cu},
-          nullPointerConstantNodes{cu} {}
+          nullPointerConstantNodes{cu},
+          ffiIntPointeeCompatNodes{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -253,6 +254,15 @@ struct EngineState {
     // unrelated expression replaced by Literal 0). UnitAttribute routes per-tree,
     // exactly like nodeToType/nodeToSymbol.
     UnitAttribute<bool>        nullPointerConstantNodes;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: call-ARG source nodes admitted via
+    // the shipped-descriptor integer-pointee pointer relaxation (a real C integer
+    // pointer into a descriptor `ptr<i64>`-style param — same representation,
+    // distinct identity). Written by `checkCallAgainstSig` ONLY when the strict
+    // `isAssignable` FAILED but the relaxed one SUCCEEDED (node-mark ⟺ relaxation
+    // fired); read by CST→HIR `coerce` to realize the Ptr→Ptr bitcast. TREE-KEYED
+    // UnitAttribute for the same cross-tree-aliasing reason as
+    // `nullPointerConstantNodes` (NodeId is tree-local).
+    UnitAttribute<bool>        ffiIntPointeeCompatNodes;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -8858,7 +8868,8 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
                          Tree const& tree, NodeId node,
                          std::vector<NodeId> const& kids,
                          CallRule const& call, TypeId fnSig,
-                         bool variadicBuiltin, ScopeId scope) {
+                         bool variadicBuiltin, bool calleeIsShippedFfi,
+                         ScopeId scope) {
     // FIX 2: the call EXPRESSION carries the callee's RESULT type — not its
     // FnSig. Without this, a `return f(args);` walk (subtreeType) would
     // surface the callee identifier's FnSig (which IS typed, below) and
@@ -8942,6 +8953,24 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
                                                     /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-descriptor
+            // DIRECT call arg ONLY (config-gated + `calleeIsShippedFfi`), RETRY with
+            // the integer-pointee pointer relaxation — a descriptor `ptr<i64>`-style
+            // param accepts a real C integer pointer of the SAME representation
+            // (`long long*`/`sqlite3_int64*`/`long*`-on-LP64) via `sameRepresentation`.
+            // The strict `isAssignable` above already FAILED for this arg, so a
+            // success here is CAUSED by the relaxation → mark the arg node so CST→HIR
+            // realizes the matching Ptr→Ptr bitcast (node-mark ⟺ relaxation fired ⟺
+            // realize, by construction). Scoped to the call-arg boundary: init /
+            // assign / return keep the default-false strict form, and the fn-pointer /
+            // indirect call sites pass `calleeIsShippedFfi=false`. Identity untouched.
+            if (ptrRules.ffiDescriptorIntPointeeCompat && calleeIsShippedFfi
+                && isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
+                                /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool, /*ffiDescriptorPointeeIntCompat=*/true)) {
+                s.ffiIntPointeeCompatNodes.set(argNodes[i], true);
+                continue;
+            }
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -9164,14 +9193,21 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             return;  // unstamped callee expression — out of v1 scope
         }
         if (in.kind(landedTy) == TypeKind::FnSig) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: an EXPRESSION-callee FnSig
+            // (paren-wrapped / deref-peeled designator) is NOT the plain direct-name
+            // shipped call the relaxation is scoped to — pass false (stay strict).
             checkCallAgainstSig(s, cfg, tree, node, kids, call, landedTy,
-                                landedVariadicBuiltin, scope);
+                                landedVariadicBuiltin,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         if (isFnPointerType(in, landedTy)) {
+            // Indirect call through a fn-pointer VALUE — never a shipped-descriptor
+            // direct call (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT): pass false.
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 in.operands(landedTy)[0],
-                                /*variadicBuiltin=*/false, scope);
+                                /*variadicBuiltin=*/false,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         ParseDiagnostic d;
@@ -9240,9 +9276,16 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // own C-style variadic bit still applies inside the shared
         // tail. Purely lattice-kind-driven.
         if (isFnPointerType(s.lattice.interner(), fnTy)) {
+            // D-CSUBSET-FNPTR-INDIRECT-CALL: a bare-identifier callee typed
+            // Ptr<FnSig> is an INDIRECT call — even if the pointer was seeded from a
+            // shipped-descriptor function's address, the call is through a pointer
+            // value, so the integer-pointee relaxation stays OFF
+            // (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT — the fn-pointer round-trip
+            // must still S0003). Pass false.
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 s.lattice.interner().operands(fnTy)[0],
-                                /*variadicBuiltin=*/false, scope);
+                                /*variadicBuiltin=*/false,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         // Genuinely non-callable value (S_NotCallable is the RIGHT code
@@ -9297,8 +9340,13 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // the variadic-aware arity check, and per-arg assignability. The
     // symbol arm threads its own `variadicBuiltin` flag (e.g. tsql
     // COALESCE admits any arg count).
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: this is the DIRECT bare-name symbol
+    // call — the ONLY site that may relax integer-pointee pointer-arg compat. Thread
+    // the callee symbol's shipped-descriptor flag (config gate applied inside).
     checkCallAgainstSig(s, cfg, tree, node, kids, call, fnTy,
-                        s.symbols.at(calleeSym).variadicBuiltin, scope);
+                        s.symbols.at(calleeSym).variadicBuiltin,
+                        /*calleeIsShippedFfi=*/
+                        s.symbols.at(calleeSym).isShippedDescriptorFn, scope);
 }
 
 // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
@@ -11217,6 +11265,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // at HIR->MIR to stamp the Call's MirInstFlags::ReturnsTwice (the
                 // isNoreturn-from-descriptor mirror, one line above).
                 rec.returnsTwice = sym.returnsTwice;
+                // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: mark FUNCTION symbols
+                // minted from a shipped descriptor so `checkCallAgainstSig` may
+                // (config-gated) relax integer-pointee pointer-arg compat at the
+                // DIRECT-call arg boundary (`ptr<i64>` accepting a same-representation
+                // `long long*`/`long*`-on-LP64). ONLY functions; the separate
+                // builtin/intrinsic loop leaves it false (keeps the intrinsic
+                // `int*`-pointee rejects strict).
+                rec.isShippedDescriptorFn =
+                    sym.kind == ffi::ShippedSymbolKind::Function;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -11589,6 +11646,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
         std::move(s.nullPointerConstantNodes),
+        std::move(s.ffiIntPointeeCompatNodes),
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),
         dataModel,

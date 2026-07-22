@@ -2061,6 +2061,28 @@ struct DSS_EXPORT SemanticConfig {
         // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
         // this flag.
         bool allowVoidPtrFnConvert = false;
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a SHIPPED-FFI-DESCRIPTOR
+        // function's CALL-ARGUMENT boundary ONLY, admit a real C integer pointer
+        // (`long long*`, `sqlite3_int64*`, `long*`-on-LP64) into a descriptor
+        // parameter modeled as the abstract width-based `ptr<i64>` (…) whose pointee
+        // is the SAME representation (size ∧ signedness ∧ integer-base-kind, via
+        // TypeInterner::sameRepresentation) but a DISTINCT identity (the `_Generic`-
+        // splitting vocabulary NAME differs). The SQLite testfixture needs it for
+        // `Tcl_GetWideIntFromObj(interp, obj, &wideIntLvalue)`: gcc accepts the
+        // ABI-identical 8-byte pointer, DSS's strict pointer-pointee typing rejected
+        // it S0003. Read by `isAssignable` (admit — the trailing
+        // `ffiDescriptorPointeeIntCompat` arg, passed true ONLY by
+        // `checkCallAgainstSig` at a `isShippedDescriptorFn` DIRECT callee) and by
+        // `cst_to_hir.cpp::coerce` (realize — the node-mark-gated Ptr→Ptr bitcast), in
+        // lockstep. Default FALSE = strict: the boundary is SCOPED — native C-to-C
+        // pointer typing, init/assign/return, and the fn-pointer/indirect call paths
+        // ALL stay strict; identity is NEVER merged (a compat admission, not a
+        // canonicalization — `_Generic(long:,long long:)` still distinguishes). Only
+        // c-subset opts in. Per-target by construction: on LLP64/pe64 `long` is I32,
+        // so `long*` still REFUSES `ptr<i64>` (sameRepresentation's kind axis) with NO
+        // format branch. Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B
+        // gate) — the same admit/realize-in-lockstep discipline.
+        bool ffiDescriptorIntPointeeCompat = false;
     };
     PointerConversionRules pointerConversions;
 
