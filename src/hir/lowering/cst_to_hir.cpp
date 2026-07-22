@@ -3907,16 +3907,17 @@ struct Lowerer {
             // ARRAY operand decays to Ptr<elem> FIRST. `*(arrayName)` then
             // dereferences the first element — identical to `*(arrayName + 0)` (the
             // c59 additive-decay path) and to `arrayName[0]` (Index, whose
-            // `indexResultType` already types an Array base directly). Without this
-            // the Array kind reached `derefResultType` below, which has NO Array arm
-            // (Ptr-only — the SHARED semantic-tier typer, deliberately left
-            // un-decayed there exactly as c59/c91's additive/condition decays are
-            // cst_to_hir-only) → the Deref came out TYPELESS → H0001 (sqlite
-            // `getVarint32(zBuf,…)`, whose macro derefs the `unsigned char
-            // zBuf[100]` array directly: `(*(A)<(u8)0x80)?((B)=(u32)*(A)),1:…`).
-            // Reuses the ONE `coerce` Array→Ptr decay funnel (the c59/c91/cast
-            // pattern) so the emitted Cast gives MIR a real pointer value AND the
-            // FnSig fold + `derefResultType` below read the DECAYED Ptr. An array of
+            // `indexResultType` already types an Array base directly). The shared
+            // `derefResultType` law now types an Array operand directly too (→ elem,
+            // the sibling of `indexResultType`), so the TYPE is covered either way —
+            // but the CODEGEN still needs this call-site decay: it materializes the
+            // Array→Ptr as an actual `coerce` Cast so MIR gets a real POINTER VALUE
+            // to load through (a lone type change would leave the Deref loading from
+            // an array aggregate). Without it, sqlite `getVarint32(zBuf,…)` — whose
+            // macro derefs the `unsigned char zBuf[100]` array directly, `(*(A)<(u8)
+            // 0x80)?((B)=(u32)*(A)),1:…` — lost its pointer value. Reuses the ONE
+            // `coerce` Array→Ptr decay funnel (the c59/c91/cast pattern) so the FnSig
+            // fold + `derefResultType` below read the DECAYED Ptr. An array of
             // function pointers `T(*a[])(…)` decays to `Ptr<Ptr<FnSig>>` → the fold
             // (which requires operand[0] == FnSig) correctly does NOT fire and the
             // deref yields the function pointer. A degenerate elementless Array
@@ -5949,19 +5950,46 @@ struct Lowerer {
     [[nodiscard]] E lowerSizeof(NodeId node) {
         // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
         // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
-        // stamped size_t. Descend to the form, then scan its children for the
-        // operand's stamped type — skipping the form's own size_t stamp.
+        // stamped size_t. Descend to the form, then recover the operand's type —
+        // skipping the form's own size_t stamp.
         NodeId form{};
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
         }
         NodeId const scan = form.valid() ? form : node;
+        // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: the VALUE form (`sizeof e`)
+        // sizes the OPERAND EXPRESSION's OWN result type — the type the semantic
+        // tier stamps DIRECTLY on the operand node (its `subtreeType`; e.g. the
+        // element type of `*arr` after C 6.3.2.1p3 array-decay, or an identifier /
+        // literal token's Pass-2 stamp). Read that DIRECT stamp and NEVER descend:
+        // `resolveStampedTypeBelow` DFS-descends past an UNSTAMPED operator node
+        // into a CHILD's stamp — a SILENT WRONG GUESS (for `sizeof(*arr)` an
+        // unstamped `*arr` fell through to `arr`'s ARRAY type: 40, not the element
+        // 4). If the operand carries no direct type, the semantic tier failed to
+        // type it — FAIL LOUD rather than mis-size by guessing at a sub-expression.
+        // The TYPE form (`sizeof(T)`) keeps the descent: its stamp legitimately
+        // lives on a leaf token below the (unstamped) type-ref wrapper.
         TypeId sized = InvalidType;
-        for (NodeId c : visible(scan)) {
-            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
-        }
-        if (!sized.valid()) {
-            return exprError(node, "sizeof operand did not resolve to a type");
+        bool const valueForm =
+            form.valid() && sem.sizeofValueRule.valid()
+            && tree().rule(form).v == sem.sizeofValueRule.v;
+        if (valueForm) {
+            for (NodeId c : visible(form)) {
+                if (TypeId t = model.typeAt(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node,
+                    "sizeof value-operand was not typed by the semantic analyzer "
+                    "(refusing to descend into a sub-expression and silently "
+                    "mis-size the operand)");
+            }
+        } else {
+            for (NodeId c : visible(scan)) {
+                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node, "sizeof operand did not resolve to a type");
+            }
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // D-LANG-TYPE-IDENTITY-VOCABULARY: C's `size_t` — the NAMED entry the

@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK (the c89-audit F4): `sizeof(*arr)` must size the ELEMENT (C 6.3.2.1p3 array-decay + 6.5.3.4), not the whole array. Pre-fix `derefResultType(Array)` = Invalid -> the semantic tier left `*arr` unstamped -> lowerSizeof's resolveStampedTypeBelow DFS-descended into the leaf `arr` and silently sized the WHOLE array: sizeof(*a)=40 (want 4), sizeof(*m)=48 (want 16), sizeof(*\"hello\")=6 (want 1), sizeof(*da)=40 (want 8), sizeof(*ua)=7 (want 1). FIX: (a) `derefResultType(Array<T,N>)=T` in the shared type_rules law (the sibling of indexResultType); (b) lowerSizeof's VALUE form reads the operand's DIRECT stamp and FAILS LOUD when it is missing -- no silent DFS guess survives. Controls (rows 4/5/8..11: Ptr deref, whole array, index) were already correct and pin that only the array-DEREF type changed. Sizes are target-independent (int 4, int[4] 16, char 1, double 8 -- no `long`). RED-ON-DISABLE: revert the Array arm -> the wall fails loud (compile error); revert the wall too -> the old DFS returns 40/48/6/40/7 -> non-42 exit. => 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

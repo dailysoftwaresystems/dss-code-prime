@@ -856,8 +856,12 @@ namespace detail::type_rules {
 // lattice law — `*` on a function designator (`FnSig`) or a function POINTER
 // (`Ptr<FnSig>`) is the IDENTITY (the designator decays straight back), so the
 // result is the operand type unchanged; a deref node there would lower to a
-// memory LOAD through the code pointer (silent garbage). Otherwise `Ptr<T>`→T;
-// a non-pointer operand → InvalidType (cascade-suppress; deeper tiers wall it).
+// memory LOAD through the code pointer (silent garbage). Otherwise `Ptr<T>`→T.
+// C 6.3.2.1p3 array-to-pointer decay under `*`: an ARRAY operand decays to
+// Ptr<elem> FIRST, so `*arrayOfT` has type `elem` — this law handles it directly
+// (== `arrayOfT[0]`, the Array arm of the sibling `indexResultType`), so the two
+// verbs agree and no caller must pre-decay merely to recover the TYPE. Any other
+// operand → InvalidType (cascade-suppress; deeper tiers wall it).
 [[nodiscard]] inline TypeId
 derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
     if (!operand.valid()) return InvalidType;
@@ -867,6 +871,16 @@ derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
         && interner.kind(interner.operands(operand)[0]) == TypeKind::FnSig)
         return operand;                                              // identity
     if (opk == TypeKind::Ptr) return interner.operands(operand)[0];   // pointee
+    // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `*arrayOfT` (C 6.3.2.1p3
+    // array-decay then C 6.5.3.2 deref) is `elem` — operand[0], the SAME slot
+    // Array/Ptr/Slice all store the element in. C forbids arrays OF functions,
+    // so operand[0] is never a bare FnSig (an array of function POINTERS yields
+    // the pointer via this arm, matching the Ptr path). A degenerate elementless
+    // Array has no element → InvalidType. `*` is NOT a decay-exception (unlike
+    // sizeof/_Alignof/unary &), so the decay belongs in this shared law, exactly
+    // as `indexResultType` decays an Array base for `[]`.
+    if (opk == TypeKind::Array && !interner.operands(operand).empty())
+        return interner.operands(operand)[0];                        // element
     return InvalidType;
 }
 

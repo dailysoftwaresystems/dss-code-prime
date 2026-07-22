@@ -5467,6 +5467,66 @@ vaOverflowArgAreaPayload(Mir const& m, std::uint32_t fi) {
 }
 } // namespace
 
+namespace {
+// `sizeof` folds to a `size_t` (u64) Const, stored as the `uint64_t` literal
+// variant — `funcHasConstInt` only inspects the `int64_t` variant, so the sizeof
+// pins below need a both-variant probe (the value is small + non-negative).
+[[nodiscard]] bool funcHasConstUIntEither(Mir const& m, std::uint32_t fi,
+                                          std::uint64_t value) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::uint64_t>(lit.value)
+                && std::get<std::uint64_t>(lit.value) == value)
+                return true;
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == static_cast<std::int64_t>(value))
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `sizeof(*a)` for `int a[10]`
+// folds to the ELEMENT size (4), NEVER the whole-array 40. Pre-fix the shared
+// `derefResultType` law had no Array arm, so the semantic tier left `*a`
+// unstamped and lowerSizeof's `resolveStampedTypeBelow` DFS-descended into the
+// leaf `a`, silently folding sizeof(int[10]) = 40. The (int) cast makes the exit
+// path read the folded size_t constant. RED-ON-DISABLE: revert the Array arm in
+// `derefResultType` — with the lowerSizeof value-form wall present the operand is
+// now UNSTAMPED, so lowering FAILS LOUD (H_UnsupportedLoweringForKind) and no
+// Const 4 is emitted (`L.mir.ok` trips / the const-4 EXPECT reds); revert the
+// wall too and the old DFS restores the silent Const 40 this pins against.
+TEST(MirLoweringCSubset, SizeofDerefArrayFoldsElementNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int a[10]; return (int)sizeof(*a); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 4))
+        << "sizeof(*a) is the element int == 4 (C 6.3.2.1p3 array-decay + 6.5.3.4)";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 40))
+        << "must NOT fold to the whole int[10] (40) — the silent DFS leaf-fallback";
+}
+
+// The 2-D companion: `sizeof(*m)` for `int m[3][4]` is the ROW `int[4]` (16),
+// never the whole 48-byte 2-D array. `*m` decays `int[3][4]` to `int(*)[4]` and
+// derefs to `int[4]`. RED-ON-DISABLE mirrors the 1-D pin above (16 <-> 48).
+TEST(MirLoweringCSubset, SizeofDerefTwoDimArrayFoldsRowNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int m[3][4]; return (int)sizeof(*m); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 16))
+        << "sizeof(*m) is the row int[4] == 16";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 48))
+        << "must NOT fold to the whole int[3][4] (48)";
+}
+
 TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
     auto L = lowerCSubset(
         "int sum(int n, ...) {\n"

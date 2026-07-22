@@ -64,6 +64,44 @@ TEST(TypeRules, IsArithmeticRejectsNonArithmetic) {
     EXPECT_FALSE(isArithmetic(in, InvalidType));
 }
 
+// ── Deref / Index result-type laws (C 6.5.3.2 deref, 6.5.2.1 index, with the
+//    6.3.2.1p3 array-to-pointer decay) ──────────────────────────────────────
+// D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `*arrayOfT` decays the array to
+// Ptr<elem> then derefs, so its type is the ELEMENT — EXACTLY `arrayOfT[0]`. The
+// shared `derefResultType` law must therefore type an Array operand directly, as
+// its sibling `indexResultType` already types an Array base. Before the fix the
+// Array arm was absent (Array → InvalidType), which is precisely the unstamped
+// operand the `sizeof(*arr)` silent-fallback miscompile rode into `resolveStamped
+// TypeBelow`'s leaf-descent.
+TEST(TypeRules, DerefOfPointerYieldsPointee) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    EXPECT_EQ(derefResultType(in, in.pointer(i32)).v, i32.v);
+}
+// RED-ON-DISABLE (unit): revert the Array arm in `derefResultType` and every
+// assertion here reds (Array → InvalidType instead of the element).
+TEST(TypeRules, DerefOfArrayYieldsElementNotWholeArray) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    auto a10 = in.array(i32, 10);            // int a[10]
+    EXPECT_EQ(derefResultType(in, a10).v, i32.v) << "*a is the element int, not int[10]";
+    // The deref and index laws must AGREE: *arr == arr[0].
+    EXPECT_EQ(derefResultType(in, a10).v, indexResultType(in, a10).v);
+    // Multi-dim `int m[3][4]`: *m is the ROW int[4], not the whole 2-D array.
+    auto row = in.array(i32, 4);
+    auto m34 = in.array(row, 3);
+    EXPECT_EQ(derefResultType(in, m34).v, row.v) << "*m is int[4] (the row)";
+    // Deref of a POINTER-to-array yields the array (the control the fix must not
+    // disturb): int(*pm)[4]; *pm is int[4].
+    EXPECT_EQ(derefResultType(in, in.pointer(row)).v, row.v);
+}
+TEST(TypeRules, DerefOfNonPointerNonArrayIsInvalid) {
+    auto in = makeInterner();
+    EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::I32)).valid());
+    EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::F64)).valid());
+    EXPECT_FALSE(derefResultType(in, InvalidType).valid());
+}
+
 // Identical TypeIds are trivially assignable (the post-intern equality
 // path).
 TEST(TypeRules, IsAssignableIdentityHolds) {
