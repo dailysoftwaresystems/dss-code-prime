@@ -1960,7 +1960,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 111u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL src/test*.c TU; C37: +29 exported fns (82 -> 111) for the testfixture MAIN harness tclsqlite-ex.c + Tcl_GetCharLength for test_recover — 23 channel/dict/NRE/misc (tier 1) + 6 more the tier-1 fixes UNMASKED (Tcl_FindExecutable/Tcl_NRCallObjProc/Tcl_NRCreateCommand/Tcl_PkgProvide/Tcl_SetSystemEncoding/Tcl_TranslateFileName). Tcl_IsShared + TCL_VERSION are macros, NOT symbols — asserted below
+    ASSERT_EQ(desc->symbols.size(), 114u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL src/test*.c TU; C37: +29 exported fns (82 -> 111) for the testfixture MAIN harness tclsqlite-ex.c + Tcl_GetCharLength for test_recover — 23 channel/dict/NRE/misc (tier 1) + 6 more the tier-1 fixes UNMASKED (Tcl_FindExecutable/Tcl_NRCallObjProc/Tcl_NRCreateCommand/Tcl_PkgProvide/Tcl_SetSystemEncoding/Tcl_TranslateFileName). C43 (D-FFI-TCL-LIST-VAR-DESCRIPTORS): +3 exported fns (Tcl_SetVar2Ex + Tcl_SplitList + Tcl_ListObjReplace, 111 -> 114) for the block-2 "Statically linked extensions" TUs ext/fts5/fts5_tcl.c + ext/rtree/test_rtreedoc.c (all nm -D `T`). Tcl_IsShared + TCL_VERSION are macros, NOT symbols — asserted below
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -2028,7 +2028,12 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           // earlier undeclared identifiers in the same declarations resolved).
                           // All nm -D `T`. RED-ON-DISABLE: drop one → tclsqlite-ex.c S0001s.
                           "Tcl_FindExecutable", "Tcl_NRCallObjProc", "Tcl_NRCreateCommand",
-                          "Tcl_PkgProvide", "Tcl_SetSystemEncoding", "Tcl_TranslateFileName"})
+                          "Tcl_PkgProvide", "Tcl_SetSystemEncoding", "Tcl_TranslateFileName",
+                          // C43 (D-FFI-TCL-LIST-VAR-DESCRIPTORS): the 3 EXPORTED Tcl-API fns
+                          // (nm -D `T`) the block-2 "Statically linked extensions" TUs need —
+                          // Tcl_SetVar2Ex + Tcl_SplitList (ext/fts5/fts5_tcl.c) + Tcl_ListObjReplace
+                          // (ext/rtree/test_rtreedoc.c). RED-ON-DISABLE: drop one → that TU S0001s.
+                          "Tcl_SetVar2Ex", "Tcl_SplitList", "Tcl_ListObjReplace"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C34b: Tcl_GetHashKey/Tcl_GetHashValue/Tcl_SetHashValue are MACROS in real tcl.h,
     // ABSENT from libtcl8.6.so's nm -D — so they must NOT be eager-imported symbols
