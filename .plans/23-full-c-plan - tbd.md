@@ -20,6 +20,8 @@
 
 ---
 
+> **2026-07-22 sweep reconciliation** (cross-checked vs the anchor registry + git): **FC18 (`D-DIAG-CORPUS-EVERY-CODE`) is the ONLY remaining phase for full C23** — FC1–FC17.9 are all ✅ (the entire §3.2 exotic long-tail was absorbed by FC17.9). Staleness reconciled: the §0.1 **FC12a** row still reads 🟡 but is functionally ✅ (variadic-callee `D-FC12A-VARIADIC-CALLEE` shipped + the FFI `...` variadic descriptor delivered in the SQLite arc; only a §B-gated AL-spill *optimization* remains — an emitted-code perf item, NOT a conformance gap); **§3.2's `D-FC6-SIZEOF-ARRAY-DIM-VALUE-FORM`** residual text is stale — registry shows it CLOSED (2026-06-15); the **FC5** row's `D-CSUBSET-LABEL-BEFORE-CASE` "named exclusion" is likewise CLOSED (registry, 2026-06-23). **FC18 remaining work** = author + grow a runnable C23 conformance corpus (positive programs across all 4 targets with §A.5 cross-target runtime closure) + positioned-diagnostic goldens toward every-error-code coverage; open-ended (a handful+ of cycles), pure file-drop mechanism, in a NEW PR.
+
 ## 0.1 Phase breakdown — the FC* cycles by cluster
 
 Each FC phase is one or more `/dss-cycle` cycles ending at a green push with a runnable corpus + strict/positioned tests. Every FC row carries the implicit **per-FC agnosticism acceptance gate** (§5): no new `if (lang/arch/format/cc.name == …)` in shared substrate; new per-CC/per-format logic lives only in the sanctioned realization tier, config-parameterized. Status: ⏳ planned · 🟡 in progress · ✅ done.
