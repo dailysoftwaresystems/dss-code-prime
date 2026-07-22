@@ -405,14 +405,24 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
     EXPECT_EQ(countCode(widen.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "F32 widens implicitly into a double param";
-    auto narrow = analyzeCSubset(
-        "int take(float v) { return 0; }\n"
-        "int main() { int r; r = take(1.5); return 0; }\n");
-    EXPECT_EQ(countCode(narrow.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "unsuffixed 1.5 stays F64 — narrowing into float must "
-           "mismatch, proving the suffix (not the base core) typed "
-           "1.5f";
+    // (Formerly: `take(1.5)` into a float param was expected to MISMATCH, using the
+    // narrowing rejection as a proxy that unsuffixed 1.5 is F64. D-CSUBSET-FLOAT-FROM-
+    // DOUBLE-NARROWING now ADMITS double->float narrowing, so that proxy is obsolete —
+    // the width is pinned DIRECTLY via _Generic SELECTION, which matches on the
+    // controlling expression's TYPE with NO promotion: 1.5f selects the `float:`
+    // association and 1.5 selects `double:`, proving the SUFFIX, not the base core,
+    // typed the literal. selectedGenericArms observes the winning arm at the semantic
+    // tier — no const-fold. RED-ON-DISABLE of the SUFFIX: were 1.5f typed F64 it would
+    // select the double arm ("2") instead of "1".)
+    auto suffixTypes = analyzeCSubset(
+        "int main() {\n"
+        "  _Generic(1.5f, float: 1, double: 2, default: 0);\n"
+        "  _Generic(1.5,  float: 3, double: 4, default: 0);\n"
+        "  return 0; }\n");
+    EXPECT_FALSE(suffixTypes.hasErrors());
+    EXPECT_EQ(selectedGenericArms(suffixTypes), (std::vector<std::string>{"1", "4"}))
+        << "1.5f selects the float association (\"1\") and 1.5 selects double (\"4\") — "
+           "the suffix (not the base core) types the literal F32 vs F64";
 }
 
 // ── FC3.5 sweep-c2: floatLiteralTyping loader validation ────────────────

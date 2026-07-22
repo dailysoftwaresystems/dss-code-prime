@@ -477,10 +477,13 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
     EXPECT_EQ(vocabOf(f64, "a"), "");
     EXPECT_EQ(vocabOf(f64, "b"), "long double");
 
-    // On a WIDER long-double axis the two have genuinely different
-    // representations, so only the WIDENING direction is an implicit conversion
-    // (`isAssignable`'s float rule is `floatRank(rhs) <= floatRank(lhs)`, a
-    // PRE-EXISTING, purely kind-keyed rule this change does not touch).
+    // On a WIDER long-double axis the two have genuinely different representations, so
+    // the conversion is governed by the float RANK rule, not identity. BOTH directions
+    // are now implicit assignment conversions: WIDENING (`floatRank(rhs) <= floatRank
+    // (lhs)`, unconditional) and — since D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING —
+    // NARROWING too (F80/F128 -> F64, gated on `floatSameKindNarrows`, coerce emits the
+    // FPTrunc). This is still a RANK rule (kind-keyed), not an identity rule; the
+    // identity distinction is the vocab split checked on the f64 axis above.
     for (LongDoubleFormat const axis : {LongDoubleFormat::X87_80,
                                         LongDoubleFormat::Ieee128}) {
         SCOPED_TRACE(static_cast<int>(axis));
@@ -492,9 +495,10 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
         auto narrow = analyzeCSubset(
             "int f(long double ld){ double a = ld; return a == 0.0; }\n",
             DataModel::Lp64, axis);
-        EXPECT_EQ(countCode(narrow.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-            << "and the NARROWING direction keeps its pre-existing rejection — "
-               "a rank rule, not an identity rule";
+        EXPECT_EQ(countCode(narrow.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+            << "and the NARROWING direction (F80/F128 -> F64) is now an admitted "
+               "implicit conversion too (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING) — the "
+               "float rank rule admits narrowing when floatSameKindNarrows is on";
     }
 }
 

@@ -268,6 +268,55 @@ TEST(TypeRules, IsAssignableAdmitsIntFloatWhenGated) {
     EXPECT_FALSE(F2I(pi, f64)) << "float->int gate does NOT admit f64 -> int*";
 }
 
+// Float→float NARROWING (F64→F32, F80/F128→…) is NOT assignable with the gate OFF
+// (the default — a non-C schema). The RED-ON-DISABLE reference for the gated test
+// below. WIDENING (F32→F64) is admitted regardless (the rank arm returns true first),
+// so it is the invariant we must NOT disturb.
+TEST(TypeRules, IsAssignableRejectsFloatNarrowingByDefault) {
+    auto in  = makeInterner();
+    auto f32 = in.primitive(TypeKind::F32);
+    auto f64 = in.primitive(TypeKind::F64);
+    EXPECT_FALSE(isAssignable(in, f32, f64)) << "F64 -> F32 narrowing NOT admitted by default";
+    EXPECT_TRUE (isAssignable(in, f64, f32)) << "F32 -> F64 widening IS admitted (gate-independent)";
+}
+
+// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c-subset), a
+// WIDER floating rhs NARROWS into a NARROWER floating lhs — `float f = aDouble;` (F64→F32,
+// the GEOPOLY `typedef float GeoCoord` assigned from a `double`), F80/F128→F64/F32 — C
+// 6.3.1.4 / 6.5.16.1, precision-lossy (value the nearest representable). WIDENING stays
+// unconditional. coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR
+// FPTrunc — the SAME makeCast path F32→F64 widening uses). RED-ON-DISABLE: the SAME
+// narrowing calls with the gate OFF (IsAssignableRejectsFloatNarrowingByDefault above)
+// REJECT. SCOPE GUARDS: this gate is float→float ONLY — it admits NEITHER float→int (the
+// separate floatConvertsToInt gate) NOR int→float NOR a pointer.
+TEST(TypeRules, IsAssignableAdmitsFloatNarrowingWhenGated) {
+    auto in   = makeInterner();
+    auto i32  = in.primitive(TypeKind::I32);
+    auto f32  = in.primitive(TypeKind::F32);
+    auto f64  = in.primitive(TypeKind::F64);
+    auto f128 = in.primitive(TypeKind::F128);
+    auto pf   = in.pointer(f32);   // float*
+    // floatSameKindNarrows ON (12th arg true); every other gate OFF.
+    auto const N = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/false,
+                            /*intSameSignednessNarrows=*/false,
+                            /*intConvertsToFloat=*/false, /*floatConvertsToInt=*/false,
+                            /*floatSameKindNarrows=*/true);
+    };
+    EXPECT_TRUE(N(f32,  f64))  << "F64 -> F32 narrows (the GEOPOLY float<-double shape)";
+    EXPECT_TRUE(N(f64,  f128)) << "F128 -> F64 narrows (the long-double rung)";
+    EXPECT_TRUE(N(f32,  f128)) << "F128 -> F32 narrows (skipping a rung)";
+    // WIDENING admitted regardless of the gate (the rank arm returns true first).
+    EXPECT_TRUE(N(f64,  f32))  << "F32 -> F64 widens (gate-independent)";
+    EXPECT_TRUE(N(f128, f64))  << "F64 -> F128 widens (gate-independent)";
+    // SCOPE GUARDS: float→float ONLY.
+    EXPECT_FALSE(N(i32, f64)) << "floatSameKindNarrows does NOT admit f64 -> i32 (that is floatConvertsToInt)";
+    EXPECT_FALSE(N(f64, i32)) << "floatSameKindNarrows does NOT admit i32 -> f64 (that is intConvertsToFloat)";
+    EXPECT_FALSE(N(f32, pf))  << "floatSameKindNarrows does NOT admit float* -> f32";
+}
+
 // InvalidType passes through on either side (cascade suppression: a
 // single previous error should not produce a downpour of follow-on
 // type-mismatch diagnostics).
@@ -326,16 +375,16 @@ TEST(TypeRules, IsAssignableStringLiteralInitsAnyCharacterArray) {
     auto char8  = in.array(charEl, 8);
     auto int8   = in.array(in.primitive(TypeKind::I32), 8);
     auto uchar3 = in.array(in.primitive(TypeKind::U8), 3);   // N=3 < M=4 → over-long
-    auto G      = true;   // charArrayFromStringLiteralInit gate (position 8)
-    EXPECT_TRUE(isAssignable(in, uchar8, char4, {}, false, false, false, false, false, false, false, G))
+    auto G      = true;   // charArrayFromStringLiteralInit gate (position 9)
+    EXPECT_TRUE(isAssignable(in, uchar8, char4, {}, false, false, false, false, false, false, false, false, G))
         << "unsigned char[8] <- char[4] string literal (C 6.2.5p15) — the sqlite `const unsigned char zHex[]` shape";
-    EXPECT_TRUE(isAssignable(in, schar8, char4, {}, false, false, false, false, false, false, false, G))
+    EXPECT_TRUE(isAssignable(in, schar8, char4, {}, false, false, false, false, false, false, false, false, G))
         << "signed char[8] <- char[4] string literal";
-    EXPECT_TRUE(isAssignable(in, char8, char4, {}, false, false, false, false, false, false, false, G))
+    EXPECT_TRUE(isAssignable(in, char8, char4, {}, false, false, false, false, false, false, false, false, G))
         << "char[8] <- char[4] string literal (the baseline must still hold)";
-    EXPECT_FALSE(isAssignable(in, int8, char4, {}, false, false, false, false, false, false, false, G))
+    EXPECT_FALSE(isAssignable(in, int8, char4, {}, false, false, false, false, false, false, false, false, G))
         << "int[8] <- char[4]: int is NOT a character type → stays a loud mismatch";
-    EXPECT_FALSE(isAssignable(in, uchar3, char4, {}, false, false, false, false, false, false, false, G))
+    EXPECT_FALSE(isAssignable(in, uchar3, char4, {}, false, false, false, false, false, false, false, false, G))
         << "unsigned char[3] <- char[4]: OVER-LONG (N < M) stays a loud mismatch";
     EXPECT_FALSE(isAssignable(in, uchar8, char4))
         << "ungated (no string-literal init context) → not admitted";
@@ -472,7 +521,8 @@ TEST(TypeRules, ScalarConvertsToBoolWhenGated) {
             /*boolWidensToArith=*/false, /*charConvertsToArith=*/false,
             /*enumConvertsToArith=*/false, /*intCrossSignednessConverts=*/false,
             /*intSameSignednessNarrows=*/false, /*intConvertsToFloat=*/false,
-            /*floatConvertsToInt=*/false, /*charArrayFromStringLiteralInit=*/false,
+            /*floatConvertsToInt=*/false, /*floatSameKindNarrows=*/false,
+            /*charArrayFromStringLiteralInit=*/false,
             /*bitIntConversions=*/false, /*scalarConvertsToBool=*/gate);
     };
     // Gated ON: scalar -> Bool admitted for arithmetic / char / pointer / nullptr.
@@ -601,7 +651,7 @@ TEST(TypeRules, IsAssignableBitIntGated) {
     // gate ON — bidirectional BitInt↔int + BitInt↔BitInt(any width)
     auto A = [&](TypeId l, TypeId r) {
         return isAssignable(in, l, r, {}, false, false, false, false, false,
-                            false, false, false, /*bitIntConversions=*/true);
+                            false, false, false, false, /*bitIntConversions=*/true);
     };
     EXPECT_TRUE(A(b4, i32));
     EXPECT_TRUE(A(i32, b4));

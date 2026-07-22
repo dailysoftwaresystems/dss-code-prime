@@ -964,6 +964,33 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
            "c-subset (only void* gets the universal-pointer pass).";
 }
 
+// D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: `pointer - arrayName` (C 6.5.6p9 + 6.3.2.1p3) —
+// the array operand decays to Ptr<elem> FIRST, so the result is ptrdiff_t (an INTEGER),
+// not a pointer. Used UNCAST in an integer context (the FTS5 `zOut - aBuf` shape, a
+// token length passed as an int), it must be admitted. The semantic type-oracle
+// (subtreeType/combineBinary) previously required BOTH operands already Ptr and never
+// decayed an Array → `z - a` typed Ptr<char> → the int init failed isAssignable →
+// S_TypeMismatch. (The pointer_minus_array example only ever CAST the result
+// `(int)(t - arr)`, so the explicit cast masked this semantic gap.) Now the semantic arm
+// decays the array first, mirroring the HIR combineBinary c65 that already lowers it.
+// RED-ON-DISABLE: revert the semantic pointer-sub array-decay → the two UNCAST sites
+// (`z - a`, `a - z`) type Ptr/Array in an int context → this count becomes 2.
+TEST(SemanticAnalyzerCSubset, PointerMinusArrayTypesAsPointerDifferenceInt) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void){ char a[32]; char *z = a + 5;\n"
+        "  int p = z - a;\n"          // ptr - array   (uncast, integer context)
+        "  int q = a - z;\n"          // array - ptr
+        "  int r = (int)(z - a);\n"   // the CAST control — clean either way
+        "  return p + q + r; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
+           "decays first), not a pointer → S_TypeMismatch, in an uncast int context";
+}
+
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
 //    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
 //
@@ -9898,24 +9925,39 @@ TEST(SemanticAnalyzerCSubset, LongDoubleLiteralTypesPerAxis) {
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble) {
-    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3). On a
-    // WALLED axis the arm is observable: `x + d` types F80, so it binds an
-    // F80 lhs cleanly and REJECTS an F64 lhs (were the result F64, the two
-    // expectations would invert — a strict both-ways pin of the rank order).
+    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3), so `x + d`
+    // (long double + double) types long double (F80). NOTE: this test formerly proved
+    // the rank via an assignment-rejection PROXY (`double r = x + d;` had to REJECT the
+    // F80->F64 narrowing). D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING now ADMITS that
+    // narrowing, so the proxy is obsolete — the rank is pinned DIRECTLY via the INFERRED
+    // TYPE of the UAC result: `typeof(x + d) pr;` declares `pr` with x+d's type, and the
+    // symbol's resolved TypeKind must be F80 (the exact idiom LongDoubleResolvesPerAxis
+    // uses). The `good` case still also binds an F80 lhs cleanly.
     auto good = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; long double r; r = x + d; }\n"},
+        {"int main(void) { long double x; double d; typeof(x + d) pr;\n"
+         "  long double r; r = x + d; }\n"},
         LongDoubleFormat::X87_80);
     EXPECT_FALSE(good.hasErrors())
-        << "`long double + double` must type long double (F80) — assignable "
-           "into a long double lhs";
+        << "`long double + double` binds an F80 lhs cleanly";
+    auto const* pr = findSymbolNamed(good, "pr");
+    ASSERT_NE(pr, nullptr);
+    ASSERT_TRUE(pr->type.valid());
+    EXPECT_EQ(good.lattice().interner().kind(pr->type), TypeKind::F80)
+        << "`x + d` (long double + double) types long double (F80): typeof(x + d) "
+           "resolves F80, proving the UAC result OUTRANKS double (F64)";
 
-    auto bad = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; double r; r = x + d; }\n"},
+    // Positive control / RED-ON-DISABLE of the RANK: `double + double` types double, so
+    // typeof(d1 + d2) resolves F64. Were the UAC rank broken so `x + d` above typed
+    // double, its EXPECT_EQ(..., F80) would fail. Proves the oracle separates F64/F80.
+    auto ctrl = analyzeWithLongDoubleAxis(
+        {"int main(void) { double d1; double d2; typeof(d1 + d2) pr2; }\n"},
         LongDoubleFormat::X87_80);
-    EXPECT_TRUE(bad.hasErrors())
-        << "`long double + double` into a DOUBLE lhs is a narrowing float "
-           "assignment (F80 -> F64) — must reject, proving the UAC result is "
-           "F80, not F64";
+    auto const* pr2 = findSymbolNamed(ctrl, "pr2");
+    ASSERT_NE(pr2, nullptr);
+    ASSERT_TRUE(pr2->type.valid());
+    EXPECT_EQ(ctrl.lattice().interner().kind(pr2->type), TypeKind::F64)
+        << "`double + double` types double (F64) — the typeof oracle separates the two "
+           "float widths, so the F80 rank pin above is observable";
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldSucceedsOnWalledAxis) {

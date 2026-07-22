@@ -8270,7 +8270,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -8318,7 +8318,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -8442,6 +8442,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                              /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows,
                                              /*intConvertsToFloat=*/cfg.intConvertsToFloat,
                                              /*floatConvertsToInt=*/cfg.floatConvertsToInt,
+                                             /*floatSameKindNarrows=*/cfg.floatSameKindNarrows,
                                              /*charArrayFromStringLiteralInit=*/false,
                                              /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                             && !admitsNullPointerConstant(
@@ -9000,7 +9001,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
             // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-descriptor
             // DIRECT call arg ONLY (config-gated + `calleeIsShippedFfi`), RETRY with
             // the integer-pointee pointer relaxation — a descriptor `ptr<i64>`-style
@@ -9015,7 +9016,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
             if (ptrRules.ffiDescriptorIntPointeeCompat && calleeIsShippedFfi
                 && isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                                 /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool, /*ffiDescriptorPointeeIntCompat=*/true)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool, /*ffiDescriptorPointeeIntCompat=*/true)) {
                 s.ffiIntPointeeCompatNodes.set(argNodes[i], true);
                 continue;
             }
@@ -9676,6 +9677,15 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
 
     // ── combine helpers (each verbatim from the prior recursive arm; operate on
     //    already-typed child results, so no recursion) ──
+    // C 6.3.2.1p3 array-to-pointer decay: an `Array<T,N>` in a value context decays
+    // to `Ptr<T>`. Shared by the pointer-SUBTRACTION arm (below) and the ternary
+    // (D-CSUBSET-TERNARY-ARRAY-DECAY) so the one decay law has a single chokepoint —
+    // a non-array passes through unchanged.
+    auto const decayArray = [&](TypeId t) -> TypeId {
+        if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+        auto const elems = interner.operands(t);
+        return elems.empty() ? t : interner.pointer(elems[0]);
+    };
     auto const combineBinary =
         [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
         // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: `&&`/`||` yield C's `int`
@@ -9707,13 +9717,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // only. D-LANG-TYPE-IDENTITY-VOCABULARY: `ptrdiff_t` is C's NAMED
             // alias (`long` on LP64, `long long` on LLP64), declared per data
             // model — a bare anonymous I64 matches NEITHER in a `_Generic`.
-            if (*op == HirOpKind::Sub
-                && lt.valid() && rt.valid()
-                && interner.kind(lt) == TypeKind::Ptr
-                && interner.kind(rt) == TypeKind::Ptr
-                && interner.operands(lt)[0] == interner.operands(rt)[0]) {
-                return synthesizedType(interner, sem.pointerDifferenceType,
-                                       s.dataModel, TypeKind::I64);
+            //
+            // D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: an ARRAY operand of pointer
+            // SUBTRACTION decays to Ptr<elem> (C 6.3.2.1p3) FIRST, so `p - arr` /
+            // `arr - p` / `arr - arr` (the FTS5 `zOut - aBuf` shape used UNCAST in an
+            // integer context) type as a true pointer DIFFERENCE (ptrdiff_t), not the
+            // Ptr the un-decayed fallback would yield. Mirrors the HIR combineBinary
+            // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES) which already emits the decay
+            // Cast + the p-q lowering — this closes the semantic-tier asymmetry the
+            // explicit-cast pointer_minus_array example masked. Same-pointee only
+            // (matches c65): a mismatched `int* - char[]` (gcc rejects) is left
+            // un-decayed → falls through (loud, not silent). `p - n` / `arr - n`
+            // (integer rhs) keep the pre-existing behavior (decay leaves rtD non-Ptr
+            // → this arm does not fire).
+            if (*op == HirOpKind::Sub && lt.valid() && rt.valid()) {
+                TypeId const ltD = decayArray(lt);
+                TypeId const rtD = decayArray(rt);
+                if (interner.kind(ltD) == TypeKind::Ptr
+                    && interner.kind(rtD) == TypeKind::Ptr
+                    && interner.operands(ltD)[0] == interner.operands(rtD)[0]) {
+                    return synthesizedType(interner, sem.pointerDifferenceType,
+                                           s.dataModel, TypeKind::I64);
+                }
             }
             // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
             // the commutative add form) is a POINTER, not the integer. `p + n`
@@ -9876,11 +9901,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // SAME pointer type (the matching-element case); incompatible-element
         // conditionals stay on the existing fallback.
         {
-            auto const decayArray = [&](TypeId t) -> TypeId {
-                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
-                auto const elems = interner.operands(t);
-                return elems.empty() ? t : interner.pointer(elems[0]);
-            };
+            // reuses the hoisted `decayArray` (single chokepoint, above combineBinary).
             TypeId const thenD = decayArray(thenT);
             TypeId const elseD = decayArray(elseT);
             if (thenD.valid() && thenD == elseD
@@ -10515,7 +10536,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

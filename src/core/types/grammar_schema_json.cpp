@@ -9701,6 +9701,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.floatConvertsToInt = v.get<bool>();
                 }
             }
+            // C 6.3.1.4/6.5.16.1 float→float NARROWING implicit assignment conversion
+            // (`float f = aDouble`, read by `isAssignable`'s float rank arm). Opt-in
+            // (default false → a non-C schema keeps floats of different width distinct).
+            if (sem.contains("floatSameKindNarrows")) {
+                auto const& v = sem.at("floatSameKindNarrows");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatSameKindNarrows",
+                              "'floatSameKindNarrows' must be a boolean");
+                } else {
+                    cfg.floatSameKindNarrows = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field

@@ -183,6 +183,17 @@ namespace detail::type_rules {
 // in all three), so `double d = ptr;` / `int n = aStruct;` stay rejected. Mirrors
 // the charConvertsToArith / intCrossSignednessConverts gates; completes the C
 // arithmetic-conversion matrix. Closes D-CSUBSET-INT-FLOAT-CONVERSION.
+// `floatSameKindNarrows` (default false): admit a WIDER floating type NARROWING into
+// a NARROWER floating lhs (`float f = aDouble;` — F64→F32; F80/F128→F64/F32) — C
+// 6.3.1.4 / 6.5.16.1, an implicit precision-lossy conversion (the value is the nearest
+// representable; gcc's off-by-default `-Wconversion`). WIDENING (rank(rhs) <= rank(lhs),
+// e.g. F32→F64) is admitted UNCONDITIONALLY by the float rank arm above; only narrowing
+// (rank(rhs) > rank(lhs)) is newly gated here. The HIR `coerce()` arithmetic-core arm
+// materializes the width-exact Cast (MIR `FPTrunc` — the SAME makeCast path F32→F64
+// widening already uses, so NO codegen change), so the post-coerce verifier (gate
+// default false) stays strict. The float-ladder MIRROR of `intSameSignednessNarrows`;
+// float→int stays the separate `floatConvertsToInt` policy (this gate is float→float
+// ONLY). Closes D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING.
 // `charArrayFromStringLiteralInit` (default false): admit `char[N] <- char[M]`
 // (N >= M, char element on BOTH sides) — C 6.7.9p14: a string literal initializing
 // a character array zero-fills the trailing N−M bytes (`char x[7] = "hi";`, the
@@ -209,6 +220,7 @@ namespace detail::type_rules {
     bool                                               intSameSignednessNarrows = false,
     bool                                               intConvertsToFloat = false,
     bool                                               floatConvertsToInt = false,
+    bool                                               floatSameKindNarrows = false,
     bool                                               charArrayFromStringLiteralInit = false,
     bool                                               bitIntConversions = false,
     bool                                               scalarConvertsToBool = false,
@@ -270,7 +282,17 @@ namespace detail::type_rules {
         return intSameSignednessNarrows;          // narrowing: C 6.3.1.3, gated
     }
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
-        return floatRank(rk) <= floatRank(lk);
+        if (floatRank(rk) <= floatRank(lk)) return true;  // widening (F32→F64): always
+        // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING): a WIDER float
+        // narrows to a NARROWER float (`float f = aDouble;`, F80/F128→F64/F32) —
+        // implicit, precision-lossy (gcc's off-by-default `-Wconversion`), value the
+        // nearest representable. Gated on `floatSameKindNarrows`; the HIR `coerce()`
+        // arithmetic-core arm materializes the width-exact Cast (MIR `FPTrunc`, the
+        // SAME makeCast path F32→F64 widening already uses), so the post-coerce verifier
+        // (gate default false) stays strict. The mirror of `intSameSignednessNarrows`
+        // for the single float rank ladder. float→int stays the separate
+        // `floatConvertsToInt` policy (this arm is float→float ONLY).
+        return floatSameKindNarrows;   // narrowing (F64→F32, …): gated
     }
     // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7/§6.5.16.1, D8): a real OR a
     // differently-elemented complex is assignable INTO a complex lhs — real->complex

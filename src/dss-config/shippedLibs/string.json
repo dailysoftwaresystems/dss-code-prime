@@ -1,7 +1,7 @@
 {
   "header": "string.h",
   "standard": "c89",
-  "$comment": "★ c82 (shell.c): `typedefs`/`constants` re-provide size_t + NULL — C89 7.21.1 REQUIRES string.h to provide both without stddef.h; widths/values identical to stddef.json, first-wins dedup makes the multi-header provision moot (stdio/stdlib/time re-provide too, exactly like real libc headers). strdup is POSIX (C23 adopted it) → per-symbol [elf,macho]; the msvcrt spelling is _strdup (the plain-name legacy alias is unverified) — ungate when a pe consumer verifies it.",
+  "$comment": "★ c82 (shell.c): `typedefs`/`constants` re-provide size_t + NULL — C89 7.21.1 REQUIRES string.h to provide both without stddef.h; widths/values identical to stddef.json, first-wins dedup makes the multi-header provision moot (stdio/stdlib/time re-provide too, exactly like real libc headers). strdup is POSIX (C23 adopted it) → per-symbol [elf,macho]; the msvcrt spelling is _strdup (the plain-name legacy alias is unverified) — ungate when a pe consumer verifies it. ★ TF-C49 (SQLITE_THREADSAFE=0): `strerror` is C89 7.11.6.2 (`char *strerror(int)`) exported by libc on ALL formats (glibc/msvcrt/libSystem `T`) → NO format gate. SQLite's unixLogErrorAtLine takes the `#else` (non-threadsafe) branch `zErr = strerror(iErrno)` when SQLITE_THREADSAFE=0 (the default THREADSAFE build takes the `zErr = \"\"` branch → references NEITHER strerror nor strerror_r, why the default corpus compiled clean without it). strerror_r stays UN-shipped: its `#if SQLITE_THREADSAFE && defined(HAVE_STRERROR_R)` branch needs HAVE_STRERROR_R, an autoconf probe DSS never defines → no consumer (would be a speculative build).",
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "typedefs": [
     { "name": "size_t", "variants": [
@@ -31,6 +31,7 @@
     { "name": "memchr",  "signature": "fn(ptr<void>, i32, u64) -> ptr<void>",  "kind": "function", "linkage": "external" },
     { "name": "strspn",  "signature": "fn(ptr<char>, ptr<char>) -> u64",       "kind": "function", "linkage": "external" },
     { "name": "strcspn", "signature": "fn(ptr<char>, ptr<char>) -> u64",       "kind": "function", "linkage": "external" },
+    { "name": "strerror","signature": "fn(i32) -> ptr<char>",                  "kind": "function", "linkage": "external" },
     { "name": "_strdup", "signature": "fn(ptr<char>) -> ptr<char>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ]
 }

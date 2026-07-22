@@ -2168,6 +2168,19 @@ struct DSS_EXPORT SemanticConfig {
     bool intConvertsToFloat = false;
     bool floatConvertsToInt = false;
 
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING): admit the
+    // implicit float→float NARROWING assignment conversion — a WIDER floating rhs
+    // into a NARROWER floating lhs (`float f = aDouble;` F64→F32; F80/F128→F64/F32),
+    // precision-lossy (gcc's off-by-default `-Wconversion`), value the nearest
+    // representable. Read by `isAssignable`'s float rank arm (init / assignment /
+    // call-arg / return). WIDENING (F32→F64) stays unconditional. coerce()'s
+    // arithmetic-core arm materializes the width-exact Cast (MIR FPTrunc, the SAME
+    // makeCast path F32→F64 widening uses), so the post-coerce verifier (default
+    // false) stays strict. Default false → a non-C schema (toy/tsql) keeps floats of
+    // different width strictly distinct. The float-ladder mirror of
+    // intSameSignednessNarrows; float→int is the separate floatConvertsToInt gate.
+    bool floatSameKindNarrows = false;
+
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
     // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.
