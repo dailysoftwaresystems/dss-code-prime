@@ -3052,7 +3052,17 @@ TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
 
 TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeTrivialModule({0xC3}, /*fnSym=*/1);
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the colliding extern must be REFERENCED
+    // to survive the reference gate and reach the compound-index duplicate check —
+    // an unreferenced non-eager import is now dropped (which also removes the
+    // collision). A relocation to SymbolId{1} keeps the extern live so the
+    // ambiguous-resolution reject (fn #1 vs extern #1) still fires.
+    AssembledModule mod = makeTrivialModule({0xE8,0,0,0,0, 0xC3}, /*fnSym=*/1);
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{1};          // references SymbolId{1} → keeps the extern live
+    rel.kind   = RelocationKind{1};
+    mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
@@ -3106,7 +3116,13 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    fn.bytes  = {0xC3};
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the extern must be REFERENCED to
+    // survive the reference gate and REACH the walker whose lazy-binding fail-loud
+    // this test exercises — an unreferenced non-eager import is now dropped (which
+    // would leave no extern for the walker to reject). CALL printf so it stays live.
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};   // call rel32 printf; ret
+    fn.relocations.push_back(
+        Relocation{1u, SymbolId{99}, RelocationKind{1}, 0});   // references printf
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});

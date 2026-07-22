@@ -82,6 +82,17 @@ struct DSS_EXPORT HirExternRecord {
     // read time — so it rides the `canonicalName` rail, not the folded-map rail.
     // Empty ⇒ unversioned. Threaded to FfiMetadata.version → the ELF writer.
     std::string version;
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ this is an EAGER import — a
+    // shipped-library descriptor symbol (producer C, `model.shippedExterns()`)
+    // that DSS imports even when UNREFERENCED (the D-FFI-DESCRIPTOR-EAGER-IMPORT
+    // invariant: a `#include`d descriptor lists a real library export the linker
+    // must bind whether or not this TU calls it). The linker's reference gate
+    // (`rejectOrDropUnreferencedExterns`) KEEPS an eager row unconditionally;
+    // a NON-eager import (producers A/B — a source `extern` decl or a bare-proto
+    // synthesis) survives ONLY when referenced (gcc's unused-decl-emits-nothing
+    // rule). INVARIANT: isEagerImport ⟹ library-bound (a descriptor always ships
+    // a per-format `library` map); the flag never rides an empty-library row.
+    bool isEagerImport = false;
 };
 
 struct DSS_EXPORT CstToHirResult {

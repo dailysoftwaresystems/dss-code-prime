@@ -400,9 +400,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // EMPTY (no format-default fallback) so the reference resolves
             // at the link tier (sibling-TU definition, or the LOUD
             // undefined-symbol reject).
+            // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker so a
+            // shipped-descriptor import (producer C) reaches the linker's
+            // reference gate as eager (kept even when unreferenced). Non-eager
+            // source/bare-proto externs leave it false → dropped if unreferenced.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
-                            r.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.isEagerImport});
         }
 
         auto const ffiEntry = reporter.errorCount();

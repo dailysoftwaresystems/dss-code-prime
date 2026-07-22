@@ -9174,9 +9174,18 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         // selects the ACTIVE target's format entry; an empty map OR a map
         // missing that format ⇒ FF5 falls back to the language's
         // `externLibraryByFormat[format]` default.
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: producer C is the ONLY eager
+        // producer — a shipped-descriptor symbol is imported even when the TU
+        // never references it (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). The
+        // eager bit rides to the linker's reference gate, which keeps this row
+        // unconditionally. INVARIANT (holds by construction here): eager ⟹
+        // library-bound — a descriptor always ships a per-format `library` map
+        // (`noLibraryBinding=false` above). Producers A (~8815) and B (~7943)
+        // leave the bit FALSE, so their unreferenced imports drop like gcc's.
         externDecls.push_back(HirExternRecord{
             node, ext.name, ext.library, /*noLibraryBinding=*/false,
-            ext.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            /*isEagerImport=*/true});
     }
 
     HirNodeId const root = builder.makeModule(decls);

@@ -10731,6 +10731,10 @@ struct Lowerer {
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
                 row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker
+                // (a shipped-descriptor DATA export, e.g. a library global) so
+                // the reference gate keeps it even when unreferenced.
+                row.isEagerImport = meta->isEagerImport;
                 row.isData      = true;
                 // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int
                 // e;` — carry the declaration's thread-storage duration on
@@ -10879,6 +10883,10 @@ struct Lowerer {
             row.mangledName = meta->mangledName;
             row.libraryPath = meta->importLibrary;
             row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker onto
+            // the import row so the linker's reference gate keeps a shipped-
+            // descriptor import (producer C) even when this TU never calls it.
+            row.isEagerImport = meta->isEagerImport;
             externImports.push_back(std::move(row));
             functionSymbols.insert(sym.v);
         }

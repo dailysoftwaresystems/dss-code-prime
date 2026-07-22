@@ -127,6 +127,12 @@ struct DSS_EXPORT ExternDeclRef {
     // descriptor reader. Empty ⇒ unversioned. A plain string (already resolved,
     // not a per-format map), threaded verbatim to FfiMetadata.version.
     std::string_view version{};
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER shipped-descriptor
+    // import (producer C). Threaded verbatim to `FfiMetadata.isEagerImport` by
+    // the FFI synthesize/ingest stages so the eager law rides to the linker's
+    // reference gate (an eager row is kept even when unreferenced). INVARIANT:
+    // isEagerImport ⟹ library-bound. Non-eager (producers A/B) leaves it false.
+    bool isEagerImport = false;
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

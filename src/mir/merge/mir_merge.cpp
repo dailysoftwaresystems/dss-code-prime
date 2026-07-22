@@ -775,12 +775,26 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // library symbol ONE merged id, so this id-keyed dedup emits exactly one row
     // per name (one IAT slot).
     std::vector<ExternImport> survivingExterns;
-    std::unordered_set<std::uint32_t> emittedExternSym;
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: map merged-symbol → survivingExterns
+    // INDEX (not a bare seen-set) so a collapsed duplicate can OR-combine its
+    // eager bit into the already-emitted row. Two CUs importing the SAME name
+    // collapse to ONE row — first-wins for every field EXCEPT isEagerImport: if
+    // EITHER contributor is eager (an eager `#include`d descriptor `puts` + a
+    // hand-written non-eager `extern int puts()`), the surviving row is eager, so
+    // the linker's reference gate keeps it even when unreferenced. Order-
+    // INDEPENDENT: whichever CU's row lands first, the eager bit is ORed in.
+    std::unordered_map<std::uint32_t, std::size_t> emittedExternIdx;
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
         for (ExternImport const& e : cus[ci].externImports) {
             if (plan.definedNames.count(e.mangledName)) continue;  // → direct, strip
             SymbolId const mergedSym = mergedSymbolOf(plan, ci, e.symbol);
-            if (!emittedExternSym.insert(mergedSym.v).second) continue;  // deduped
+            auto const [it, inserted] =
+                emittedExternIdx.try_emplace(mergedSym.v, survivingExterns.size());
+            if (!inserted) {                          // duplicate of an emitted row
+                if (e.isEagerImport)                  // OR-combine the eager law
+                    survivingExterns[it->second].isEagerImport = true;
+                continue;                             // deduped
+            }
             ExternImport carried = e;
             carried.symbol = mergedSym;
             survivingExterns.push_back(std::move(carried));

@@ -358,6 +358,72 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
 }
 
+// ── D-LINK-EXTERN-IMPORT-REFERENCE-GATE (e): the merge OR-combines the eager bit
+// when collapsing duplicate imports of one name. Two CUs both import "puts": one
+// EAGER (a `#include`d shipped-descriptor import), one NON-EAGER (a hand-written
+// `extern int puts()`). Neither defines puts, so it stays a real FFI import and
+// the merge collapses the two rows to ONE. The surviving row MUST be EAGER (the
+// eager law wins on collapse) so the linker's reference gate keeps it even when
+// unreferenced. ORDER-INDEPENDENT: whichever CU lands first, the eager bit is
+// ORed in. RED-ON-DISABLE: replace the OR-combine with a plain first-wins skip →
+// the swapped-order arm (non-eager CU first) yields a NON-EAGER surviving row and
+// goes red.
+TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
+    auto buildCallsPuts = [](SymbolId fnSym, SymbolId extSym,
+                             TypeInterner& in) -> Mir {
+        TypeId const i32 = in.primitive(TypeKind::I32);
+        TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(sig, fnSym);
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const pAddr = mb.addGlobalAddr(extSym, sig);   // extern puts
+        MirInstId const callOps[] = {pAddr};
+        MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+        mb.addReturn(call);
+        return std::move(mb).finish();
+    };
+    // Merge two CUs importing "puts" — one eager, one not — and return the
+    // surviving row's eager bit. `eagerInCu0` selects which CU carries the eager
+    // marker, so running both ways proves the OR-combine is order-independent.
+    auto survivingPutsEager = [&](bool eagerInCu0) -> bool {
+        TypeInterner in0{CompilationUnitId{1}};
+        Mir mir0 = buildCallsPuts(SymbolId{100}, SymbolId{10}, in0);
+        ExternImport e0{SymbolId{10}, "puts", "libc.so"};
+        e0.isEagerImport = eagerInCu0;
+        std::vector<ExternImport> ext0 = {e0};
+
+        TypeInterner in1{CompilationUnitId{2}};
+        Mir mir1 = buildCallsPuts(SymbolId{50}, SymbolId{20}, in1);
+        ExternImport e1{SymbolId{20}, "puts", "libc.so"};
+        e1.isEagerImport = !eagerInCu0;
+        std::vector<ExternImport> ext1 = {e1};
+
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {10, "puts"}}), ext0},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "helper"}, {20, "puts"}}), ext1},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        auto merged =
+            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+        EXPECT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+        if (!merged.has_value()) return false;
+        std::size_t putsRows = 0;
+        bool eager = false;
+        for (ExternImport const& e : merged->externImports) {
+            if (e.mangledName == "puts") { ++putsRows; eager = e.isEagerImport; }
+        }
+        EXPECT_EQ(putsRows, 1u) << "same-named imports must collapse to ONE row";
+        return eager;
+    };
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/true))
+        << "eager CU0 + non-eager CU1 → surviving row EAGER";
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/false))
+        << "non-eager CU0 + eager CU1 → surviving row EAGER (ORDER-INDEPENDENT; "
+           "RED if the merge uses plain first-wins instead of the OR-combine)";
+}
+
 // ── A cross-CU call into a MULTI-BLOCK callee: clone + rewire ──────
 // CU0: int main() { return f(); } where `f` is an EXTERN (import row "f").
 // CU1's f is a diamond: entry CondBr → then(return 7) / else(return 9). This pins

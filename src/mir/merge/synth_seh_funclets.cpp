@@ -551,6 +551,18 @@ bool synthesizeSehFunclets(Mir&                        mir,
         pers.mangledName = "__C_specific_handler";
         pers.libraryPath = "msvcrt.dll";
         pers.isData      = false;
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE (TF-C44): this personality import is
+        // referenced by the pe UNWIND_INFO's EHANDLER handler-RVA field (the SEH scope
+        // descriptor's `personalitySymbol` / `SehHandlerPatch`), NOT by a function/data
+        // RELOCATION — so the linker's reloc-based reference gate cannot see the
+        // reference and would DROP it as an unreferenced non-eager import (→ pe::encodeExec
+        // "SEH personality symbol has no import thunk"). It is a compiler-SYNTHESIZED,
+        // always-needed runtime import (minted ONLY when a SEH region resolved, and wired
+        // into the unwind info by construction), so it is EXEMPT from the reference gate —
+        // the same "keep regardless of reloc-referencing" contract as a descriptor eager
+        // import. Red-on-disable: clear this bit → the seh_catch_* examples' pe64 compile
+        // fails loud at the pe writer.
+        pers.isEagerImport = true;
         externImports.push_back(std::move(pers));
     }
 
