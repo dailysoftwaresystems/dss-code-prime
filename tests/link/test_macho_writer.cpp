@@ -38,6 +38,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1994,6 +1995,202 @@ TEST(MachOExecWriter, ExternImportsProduceDynamicImage) {
     EXPECT_NE(fileView.find("_printf"), std::string_view::npos);
 }
 
+// D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD (the Mach-O sibling of the ELF
+// DT_NEEDED-per-referenced-library walker D-FFI-MATH-LIBM-DT-NEEDED):
+// an extern import that references a NON-libSystem library (the shipped
+// exec schema declares only libSystem) must AUTO-EMIT its own
+// LC_LOAD_DYLIB — before this walker the writer instead REJECTED it
+// (K_SymbolUndefined "not declared in image.loadDylibs"), so a program
+// importing `/usr/lib/libz.1.dylib` (zlib.json) could not link. This is
+// the host-independent structural guard behind the arm64 zlib_roundtrip
+// runtime witness: it pins the emitted LC_LOAD_DYLIB set (schema first,
+// then the referenced lib) AND that each import's bind opcode targets
+// the ordinal of ITS OWN library — the libz import must bind to the libz
+// ordinal (2), NOT libSystem's (1). RED-ON-DISABLE: revert the walker to
+// the validate-or-reject loop → `macho::encode` fails loud (errorCount
+// > 0, empty bytes) → every ASSERT/EXPECT here fails.
+TEST(MachOExecWriter, NonLibSystemImportAutoEmitsLcLoadDylibAndBindsToItsOrdinal) {
+    auto loaded = loadShippedExec();  // arm64 + macho64-arm64-darwin-exec
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    // A single function that BL-branches to BOTH externs (so each gets a
+    // __stubs/__got slot + a bind site), then RET.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94,   // BL  _printf   (sym 99)
+                 0x00, 0x00, 0x00, 0x94,   // BL  _deflate  (sym 100)
+                 0xC0, 0x03, 0x5F, 0xD6};  // RET
+    fn.relocations.push_back(Relocation{0u, SymbolId{99},  RelocationKind{1}, 0});
+    fn.relocations.push_back(Relocation{4u, SymbolId{100}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    // Import #1 lives in the schema-declared libSystem (ordinal 1);
+    // import #2 lives in a NON-schema library — the case the walker now
+    // handles. Declaration order deliberately puts the non-libSystem
+    // import LAST to prove the emission is set-driven, not order-lucky.
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99},  "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{100}, "_deflate",
+                     "/usr/lib/libz.1.dylib"});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a referenced non-libSystem import must AUTO-EMIT LC_LOAD_DYLIB, "
+           "not be rejected (D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD).";
+    ASSERT_FALSE(bytes.empty());
+
+    // ── Walk the load commands: collect LC_LOAD_DYLIB paths in order and
+    //    capture the LC_DYLD_INFO_ONLY bind stream.
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::vector<std::string> dylibPaths;
+    std::size_t bindOff = 0, bindSize = 0;
+    std::size_t off = 32;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        ASSERT_NE(cmdsize, 0u);
+        if (cmd == 0x0Cu) {  // LC_LOAD_DYLIB
+            std::uint32_t const nameOff = readU32LE(bytes, off + 8);
+            std::string path(
+                reinterpret_cast<char const*>(bytes.data()) + off + nameOff);
+            dylibPaths.push_back(std::move(path));
+        } else if (cmd == 0x80000022u) {  // LC_DYLD_INFO_ONLY
+            bindOff  = readU32LE(bytes, off + 16);
+            bindSize = readU32LE(bytes, off + 20);
+        }
+        off += cmdsize;
+    }
+
+    // THE PIN #1: exactly two LC_LOAD_DYLIB — the schema's libSystem
+    // FIRST (fixed ordinal 1), then the referenced libz.
+    ASSERT_EQ(dylibPaths.size(), 2u)
+        << "libSystem (schema) + libz (referenced) → two LC_LOAD_DYLIB.";
+    EXPECT_EQ(dylibPaths[0], "/usr/lib/libSystem.B.dylib");
+    EXPECT_EQ(dylibPaths[1], "/usr/lib/libz.1.dylib");
+
+    // ── Decode the bind opcode stream into name → dylib-ordinal.
+    ASSERT_GT(bindSize, 0u);
+    ASSERT_LE(bindOff + bindSize, bytes.size());
+    std::unordered_map<std::string, std::uint32_t> ordinalOf;
+    std::uint32_t curOrd = 0;
+    std::size_t bi = bindOff;
+    std::size_t const bend = bindOff + bindSize;
+    auto skipUleb = [&]() {
+        while (bi < bend && (bytes[bi] & 0x80u)) ++bi;
+        if (bi < bend) ++bi;
+    };
+    while (bi < bend) {
+        std::uint8_t const opcode = bytes[bi] & 0xF0u;
+        std::uint8_t const imm    = bytes[bi] & 0x0Fu;
+        ++bi;
+        switch (opcode) {
+            case 0x00u: bi = bend; break;               // BIND_OPCODE_DONE
+            case 0x10u: curOrd = imm; break;            // SET_DYLIB_ORDINAL_IMM
+            case 0x20u: {                               // SET_DYLIB_ORDINAL_ULEB
+                std::uint32_t v = 0; int sh = 0;
+                while (bi < bend) {
+                    std::uint8_t b = bytes[bi++];
+                    v |= static_cast<std::uint32_t>(b & 0x7Fu) << sh;
+                    if (!(b & 0x80u)) break;
+                    sh += 7;
+                }
+                curOrd = v;
+                break;
+            }
+            case 0x40u: {                               // SET_SYMBOL_TRAILING_FLAGS_IMM
+                std::string name(
+                    reinterpret_cast<char const*>(bytes.data()) + bi);
+                bi += name.size() + 1;                  // name + NUL
+                ordinalOf[name] = curOrd;
+                break;
+            }
+            case 0x50u: break;                          // SET_TYPE_IMM
+            case 0x60u: skipUleb(); break;              // SET_ADDEND_SLEB
+            case 0x70u: skipUleb(); break;              // SET_SEGMENT_AND_OFFSET_ULEB
+            case 0x80u: skipUleb(); break;              // ADD_ADDR_ULEB
+            case 0x90u: break;                          // DO_BIND
+            default: break;
+        }
+    }
+
+    // THE PIN #2: each import binds to the ordinal of ITS OWN library.
+    // _printf → libSystem (ordinal 1); _deflate → libz (ordinal 2). A
+    // regression that pinned every import to libSystem would bind
+    // _deflate to ordinal 1 and dyld would search libSystem for a symbol
+    // that lives in libz → load failure.
+    ASSERT_TRUE(ordinalOf.count("_printf"));
+    ASSERT_TRUE(ordinalOf.count("_deflate"));
+    EXPECT_EQ(ordinalOf["_printf"],  1u);
+    EXPECT_EQ(ordinalOf["_deflate"], 2u)
+        << "the libz import must bind to the libz dylib ordinal (2), "
+           "NOT libSystem's (1).";
+
+    // ── THE PIN #3: ncmds/sizeofcmds account for the added command.
+    // Re-encode an otherwise-identical module whose SECOND import also
+    // lives in libSystem (so exactly ONE dylib is emitted) — same extern
+    // count, same got slots, same binds; the ONLY difference is the extra
+    // referenced dylib. ncmds must grow by exactly 1 and sizeofcmds by
+    // exactly the libz LC_LOAD_DYLIB size.
+    AssembledModule baseMod;
+    baseMod.expectedFuncCount = 1;
+    AssembledFunction bfn;
+    bfn.symbol = SymbolId{1};
+    bfn.bytes  = {0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00, 0x94,
+                  0xC0, 0x03, 0x5F, 0xD6};
+    bfn.relocations.push_back(Relocation{0u, SymbolId{99},  RelocationKind{1}, 0});
+    bfn.relocations.push_back(Relocation{4u, SymbolId{100}, RelocationKind{1}, 0});
+    baseMod.functions.push_back(std::move(bfn));
+    baseMod.externImports.push_back(
+        ExternImport{SymbolId{99},  "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    baseMod.externImports.push_back(
+        ExternImport{SymbolId{100}, "_puts",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter baseRep;
+    auto baseBytes = macho::encode(baseMod, *loaded.target, *loaded.format,
+                                   baseRep);
+    ASSERT_EQ(baseRep.errorCount(), 0u);
+    ASSERT_FALSE(baseBytes.empty());
+    std::uint32_t const baseNcmds      = readU32LE(baseBytes, 16);
+    std::uint32_t const baseSizeofcmds = readU32LE(baseBytes, 20);
+    std::uint32_t const thisSizeofcmds = readU32LE(bytes, 20);
+    EXPECT_EQ(ncmds, baseNcmds + 1u)
+        << "the extra referenced dylib adds exactly one LC_LOAD_DYLIB.";
+    // LC_LOAD_DYLIB size = 24-byte dylib_command + path + NUL, padded to 8.
+    std::string const libz = "/usr/lib/libz.1.dylib";
+    std::uint32_t const libzCmdSize =
+        static_cast<std::uint32_t>(((24 + libz.size() + 1 + 7) / 8) * 8);
+    EXPECT_EQ(thisSizeofcmds, baseSizeofcmds + libzCmdSize);
+}
+
+// D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD, fail-loud belt: an extern with an
+// EMPTY libraryPath is unresolvable — Mach-O's two-level namespace binds
+// every import against a NAMED dylib ordinal, so there is no library for
+// dyld to search. The walker rejects it (the ELF library-less guard's
+// Mach-O analog; Mach-O grants no `.so`-style library-less exemption).
+TEST(MachOExecWriter, EmptyLibraryPathImportFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};  // BL ; RET
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_mystery", ""});  // no library
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a library-less import must fail loud, not ship a bindless binary.";
+}
+
 TEST(MachOExecWriter, DynamicImageEmitsExpectedSegments) {
     // Dynamic Mach-O carries 4 segments: __PAGEZERO + __TEXT (with
     // __text + __stubs) + __DATA_CONST (with __got) + __LINKEDIT.
@@ -3217,10 +3414,14 @@ TEST(MachOExecWriter, DysymtabIundefsymNundefsymCorrect) {
     EXPECT_EQ(nundefsym, 1u);
 }
 
-TEST(MachOExecWriter, UndeclaredDylibInExternImportFailsLoud) {
-    // Defense-in-depth: extern.libraryPath must be present in
-    // image.loadDylibs — dyld rejects bind opcodes whose ordinals
-    // point at an undeclared dylib.
+TEST(MachOExecWriter, UndeclaredDylibInExternImportAutoEmitsLcLoadDylib) {
+    // D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD: a NAMED import library not
+    // declared in the format schema's `image.loadDylibs` is no longer
+    // REJECTED — it is AUTO-EMITTED as its own LC_LOAD_DYLIB (the Mach-O
+    // sibling of the ELF DT_NEEDED-per-referenced-library walker). This
+    // supersedes the pre-cycle "undeclared dylib fails loud" contract.
+    // (An EMPTY libraryPath still fails loud — see
+    // EmptyLibraryPathImportFailsLoud.)
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped(
@@ -3239,8 +3440,30 @@ TEST(MachOExecWriter, UndeclaredDylibInExternImportFailsLoud) {
                      "/usr/lib/libNotDeclared.dylib"});
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    ASSERT_GE(rep.errorCount(), 1u);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a named non-schema import library must AUTO-EMIT LC_LOAD_DYLIB, "
+           "not be rejected.";
+    ASSERT_FALSE(bytes.empty());
+    // The undeclared library appears as its own LC_LOAD_DYLIB.
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    bool sawUndeclared = false, sawLibSystem = false;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        ASSERT_NE(cmdsize, 0u);
+        if (cmd == 0x0Cu) {  // LC_LOAD_DYLIB
+            std::string const path(
+                reinterpret_cast<char const*>(bytes.data()) + off
+                + readU32LE(bytes, off + 8));
+            if (path == "/usr/lib/libNotDeclared.dylib") sawUndeclared = true;
+            if (path == "/usr/lib/libSystem.B.dylib")     sawLibSystem = true;
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawLibSystem)  << "the schema's libSystem stays declared.";
+    EXPECT_TRUE(sawUndeclared) << "the referenced non-schema library is "
+                                  "auto-emitted as its own LC_LOAD_DYLIB.";
 }
 
 // ── D-CSUBSET-THREAD-LOCAL (TLS C4): Mach-O TLV structural pins ──────────

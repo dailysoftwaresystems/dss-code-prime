@@ -3178,39 +3178,83 @@ encodeExecDynamic(AssembledModule const&    module,
     //       resolved.
 
     // ── (h) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ────────
+    //
+    // D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD (the Mach-O sibling of the ELF
+    // DT_NEEDED-per-referenced-library walker D-FFI-MATH-LIBM-DT-NEEDED):
+    // the emitted LC_LOAD_DYLIB set is the schema's `image.loadDylibs`
+    // UNION the DISTINCT libraries referenced by extern imports
+    // (`externImports[].libraryPath`, collected into `libraryOrder`
+    // above). Before this walker the loop here merely VALIDATED that
+    // every referenced library was already declared in the schema and
+    // REJECTED otherwise — and the shipped exec schema declares only
+    // libSystem, so a program importing a non-libSystem dylib (e.g.
+    // `/usr/lib/libz.1.dylib` via zlib.json) could not link. Now a
+    // referenced non-schema library is AUTO-EMITTED as its own
+    // LC_LOAD_DYLIB, exactly as ELF auto-emits a DT_NEEDED. Order is
+    // STABLE: the schema libraries FIRST (at their fixed ordinals —
+    // libSystem stays ordinal 1, so the `_exit`/TLV-bootstrap binds are
+    // unmoved), then the referenced extras sorted lexicographically +
+    // deduped (the ELF DT_NEEDED ordering discipline — deterministic and
+    // config-agnostic). AGNOSTIC: the set is driven entirely by
+    // descriptor-supplied paths; no arch / format / library-name
+    // identity appears here.
+    std::vector<std::string> emittedDylibs;
+    emittedDylibs.reserve(im.loadDylibs.size() + libraryOrder.size());
+    std::unordered_set<std::string> emittedSet;
+    for (auto const& d : im.loadDylibs) {
+        if (emittedSet.insert(d.path).second) emittedDylibs.push_back(d.path);
+    }
+    // Referenced libraries not already declared by the schema, collected
+    // then sorted + deduped (lexicographic, matching the ELF DT_NEEDED
+    // order). An EMPTY referenced path is FAIL-LOUD: Mach-O's two-level
+    // namespace binds every import against a NAMED dylib ordinal, so a
+    // library-less import cannot be resolved by dyld (the ELF
+    // `numLibs == 0` guard's Mach-O analog; upstream the exec linker
+    // already rejects such rows via allowsUndefinedImports()==false —
+    // this is the belt, and unlike ELF's `.so` arm Mach-O grants no
+    // library-less exemption to either image flavor).
+    std::vector<std::string> referencedExtra;
+    referencedExtra.reserve(libraryOrder.size());
+    for (auto const& lib : libraryOrder) {
+        if (lib.empty()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: an extern import declares an "
+                 "empty libraryPath — Mach-O's two-level namespace binds "
+                 "every import against a NAMED dylib ordinal, so dyld "
+                 "cannot resolve a library-less import. "
+                 "D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD.");
+            return {};
+        }
+        if (!emittedSet.contains(lib)) referencedExtra.push_back(lib);
+    }
+    std::sort(referencedExtra.begin(), referencedExtra.end());
+    referencedExtra.erase(
+        std::unique(referencedExtra.begin(), referencedExtra.end()),
+        referencedExtra.end());
+    for (auto const& lib : referencedExtra) {
+        emittedSet.insert(lib);
+        emittedDylibs.push_back(lib);
+    }
+
     std::size_t const dylinkerCmdSize =
         commandSizeWithPath(12, im.dylinkerPath);
     std::size_t totalDylibCmdSize = 0;
-    for (auto const& d : im.loadDylibs) {
-        totalDylibCmdSize += commandSizeWithPath(24, d.path);
+    for (auto const& path : emittedDylibs) {
+        totalDylibCmdSize += commandSizeWithPath(24, path);
     }
-    // Linker validates non-empty loadDylibs upstream; defense-in-
-    // depth makes sure every library referenced by an externImport
-    // is in loadDylibs. dyld rejects bind opcodes referring to
-    // ordinals not present in LC_LOAD_DYLIB[].
-    std::unordered_set<std::string> declaredLibs;
-    declaredLibs.reserve(im.loadDylibs.size());
-    for (auto const& d : im.loadDylibs) declaredLibs.insert(d.path);
-    for (auto const& lib : libraryOrder) {
-        if (!declaredLibs.contains(lib)) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExecDynamic: extern "
-                             "imports reference library '"} + lib +
-                 "' but it is not declared in image.loadDylibs — "
-                 "dyld rejects bind opcodes referring to undeclared "
-                 "dylib ordinals.");
-            return {};
-        }
-    }
-    // Stable map: library → dylib ordinal (1-based per dyld).
+    // Stable map: library → dylib ordinal (1-based per dyld). Keyed off
+    // `emittedDylibs` (schema ∪ referenced) so a referenced non-schema
+    // library resolves to ITS ordinal (not libSystem's) — each import's
+    // BIND_OPCODE_SET_DYLIB_ORDINAL then targets the dylib that actually
+    // exports it.
     auto dylibOrdinal = [&](std::string const& path)
                           -> std::uint32_t {
-        for (std::size_t i = 0; i < im.loadDylibs.size(); ++i) {
-            if (im.loadDylibs[i].path == path) {
+        for (std::size_t i = 0; i < emittedDylibs.size(); ++i) {
+            if (emittedDylibs[i] == path) {
                 return static_cast<std::uint32_t>(i + 1);
             }
         }
-        return 0;  // unreachable — declaredLibs check above
+        return 0;  // unreachable — every libraryOrder entry is in emittedDylibs
     };
 
     // ── (i) Build dyld-binding bytes ─────────────────────────────
@@ -3626,7 +3670,7 @@ encodeExecDynamic(AssembledModule const&    module,
         + (emitDylinker ? 1u : 0u)
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
-        + im.loadDylibs.size() + 1u
+        + emittedDylibs.size() + 1u    // N × LC_LOAD_DYLIB (schema ∪ referenced)
         + (useChainedFixups ? 0u : 1u)
         + (emitCodeSig ? 1u : 0u)
         + (emitBuildVersion ? 1u : 0u));
@@ -4478,17 +4522,21 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU64LE(bytes, 0);
     }
 
-    // LC_LOAD_DYLIB[]
-    for (auto const& d : im.loadDylibs) {
+    // LC_LOAD_DYLIB[] — one per dylib in the emitted set (schema ∪
+    // referenced import libraries; D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD).
+    // timestamp / current_version / compatibility_version are 0 (dyld
+    // accepts 0 and resolves a `/usr/lib/...` dylib by path even when it
+    // lives only in the dyld shared cache).
+    for (auto const& path : emittedDylibs) {
         std::size_t const cmdStart = bytes.size();
-        std::size_t const cmdSize = commandSizeWithPath(24, d.path);
+        std::size_t const cmdSize = commandSizeWithPath(24, path);
         appendU32LE(bytes, LC_LOAD_DYLIB);
         appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
         appendU32LE(bytes, 24);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
-        for (char c : d.path)
+        for (char c : path)
             appendU8(bytes, static_cast<std::uint8_t>(c));
         appendU8(bytes, 0);
         while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);
