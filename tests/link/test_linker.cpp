@@ -322,6 +322,48 @@ TEST(Linker, UnknownSymbolEmitsK_SymbolUndefined) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u);
 }
 
+// D-LINK-DATA-RELOC-TARGET-VALIDATE: a DATA-item relocation (an abs64 pointer slot
+// in a symbol-address global / function-pointer table / switch jump table) whose
+// target is declared by NO function / data item / extern in its CU must fail LOUD at
+// the RESOLUTION tier — symmetric with the function-relocation check above. Before
+// this the resolver inspected ONLY `m.functions[].relocations`, so a dangling /
+// mis-targeted DATA reloc slipped past resolution and surfaced only as a silent
+// wrong / NULL pointer at runtime (the class the aSyscall miscompile belonged to).
+// RED-ON-DISABLE: remove the `m.dataItems` loop in `resolveCrossCuSymbols` → the
+// resolution-tier diagnostic (message "data-item relocation in CU …") never fires.
+TEST(Linker, DataItemUndefinedRelocationFailsLoud) {
+    auto loaded = loadMinimal();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;             // one clean function (no relocations)
+    fn.symbol = SymbolId{1};
+    mod.functions.push_back(std::move(fn));
+    // A data item (a function-pointer table analogue) whose abs64 relocation targets
+    // SymbolId #99 — declared by nothing in this CU.
+    AssembledData di;
+    di.symbol  = SymbolId{2};
+    di.section = DataSectionKind::Data;
+    di.bytes.assign(8, std::uint8_t{0});
+    di.relocations.push_back(Relocation{/*offset=*/0u, /*target=*/SymbolId{99},
+                                        /*kind=*/RelocationKind{2}, /*addend=*/0});
+    mod.dataItems.push_back(std::move(di));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "a DATA-item relocation to an undeclared symbol must fail loud";
+    bool namedByResolutionCheck = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("data-item relocation") != std::string::npos) {
+            namedByResolutionCheck = true;
+        }
+    }
+    EXPECT_TRUE(namedByResolutionCheck)
+        << "the resolution-tier data-item reloc check must NAME the dangling target "
+           "(RED-on-disable if the dataItems loop is removed).";
+    EXPECT_FALSE(image.ok());
+}
+
 // D-LK4-3 collision pin: two CompilationUnits (distinct cuIds) each define a
 // function with the SAME bare SymbolId #42, and each NAMES its #42 in the symbol
 // table (with DISTINCT names "foo"/"bar"). The linker's compound key (cuId,

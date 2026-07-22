@@ -575,10 +575,19 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // ExternImport row, so a surviving real-FFI extern (its name has no cross-CU
     // def) collapses across CUs to one canonical merged id by mangledName.
     auto assignSymbol = [&](std::uint32_t ci, SymbolId oldSym,
-                            std::string const& name, bool isFfiExtern) {
+                            std::string const& name, bool isFfiExtern,
+                            bool isLocalDef) {
         CuSymKey const key{ci, oldSym.v};
         if (plan.symMerged.count(key)) return;  // already assigned (idempotent)
-        if (!name.empty()) {
+        // A LOCAL (internal-linkage) DEFINITION is module-private (C 6.2.2p3): a
+        // `static` object / function is a DISTINCT entity even when an UNRELATED CU
+        // exports the SAME name, so it must NEVER fold onto a same-named externally-
+        // visible winner. Only externally-visible defs (Global/Weak — collapsing
+        // onto their own winner) and extern REFERENCES fold by name. Without this
+        // guard a `static aSyscall[]` in one TU silently ALIASES a non-static
+        // `aSyscall[]` in another (a function-pointer-table miscompile invisible
+        // until BOTH TUs are linked — D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0).
+        if (!name.empty() && !isLocalDef) {
             auto const it = plan.canonicalForName.find(name);
             if (it != plan.canonicalForName.end()) {
                 // Externally-visible name (def winner / shadowed loser / an
@@ -619,18 +628,23 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         for (std::uint32_t fi = 0; fi < nf; ++fi) {
             MirFuncId const f = m.funcAt(fi);
             assignSymbol(ci, m.funcSymbol(f), cus[ci].nameOf(m.funcSymbol(f)),
-                         /*isFfiExtern=*/false);
+                         /*isFfiExtern=*/false,
+                         /*isLocalDef=*/m.funcBinding(f) == SymbolBinding::Local);
         }
         std::size_t const ng = m.moduleGlobalCount();
         for (std::uint32_t gi = 0; gi < ng; ++gi) {
             MirGlobalId const g = m.globalAt(gi);
             assignSymbol(ci, m.globalSymbol(g), cus[ci].nameOf(m.globalSymbol(g)),
-                         /*isFfiExtern=*/false);
+                         /*isFfiExtern=*/false,
+                         /*isLocalDef=*/m.globalBinding(g) == SymbolBinding::Local);
         }
         for (ExternImport const& e : cus[ci].externImports) {
             // An extern's name is its mangledName (nameOf must agree, but the
-            // import row is authoritative for the on-binary name).
-            assignSymbol(ci, e.symbol, e.mangledName, /*isFfiExtern=*/true);
+            // import row is authoritative for the on-binary name). An extern is a
+            // REFERENCE, never a Local definition — it folds onto a cross-CU def
+            // winner or a shared FFI import (isLocalDef=false).
+            assignSymbol(ci, e.symbol, e.mangledName, /*isFfiExtern=*/true,
+                         /*isLocalDef=*/false);
         }
     }
 
@@ -685,8 +699,16 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     builder.setCharTypesAliasAll(cus[0].mir->charTypesAliasAll());
 
     auto isShadowedLoser = [&](std::uint32_t ci, std::string const& name,
-                               SymbolId sym) -> bool {
+                               SymbolId sym, bool isLocal) -> bool {
         if (name.empty()) return false;
+        // A LOCAL (internal-linkage) definition is module-private (C 6.2.2p3): it
+        // is neither a winner NOR a loser of cross-CU name resolution, even when it
+        // shares a name with an externally-visible symbol in another CU. It is
+        // ALWAYS kept (cloned with its own fresh merged id). Without this, a
+        // `static aSyscall[]` sharing a name with another TU's extern `aSyscall[]`
+        // would be dropped as a "loser" and its own references would dangle
+        // (D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0).
+        if (isLocal) return false;
         auto const it = resolution.winners.find(name);
         if (it == resolution.winners.end()) return false;  // not externally visible
         LinkedSymbolKey const& win = it->second;
@@ -699,7 +721,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         for (std::uint32_t fi = 0; fi < nf; ++fi) {
             MirFuncId const f = m.funcAt(fi);
             std::string const name = cus[ci].nameOf(m.funcSymbol(f));
-            if (isShadowedLoser(ci, name, m.funcSymbol(f))) continue;  // weak loser
+            if (isShadowedLoser(ci, name, m.funcSymbol(f),
+                                m.funcBinding(f) == SymbolBinding::Local))
+                continue;  // weak loser (never a Local — module-private, kept)
             SymbolId const mergedSym =
                 mergedSymbolOf(plan, ci, m.funcSymbol(f));
             FunctionCloner cloner{m, *cus[ci].interner, ci, plan, host, builder};
@@ -716,7 +740,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         for (std::uint32_t gi = 0; gi < ng; ++gi) {
             MirGlobalId const g = m.globalAt(gi);
             std::string const name = cus[ci].nameOf(m.globalSymbol(g));
-            if (isShadowedLoser(ci, name, m.globalSymbol(g))) continue;
+            if (isShadowedLoser(ci, name, m.globalSymbol(g),
+                                m.globalBinding(g) == SymbolBinding::Local))
+                continue;
 
             TypeId const ty = reinternType(*cus[ci].interner, m.globalType(g),
                                            host, plan.typeRemap[ci]);
@@ -813,7 +839,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 MirFuncId const f = m.funcAt(fi);
                 std::string const name = cus[ci].nameOf(m.funcSymbol(f));
                 if (name.empty() || !entrySet.count(name)) continue;
-                if (isShadowedLoser(ci, name, m.funcSymbol(f))) continue;
+                if (isShadowedLoser(ci, name, m.funcSymbol(f),
+                                    m.funcBinding(f) == SymbolBinding::Local))
+                    continue;
                 userEntrySymbol = mergedSymbolOf(plan, ci, m.funcSymbol(f));
                 break;
             }

@@ -274,6 +274,28 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                 }
             }
         }
+        // D-LINK-DATA-RELOC-TARGET-VALIDATE: DATA-item relocations get the SAME
+        // resolvability check as function relocations above — an abs64 pointer slot
+        // in a symbol-address global / function-pointer table / jump table (the c67
+        // encodeAggregateValue arm, the c70 switch table) targets a SymbolId that
+        // must be declared in this CU (the compound index covers functions, data
+        // items, block symbols, and extern imports). Closing this asymmetry makes a
+        // mis-remapped or dangling DATA reloc target fail LOUD at link
+        // (K_SymbolUndefined) instead of surfacing as a SILENT wrong/NULL pointer at
+        // runtime, exactly the class the function-reloc loop already guards.
+        for (auto const& di : m.dataItems) {
+            for (auto const& rel : di.relocations) {
+                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "data-item relocation in CU #" + std::to_string(m.cuId.v) +
+                           " (data SymbolId #" + std::to_string(di.symbol.v) +
+                           ") targets symbol #" + std::to_string(rel.target.v) +
+                           " which is not defined or imported in that CompilationUnit "
+                           "(a cross-CU reference must be declared as an extern import).");
+                }
+            }
+        }
     }
     image.resolvedGlobalDefs.clear();
     for (auto const& [name, key] : resolution.winners) image.resolvedGlobalDefs.emplace(name, key);
@@ -898,6 +920,36 @@ LinkedImage link(std::span<AssembledModule const> modules,
             }
         }
         if (funcResolved) ++image.resolvedFuncCount;
+    }
+
+    // D-LINK-DATA-RELOC-TARGET-VALIDATE: DATA-item relocations get the SAME
+    // undefined-target check as the function relocations above. A symbol-address
+    // global / function-pointer table / c70 switch jump table carries abs64
+    // relocations in its DATA bytes whose target must be a declared function / data
+    // item / synthetic block symbol / extern import (all indexed in `symbolIndex` by
+    // buildCompoundIndex) or a writer-reserved singleton. Without this, a
+    // mis-remapped or dangling data-reloc target surfaced ONLY as a silent wrong /
+    // NULL pointer at runtime — the class the aSyscall Local/Global merge miscompile
+    // (D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0) belonged to — instead of a LOUD
+    // K_SymbolUndefined at link. This is the N==1 twin of the per-CU data check the
+    // multi-module `resolveCrossCuSymbols` now runs (and the merged whole-program
+    // image flows through THIS single-CU path).
+    for (auto const& di : module.dataItems) {
+        for (auto const& reloc : di.relocations) {
+            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
+                && !isWriterReservedSymbolIdValue(reloc.target.v)) {
+                std::string msg = "data-item relocation in symbol #";
+                msg += std::to_string(di.symbol.v);
+                msg += " references undefined symbol #";
+                msg += std::to_string(reloc.target.v);
+                msg += " (not declared by any AssembledFunction, "
+                       "ExternImport, nor AssembledData item)";
+                report(reporter,
+                       DiagnosticCode::K_SymbolUndefined,
+                       DiagnosticSeverity::Error,
+                       std::move(msg));
+            }
+        }
     }
 
     // Skip walker dispatch if the cross-reference unifier failed.
