@@ -3042,6 +3042,37 @@ TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
+// GROUP 10 — GROUPED declarators (D-CSUBSET-GROUPED-DECLARATOR-CONST closed with
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION): the object-forming pointer
+// layer hides inside redundant parens, so declaratorObjectIsConst must DESCEND
+// the group to find it. Each pin flips under revert (drop the group descent):
+// the grouped const-pointer stops violating; the grouped pointer-to-const starts
+// spuriously violating (the head-scan over-approximation returns).
+// `char (* const p)` ≡ `char * const p` — a const POINTER object → `p += 1`
+// violates. RED-ON-DISABLE: without the group descent the layer is invisible,
+// the object falls to the head scan (no const in `char`) → 0 violations.
+TEST(SemanticAnalyzerCSubset, GroupedConstPointerParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char (* const p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const char (*p)` ≡ `const char *p` — a MUTABLE pointer to const → `p += 1`
+// clean. RED-ON-DISABLE: without the group descent the object falls to the head
+// scan, which sees the head `const` and wrongly marks p const → a spurious
+// S_ConstViolation (the pre-fix over-approximation). This is the exact
+// D-CSUBSET-GROUPED-DECLARATOR-CONST closing pin (`const char (*p); p = 0;`).
+TEST(SemanticAnalyzerCSubset, GroupedPointerToConstParamIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char (*p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
 // aliased TypeId (I32). (c-subset's grammar parses the typedef DECL; the
 // alias-in-type-position USE site is exercised generically — see the
@@ -8750,6 +8781,53 @@ TEST(SemanticAnalyzerCSubset, AutoInfersIntPass15Visible) {
         << "typeof(x) at the NEXT declaration's Pass-1.5 visit must see the "
            "inferred type (y has no initializer — the backfill cannot type it)";
     EXPECT_EQ(model.lattice().interner().kind(y->type), TypeKind::I32);
+}
+
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION (the PRIMARY red-on-disable
+// pin): a file-scope ARRAY whose ELEMENTS are const pointers — the direct-
+// declarator spelling `int (*const ops[N])(int)` — is a const object (C 6.7.3p9
+// so-qualifies the element; gcc/clang park such a fn-ptr table in relocated-read-
+// only `.data.rel.ro`). Its `SymbolRecord.isConst` must be TRUE so it threads
+// MutabilityAttr → MirGlobal.isConst → the asm relocBearingGlobalSection
+// chokepoint routes it to RelRoConst, not writable `.data`. The const pointer
+// layer hides inside the parenthesized group, so this REDS if declaratorObject-
+// IsConst stops descending the group (the object then falls to the head scan,
+// which sees no `const` in `int` → isConst=false → mis-routed to `.data`). This
+// is the shape of sqlite3.c's `static int (*const sqlite3BuiltinExtensions[])
+// (sqlite3*) = {…};`. A NON-const sibling and the typedef'd spelling anchor the
+// two ends (must-not-over-classify / must-stay-correct).
+TEST(SemanticAnalyzerCSubset, ElementConstFnPtrArrayGlobalIsConst) {
+    auto model = analyzeShipped("c-subset", {
+        "int a(int x){ return x + 10; }\n"
+        "int b(int x){ return x + 20; }\n"
+        "int (*const ops[2])(int) = { a, b };\n"        // array of CONST fn-ptrs
+        "int (*muts[2])(int) = { a, b };\n"             // array of MUTABLE fn-ptrs
+        "typedef int (*op)(int);\n"
+        "const op tab[2] = { a, b };\n"                 // typedef'd spelling
+        "static int (*const exts[])(int) = { a };\n",   // sqlite's inferred static
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* ops = findSymbolNamed(model, "ops");
+    ASSERT_NE(ops, nullptr);
+    EXPECT_TRUE(ops->isConst)
+        << "int (*const ops[2])(int): the array's elements are const pointers "
+           "→ a const object → RelRoConst; the group-hidden `* const` layer must "
+           "be found by descending the parenthesized group";
+    auto const* muts = findSymbolNamed(model, "muts");
+    ASSERT_NE(muts, nullptr);
+    EXPECT_FALSE(muts->isConst)
+        << "int (*muts[2])(int): mutable fn-ptr elements → NOT const (the fix "
+           "keys on the `* const` marker, never merely on the grouping)";
+    auto const* tab = findSymbolNamed(model, "tab");
+    ASSERT_NE(tab, nullptr);
+    EXPECT_TRUE(tab->isConst)
+        << "const op tab[2] (typedef spelling) stays const — the head-const path "
+           "is untouched by the group descent";
+    auto const* exts = findSymbolNamed(model, "exts");
+    ASSERT_NE(exts, nullptr);
+    EXPECT_TRUE(exts->isConst)
+        << "static int (*const exts[])(int) — sqlite's inferred-size const fn-ptr "
+           "table — is a const object too";
 }
 
 // ★C1 — the auto-presence gate: all four specifier-led C89 implicit-int

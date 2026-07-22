@@ -903,10 +903,17 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
 // `declaratorDeclaredType` (the c27 volatile path) — one structural model, the
 // const verdict cannot drift from the type the declarator actually forms.
 //
-// SCOPE: a GROUPED pointer declarator `char (* const p)` hides its layer inside
-// the group, so it falls to the whole-decl scan (STATUS QUO — no regression; it
-// was coarse before too). Grouped-with-head-const stays a pre-existing
-// over-approximation (anchor D-CSUBSET-GROUPED-DECLARATOR-CONST).
+// GROUPS (D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
+// CLASSIFICATION, closed together): a GROUPED pointer declarator hides its layer
+// inside the parens — `char (* const p)` (scalar), and the array-of-const-fn-ptr
+// direct-declarator spelling `int (* const ops[N])(int)` (an array whose ELEMENT
+// is a const pointer; C 6.7.3p9 so-qualifies the element, and gcc/clang park such
+// a table in relocated-read-only `.data.rel.ro`). The pointer-layer scan now
+// DESCENDS the group (same recursion `directDeclaredType` / `declaratorNameNode`
+// use) to reach the TRUE outermost object-forming pointer layer, so both spellings
+// classify like their `int * const p` / typedef'd `const op tab[N]` siblings.
+// A grouped-with-head-const `const char (*p)` is thereby MUTABLE (the inner `*`
+// carries no const), the correct verdict — the former over-approximation is gone.
 [[nodiscard]] bool
 declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         DeclaratorConfig const& dc, SchemaTokenId constMarker,
@@ -927,16 +934,57 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
             if (d.valid()) inner = d;
         }
     }
-    // The LAST pointer layer in source order = the outermost pointer, whose
-    // qualifier governs the OBJECT. visibleChildren is source-ordered.
+    // Find the pointer layer (if any) forming the OBJECT's outermost derivation,
+    // whose `* const` qualifier governs object-const-ness (a HEAD/pointee const
+    // leaves the pointer object MUTABLE — c36). The LAST pointer layer in source
+    // order at a declarator level = the outermost pointer. When NO pointer layer
+    // is a DIRECT child, an object-forming pointer may still be parenthesized
+    // inside the direct's GROUP — `char (* const p)` (a grouped scalar const
+    // pointer) or `int (* const ops[N])(int)` (an array of const fn-ptrs, the
+    // direct-declarator spelling) — so descend the group exactly as
+    // directDeclaredType / declaratorNameNode do (by config-resolved ROLE, never a
+    // rule name), skipping the direct's own array/fn suffixes (they carry outer
+    // array-/fn-ness, never the object's const, which lives on the pointer star).
+    // D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
+    // CLASSIFICATION: without this descent the grouped/element-forming layer was
+    // invisible, the object fell to the head scan below, and an array of const
+    // pointers mis-classified MUTABLE → its file-scope global landed in writable
+    // `.data` instead of relocated-read-only relro on EVERY format (correctness-
+    // neutral at runtime — a writable const table still links + runs — but it
+    // dropped the relro hardening + the object's const-ness). visibleChildren is
+    // source-ordered; the depth cap turns a corrupt/cyclic node graph into a
+    // bounded miss (→ head scan) instead of a hang, mirroring declaratorNameNode.
     NodeId lastLayer{};
-    if (inner.valid() && tree.kind(inner) == NodeKind::Internal) {
-        for (NodeId c : visibleChildren(tree, inner)) {
-            if (tree.kind(c) == NodeKind::Internal
-                && tree.rule(c) == dc.pointerLayerRule) {
-                lastLayer = c;
+    NodeId cur = inner;
+    for (std::size_t step = 0;
+         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal
+            || tree.rule(cur) != dc.declaratorRule) {
+            break;
+        }
+        NodeId layerHere{};
+        NodeId direct{};
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.pointerLayerRule) {
+                layerHere = c;                          // last-wins = outermost
+            } else if (cr == dc.directRule && !direct.valid()) {
+                direct = c;
             }
         }
+        if (layerHere.valid()) { lastLayer = layerHere; break; }
+        // No pointer layer at THIS level: an object-forming pointer (if any) is
+        // hidden inside the direct's parenthesized group — descend it. A name-only
+        // direct (no group) or a malformed level ⇒ no object pointer ⇒ the object
+        // is a scalar / array-of-scalar / typedef'd-pointer whose const is on the
+        // HEAD, handled by the fallback scan below.
+        if (!direct.valid()) break;
+        NodeId const group = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, direct, dc.groupRule);
+        if (!group.valid()) break;
+        cur = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, group, dc.declaratorRule);
     }
     if (lastLayer.valid())
         return subtreeContainsToken(tree, lastLayer, constMarker, declByRule,
