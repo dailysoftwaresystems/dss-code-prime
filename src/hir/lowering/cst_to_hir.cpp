@@ -988,11 +988,17 @@ struct Lowerer {
     // true, so this reuses the SAME synthetic decay Cast every other
     // decay site emits (a string literal materializes as a rodata
     // GlobalAddr at HIR->MIR; a named array yields its base address).
-    // The integer/float default promotions for variadic tails are the
-    // ABI arg-setup tier's width concern, NOT re-typed here; a FnSig
-    // designator already lowers to the function's address uniformly.
-    // Non-Array / valid-param behavior is byte-identical to the prior
-    // inline `coerce(arg, paramType)` / pass-through shapes.
+    // The integer/float default promotions for a SCALAR variadic tail are
+    // ALSO applied here (D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION): C's default
+    // argument promotions are a TYPING operation (6.5.2.2p6), so the HIR tier —
+    // the one that owns the coerce/makeCast→SExt/ZExt/FPExt conversion machinery
+    // — is their natural home, and the ABI arg-setup tier below then sees the
+    // already-promoted width (a signed `short -1` sign-extends to int -1, NOT the
+    // pre-fix zero-filled 65535 that broke sqlite's `sqlite3_expert_new` nArg=-1).
+    // A FnSig designator still lowers to the function's address uniformly (it is
+    // a non-arithmetic kind and passes straight through). Non-Array / valid-param
+    // behavior is byte-identical to the prior inline `coerce(arg, paramType)` /
+    // pass-through shapes.
     // `argNode` (default InvalidNode): the CST arg-expression node, forwarded to
     // `coerce` so the D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT node-mark can drive
     // the Ptr→Ptr bitcast realize. Only the declared-param path forwards it (a
@@ -1000,13 +1006,34 @@ struct Lowerer {
     // checks only up to the declared arity).
     [[nodiscard]] E coerceCallArg(E arg, TypeId paramType, NodeId argNode = {}) {
         if (paramType.valid()) return coerce(arg, paramType, argNode);
-        if (arg.type.valid()
-            && interner.kind(arg.type) == TypeKind::Array) {
+        if (!arg.type.valid()) return arg;
+        TypeKind const ak = interner.kind(arg.type);
+        // Array<T,N> → Ptr<T> lvalue decay (C 6.3.2.1p3 — the c79 shape).
+        if (ak == TypeKind::Array) {
             auto const elems = interner.operands(arg.type);
             if (!elems.empty())
                 return coerce(arg, interner.pointer(elems[0]));
+            return arg;
         }
-        return arg;
+        // C 6.5.2.2p6 default argument promotions for a SCALAR variadic-tail /
+        // unprototyped arg (D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION): `float`
+        // widens to `double` (FPExt), and an integer narrower than `int` promotes
+        // to `int` — SExt for a signed source, ZExt for an unsigned one, the
+        // signedness-keyed choice being mapCast's (driven by the arg's OWN type),
+        // never re-derived here. Both reuse the ONE coerce→makeCast→mapCast
+        // conversion path every other site funnels through: the float widen via a
+        // direct `coerce` to F64, the integer promotion via the shared
+        // `promoteSubIntArith` (`integerPromotedType` + `coerce`) — NO hand-rolled
+        // rank/width logic. A wider arithmetic arg (`int`/`unsigned`/`long`/
+        // `double`/`long double`), a pointer, a struct-by-value, or a FnSig
+        // designator all pass through unchanged: `promoteSubIntArith` is a no-op on
+        // ≥int, on floats, and on non-arithmetic kinds, and a language with no
+        // `arithmeticConversions` block (every non-C shipped language) has no
+        // `arith_`, so the whole promotion is inert there — config-gated, not a
+        // language branch.
+        if (ak == TypeKind::F32)
+            return coerce(arg, interner.primitive(TypeKind::F64));
+        return promoteSubIntArith(arg);
     }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,

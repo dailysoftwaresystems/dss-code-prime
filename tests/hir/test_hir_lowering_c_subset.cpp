@@ -5722,6 +5722,81 @@ TEST(HirLoweringCSubset, DerefOfArrayOperandDecaysToPointer) {
         << "…whose pointee is the ELEMENT type (int)";
 }
 
+// D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION: C 6.5.2.2p6 default ARGUMENT
+// promotions for a SCALAR variadic-tail arg are applied in `coerceCallArg` — a
+// sub-int integer promotes to `int` (a Cast typed I32), a `float` widens to
+// `double` (a Cast typed F64), and an arg already at/above the promotion floor
+// (`int`, `double`, …) passes through with NO cast. The signedness-keyed
+// SExt/ZExt of the integer promotion is mapCast's downstream concern (proven
+// end-to-end — signed -1 vs unsigned 65535 — by the corpus witness
+// examples/c-subset/varargs_default_arg_promotion). RED-ON-DISABLE: revert the
+// scalar promotion in coerceCallArg → the narrow/float arg reaches the Call as
+// its raw I16/I8/F32 (the Cast + type asserts flip); pre-fix this was the
+// silent miscompile that made sqlite's `sqlite3_expert_new` see nArg=-1 as
+// 65535.
+TEST(HirLoweringCSubset, VariadicTailScalarArgGetsDefaultArgPromotion) {
+    // Lower `int main() { <decls> return va(1, x); }` against a variadic `va`,
+    // and report the (nodeKind, typeKind) of the variadic-tail arg `x` (the
+    // Call's LAST child — [callee, fixed `1`, tail `x`]).
+    auto tailArg = [](std::string decls) -> std::pair<HirKind, TypeKind> {
+        SemanticModel model = analyzeCSubset(
+            "int va(int n, ...);\n"
+            "int main() { " + decls + " return va(1, x); }\n");
+        EXPECT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? std::string{}
+                : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& ti = model.lattice().interner();
+        auto ds = res->hir.moduleDecls(res->hir.root());
+        HirNodeId const call = findFirstByKind(
+            res->hir, res->hir.functionBody(ds.back()), HirKind::Call);
+        EXPECT_TRUE(call.valid()) << "main ends in a Call `va(1, x)`";
+        auto const kids = res->hir.children(call);
+        EXPECT_GE(kids.size(), 3u) << "[callee, `1`, `x`]";
+        HirNodeId const arg = kids.back();
+        return {res->hir.kind(arg), ti.kind(res->hir.typeId(arg))};
+    };
+
+    // signed short -1 → integer-promoted to int: a Cast typed I32.
+    {
+        auto [k, t] = tailArg("short x; x = -1;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `short` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // signed char -1 → promoted to int.
+    {
+        auto [k, t] = tailArg("signed char x; x = -1;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `signed char` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // unsigned short → promoted to int (mapCast picks ZExt for the unsigned source).
+    {
+        auto [k, t] = tailArg("unsigned short x; x = 5;");
+        EXPECT_EQ(k, HirKind::Cast) << "an `unsigned short` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // float → widened to double (FPExt): a Cast typed F64.
+    {
+        auto [k, t] = tailArg("float x; x = 1.5f;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `float` variadic arg must widen";
+        EXPECT_EQ(t, TypeKind::F64) << "…to double (F64)";
+    }
+    // int is already at the promotion floor → NO cast (passes through unchanged).
+    {
+        auto [k, t] = tailArg("int x; x = 5;");
+        EXPECT_NE(k, HirKind::Cast) << "an `int` variadic arg must NOT be re-cast";
+        EXPECT_EQ(t, TypeKind::I32);
+    }
+    // double is already double → NO widen.
+    {
+        auto [k, t] = tailArg("double x; x = 1.5;");
+        EXPECT_NE(k, HirKind::Cast) << "a `double` variadic arg must NOT be re-cast";
+        EXPECT_EQ(t, TypeKind::F64);
+    }
+}
+
 // ── c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except frontend ──────────────
 
 // The guarded body, filter expression, and handler body lower to a core
