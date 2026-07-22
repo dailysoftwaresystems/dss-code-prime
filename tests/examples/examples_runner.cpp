@@ -141,6 +141,15 @@ struct DependsOnArtifact {
     bool                     multiCu = false;
     std::string              spec;
     std::string              artifact;
+    // NESTED prerequisites this dependency ITSELF resolves against — built
+    // FIRST (into the same scratch out dir) and threaded into THIS dep's own
+    // `--resolve-library`. Enables a fat `-staticlib` dep that MERGES a nested
+    // input `-staticlib` (D-FF1-STATICLIB-FAT-ARCHIVE): to witness the merge a
+    // dependency must itself resolve an INPUT archive. Empty (the default) ⇒ a
+    // single-level dependency, EXACTLY the pre-nesting behavior (every c171
+    // example unchanged). Arbitrary depth; fully generic (no example-name
+    // special-casing).
+    std::vector<DependsOnArtifact> dependsOn;
 };
 
 struct ExampleTarget {
@@ -249,6 +258,49 @@ struct ExampleManifest {
     // spawned and `exitCode` is not required.
     std::vector<ExpectedDiagnostic> expectDiagnostics;
 };
+
+// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: parse ONE
+// `dependsOn` entry. RECURSIVE — an entry may itself carry a nested
+// `dependsOn` (e.g. a fat `-staticlib` that resolves an input `-staticlib` to
+// MERGE it). This SAME helper serves both the target-level parse AND the
+// recursion, so a dependency can have its own dependency at any depth. Returns
+// nullopt (ADD_FAILURE already fired) on any malformed field. A missing
+// `dependsOn` key leaves the nested vector empty ⇒ the pre-nesting shape.
+[[nodiscard]] std::optional<DependsOnArtifact>
+parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
+    DependsOnArtifact dep;
+    dep.spec     = d.value("spec", "");
+    dep.artifact = d.value("artifact", "");
+    dep.multiCu  = d.value("multiCu", false);
+    if (d.contains("sources") && d.at("sources").is_array()) {
+        for (auto const& s : d.at("sources")) {
+            if (s.is_string()) dep.sources.push_back(s.get<std::string>());
+        }
+    }
+    if (dep.sources.empty() || dep.spec.empty() || dep.artifact.empty()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " dependsOn entry needs non-empty 'sources', 'spec',"
+                         " and 'artifact'";
+        return std::nullopt;
+    }
+    // Nested `dependsOn`: this entry's OWN prerequisites (built first, resolved
+    // into this entry's build). The recursion is the ONLY new behavior — a
+    // missing key leaves `dep.dependsOn` empty (the pre-nesting single-level
+    // shape, every existing c171 example unchanged).
+    if (d.contains("dependsOn")) {
+        if (!d.at("dependsOn").is_array()) {
+            ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                          << " dependsOn entry 'dependsOn' must be an array";
+            return std::nullopt;
+        }
+        for (auto const& nested : d.at("dependsOn")) {
+            auto parsed = parseDependsOnEntry(nested, manifestPath);
+            if (!parsed.has_value()) return std::nullopt;  // already reported
+            dep.dependsOn.push_back(std::move(*parsed));
+        }
+    }
+    return dep;
+}
 
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
     std::ifstream in(path);
@@ -385,7 +437,9 @@ struct ExampleManifest {
         }
         // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
         // library artifacts this target links against (built FIRST, threaded
-        // into `--resolve-library`).
+        // into `--resolve-library`). Each entry is parsed by the SHARED
+        // recursive helper, so a dep may carry its OWN nested `dependsOn`
+        // (a fat `-staticlib` merging an input `-staticlib`).
         if (t.contains("dependsOn")) {
             if (!t.at("dependsOn").is_array()) {
                 ADD_FAILURE() << "manifest " << path.generic_string()
@@ -393,23 +447,9 @@ struct ExampleManifest {
                 return m;
             }
             for (auto const& d : t.at("dependsOn")) {
-                DependsOnArtifact dep;
-                dep.spec     = d.value("spec", "");
-                dep.artifact = d.value("artifact", "");
-                dep.multiCu  = d.value("multiCu", false);
-                if (d.contains("sources") && d.at("sources").is_array()) {
-                    for (auto const& s : d.at("sources")) {
-                        if (s.is_string()) dep.sources.push_back(s.get<std::string>());
-                    }
-                }
-                if (dep.sources.empty() || dep.spec.empty()
-                 || dep.artifact.empty()) {
-                    ADD_FAILURE() << "manifest " << path.generic_string()
-                                  << " target 'dependsOn' entry needs non-empty "
-                                     "'sources', 'spec', and 'artifact'";
-                    return m;
-                }
-                et.dependsOn.push_back(std::move(dep));
+                auto parsed = parseDependsOnEntry(d, path);
+                if (!parsed.has_value()) return m;  // ADD_FAILURE already fired
+                et.dependsOn.push_back(std::move(*parsed));
             }
         }
         m.targets.push_back(std::move(et));
@@ -543,6 +583,87 @@ struct ArmResult {
     std::string capturedStdout;
 };
 
+// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
+// prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
+// nested `dependsOn` FIRST (into the same `outDir`) and threading their output
+// paths into THIS dep's `--resolve-library`. So a `-staticlib` dep listing a
+// nested `-staticlib` dep MERGES it (the fat archive, D-FF1-STATICLIB-FAT-
+// ARCHIVE): the nested input `.a` is built, then the fat `.a` build resolves it
+// and bundles its members in. ORDER-CORRECT (a dep's prerequisites exist on
+// disk before its own build runs) and fully generic (arbitrary depth, no
+// example-name special-casing). `dep.sources` resolve against `scratchPath`
+// (the example's mirrored file neighborhood). Returns the built artifact's
+// path, or nullopt (ADD_FAILURE already fired) on any source-missing / compile
+// / artifact-missing failure — the caller poisons the arm. A dep with NO nested
+// `dependsOn` never calls setResolveLibraries ⇒ byte-identical to the
+// pre-nesting single-level build (every existing c171 example unchanged).
+[[nodiscard]] std::optional<fs::path>
+buildDependencyArtifact(DependsOnArtifact const& dep,
+                        fs::path const&          scratchPath,
+                        fs::path const&          outDir,
+                        fs::path const&          exampleDir,
+                        std::string const&       language) {
+    // Nested prerequisites FIRST (order-correct): each nested artifact must
+    // exist on disk before this dep's own build resolves against it.
+    std::vector<fs::path> nestedLibs;
+    nestedLibs.reserve(dep.dependsOn.size());
+    for (auto const& nested : dep.dependsOn) {
+        auto nestedPath = buildDependencyArtifact(nested, scratchPath, outDir,
+                                                  exampleDir, language);
+        if (!nestedPath.has_value()) return std::nullopt;  // already reported
+        nestedLibs.push_back(std::move(*nestedPath));
+    }
+
+    // This dep's own sources (mirrored into the scratch dir alongside the main
+    // sources at the top of compileAndRunArm).
+    std::vector<std::string> depSrcPaths;
+    depSrcPaths.reserve(dep.sources.size());
+    for (auto const& s : dep.sources) {
+        auto const sp = scratchPath / s;
+        if (!fs::exists(sp)) {
+            ADD_FAILURE() << "dependsOn source '" << s
+                          << "' not found in example dir "
+                          << exampleDir.generic_string();
+            return std::nullopt;
+        }
+        depSrcPaths.push_back(sp.generic_string());
+    }
+
+    Program            depProg;
+    DiagnosticReporter depRep;
+    depProg.setOutputDir(outDir);
+    // Thread resolve-libraries ONLY when this dep has nested prerequisites — an
+    // empty set skips the call, keeping every single-level example's build
+    // byte-identical to the pre-nesting path.
+    if (!nestedLibs.empty()) {
+        depProg.setResolveLibraries(nestedLibs);
+    }
+    int const depRc = dep.multiCu
+        ? depProg.compileUnits(depSrcPaths, language, {dep.spec}, depRep)
+        : depProg.compileFiles(depSrcPaths, language, {dep.spec}, depRep);
+    if (depRc != 0 || depRep.errorCount() != 0u) {
+        std::ostringstream depDump;
+        for (auto const& d : depRep.all()) {
+            depDump << "\n  " << diagnosticCodeName(d.code)
+                    << " (severity=" << static_cast<int>(d.severity)
+                    << "): " << d.actual;
+        }
+        ADD_FAILURE() << "dependsOn library build failed for spec=" << dep.spec
+                      << " (artifact=" << dep.artifact
+                      << ", example=" << exampleDir.generic_string() << ")"
+                      << depDump.str();
+        return std::nullopt;
+    }
+    auto const depArtifact = outDir / dep.artifact;
+    if (!fs::exists(depArtifact)) {
+        ADD_FAILURE() << "dependsOn artifact missing at "
+                      << depArtifact.generic_string() << " (spec=" << dep.spec
+                      << ")";
+        return std::nullopt;
+    }
+    return depArtifact;
+}
+
 [[nodiscard]] ArmResult
 compileAndRunArm(fs::path const& exampleDir,
                  ExampleManifest const& m,
@@ -588,53 +709,22 @@ compileAndRunArm(fs::path const& exampleDir,
     scratch.useAsCwd();
     auto const outDir = scratch.path() / "out";
 
-    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
-    // artifact FIRST (into the same out dir), then thread their paths into the
-    // dependent build's `--resolve-library`. A dep build failure poisons the
-    // arm with the SAME strict compile-side checks as the main build.
+    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build each
+    // prerequisite LIBRARY artifact FIRST (into the same out dir), recursively
+    // building any nested `dependsOn` before it, then thread their paths into
+    // the dependent build's `--resolve-library`. A dep (or nested-dep) build
+    // failure poisons the arm with the SAME strict compile-side checks as the
+    // main build (buildDependencyArtifact fires ADD_FAILURE + returns nullopt).
     std::vector<fs::path> resolveLibs;
+    resolveLibs.reserve(t.dependsOn.size());
     for (auto const& dep : t.dependsOn) {
-        std::vector<std::string> depSrcPaths;
-        depSrcPaths.reserve(dep.sources.size());
-        for (auto const& s : dep.sources) {
-            auto const sp = scratch.path() / s;
-            if (!fs::exists(sp)) {
-                ADD_FAILURE() << "dependsOn source '" << s
-                              << "' not found in example dir "
-                              << exampleDir.generic_string();
-                armResult.status = ArmStatus::Poisoned;
-                return armResult;
-            }
-            depSrcPaths.push_back(sp.generic_string());
-        }
-        Program            depProg;
-        DiagnosticReporter depRep;
-        depProg.setOutputDir(outDir);
-        int const depRc = dep.multiCu
-            ? depProg.compileUnits(depSrcPaths, m.language, {dep.spec}, depRep)
-            : depProg.compileFiles(depSrcPaths, m.language, {dep.spec}, depRep);
-        if (depRc != 0 || depRep.errorCount() != 0u) {
-            std::ostringstream depDump;
-            for (auto const& d : depRep.all()) {
-                depDump << "\n  " << diagnosticCodeName(d.code)
-                        << " (severity=" << static_cast<int>(d.severity)
-                        << "): " << d.actual;
-            }
-            ADD_FAILURE() << "dependsOn library build failed for spec="
-                          << dep.spec << " (dependent target=" << t.spec
-                          << ", arm=" << armLabel << ")" << depDump.str();
+        auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
+                                                   exampleDir, m.language);
+        if (!depArtifact.has_value()) {
             armResult.status = ArmStatus::Poisoned;
             return armResult;
         }
-        auto const depArtifact = outDir / dep.artifact;
-        if (!fs::exists(depArtifact)) {
-            ADD_FAILURE() << "dependsOn artifact missing at "
-                          << depArtifact.generic_string()
-                          << " (spec=" << dep.spec << ")";
-            armResult.status = ArmStatus::Poisoned;
-            return armResult;
-        }
-        resolveLibs.push_back(depArtifact);
+        resolveLibs.push_back(std::move(*depArtifact));
     }
 
     Program            prog;
