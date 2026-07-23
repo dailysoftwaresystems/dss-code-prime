@@ -744,7 +744,11 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
         for (std::uint32_t bi = 0; bi < nb; ++bi)
             total += lir.blockInstCount(lir.funcBlockAt(fn, bi));
         if (total < minInsts) continue;
-        std::fprintf(f, "=== func %u : %u blocks, %u insts ===\n", fn.v, nb, total);
+        // The symbol id is what the object file names `sym_<N>` for an
+        // internal-linkage function — it is how a dumped function is matched to a
+        // disassembled one.
+        std::fprintf(f, "=== func %u sym %u : %u blocks, %u insts ===\n", fn.v,
+                     lir.funcSymbol(fn).v, nb, total);
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             LirBlockId const blk = lir.funcBlockAt(fn, bi);
             std::fprintf(f, "  b%u:", blk.v);
