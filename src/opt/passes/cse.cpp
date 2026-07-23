@@ -88,6 +88,15 @@ struct CseKeyHash {
     // gate above catches it; this redundant check pins the invariant
     // against a future opcode-table cleanup that sets it false.
     if (op == MirOpcode::Alloca) return false;
+    // TF-C58 bisect (env-gated, diagnostic): `DSS_CSE_NO_LOAD=1` withdraws Load from
+    // the CSE candidate set. If the arm64 select1.test miscompile disappears under
+    // it, the defect is the Load CSE alias gate missing a may-aliasing Store that
+    // lies on the BACK-EDGE path between the canonical Load (loop preheader) and the
+    // candidate Load (loop body) — i.e. the clobber walk not accounting for the loop.
+    if (op == MirOpcode::Load) {
+        static bool const noLoadCse = std::getenv("DSS_CSE_NO_LOAD") != nullptr;
+        if (noLoadCse) return false;
+    }
     return true;
 }
 
