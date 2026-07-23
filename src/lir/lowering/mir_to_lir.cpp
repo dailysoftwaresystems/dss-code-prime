@@ -1825,8 +1825,16 @@ struct Lowerer {
             case MirOpcode::Bitcast:    return lowerBitcast(id);
             case MirOpcode::IntToPtr:
             case MirOpcode::PtrToInt:
-                // Identity cast between integer and pointer on x86_64
-                // — both are 64-bit GPR-class values. Single `mov`.
+                // Identity cast between a POINTER-WIDTH integer and a pointer —
+                // both GPR-class, a single `mov`. The int→ptr source is GUARANTEED
+                // pointer-width: `combineCast` (hir_to_mir.cpp) widens a narrower int
+                // (SExt signed / ZExt unsigned) BEFORE emitting IntToPtr
+                // (D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND), so this identity mov never
+                // sees an unextended narrower source (a bare `(u8*)(-1)` is now the
+                // sign-extended all-ones pointer, not 0x0000_0000_FFFF_FFFF). A
+                // PtrToInt to a NARROWER int still emits an un-truncated mov — LATENT
+                // only (the result is narrow-typed; no consumer reads it at full
+                // pointer width), tracked by D-CSUBSET-PTR-TO-NARROW-INT-TRUNCATE.
                 return lowerCast(id, MnemonicSlot::Mov, "MIR IntToPtr/PtrToInt");
             // ── cycle 3d bitwise + Neg ─────────────────────────────
             case MirOpcode::And:    return lowerBinaryOp(id, MnemonicSlot::And);

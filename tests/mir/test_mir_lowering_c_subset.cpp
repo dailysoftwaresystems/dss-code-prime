@@ -999,6 +999,62 @@ TEST(MirLoweringCSubset, BareCharToIntPromotionIsTargetSignednessAware) {
     }
 }
 
+// D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion widens the
+// source to POINTER WIDTH per its signedness BEFORE IntToPtr — SExt a signed
+// narrower int, ZExt an unsigned one, and SKIP a source already at pointer width
+// (byte-identical bare IntToPtr). Previously IntToPtr lowered a narrower source
+// with NO extension (identity mov), so a signed `-1` zero-extended to
+// 0x0000_0000_FFFF_FFFF instead of all-ones — breaking `(u8*)(-1)` sentinels
+// (sqlite) on arm64's >4 GiB addresses. This pins the MIR shape at the combineCast
+// fix site. RED-ON-DISABLE: revert the fix → the narrower arms emit a bare IntToPtr
+// with no SExt/ZExt (the signed arm's `sexts.size()==1` fails).
+TEST(MirLoweringCSubset, IntToPtrExtendsSourceToPointerWidthBySignedness) {
+    // signed narrower (int, 32-bit) → SExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* f(int x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+            << "signed int→ptr must SIGN-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // unsigned narrower (unsigned, 32-bit) → ZExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* g(unsigned x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+            << "unsigned int→ptr must ZERO-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // pointer-width source (long long, 64-bit) → bare IntToPtr, NO extension: the
+    // byte-identical skip (`fromResolved == ptrIntKind`).
+    {
+        auto L = lowerCSubset("void* h(long long x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+            << "a pointer-width source must NOT be extended (byte-identical skip)";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        // Pin the byte-identical invariant directly: the skip must emit NO widening
+        // op at all — not even a same-width Bitcast. Dropping the `fromResolved !=
+        // ptrIntKind` guard would make `mapCast(I64,I64)` return Bitcast → a stray
+        // GPR mov at LIR → byte-identical BREAKS for every pointer-width int→ptr on
+        // x86_64/pe64. SExt/ZExt counts alone would NOT catch that; this does.
+        EXPECT_EQ(collectOps(m, MirOpcode::Bitcast).size(), 0u)
+            << "a pointer-width source must skip cleanly (no Bitcast) — byte-identical";
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+}
+
 // CE4 end-to-end: a ternary initializer folds when cond + selected arm
 // both fold (the unselected arm doesn't need to fold). `int g = 1 ? 7 : x;`
 // — even if `x` were non-constant, cond=true picks the then-arm and the

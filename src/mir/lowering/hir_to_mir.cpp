@@ -3590,6 +3590,47 @@ struct Lowerer {
             castOperand = mir.addInst(ext, extOps,
                                       interner.primitive(TypeKind::I32));
         }
+        // D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion must
+        // extend the source to POINTER WIDTH per the SOURCE's signedness — sign-extend
+        // a signed narrower int (SExt), zero-extend an unsigned one (ZExt), truncate a
+        // wider one (Trunc). This is the universal C convention (= `(uintptr_t)(intptr_t)`)
+        // that real code relies on: sqlite's `(const u8*)(-1)` max-pointer sentinel must
+        // be all-ones, not 0x0000_0000_FFFF_FFFF. Previously IntToPtr lowered as an
+        // identity `mov`, so a narrower source was NOT extended (a 32-bit `-1` became
+        // 0x0000_0000_FFFF_FFFF → on arm64, whose addresses exceed 4 GiB, this broke the
+        // sentinel and cascaded through sqlite's expr.test). Mirrors the sub-int→float
+        // promotion above and the synth_threads_shim explicit-SExt pattern. A source
+        // already AT pointer width (`fromResolved == ptrIntKind`) is SKIPPED → the emit
+        // below is a byte-identical bare IntToPtr. AGNOSTIC: pointer width is config-
+        // driven (`config.dataModel`), signedness rides the ONE `isSignedIntKind`
+        // chokepoint (so a `char*` cast honors `config.charIsUnsigned`) — no arch branch.
+        if (mop == MirOpcode::IntToPtr) {
+            std::uint64_t const ptrBytes =
+                scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8);
+            bool const srcSigned = isSignedIntKind(fromResolved);
+            TypeKind ptrIntKind{};
+            switch (ptrBytes) {
+                case 8: ptrIntKind = srcSigned ? TypeKind::I64 : TypeKind::U64; break;
+                case 4: ptrIntKind = srcSigned ? TypeKind::I32 : TypeKind::U32; break;
+                default:
+                    unsupported(node, std::format(
+                        "int→pointer conversion for a {}-byte pointer width has no "
+                        "integer kind", ptrBytes));
+                    return InvalidMirInst;
+            }
+            if (fromResolved != ptrIntKind) {
+                MirOpcode const ptrExt = mapCast(fromResolved, ptrIntKind);
+                if (ptrExt == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "int→pointer source width conversion from TypeKind {} has no "
+                        "MIR opcode", static_cast<unsigned>(fromResolved)));
+                    return InvalidMirInst;
+                }
+                std::array<MirInstId, 1> ptrExtOps{operand};
+                castOperand = mir.addInst(ptrExt, ptrExtOps,
+                                          interner.primitive(ptrIntKind));
+            }
+        }
         std::array<MirInstId, 1> ops{castOperand};
         return mir.addInst(mop, ops, t);
     }
