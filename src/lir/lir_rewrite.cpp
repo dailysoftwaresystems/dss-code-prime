@@ -388,9 +388,17 @@ rewriteOneFunc(Lir const&               src,
     // scratch candidate). The forbidden set = argGprs ∪ argFprs (the
     // SAME `forbiddenBase` the spilled-indirect-callee filter uses; the
     // result's class pool only ever matches its own-class arg regs).
-    // `arg` ops have no operands, and every later instruction runs after
-    // all args are materialized, so the arg-op RESULT store is the sole
-    // entry-region reload that can clobber a still-live incoming arg reg.
+    // `arg` ops have no operands, so THIS handle covers only the arg-op's
+    // OWN spilled RESULT store. ★ SCOPE-CORRECTED (TF-C55, D-AS-REWRITE-SPILL-
+    // SCRATCH-INCOMING-ARG-CLOBBER): c75's premise that "every later
+    // instruction runs after all args are materialized, so the arg-op result
+    // store is the SOLE entry-region reload that can clobber a live incoming
+    // arg reg" is FALSE under the release optimizer, which reorders a spilled
+    // def AHEAD of the `arg` capture. The general case — ANY reordered
+    // instruction's spill-reload scratch — is covered by the `pendingArgOrdinals`
+    // forbid below (unioned into the default forbid at every resolveReg). This
+    // arg-op-result forbid stays correct + load-bearing for its own (spilled
+    // arg-op) case.
     auto const argOp = schema.opcodeByMnemonic("arg");
 
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the active cc, cached for the
@@ -413,6 +421,60 @@ rewriteOneFunc(Lir const&               src,
     }
 
     bool classExhausted = false;
+
+    // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: the incoming arg-register
+    // ordinals that still hold a live parameter. A spill-reload SCRATCH must not
+    // stage through one of these before its `arg` op materializes the param out
+    // of it. The optimizer (release pipeline) can reorder a spilled def AHEAD of
+    // the arg materialization, and the scratch pool is ordinal-ordered so pool[0]
+    // is the first arg register (x0 on AAPCS64); a def staged through it clobbers
+    // the incoming param (the release-only arm64 sqlite fault: arg0 read as 0 →
+    // `ldur [0x10]` SEGV; argc read as 0 → shell sees no args). POSITION-AWARE:
+    // each ordinal is retired the moment its `arg` op is WALKED below (== where
+    // lir_callconv captures the param, freeing the register), so the forbid
+    // covers only the entry window and never shrinks the pool function-wide
+    // (which could turn a post-window-correct pick into a loud pool exhaustion).
+    // OCCUPIED registers only — an arg register the function has no param for
+    // never holds an incoming value, so it stays a free scratch. The allocator
+    // side (D-AS-REGALLOC-ARG-REGISTER-OCCUPIED) closes the vreg-HOME variant of
+    // this hazard; this closes the transient-SCRATCH variant through the same
+    // shared `incomingArgRegister` formula.
+    std::vector<std::uint16_t> pendingArgOrdinals;
+    if (argOp.has_value() && ccForArgs != nullptr) {
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const blk = src.funcBlockAt(fn, bi);
+            std::uint32_t const n = src.blockInstCount(blk);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = src.blockInstAt(blk, i);
+                if (src.instOpcode(inst) != *argOp) continue;
+                LirReg const res = src.instResult(inst);
+                if (!res.valid() || res.isPhysical != 0) continue;
+                auto const inc = lir_pass_util::incomingArgRegister(
+                    schema, *ccForArgs, res.regClass(), src.instPayload(inst));
+                if (inc.kind
+                    == lir_pass_util::IncomingArgRegKind::UnresolvableName) {
+                    // A cc arg register absent from the target table — the same
+                    // schema misconfiguration `buildForbidden` fails loud on;
+                    // never build a silently-weakened scratch exclusion.
+                    report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                           DiagnosticSeverity::Error,
+                           std::format("rewriteOneFunc: cc '{}' arg register "
+                                       "(payload {}) does not resolve in the "
+                                       "target register table — cannot build "
+                                       "the incoming-arg spill-scratch forbid",
+                                       ccForArgs->name,
+                                       src.instPayload(inst)));
+                    return false;
+                }
+                if (inc.kind == lir_pass_util::IncomingArgRegKind::Register) {
+                    bool dup = false;
+                    for (auto const e : pendingArgOrdinals)
+                        if (e == inc.ordinal) { dup = true; break; }
+                    if (!dup) pendingArgOrdinals.push_back(inc.ordinal);
+                }
+            }
+        }
+    }
 
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
@@ -482,6 +544,19 @@ rewriteOneFunc(Lir const&               src,
                         if (e == o) { dup = true; break; }
                     if (!dup) implicitForbidden.push_back(o);
                 }
+            }
+            // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: union the still-
+            // pending incoming-arg ordinals into the DEFAULT forbid so a spilled
+            // operand/result reload for THIS instruction (possibly a def the
+            // optimizer reordered ahead of the arg materializations) never
+            // stages through a live incoming arg register. The isCall-op0 and
+            // spilled-`arg`-result cases below instead use `forbiddenBase` (all
+            // argGprs∪argFprs, a SUPERSET of the pending set) — already covered.
+            for (auto const ord : pendingArgOrdinals) {
+                bool dup = false;
+                for (auto const e : implicitForbidden)
+                    if (e == ord) { dup = true; break; }
+                if (!dup) implicitForbidden.push_back(ord);
             }
             std::span<std::uint16_t const> const implicitForbiddenSpan{
                 implicitForbidden.data(), implicitForbidden.size()};
@@ -605,6 +680,26 @@ rewriteOneFunc(Lir const&               src,
                 std::array<LirOperand, 1> storeOps{LirOperand::makeReg(newResult)};
                 b.addInst(*frameStoreOp, InvalidLirReg, storeOps,
                           pendingStore->v);
+            }
+
+            // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: this `arg` op has
+            // now been walked — lir_callconv captures the param out of its
+            // incoming register at THIS position, so past here the register is a
+            // free scratch. Retire its ordinal from the pending forbid (empties
+            // the set past the entry window → no function-wide pool loss).
+            if (argOp.has_value() && op == *argOp && ccForArgs != nullptr
+                && srcResult.valid() && srcResult.isPhysical == 0) {
+                auto const inc = lir_pass_util::incomingArgRegister(
+                    schema, *ccForArgs, srcResult.regClass(), payload);
+                if (inc.kind == lir_pass_util::IncomingArgRegKind::Register) {
+                    for (auto it = pendingArgOrdinals.begin();
+                         it != pendingArgOrdinals.end(); ++it) {
+                        if (*it == inc.ordinal) {
+                            pendingArgOrdinals.erase(it);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
