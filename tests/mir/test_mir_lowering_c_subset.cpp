@@ -99,6 +99,11 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the target's
+        // bare-`char` signedness exactly as compile_pipeline.cpp does, so an
+        // arm64 target lowers the char→int promotion as ZExt (unsigned) and
+        // x86_64 as SExt (signed). Absent key ⇒ false = signed.
+        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned();
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
@@ -950,6 +955,48 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::ICmpSgt);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::ZExt);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
+}
+
+// TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): bare `char`'s signedness
+// is TARGET-config-driven — the char→int promotion sign-extends (SExt) on a
+// signed-char target (x86_64/pe64) and zero-extends (ZExt) on an unsigned-char
+// target (AArch64). `int f(char c) { return c; }` promotes `c` (char) to the
+// int return type via `mapCast(Char, I32)` — Finding 1's REAL decision site
+// (the former `mapCast`-local `isSignedInt`), routed through the target-aware
+// `isSignedIntKind`. This pins BOTH arms of that one predicate through the full
+// frontend. RED-ON-DISABLE: revert `isSignedIntKind(Char)` to the hard-coded
+// signed set → the arm64 config emits SExt (not ZExt) and the arm64 assertion
+// below flips (0 ZExt / 1 SExt). x86_64 is unchanged (byte-identical).
+TEST(MirLoweringCSubset, BareCharToIntPromotionIsTargetSignednessAware) {
+    constexpr char kSrc[] = "int f(char c) { return c; }";
+
+    // x86_64: bare char is SIGNED ⇒ char→int promotion is SExt (sxtb / movsx).
+    {
+        auto L = lowerCSubset(kSrc, "x86_64", "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(sexts.size(), 1u)
+            << "x86_64: bare char is signed — the char→int promotion must SExt";
+        EXPECT_EQ(zexts.size(), 0u)
+            << "x86_64: no ZExt — char is signed here";
+    }
+
+    // arm64: bare char is UNSIGNED (AArch64 ABI) ⇒ promotion is ZExt (uxtb / movzx).
+    {
+        auto L = lowerCSubset(kSrc, "arm64", "aapcs64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(zexts.size(), 1u)
+            << "arm64: bare char is UNSIGNED — the char→int promotion must ZExt";
+        EXPECT_EQ(sexts.size(), 0u)
+            << "arm64: no SExt — char is unsigned here (the TF-C56 fix)";
+    }
 }
 
 // CE4 end-to-end: a ternary initializer folds when cond + selected arm

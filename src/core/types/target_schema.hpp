@@ -2572,6 +2572,16 @@ struct DSS_EXPORT TargetSchemaData {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
 
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): whether bare `char`
+    // (the distinct `TypeKind::Char`, NOT `signed char`/`unsigned char`) is an
+    // UNSIGNED type on this target. Config-driven, NOT an arch identity branch:
+    // the AArch64 ABI mandates unsigned bare `char`, while x86_64/pe64 use
+    // signed — so `arm64.target.json` declares `"charIsUnsigned": true` and the
+    // x86_64 descriptor omits it. Default false = signed (the C-common default
+    // that keeps x86_64/pe64 byte-identical). Consumed by HIR→MIR lowering (the
+    // char→int promotion's SExt-vs-ZExt decision) via `MirLoweringConfig`.
+    bool charIsUnsigned = false;
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
     // a target without it (arm64 until TLS C2) cannot lay out a TLS
@@ -2826,6 +2836,15 @@ public:
     }
     [[nodiscard]] bool aggregateLayoutLoaded() const noexcept {
         return d_.aggregateLayoutLoaded;
+    }
+
+    // ── Bare-char signedness (TF-C56, D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) ──
+    // True iff bare `char` is an UNSIGNED type on this target (the AArch64 ABI
+    // rule), false = signed (x86_64/pe64; the default). Threaded into
+    // `MirLoweringConfig.charIsUnsigned` so the char→int promotion picks
+    // ZExt (unsigned) vs SExt (signed) with NO arch identity branch.
+    [[nodiscard]] bool charIsUnsigned() const noexcept {
+        return d_.charIsUnsigned;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────

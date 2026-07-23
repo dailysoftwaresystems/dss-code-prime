@@ -1,0 +1,15 @@
+{
+  "$comment": "TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): bare `char`'s signedness is target-config-driven — signed on x86_64 (SysV + pe64), UNSIGNED on arm64 (AArch64 ABI). ONE source; per-target exitCode witnesses the divergence: `char c=(char)0x80; c<0` is TRUE→10 on the signed-char targets, FALSE→20 on the unsigned-char targets. The `volatile` seed defeats const-folding so the release arm runs the real machine char->int extension (SExt vs ZExt/uxtb).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 10,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"], "exitCode": 10 },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "exitCode": 10 },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "exitCode": 20 },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "exitCode": 20 }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

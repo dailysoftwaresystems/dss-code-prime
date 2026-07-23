@@ -11,6 +11,8 @@
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (AArch64 is Variant I under EVERY OS, so it lives on the TARGET, not the format; the x86_64 twin declares variant2). variant1 = the thread pointer (TPIDR_EL0) points AT the TCB head and the TLS block FOLLOWS it; a symbol's link-time thread-pointer offset is POSITIVE: tpoff = alignUp(tcbHeaderBytes, p_align) + templateOffset. tcbHeaderBytes = 16 — the AArch64 TCB header is two pointers (the psABI/glibc `tcbhead_t` prefix: dtv pointer + private). Consumed ONLY by the walker's tpoff helper (addTlsSymbolOffsets) when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
   "tls": { "variant": "variant1", "tcbHeaderBytes": 16 },
+  "$charIsUnsignedComment": "TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): the AArch64 procedure-call standard mandates that bare `char` (unqualified — NOT `signed char`) is an UNSIGNED type (AAPCS64 + Apple arm64 agree; gcc/clang -arm64 confirm). x86_64/pe64 use signed `char` and omit this key (default false). The single arm64 descriptor covers linux-arm64 AND apple-arm64. Consumed by HIR→MIR: the char→int integer promotion zero-extends (ZExt / uxtb) instead of sign-extends (SExt / sxtb), so `(char)0x80 < 0` is FALSE on arm64.",
+  "charIsUnsigned": true,
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel — same discipline as x86_64. Substrate's addInst guard rejects opcode 0 loudly.",

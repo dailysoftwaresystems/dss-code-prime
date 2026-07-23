@@ -567,6 +567,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the active
+    // target's bare-`char` signedness (AArch64 = unsigned; x86_64/pe64 = signed)
+    // so HIR→MIR picks ZExt vs SExt for the char→int promotion — a config bool,
+    // never an arch identity branch. Absent key ⇒ false = signed.
+    mirCfg.charIsUnsigned        = target.charIsUnsigned();
     // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
     // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
     // merge maps MIR symbols to names through `model.recordFor`, so a

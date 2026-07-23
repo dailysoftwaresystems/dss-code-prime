@@ -587,6 +587,14 @@ struct Lowerer {
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
                            || tk == TypeKind::F64 || tk == TypeKind::F80
                            || tk == TypeKind::F128);
+        // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char` is absent
+        // here → classified UNSIGNED for Div/Rem/Shr (UDiv/UMod/LShr), TARGET-BLIND
+        // (and opposite the mir_to_lir widen arms' signed default — the scattered-
+        // but-dead inconsistency the TF-C56 audit flagged). DEAD: C's usual
+        // arithmetic conversions promote a char operand to `int` before any binary
+        // op, so `tk` here is always a post-UAC kind, never a bare `Char`. Route
+        // through the target `charIsUnsigned` (or fail loud) if a non-promoting
+        // frontend ever feeds a raw narrow Char.
         bool const isSigned = (tk == TypeKind::I8 || tk == TypeKind::I16
                             || tk == TypeKind::I32 || tk == TypeKind::I64
                             || tk == TypeKind::I128);
@@ -658,17 +666,20 @@ struct Lowerer {
         }
     }
 
-    [[nodiscard]] static MirOpcode mapCast(TypeKind from, TypeKind to) noexcept {
+    // D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): NON-static (reads
+    // `config` via `isSignedIntKind`) — the char→int promotion's SExt-vs-ZExt
+    // decision must consult the target's bare-`char` signedness. The former
+    // local `isSignedInt` lambda (a target-blind duplicate that hard-coded Char
+    // as signed) is DELETED; both the widen-direction (:700) and the
+    // int↔float sign (:711/:714) now route through the ONE target-aware member
+    // `isSignedIntKind`, so no site can disagree about char's sign.
+    [[nodiscard]] MirOpcode mapCast(TypeKind from, TypeKind to) const noexcept {
         auto isInt = [](TypeKind k) noexcept {
             return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
                 || k == TypeKind::I64 || k == TypeKind::I128
                 || k == TypeKind::U8  || k == TypeKind::U16 || k == TypeKind::U32
                 || k == TypeKind::U64 || k == TypeKind::U128
                 || k == TypeKind::Char || k == TypeKind::Byte || k == TypeKind::Bool;
-        };
-        auto isSignedInt = [](TypeKind k) noexcept {
-            return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
-                || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
         };
         auto isFloat = [](TypeKind k) noexcept {
             return k == TypeKind::F16 || k == TypeKind::F32
@@ -697,7 +708,7 @@ struct Lowerer {
             if (fw == 0 || tw == 0) return MirOpcode::Invalid;
             if (tw <  fw) return MirOpcode::Trunc;
             if (tw == fw) return MirOpcode::Bitcast;
-            return isSignedInt(from) ? MirOpcode::SExt : MirOpcode::ZExt;
+            return isSignedIntKind(from) ? MirOpcode::SExt : MirOpcode::ZExt;
         }
         if (isFloat(from) && isFloat(to)) {
             int const fw = bitWidth(from);
@@ -708,10 +719,10 @@ struct Lowerer {
             return MirOpcode::FPExt;
         }
         if (isInt(from)   && isFloat(to)) {
-            return isSignedInt(from) ? MirOpcode::SIToFP : MirOpcode::UIToFP;
+            return isSignedIntKind(from) ? MirOpcode::SIToFP : MirOpcode::UIToFP;
         }
         if (isFloat(from) && isInt(to)) {
-            return isSignedInt(to) ? MirOpcode::FPToSI : MirOpcode::FPToUI;
+            return isSignedIntKind(to) ? MirOpcode::FPToSI : MirOpcode::FPToUI;
         }
         if (from == TypeKind::Ptr && isInt(to))   return MirOpcode::PtrToInt;
         if (isInt(from)   && to == TypeKind::Ptr) return MirOpcode::IntToPtr;
@@ -873,11 +884,24 @@ struct Lowerer {
     // target / format identity anywhere — the limb work is generic MIR (Add/Sub/And/…/
     // Gep + Br/CondBr over the closed verb set), agnostic by construction.
 
-    // Signed native integer kind (the `mapCast` local `isSignedInt`, hoisted for the
-    // wide-op reuse). Char is signed on both shipped targets' data models.
-    [[nodiscard]] static bool isSignedIntKind(TypeKind k) noexcept {
+    // Signed native integer kind — the ONE target-aware char-signedness
+    // chokepoint (drives every SExt-vs-ZExt / SIToFP-vs-UIToFP in `mapCast`
+    // AND the wide-`_BitInt` op reuse). NON-static: it reads `config`.
+    //
+    // ★ D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): bare `char`
+    // (`TypeKind::Char`, distinct from `signed char`/`unsigned char` = I8/U8)
+    // is signed on x86_64/pe64 but UNSIGNED on AArch64 per its ABI — so its
+    // sign is TARGET-config-driven (`config.charIsUnsigned`), NOT an arch
+    // identity branch and NOT a hard-coded set membership (the former comment
+    // "Char is signed on both shipped targets" was the false premise: it made
+    // DSS-arm64 emit SExt for `char c=(char)0x80; c<0`, wrongly true). The real
+    // signed int kinds (I8/I16/I32/I64/I128) are unconditional; only Char
+    // consults the target. Default `charIsUnsigned=false` ⇒ signed ⇒ x86_64/
+    // pe64 codegen is byte-identical to before.
+    [[nodiscard]] bool isSignedIntKind(TypeKind k) const noexcept {
+        if (k == TypeKind::Char) return !config.charIsUnsigned;
         return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
-            || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
+            || k == TypeKind::I64 || k == TypeKind::I128;
     }
 
     // A C floating type (the F-prefixed kinds). Used to fail loud on a float<->WIDE

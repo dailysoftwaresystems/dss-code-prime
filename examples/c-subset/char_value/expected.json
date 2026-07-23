@@ -1,5 +1,5 @@
 {
-  "$comment": "char VALUE codegen across all targets (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN + D-CSUBSET-CHAR-INT-WIDENING): byte load (movzx/LDURB), byte store (mov r/m8/STURB, baseline pipeline), char->int SExt (movsx/SXTB, sign-correct), int->char Trunc. 65 + 66 + 1 = 132; a zero-extend regression of the SExt drops it to 131. All offset-0 / local-scalar access (no indexed pointer arithmetic), so it runs on every target including arm64 whose lea has only the symbol form. The optimizedPipelines arm proves the value flow survives Mem2Reg (char locals promoted out of their byte stack slots).",
+  "$comment": "char VALUE codegen across all targets (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN + D-CSUBSET-CHAR-INT-WIDENING + D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): byte load (movzx/LDURB), byte store (mov r/m8/STURB, baseline pipeline), the char->int promotion, int->char Trunc. `neg=(char)200` then `isneg = neg<0` makes the exit code a per-target signedness WITNESS: bare `char` is SIGNED on x86_64/pe64 (SExt/movsx -> -56<0==1 -> 65+66+1=132) and UNSIGNED on arm64 (ZExt/uxtb per the AArch64 ABI -> 200<0==0 -> 65+66+0=131). gcc agrees on both (gcc-arm64=131, gcc-x86_64=132). All offset-0 / local-scalar access (no indexed pointer arithmetic), so it runs on every target including arm64 whose lea has only the symbol form. The optimizedPipelines arm proves the value flow survives Mem2Reg (char locals promoted out of their byte stack slots) AND that ConstFold does NOT mis-fold the char compare (x86_64 optimized stays 132, not 131 — the const-eval char-sign twin is tracked by D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS).",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 132,
@@ -18,13 +18,15 @@
       "spec": "arm64:elf64-aarch64-linux-exec",
       "artifact": "main",
       "runOn": ["linux"],
-      "emulator": "qemu-aarch64"
+      "emulator": "qemu-aarch64",
+      "exitCode": 131
     },
     {
       "spec": "arm64:macho64-arm64-darwin-exec",
       "artifact": "main",
       "runOn": ["darwin"],
-      "emulator": ""
+      "emulator": "",
+      "exitCode": 131
     }
   ],
   "optimizedPipelines": [

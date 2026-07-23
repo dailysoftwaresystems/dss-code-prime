@@ -1402,22 +1402,28 @@ struct Lowerer {
                 // An I32 source stays REJECTED: C's I32→wider
                 // conversion sign-extends (mapCast routes it to SExt);
                 // a ZExt-from-I32 reaching here is a lowering bug, not
-                // a missing realization. U8/U16/Char sources through
-                // the x86 byte-form would read one byte of a wider
-                // value — fail loud until their forms are encoded.
+                // a missing realization.
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
                     // D-CSUBSET-SUBNATIVE-ALU-FORMS: unsigned narrow read-back — a U16
                     // source → movzx r/m16 / UXTH; a U8 source → movzx r/m8 / UXTB.
                     // Bool/U32 keep their existing widener forms.
+                    // D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): a `Char`
+                    // source now reaches ZExt too — on an unsigned-char target
+                    // (AArch64) the char→int promotion is ZExt, and Char shares
+                    // U8's 8-bit width (`widthFlagsForType(Char)` = width-8), so it
+                    // reuses the SAME byte widener (movzx r/m8 / uxtb). The SExt
+                    // gate already accepts Char (signed-char targets, unchanged).
                     if (ty.valid()
                         && reprKind(ty) != TypeKind::Bool
                         && reprKind(ty) != TypeKind::U32
                         && reprKind(ty) != TypeKind::U8
-                        && reprKind(ty) != TypeKind::U16) {
+                        && reprKind(ty) != TypeKind::U16
+                        && reprKind(ty) != TypeKind::Char) {
                         return failConv(ty, "ZExt source",
-                                        "the Bool-, U32-, U16-, and U8-source forms");
+                                        "the Bool-, U32-, U16-, U8-, and "
+                                        "Char-source forms");
                     }
                 }
                 return true;
@@ -3799,7 +3805,14 @@ struct Lowerer {
                     break;
                 case TypeKind::Char: case TypeKind::I8:
                 case TypeKind::I16:  case TypeKind::I32:
-                    widenSlot = MnemonicSlot::SExt;  // signed → sign-extend
+                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: `Char` is
+                    // bucketed SExt here TARGET-BLIND (right for signed-char
+                    // targets, but arm64's unsigned char would want ZExt). DEAD
+                    // today — C's mandatory integer promotion widens a char index
+                    // to `int` before Gep lowering (cst_to_hir combineIndex), so a
+                    // raw narrow `Char` never reaches this arm; latent only for a
+                    // future non-promoting (non-C) frontend over this substrate.
+                    widenSlot = MnemonicSlot::SExt;  // signed sub-64 → sign-extend
                     break;
                 default:
                     break;  // non-integer/unexpected — a promoted index never reaches here
@@ -7398,6 +7411,13 @@ struct Lowerer {
                 break;
             case TypeKind::Char: case TypeKind::I8:
             case TypeKind::I16:  case TypeKind::I32:
+                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char`
+                // SExt here is TARGET-BLIND (arm64 unsigned char would want ZExt)
+                // but DEAD — C promotes a switch discriminant to `int` (6.8.4.2,
+                // cst_to_hir promoteSubIntArith) before this fast path, so a raw
+                // narrow `Char` never reaches it. `unsigned char` (=U8) already
+                // ZExt's above; only a future non-promoting frontend could expose
+                // the bare-Char gap.
                 discrimWidenSlot = MnemonicSlot::SExt;
                 break;
             default:
