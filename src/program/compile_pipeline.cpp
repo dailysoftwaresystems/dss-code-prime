@@ -803,6 +803,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
         return std::nullopt;
     }
+    // TF-C58 bisect (env-gated, zero-cost when unset): the loop-carried-update check
+    // runs at EACH post-regalloc stage so the pass that drops a back-edge update is
+    // identified by which stage first reports.
+    checkLoopCarriedSpills(legal.lir, target, "post-legalize");
 
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
@@ -849,6 +853,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     auto const asmEntry = reporter.errorCount();
     phase.emplace(substrate::CompilePhase::Encode);
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    checkLoopCarriedSpills(cc.lir, target, "post-callconv");
+    dumpLirFuncs(cc.lir, target, "post-callconv");
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {

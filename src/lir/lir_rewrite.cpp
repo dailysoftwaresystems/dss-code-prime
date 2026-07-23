@@ -718,6 +718,195 @@ rewriteOneFunc(Lir const&               src,
 
 } // namespace
 
+// ── Diagnostic instrumentation (D-AS-REGALLOC-LOOP-CARRIED-SPILL-RELOAD-MISSING) ──
+// ENV-GATED and zero-cost when unset. `DSS_DUMP_LIR_MIN_INSTS=<N>` appends a
+// post-rewrite dump of every function with >= N instructions to the file named by
+// `DSS_DUMP_LIR_FILE` (default "dss_lir_dump.txt"): blocks + successors + each
+// instruction's mnemonic, result and operands (p<ordinal> physical, v<id> virtual).
+// Purpose: isolate a loop-carried value whose back-edge phi-move goes missing in a
+// high-pressure function (sqlite's balance_nonroot) — the release-only arm64
+// miscompile behind the select1.test SEGV. The min-instruction filter keeps the
+// dump to the few largest functions instead of the whole amalgamation.
+static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
+                                              TargetSchema const& schema) {
+    char const* const minEnv = std::getenv("DSS_DUMP_LIR_MIN_INSTS");
+    if (minEnv == nullptr) return;
+    auto const minInsts =
+        static_cast<std::uint32_t>(std::strtoul(minEnv, nullptr, 10));
+    char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
+    std::FILE* const f =
+        std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a");
+    if (f == nullptr) return;
+    for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
+        LirFuncId const fn = lir.funcAt(i);
+        std::uint32_t const nb = lir.funcBlockCount(fn);
+        std::uint32_t total = 0;
+        for (std::uint32_t bi = 0; bi < nb; ++bi)
+            total += lir.blockInstCount(lir.funcBlockAt(fn, bi));
+        if (total < minInsts) continue;
+        std::fprintf(f, "=== func %u : %u blocks, %u insts ===\n", fn.v, nb, total);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            std::fprintf(f, "  b%u:", blk.v);
+            for (auto const s : lir.blockSuccessors(blk))
+                std::fprintf(f, " ->b%u", s.v);
+            std::fprintf(f, "\n");
+            std::uint32_t const n = lir.blockInstCount(blk);
+            for (std::uint32_t k = 0; k < n; ++k) {
+                LirInstId const inst = lir.blockInstAt(blk, k);
+                auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+                LirReg const res = lir.instResult(inst);
+                std::fprintf(f, "    ");
+                if (res.valid())
+                    std::fprintf(f, "%s%u = ", res.isPhysical != 0 ? "p" : "v",
+                                 res.id);
+                if (info != nullptr)
+                    std::fprintf(f, "%.*s", static_cast<int>(info->mnemonic.size()),
+                                 info->mnemonic.data());
+                else
+                    std::fprintf(f, "?");
+                for (auto const& o : lir.instOperands(inst)) {
+                    if (o.kind == LirOperandKind::Reg && o.reg.valid())
+                        std::fprintf(f, " %s%u",
+                                     o.reg.isPhysical != 0 ? "p" : "v", o.reg.id);
+                    else
+                        std::fprintf(f, " _");
+                }
+                std::fprintf(f, " ;pl=%u\n", lir.instPayload(inst));
+            }
+        }
+    }
+    std::fclose(f);
+}
+
+// Stage-labelled wrapper so the pipeline can dump at any post-regalloc point.
+void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
+    if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
+    char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
+    if (std::FILE* const f =
+            std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a")) {
+        std::fprintf(f, "########## STAGE %s ##########\n",
+                     stage != nullptr ? stage : "?");
+        std::fclose(f);
+    }
+    dumpRewrittenFuncsIfRequestedImpl(lir, schema);
+}
+
+// ── TF-C58 anomaly detector (D-AS-REGALLOC-LOOP-CARRIED-SPILL-RELOAD-MISSING) ──
+// ENV-GATED (`DSS_CHECK_LOOP_SPILL=1`), zero cost when unset. Flags the exact
+// release-only miscompile signature observed in sqlite's balance_nonroot: a frame
+// slot that a loop's PREHEADER loads (initializing a register) and the loop BODY
+// stores (updating the loop-carried value) but that the loop NEVER reloads — so the
+// register goes stale and the loop-carried update is silently lost every iteration.
+// Natural loops are approximated by back-edges over the function's block order; this
+// is a DIAGNOSTIC, not a proof. Loops larger than 200 blocks are skipped to keep the
+// scan cheap (the copy loop under investigation is small).
+void checkLoopCarriedSpills(Lir const&          lir,
+                            TargetSchema const& schema,
+                            char const*         stage) {
+    if (std::getenv("DSS_CHECK_LOOP_SPILL") == nullptr) return;
+    auto const flOp = schema.opcodeByMnemonic(schema.frameLoadMnemonic());
+    auto const fsOp = schema.opcodeByMnemonic(schema.frameStoreMnemonic());
+    if (!flOp.has_value() || !fsOp.has_value()) return;
+    auto has = [](std::vector<std::uint32_t> const& v, std::uint32_t x) {
+        for (auto const e : v) if (e == x) return true;
+        return false;
+    };
+    for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
+        LirFuncId const fn = lir.funcAt(i);
+        std::uint32_t const nb = lir.funcBlockCount(fn);
+        std::vector<LirBlockId>                 blocks(nb);
+        std::vector<std::vector<std::uint32_t>> st(nb), ld(nb);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            blocks[bi] = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(blocks[bi]);
+            for (std::uint32_t j = 0; j < n; ++j) {
+                LirInstId const ii = lir.blockInstAt(blocks[bi], j);
+                auto const          op   = lir.instOpcode(ii);
+                std::uint32_t const slot = lir.instPayload(ii);
+                if (op == *fsOp) { if (!has(st[bi], slot)) st[bi].push_back(slot); }
+                else if (op == *flOp) { if (!has(ld[bi], slot)) ld[bi].push_back(slot); }
+            }
+        }
+        // Predecessor lists (for the natural-loop backward walk).
+        std::vector<std::vector<std::uint32_t>> preds(nb);
+        for (std::uint32_t bi = 0; bi < nb; ++bi)
+            for (auto const s : lir.blockSuccessors(blocks[bi]))
+                for (std::uint32_t k = 0; k < nb; ++k)
+                    if (blocks[k].v == s.v) { preds[k].push_back(bi); break; }
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            for (auto const s : lir.blockSuccessors(blocks[bi])) {
+                std::uint32_t hdr = nb;
+                for (std::uint32_t k = 0; k <= bi; ++k)
+                    if (blocks[k].v == s.v) { hdr = k; break; }
+                if (hdr > bi) continue;  // not a back-edge
+                // TRUE natural-loop body: header + every block that reaches the
+                // back-edge source WITHOUT passing through the header. (An index
+                // RANGE would be wrong — the optimizer reorders blocks, so a loop's
+                // blocks need not be contiguous, and an in-loop load would then be
+                // mis-read as "before the loop" = a false positive.)
+                std::vector<bool>          inLoop(nb, false);
+                std::vector<std::uint32_t> work;
+                inLoop[hdr] = true;
+                if (!inLoop[bi]) { inLoop[bi] = true; work.push_back(bi); }
+                while (!work.empty()) {
+                    std::uint32_t const n2 = work.back(); work.pop_back();
+                    for (auto const p : preds[n2])
+                        if (!inLoop[p]) { inLoop[p] = true; work.push_back(p); }
+                }
+                // The BROKEN-DEPENDENCY-CYCLE signature. "Slot stored in loop,
+                // loaded only outside" alone is NOT a bug (a spilled accumulator
+                // read after the loop looks identical, and fires on the correct
+                // debug build). The bug is specifically a STALE REGISTER: a reg
+                // loaded from slot S OUTSIDE the loop, USED inside the loop, and
+                // never REDEFINED inside it, while the loop STORES S — so every
+                // iteration recomputes from the same stale value and S's update is
+                // lost.
+                std::vector<std::uint32_t> loopStores, loopDefs, loopUses;
+                for (std::uint32_t k = 0; k < nb; ++k) {
+                    if (!inLoop[k]) continue;
+                    for (auto const slot : st[k])
+                        if (!has(loopStores, slot)) loopStores.push_back(slot);
+                    std::uint32_t const n2 = lir.blockInstCount(blocks[k]);
+                    for (std::uint32_t j = 0; j < n2; ++j) {
+                        LirInstId const ii = lir.blockInstAt(blocks[k], j);
+                        LirReg const    r  = lir.instResult(ii);
+                        if (r.valid() && !has(loopDefs, r.id)) loopDefs.push_back(r.id);
+                        for (auto const& o : lir.instOperands(ii))
+                            if (o.kind == LirOperandKind::Reg && o.reg.valid()
+                                && !has(loopUses, o.reg.id))
+                                loopUses.push_back(o.reg.id);
+                    }
+                }
+                std::vector<std::uint32_t> reported;
+                for (std::uint32_t m = 0; m < nb; ++m) {
+                    if (inLoop[m]) continue;
+                    std::uint32_t const n2 = lir.blockInstCount(blocks[m]);
+                    for (std::uint32_t j = 0; j < n2; ++j) {
+                        LirInstId const ii = lir.blockInstAt(blocks[m], j);
+                        if (lir.instOpcode(ii) != *flOp) continue;
+                        std::uint32_t const slot = lir.instPayload(ii);
+                        LirReg const        rx   = lir.instResult(ii);
+                        if (!rx.valid() || has(reported, slot)) continue;
+                        if (!has(loopStores, slot)) continue;   // loop must update S
+                        if (!has(loopUses, rx.id)) continue;    // stale reg must be READ
+                        if (has(loopDefs, rx.id)) continue;     // refreshed => fine
+                        reported.push_back(slot);
+                        std::fprintf(stderr,
+                                     "[TF-C58][%s] func %u loop(hdr b%u, latch b%u): "
+                                     "slot %u is STORED in the loop, but the reg p%u it "
+                                     "was loaded into (block b%u, outside) is USED in "
+                                     "the loop and NEVER redefined there — stale "
+                                     "register, loop-carried update lost\n",
+                                     stage != nullptr ? stage : "?", fn.v, hdr, bi,
+                                     slot, rx.id, m);
+                    }
+                }
+            }
+        }
+    }
+}
+
 LirRewriteResult
 rewriteWithAllocation(Lir const&           src,
                       TargetSchema const&  schema,
@@ -755,6 +944,8 @@ rewriteWithAllocation(Lir const&           src,
     LirRewriteResult out;
     out.lir = std::move(b).finish();
     out.ok  = !anyFunctionFailed && (reporter.errorCount() == baseline);
+    dumpLirFuncs(out.lir, schema, "post-rewrite");
+    checkLoopCarriedSpills(out.lir, schema, "post-rewrite");
     return out;
 }
 
