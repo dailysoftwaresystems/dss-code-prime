@@ -1339,14 +1339,60 @@ encode(AssembledModule const&    module,
     // `_sym_<id>` fallback for static/local/synthesized symbols.
     link::format::ObjectSymbolNames const objNames{module};
 
-    // Defined function symbols: N_SECT|N_EXT, n_sect=1, n_value=offset.
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
+    // symbol cannot round-trip a Mach-O RELOCATABLE (MH_OBJECT) object today.
+    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
+    // externally-visible `__attribute__((weak))` def; a faithful weak def needs
+    // N_WEAK_DEF (n_desc) + MH_WEAK_DEFINES machinery that is NOT wired. Emitting
+    // it strong (N_SECT|N_EXT) would SILENTLY drop the weak-override semantics,
+    // so fail loud instead — the exact posture the MH_DYLIB export arm already
+    // takes on this case (macho::encodeExecDynamic, D-LK3-DYLIB-WEAK-EXPORT).
+    // Each writer owns its own fail-loud + vocabulary; the Weak decision is the
+    // one shared `definedBinding`, so no `if(format)` leaks into the substrate.
+    auto emitWeakDefinedRelocatableError =
+        [&](std::string_view symName, char const* symKind) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "macho::encode (MH_OBJECT): defined {} symbol '{}' has "
+                     "WEAK binding -- a weak DEFINED symbol cannot be emitted "
+                     "to a Mach-O RELOCATABLE object until N_WEAK_DEF (n_desc) "
+                     "+ MH_WEAK_DEFINES machinery ships "
+                     "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
+                     "(N_SECT|N_EXT) would silently lose weak-override "
+                     "semantics.",
+                     symKind, symName));
+        };
+
+    // Defined function symbols: n_sect=1, n_value=offset. n_type binding is
+    // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
+    // COLLISION, TF-C54): a static/synthesized `_sym_<id>` def is Local → bare
+    // N_SECT (NO N_EXT), so a sibling `.o`'s unrelated `_sym_<id>` can never
+    // bind to it at a FOREIGN link; an externally-visible def keeps N_SECT|N_EXT.
+    // A Mach-O RELOCATABLE object carries no LC_DYSYMTAB (no local/extern range
+    // split to keep in sync — see the symtab-order note above), so the emission
+    // order is unchanged; only the N_EXT bit flips. A WEAK def FAILS LOUD here
+    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c-subset DOES produce weak defined
+    // symbols (`__attribute__((weak))` → SymbolBinding::Weak, per
+    // `c-subset.lang.json` + examples/c-subset/attributes_syntax's `weak_helper`
+    // and weak_inline_crosscu), but they reach a Mach-O binary ONLY via the EXEC
+    // arms (encodeExec/encodeExecDynamic — `encode` dispatches to them above),
+    // where a weak def is merge-resolved strong-over-weak / forced Global before
+    // the writer. A weak def routed to THIS relocatable path cannot round-trip
+    // until the N_WEAK_DEF machinery ships, so the writer fails loud rather than
+    // silently degrade it to N_SECT|N_EXT (see the lambda + the MH_DYLIB arm).
     for (auto const& f : funcSyms) {
         std::string const symName = objNames.definedName(f.symId, "_sym_");
+        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "function");
+            return {};
+        }
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff,
-                    static_cast<std::uint8_t>(N_SECT | N_EXT),
-                    kTextSectionNumber,
-                    /*n_desc=*/0,
+        std::uint8_t const nType =
+            (binding == SymbolBinding::Local)
+                ? N_SECT
+                : static_cast<std::uint8_t>(N_SECT | N_EXT);
+        appendNlist(nameOff, nType, kTextSectionNumber, /*n_desc=*/0,
                     f.valueInText);
     }
     // Synthetic per-block symbols (computed-goto labels / dense-switch
@@ -1374,16 +1420,26 @@ encode(AssembledModule const&    module,
     // st_value). Emission order matches the symIdxBySymbol registration
     // above (functions → blocks → data → externs) so relocation r_symbolnum
     // indices line up. Externally-visible items carry their real
-    // (pre-mangled) name; static/synthesized ones keep `_sym_<id>` (the
-    // same carve-out the function loop above uses).
+    // (pre-mangled) name + N_SECT|N_EXT; static/synthesized ones keep
+    // `_sym_<id>` + Local → bare N_SECT, NO N_EXT (the same name+binding
+    // coupling the function loop above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION, TF-C54).
+    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
+    // as the function loop above (a Mach-O relocatable object has no N_WEAK_DEF
+    // path yet; degrading it to N_SECT|N_EXT would silently drop the semantics).
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "_sym_");
+        SymbolBinding const binding = objNames.definedBinding(d.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "data");
+            return {};
+        }
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff,
-                    static_cast<std::uint8_t>(N_SECT | N_EXT),
-                    d.sectOrdinal,
-                    /*n_desc=*/0,
-                    d.flatAddr);
+        std::uint8_t const nType =
+            (binding == SymbolBinding::Local)
+                ? N_SECT
+                : static_cast<std::uint8_t>(N_SECT | N_EXT);
+        appendNlist(nameOff, nType, d.sectOrdinal, /*n_desc=*/0, d.flatAddr);
     }
     // Undefined extern symbols: N_UNDF|N_EXT, n_sect=0, n_value=0.
     // D-LK-OBJECT-EXTERN-CALL-MACHO: the undefined extern carries its REAL

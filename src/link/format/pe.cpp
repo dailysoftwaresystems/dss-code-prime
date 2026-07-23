@@ -1202,15 +1202,63 @@ encode(AssembledModule const&    module,
     // static/local/synthesized symbols.
     link::format::ObjectSymbolNames const objNames{module};
 
-    // Defined function symbols (GLOBAL EXTERNAL, type=FUNCTION,
-    // SectionNumber=1 for `.text`).
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
+    // symbol cannot round-trip a PE/COFF RELOCATABLE (.obj) object today.
+    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
+    // externally-visible `__attribute__((weak))` def; a faithful COFF weak def
+    // needs an IMAGE_SYM_CLASS_WEAK_EXTERNAL record + its weak-external aux
+    // (tagging the default resolution) that is NOT wired. Emitting it strong
+    // (EXTERNAL) would SILENTLY drop the weak-override semantics, so fail loud
+    // instead — the same posture the Mach-O MH_DYLIB export arm takes on this
+    // case (D-LK3-DYLIB-WEAK-EXPORT). Each writer owns its own fail-loud +
+    // vocabulary; the Weak decision is the one shared `definedBinding`.
+    auto emitWeakDefinedRelocatableError =
+        [&](std::string_view symName, char const* symKind) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::string{"pe::encode (Obj): defined "} + symKind
+                     + " symbol '" + std::string{symName}
+                     + "' has WEAK binding -- a weak DEFINED symbol cannot be "
+                       "emitted to a PE/COFF RELOCATABLE object until COFF weak-"
+                       "external (IMAGE_SYM_CLASS_WEAK_EXTERNAL + its weak-"
+                       "external aux record) machinery ships "
+                       "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
+                       "(IMAGE_SYM_CLASS_EXTERNAL) would silently lose weak-"
+                       "override semantics.");
+        };
+
+    // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
+    // Storage class is coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION, TF-C54): a static/synthesized `sym_<id>` def is
+    // Local → IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s unrelated
+    // `sym_<id>` can never collide with it at a FOREIGN multi-TU link; an
+    // externally-visible def keeps EXTERNAL (2). COFF has NO local-first
+    // ordering rule (unlike ELF), so the emission order is unchanged — only the
+    // storage class flips. A WEAK def FAILS LOUD (D-LK-OBJECT-WEAK-DEF-
+    // RELOCATABLE): the c-subset DOES produce weak defined symbols
+    // (`__attribute__((weak))` → SymbolBinding::Weak, per `c-subset.lang.json` +
+    // examples/c-subset/attributes_syntax's `weak_helper` and
+    // weak_inline_crosscu), but they reach a PE binary ONLY via the EXEC/DLL arm
+    // (encodeExec — `encode` dispatches to it above when objectType != Obj),
+    // where a weak def is merge-resolved strong-over-weak / forced Global before
+    // the writer. A weak def routed to THIS relocatable path cannot round-trip
+    // until the COFF weak-external machinery ships, so the writer fails loud
+    // rather than silently degrade it to EXTERNAL.
     for (auto const& f : funcSyms) {
         std::string const symName = objNames.definedName(f.symId, "sym_");
+        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "function");
+            return {};
+        }
+        std::uint8_t const storageClass =
+            (binding == SymbolBinding::Local)
+                ? IMAGE_SYM_CLASS_STATIC
+                : IMAGE_SYM_CLASS_EXTERNAL;
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(f.valueInText),
                         kTextSectionNumber,
                         IMAGE_SYM_DTYPE_FUNCTION,
-                        IMAGE_SYM_CLASS_EXTERNAL);
+                        storageClass);
     }
     // Synthetic per-block symbols (computed-goto labels / dense-switch
     // jump-table targets): IMAGE_SYM_CLASS_STATIC — deliberately LOCAL,
@@ -1237,15 +1285,29 @@ encode(AssembledModule const&    module,
     // External`; NOT Mach-O's flat-address n_value), type = 0 (COFF
     // data symbols are `notype`; DTYPE_FUNCTION is functions-only).
     // Externally-visible items carry their real (identity-mangled)
-    // name; static/synthesized ones keep `sym_<id>` (the same carve-out
-    // the function loop above uses).
+    // name + EXTERNAL; static/synthesized ones keep `sym_<id>` + Local →
+    // IMAGE_SYM_CLASS_STATIC (the same name+binding coupling the function loop
+    // above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
+    // TF-C54; the design-audit caught this DATA site as the omitted twin).
+    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
+    // as the function loop above (COFF weak-external is not wired; degrading it
+    // to EXTERNAL would silently drop the weak-override semantics).
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "sym_");
+        SymbolBinding const binding = objNames.definedBinding(d.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "data");
+            return {};
+        }
+        std::uint8_t const storageClass =
+            (binding == SymbolBinding::Local)
+                ? IMAGE_SYM_CLASS_STATIC
+                : IMAGE_SYM_CLASS_EXTERNAL;
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(d.sectionRelOffset),
                         d.sectionNumber,
                         /*type=*/0,
-                        IMAGE_SYM_CLASS_EXTERNAL);
+                        storageClass);
     }
     // Undefined extern symbols (SectionNumber=0=UNDEF, type=0,
     // value=0). D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the

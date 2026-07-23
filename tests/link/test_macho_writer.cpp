@@ -235,8 +235,11 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     EXPECT_EQ(readU32LE(bytes, symoff + 0), 1u)
         << "n_strx points 1 byte past the leading NUL "
            "('_sym_7' lives at offset 1 in the strtab)";
-    // n_type = N_SECT | N_EXT = 0x0F
-    EXPECT_EQ(bytes[symoff + 4], 0x0Fu);
+    // n_type = N_SECT = 0x0E — the function has no ModuleSymbol row, so it is
+    // not externally visible → `definedBinding` = Local → bare N_SECT, NO N_EXT
+    // (TF-C54, D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION;
+    // pre-fix it was N_SECT|N_EXT = 0x0F).
+    EXPECT_EQ(bytes[symoff + 4], 0x0Eu);
     // n_sect = 1 (1-based)
     EXPECT_EQ(bytes[symoff + 5], 1u);
     // n_value = 0 (function offset 0 in .text)
@@ -289,6 +292,111 @@ TEST(MachOWriter, ObjectSymtabEmitsPipelineMangledNameVerbatimNoDoubleUnderscore
     EXPECT_EQ(name, "_public_fn")
         << "Mach-O writer must emit the pipeline-mangled name verbatim — "
            "exactly one leading underscore, never a re-mangled `__public_fn`";
+}
+
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54) ──
+
+TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
+    // Red-on-disable pin: two defined functions, A global + B static (Local).
+    // NAME and BINDING are coupled (`definedName`/`definedBinding`): A keeps its
+    // real name + N_SECT|N_EXT (0x0F); B stays internal `_sym_11` + bare N_SECT
+    // (0x0E, NO N_EXT), so a sibling `.o`'s unrelated `_sym_<id>` can never bind
+    // to it at a FOREIGN link. Mach-O relocatable objects carry no LC_DYSYMTAB,
+    // so there is no local-first reordering — only the N_EXT bit flips.
+    // Reverting `definedBinding` → B emits N_SECT|N_EXT and this pin goes red.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction a;
+    a.symbol = SymbolId{10};
+    a.bytes  = {0xC3};
+    mod.functions.push_back(std::move(a));
+    AssembledFunction b;
+    b.symbol = SymbolId{11};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_realfn",
+                                       SymbolBinding::Global, SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_statfn",
+                                       SymbolBinding::Local, SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // LC_SYMTAB at byte 184; symoff @ +8, nsyms @ +12, stroff @ +16.
+    // nlist_64 = n_strx(u32,+0) n_type(u8,+4) n_sect(u8,+5) n_desc(u16,+6)
+    //            n_value(u64,+8) = 16 bytes.
+    std::uint32_t const symoff = readU32LE(bytes, 184 + 8);
+    std::uint32_t const stroff = readU32LE(bytes, 184 + 16);
+    ASSERT_EQ(readU32LE(bytes, 184 + 12), 2u);
+
+    auto nameAt = [&](std::uint32_t i) {
+        std::uint32_t const strx = readU32LE(bytes, symoff + i * 16 + 0);
+        std::string s;
+        for (std::size_t p = stroff + strx; p < bytes.size() && bytes[p] != 0; ++p)
+            s.push_back(static_cast<char>(bytes[p]));
+        return s;
+    };
+
+    // sym[0] = fn A (global) → real name, N_SECT|N_EXT (0x0F).
+    EXPECT_EQ(nameAt(0), "_realfn");
+    EXPECT_EQ(bytes[symoff + 0 * 16 + 4], 0x0Fu)
+        << "externally-visible fn keeps N_SECT|N_EXT";
+    // sym[1] = fn B (static) → internal `_sym_11`, bare N_SECT (0x0E).
+    EXPECT_EQ(nameAt(1), "_sym_11");
+    EXPECT_EQ(bytes[symoff + 1 * 16 + 4], 0x0Eu)
+        << "static (Local) fn drops N_EXT — the TF-C54 fix";
+}
+
+// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
+//
+// The relocatable Mach-O (MH_OBJECT) writer cannot faithfully emit a WEAK
+// DEFINED symbol (N_WEAK_DEF + MH_WEAK_DEFINES is not wired). Degrading it to
+// N_SECT|N_EXT would SILENTLY lose the weak-override semantics, so the writer
+// fails loud instead — the same posture the MH_DYLIB export arm already takes
+// (macho.cpp:2980, D-LK3-DYLIB-WEAK-EXPORT). RED-ON-DISABLE: reverting the
+// fail-loud arm makes the writer emit the weak fn as N_SECT|N_EXT (0x0F) with 0
+// errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat citing
+// the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) + the EXEC
+// arms (weak forced Global / merge-resolved) are unaffected.
+TEST(MachOWriter, ObjectWeakDefinedFunctionFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction w;
+    w.symbol = SymbolId{10};
+    w.bytes  = {0xC3};
+    mod.functions.push_back(std::move(w));
+    // A WEAK, externally-visible defined function (the `__attribute__((weak))`
+    // shape c-subset.lang.json produces). `definedBinding` returns Weak.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined symbol must emit no bytes (loud-fail path), never a "
+           "silently-degraded N_SECT|N_EXT record";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak def";
+    bool found = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            d.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") !=
+                std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE (the "
+           "Mach-O N_WEAK_DEF deferral) for future-grep navigability";
 }
 
 // ── relocation_info r_info packing ─────────────────────────────
@@ -586,6 +694,105 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
     EXPECT_EQ(bytes[n1 + 4], 0x0Fu);         // N_SECT | N_EXT
     EXPECT_EQ(bytes[n1 + 5], 2u);            // n_sect = __const ordinal
     EXPECT_EQ(readU64LE(bytes, n1 + 8), 8u); // n_value = flat address
+}
+
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54):
+//    the DATA emit site drops N_EXT for a static item, as the function site ──
+//
+// The n_type binding lives at a SECOND, fully-duplicated emit site (the data
+// loop), NOT shared with the function loop — the design-audit flagged this data
+// twin as unpinned. A static (Local) DATA item carves to `_sym_<id>` + bare
+// N_SECT (0x0E, NO N_EXT); the Global half is pinned by
+// Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol above (0x0F). A
+// string-literal / `static const` rodata is exactly this Local shape, and
+// pre-fix it collided across TUs as N_SECT|N_EXT `_sym_<id>`. RED-ON-DISABLE:
+// reverting the data-site ternary (macho.cpp) to a hardcoded N_SECT|N_EXT makes
+// this read 0x0F → the ==0x0E assertion goes red.
+TEST(MachOWriter, Arm64ObjectStaticDataItemDropsNExt) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 RET
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {'h', 'i', 0};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    // STATIC (Local) data → carved `_sym_42` + bare N_SECT (NO N_EXT). Same flat
+    // layout as the Global test above, so the LC_SYMTAB constants match; only
+    // the name and the N_EXT bit change.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "_msg",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    std::uint32_t const stroff = readU32LE(bytes, 280);
+    ASSERT_EQ(readU32LE(bytes, 276), 2u);   // nsyms = fn + data
+    std::size_t const n1 = symoff + 16;     // nlist[1] = the data symbol
+    EXPECT_EQ(readStrtabName(bytes, stroff, readU32LE(bytes, n1)), "_sym_42")
+        << "a static (Local) data item stays internal `_sym_<id>`";
+    EXPECT_EQ(bytes[n1 + 4], 0x0Eu)   // bare N_SECT — THE FIX
+        << "static data drops N_EXT (0x0E), not the pre-fix N_SECT|N_EXT (0x0F)";
+}
+
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
+// data-site twin of ObjectWeakDefinedFunctionFailsLoud. The data loop has its
+// OWN weak guard (macho.cpp); reverting it silently degrades a weak data def to
+// N_SECT|N_EXT with no diagnostic. RED-ON-DISABLE: revert the data-site guard →
+// non-empty bytes + errorCount 0 → this pin goes red.
+TEST(MachOWriter, Arm64ObjectWeakDefinedDataFailsLoud) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;   // a benign anchor fn so only the DATA is weak
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 RET
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_anchor",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{10};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_weakdat",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak data def";
+    bool found = false;
+    for (auto const& dg : rep.all()) {
+        if (dg.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            dg.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE at the data site";
 }
 
 // (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function (a
@@ -1233,9 +1440,11 @@ TEST(MachOWriter, MultiFunctionModuleEmitsSequentialTextBytesAndIndices) {
     EXPECT_EQ(readU64LE(bytes, symoff + 0 * 16 + 8), 0u);
     // Sym[1] = function `b`: n_value = 3 (right after `a`'s bytes).
     EXPECT_EQ(readU64LE(bytes, symoff + 1 * 16 + 8), 3u);
-    // Both symbols are N_SECT | N_EXT = 0x0F.
-    EXPECT_EQ(bytes[symoff + 0 * 16 + 4], 0x0Fu);
-    EXPECT_EQ(bytes[symoff + 1 * 16 + 4], 0x0Fu);
+    // Both functions have no ModuleSymbol row → not externally visible →
+    // `definedBinding` = Local → bare N_SECT = 0x0E, NO N_EXT (TF-C54; pre-fix
+    // both were N_SECT|N_EXT = 0x0F).
+    EXPECT_EQ(bytes[symoff + 0 * 16 + 4], 0x0Eu);
+    EXPECT_EQ(bytes[symoff + 1 * 16 + 4], 0x0Eu);
 }
 
 // ── End-to-end via the format-blind linker::link() dispatch ────────────

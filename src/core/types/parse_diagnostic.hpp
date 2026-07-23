@@ -1725,7 +1725,8 @@ enum class DiagnosticCode : std::uint16_t {
     //
     // Per-format codes join the family alongside their LK* cycles.
     //
-    // K_NoMatchingObjectFormat fires in four scenarios:
+    // K_NoMatchingObjectFormat is the general format-capability
+    // fail-loud. The four format-DISPATCH scenarios are:
     //   1. The linker engine's format-dispatch switch reaches
     //      `ObjectFormatKind::Unknown` (the invalid sentinel was
     //      not initialized by the format schema's loader path).
@@ -1743,6 +1744,14 @@ enum class DiagnosticCode : std::uint16_t {
     //      ShStrtab — any missing row fires this code; PE and
     //      Mach-O writers only require SectionKind::Text since
     //      their symbol/string tables don't carry section headers).
+    // Beyond dispatch, it ALSO fires when a walker is correctly
+    // matched but cannot FAITHFULLY EMIT a specific symbol shape it
+    // received — degrading which would be a silent miscompile. The
+    // standing instance is a WEAK DEFINED symbol on a format whose
+    // weak machinery is not wired: the Mach-O MH_DYLIB export arm
+    // (D-LK3-DYLIB-WEAK-EXPORT) and the PE/COFF + Mach-O RELOCATABLE
+    // writers (D-LK-OBJECT-WEAK-DEF-RELOCATABLE, TF-C54) fail loud
+    // here rather than emit the def strong and lose weak semantics.
     // K_FormatLacksImportSupport: a format walker received an
     //   AssembledModule with non-empty `externImports` but its
     //   image-side arm doesn't yet emit import tables. The three

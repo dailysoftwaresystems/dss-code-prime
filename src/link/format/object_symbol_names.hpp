@@ -26,9 +26,23 @@
 // or by a reloc within the same `.o`), never by a foreign linker by name, so
 // the anchor explicitly permits them to "stay internal". A static
 // (Local-binding) function therefore falls through to the fallback — this is
-// the `may stay internal` name carve-out (flipping it to STB_LOCAL binding,
-// vs its current GLOBAL `sym_<id>`, is the separate symtab-ordering concern
-// the anchor defers).
+// the `may stay internal` name carve-out.
+//
+// NAME<->BINDING LOCKSTEP (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
+// COLLISION, TF-C54): `definedBinding` is the exact binding companion of
+// `definedName`. It runs the IDENTICAL `definedBySym_` lookup + the IDENTICAL
+// `!name.empty() && isExternallyVisible(...)` predicate, so a symbol that gets
+// the `<prefix><id>` fallback NAME is ALWAYS emitted with `SymbolBinding::Local`
+// binding, and a symbol that keeps its real NAME keeps its real (Global/Weak)
+// binding -- the two can never drift. Before TF-C54 the writers consulted
+// `definedName` for the name but HARDCODED the GLOBAL storage class, so a
+// `static` function shipped as a GLOBAL `sym_<id>`: invisible to DSS's own
+// (cuId,SymbolId)-keyed linker, but a FOREIGN linker keys by name -> two TUs
+// both defining GLOBAL `sym_3774` -> `ld: multiple definition` x thousands
+// (the arm64/x86_64 multi-TU sqlite foreign link). Each format writer maps this
+// ONE `SymbolBinding` decision to its own vocabulary (ELF STB_*, COFF
+// IMAGE_SYM_CLASS_*, Mach-O N_EXT) + ELF's local-before-global `.symtab`
+// ordering -- no `if(format)` in this shared substrate.
 //
 // The IMPORT side (`externName`) names an UNDEFINED extern reference so a
 // foreign linker resolves it — its `ExternImport.mangledName` (already the
@@ -73,6 +87,47 @@ public:
             }
         }
         return std::string{internalPrefix} + std::to_string(id.v);
+    }
+
+    // The `.symtab` BINDING for a DEFINED symbol -- the binding companion of
+    // `definedName`, coupled to it BYTE-FOR-BYTE by using the SAME lookup and
+    // the SAME `!name.empty() && isExternallyVisible(...)` predicate:
+    //   * present, named, externally-visible -> the real `ms.binding`
+    //     (Global or Weak) -- exactly the case `definedName` returns the real
+    //     name for;
+    //   * absent / nameless / not-externally-visible (a `static`/Local def, a
+    //     synthesized rodata/thunk, an interior block symbol, or a substrate
+    //     module with no `ModuleSymbol` row) -> `SymbolBinding::Local` --
+    //     exactly the case `definedName` returns the `<prefix><id>` fallback for.
+    // Guarantee: a `<prefix><id>`-named symbol is ALWAYS Local; a real-named
+    // symbol keeps its real binding. The `!ms.name.empty()` clause is load-
+    // bearing (a nameless row can never be foreign-visible, so it must stay
+    // Local, matching the name side). See the LOCKSTEP note above +
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION.
+    //
+    // BOUNDARY (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL, OPEN/unfired):
+    // reusing `isExternallyVisible` means a Global-binding + Hidden-visibility
+    // def resolves here to Local, so it emits STB_LOCAL (name already carved to
+    // `<prefix><id>` by `definedName` — this only aligns the binding). gcc keeps
+    // it STB_GLOBAL + STV_HIDDEN (resolvable during a static link, hidden from
+    // the dynamic export). The c-subset CAN form a Global+Hidden symbol
+    // (`__attribute__((visibility("hidden")))` on a NON-static fn -- e.g.
+    // examples/c-subset/attributes_syntax's `dead_helper`), but none is routed
+    // to a relocatable writer LIVE: it is DCE-eliminated (an unused hidden
+    // helper), or reaches an EXEC writer where `isExec` forces Global -- so the
+    // Local-emission trap never fires at the ET_REL/COFF/Mach-O symtab. Closing
+    // it means a coupled name+binding STV_HIDDEN emission (real name +
+    // STB_GLOBAL + st_other=STV_HIDDEN).
+    [[nodiscard]] SymbolBinding
+    definedBinding(SymbolId id) const {
+        if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
+            ModuleSymbol const& ms = *it->second;
+            if (!ms.name.empty()
+                && isExternallyVisible(ms.binding, ms.visibility)) {
+                return ms.binding;  // Global or Weak
+            }
+        }
+        return SymbolBinding::Local;
     }
 
     // The `.symtab` name for an UNDEFINED extern reference. Returns the import's

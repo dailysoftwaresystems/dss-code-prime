@@ -240,7 +240,14 @@ TEST(ElfWriter, SectionHeaderTableHasSevenEntriesNullThenTextThenRelocThenNoteLa
 
 // ── .symtab local-then-global ordering ──────────────────────────
 
-TEST(ElfWriter, SymtabFirstNonLocalEqualsTwoBecauseSectionSymbolIsLocal) {
+TEST(ElfWriter, SymtabLocalDefinedFunctionLandsBeforeFirstNonLocal) {
+    // A defined function with NO `ModuleSymbol` row (the substrate /
+    // `makeTrivialModule` shape) is not externally visible, so `definedBinding`
+    // returns Local: it emits STB_LOCAL and lands in the LOCAL region, and
+    // `.symtab.sh_info` (the first-non-local index) counts it — UNDEF(0) +
+    // STT_SECTION(1) + this local func(2) = 3. RED-ON-DISABLE vs TF-C54
+    // (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION): the pre-fix
+    // writer emitted it STB_GLOBAL at index 2 with sh_info=2.
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 7);
     DiagnosticReporter rep;
@@ -248,11 +255,17 @@ TEST(ElfWriter, SymtabFirstNonLocalEqualsTwoBecauseSectionSymbolIsLocal) {
     ASSERT_EQ(rep.errorCount(), 0u);
 
     std::uint64_t const shoff = readU64LE(bytes, 40);
-    // Section 3 is .symtab. sh_info @ offset 44 within Shdr.
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    // The nameless-substrate function is Local: STB_LOCAL|STT_FUNC = 0x02, at
+    // index 2 (right after UNDEF + the .text STT_SECTION local).
+    EXPECT_EQ(bytes[symtabOff + 2 * 24 + 4], 0x02u)
+        << "a defined function with no ModuleSymbol row emits STB_LOCAL (TF-C54)";
+
+    // Section 3 is .symtab. sh_info @ offset 44 within Shdr = first non-LOCAL.
     std::uint64_t const symtabShdr = shoff + 3 * 64;
-    EXPECT_EQ(readU32LE(bytes, symtabShdr + 44), 2u)
-        << "first non-LOCAL symbol must be at index 2 (after STN_UNDEF + "
-           "STT_SECTION local for .text)";
+    EXPECT_EQ(readU32LE(bytes, symtabShdr + 44), 3u)
+        << "first non-LOCAL index = UNDEF + STT_SECTION + the now-Local defined "
+           "function = 3 (was 2 pre-TF-C54 when the func was hardcoded STB_GLOBAL)";
     // sh_link points at .strtab (index 4).
     EXPECT_EQ(readU32LE(bytes, symtabShdr + 40), 4u);
     // sh_entsize = 24 (Elf64_Sym).
@@ -292,64 +305,102 @@ TEST(ElfWriter, FunctionSymbolStValueMatchesTextOffset) {
     EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 1u);
 }
 
-// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .o symtab ──
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54) ──
+// ── the .o symtab couples NAME and BINDING, local-before-global ──
 
-TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+TEST(ElfWriter, ObjectSymtabCouplesNameAndBindingLocalStaticBeforeGlobalWeak) {
+    // THE red-on-disable pin for TF-C54. One module with every defined-symbol
+    // form the coupling must distinguish:
+    //   * fn A  (SymbolId 10) — Global   → real name `public_fn`, STB_GLOBAL,
+    //                                       GLOBAL region (after sh_info);
+    //   * fn B  (SymbolId 11) — static   → internal `sym_11`,     STB_LOCAL,
+    //                           (Local)    LOCAL region (before sh_info);
+    //   * fn C  (SymbolId 12) — Weak     → real name `weak_fn`,   STB_WEAK,
+    //                                       GLOBAL region;
+    //   * data D (SymbolId 13) — static  → internal `sym_13`,     STB_LOCAL.
+    //                            (Local)
+    // The emitted NAME (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) and the emitted BINDING
+    // are driven by the SAME predicate (`definedName`/`definedBinding`), so a
+    // `sym_<id>` name is ALWAYS STB_LOCAL and a real name keeps its real
+    // binding. Reverting `definedBinding` to the pre-TF-C54 hardcoded STB_GLOBAL
+    // makes the static fn/data emit 0x12/0x11 in the GLOBAL region and sh_info
+    // collapse to 2 → this pin goes red (the exact FOREIGN multi-TU `sym_<id>`
+    // multiple-definition collision this cycle fixes).
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
-    // Two defined functions covering both externally-visible forms:
-    //   * fn A (SymbolId 10) — externally-visible (Global) → REAL name.
-    //   * fn B (SymbolId 11) — static (Local) → stays internal `sym_11`.
-    // (The IMPORT side — naming an undefined extern + its PLT32 reloc — is
-    // covered by ObjectExternCallEmitsUndefImportNameAndPlt32Reloc below.)
     AssembledModule mod;
-    mod.expectedFuncCount = 2;
-
-    AssembledFunction a;
-    a.symbol = SymbolId{10};
-    a.bytes  = {0xC3};
-    mod.functions.push_back(std::move(a));
-
-    AssembledFunction b;
-    b.symbol = SymbolId{11};
-    b.bytes  = {0xC3};
-    mod.functions.push_back(std::move(b));
+    mod.expectedFuncCount = 3;
+    auto addFn = [&](std::uint32_t id) {
+        AssembledFunction f;
+        f.symbol = SymbolId{id};
+        f.bytes  = {0xC3};
+        mod.functions.push_back(std::move(f));
+    };
+    addFn(10);   // A — global
+    addFn(11);   // B — static (Local)
+    addFn(12);   // C — weak
+    AssembledData d;
+    d.symbol    = SymbolId{13};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {0, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
 
     // The name/binding table the compile pipeline populates (LK11a), carrying
     // the already-mangled on-binary name (identity on ELF).
     mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "public_fn",
-                                       SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+                                       SymbolBinding::Global, SymbolVisibility::Default});
     mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "static_fn",
-                                       SymbolBinding::Local,
-                                       SymbolVisibility::Default});
+                                       SymbolBinding::Local, SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{12}, "weak_fn",
+                                       SymbolBinding::Weak, SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{13}, "static_data",
+                                       SymbolBinding::Local, SymbolVisibility::Default});
 
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    std::uint64_t const shoff     = readU64LE(bytes, 40);
-    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
-    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    // A `.data` section is present, so locate `.symtab`/`.strtab` by name.
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint32_t const shInfo    = readU32LE(bytes, shoff + symtabIdx * 64 + 44);
 
-    // Symtab order: 0=UNDEF, 1=STT_SECTION, 2=fnA, 3=fnB.
     auto nameAt = [&](std::uint64_t i) {
         return readStrtabName(bytes, strtabOff,
                               readU32LE(bytes, symtabOff + i * 24 + 0));
     };
     auto infoAt = [&](std::uint64_t i) { return bytes[symtabOff + i * 24 + 4]; };
 
-    // EXPORT — externally-visible fn A carries its real C name (STB_GLOBAL|STT_FUNC).
-    EXPECT_EQ(nameAt(2), "public_fn")
-        << "externally-visible defined function must carry its real name";
-    EXPECT_EQ(infoAt(2), 0x12u);   // (STB_GLOBAL<<4)|STT_FUNC
+    // Order: 0=UNDEF, 1=STT_SECTION(.text) | LOCAL pass: 2=static fn B,
+    // 3=static data D | [sh_info=4] | GLOBAL pass: 4=fn A, 5=weak fn C.
+    EXPECT_EQ(nameAt(2), "sym_11")
+        << "a static (Local) function stays internal `sym_<id>`";
+    EXPECT_EQ(infoAt(2), 0x02u)  // (STB_LOCAL<<4)|STT_FUNC — THE FIX
+        << "static fn emits STB_LOCAL, not the pre-fix STB_GLOBAL";
+    EXPECT_EQ(nameAt(3), "sym_13")
+        << "a static (Local) data item stays internal `sym_<id>`";
+    EXPECT_EQ(infoAt(3), 0x01u)  // (STB_LOCAL<<4)|STT_OBJECT
+        << "static data emits STB_LOCAL|STT_OBJECT";
 
-    // CARVE-OUT — static fn B stays internal `sym_11` (isExternallyVisible=false).
-    EXPECT_EQ(nameAt(3), "sym_11")
-        << "a static (Local-binding) function must stay internal, not leak its "
-           "real name into the object symtab";
-    EXPECT_EQ(infoAt(3), 0x12u);   // still STB_GLOBAL|STT_FUNC (name-only carve-out)
+    EXPECT_EQ(shInfo, 4u)
+        << "sh_info = first non-local: UNDEF + STT_SECTION + local fn + local "
+           "data = 4 (every STB_LOCAL precedes the first non-local, ELF ABI)";
+
+    EXPECT_EQ(nameAt(4), "public_fn")
+        << "externally-visible fn keeps its real name in the GLOBAL region";
+    EXPECT_EQ(infoAt(4), 0x12u)  // (STB_GLOBAL<<4)|STT_FUNC — unchanged
+        << "global fn stays STB_GLOBAL|STT_FUNC";
+    EXPECT_EQ(nameAt(5), "weak_fn")
+        << "a weak def keeps its real name";
+    EXPECT_EQ(infoAt(5), 0x22u)  // (STB_WEAK<<4)|STT_FUNC
+        << "weak fn emits STB_WEAK|STT_FUNC (native ELF weak)";
 }
 
 // ── D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined extern + PLT32 ──
