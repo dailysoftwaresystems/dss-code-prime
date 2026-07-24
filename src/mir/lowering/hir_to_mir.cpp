@@ -10783,7 +10783,20 @@ struct Lowerer {
                         "name (the linker's import-table key).", decl.v));
                     continue;
                 }
-                if (meta->importLibrary.empty()) {
+                // c86 / TF-C67 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a
+                // `noLibraryBinding` DATA extern is EXEMPT from the library
+                // requirement, exactly like the ExternFunction arm below — an
+                // unbound cross-TU DATA reference (e.g. sqlite's `extern
+                // FuncDefHash sqlite3BuiltinFunctions;`, or any `--resolve-
+                // library` governed-unmatched global) carries an EMPTY
+                // libraryPath on purpose. The LK11 merge resolves it against a
+                // sibling TU's definition (row stripped, the reference binds to
+                // the definition); an unresolved survivor is rejected LOUD at
+                // the link tier as an undefined symbol (K_SymbolUndefined). This
+                // MUST match the function arm — a data extern is no less
+                // sibling-resolvable than a function one, and TF-C66's
+                // resolve-library reroute produces both.
+                if (meta->importLibrary.empty() && !meta->noLibraryBinding) {
                     unsupported(decl, std::format(
                         "HIR ExternGlobal (id {}) — `importLibrary` is "
                         "missing from the HirAttribute<FfiMetadata> "

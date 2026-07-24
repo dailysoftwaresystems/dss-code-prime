@@ -278,6 +278,75 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
            "--resolve-library";
 }
 
+// ── TF-C67: a sibling-TU-defined DATA extern under --resolve-library ───────
+//
+// The DATA (ExternGlobal) twin of SiblingTuDefinitionResolvesUnderResolveLibrary.
+// TF-C66's reroute marks a governed-unmatched extern UNBOUND (noLibraryBinding),
+// for DATA externs as well as functions -- e.g. sqlite's `extern FuncDefHash
+// sqlite3BuiltinFunctions;` defined in a sibling TU. The HIR->MIR ExternGlobal
+// lowering (hir_to_mir.cpp) used to REQUIRE a library for every data extern
+// (H0009), unlike the ExternFunction arm which exempts noLibraryBinding. That
+// asymmetry SKIPPED the unbound data extern's import row, which then broke a
+// referencing function body's lowering into an unsealed MIR block -- a
+// MirBuilder abort on the full sqlite testfixture (D-MIR-LOWER-BLOCK-CREATED-
+// NEVER-FILLED-TESTFIXTURE). TF-C67 gives ExternGlobal the SAME noLibraryBinding
+// exemption: an unbound data extern is sibling-resolved at link (row stripped),
+// or rejected LOUD if unresolved. RED-ON-DISABLE: revert the ExternGlobal
+// exemption and this build fails H0009 on `dss_data_answer`.
+TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibrary) {
+#if defined(_WIN32)
+    std::string const libTarget   = "x86_64:pe64-x86_64-windows-dll";
+    std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
+    std::string const libArtifact = "dsslib.dll";
+    std::string const exeArtifact = "decl.exe";
+#else
+    std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
+    std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";
+    std::string const libArtifact = "dsslib.so";
+    std::string const exeArtifact = "decl";
+#endif
+    ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    // TU A references the in-build DATA symbol; TU B defines it (= 42). It is
+    // governed (no override), absent from the library and every descriptor ->
+    // TF-C66 marks it UNBOUND -> exactly the ExternGlobal path TF-C67 fixes.
+    auto const declSrc = writeSrc(
+        dir, "decl.c",
+        "extern int dss_data_answer;\n"
+        "int main(void){ return dss_data_answer; }\n");
+    auto const defSrc = writeSrc(dir, "def.c",
+                                 "int dss_data_answer = 42;\n");
+
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), libTarget, libRep), 0);
+    auto const libPath = dir / libArtifact;
+    ASSERT_TRUE(fs::exists(libPath));
+
+    DiagnosticReporter rep;
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries({libPath});
+    int const rc = p.compileUnits(
+        std::vector<std::string>{declSrc.string(), defSrc.string()},
+        "c-subset", std::vector<std::string>{execTarget}, rep);
+    ASSERT_EQ(rc, 0)
+        << "an unbound DATA extern DEFINED BY A SIBLING TU must lower + link "
+           "(no H0009, no MirBuilder abort) -- the TF-C67 ExternGlobal exemption";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_SymbolUndefined),
+              0u);
+
+    auto const exePath = dir / exeArtifact;
+    ASSERT_TRUE(fs::exists(exePath)) << "the multi-TU exec must be emitted";
+    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "the sibling-TU data definition (42) must resolve + run under an "
+           "active --resolve-library";
+}
+
 // ── Eager --resolve-library path validation (all hosts) -- MEDIUM fold ─────
 //
 // A nonexistent / unreadable `--resolve-library` path must fail loud
