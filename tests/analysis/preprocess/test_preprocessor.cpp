@@ -1898,6 +1898,133 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
 // token's OWN span (its physical position is the `#define` line 1) yields `1`;
 // the invocation-offset inheritance (ExpToken::invOffset threaded through the
 // object-like splice) is exactly what makes it `4`.
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C59 `#line` (C23 6.10.4 -- D-CPP-LINE-DIRECTIVE). Sets the PRESUMED line,
+// and optionally the presumed file, for the lines that FOLLOW. Config-driven
+// (`lineDirective`), so an empty field leaves `#line` to the generic
+// unsupported-directive fail-loud. Every assertion below is RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// THE off-by-one that a naive implementation gets wrong: `#line N` numbers the
+// line FOLLOWING the directive N -- not the directive's own line.
+// RED-ON-DISABLE: dropping the `-1` in `N + physLine - dirLine - 1` yields 101.
+TEST(Preprocessor, Tf59LineDirectiveRenumbersFollowingLine) {
+    PreprocessResult r;
+    //                    line: 1          2
+    auto lexs = ppLexemes("#line 100\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "#line 100 must number the FOLLOWING line 100 (not 101, and not the "
+           "directive's own physical line)";
+}
+
+// Numbering ADVANCES from the directive: two lines later is N+1.
+// RED-ON-DISABLE: a fix that pins every following line to N gives 100 twice.
+TEST(Preprocessor, Tf59LineDirectiveNumberingAdvances) {
+    PreprocessResult r;
+    //                    line: 1          2               3
+    auto lexs = ppLexemes("#line 100\nint a = __LINE__;\nint b = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 10u) << "expected: int a = 100 ; int b = 101 ;";
+    EXPECT_EQ(lexs[3], "100");
+    EXPECT_EQ(lexs[8], "101") << "numbering must ADVANCE from the directive";
+}
+
+// C23 6.10.4p3: the file operand is OPTIONAL, and when OMITTED the presumed NAME
+// is left UNCHANGED. So a bare `#line N` AFTER a `#line M "f"` must keep "f".
+// RED-ON-DISABLE: resetting the name on a bare directive reverts __FILE__ to the
+// real buffer name -- the single subtlest rule in the directive.
+TEST(Preprocessor, Tf59LineDirectiveOmittedFileLeavesPresumedNameUnchanged) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#line 10 \"virtual.c\"\n#line 900\n"
+                          "const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool sawVirtual = false;
+    for (auto const& s : lexs) {
+        if (s.find("virtual.c") != std::string::npos) sawVirtual = true;
+    }
+    EXPECT_TRUE(sawVirtual)
+        << "a BARE `#line 900` must NOT revert the presumed file name set by the "
+           "earlier `#line 10 \"virtual.c\"` (C23 6.10.4p3)";
+}
+
+// A `#line` inside an ELIDED conditional branch is skipped with NO diagnostic and
+// NO renumbering -- the #define/#include/#pragma/#embed dead-branch parity.
+// RED-ON-DISABLE: dispatching before the `stackActive()` gate renumbers to 500.
+TEST(Preprocessor, Tf59LineDirectiveInDeadBranchIsInert) {
+    PreprocessResult r;
+    //                    line: 1      2           3       4
+    auto lexs = ppLexemes("#if 0\n#line 500\n#endif\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a `#line` in a dead branch must not diagnose";
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "4")
+        << "a dead-branch `#line` must NOT renumber -- the real line 4 stands";
+}
+
+// Fail loud, never silently mis-number: a non-digit operand is rejected. This is
+// also the current behaviour for the macro-expanded form (6.10.4p4), pinned by
+// D-CPP-LINE-DIRECTIVE-MACRO-OPERAND -- a wrong line number would be exactly the
+// silent-wrongness the bar forbids.
+TEST(Preprocessor, Tf59LineDirectiveNonDigitOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line abc\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "a non-digit `#line` operand must FAIL LOUD, never silently renumber";
+}
+
+// A missing operand is a constraint violation, not a no-op.
+TEST(Preprocessor, Tf59LineDirectiveMissingOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#line` with no operand must FAIL LOUD";
+}
+
+// C23 6.10.4p2: the digit sequence is constrained to 1..2147483647 — the range is
+// TWO-sided. `#line 0` was silently accepted (making __LINE__ 0) until the
+// code-audit caught the one-sided check. RED-ON-DISABLE: drop the `n == 0` arm.
+TEST(Preprocessor, Tf59LineDirectiveZeroFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line 0\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#line 0` is out of the 1..2147483647 range (C23 6.10.4p2)";
+}
+
+// Trailing junk after the file operand must be rejected, matching handleEmbed.
+// Silently ignoring it would half-honour an unsupported form.
+// RED-ON-DISABLE: drop the trailing-token arm.
+TEST(Preprocessor, Tf59LineDirectiveTrailingJunkFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line 5 \"f.c\" garbage\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "tokens after the #line file operand must FAIL LOUD";
+}
+
+// A directive may span several PHYSICAL lines via a `\` continuation. `#line N`
+// renumbers the line after the directive ENDS, so keying the record on the
+// directive's FIRST token made this silently off-by-one (audit finding 1:
+// DSS gave 101, gcc gives 100).
+// RED-ON-DISABLE: resolve from `dirTok` instead of the line's last token.
+TEST(Preprocessor, Tf59LineDirectiveSpanningContinuationIsNotOffByOne) {
+    PreprocessResult r;
+    //                    line: 1        2      3
+    auto lexs = ppLexemes("#line \\\n100\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "a `\\`-continued #line renumbers the line after the directive ENDS "
+           "(gcc gives 100); keying on the directive's first token gives 101";
+}
+
+// The design's HEADLINE property, which nothing pinned until the code-audit said
+// so: records are keyed PER ORIGIN BUFFER, so a `#line` inside an #include'd
+// header renumbers only THAT header — the includer's own numbering is untouched.
+// RED-ON-DISABLE: replace the per-origin map with one global vector and the
+// includer's __LINE__ after the #include wrongly follows the header's directive.
+// (moved below — it needs the `fs` alias + `ppText`, declared later in this file)
+
 TEST(Preprocessor, FC15bLineInMacroResolvesToInvocationLine) {
     PreprocessResult r;
     //              line: 1                    2        3        4
@@ -3315,6 +3442,41 @@ TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
         << "the command-line define seed must thread into the child builder so "
            "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
            "DEFINEDNESS-PARITY child-threading)";
+    fs::remove_all(dir, ec);
+}
+
+// TF-C59 (D-CPP-LINE-DIRECTIVE) — the design's HEADLINE property, which nothing
+// pinned until the independent code-audit said so: `#line` records are keyed PER
+// ORIGIN BUFFER, so a `#line` inside an #include'd header renumbers only THAT
+// header; the includer's own numbering is untouched.
+// RED-ON-DISABLE: replace the per-origin `lineDirs_` map with a single global
+// vector and the includer's `__LINE__` after the #include wrongly follows the
+// header's directive (every other Tf59 test stays green — they are all
+// single-buffer, which is exactly the coverage hole the audit found).
+TEST(Preprocessor, Tf59LineDirectiveInHeaderDoesNotRenumberIncluder) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf59_line_hdr";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "h.h", std::ios::binary)
+          << "#line 700\nint from_header = __LINE__;\n"; }
+    auto schema = cSubset();
+    //                                        line: 1              2
+    auto buf = SourceBuffer::fromString(
+        "#include \"h.h\"\nint after = __LINE__;\n", "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    EXPECT_FALSE(out.diagnostics->hasErrors());
+    bool saw700 = false, saw2 = false;
+    for (Token const& t : out.tokens) {
+        std::string const s{out.synthBuffer->slice(t.span)};
+        if (s == "700") saw700 = true;
+        if (s == "2")   saw2   = true;
+    }
+    EXPECT_TRUE(saw700) << "the header's own line must follow its #line 700";
+    EXPECT_TRUE(saw2)
+        << "the INCLUDER's line 2 must be UNAFFECTED by the header's #line — "
+           "exactly what per-origin keying buys";
     fs::remove_all(dir, ec);
 }
 

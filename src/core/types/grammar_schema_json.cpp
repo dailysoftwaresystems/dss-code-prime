@@ -4180,6 +4180,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // `hasIncludeAngle*` KINDS only to recognise-and-reject an angle
             // argument at runtime; see the field doc in preprocess_config.hpp.
             readOptWord("embedDirective",         cfg.embedDirective);
+            // TF-C59 (`#line`; C23 6.10.4 / D-CPP-LINE-DIRECTIVE). OPTIONAL —
+            // absent leaves it empty, so a `#line` hits the generic
+            // unsupported-directive fail-loud (the embed/pragma opt-in model).
+            readOptWord("lineDirective",          cfg.lineDirective);
             readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like

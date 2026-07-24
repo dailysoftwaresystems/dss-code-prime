@@ -81,6 +81,7 @@
     "hasCAttributeOperator":    "__has_c_attribute",
     "$fc179EmbedComment": "FC17.9(h) C23 `#embed` (6.10.4) + `__has_embed` (6.10.1). `#embed \"r\"` resolves the QUOTED binary resource with the SAME search a quote-`#include` uses (self-dir first, then include dirs) and expands to the resource bytes as a comma-separated list of decimal `int` constants (0..255), spliced through the SAME product-token mechanism as `#`/`##` -- so the tokens are ordinary integer literals + commas the parser accepts in a brace initializer. `__has_embed` reports the C23 trichotomy NOT_FOUND(0)/FOUND(1)/EMPTY(2) (== the `__STDC_EMBED_*` macros above). CYCLE-1 SUBSET: the standard parameters (limit/prefix/suffix/if_empty + vendor) and the ANGLE form `<r>` and a macro-expanded argument are DEFERRED loud (D-PP-EMBED-{PARAMS,ANGLE,MACRO-ARG}); a resource above a ~16 MiB splice budget fails loud, never OOMs (the streaming boundary). `__has_embed` with any parameter clause answers NOT_FOUND(0) per C23 (the standard's own unsupported-signal, not an error). The angle delimiters are the SAME token KINDS as `__has_include` (hasIncludeAngleOpenToken/CloseToken), matched by KIND never the `<`/`>` bytes; the operator words are matched by TEXT, never a hard-coded spelling.",
     "embedDirective":           "embed",
+    "lineDirective":            "line",
     "hasEmbedOperator":         "__has_embed",
     "knownCAttributes": [
       { "name": "deprecated",   "version": 202311 },

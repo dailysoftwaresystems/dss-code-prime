@@ -1967,6 +1967,14 @@ private:
             // hard-coded "embed"; an empty field (a language with no `#embed`)
             // skips this arm -> the generic unsupported-directive fail-loud below.
             handleEmbed(in, p, end, body);
+        } else if (!cfg().lineDirective.empty()
+                   && word == cfg().lineDirective) {
+            // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE). Reached ONLY for a LIVE
+            // `#line` (the dead-branch gate above already returned, so a `#line`
+            // in an elided branch is skipped with no diagnostic — the
+            // #define/#include/#pragma/#embed parity). The line's tokens are NOT
+            // forwarded into `body`: a directive is not program text.
+            handleLine(in, p + 1, end);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
                    synth_->id(), in[p].span,
@@ -2543,6 +2551,105 @@ private:
         }
     }
 
+    // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE): `#line digits ["file"]` sets the
+    // PRESUMED line — and optionally the presumed file name — reported by
+    // `__LINE__`/`__FILE__` for the lines that FOLLOW. Records a per-origin entry
+    // consumed by `presumedLine`/`presumedFile`.
+    //
+    // The MACRO-EXPANDED operand form (6.10.4p4 — `#line SOME_MACRO`) is NOT yet
+    // handled: such an operand is not a digit sequence, so it hits the fail-loud
+    // below rather than being silently mis-numbered. Anchored
+    // `D-CPP-LINE-DIRECTIVE-MACRO-OPERAND`; generated C (lemon/bison/flex) always
+    // emits the literal-digit form, which is what unblocks sqlite's `parse.c`.
+    void handleLine(std::vector<Token> const& in, std::size_t p,
+                    std::size_t end) {
+        std::size_t const dirTok = p;          // first operand token (span source)
+        p = skipTrivia(in, p);
+        if (p >= end || isNewline(in[p])) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   (p < end ? in[p].span : SourceSpan::empty(0)),
+                   "#line requires a line number");
+            return;
+        }
+        std::string_view const numTx = text(in[p]);
+        if (numTx.empty()
+            || numTx.find_first_not_of("0123456789") != std::string_view::npos) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[p].span,
+                   std::string{"#line requires a digit sequence — got: "}
+                       + std::string{numTx});
+            return;
+        }
+        unsigned long long n = 0;
+        for (char const c : numTx) {
+            n = n * 10ull + static_cast<unsigned long long>(c - '0');
+            if (n > 2147483647ull) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[p].span, "#line number out of range");
+                return;
+            }
+        }
+        // C23 6.10.4p2 constrains the digit sequence to 1..2147483647 — the range
+        // is TWO-sided. `#line 0` was silently accepted before (gcc
+        // -pedantic-errors rejects it), which would make `__LINE__` 0.
+        if (n == 0) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[p].span, "#line number out of range");
+            return;
+        }
+        LineDirectiveRec rec;
+        rec.presumedLine = static_cast<std::uint32_t>(n);
+
+        // OPTIONAL "file" operand (6.10.4p3): absent => presumed name UNCHANGED.
+        std::size_t const q = skipTrivia(in, p + 1);
+        if (q < end && !isNewline(in[q])) {
+            // A quoted operand is TWO tokens, exactly as `#include`/`#embed` see
+            // it: the OPENER (config kind `quoteIncludeToken`, which consumed only
+            // the `"`) followed by the coalesced BODY token whose text is the raw
+            // bytes between the quotes. Keying on the CONFIG kind + position keeps
+            // this agnostic — never a hard-coded `"` scan of one token's text.
+            if (quoteIncludeKind_.valid() && in[q].schemaKind == quoteIncludeKind_
+                && q + 1 < end && !isNewline(in[q + 1])) {
+                rec.file    = std::string{text(in[q + 1])};
+                rec.hasFile = true;
+                // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
+                // ignoring tokens after the operand would let an unsupported
+                // form be half-honoured (`#line 5 "f" <anything>`).
+                std::size_t const t = skipTrivia(in, q + 2);
+                if (t < end && !isNewline(in[t])) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), in[t].span,
+                           std::string{"unexpected token after the #line file "
+                                       "operand: "} + std::string{text(in[t])});
+                    return;
+                }
+            } else {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[q].span,
+                       "#line file operand must be a \"quoted\" string");
+                return;
+            }
+        }
+
+        // Key by the ORIGIN buffer the directive physically sits in, so a header
+        // and its includer keep independent numbering.
+        if (lineMap_ == nullptr || lineMap_->empty()) return;
+        // Resolve from the LAST token of the directive line, not the first: a
+        // directive may span several PHYSICAL lines (a `\` continuation, or a
+        // block comment across lines), and `#line N` renumbers the line after the
+        // directive ENDS. Keying on the first token made every such directive
+        // silently off-by-one per extra line. `end` is one past the terminating
+        // newline, so `end-1` is that newline (or the last real token at EOF with
+        // no trailing newline) — identical for the single-line case.
+        std::size_t const spanTok =
+            (end > 0 && end - 1 < in.size() && end - 1 >= dirTok) ? end - 1
+                                                                  : dirTok;
+        LineMap::Resolved const r = lineMap_->resolve(in[spanTok].span.start());
+        if (r.origin == nullptr) return;
+        rec.physLine = r.origin->lineCol(r.offset).line;
+        lineDirs_[static_cast<void const*>(r.origin)].push_back(std::move(rec));
+    }
+
     void handleUndef(std::vector<Token> const& in, std::size_t p,
                      std::size_t end) {
         p = skipTrivia(in, p);
@@ -3038,30 +3145,100 @@ private:
     // the synth buffer -- a Number for `__LINE__`/Constant, a StringStart +
     // StringLiteral pair for `__FILE__`/`__DATE__`/`__TIME__` (exactly as a
     // stringize product). Dispatches ONLY on `def.kind`, never the name.
+    // ── TF-C59 `#line` presumed-position map (C23 6.10.4 / D-CPP-LINE-DIRECTIVE) ──
+    // One record per `#line` DIRECTIVE, keyed by the ORIGIN buffer it appeared in
+    // (a header and its includer each keep their own numbering) and the PHYSICAL
+    // line the directive itself sat on. `#line N` renumbers the line FOLLOWING the
+    // directive to N, hence the `-1` in the arithmetic below.
+    //
+    // Stored per-origin and appended in source order, so the lookup is "the last
+    // directive at or before this physical line". Directives are encountered in
+    // increasing line order within a buffer, so the vector is sorted by
+    // construction — no sort, and a reverse scan finds the active record.
+    struct LineDirectiveRec {
+        std::uint32_t physLine     = 0;      // line the `#line` itself is on
+        std::uint32_t presumedLine = 0;      // N — the number given to physLine+1
+        std::string   file;                  // presumed name (empty => inherit)
+        bool          hasFile      = false;  // operand present (6.10.4p3)
+    };
+    std::unordered_map<void const*, std::vector<LineDirectiveRec>> lineDirs_;
+
+    // The active record for (origin, physLine), or nullptr when no `#line`
+    // precedes that line in that buffer.
+    [[nodiscard]] LineDirectiveRec const* activeLineDir(
+        void const* origin, std::uint32_t physLine) const {
+        auto const it = lineDirs_.find(origin);
+        if (it == lineDirs_.end()) return nullptr;
+        LineDirectiveRec const* best = nullptr;
+        for (auto const& rec : it->second) {
+            // No early `break`: a full scan returns the last-applicable record
+            // regardless of append order, matching `presumedFile`'s reverse scan.
+            // Records ARE appended in increasing order today (one forward pass
+            // per origin), but that invariant lives in SourceBuffer, not here —
+            // an include/buffer cache would break it silently, and the two
+            // lookups would then disagree. ~50 records for lemon's parse.c.
+            if (rec.physLine < physLine) best = &rec;
+        }
+        return best;
+    }
+
+    // PRESUMED line for a physical line: N + (physLine - directiveLine - 1).
+    [[nodiscard]] std::uint32_t presumedLine(void const* origin,
+                                             std::uint32_t physLine) const {
+        LineDirectiveRec const* const rec = activeLineDir(origin, physLine);
+        if (rec == nullptr) return physLine;
+        return rec->presumedLine + (physLine - rec->physLine - 1u);
+    }
+
+    // PRESUMED file name. C23 6.10.4p3: the file operand is OPTIONAL and when
+    // omitted the presumed name is left UNCHANGED — so walk back to the most
+    // recent record that actually CARRIED a name, and leave `name` untouched if
+    // none did. (A `#line N` after a `#line M "f"` keeps reporting "f".)
+    void presumedFile(void const* origin, std::uint32_t physLine,
+                      std::string& name) const {
+        auto const it = lineDirs_.find(origin);
+        if (it == lineDirs_.end()) return;
+        for (auto r = it->second.rbegin(); r != it->second.rend(); ++r) {
+            if (r->physLine >= physLine) continue;
+            if (r->hasFile) { name = r->file; return; }
+        }
+    }
+
     std::vector<Token> materializePredefined(PredefinedMacroDef const& def,
                                              ByteOffset invOffset) {
         switch (def.kind) {
         case PredefinedMacroKind::Line: {
-            // C 6.10.8.1: the LINE number of the macro's INVOCATION. Resolve the
-            // invocation offset through the line-map to its ORIGIN buffer +
-            // offset, then read the 1-based origin line. Null/empty line-map ->
-            // line 1 (defensive; a real TU always has a map).
+            // C 6.10.8.1: the LINE number of the macro's INVOCATION -- but the
+            // PRESUMED one, which `#line` may have remapped (C23 6.10.4p2-3).
+            // Resolve the invocation offset through the line-map to its ORIGIN
+            // buffer + offset, read the 1-based PHYSICAL line, then apply any
+            // active `#line` for that origin. Null/empty line-map -> line 1
+            // (defensive; a real TU always has a map).
             std::uint32_t line = 1;
             if (lineMap_ != nullptr && !lineMap_->empty()) {
                 LineMap::Resolved const r = lineMap_->resolve(invOffset);
-                if (r.origin != nullptr) line = r.origin->lineCol(r.offset).line;
+                if (r.origin != nullptr) {
+                    line = r.origin->lineCol(r.offset).line;
+                    line = presumedLine(r.origin, line);
+                }
             }
             return materializeSignificant(std::to_string(line));
         }
         case PredefinedMacroKind::File: {
-            // C 6.10.8.1: the presumed NAME of the current source file. Resolve
+            // C 6.10.8.1: the PRESUMED NAME of the current source file. Resolve
             // the invocation offset to its ORIGIN buffer so a `__FILE__` inside an
-            // `#include`'d header reports the HEADER's name, not the main file's.
+            // `#include`'d header reports the HEADER's name, not the main file's,
+            // then let an active `#line "file"` override it (C23 6.10.4p3 -- the
+            // file operand is OPTIONAL, and when omitted the presumed name is
+            // left UNCHANGED, so the override only applies when one was given).
             // `\` -> `/` normalized, then quoted as a C string literal.
             std::string name = "<source>";   // defensive synth name
             if (lineMap_ != nullptr && !lineMap_->empty()) {
                 LineMap::Resolved const r = lineMap_->resolve(invOffset);
-                if (r.origin != nullptr) name = std::string{r.origin->name()};
+                if (r.origin != nullptr) {
+                    name = std::string{r.origin->name()};
+                    presumedFile(r.origin, r.origin->lineCol(r.offset).line, name);
+                }
             }
             for (char& c : name) {
                 if (c == '\\') c = '/';
