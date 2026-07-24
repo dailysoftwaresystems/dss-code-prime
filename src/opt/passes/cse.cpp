@@ -88,15 +88,6 @@ struct CseKeyHash {
     // gate above catches it; this redundant check pins the invariant
     // against a future opcode-table cleanup that sets it false.
     if (op == MirOpcode::Alloca) return false;
-    // TF-C58 bisect (env-gated, diagnostic): `DSS_CSE_NO_LOAD=1` withdraws Load from
-    // the CSE candidate set. If the arm64 select1.test miscompile disappears under
-    // it, the defect is the Load CSE alias gate missing a may-aliasing Store that
-    // lies on the BACK-EDGE path between the canonical Load (loop preheader) and the
-    // candidate Load (loop body) — i.e. the clobber walk not accounting for the loop.
-    if (op == MirOpcode::Load) {
-        static bool const noLoadCse = std::getenv("DSS_CSE_NO_LOAD") != nullptr;
-        if (noLoadCse) return false;
-    }
     return true;
 }
 
@@ -250,14 +241,25 @@ void CsePolicy::analyze(MirFuncId fn,
             if (it != scope.end()) {
                 // Load admission gate: a Load CSE'd against a dominating
                 // canonical Load is sound only if no may-aliasing Store
-                // sits anywhere between them. We scan three slices
-                // owned by the caller (this site) plus the strictly-
-                // between region owned by the clobber index's
-                // `anyClobberBetween` (same fwd∩bwd region as the
-                // reference `mirRegionBetween`, memoized):
-                //   — canonical's block tail (after canonical, to end)
-                //   — strictly-between blocks (region walker)
-                //   — useBlock's head (start, up to current)
+                // sits anywhere between them, ON ANY EXECUTED PATH — the
+                // back edge included. We scan FOUR slices, three owned by
+                // the caller (this site) plus the strictly-between region
+                // owned by the clobber index's `anyClobberBetween` (same
+                // fwd∩bwd region as the reference `mirRegionBetween`,
+                // memoized):
+                //   (a) canonical's block tail (after canonical, to end)
+                //   (b) strictly-between blocks (region walker)
+                //   (c) useBlock's head (start, up to current)
+                //   (d) useBlock's TAIL, when the use block sits on a cycle
+                //       that does not pass through the canonical's block
+                //       (`D-OPT-CSE-LOAD-BACKEDGE-TAIL` — omitting this was
+                //       a real release-only miscompile)
+                // ★ These four are a COVER: proving that is a hand argument
+                // re-done at each edit, not a property the API enforces. If a
+                // SECOND consumer ever needs point-to-point clobber cover,
+                // hoist the decomposition into the analysis as one chokepoint
+                // so it cannot be partially reimplemented —
+                // `D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`.
                 // The region walker EXCLUDES both endpoints to keep the
                 // two responsibilities disjoint and prevent the dead-
                 // code-masking-bug class where overlapping scans hide
@@ -359,6 +361,41 @@ void CsePolicy::analyze(MirFuncId fn,
                         if (admit && storesClobber(B, 0, i)) {
                             admit = false;
                         }
+                        // (d) WRAP-AROUND slice (D-OPT-CSE-LOAD-BACKEDGE-TAIL).
+                        // Slices (a)-(c) cover only an ACYCLIC canonical→use path.
+                        // If the use sits on a cycle that does NOT re-execute the
+                        // canonical, execution WRAPS: Load(iter N) → B's TAIL →
+                        // back-edge → Load(iter N+1). A may-aliasing Store in B's
+                        // tail therefore clobbers the NEXT iteration's Load, and
+                        // NOTHING above scans [i+1, ninst) — (b) drops both
+                        // endpoints and (c) stops at `i`. That gap is the sqlite
+                        // `balance_nonroot` silent miscompile: its loop body holds
+                        // both this Load and the store that advances the pointer.
+                        // Cheap index scan FIRST (usually a map miss); the
+                        // reachability walk runs only when a clobber is actually
+                        // there.
+                        //
+                        // RE-EXECUTION LEMMA (why the other two regions need no
+                        // slice) — stated over the MODELED CFG, where every edge
+                        // originates at a terminator (an `IndirectBr` lists all
+                        // address-taken blocks as successors, and the SEH region
+                        // ops are themselves terminators AND memory clobbers, so
+                        // no mid-block fault edge can smuggle a path past this):
+                        // a block is entered only at index 0, so any wrap
+                        // that re-enters canonicalBlock re-executes the canonical
+                        // and REFRESHES the value. Hence canonicalBlock's head
+                        // [0, canonicalIdx) is not a hole, and the same-block
+                        // branch above (canonicalIdx < i) is already exact.
+                        // Scanning either would only lose precision. That
+                        // admission carries one obligation — the canonical must
+                        // stay inside the cycle — which LICM discharges: its Load
+                        // hoist gate scans the WHOLE loop body (licm.cpp), so it
+                        // refuses to hoist exactly when such a clobber exists.
+                        if (admit
+                            && storesClobber(B, i + 1, ninst)
+                            && clobbers.blockReachesItselfAvoiding(B, canonicalBlock)) {
+                            admit = false;
+                        }
                     }
                 }
                 if (admit) {
@@ -366,9 +403,19 @@ void CsePolicy::analyze(MirFuncId fn,
                     ++instructionsCsed_;
                     continue;
                 }
-                // Fall through to insert this Load as a new canonical
-                // — a later identical Load may still CSE against it
-                // if no aliasing Store separates THEM.
+                // Fall through. NOTE (corrected — the old comment here claimed
+                // this Load "becomes the new canonical", which is FALSE):
+                // `scope.emplace` below is a NO-OP when the key already exists,
+                // so the STALE canonical survives a rejected candidate. That is
+                // SOUND — a later identical Load re-runs the full gate against
+                // that stale canonical, and the same clobber that rejected this
+                // one rejects it too — but IMPRECISE: two Loads that both sit
+                // AFTER the clobber cannot CSE against each other, because
+                // neither ever became canonical. Replacing the canonical here
+                // is NOT a local edit: `log` records keys for scope-exit
+                // rollback (erase), so an overwrite would need save/restore of
+                // the previous binding. Precision only, never a miscompile:
+                // anchored `D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT`.
             }
             log.push_back(k);
             scope.emplace(std::move(k), id);

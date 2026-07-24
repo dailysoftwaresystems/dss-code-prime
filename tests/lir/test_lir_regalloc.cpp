@@ -15,8 +15,6 @@
 #include "lir/lir.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
-#include "lir/lir_rewrite.hpp"
-#include "lir/lir_text.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
@@ -1347,85 +1345,6 @@ TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     expectAllocationInvariants(out.perFunc[0]);
-}
-
-// TF-C58 (D-AS-REGALLOC-LOOP-CARRIED-SPILL-RELOAD-MISSING) repro scaffold: a loop
-// with a loop-carried i32 counter phi + heavy filler pressure. Under spill, the
-// phi's spilled back-edge incoming's reload can be DROPPED at the latch → the
-// counter never advances (the balance_nonroot select1.test SEGV). EXPLORATORY:
-// currently dumps the rewritten LIR (via ADD_FAILURE) so we can confirm the drop,
-// then convert to a red-on-disable assertion. Tune filler / switch to a ptr+Load
-// if this shape doesn't hit the exact phi-in-reg / incoming-spilled allocation.
-TEST(LirRegAlloc, DISABLED_Tf58LoopCarriedSpilledPhiReloadReproScaffold) {
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    TypeInterner in{CompilationUnitId{1}};
-    TypeId const i32   = in.primitive(TypeKind::I32);
-    TypeId const boolT = in.primitive(TypeKind::Bool);
-    std::vector<TypeId> const params{i32};
-    auto const sig = in.fnSig(params, i32, CallConv::CcSysV);
-    MirBuilder mb;
-    mb.addFunction(sig, SymbolId{1});
-    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const header = mb.createBlock();
-    MirBlockId const body   = mb.createBlock();
-    MirBlockId const exit   = mb.createBlock();
-    // entry / preheader
-    mb.beginBlock(entry);
-    MirInstId const N = mb.addArg(0, i32);
-    MirLiteralValue z;   z.value = static_cast<std::int64_t>(0); z.core = TypeKind::I32;
-    MirLiteralValue one; one.value = static_cast<std::int64_t>(1); one.core = TypeKind::I32;
-    MirInstId const i0 = mb.addConst(z, i32);
-    MirInstId const c1 = mb.addConst(one, i32);
-    mb.addBr(header);
-    // header: 20 loop-carried counter phis (each phi_k = φ(0 [entry], next_k [body])).
-    // Maximal pressure ON THE LOOP-CARRIED VALUES so several must spill — the bug drops
-    // the latch phi-move reload for a phi whose incoming (next_k) got spilled.
-    constexpr int kPhis = 20;
-    mb.beginBlock(header);
-    std::vector<MirInstId> phis;
-    for (int k = 0; k < kPhis; ++k) {
-        MirInstId const p = mb.addPhi(i32);
-        mb.addPhiIncoming(p, MirPhiIncoming{i0, entry});
-        phis.push_back(p);
-    }
-    std::array<MirInstId, 2> cmpOps{phis[0], N};
-    MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmpOps, boolT);
-    mb.addCondBr(cond, body, exit);
-    // body / latch: next_k = phi_k + 1 for each; br header
-    mb.beginBlock(body);
-    std::vector<MirInstId> nexts;
-    for (int k = 0; k < kPhis; ++k) {
-        std::array<MirInstId, 2> incOps{phis[static_cast<std::size_t>(k)], c1};
-        nexts.push_back(mb.addInst(MirOpcode::Add, incOps, i32));
-    }
-    mb.addBr(header);
-    for (int k = 0; k < kPhis; ++k)
-        mb.addPhiIncoming(phis[static_cast<std::size_t>(k)],
-                          MirPhiIncoming{nexts[static_cast<std::size_t>(k)], body});
-    // exit: return ONLY phi_0 — phi_1..19 are loop-INTERNAL (used only for their own
-    // increment) so they have SHORT ranges (stay in registers), while their incomings
-    // next_1..19 all live to the latch phi-move → under pressure THEY spill → the
-    // phi-in-register / incoming-spilled case the bug needs.
-    mb.beginBlock(exit);
-    mb.addReturn(phis[0]);
-    Mir mir = std::move(mb).finish();
-    DiagnosticReporter lrep;
-    auto lir = lowerToLir(mir, **target, in, lrep);
-    ASSERT_TRUE(lir.ok) << (lrep.all().empty() ? "" : lrep.all()[0].actual);
-    LirLiveness const lv = analyzeLiveness(lir.lir);
-    DiagnosticReporter rrep;
-    auto alloc = allocateRegisters(lir.lir, **target, lv, /*ccIndex=*/0, rrep);
-    ASSERT_TRUE(alloc.ok());
-    ASSERT_EQ(alloc.perFunc.size(), 1u);
-    EXPECT_GT(alloc.perFunc[0].numSpillSlots, 0u) << "expected pressure to spill";
-    DiagnosticReporter wrep;
-    auto rw = rewriteWithAllocation(lir.lir, **target, alloc, wrep);
-    ASSERT_TRUE(rw.ok);
-    DiagnosticReporter erep;
-    std::string const text = emitLir(rw.lir, **target, LirTextContext{}, erep);
-    ADD_FAILURE() << "TF-C58 rewritten LIR dump (inspect the body/latch for the "
-                     "loop-carried reload):\n" << text;
 }
 
 TEST(LirRegAlloc, SwitchFunctionAllocatesWithoutCrash) {
