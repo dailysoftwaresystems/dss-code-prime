@@ -463,11 +463,28 @@ struct SynthBuilder {
     // pass (`deadRanges()`), NOT this pre-scan -- so a guard this weaker eval
     // mis-reads only ever causes a loud include skip/resolve, never a silent
     // illegal-char drop.
+    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the replacement is stored
+    // as TEXT, not span-tokens. The map below is SHARED across the whole builder
+    // tree, and a span-token would slice the WRONG buffer in any builder other
+    // than the one that recorded it — `SourceBuffer::slice` CLAMPS rather than
+    // faults, so that failure mode is plausible-wrong-bytes, never a crash. The
+    // text is re-tokenized into the per-evaluation product tail at expansion
+    // time (`sbMintProduct`), the same FC15b mechanism `materializeSignificant`
+    // uses in the authoritative pass.
     struct SbMacro {
-        bool               functionLike = false;
-        std::vector<Token> replacement;  // object-like body (spans in scanBuf)
+        bool        functionLike = false;
+        std::string replacementText;     // object-like body, buffer-independent
     };
-    std::unordered_map<std::string, SbMacro> localMacros;
+    // TF-C60: SHARED BY REFERENCE across every child builder (the
+    // `includeStack`/`fatal`/`resolvedDescriptorsOut` pattern), so the pre-scan's
+    // macro state spans the WHOLE include tree in DOCUMENT ORDER. Before this it
+    // was per-builder: a `#define` arriving via a NESTED include was invisible to
+    // the parent's later `#if` (and a parent's source `#define` invisible to a
+    // child's), the guard folded 0 → FALSE-DEAD → the gated quote-`#include` was
+    // left verbatim → the macro pass forwarded it as inert tokens → the header
+    // was SILENTLY DROPPED (sqlite os_unix.c: sqliteInt.h→os_setup.h defines
+    // SQLITE_OS_UNIX, `#if SQLITE_OS_UNIX` gates `#include "os_common.h"`).
+    std::unordered_map<std::string, SbMacro>& localMacros;
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
@@ -706,7 +723,7 @@ struct SynthBuilder {
     // pass reports it authoritatively). Mirrors the redefinition-tolerant table
     // write (last definition wins; the pre-scan needs no compatibility check).
     void sbTrackDefine(std::vector<PPToken> const& toks, std::size_t nameP,
-                       std::size_t end) {
+                       std::size_t end, SourceBuffer const& buf) {
         std::size_t p = nameP;
         while (p < end && isTrivia(toks[p].tok)) ++p;
         if (p >= end || isNewline(toks[p].tok)
@@ -726,26 +743,104 @@ struct SynthBuilder {
             // No body needed: a function-like invocation forces the conservative
             // direction regardless of the replacement.
         } else {
+            // TF-C60: record the replacement as RAW SOURCE TEXT — buffer-
+            // independent (the shared map outlives this builder's scan buffer)
+            // AND byte-faithful.
+            //
+            // ★ Do NOT join token TEXTS: a PPToken is not always a self-contained
+            // spelling. The tokenizer emits a coalesced literal as an OPENER
+            // token plus a BODY token and then consumes the closing delimiter
+            // with NO token at all (tokenizer.cpp), so `'A'` is the two texts `'`
+            // and `A` — joining them (with or without a separator) LOSES the
+            // closer and yields `' A`, which re-lexes to an unterminated literal.
+            // `#define NL '\n'` guarding a conditional include is ordinary C and
+            // would hard-error. Slicing the source range keeps every byte,
+            // including delimiters the token stream does not carry.
+            //
+            // The range runs from the first significant replacement token to the
+            // END of the directive line (the newline's start, or the last token's
+            // end when the line is unterminated). Taking the whole tail also
+            // captures a trailing closer; any trailing comment re-lexes to trivia
+            // and is dropped by `sbMintProduct`.
+            std::size_t firstStart = 0;
+            std::size_t lineEnd    = 0;
+            bool        haveFirst  = false;
             for (std::size_t q = p; q < end; ++q) {
-                if (isNewline(toks[q].tok)) break;
+                if (isNewline(toks[q].tok)) { lineEnd = toks[q].tok.span.start();
+                                              break; }
                 if (isTrivia(toks[q].tok)) continue;
-                m.replacement.push_back(toks[q].tok);
+                if (!haveFirst) { firstStart = toks[q].tok.span.start();
+                                  haveFirst  = true; }
+                lineEnd = toks[q].tok.span.end();
+            }
+            if (haveFirst && lineEnd > firstStart) {
+                m.replacementText =
+                    std::string{buf.slice(SourceSpan::of(
+                        static_cast<ByteOffset>(firstStart),
+                        static_cast<ByteOffset>(lineEnd)))};
             }
         }
         localMacros[name] = std::move(m);
     }
 
-    // c17: object-like macro expansion over `localMacros` for the
-    // `sbEvalIfOperand` `#if` evaluation. A bounded recursive rescan (so a
-    // `#define A B` / `#define B 1` chain folds, the common object-like case),
-    // with an `active`-set self-reference guard (a `#define X X` freezes to its
-    // own name, matching the full engine) + a depth backstop. FUNCTION-like
-    // names are NEVER expanded here -- an invocation is already detected as
-    // conservative by `sbEvalIfOperand`. Replacement tokens slice against `buf`
-    // (the scan buffer the `#define` came from), so their spans stay valid for
-    // the ICE parser.
+    // TF-C60 (c′): read a token's TEXT product-awarely. A token minted by
+    // `sbMintProduct` spans `[bufLen + productOffset, …)` — past the scan
+    // buffer's end — so slice it from the per-eval PRODUCT string instead.
+    // (`SourceBuffer::slice` would silently CLAMP an out-of-range span to
+    // plausible wrong bytes, so this branch is correctness, not cosmetics.)
+    static std::string_view sbTextOf(Token const& t, SourceBuffer const& buf,
+                                     std::string const& product) {
+        std::size_t const bufLen = buf.text().size();
+        if (t.span.start() >= bufLen) {
+            std::size_t const s = t.span.start() - bufLen;
+            std::size_t const e = t.span.end() - bufLen;
+            if (e <= product.size() && s <= e)
+                return std::string_view{product}.substr(s, e - s);
+            return {};
+        }
+        return buf.slice(t.span);
+    }
+
+    // TF-C60 (c′, the FC15b product-tail pattern): re-tokenize a shared macro's
+    // replacement TEXT into the per-evaluation product string, minting tokens
+    // whose spans point at `[bufLen + productBase, …)` — exactly where
+    // `evaluateIfExpression` slices them from, since it assembles
+    // `combined = synth.text() + productText()` (pp_if_eval). Token KINDS come
+    // from the real tokenizer, so nothing is ever re-lexed across a
+    // substitution boundary (no glue hazard, no `<a/b.h>` byte corruption).
+    std::vector<Token> sbMintProduct(std::string_view spelling,
+                                     SourceBuffer const& buf,
+                                     std::string& product) const {
+        ByteOffset const productBase = static_cast<ByteOffset>(product.size());
+        product.append(spelling);
+        auto tiny = SourceBuffer::fromString(std::string{spelling},
+                                             "<sb-product>");
+        DiagnosticReporter scratch;   // pre-scan diagnostics are never user-facing
+        auto ppToks = tokenizeToPP(tiny, schema, scratch);
+        ByteOffset const bufLen = static_cast<ByteOffset>(buf.text().size());
+        std::vector<Token> out;
+        for (PPToken const& pt : ppToks) {
+            if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
+            if (pt.tok.coreKind == CoreTokenKind::Eof) continue;
+            Token t = pt.tok;
+            t.span  = SourceSpan::of(bufLen + productBase + pt.tok.span.start(),
+                                     bufLen + productBase + pt.tok.span.end());
+            out.push_back(t);
+        }
+        return out;
+    }
+
+    // c17 (reworked TF-C60): object-like macro expansion over the SHARED
+    // `localMacros` for the `sbEvalIfOperand` `#if` evaluation. A bounded
+    // recursive rescan (so a `#define A B` / `#define B 1` chain folds), with an
+    // `active`-set self-reference guard (a `#define X X` freezes to its own
+    // name, matching the full engine) + a depth backstop. FUNCTION-like names
+    // are NEVER expanded here -- an invocation is already detected as
+    // conservative by `sbEvalIfOperand`. Substituted tokens are MINTED into the
+    // per-eval `product` string (never carried as foreign-buffer spans), so the
+    // shared map stays buffer-independent.
     std::vector<Token> sbExpand(std::vector<Token> const& in,
-                                SourceBuffer const& buf,
+                                SourceBuffer const& buf, std::string& product,
                                 std::set<std::string>& active, int depth) const {
         if (depth > 32) return in;   // backstop (a pathological cycle the guard
                                      // missed never loops the host)
@@ -753,13 +848,15 @@ struct SynthBuilder {
         outToks.reserve(in.size());
         for (Token const& t : in) {
             if (t.coreKind == CoreTokenKind::Word) {
-                std::string name{buf.slice(t.span)};
+                std::string name{sbTextOf(t, buf, product)};
                 auto it = localMacros.find(name);
                 if (it != localMacros.end() && !it->second.functionLike
                     && active.find(name) == active.end()) {
                     active.insert(name);
+                    std::vector<Token> minted = sbMintProduct(
+                        it->second.replacementText, buf, product);
                     std::vector<Token> sub =
-                        sbExpand(it->second.replacement, buf, active, depth + 1);
+                        sbExpand(minted, buf, product, active, depth + 1);
                     active.erase(name);
                     for (Token const& s : sub) outToks.push_back(s);
                     continue;
@@ -806,10 +903,37 @@ struct SynthBuilder {
             }
         }
 
+        // TF-C60 (c′): the per-EVALUATION product string. Substituted macro
+        // replacements are minted here; `productCb` hands it to
+        // `evaluateIfExpression`, which slices product-region spans from
+        // `synth.text() + productText()`. Owned per call — it must outlive the
+        // whole evaluation (the ICE slices after the expand callback returns).
+        std::string sbProduct;
+        // FIX-3 completion (post-expansion arm): an object-like macro can EXPAND
+        // TO a function-like macro's NAME (`#define Z ENABLED(1)`), which the
+        // raw-operand check above cannot see. Freezing the expansion here is NOT
+        // conservative — folding an unexpandable identifier to 0 is only the safe
+        // direction at EVEN polarity; `#if !Z` inverts it to TRUE and would
+        // eagerly resolve an authoritatively-DEAD include, re-opening P0016 (the
+        // exact hazard FIX-3 exists to forbid, and now tree-wide, since a
+        // wrongly-spliced header's `#define`s pollute the SHARED map). Record the
+        // uncertainty and let the caller take the conservative skip instead.
+        bool sbPostExpandUncertain = false;
         PpMacroExpand expandCb =
-            [this, &buf](std::vector<Token> const& in) {
+            [this, &buf, &sbProduct,
+             &sbPostExpandUncertain](std::vector<Token> const& in) {
                 std::set<std::string> active;
-                return sbExpand(in, buf, active, 0);
+                std::vector<Token> out = sbExpand(in, buf, sbProduct, active, 0);
+                for (Token const& t : out) {
+                    if (t.coreKind != CoreTokenKind::Word) continue;
+                    auto it =
+                        localMacros.find(std::string{sbTextOf(t, buf, sbProduct)});
+                    if (it != localMacros.end() && it->second.functionLike) {
+                        sbPostExpandUncertain = true;
+                        return in;
+                    }
+                }
+                return out;
             };
         PpIsDefined definedCb = [this](std::string_view n) {
             // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY): unified with
@@ -856,7 +980,13 @@ struct SynthBuilder {
             }
             return resolveQuote(filename, includingDir).has_value();
         };
-        PpProductText productCb = []() { return std::string_view{}; };
+        // TF-C60 (c′): hand the per-eval product tail to the ICE — it assembles
+        // `combined = synth.text() + productText()` and slices minted tokens
+        // (spans at `bufLen + offset`) from the product region. An empty-view
+        // callback here would make every minted span slice past the end (CLAMPED
+        // to garbage) — exactly the silent-wrong-bytes class (b) exists to kill.
+        PpProductText productCb =
+            [&sbProduct]() { return std::string_view{sbProduct}; };
         // FC17.9(h): the pre-scan `__has_embed`, resolving against THIS
         // recursion's `includingDir` (the origin file of every token in the scan
         // buffer), so it AGREES with the authoritative per-origin callback by
@@ -882,6 +1012,14 @@ struct SynthBuilder {
         auto v = evaluateIfExpression(operand, *schema, expandCb, definedCb,
                                       hasIncludeCb, buf, productCb, scratch,
                                       embedCb);
+        // FIX-3 post-expansion arm (see `sbPostExpandUncertain` above): the
+        // expansion produced a function-like macro name, so this weaker pre-scan
+        // cannot decide the guard — take the conservative skip in BOTH polarities
+        // rather than trust a frozen-identifier fold.
+        if (sbPostExpandUncertain) {
+            uncertain = true;
+            return false;
+        }
         if (!v.has_value()) {
             uncertain = true;   // malformed/unsupported -> conservative (skip)
             return false;
@@ -920,7 +1058,15 @@ struct SynthBuilder {
         // pre-pass is needed. appendWithContinuationSplice bases each source
         // segment at the CURRENT out.size() (== prefixLen), so the line-map stays
         // correct (source at synthStart >= prefixLen).
-        std::string spliced = preScanDefinePrefix;
+        // TF-C60 (Finding 7): the prefix seeds the ROOT build ONLY. `localMacros`
+        // is now SHARED across the builder tree, so a child re-prepending it
+        // would RE-ADD a command-line define the source had `#undef`'d before the
+        // include — breaking the C21 "#undef composes" invariant in the exact
+        // direction the authoritative pass resolves it (its prologue runs ONCE
+        // per TU, then the #undef holds for the rest, children included). The
+        // prefix's second historical role — providing sliceable SPANS for seeded
+        // replacement values — is obsolete: SbMacro now stores replacement TEXT.
+        std::string spliced = (depth == 0) ? preScanDefinePrefix : std::string{};
         std::size_t const prefixLen = spliced.size();
         LineMap     localMap;
         appendWithContinuationSplice(source->text(), source, 0, spliced,
@@ -1121,7 +1267,7 @@ struct SynthBuilder {
             // be scanned as include syntax). ──
             if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
-                sbTrackDefine(toks, j + 1, lineEndTok);
+                sbTrackDefine(toks, j + 1, lineEndTok, *scanBuf);
                 i = lineEndTok - 1;
                 continue;
             }
@@ -1245,7 +1391,8 @@ struct SynthBuilder {
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
                                        rep, depth + 1, includeStack, fatal,
-                                       preScanDefinePrefix, resolvedDescriptorsOut};
+                                       preScanDefinePrefix, resolvedDescriptorsOut,
+                                       localMacros};
                     child.build(headerBuf, out, map);
                     includeStack.pop_back();
                     out.push_back(newline);
@@ -1370,6 +1517,11 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"quote include not found: "} + filename);
+                // TF-C60 (Finding 5): DROP the directive so the macro pass's
+                // unresolved-live-quote-include fail-loud does not re-report the
+                // same problem a second time. This error is the sole reporter.
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;
                 continue;
             }
             std::error_code ec;
@@ -1380,6 +1532,8 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"circular include of "} + filename);
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
             }
             auto headerBuf = SourceBuffer::fromFile(*resolved);
@@ -1387,6 +1541,8 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"quote include unreadable: "} + filename);
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
             }
 
@@ -1395,7 +1551,7 @@ struct SynthBuilder {
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
                                depth + 1, includeStack, fatal, preScanDefinePrefix,
-                               resolvedDescriptorsOut};
+                               resolvedDescriptorsOut, localMacros};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -1947,13 +2103,42 @@ private:
             // only when the conditional stack is ACTIVE (the dead-branch gate
             // above already returned for an elided include), so it is reached
             // ONLY for a LIVE include -- which `SynthBuilder` resolved/spliced
-            // for a quote form (now CONDITIONAL-aware: a DEAD-branch quote
-            // include is left verbatim + reaches HERE only if live) and passed
-            // through for an angle form (to the post-parse import resolver). The
-            // line's text is forwarded so the resolver still sees the angle form
-            // (its tokens are inert to the parser). The former ordering hazard
-            // (a dead-branch quote include resolved upstream) no longer exists:
-            // SynthBuilder gates quote resolution on its own conditional scan.
+            // for a quote form and passed through for an angle form (to the
+            // post-parse import resolver). The angle line's text is forwarded so
+            // the resolver still sees it (its tokens are inert to the parser).
+            //
+            // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE, the fail-loud
+            // half): a QUOTE include reaching THIS arm was NOT spliced by the
+            // pre-scan — and this arm is authoritatively LIVE — so forwarding it
+            // as inert tokens SILENTLY DROPS the header (the old comment's
+            // "fails loud downstream" claim was false; nothing downstream ever
+            // failed). Sharing the macro state makes the pre-scan lockstep on
+            // ORDINARY object-like guards, so what remains is a guard this
+            // weaker evaluator cannot decide. ★ Do NOT name a single cause in
+            // the message: the code-audit reached this arm from FIVE distinct
+            // ones (a function-like guard, an object-like macro expanding TO a
+            // function-like name, a descriptor-injected macro the pre-scan never
+            // tracks [D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED], an expansion
+            // chain past the depth backstop, and — before it was fixed — a
+            // literal whose closer the replacement text had lost). Naming one
+            // sends users chasing the wrong thing.
+            {
+                std::size_t q = skipTrivia(in, p + 1);
+                if (q < end && quoteIncludeKind_.valid()
+                    && in[q].schemaKind == quoteIncludeKind_) {
+                    std::string_view nameTx =
+                        (q + 1 < end && !isNewline(in[q + 1])) ? text(in[q + 1])
+                                                               : std::string_view{};
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                           synth_->id(), in[q].span,
+                           std::string{"quote #include \""} + std::string{nameTx}
+                               + "\" is LIVE here but the include pre-scan could "
+                                 "not evaluate its conditional guard, so the "
+                                 "header was never spliced; refusing to silently "
+                                 "drop it");
+                    return end;
+                }
+            }
             for (std::size_t q = start; q < end; ++q) body.push_back(in[q]);
         } else if (!cfg().embedDirective.empty()
                    && word == cfg().embedDirective) {
@@ -3853,9 +4038,13 @@ PreprocessResult preprocess(
     // authoritatively-live set the finish() oracle's `shippedLibDescriptors` holds.
     // Threaded by reference into the SynthBuilder (and its recursive children).
     std::vector<std::pair<fs::path, ByteOffset>> resolvedParents;
+    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the ROOT owns the pre-scan
+    // macro map; every child builder threads it by reference, so `#define`s flow
+    // across include boundaries in document order (both directions).
+    std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          *result.diagnostics, 0, includeStack, result.fatal,
-                         preScanDefinePrefix, resolvedParents};
+                         preScanDefinePrefix, resolvedParents, preScanMacros};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
