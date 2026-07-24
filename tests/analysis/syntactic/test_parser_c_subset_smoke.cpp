@@ -799,36 +799,167 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
 
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
     ASSERT_NE(ext, NodeId{});
-    // FC4 c1: `param` is now declarator-shaped — `declHeadForParam` carries
-    // the base type and the (optional) `declarator` carries the name. The
-    // externDecl spine itself stays legacy (typeRef + Identifier).
-    // TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is the `externSpecifiers`
-    // HEAD WRAPPER (`extern` + an optional thread-storage run) — the row's
-    // specifierPrefix, stripped before positional counting so name/type
-    // indices stay stable whether or not `extern thread_local` is spelled.
+    // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: externDecl is now the extern twin of
+    // topLevelDecl — `externSpecifiers` (the specifierPrefix HEAD WRAPPER, TLS C1) +
+    // `typeRefAllowingStruct` (the star-free base-type head struct fields use) +
+    // `initDeclaratorList` (N declarators, each owning its pointer/array/fn suffix) +
+    // `;`. A function prototype is a declarator whose name carries a fnSuffix; in the
+    // suffix-repeat position that suffix is `fnSuffixTail` (the guard-less post-base
+    // twin of `fnSuffix`, semantically folded to FnSig identically). The legacy
+    // single-declarator spine (`typeRef Identifier externTail(externFuncTail)`) was
+    // retired. FC4 c1: `param` is declarator-shaped (declHeadForParam + declarator).
     constexpr std::string_view kExpected =
         "rule:externDecl\n"
         "  rule:externSpecifiers\n"
         "    tok:\"extern\"\n"
-        "  rule:typeRef\n"
-        "    rule:typeBase\n"
+        "  rule:typeRefAllowingStruct\n"
+        "    rule:typeBaseAllowingStruct\n"
         "      rule:typeSpecifierSeq\n"
         "        tok:\"int\"\n"
-        "  tok:\"printf\"\n"
-        "  rule:externTail\n"
-        "    rule:externFuncTail\n"
-        "      tok:\"(\"\n"
-        "      rule:paramList\n"
-        "        rule:param\n"
-        "          rule:declHeadForParam\n"
-        "            rule:typeSpecifierSeq\n"
-        "              tok:\"char\"\n"
-        "          rule:declarator\n"
-        "            rule:directDeclarator\n"
-        "              tok:\"x\"\n"
-        "      tok:\")\"\n"
-        "      tok:\";\"\n";
+        "  rule:initDeclaratorList\n"
+        "    rule:initDeclarator\n"
+        "      rule:declarator\n"
+        "        rule:directDeclarator\n"
+        "          tok:\"printf\"\n"
+        "          rule:fnSuffixTail\n"
+        "            tok:\"(\"\n"
+        "            rule:paramList\n"
+        "              rule:param\n"
+        "                rule:declHeadForParam\n"
+        "                  rule:typeSpecifierSeq\n"
+        "                    tok:\"char\"\n"
+        "                rule:declarator\n"
+        "                  rule:directDeclarator\n"
+        "                    tok:\"x\"\n"
+        "            tok:\")\"\n"
+        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): the `;` now rides the
+        // `externDeclTail` wrapper (the `{ block | EndStatement }` alt — the twin of
+        // topLevelDeclTail), so a `block` tail can make externDecl a function
+        // DEFINITION. A prototype takes the EndStatement arm.
+        "  rule:externDeclTail\n"
+        "    tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): `extern` on a FUNCTION
+// DEFINITION — `extern int f(void){ return 0; }` (valid C 6.9.1, symmetric with
+// `static int f(){…}`; the Tcl `EXTERN int Sqlite3_Init(…){…}` shape). The
+// `externDeclTail`'s `block` arm makes it a definition; before this cycle
+// externDecl was declaration-only and P0009'd at the `{`. RED-ON-DISABLE: revert
+// externDeclTail's block arm -> this no longer parses (P0009).
+TEST(ParserCSubsetSmoke, ExternFunctionDefinitionParses) {
+    auto h = loadAndTokenize("extern int f(void){ return 0; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern int f(void){ return 0; }` must parse as a function definition";
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    // The externDeclTail's chosen arm is a `block` (a function-definition body),
+    // NOT an EndStatement token — this is what distinguishes the definition from
+    // the prototype/declaration forms.
+    const NodeId tail = findFirstNodeWithRule(t, "externDeclTail");
+    ASSERT_NE(tail, NodeId{})
+        << "externDecl must carry an externDeclTail wrapper";
+    bool tailHasBlock = false;
+    for (NodeId c : t.children(tail)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "block")
+            tailHasBlock = true;
+    }
+    EXPECT_TRUE(tailHasBlock)
+        << "an extern function DEFINITION's tail is a `block` body, not `;`";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION regression: the DSS per-declaration import-
+// library override (`extern void* g(int) "kernel32.dll";`) still parses — the
+// `{optional stringLiteralExpr}` stays a DIRECT child BEFORE the externDeclTail
+// (so externLibraryOverride's scan is unchanged), and the EndStatement tail rides
+// the wrapper. RED-ON-DISABLE: nest the string inside externDeclTail -> the
+// override lowering would no longer find it as a direct role child.
+TEST(ParserCSubsetSmoke, ExternImportLibraryOverrideParses) {
+    auto h = loadAndTokenize("extern void* g(int) \"kernel32.dll\";");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the import-library override form must still parse";
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+    // The stringLiteralExpr is a DIRECT child of externDecl (not nested in the
+    // tail) — the byte-preserved import-override position.
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    bool directString = false;
+    for (NodeId c : t.children(ext)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "stringLiteralExpr")
+            directString = true;
+    }
+    EXPECT_TRUE(directString)
+        << "the library-override string must stay a DIRECT externDecl child";
+}
+
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: a MULTI-declarator `extern` declaration
+// (`extern int a, b;`) parses — ONE externDecl whose initDeclaratorList holds TWO
+// initDeclarator children. RED-ON-DISABLE: reverting externDecl to the legacy
+// single-declarator spine P0009's on the comma, so this test would not parse.
+TEST(ParserCSubsetSmoke, ExternMultiDeclaratorParses) {
+    auto h = loadAndTokenize("extern int a, b;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern int a, b;` must parse with no diagnostics";
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    const NodeId list = findFirstNodeWithRule(t, "initDeclaratorList");
+    ASSERT_NE(list, NodeId{})
+        << "externDecl must carry an initDeclaratorList (the multi-declarator list)";
+    std::size_t initDeclarators = 0;
+    for (NodeId c : t.children(list)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "initDeclarator")
+            ++initDeclarators;
+    }
+    EXPECT_EQ(initDeclarators, 2u)
+        << "`extern int a, b;` must bind TWO declarators (one per comma-separated name)";
+}
+
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: per-declarator pointer/array suffix —
+// `extern int *a, b;` — the star binds to `a` ONLY (a: int*, b: int), because the
+// star lives inside `a`'s own declarator, not the shared head. RED-ON-DISABLE: a
+// shared-head star (the retired `typeRef` spine) would apply to both.
+TEST(ParserCSubsetSmoke, ExternMultiDeclaratorPerDeclaratorPointerParses) {
+    auto h = loadAndTokenize("extern int *a, b;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    const NodeId list = findFirstNodeWithRule(t, "initDeclaratorList");
+    ASSERT_NE(list, NodeId{});
+    // Exactly ONE pointerLayer in the whole declaration (a's star), not two.
+    const auto ptrRule = t.schema().rules().find("pointerLayer");
+    ASSERT_TRUE(ptrRule.valid());
+    std::size_t pointerLayers = 0;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId n{i};
+        if (t.kind(n) == NodeKind::Internal && t.rule(n).v == ptrRule.v)
+            ++pointerLayers;
+    }
+    EXPECT_EQ(pointerLayers, 1u)
+        << "`extern int *a, b;` — the star binds ONLY to a (one pointerLayer), "
+           "so b stays a plain int";
 }
 
 TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {

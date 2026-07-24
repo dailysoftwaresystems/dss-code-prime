@@ -1,0 +1,33 @@
+{
+  "$comment": "D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0: a file-LOCAL (`static`) global/function must NEVER be identified with a same-named EXTERNALLY-VISIBLE (Global) symbol in another CU (C 6.2.2p3 internal linkage). Distilled from the sqlite testfixture crash: os_unix.c's `static ... aSyscall[]` (rows -> the static posixOpen) shared the name `aSyscall` with test_syscall.c's NON-static `aSyscall[]` (rows -> ts_open); the cross-CU MIR merge FOLDED the Local onto the Global (assignSymbol) AND dropped the Local as a shadowed loser (isShadowedLoser), so os_unix's own code read test_syscall's table -> a call through a NULL fn-ptr at the first FILE-db open. Invisible until BOTH TUs link (the 2-TU sqlite3.c+main build lacked the extern aSyscall). Here os_unix.c's `static vfsSyscall` (-> localOpen, 42) collides with testvfs.c's extern `vfsSyscall` (-> testOpen, 999); main returns 42 IFF the two tables stayed distinct. RED-ON-DISABLE: restore the merge name-collapse -> osOpen reads testvfs's table -> returns 999 -> exit 231, not 42. Witnessed end-to-end on WSL glibc (elf x86_64) + qemu (elf aarch64) + the darwin CI leg (macho arm64) + natively on windows (pe64); every arm routes through the LK11 whole-program MIR merge, so ALL formats exercise the Local-vs-Global identity fix.",
+  "language": "c-subset",
+  "sources": ["main.c", "os_unix.c", "testvfs.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "inlining", "passes": ["Inlining"]}
+  ]
+}

@@ -94,8 +94,30 @@ struct DSS_EXPORT LinkedImage {
     // re-deriving it from the format-specific import-table bytes.
     std::vector<std::string> externImportNames;
 
+    // True iff `link()` ran to a clean conclusion — set ONLY at the final
+    // return, when the walker produced bytes with NO new diagnostic. Every
+    // failure early-return (undefined extern, thread-local reject, trampoline
+    // fail, unresolved reloc, malformed dataItems, …) returns BEFORE that point
+    // and leaves it false. Load-bearing: a FAILED link can reach the same
+    // `resolvedFuncCount == expectedFuncCount == 0` count state as a genuinely
+    // EMPTY module (an undefined-extern reject early-returns with BOTH counts 0
+    // — linker.cpp:610-611, before `expectedFuncCount` is even set), so the
+    // count check alone cannot tell success from failure.
+    bool                      linkedCleanly = false;
+
+    // Success channel: the link concluded cleanly AND every expected function
+    // resolved (`resolvedFuncCount == expectedFuncCount`). An EMPTY module
+    // (0 functions — a declaration-only / all-preprocessed-out TU) is a VALID
+    // success: `link()` emits a valid empty relocatable object, `linkedCleanly`
+    // is set, and 0 == 0 — so it is NOT silently rejected
+    // (D-CSUBSET-TESTTU-SILENT-EXIT1). The earlier `expectedFuncCount > 0`
+    // clause wrongly forced ok()==false for the empty case; but merely dropping
+    // it would make a 0-function FAILURE (both counts 0, with a K_* diagnostic)
+    // read as ok — hence the explicit `linkedCleanly` completion flag.
+    // `writeImage` additionally guards `bytes.empty()` (K_ImageEmpty): even an
+    // empty module must yield real object bytes (a valid header + sections).
     [[nodiscard]] bool ok() const noexcept {
-        return expectedFuncCount > 0
+        return linkedCleanly
             && resolvedFuncCount == expectedFuncCount;
     }
 };

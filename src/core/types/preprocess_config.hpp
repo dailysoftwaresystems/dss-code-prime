@@ -337,6 +337,25 @@ struct DSS_EXPORT PreprocessConfig {
     // THIS string, never a hard-coded "embed".
     std::string embedDirective;    // "embed"
 
+    // TF-C59 (`#line`; C23 6.10.4 / D-CPP-LINE-DIRECTIVE): the LINE-CONTROL
+    // directive keyword. `#line digits ["file"]` sets the PRESUMED line (and
+    // optionally the presumed file name) reported by `__LINE__`/`__FILE__` and
+    // by diagnostic positions from the FOLLOWING line onward. The operands may
+    // themselves be macro-invocations (6.10.4p4), in which case they are
+    // macro-expanded first and the RESULT must match one of the two forms.
+    //
+    // Why this is not optional in practice: every C-generating tool emits it
+    // (lemon, bison, flex, re2c, protoc) so the compiler's diagnostics point at
+    // the GENERATOR's input rather than the generated file. SQLite's own
+    // `parse.c` (lemon) carries 50 of them — the amalgamation only works today
+    // because `mksqlite3c.tcl` STRIPS them while generating `sqlite3.c`.
+    //
+    // OPTIONAL -- empty means the language declares NO `#line`, so a `#line`
+    // falls through to the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`; the `pragmaDirective`/`embedDirective`
+    // opt-in model). The engine matches THIS string, never a hard-coded "line".
+    std::string lineDirective;     // "line"
+
     // FC17.9(h) (`__has_embed`; C23 6.10.1): the `__has_embed` OPERATOR keyword,
     // valid only inside a `#if`/`#elif` operand. `__has_embed("resource")` tests
     // whether the resource a `#embed` of the same form would read exists, yielding

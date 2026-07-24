@@ -358,6 +358,72 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
 }
 
+// ── D-LINK-EXTERN-IMPORT-REFERENCE-GATE (e): the merge OR-combines the eager bit
+// when collapsing duplicate imports of one name. Two CUs both import "puts": one
+// EAGER (a `#include`d shipped-descriptor import), one NON-EAGER (a hand-written
+// `extern int puts()`). Neither defines puts, so it stays a real FFI import and
+// the merge collapses the two rows to ONE. The surviving row MUST be EAGER (the
+// eager law wins on collapse) so the linker's reference gate keeps it even when
+// unreferenced. ORDER-INDEPENDENT: whichever CU lands first, the eager bit is
+// ORed in. RED-ON-DISABLE: replace the OR-combine with a plain first-wins skip →
+// the swapped-order arm (non-eager CU first) yields a NON-EAGER surviving row and
+// goes red.
+TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
+    auto buildCallsPuts = [](SymbolId fnSym, SymbolId extSym,
+                             TypeInterner& in) -> Mir {
+        TypeId const i32 = in.primitive(TypeKind::I32);
+        TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(sig, fnSym);
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const pAddr = mb.addGlobalAddr(extSym, sig);   // extern puts
+        MirInstId const callOps[] = {pAddr};
+        MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+        mb.addReturn(call);
+        return std::move(mb).finish();
+    };
+    // Merge two CUs importing "puts" — one eager, one not — and return the
+    // surviving row's eager bit. `eagerInCu0` selects which CU carries the eager
+    // marker, so running both ways proves the OR-combine is order-independent.
+    auto survivingPutsEager = [&](bool eagerInCu0) -> bool {
+        TypeInterner in0{CompilationUnitId{1}};
+        Mir mir0 = buildCallsPuts(SymbolId{100}, SymbolId{10}, in0);
+        ExternImport e0{SymbolId{10}, "puts", "libc.so"};
+        e0.isEagerImport = eagerInCu0;
+        std::vector<ExternImport> ext0 = {e0};
+
+        TypeInterner in1{CompilationUnitId{2}};
+        Mir mir1 = buildCallsPuts(SymbolId{50}, SymbolId{20}, in1);
+        ExternImport e1{SymbolId{20}, "puts", "libc.so"};
+        e1.isEagerImport = !eagerInCu0;
+        std::vector<ExternImport> ext1 = {e1};
+
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {10, "puts"}}), ext0},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "helper"}, {20, "puts"}}), ext1},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        auto merged =
+            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+        EXPECT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+        if (!merged.has_value()) return false;
+        std::size_t putsRows = 0;
+        bool eager = false;
+        for (ExternImport const& e : merged->externImports) {
+            if (e.mangledName == "puts") { ++putsRows; eager = e.isEagerImport; }
+        }
+        EXPECT_EQ(putsRows, 1u) << "same-named imports must collapse to ONE row";
+        return eager;
+    };
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/true))
+        << "eager CU0 + non-eager CU1 → surviving row EAGER";
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/false))
+        << "non-eager CU0 + eager CU1 → surviving row EAGER (ORDER-INDEPENDENT; "
+           "RED if the merge uses plain first-wins instead of the OR-combine)";
+}
+
 // ── A cross-CU call into a MULTI-BLOCK callee: clone + rewire ──────
 // CU0: int main() { return f(); } where `f` is an EXTERN (import row "f").
 // CU1's f is a diamond: entry CondBr → then(return 7) / else(return 9). This pins
@@ -801,6 +867,129 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     EXPECT_EQ(*pInitSym, *mergedTarget)
         << "p's symbol-address init must point at the MERGED target id, not the "
            "stale CU-local id (remapLiteralSymbols).";
+
+    MirVerifier verifier{mm, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0: a file-LOCAL (`static`, internal-linkage /
+// Local binding) global or function must NEVER be identified with a same-named
+// EXTERNALLY-VISIBLE (Global) symbol in ANOTHER CU — C 6.2.2p3 internal linkage
+// makes them DISTINCT entities. The canonical sqlite defect: os_unix.c's
+// `static struct unix_syscall aSyscall[]` (24-byte rows → the static `posixOpen`)
+// shares the NAME `aSyscall` with test_syscall.c's NON-static `aSyscall[]` (32-byte
+// rows → `ts_open`). The merge (a) FOLDED the Local onto the Global winner's id in
+// `assignSymbol` AND (b) DROPPED the Local as a "shadowed loser" in
+// `isShadowedLoser`, so os_unix's own code read test_syscall's table → a call
+// through a NULL fn-ptr at the first FILE-DB open (invisible until BOTH TUs link;
+// the 2-TU `sqlite3.c + main` build lacks the extern `aSyscall`, hence "works at 2,
+// crashes at 88"). This models it at the merge tier: CU0 has a GLOBAL `T` → &fa;
+// CU1 has a same-named STATIC (Local) `T` → &fb. Post-merge BOTH `T`s must survive
+// as DISTINCT globals, each keeping its OWN symbol-address init target.
+// RED-ON-DISABLE: drop the `!isLocalDef` guard in `assignSymbol` OR the `isLocal`
+// guard in `isShadowedLoser` → CU1's Local `T` folds onto / is shadowed by CU0's
+// `T`, so only ONE `T` survives (the `size()==2` pin fails) and it points at fa.
+TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
+    // CU0 — the test_syscall analogue: private `int fa(void){return 1;}` and a
+    // NON-static (Global, externally visible) `int(*T)(void) = &fa;`.
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const sig0  = in0.fnSig({}, i32_0, CallConv::CcSysV);
+    TypeId const pfn0  = in0.pointer(sig0);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig0, SymbolId{10}, SymbolBinding::Local);  // fa (private)
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(1), i32_0));
+        MirLiteralValue saA;
+        saA.value = MirSymbolAddrValue{/*symbol=*/10u, /*addend=*/0};   // &fa
+        saA.core  = TypeKind::Ptr;
+        (void)mb.addGlobal(pfn0, SymbolId{20}, mb.literalPoolAdd(saA),
+                           MirFuncId{}, SymbolBinding::Global,   // EXTERNAL "T"
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
+        mir0 = std::move(mb).finish();
+    }
+    // CU1 — the os_unix analogue: private `int fb(void){return 2;}` and a STATIC
+    // (Local) `int(*T)(void) = &fb;` with the SAME name `T` as CU0's extern.
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    TypeId const pfn1  = in1.pointer(sig1);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{60}, SymbolBinding::Local);  // fb (private)
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(2), i32_1));
+        MirLiteralValue saB;
+        saB.value = MirSymbolAddrValue{/*symbol=*/60u, /*addend=*/0};   // &fb
+        saB.core  = TypeKind::Ptr;
+        (void)mb.addGlobal(pfn1, SymbolId{70}, mb.literalPoolAdd(saB),
+                           MirFuncId{}, SymbolBinding::Local,   // STATIC "T" (same name)
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
+        mir1 = std::move(mb).finish();
+    }
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{10, "fa"}, {20, "T"}}), {}},
+        MergeCuInput{&mir1, &in1, namerOf({{60, "fb"}, {70, "T"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    Mir const& mm = merged->mir;
+
+    // Both private functions survive with DISTINCT merged ids (a Local func/global
+    // is module-private and is never folded by name).
+    auto const fa = findFuncByName(mm, merged->symbolNames, "fa");
+    auto const fb = findFuncByName(mm, merged->symbolNames, "fb");
+    ASSERT_TRUE(fa.has_value());
+    ASSERT_TRUE(fb.has_value());
+    std::uint32_t const faSym = mm.funcSymbol(*fa).v;
+    std::uint32_t const fbSym = mm.funcSymbol(*fb).v;
+    EXPECT_NE(faSym, fbSym);
+
+    // Collect EVERY merged global named "T" together with its symbol-address init
+    // target.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tGlobals;  // (Tsym, initTarget)
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = mm.globalAt(i);
+        std::uint32_t const gsym = mm.globalSymbol(g).v;
+        auto const it = merged->symbolNames.find(gsym);
+        if (it == merged->symbolNames.end() || it->second != "T") continue;
+        std::uint32_t const initIdx = mm.globalInitLiteralIndex(g);
+        ASSERT_NE(initIdx, UINT32_MAX);
+        auto const* sa =
+            std::get_if<MirSymbolAddrValue>(&mm.literalValue(initIdx).value);
+        ASSERT_NE(sa, nullptr) << "each T's init must stay a MirSymbolAddrValue";
+        tGlobals.emplace_back(gsym, sa->symbol);
+    }
+
+    // THE PIN: the file-local `static T` and the extern `T` remain TWO distinct
+    // globals with distinct merged ids — the Local was NOT folded onto / shadowed
+    // by the Global.
+    ASSERT_EQ(tGlobals.size(), 2u)
+        << "the file-local `static T` and the extern `T` must remain TWO distinct "
+           "globals; folding the Local onto the same-named Global is the miscompile.";
+    EXPECT_NE(tGlobals[0].first, tGlobals[1].first);
+
+    // Each `T` keeps its OWN init target: one points at CU0's fa, the OTHER at CU1's
+    // fb (never both folded to fa).
+    bool const pointsFa =
+        tGlobals[0].second == faSym || tGlobals[1].second == faSym;
+    bool const pointsFb =
+        tGlobals[0].second == fbSym || tGlobals[1].second == fbSym;
+    EXPECT_TRUE(pointsFa) << "one T must still point at CU0's fa";
+    EXPECT_TRUE(pointsFb)
+        << "the OTHER T must still point at CU1's fb (not folded to CU0's fa) — the "
+           "os_unix-reads-test_syscall's-table miscompile.";
 
     MirVerifier verifier{mm, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep));

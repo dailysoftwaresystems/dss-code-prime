@@ -81,6 +81,7 @@
     "hasCAttributeOperator":    "__has_c_attribute",
     "$fc179EmbedComment": "FC17.9(h) C23 `#embed` (6.10.4) + `__has_embed` (6.10.1). `#embed \"r\"` resolves the QUOTED binary resource with the SAME search a quote-`#include` uses (self-dir first, then include dirs) and expands to the resource bytes as a comma-separated list of decimal `int` constants (0..255), spliced through the SAME product-token mechanism as `#`/`##` -- so the tokens are ordinary integer literals + commas the parser accepts in a brace initializer. `__has_embed` reports the C23 trichotomy NOT_FOUND(0)/FOUND(1)/EMPTY(2) (== the `__STDC_EMBED_*` macros above). CYCLE-1 SUBSET: the standard parameters (limit/prefix/suffix/if_empty + vendor) and the ANGLE form `<r>` and a macro-expanded argument are DEFERRED loud (D-PP-EMBED-{PARAMS,ANGLE,MACRO-ARG}); a resource above a ~16 MiB splice budget fails loud, never OOMs (the streaming boundary). `__has_embed` with any parameter clause answers NOT_FOUND(0) per C23 (the standard's own unsupported-signal, not an error). The angle delimiters are the SAME token KINDS as `__has_include` (hasIncludeAngleOpenToken/CloseToken), matched by KIND never the `<`/`>` bytes; the operator words are matched by TEXT, never a hard-coded spelling.",
     "embedDirective":           "embed",
+    "lineDirective":            "line",
     "hasEmbedOperator":         "__has_embed",
     "knownCAttributes": [
       { "name": "deprecated",   "version": 202311 },
@@ -586,15 +587,31 @@
       "alt": [ "StaticKeyword", "ConstexprKeyword", "ThreadLocalKeyword", "ThreadLocalC23Keyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
-      "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
+      "$comment": "GNU `__attribute__((...))`. FC4 c1 grew the parenthesized-string form `visibility(\"hidden\")`. TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) generalizes the ARGUMENT to `attrArgs` (a balanced list of identifiers / numbers / strings / nested parens) so real-header forms parse — `aligned(16)` (number), `__format__(__printf__,1,2)` (multi-arg), `__nonnull__((1,3))` (nested). It also admits a COMMA-separated run of further clauses (`__nothrow__, __leaf__`) via `attrClauseTail`. THE FIRST CLAUSE'S NAME stays a DIRECT child of attrSpec (so extractOneAttrClause + linkageFrom see it); ARGS live in the `attrArgs` subtree (so linkageFrom's `attributeArgRule` handling skips arg tokens for the specifier scan, keeping only a lone composite string). The trailing clauses nest under `attrClauseTail` so they don't pollute the first-clause name scan (multi-clause HONORING is a pinned follow-up; the first clause is honored).",
       "sequence": [
         "AttributeKeyword", "ParenOpen", "ParenOpen",
         { "optional": { "sequence": [
             "Identifier",
-            { "optional": { "sequence": [ "ParenOpen", "stringLiteralExpr", "ParenClose" ] } }
+            { "optional": "attrArgs" },
+            { "repeat": { "sequence": [ "Comma", "attrClauseTail" ] } }
         ] } },
         "ParenClose", "ParenClose"
       ]
+    },
+    "attrClauseTail": {
+      "$comment": "TF-C62: a NON-FIRST clause in a comma-separated `__attribute__((a, b))` run — name + optional args, nested so it doesn't add a direct-child identifier to attrSpec's first-clause name scan.",
+      "sequence": [ "Identifier", { "optional": "attrArgs" } ]
+    },
+    "attrArgs": {
+      "$comment": "TF-C62: the parenthesized ARGUMENT of one GNU attribute — a balanced `( ... )` holding a comma-separated list of arg items (an identifier, an integer/float literal, a string, or a NESTED `attrArgs` for `__nonnull__((1))`-style double parens). This is the `attributeArgRule` linkageFrom + extractOneAttrClause treat specially: its tokens are NOT scanned as linkage specifiers, but a LONE string inside it pairs with the preceding attribute name for the composite key (`visibility(\"hidden\")` -> `visibility:hidden`).",
+      "sequence": [ "ParenOpen", { "optional": "attrArgList" }, "ParenClose" ]
+    },
+    "attrArgList": {
+      "sequence": [ "attrArgItem", { "repeat": { "sequence": [ "Comma", "attrArgItem" ] } } ]
+    },
+    "attrArgItem": {
+      "$comment": "TF-C62: one attribute argument atom. The alt FIRST sets are disjoint (Identifier / IntLiteral / FloatLiteral / string-openers / ParenOpen) so the list stays predictive. Operator-expression args (`aligned(2*x)`) are residue — they fail loud, never silently mis-parse; a real header needing them is the follow-up.",
+      "alt": [ "Identifier", "IntLiteral", "FloatLiteral", "stringLiteralExpr", "attrArgs" ]
     },
     "stdAttr": {
       "$comment": "C23 [[...]] attribute specifier (D14: parsed, semantically IGNORED — linkageSpecifierIgnoredRules skips the whole subtree in the linkage scan). Namespaced `[[gnu::attr]]` and a parenthesized string argument are accepted; richer argument forms are residue.",
@@ -672,8 +689,10 @@
     },
 
     "initDeclarator": {
+      "$comment": "TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): an OPTIONAL after-declarator `__attribute__((...))` run (`void f(void) __attribute__((noreturn));`, `Tcl_Panic(...) TCL_FORMAT_PRINTF(1,2);`) sits between the declarator and the optional initializer. FIRST(attrSpec) = {AttributeKeyword} is disjoint from AssignOp/Comma/EndStatement, so it stays predictive (no speculation). The C23 `[[...]]` stdAttr rides here too. A run (repeat) admits `f() __attribute__((a)) __attribute__((b))`. These attributes are IGNORED for linkage (they are after the specifier prefix linkageFrom reads); the semantic attribute scan can still reach them via the declarator subtree — noreturn-after-declarator honoring is a pinned follow-up, parse-and-ignore is the first-increment behavior.",
       "sequence": [
         "declarator",
+        { "repeat": { "alt": [ "attrSpec", "stdAttr" ] } },
         { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
       ]
     },
@@ -759,13 +778,19 @@
     },
 
     "externDecl": {
-      "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the former bare `ExternKeyword` child 0 is now the `externSpecifiers` HEAD WRAPPER (`extern` + an optional thread-storage specifier run) so `extern thread_local int e;` parses (C11 6.7.1p3 — extern IS one of the two specifiers thread_local may pair with; the cross-TU TLS declaration form). The wrapper occupies exactly the ONE child slot the keyword did AND is the row's `specifierPrefix`, so the shared first-child strip (decl_prefix_strip.hpp / the parser sketch's strip) renumbers the role children to [typeRef, Identifier, externTail] = name 1 / type 0 / kindByChild [2,0] REGARDLESS of specifier presence — no index shift, no new engine mechanism. FIRST(externDecl) stays {ExternKeyword}. The REVERSE order `thread_local extern` stays a loud parse error (topLevelDecl's head never matches `extern`), matching the `extern constexpr` posture.",
+      "$comment": "D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): the trailing `externDeclTail` (a `{ block | EndStatement }` alt, the twin of `topLevelDeclTail`) admits `extern` on a FUNCTION DEFINITION — `extern int f(void){…}` (valid C 6.9.1, symmetric with `static int f(){…}`; the Tcl `EXTERN int Sqlite3_Init(…){…}` shape). A `block` tail → a function definition with EXTERNAL linkage (via the row's `kindByChild`, effectiveKind Function, a DEFINING symbol); an `EndStatement` tail → the ordinary non-defining declaration below. See externDeclTail for the disambiguation + fail-loud notes. c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (SQLite testfixture arc, 2026-07-18): a C 6.7 extern declaration is `extern` + a decl-specifier HEAD + an init-declarator LIST + `;` — the extern-flavored twin of `topLevelDecl`. SUPERSEDES the legacy single-declarator spine (`externSpecifiers typeRef Identifier externTail`), which bound exactly ONE `name` at a fixed child index and P0009'd on `extern int a, b;` (test1.c:9341 `extern int sqlite3_sync_count, sqlite3_fullsync_count;`). The head is `typeRefAllowingStruct` — the SAME star-free base-type head struct FIELDS use (base type + cv-qualifiers, NO pointer stars): pointer stars MUST bind PER-DECLARATOR (inside each slot's `declarator` pointerLayer) so `extern int *a, b;` types a as int* and b as int (a shared-head star would mis-type b). It admits struct/union/enum aggregates (D-CSUBSET-EXTERN-AGGREGATE-TYPE preserved — typeBaseAllowingStruct carries the same specifiers the retired `typeBase` did) + typedef-names + typeof + a `volatile` head (a strict gain over the retired `typeRef`, which had const only). The `initDeclaratorList` is the PROVEN `initDeclarator (, initDeclarator)*` list every object declaration uses; each `declarator` owns its pointer/array/fn suffix, so a function prototype (`extern int f(int);` — a declarator with an fnSuffix), an incomplete-array object (`extern char v[];`), and a mixed list (`extern int a, *p, g[4], h(void);`) ALL parse through ONE list — no bespoke func-vs-object tail. Pass-1 routes through the DECLARATOR-MODE minting (head:0/declaratorList:1) which mints N `nonDefiningDeclaration` symbols; CST→HIR's `lowerExternDeclInto` emits N ExternGlobal/ExternFunction nodes (one per declarator). FIRST(externDecl) stays {ExternKeyword} (unique-production direct descent, non-speculative). TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 stays the `externSpecifiers` HEAD WRAPPER (`extern` + an optional thread-storage run) so `extern thread_local int e;` parses (C11 6.7.1p3); it is the row's `specifierPrefix` (stripped before the head:0/list:1 count, so the indices are stable whether or not a specifier is present). The REVERSE order `thread_local extern` stays a loud parse error (topLevelDecl's head never matches `extern`). D-CSUBSET-EXTERN-LIBRARY-SYNTAX: a TRAILING `{optional stringLiteralExpr}` after the list carries the DSS per-declaration import-library override (`extern void* GetStdHandle(int) \"kernel32.dll\";` — examples/c-subset/hello_writefile); FIRST(stringLiteralExpr) = string-openers, DISJOINT from Comma/`=`/`;`, so the list stops before it (non-speculative) and it applies to EVERY declarator in this declaration. CST→HIR's `lowerExternDeclInto` decodes it (extractLibraryOverride) into each emitted extern's import-library map. It sits AFTER initDeclaratorList so it never shifts the head:0/list:1 indices.",
       "sequence": [
         "externSpecifiers",
-        "typeRef",
-        "Identifier",
-        "externTail"
+        "typeRefAllowingStruct",
+        "initDeclaratorList",
+        { "optional": "stringLiteralExpr" },
+        "externDeclTail"
       ]
+    },
+
+    "externDeclTail": {
+      "$comment": "D-CSUBSET-EXTERN-FN-DEFINITION (SQLite testfixture MAIN harness, §B 2026-07-21): the extern-declaration TAIL — the extern twin of `topLevelDeclTail`. A `block` tail makes the declaration a FUNCTION DEFINITION with EXTERNAL linkage (`extern int f(void){…}` — the Tcl `EXTERN int Sqlite3_Init(Tcl_Interp*){…}` shape, ×14 in tclsqlite-ex.c; `EXTERN` is the tcl.json macro → `extern`); an `EndStatement` tail makes it the ordinary non-defining declaration (`extern int a, b;` / a prototype / an object ref / the `\"kernel32.dll\"` import-library override — BYTE-IDENTICAL to pre-cycle, only the `;` token now rides this wrapper). FIRST(block)={BlockOpen} vs FIRST(EndStatement)={Semicolon} are DISJOINT, so the alt is predictively decided — NON-speculative, exactly like `topLevelDeclTail`. The `{optional stringLiteralExpr}` library override sits BEFORE this tail (a per-DECLARATION override) so it stays a DIRECT role child (externLibraryOverride's scan is unchanged); it is decl-only, so the pathological `extern int f() \"lib\" {…}` — a body AND an override — is caught FAIL-LOUD at HIR (H_ExternDeclMalformed, cst_to_hir lowerExternDeclInto), never a silent body-drop. externDecl's semantics row gains `kindByChild` (childPath [2,0] = this tail's block child → whenKind function); when a body is present the SHARED declarator-mode minting upgrades effectiveKind to Function (a DEFINING symbol, isExtern suppressed) and CST→HIR lowers a real Function (body emitted) via the same path topLevelDecl's function-definition arm uses. externDecl is added to `scopes` (the empty scope is harmless for a plain declaration — the topLevelDecl precedent — and dominates the params+body for a definition, via the generic declNodeIsFunctionDefinition scope logic). A function DEFINITION in BLOCK scope (a nested function via `extern` — not valid C) fails LOUD (cst_to_hir block-scope ExternDecl guard), never a silent hoist.",
+      "alt": [ "block", "EndStatement" ]
     },
 
     "externSpecifiers": {
@@ -776,35 +801,10 @@
       ]
     },
 
-    "externFuncTail": {
-      "sequence": [
-        "ParenOpen",
-        { "optional": "paramList" },
-        "ParenClose",
-        { "optional": "stringLiteralExpr" },
-        "EndStatement"
-      ]
-    },
-
-    "externTail": {
-      "alt": [
-        "externFuncTail",
-        "varDeclTail"
-      ]
-    },
-
-    "varDeclTail": {
-      "sequence": [
-        { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "initValue" ] } },
-        "EndStatement"
-      ]
-    },
-
     "initValue": { "$comment": "FC5: assignmentExpr (NOT expression) — the comma-gate. Covers ALL three initializer consumers (initDeclarator, structField, braceInitList initElement), so `int a = b, c;` stays 2 declarators (not `a = (b,c)`).", "alt": [ "braceInitList", "assignmentExpr" ] },
 
     "arrayDeclSuffix": {
-      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl) + the legacy externDecl. It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`).",
+      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl, externDecl). It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`).",
       "sequence": [
         "BracketOpen",
         { "repeat": { "alt": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] } },
@@ -826,19 +826,8 @@
       ]
     },
 
-    "typeBase": { "alt": [ "typeSpecifierSeq", "Identifier", "typeofSpecifier" ] },
-
-    "typeRef": {
-      "sequence": [
-        { "optional": "ConstKeyword" },
-        "typeBase",
-        { "repeat": "StarOp" },
-        { "optional": "ConstKeyword" }
-      ]
-    },
-
     "typeBaseAllowingStruct": {
-      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
+      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested. c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: also the extern-declaration head type-base (via `typeRefAllowingStruct`), so an aggregate extern (`extern struct Foo g;`) resolves through the SAME arms — the retired `typeBase` sibling folded into this rule.",
       "alt": [
         "typeSpecifierSeq",
         "structSpec",
@@ -962,11 +951,13 @@
 
     "statement": {
       "$c30Comment": "c30 D-CSUBSET-LOCAL-TYPEDEF: `typedefDecl` is admitted as a block item (a BLOCK-SCOPED typedef — `typedef void(*LOGFUNC_t)(void*,int,const char*);` inside a function, sqlite3.c:187603). FIRST = TypedefKeyword, DISJOINT from every other statement alt (varDecl is qualifier/type-keyword/storage-class-led; declOrExprStmt is Identifier-led; the rest are their own keywords), so a unique-production DIRECT DESCENT — NO speculation. The whole typedef-name machinery is ALREADY scope-keyed: Pass-1 binds the alias into `current` (= the enclosing block scope) in the Ordinary namespace; the type resolver (`resolveTypeNodeImpl` SE5 arm) and the parse-time oracle (`BinderSketch`) both walk the scope chain, so a block-scoped typedef-name resolves IN the block, SHADOWS an outer same-name typedef, and does NOT leak out (red-on-disable pins enforce the non-leak). HIR→MIR's `lowerStmtNode` lowers a statement-position TypeDecl as a NO-OP (a typedef emits no code; mirrors the TOP-LEVEL TypeDecl). Mirrors c28 (block-scoped struct/union/enum definition).",
+      "$blockExternComment": "D-CSUBSET-BLOCK-SCOPE-EXTERN (TF arc C10, SQLite testfixture 2026-07-18): the FILE-scope `externDecl` rule is ALSO admitted as a block item, so a block-scope `extern` declaration parses — `extern int f(int);` (a function prototype) AND `extern T *p;` (an object reference) inside a function body (C89 6.7.1; 6/44 sqlite src/test*.c hit this FIRST, e.g. test_thread.c:116 `extern int Sqlitetest_mutex_Init(Tcl_Interp*);`, test_btree.c:32 `extern BtShared *sqlite3SharedCacheList;`). FIRST(externDecl) = {ExternKeyword}, DISJOINT from every other statement alt (nothing else leads with `extern` — before this it P0009'd 'got extern'), so a unique-production DIRECT DESCENT — NO speculation. REUSES the file-scope externDecl semantics + HIR lowering WHOLESALE: Pass-1's rule-keyed full-tree walk mints the `nonDefiningDeclaration` symbol into `current` (= the enclosing BLOCK scope, C 6.2.2p4 name scope) exactly like the c30 block-typedef / c28 block-struct; CST→HIR's lowerStmt routes the synthesized ExternFunction/ExternGlobal to the module-decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-SCOPE-PROTOTYPE pattern) and lowers the STATEMENT to a no-op (the Skip precedent); collectExterns registers the symbol so a block use resolves via GlobalAddr, identical to a file-scope extern. ★ DELIBERATELY does NOT re-home to file scope the way D-CSUBSET-BLOCK-SCOPE-PROTOTYPE does for bare prototypes: block-scope binding is REQUIRED so a block-scope extern OBJECT that shadows an outer local (C 6.2.1) reads the extern, not the local — a file-scope re-home would mis-bind the shadow (design-audit Finding 3). A same-TU DEFINITION of the extern name in ANOTHER TU resolves at the LK11 cross-CU merge (import stripped); a same-TU FILE-SCOPE definition does NOT merge with the block extern (different scope), so the extern stays a real import (the cross-CU witness shape, examples/c-subset/block_scope_extern).",
       "$fc17Comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): `varDecl` is REPLACED by `declOrAttrStmt` (= alt{varDecl, attributeDeclaration}) — the ONLY varDecl-as-alt-branch site — so a `[[fallthrough]];` statement parses. A DIRECT statement-alt addition of attributeDeclaration was REFUTED: varDecl's FIRST already carries BracketOpen/AttributeKeyword (via localDeclSpecifiers' stdAttr/attrSpec), so the two branches collide → C_AmbiguousAlternatives at load. Every non-attribute-led statement still direct-descends (see declOrAttrStmt's hot-path note).",
       "alt": [
         "declOrAttrStmt",
         "typedefDecl",
         "staticAssertDecl",
+        "externDecl",
         "block",
         "ifStmt",
         "whileStmt",
@@ -1371,7 +1362,7 @@
       "sequence": [ { "alt": [ "CharStart", "WideCharStart", "Utf16CharStart", "Utf32CharStart", "Utf8CharStart" ] }, "CharLiteral" ]
     },
     "stringLiteralExpr": {
-      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), the externDecl library-override tail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
       "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral", { "repeat": { "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral" ] } } ]
     },
 
@@ -1406,7 +1397,9 @@
       "implicitToVoidPtr":                  true,
       "implicitFromVoidPtr":                true,
       "nullPointerConstantFromIntegerZero": true,
-      "nullPointerConstantFromNullptrT":    true
+      "nullPointerConstantFromNullptrT":    true,
+      "allowVoidPtrFnConvert":              true,
+      "ffiDescriptorIntPointeeCompat":      true
     },
     "$pointerAliasingComment": "Two orthogonal C99-derived alias-analysis opt-ins. `strictAliasingOnDistinctTypes` (C99 §6.5): accessing an object through a pointer of an incompatible type is undefined behavior — lets the MIR optimizer's CSE/LICM Load admission prove Ptr<I32> and Ptr<I64> don't alias (Rule 6 in mirMayAlias). `charTypesAliasAll` (C99 §6.5 ¶7): character-type pointers may alias an object of any type — the canonical strict-aliasing carve-out for serializers/hash-visitors/memcpy. C-family languages declare both true. A Rust frontend or strict-typed DSL would declare `charTypesAliasAll: false` (the type-checker enforces aliasing at a higher tier). See D-OPT-LOAD-ALIAS-ANALYSIS for the substrate's design.",
     "pointerAliasing": {
@@ -1433,6 +1426,7 @@
       "arraySuffixModifierTokens": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "StarOp" ],
       "initDeclaratorRule": "initDeclarator",
       "listRule":           "initDeclaratorList",
+      "afterDeclaratorAttrRules": ["attrSpec", "stdAttr"],
       "memberDeclaratorRule": "structMemberDeclarator",
       "memberListRule":       "structMemberDeclaratorList"
     },
@@ -1568,25 +1562,24 @@
         "anonymousNameAllowed": true,
         "specifierPrefix": "structMemberDeclSpecifiers" },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
-      { "rule": "externDecl", "name": 1, "type": 0, "kind": "variable",
+      { "rule": "externDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "nonDefiningDeclaration": true,
-        "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is now the `externSpecifiers` head wrapper (`extern` + optional thread-storage run) and is this row's specifierPrefix — the shared first-child strip renumbers the role children to [typeRef, Identifier, externTail], so name/type/kindByChild are 1/0/[2,0] (they were 2/1/[3,0] against the raw shape) and stay STABLE whether or not a specifier is present. The linkage scan resolves both thread-storage spellings to {threadStorage:true} (`extern thread_local int e;` — the cross-TU TLS declaration, C11 6.7.1p3) and ignores ExternKeyword by kind (extern-ness IS the rule's identity: nonDefiningDeclaration mints the record; a binding entry would be the noreturn clobber hazard).",
+        "requireNamedDeclarators": true,
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
+        "$multiDeclaratorComment": "c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): externDecl is now a DECLARATOR-MODE row (the extern twin of topLevelDecl) — head:0 (`typeRefAllowingStruct`, the star-free base type) + declaratorList:1 (`initDeclaratorList`), POST-STRIP indices (the `externSpecifiers` specifierPrefix at child 0 is stripped, so head/list stay 0/1 whether or not `extern thread_local` is spelled). SUPERSEDES the legacy `name:1/type:0/kindByChild[externFuncTail]` single-declarator row. Pass-1's declarator-mode minting (semantic_analyzer.cpp) mints ONE `nonDefiningDeclaration` symbol PER named declarator — `extern int a, b;` mints a AND b, each with its OWN per-declarator pointer/array/fn suffix folded onto the shared head base type (`extern int *a, b[10];` → a:int*, b:int[10]). `requireNamedDeclarators` fails loud (S_DeclarationDeclaresNothing) on an abstract declarator (`extern int *;`) — an extern must name a symbol. A FUNCTION declarator (`extern int f(int);` — its name carries an fnSuffix) is detected as a prototype (hasFnSuffixOnName → isProtoDeclaration) and lowered to ExternFunction; an OBJECT declarator to ExternGlobal — no bespoke func/object tail. Function-ness NO LONGER upgrades the kind to Function (it stays Variable+isProto, the same model topLevelDecl uses for a bare prototype `int f(int);`); the observable HIR (ExternFunction import) is unchanged. constMarker/volatileMarker mirror topLevelDecl so `extern const int x;` marks x const via the per-declarator declaratorObjectIsConst path. allowFlexibleArray preserves the extern INCOMPLETE-array object (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, `extern char v[];`) through the declarator's absent-length `[]`. TLS C1 (D-CSUBSET-THREAD-LOCAL): the `externSpecifiers` specifierPrefix carries `extern thread_local` — the declarator-mode storage scan reads {threadStorage:true} and marks every declarator's symbol isThreadLocal; ExternKeyword is ignored by kind (extern-ness IS the rule's identity — nonDefiningDeclaration mints the record). RE-HOME: a block-scope extern (object OR function) binds in the CURRENT block scope, NOT re-homed to file scope — the Pass-1 isProto file-scope re-home is SUPPRESSED for a non-defining extern (D-CSUBSET-BLOCK-SCOPE-EXTERN shadow correctness; see semantic_analyzer.cpp).",
         "specifierPrefix": "externSpecifiers",
+        "$kindByChildComment": "D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): the extern twin of topLevelDecl's function-definition discriminator. Post-strip role children are [typeRefAllowingStruct(0), initDeclaratorList(1), {stringLiteralExpr?}, externDeclTail]. childPath [2,0] = the externDeclTail's first child (with NO library override present — the definition case never carries one): a `block` node ⇒ a function DEFINITION (whenKind function), else the EndStatement token (a declaration; whenRule never matches a token). When a library override IS present the tail shifts to role index 3 so childPath[2] lands on the stringLiteralExpr (not a block) ⇒ stays a declaration — and the pathological override+body `extern f() \"lib\" {…}` is caught fail-loud at HIR, never mis-lowered. On a Function match the SHARED declarator-mode minting (semantic_analyzer.cpp) suppresses isExtern (a definition is DEFINING, not non-defining, despite nonDefiningDeclaration on this row) and binds the params/body via the externDecl scope (added to `scopes`); CST→HIR's lowerExternDeclInto delegates to the topLevelDecl function-definition lowering (a real Function with an emitted body), NOT ExternFunction. paramsPath/bodyPath ABSENT: declarator-mode params live in the declarator's fnSuffix and the matched block IS the body.",
+        "kindByChild": {
+          "childPath": [2, 0],
+          "whenRule": "block",
+          "whenKind": "function"
+        },
         "linkageSpecifiers": {
           "_Thread_local": { "threadStorage": true },
           "thread_local":  { "threadStorage": true }
         },
         "linkageSpecifierIgnoredKinds": ["ExternKeyword"],
-        "kindByChild": {
-          "childPath": [2, 0],
-          "whenRule": "externFuncTail",
-          "whenKind": "function",
-          "paramsPath": [1]
-        },
-        "variadicMarker": "EllipsisOp",
-        "$allowFlexibleArrayComment": "c82 (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, C 6.7p7/6.9.2): an extern OBJECT declaration may carry an INCOMPLETE array type — sqlite3.h's `SQLITE_EXTERN const char sqlite3_version[];`. The absent-length `[]` resolves through the SAME incomplete-array path a FAM uses (interner incompleteArray = the Array kind + a length sentinel, so decay/index consumers keep working while sizeof fails loud). The symbol is non-defining: a sibling-TU DEFINITION completes it at the MIR merge (LK11 name resolution drops the import row); a NEVER-defined one survives as an extern-data import, which the link tier fail-louds on until the extern-data import model lands (the c82 §B, D-LK-EXTERN-DATA-IMPORT).",
-        "allowFlexibleArray": true,
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
+        "allowFlexibleArray": true }
     ],
     "references": [
       { "rule": "operand" },
@@ -1604,8 +1597,8 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). c25: the unified `structSpec`/`unionSpec`/`enumSpec` rules are the fieldChildren composites (they REPLACE the retired *SpecifierBody rules). Each opens a scope ONLY in DEFINITION mode (body present) — Pass 1 gates the pushScope on the `definesWhenChild` body-child presence, so a body-absent tag reference (`struct S v;`) opens no scope. The member-body wrapper rules (structBody/unionBody/enumBody) are deliberately NOT scope rules — their fields bind into the enclosing XxxSpec scope.",
-    "scopes": [ "block", "forStmt", "topLevelDecl",
+    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): externDecl joins the list for the SAME reason — an `extern int f(void){…}` DEFINITION's params/body need a dominating scope; the empty scope opened for a plain `extern int a,b;` / block-scope extern is harmless (same as a variable-kind topLevelDecl, and isDefinitionAtNode defaults true here so the scope opens uniformly, while a definition's params bind into it via the generic declNodeIsFunctionDefinition gate and a bare-proto's params still isolate via isPrototypeParamScopeNode). c25: the unified `structSpec`/`unionSpec`/`enumSpec` rules are the fieldChildren composites (they REPLACE the retired *SpecifierBody rules). Each opens a scope ONLY in DEFINITION mode (body present) — Pass 1 gates the pushScope on the `definesWhenChild` body-child presence, so a body-absent tag reference (`struct S v;`) opens no scope. The member-body wrapper rules (structBody/unionBody/enumBody) are deliberately NOT scope rules — their fields bind into the enclosing XxxSpec scope.",
+    "scopes": [ "block", "forStmt", "topLevelDecl", "externDecl",
                 "structSpec", "unionSpec", "enumSpec" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
@@ -1837,6 +1830,8 @@
     "$charStringLiteralComment": "C 6.4.4.4: a character constant has type `int` (so sizeof('c')==4, NOT 1) — CharLiteral→I32. C 6.4.5: a string literal has type char[N+1] — StringLiteral declares stringArray:true with element core Char, so the engine builds Array<Char, decodedLen+1> per occurrence (the HIR value path independently lowers the same Array<Char,N+1> via the shared char_decode). charConvertsToArith (below) admits the C char<->int implicit conversion in BOTH directions: int->char (`char x='c';`) and char->int widening (`int y=c;`; codegen materializes the Char->int SExt). Pinned by CharParamReturnedAsIntIsClean + the char_value corpus.",
     "charConvertsToArith": true,
     "enumConvertsToArith": true,
+    "$scalarConvertsToBoolComment": "C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION): admit the scalar->_Bool implicit assignment conversion (`_Bool b=5;`, `_Bool b=ptr;`, `_Bool b=nullptr;`, `_Bool b=(a<b);`) — the result is 0 if the value compares equal to 0 else 1. isAssignable's scalar->Bool arm admits an arithmetic (int rank/float/Char/Enum) OR pointer OR nullptr rhs into a Bool lhs; coerce() realizes it as the `!= 0` truthiness test (the SAME condition-materialization `if(x)` uses — NOT a low-bit-truncating Cast, so `_Bool b=2` is true). The MIRROR of boolWidensToArith (Bool rhs->arith lhs). Needed once a comparison result types `int` (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE): `_Bool b=(a<b)` then flows int->Bool. Flip to false -> scalar->bool errors S0003 (the scalar_to_bool_convert corpus is RED-ON-DISABLE).",
+    "scalarConvertsToBool": true,
     "bitIntConversions": true,
     "$intCrossSignednessComment": "C 6.3.1.3/6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): admit the signed<->unsigned implicit assignment conversion (`int x=u;`, `u=i;`, `return i;`/`f(u)` across the signedness boundary) — value-preserving in range, modular out of range; needed for full-C + SQLite's int/unsigned/size_t mixing. coerce()'s arithmetic-core arm materializes the width-exact Cast. SAME-signedness narrowing (`int x=aLong`) is the SIBLING gate intSameSignednessNarrows below.",
     "intCrossSignednessConverts": true,
@@ -1845,6 +1840,8 @@
     "$intFloatConvertComment": "C 6.3.1.4/6.3.1.5/6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): admit the int<->float implicit assignment conversion in BOTH directions, gated independently. intConvertsToFloat -> an integer flows into a float lhs (`double d=5;`, `f(anInt)` to a `double` param; the sqlite kahanBabuskaNeumaierStep(pSum,iBig) shape feeds an i64 to a `volatile double`). floatConvertsToInt -> a float flows into an integer lhs (`int n=aDouble;`, truncating toward zero). coerce()'s arithmetic-core arm materializes the MIR SIToFP/UIToFP (int->float) / FPToSI/FPToUI (float->int). Flipping either to false -> that direction errors S0003 S_TypeMismatch (the int_float_convert corpus is RED-ON-DISABLE). Completes the C arithmetic-conversion matrix alongside intCrossSignednessConverts + intSameSignednessNarrows.",
     "intConvertsToFloat": true,
     "floatConvertsToInt": true,
+    "$floatNarrowComment": "C 6.3.1.4/6.5.16.1 (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING): admit the implicit float->float NARROWING assignment conversion -- a WIDER floating rhs into a NARROWER floating lhs (`float f=aDouble;` F64->F32; F80/F128->F64/F32), precision-lossy (gcc's off-by-default -Wconversion), value the nearest representable. Needed for full-C + SQLite's GEOPOLY `typedef float GeoCoord` assigned from `double` RHS (geopolyParseNumber/geopolyRegularFunc). WIDENING (F32->F64) stays UNCONDITIONAL; only narrowing is gated. isAssignable's float rank arm admits rank(rhs)>rank(lhs) only when true; coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR FPTrunc -- the SAME makeCast path F32->F64 widening already uses, NO codegen change). The float-ladder mirror of intSameSignednessNarrows; float->int stays the separate floatConvertsToInt gate. Flip to false -> `float f=aDouble` errors S0003 (the float_narrowing corpus is RED-ON-DISABLE).",
+    "floatSameKindNarrows": true,
     "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float, l/L -> long double). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates (the `long double` row copies the coreByLongDoubleFormat axis map, so `20.0L` types per-format: F64/F80/F128). The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. FC17.9(e): l/L are in BOTH suffix sets — the tokenizer's per-shape suffix rule keeps integer `20L` an IntLiteral (integer suffixes first on an integer-shaped token) while `20.0L`/`2e1L` take the float suffix.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },
@@ -1875,7 +1872,7 @@
       { "suffixes": ["uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU"],
         "bitPrecise": true, "signed": false }
     ],
-    "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true) and still yield Bool. shiftResult `promotedLeft` (C 6.5.7): a shift's type is its PROMOTED LEFT operand (the right operand never contributes, so `i32 << i64` is I32) -- the engine reads this verb instead of hardcoding C's special shift rule; the alternative `commonType` types `<<`/`>>` like an ordinary binary op (common type of both).",
+    "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true); the SSA carrier stays i1/Bool while the SEMANTIC result type is C's `int` (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE / D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE — a deliberate tier split, like char->i32). shiftResult `promotedLeft` (C 6.5.7): a shift's type is its PROMOTED LEFT operand (the right operand never contributes, so `i32 << i64` is I32) -- the engine reads this verb instead of hardcoding C's special shift rule; the alternative `commonType` types `<<`/`>>` like an ordinary binary op (common type of both).",
     "arithmeticConversions": {
       "integerPromotion": { "minRankType": "int", "alsoPromote": ["char", "bool"] },
       "mixedSignedness": "rank-prefer-unsigned",

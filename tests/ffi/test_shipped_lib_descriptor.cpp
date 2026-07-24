@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace dss;
@@ -505,6 +507,199 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     EXPECT_TRUE(macros->empty());      // no `macros` key -> nothing injected
 }
 
+// ── D-FFI-DESCRIPTOR-INCLUDES: the transitive shipped-header `#include` graph ──
+//
+// A descriptor may declare `"includes": ["stdio.h"]` — the sibling headers it
+// transitively `#include`s. `readShippedLibDescriptor` populates `.includes`, the
+// interner-free `readShippedLibIncludes` returns the same (lock-step), and
+// `forEachDescriptorInClosure` walks the closure cycle-safe.
+
+// (a) `includes` decodes on BOTH the interned full read AND the interner-free read.
+// RED-ON-DISABLE: drop the `decodeShippedIncludes` call in readShippedLibDescriptor
+// (or the readShippedLibIncludes impl) → `.includes` empty / nullopt.
+TEST(ShippedLibDescriptor, IncludesSurfaceDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "parent.json", R"JSON({
+        "header": "parent.h",
+        "includes": ["stdio.h", "sys/uio.h"],
+        "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->includes.size(), 2u);
+    EXPECT_EQ(desc->includes[0], "stdio.h");
+    EXPECT_EQ(desc->includes[1], "sys/uio.h");
+    // Interner-FREE read returns the identical list (the walker's source).
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_FALSE(rep2.hasErrors());
+    ASSERT_EQ(inc->size(), 2u);
+    EXPECT_EQ(inc->at(0), "stdio.h");
+    EXPECT_EQ(inc->at(1), "sys/uio.h");
+}
+
+// Absent `includes` ⇒ empty (back-compat — every existing descriptor untouched).
+TEST(ShippedLibDescriptor, IncludesAbsentIsEmpty) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "noinc.json", R"JSON({
+        "header": "noinc.h", "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_TRUE(desc->includes.empty());
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_TRUE(inc->empty());
+}
+
+// (a') A malformed `includes` field FAILS LOUD (F_ShippedLibDescriptorMalformed) on
+// BOTH reads — a non-array shape AND a non-string / empty entry. RED-ON-DISABLE:
+// drop the shape validation in decodeShippedIncludes → the malformed field is
+// silently accepted.
+TEST(ShippedLibDescriptor, IncludesMalformedFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // Non-array.
+    {
+        auto const path = writeTemp(dir, "badinc1.json", R"JSON({
+            "header": "b.h", "includes": "stdio.h",
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+        // The interner-free read stays in lock-step (same code, nullopt).
+        DiagnosticReporter rep2;
+        auto inc = readShippedLibIncludes(path, rep2);
+        EXPECT_FALSE(inc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep2, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+    // Non-string entry.
+    {
+        auto const path = writeTemp(dir, "badinc2.json", R"JSON({
+            "header": "b.h", "includes": [123],
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+}
+
+// (b) ★ CYCLE SAFETY (the correctness must): two temp descriptors a.json(includes:[b])
+// + b.json(includes:[a]) — a CYCLE. forEachDescriptorInClosure must visit each
+// EXACTLY ONCE and TERMINATE (a broken visited-set would infinite-loop / OOM).
+TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h", "includes": ["b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "includes": ["a.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    // Terminated (we got here) + each descriptor visited exactly once.
+    ASSERT_EQ(order.size(), 2u);
+    EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
+    EXPECT_EQ(order[1], "b");   // then its include
+    EXPECT_TRUE(unresolved.empty());
+}
+
+// (b') DIAMOND (a→b, a→c, b→d, c→d): the shared leaf `d` is visited ONCE, and every
+// descriptor is visited parent-before-child.
+TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "da.json", R"JSON({
+        "header": "da.h", "includes": ["db.h", "dc.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "db.json", R"JSON({
+        "header": "db.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dc.json", R"JSON({
+        "header": "dc.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "cf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dd.json", R"JSON({
+        "header": "dd.h", "symbols": [ { "name": "df", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const&) {});
+    ASSERT_EQ(order.size(), 4u);        // each of a/b/c/d visited exactly once
+    EXPECT_EQ(order[0], "da");          // parent first (the DFS root)
+    // The shared leaf `dd` appears exactly once (the diamond dedup — this is the
+    // load-bearing property; a broken visited-set would visit it twice).
+    EXPECT_EQ(std::count(order.begin(), order.end(), std::string{"dd"}), 1);
+    // Parent-before-child holds for every TRAVERSED edge (a DFS: `dd` is reached
+    // through `db`'s descent, so `dd` is visited BEFORE `dc` even starts — the
+    // `dc→dd` edge is pruned by the visited-set, NOT re-traversed. So the honest
+    // invariants are: da precedes every other node, and db precedes dd).
+    auto idx = [&](std::string const& s) {
+        return std::find(order.begin(), order.end(), s) - order.begin();
+    };
+    EXPECT_LT(idx("da"), idx("db"));
+    EXPECT_LT(idx("da"), idx("dc"));
+    EXPECT_LT(idx("da"), idx("dd"));
+    EXPECT_LT(idx("db"), idx("dd"));   // dd is db's child, reached first via db
+}
+
+// (c) FAIL-LOUD: an `includes` entry that resolves to NO descriptor on systemDirs
+// invokes `onUnresolvedInclude` with the offending header name (the import resolver
+// turns this into a positioned F_ShippedHeaderNotFound). RED-ON-DISABLE: drop the
+// `if (!childPath) onUnresolvedInclude(...)` arm → a typo'd include is silently
+// swallowed.
+TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "typo.json", R"JSON({
+        "header": "typo.h", "includes": ["stdioo.h"],
+        "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        path, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    ASSERT_EQ(order.size(), 1u);        // only the parent (the typo has no descriptor)
+    EXPECT_EQ(order[0], "typo");
+    ASSERT_EQ(unresolved.size(), 1u);   // the unresolvable entry was surfaced
+    EXPECT_EQ(unresolved[0], "stdioo.h");
+}
+
 // ── structs surface (named-field aggregate; the struct-body mechanism) ────────
 
 // A `structs` entry decodes into a ShippedStruct with named fields + an interned
@@ -593,6 +788,133 @@ TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── unions surface (named-member union; the union-body mechanism, C34b) ───────
+//
+// A `unions` entry decodes into a ShippedUnion with named members + an interned
+// UNION TypeId (TypeKind::Union — every member overlaid at offset 0). The SIBLING
+// of `structs`: member names live HERE because the hir-text `union "N" { T,… }`
+// spelling carries member TYPES positionally but no names.
+// (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+TEST(ShippedLibDescriptor, UnionsSurfaceParsed) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "u.json", R"JSON({
+        "header": "u.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" },
+                { "name": "words",        "type": "arr<i32, 1>" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    EXPECT_EQ(desc->unions[0].name, "keyU");
+    ASSERT_EQ(desc->unions[0].fields.size(), 3u);
+    EXPECT_EQ(desc->unions[0].fields[0].name, "oneWordValue");
+    EXPECT_EQ(desc->unions[0].fields[1].name, "string");
+    EXPECT_EQ(desc->unions[0].fields[2].name, "words");
+    ASSERT_TRUE(desc->unions[0].typeId.valid());
+    // The interned type is a UNION (member-overlay semantics), not a struct.
+    EXPECT_EQ(interner.kind(desc->unions[0].typeId), TypeKind::Union);
+    auto const ops = interner.operands(desc->unions[0].typeId);
+    ASSERT_EQ(ops.size(), 3u);
+    EXPECT_EQ(interner.kind(ops[0]), TypeKind::Ptr);   // ptr<void>
+}
+
+// A unions-ONLY descriptor is VALID — the ≥1-surface check counts unions.
+// RED-ON-DISABLE: without `out.unions.empty()` (+ !declaredUnions) in the gate,
+// this fails-loud as "declares nothing".
+TEST(ShippedLibDescriptor, UnionsOnlyDescriptorIsValid) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uo.json", R"JSON({
+        "header": "uo.h",
+        "unions": [ { "name": "u", "fields": [ { "name": "a", "type": "i32" } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+}
+
+// A union member must NOT carry an explicit `offset` — every member overlays at 0
+// by union semantics (an explicit-offset overlapping layout is the c107 `structs`
+// channel). RED-ON-DISABLE: drop the offset-reject loop and the `@4` member is
+// silently accepted (then laid out at 0 anyway — a wrong-but-runs surface).
+TEST(ShippedLibDescriptor, UnionMemberOffsetFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubad.json", R"JSON({
+        "header": "ub.h",
+        "unions": [ { "name": "u", "fields": [
+            { "name": "a", "type": "i32" },
+            { "name": "b", "type": "i32", "offset": 4 } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A union member with an undecodable type fails loud (the F_ShippedLibUnsupportedType
+// path, shared with structs via decodeStructFieldList).
+TEST(ShippedLibDescriptor, UnionMemberBadTypeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubt.json",
+        R"({ "header": "ub.h", "unions": [ { "name": "u",
+             "fields": [ { "name": "a", "type": "not_a_type" } ] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// Option C: a `unions` entry PUBLISHES its name so a later `structs` FIELD spells
+// the union BY NAME (`Entry.key : "keyU"`) — the field resolves to the SAME
+// interned union TypeId (so a member scope on that union resolves `entry.key.member`).
+// RED-ON-DISABLE: drop the mergedNamedTypes publish in the unions decode and the
+// struct field's `keyU` fails to decode (F_ShippedLibUnsupportedType).
+TEST(ShippedLibDescriptor, UnionReferencedByNameInStructField) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uref.json", R"JSON({
+        "header": "ur.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" } ] }
+        ],
+        "structs": [
+            { "name": "Entry", "fields": [
+                { "name": "clientData", "type": "ptr<void>" },
+                { "name": "key",        "type": "keyU" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[0].fields[1].name, "key");
+    EXPECT_EQ(desc->structs[0].fields[1].type, desc->unions[0].typeId)
+        << "the by-name union field must intern to the same union TypeId";
+    EXPECT_EQ(interner.kind(desc->structs[0].fields[1].type), TypeKind::Union);
 }
 
 // ── per-target struct VARIANTS (per-target byte layout; plan 25) ─────────────
@@ -1428,6 +1750,658 @@ TEST(ShippedLibDescriptor, ConstantsAndTypedefsDecode) {
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::U64);
 }
 
+// ── Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION): a descriptor spells its
+// OWN typedef BY NAME ────────────────────────────────────────────────────────────
+//
+// The reader resolves a descriptor's typedefs FIRST and threads each resolved
+// `name -> TypeId` into the `namedTypes` span used for the REST of that
+// descriptor's signature / struct-field / constant / later-typedef parses. So a
+// signature can spell `ptr<Widget>` where `Widget` is a typedef the SAME descriptor
+// declares, instead of re-inlining `Widget`'s full struct body at every use (the
+// Tcl_Obj ~45-site ripple this closes). GENERIC + content-blind: no name is
+// special-cased. Pinned on a SYNTHETIC descriptor (independent of tcl.json): a
+// typedef `Widget` = a 2-field struct, a SECOND typedef `WidgetPair` spelling
+// `ptr<Widget>` BY NAME, a `structs` field `ptr<Widget>`, and a symbol
+// `fn(ptr<Widget>) -> i32` — all four must land the ONE interned `Widget` struct.
+// RED-ON-DISABLE: drop the typedef-name threading (pass the bare caller
+// `namedTypes` again) → every by-name `Widget` becomes "unknown type" → read fails.
+TEST(ShippedLibDescriptor, OptionCDescriptorTypedefReferencedByName) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "widget.json", R"({
+        "header": "widget.h",
+        "typedefs": [
+            { "name": "Widget",     "type": "struct \"Widget\" { i32, ptr<char> }" },
+            { "name": "WidgetPair", "type": "struct \"WidgetPair\" { ptr<Widget>, ptr<Widget> }" }
+        ],
+        "structs": [
+            { "name": "Holder", "fields": [ { "name": "w", "type": "ptr<Widget>" } ] }
+        ],
+        "symbols": [
+            { "name": "widget_id", "signature": "fn(ptr<Widget>) -> i32" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value())
+        << "a descriptor referencing its OWN typedef by name must decode";
+    EXPECT_FALSE(rep.hasErrors());
+
+    ASSERT_EQ(desc->typedefs.size(), 2u);
+    ASSERT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
+    TypeId const widget = desc->typedefs[0].type;         // Widget
+    EXPECT_EQ(interner.name(widget), "Widget");
+
+    // WidgetPair's fields are `ptr<Widget>` — the pointee is the SAME interned Widget.
+    ASSERT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
+    auto const pairFields = interner.operands(desc->typedefs[1].type);
+    ASSERT_EQ(pairFields.size(), 2u);
+    ASSERT_EQ(interner.kind(pairFields[0]), TypeKind::Ptr);
+    auto const pairPointee = interner.operands(pairFields[0]);
+    ASSERT_EQ(pairPointee.size(), 1u);
+    EXPECT_EQ(pairPointee[0].v, widget.v)
+        << "a later typedef spelling ptr<Widget> by name must land the same Widget";
+
+    // The symbol signature `fn(ptr<Widget>) -> i32` — the param pointee is Widget.
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->symbols[0].signature), TypeKind::FnSig);
+    auto const params = interner.fnParams(desc->symbols[0].signature);
+    ASSERT_EQ(params.size(), 1u);
+    ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+    auto const symPointee = interner.operands(params[0]);
+    ASSERT_EQ(symPointee.size(), 1u);
+    EXPECT_EQ(symPointee[0].v, widget.v)
+        << "a signature spelling ptr<Widget> by name must land the same Widget";
+
+    // The `structs`-surface field `ptr<Widget>` too — ONE Widget across every surface.
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->structs[0].fields[0].type), TypeKind::Ptr);
+    auto const holderPointee = interner.operands(desc->structs[0].fields[0].type);
+    ASSERT_EQ(holderPointee.size(), 1u);
+    EXPECT_EQ(holderPointee[0].v, widget.v);
+}
+
+// Fail-loud is PRESERVED under Option C: threading the descriptor's OWN typedefs
+// adds ONLY those declared names — it does NOT turn every bare identifier into a
+// valid type. A signature spelling `ptr<Nonesuch>`, where no such typedef exists,
+// still FAILS the read (the identifier fallback is the LAST resort before the
+// unknown-type reject). RED-ON-DISABLE of fail-loud: were the fallback to swallow
+// an unknown name, this malformed descriptor would wrongly decode.
+TEST(ShippedLibDescriptor, OptionCUnknownTypeNameStillFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json", R"({
+        "header": "bad.h",
+        "typedefs": [ { "name": "Widget", "type": "struct \"Widget\" { i32 }" } ],
+        "symbols": [ { "name": "f", "signature": "fn(ptr<Nonesuch>) -> i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value())
+        << "an unknown type name must still fail loud under Option C";
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C1): the REAL tcl.json ──────
+//
+// The first brick toward building SQLite's `testfixture` (which links libtcl8.6
+// and runs the .test suite = "all sqlite units") with DSS. Pins the seed
+// descriptor STRUCTURALLY against the real config file so a malformed edit /
+// wrong SONAME / broken signature fails loud here — always-on on every leg
+// (no libtcl needed to READ the descriptor; the RUN witness is the
+// shipped_tcl_eval example, linux-only). testfixture calls TCL DIRECTLY (no
+// USE_TCL_STUBS), so these are plain extern prototypes.
+//
+// RED-ON-DISABLE: change tcl.json's elf `library` off "libtcl8.6.so" (the TCL
+// SONAME the DT_NEEDED must name) -> the library pin below fails; drop a symbol
+// or corrupt a signature -> the corresponding structural pin fails.
+TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "tcl.json";
+    ASSERT_TRUE(fs::exists(path)) << "tcl.json not found at " << path.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Decode for the elf x86_64 target (tcl.json is elf-only, no variants).
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                         std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    // Provenance + the link target — the DT_NEEDED-driving fields.
+    EXPECT_EQ(desc->header, "tcl.h");
+    ASSERT_EQ(desc->library.count("elf"), 1u);
+    EXPECT_EQ(desc->library.at("elf"), "libtcl8.6.so");   // TCL's SONAME
+    ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->availableObjectFormats[0], "elf");    // elf-only in C1
+
+    // C32 (D-FFI-DESCRIPTOR-INCLUDES): tcl.json declares the transitive `#include`
+    // of <stdio.h> (real tcl.h #includes it), so a `#include <tcl.h>` TU also gets
+    // stdio.json's FILE/fopen/… surface (the flat-descriptor FILE §B fix; sqlite
+    // test_md5.c's path). RED-ON-DISABLE: remove tcl.json's `includes` field → this
+    // pin fails AND the shipped_tcl_transitive_stdio example S0001s on `FILE *f;`.
+    ASSERT_EQ(desc->includes.size(), 1u);
+    EXPECT_EQ(desc->includes[0], "stdio.h");
+
+    // The two opaque handles (modeled like stdio.json's FILE — struct types) +
+    // the C4 ClientData typedef (void* — a Ptr, not a struct).
+    // C34a (D-FFI-TCL-DESCRIPTOR + Option C D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION):
+    // +Tcl_ObjType at index 1 (the Tcl_Obj->typePtr pointee; the real Tcl_Obj layout).
+    // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): +4 hash-cluster typedefs at
+    // indices 3-6 (Tcl_HashKey UNION + Tcl_HashTable/Entry/Search structs), inserted
+    // right after Tcl_Obj so they spell ptr<Tcl_Obj> by name (Option C) and
+    // Tcl_HashEntry spells Tcl_HashKey by name — the C4-C8 typedefs shift to 7-13.
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE / D-FFI-TCL-DESCRIPTOR): +3 thread/event/
+    // time typedefs at indices 14-16 (Tcl_ThreadId opaque ptr, Tcl_Event + Tcl_Time
+    // structs) for sqlite src/test_thread.c — the FINAL testfixture TU (44/44).
+    // C37 (D-FFI-TCL-DESCRIPTOR + Option C): +2 channel typedefs at indices 17-18
+    // (Tcl_ChannelTypeVersion opaque ptr for the TCL_CHANNEL_VERSION_5 macro cast,
+    // Tcl_ChannelType the 17-field channel-driver vtable struct) for the testfixture
+    // MAIN harness tclsqlite-ex.c (its `static Tcl_ChannelType IncrblobChannelType={...}`).
+    ASSERT_EQ(desc->typedefs.size(), 19u);
+    EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
+    EXPECT_EQ(desc->typedefs[1].name, "Tcl_ObjType");    // C34a: the typePtr pointee
+    EXPECT_EQ(desc->typedefs[2].name, "Tcl_Obj");
+    EXPECT_EQ(desc->typedefs[3].name, "Tcl_HashKey");    // C34b: the key UNION
+    EXPECT_EQ(desc->typedefs[4].name, "Tcl_HashTable");  // C34b
+    EXPECT_EQ(desc->typedefs[5].name, "Tcl_HashEntry");  // C34b
+    EXPECT_EQ(desc->typedefs[6].name, "Tcl_HashSearch"); // C34b
+    EXPECT_EQ(desc->typedefs[7].name, "ClientData");
+    EXPECT_EQ(desc->typedefs[8].name, "Tcl_CmdInfo");     // C5 (bare-name type)
+    EXPECT_EQ(desc->typedefs[9].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[10].name, "Tcl_CmdProc");    // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[11].name, "Tcl_WideInt");    // C8
+    EXPECT_EQ(desc->typedefs[12].name, "Tcl_DString");    // C8
+    EXPECT_EQ(desc->typedefs[13].name, "Tcl_Channel");    // C8
+    EXPECT_EQ(desc->typedefs[14].name, "Tcl_ThreadId");   // C34c: opaque thread handle
+    EXPECT_EQ(desc->typedefs[15].name, "Tcl_Event");      // C34c: the event base struct
+    EXPECT_EQ(desc->typedefs[16].name, "Tcl_Time");       // C34c: {sec,usec}
+    EXPECT_EQ(desc->typedefs[17].name, "Tcl_ChannelTypeVersion"); // C37: opaque ptr
+    EXPECT_EQ(desc->typedefs[18].name, "Tcl_ChannelType");        // C37: driver vtable
+    EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
+    EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);  // C34a: Tcl_ObjType
+    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Struct);  // Tcl_Obj (5 real fields)
+    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Union);   // C34b: Tcl_HashKey UNION
+    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::Struct);  // C34b: Tcl_HashTable
+    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::Struct);  // C34b: Tcl_HashEntry
+    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::Struct);  // C34b: Tcl_HashSearch
+    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::Ptr);     // ClientData = void*
+    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Struct);  // Tcl_CmdInfo
+    // C8: the two command-proc typedefs are FUNCTION TYPES (used as `Tcl_ObjCmdProc *`
+    // = a fn-pointer in 34 of the 44 test TUs); Tcl_WideInt = long long (i64);
+    // Tcl_DString = a 216-byte struct (used as a local — the size is load-bearing);
+    // Tcl_Channel = an opaque pointer. RED-ON-DISABLE: drop any of these 5 and the
+    // shipped_tcl_typedefs example (+ ~13 sqlite test TUs) fail S0006 "undeclared type".
+    EXPECT_EQ(interner.kind(desc->typedefs[9].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[10].type), TypeKind::FnSig);  // Tcl_CmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[11].type), TypeKind::I64);    // Tcl_WideInt = long long
+    EXPECT_EQ(interner.kind(desc->typedefs[12].type), TypeKind::Struct); // Tcl_DString (216-byte)
+    EXPECT_EQ(interner.kind(desc->typedefs[13].type), TypeKind::Ptr);    // Tcl_Channel = opaque ptr
+    // C34c: Tcl_ThreadId = opaque `struct Tcl_ThreadId_ *` (a Ptr); Tcl_Event +
+    // Tcl_Time are structs (Tcl_Event = 2 ptrs = 16B; Tcl_Time = {i64 sec, i64 usec}
+    // = 16B). RED-ON-DISABLE: drop any and sqlite test_thread.c fails S0006.
+    EXPECT_EQ(interner.kind(desc->typedefs[14].type), TypeKind::Ptr);    // Tcl_ThreadId
+    EXPECT_EQ(interner.kind(desc->typedefs[15].type), TypeKind::Struct); // Tcl_Event
+    EXPECT_EQ(interner.kind(desc->typedefs[16].type), TypeKind::Struct); // Tcl_Time
+    // C37: Tcl_ChannelTypeVersion is an opaque pointer (the `struct Tcl_ChannelTypeVersion_ *`
+    // cast target of TCL_CHANNEL_VERSION_5); Tcl_ChannelType is the 17-field driver struct.
+    EXPECT_EQ(interner.kind(desc->typedefs[17].type), TypeKind::Ptr);    // Tcl_ChannelTypeVersion
+    EXPECT_EQ(interner.kind(desc->typedefs[18].type), TypeKind::Struct); // Tcl_ChannelType
+
+    // Find a symbol by name (declaration order is not load-bearing).
+    auto sym = [&](std::string_view name) -> ShippedSymbol const* {
+        for (auto const& s : desc->symbols)
+            if (s.name == name) return &s;
+        return nullptr;
+    };
+    ASSERT_EQ(desc->symbols.size(), 114u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func; C22: +3 (Tcl_AttemptRealloc/Tcl_UtfToLower/Tcl_AppendObjToObj, 61 -> 64) for test6 + test_vfs; C27: +1 (Tcl_ObjGetVar2, 64 -> 65) for test_quota; C28: +2 (Tcl_GetDouble + Tcl_DStringAppend, 65 -> 67) for test1; C34b: +6 exported hash fns + Tcl_NewListObj (67 -> 74) for test_malloc; C34c: +8 exported thread/event/time fns (74 -> 82) for test_thread — the FINAL src/test*.c TU; C37: +29 exported fns (82 -> 111) for the testfixture MAIN harness tclsqlite-ex.c + Tcl_GetCharLength for test_recover — 23 channel/dict/NRE/misc (tier 1) + 6 more the tier-1 fixes UNMASKED (Tcl_FindExecutable/Tcl_NRCallObjProc/Tcl_NRCreateCommand/Tcl_PkgProvide/Tcl_SetSystemEncoding/Tcl_TranslateFileName). C43 (D-FFI-TCL-LIST-VAR-DESCRIPTORS): +3 exported fns (Tcl_SetVar2Ex + Tcl_SplitList + Tcl_ListObjReplace, 111 -> 114) for the block-2 "Statically linked extensions" TUs ext/fts5/fts5_tcl.c + ext/rtree/test_rtreedoc.c (all nm -D `T`). Tcl_IsShared + TCL_VERSION are macros, NOT symbols — asserted below
+    for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
+                          "Tcl_GetObjResult", "Tcl_GetIntFromObj",
+                          "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
+                          "Tcl_GetString", "Tcl_WrongNumArgs", "Tcl_SetResult",
+                          "Tcl_AppendResult", "Tcl_GetCommandInfo", "Tcl_SetCommandInfo",
+                          "Tcl_DeleteCommand", "Tcl_GetIndexFromObjStruct",
+                          // C9: representative of the 39-function surface (S0001 blocker)
+                          "Tcl_NewObj", "Tcl_NewStringObj", "Tcl_ListObjAppendElement",
+                          "Tcl_ListObjLength", "Tcl_ListObjIndex", "Tcl_SetVar",
+                          "Tcl_SetVar2", "Tcl_GetInt", "Tcl_GetDoubleFromObj",
+                          "Tcl_DStringInit", "Tcl_ResetResult", "Tcl_DuplicateObj",
+                          "Tcl_LinkVar", "Tcl_GetChannel",
+                          // C15 (D-FFI-TCL-DESCRIPTOR): the two Tcl BYTE-ARRAY functions.
+                          "Tcl_NewByteArrayObj", "Tcl_GetByteArrayFromObj",
+                          // C16 (D-FFI-TCL-DESCRIPTOR): test_func's 2 missing fns
+                          // (Tcl_NewDoubleObj = fn(f64)->Tcl_Obj*; Tcl_AppendStringsToObj
+                          // = variadic fn(Tcl_Obj*, ...)->void) -> test_func goes CLEAN.
+                          "Tcl_NewDoubleObj", "Tcl_AppendStringsToObj",
+                          // C22 (D-FFI-TCL-DESCRIPTOR): test6's 2 (Tcl_AttemptRealloc
+                          // = fn(char*,u32)->char*; Tcl_UtfToLower = fn(char*)->i32) +
+                          // test_vfs's 1 (Tcl_AppendObjToObj = fn(Tcl_Obj*,Tcl_Obj*)->void)
+                          "Tcl_AttemptRealloc", "Tcl_UtfToLower", "Tcl_AppendObjToObj",
+                          // C27 (D-FFI-TCL-DESCRIPTOR): test_quota's Tcl_ObjGetVar2
+                          // = Tcl_Obj *fn(Tcl_Interp*, Tcl_Obj*, Tcl_Obj*, int) — the
+                          // GET twin of Tcl_ObjSetVar2 (one fewer param, no newValuePtr).
+                          "Tcl_ObjGetVar2",
+                          // C28 (D-FFI-TCL-DESCRIPTOR): test1's Tcl_GetDouble
+                          // = fn(Tcl_Interp*, char*, f64*)->i32 (the Tcl_GetInt double-out
+                          // sibling) + Tcl_DStringAppend = fn(Tcl_DString*, char*, i32)->char*
+                          // (the Tcl_DStringAppendElement sibling); both exported T (nm -D).
+                          "Tcl_GetDouble", "Tcl_DStringAppend",
+                          // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the 6
+                          // EXPORTED hash functions (nm -D `T`-verified) test_malloc.c
+                          // needs — Tcl_GetHashKey/Value are ABSENT (macros, asserted
+                          // below), NOT symbols. RED-ON-DISABLE: drop one → test_malloc
+                          // S0001s on the hash API.
+                          "Tcl_InitHashTable", "Tcl_DeleteHashTable", "Tcl_CreateHashEntry",
+                          "Tcl_FirstHashEntry", "Tcl_NextHashEntry", "Tcl_DeleteHashEntry",
+                          // C34b: test_malloc's list constructor (the sole non-hash
+                          // residual once the hash cluster lands; exported T).
+                          "Tcl_NewListObj",
+                          // C34c (D-FFI-TCL-DESCRIPTOR): the 8 EXPORTED thread/event/
+                          // time functions (nm -D `T`-verified) sqlite test_thread.c
+                          // needs — the FINAL testfixture TU (44/44). RED-ON-DISABLE:
+                          // drop one → test_thread S0001s on the thread API.
+                          "Tcl_CreateThread", "Tcl_JoinThread", "Tcl_ExitThread",
+                          "Tcl_GetCurrentThread", "Tcl_ThreadAlert",
+                          "Tcl_ThreadQueueEvent", "Tcl_DoOneEvent", "Tcl_GetTime",
+                          // C37 (D-FFI-TCL-DESCRIPTOR): the 23 EXPORTED channel/dict/NRE/
+                          // misc functions (nm -D `T`-verified) the testfixture MAIN harness
+                          // tclsqlite-ex.c needs + Tcl_GetCharLength for ext/recover/
+                          // test_recover.c. Tcl_IsShared is a MACRO (nm -D ABSENT), asserted
+                          // below — NOT in this list. RED-ON-DISABLE: drop one → tclsqlite-ex
+                          // (or test_recover) S0001s on that symbol.
+                          "Tcl_Alloc", "Tcl_Close", "Tcl_CreateChannel", "Tcl_DictObjPut",
+                          "Tcl_DictObjRemove", "Tcl_GetChannelName", "Tcl_GetVersion",
+                          "Tcl_GetsObj", "Tcl_GlobalEval", "Tcl_NRAddCallback",
+                          "Tcl_NREvalObj", "Tcl_NewDictObj", "Tcl_OpenFileChannel",
+                          "Tcl_RegisterChannel", "Tcl_SetBooleanObj", "Tcl_SetChannelOption",
+                          "Tcl_SetIntObj", "Tcl_SetObjLength", "Tcl_SetWideIntObj",
+                          "Tcl_UnregisterChannel", "Tcl_UnsetVar2", "Tcl_VarEval",
+                          "Tcl_GetCharLength",
+                          // C37 tier 2: the 6 EXPORTED functions the tier-1 fixes UNMASKED
+                          // (the front-end had suppressed these downstream S0001s until the
+                          // earlier undeclared identifiers in the same declarations resolved).
+                          // All nm -D `T`. RED-ON-DISABLE: drop one → tclsqlite-ex.c S0001s.
+                          "Tcl_FindExecutable", "Tcl_NRCallObjProc", "Tcl_NRCreateCommand",
+                          "Tcl_PkgProvide", "Tcl_SetSystemEncoding", "Tcl_TranslateFileName",
+                          // C43 (D-FFI-TCL-LIST-VAR-DESCRIPTORS): the 3 EXPORTED Tcl-API fns
+                          // (nm -D `T`) the block-2 "Statically linked extensions" TUs need —
+                          // Tcl_SetVar2Ex + Tcl_SplitList (ext/fts5/fts5_tcl.c) + Tcl_ListObjReplace
+                          // (ext/rtree/test_rtreedoc.c). RED-ON-DISABLE: drop one → that TU S0001s.
+                          "Tcl_SetVar2Ex", "Tcl_SplitList", "Tcl_ListObjReplace"})
+        EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+    // C34b: Tcl_GetHashKey/Tcl_GetHashValue/Tcl_SetHashValue are MACROS in real tcl.h,
+    // ABSENT from libtcl8.6.so's nm -D — so they must NOT be eager-imported symbols
+    // (that would break every tcl binary's LOAD, the C9 refcount precedent). They ship
+    // as `macros` (asserted in the macro block below).
+    EXPECT_EQ(sym("Tcl_GetHashKey"), nullptr)   << "Tcl_GetHashKey is a macro, not a symbol";
+    EXPECT_EQ(sym("Tcl_GetHashValue"), nullptr) << "Tcl_GetHashValue is a macro, not a symbol";
+    EXPECT_EQ(sym("Tcl_SetHashValue"), nullptr) << "Tcl_SetHashValue is a macro, not a symbol";
+    // C37: Tcl_IsShared is a pure tcl.h field-poking macro, ABSENT from libtcl8.6.so's
+    // nm -D — so it must NOT be an eager-imported symbol (that would break every tcl
+    // binary's LOAD 127, the C9 refcount precedent). It ships as a `macros` entry
+    // (`((objPtr)->refCount > 1)`), asserted in the macro block below.
+    EXPECT_EQ(sym("Tcl_IsShared"), nullptr) << "Tcl_IsShared is a macro, not a symbol";
+    // C37 tier 2: TCL_VERSION is a tcl.h string macro (nm -D ABSENT), likewise NOT a symbol.
+    EXPECT_EQ(sym("TCL_VERSION"), nullptr) << "TCL_VERSION is a macro, not a symbol";
+    // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
+    // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
+    // (`Tcl_NewByteArrayObj(const unsigned char*, int)` /
+    // `unsigned char *Tcl_GetByteArrayFromObj(Tcl_Obj*, int*)`), NOT `char*`. The
+    // former `ptr<char>` descriptor made test5/test_blob/test_hexio S0003 on their
+    // `(u8*)` / `unsigned char *` byte buffers (char* vs unsigned char* is a strict
+    // fail-loud pointer mismatch); the fix takes all three fully CLEAN. The exact
+    // `ptr<u8>` element type is behaviorally RED-ON-DISABLE via the
+    // shipped_tcl_bytearray example: revert the two signatures to `ptr<char>` and
+    // BOTH the u8* arg AND the u8* return raise S0003 -> that example stops compiling.
+    // C13 (D-FFI-TCL-DESCRIPTOR, dissolves D-FFI-TCL-REFCOUNT-MACROS): Tcl_IncrRefCount /
+    // Tcl_DecrRefCount are field-poking MACROS in real tcl.h that libtcl does NOT export.
+    // C9 left them out entirely (a symbol would be eager-imported and break every tcl
+    // binary's LOAD 127). C13 FLIPS that: they are now PRESENT as function-MACROS over
+    // the EXPORTED Tcl_DbIncrRefCount / Tcl_DbDecrRefCount (which do the same ++/--refCount
+    // + free) — so they stay OUT of the symbol table but are IN the macro table, and the
+    // 4 EXPORTED backers ARE symbols (eager-import-safe). Tcl_DStringValue is a new macro
+    // too. Pin BOTH invariants: refcount ops are NOT eager-imported symbols ...
+    EXPECT_EQ(sym("Tcl_IncrRefCount"), nullptr) << "refcount ops are macros, not eager-imported symbols";
+    EXPECT_EQ(sym("Tcl_DecrRefCount"), nullptr) << "refcount ops are macros, not eager-imported symbols";
+    {
+        // ... but the 4 new EXPORTED backers ARE symbols (Db{Incr,Decr}RefCount back the
+        // refcount macros; GetSlave/BackgroundError clear residual test-TU S0001). Because
+        // they are exported, eager-import stays safe (unlike the C9 macro-only attempt).
+        // RED-ON-DISABLE: drop any and the refcount macros expand to an undeclared function
+        // (S0001) or the shipped_tcl_refcount example fails to link (ld exit 127).
+        for (auto const* n : {"Tcl_DbIncrRefCount", "Tcl_DbDecrRefCount",
+                              "Tcl_GetSlave", "Tcl_BackgroundError"})
+            EXPECT_NE(sym(n), nullptr) << "missing C13 exported Tcl symbol: " << n;
+
+        // The FLIP itself: the 3 new function-macros are PRESENT (refcount ops are no
+        // longer absent from the descriptor — they resolve as macros over the Db* backers
+        // / the Tcl_DString `string` field). RED-ON-DISABLE: remove a macro from tcl.json
+        // and both its presence check and its exact-replacement check fail.
+        auto macro = [&](std::string_view name) -> ShippedMacro const* {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return &m;
+            return nullptr;
+        };
+        auto const* incr = macro("Tcl_IncrRefCount");
+        ASSERT_NE(incr, nullptr) << "Tcl_IncrRefCount must now be a macro";
+        ASSERT_TRUE(incr->params.has_value());
+        ASSERT_EQ(incr->params->size(), 1u);
+        EXPECT_EQ((*incr->params)[0], "objPtr");
+        EXPECT_EQ(incr->replacement, "Tcl_DbIncrRefCount((objPtr), \"\", 0)");
+        auto const* decr = macro("Tcl_DecrRefCount");
+        ASSERT_NE(decr, nullptr) << "Tcl_DecrRefCount must now be a macro";
+        EXPECT_EQ(decr->replacement, "Tcl_DbDecrRefCount((objPtr), \"\", 0)");
+        auto const* dsv = macro("Tcl_DStringValue");
+        ASSERT_NE(dsv, nullptr) << "Tcl_DStringValue must be a macro";
+        ASSERT_TRUE(dsv->params.has_value());
+        ASSERT_EQ(dsv->params->size(), 1u);
+        EXPECT_EQ((*dsv->params)[0], "dsPtr");
+        EXPECT_EQ(dsv->replacement, "((dsPtr)->string)");
+        // C28 (D-FFI-TCL-DESCRIPTOR): Tcl_DStringLength — the LENGTH twin of
+        // Tcl_DStringValue (tcl.h:1014 `#define Tcl_DStringLength(dsPtr) ((dsPtr)->length)`),
+        // reading the Tcl_DString `length` field modeled in C13 (NO new struct layout).
+        // test1.c:23893. RED-ON-DISABLE: remove it and the shipped_tcl_dstring example's
+        // Tcl_DStringLength read fails to resolve (S0001).
+        auto const* dsl = macro("Tcl_DStringLength");
+        ASSERT_NE(dsl, nullptr) << "Tcl_DStringLength must be a macro";
+        ASSERT_TRUE(dsl->params.has_value());
+        ASSERT_EQ(dsl->params->size(), 1u);
+        EXPECT_EQ((*dsl->params)[0], "dsPtr");
+        EXPECT_EQ(dsl->replacement, "((dsPtr)->length)");
+        // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the 3 hash-access macros.
+        // Tcl_Get/SetHashValue read clientData; Tcl_GetHashKey is the REAL tcl.h macro
+        // (fail-loud-correct for EVERY key type) reading the `key` UNION members — NOT
+        // a sidestep. RED-ON-DISABLE: remove the union-member injection and the
+        // key.oneWordValue/key.string reads in this macro body fail S_NotAComposite.
+        auto const* ghv = macro("Tcl_GetHashValue");
+        ASSERT_NE(ghv, nullptr) << "Tcl_GetHashValue must be a macro";
+        EXPECT_EQ(ghv->replacement, "((h)->clientData)");
+        auto const* shv = macro("Tcl_SetHashValue");
+        ASSERT_NE(shv, nullptr) << "Tcl_SetHashValue must be a macro";
+        EXPECT_EQ(shv->replacement, "((h)->clientData = (ClientData) (value))");
+        auto const* ghk = macro("Tcl_GetHashKey");
+        ASSERT_NE(ghk, nullptr) << "Tcl_GetHashKey must be a macro (absent from nm -D)";
+        ASSERT_TRUE(ghk->params.has_value());
+        ASSERT_EQ(ghk->params->size(), 2u);
+        EXPECT_NE(ghk->replacement.find("(h)->key.oneWordValue"), std::string::npos)
+            << "the REAL Tcl_GetHashKey reads the key.oneWordValue union member";
+        EXPECT_NE(ghk->replacement.find("(h)->key.string"), std::string::npos)
+            << "the REAL Tcl_GetHashKey reads the key.string union member";
+        EXPECT_NE(ghk->replacement.find("(tablePtr)->keyType"), std::string::npos)
+            << "the REAL Tcl_GetHashKey dispatches on tablePtr->keyType (not a sidestep)";
+        // C37 (D-FFI-TCL-DESCRIPTOR): Tcl_IsShared is a pure tcl.h field-poking macro
+        // (nm -D ABSENT), shipped as the non-TCL_MEM_DEBUG build form reading the real
+        // Tcl_Obj refCount field modeled in C34a (fail-loud-correct; the C13 refcount-macro
+        // precedent). RED-ON-DISABLE: remove it → tclsqlite-ex.c S0001s on Tcl_IsShared.
+        auto const* shared = macro("Tcl_IsShared");
+        ASSERT_NE(shared, nullptr) << "Tcl_IsShared must ship as a macro (absent from nm -D)";
+        ASSERT_TRUE(shared->params.has_value());
+        ASSERT_EQ(shared->params->size(), 1u);
+        EXPECT_EQ((*shared->params)[0], "objPtr");
+        EXPECT_EQ(shared->replacement, "((objPtr)->refCount > 1)");
+    }
+
+    // C13: Tcl_DString gains its REAL named layout so Tcl_DStringValue's `->string` read
+    // resolves — { char *string; int length; int spaceAvl; char staticSpace[200] } = 216
+    // bytes, the same size/align as the old opaque arr<u64,27> blob. Modeled via the
+    // `structs` surface (the Tcl_CmdInfo C5 precedent). Pin `string` at slot 0 so a wrong
+    // layout (which would misread what libtcl fills at the ABI offsets) fails loud.
+    // RED-ON-DISABLE: drop the Tcl_DString struct entry (or rename `string`) and the
+    // shipped_tcl_refcount example's Tcl_DStringValue read fails to resolve.
+    {
+        ShippedStruct const* dstr = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_DString") dstr = &s;
+        ASSERT_NE(dstr, nullptr) << "missing Tcl_DString struct";
+        ASSERT_EQ(dstr->fields.size(), 4u);
+        EXPECT_EQ(dstr->fields[0].name, "string");
+        EXPECT_EQ(interner.kind(dstr->fields[0].type), TypeKind::Ptr);   // char* at slot 0
+        EXPECT_EQ(dstr->fields[1].name, "length");
+        EXPECT_EQ(interner.kind(dstr->fields[1].type), TypeKind::I32);
+        EXPECT_EQ(dstr->fields[3].name, "staticSpace");
+        EXPECT_EQ(interner.kind(dstr->fields[3].type), TypeKind::Array);
+    }
+
+    // C5: the Tcl_CmdInfo command-introspection struct — the FIRST field-access
+    // struct (8 fields: int + 7 pointers). Pin its shape so a wrong field
+    // layout (which would misplace what libtcl fills at runtime) fails loud.
+    {
+        ShippedStruct const* cmdInfo = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_CmdInfo") cmdInfo = &s;
+        ASSERT_NE(cmdInfo, nullptr) << "missing Tcl_CmdInfo struct";
+        ASSERT_EQ(cmdInfo->fields.size(), 8u);
+        EXPECT_EQ(cmdInfo->fields[0].name, "isNativeObjectProc");
+        EXPECT_EQ(interner.kind(cmdInfo->fields[0].type), TypeKind::I32);  // offset 0
+        EXPECT_EQ(cmdInfo->fields[5].name, "deleteProc");
+        EXPECT_EQ(interner.kind(cmdInfo->fields[5].type), TypeKind::Ptr);  // a pointer
+        // C34a (D-FFI-TCL-DESCRIPTOR): objProc is now the REAL Tcl_ObjCmdProc fn-ptr
+        // (was ptr<void>) so test1.c:31551 `cmdInfo.objProc(...)` is CALLABLE, not an
+        // opaque void*. ptr<fn(void*, Tcl_Interp*, i32, Tcl_Obj**) -> i32>; still 8
+        // bytes so isNativeObjectProc@0 is unshifted (ZERO ABI change). RED-ON-DISABLE:
+        // revert objProc to ptr<void> and the shipped_tcl_objfields call fails S0004.
+        EXPECT_EQ(cmdInfo->fields[1].name, "objProc");
+        ASSERT_EQ(interner.kind(cmdInfo->fields[1].type), TypeKind::Ptr);
+        auto const objProcPointee = interner.operands(cmdInfo->fields[1].type);
+        ASSERT_EQ(objProcPointee.size(), 1u);
+        EXPECT_EQ(interner.kind(objProcPointee[0]), TypeKind::FnSig);   // ptr-to-FUNCTION
+        EXPECT_EQ(interner.kind(interner.fnResult(objProcPointee[0])), TypeKind::I32);
+    }
+
+    // C34a (D-FFI-TCL-DESCRIPTOR + Option C): the REAL Tcl_Obj layout — a 5-field
+    // struct (was an opaque `arr<u64,6>`), so test1.c:6182-6183 `pVar->typePtr` /
+    // `pVar->typePtr->name` (S000D x2) resolve to a genuine field scope. Pins the
+    // field names/types AND the DERIVED ABI layout: 48 bytes total with typePtr @
+    // offset 24 (natural alignment i32@0, char*@8, i32@16, Tcl_ObjType*@24,
+    // arr<u64,2>@32) — the real LP64 Tcl_Obj, ZERO ABI shift vs the old 48-byte
+    // blob. Tcl_ObjType (the typePtr pointee) is 40 bytes with `name` @ 0 (so
+    // `typePtr->name` resolves). Option C is what lets Tcl_Obj->typePtr spell
+    // `ptr<Tcl_ObjType>` BY NAME: the typedef and the structs-surface tag intern to
+    // ONE type (asserted below), so every `ptr<Tcl_Obj>` signature and a user
+    // `Tcl_Obj *` share this field scope. RED-ON-DISABLE: revert the Tcl_Obj typedef
+    // body to `arr<u64,6>` → these pins AND the shipped_tcl_objfields example fail.
+    {
+        ShippedStruct const* tclObj  = nullptr;
+        ShippedStruct const* objType = nullptr;
+        for (auto const& s : desc->structs) {
+            if (s.name == "Tcl_Obj")     tclObj  = &s;
+            if (s.name == "Tcl_ObjType") objType = &s;
+        }
+        ASSERT_NE(tclObj, nullptr)  << "missing Tcl_Obj struct (C34a real layout)";
+        ASSERT_NE(objType, nullptr) << "missing Tcl_ObjType struct (C34a)";
+        ASSERT_EQ(tclObj->fields.size(), 5u);
+        EXPECT_EQ(tclObj->fields[0].name, "refCount");
+        EXPECT_EQ(interner.kind(tclObj->fields[0].type), TypeKind::I32);
+        EXPECT_EQ(tclObj->fields[3].name, "typePtr");
+        ASSERT_EQ(interner.kind(tclObj->fields[3].type), TypeKind::Ptr);   // Tcl_ObjType*
+        // typePtr points AT the Tcl_ObjType struct (so `typePtr->name` resolves).
+        auto const pointee = interner.operands(tclObj->fields[3].type);
+        ASSERT_EQ(pointee.size(), 1u);
+        EXPECT_EQ(interner.kind(pointee[0]), TypeKind::Struct);
+        EXPECT_EQ(interner.name(pointee[0]), "Tcl_ObjType");
+        // The DERIVED ABI layout: 48 bytes, typePtr (field 3) @ 24.
+        auto objLayout = computeLayout(tclObj->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(objLayout.has_value());
+        EXPECT_EQ(objLayout->size, 48u);
+        EXPECT_EQ(objLayout->fieldOffsets[3], 24u);   // typePtr @ 24 (the crux)
+        // Tcl_ObjType: `name` @ 0, 40 bytes.
+        ASSERT_EQ(objType->fields.size(), 5u);
+        EXPECT_EQ(objType->fields[0].name, "name");
+        auto otLayout = computeLayout(objType->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(otLayout.has_value());
+        EXPECT_EQ(otLayout->size, 40u);
+        EXPECT_EQ(otLayout->fieldOffsets[0], 0u);
+        // Option C identity: the Tcl_Obj / Tcl_ObjType TYPEDEFS and the structs-
+        // surface TAGS are the SAME interned type (define once, reference by name).
+        EXPECT_EQ(tclObj->typeId.v,  desc->typedefs[2].type.v);   // Tcl_Obj
+        EXPECT_EQ(objType->typeId.v, desc->typedefs[1].type.v);   // Tcl_ObjType
+    }
+
+    // C37 (D-FFI-TCL-DESCRIPTOR + Option C): the Tcl_ChannelType channel-driver vtable —
+    // the S0006 struct tclsqlite-ex.c needs for `static Tcl_ChannelType IncrblobChannelType
+    // = {...}` (a 15-element positional aggregate initializer, so the FULL layout is needed
+    // to type-check it — not lazily opaque). Pins the field names/types AND the DERIVED ABI
+    // layout, offsetof-verified vs /usr/include/tcl8.6/tcl.h: 136 bytes, 17 fields all
+    // 8-byte pointers (typeName ptr<char>@0, version @8, closeProc @16, wideSeekProc @112,
+    // threadActionProc @120, truncateProc @128). The 15 proc fields are OPAQUE ptr<void>
+    // (the initializer assigns real driver-function designators via the C33 fn-ptr->void*
+    // leniency). RED-ON-DISABLE: drop the struct → tclsqlite-ex.c S0006s on Tcl_ChannelType;
+    // change a field's slot → the offset pins fail.
+    {
+        ShippedStruct const* chan = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_ChannelType") chan = &s;
+        ASSERT_NE(chan, nullptr) << "missing Tcl_ChannelType struct (C37)";
+        ASSERT_EQ(chan->fields.size(), 17u);
+        EXPECT_EQ(chan->fields[0].name, "typeName");
+        EXPECT_EQ(interner.kind(chan->fields[0].type), TypeKind::Ptr);   // const char*
+        EXPECT_EQ(chan->fields[1].name, "version");
+        EXPECT_EQ(interner.kind(chan->fields[1].type), TypeKind::Ptr);   // opaque version ptr
+        EXPECT_EQ(chan->fields[2].name, "closeProc");
+        EXPECT_EQ(interner.kind(chan->fields[2].type), TypeKind::Ptr);   // opaque driver-proc
+        EXPECT_EQ(chan->fields[14].name, "wideSeekProc");
+        EXPECT_EQ(chan->fields[15].name, "threadActionProc");
+        EXPECT_EQ(chan->fields[16].name, "truncateProc");
+        EXPECT_EQ(interner.kind(chan->fields[16].type), TypeKind::Ptr);
+        // The DERIVED ABI layout (offsetof-verified vs tcl.h): 136 bytes, all 8-byte ptrs.
+        auto chanLayout = computeLayout(chan->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(chanLayout.has_value());
+        EXPECT_EQ(chanLayout->size, 136u);
+        EXPECT_EQ(chanLayout->fieldOffsets[1], 8u);     // version @ 8
+        EXPECT_EQ(chanLayout->fieldOffsets[2], 16u);    // closeProc @ 16
+        EXPECT_EQ(chanLayout->fieldOffsets[14], 112u);  // wideSeekProc @ 112
+        EXPECT_EQ(chanLayout->fieldOffsets[15], 120u);  // threadActionProc @ 120
+        EXPECT_EQ(chanLayout->fieldOffsets[16], 128u);  // truncateProc @ 128
+        // Option C identity: the Tcl_ChannelType typedef (index 18) and the structs-surface
+        // tag intern to ONE type (define once, reference by name — Tcl_CreateChannel's
+        // `const Tcl_ChannelType*` param spells it by name).
+        EXPECT_EQ(chan->typeId.v, desc->typedefs[18].type.v);
+    }
+
+    // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
+    {
+        auto const* s = sym("Tcl_CreateInterp");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_TRUE(interner.fnParams(s->signature).empty());
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::Ptr);
+    }
+    // Tcl_Eval: fn(Tcl_Interp*, char*) -> i32 — result + the string param.
+    {
+        auto const* s = sym("Tcl_Eval");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::I32);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 2u);
+        ASSERT_EQ(interner.kind(params[1]), TypeKind::Ptr);
+        auto const elem = interner.operands(params[1]);
+        ASSERT_EQ(elem.size(), 1u);
+        EXPECT_EQ(interner.kind(elem[0]), TypeKind::Char);
+    }
+    // Tcl_GetIntFromObj: fn(Tcl_Interp*, Tcl_Obj*, i32*) -> i32 — the int* out-param.
+    {
+        auto const* s = sym("Tcl_GetIntFromObj");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::I32);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 3u);
+        ASSERT_EQ(interner.kind(params[2]), TypeKind::Ptr);
+        auto const elem = interner.operands(params[2]);
+        ASSERT_EQ(elem.size(), 1u);
+        EXPECT_EQ(interner.kind(elem[0]), TypeKind::I32);
+    }
+    // Tcl_CreateObjCommand (C2): the FUNCTION-POINTER param (index 2) is the
+    // crux — a `ptr<fn(...)>` libtcl calls back into (the core testfixture
+    // command pattern). Pin the callback signature so a wrong/missing fn-ptr
+    // type fails loud (red-on-disable). This is the signal.json handler-pointer
+    // precedent applied to the TCL ObjCmdProc.
+    {
+        auto const* s = sym("Tcl_CreateObjCommand");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 5u);
+        // param[2] = Tcl_ObjCmdProc* : ptr<fn(void*, Tcl_Interp*, i32, Tcl_Obj**) -> i32>
+        ASSERT_EQ(interner.kind(params[2]), TypeKind::Ptr);
+        auto const callee = interner.operands(params[2]);
+        ASSERT_EQ(callee.size(), 1u);
+        ASSERT_EQ(interner.kind(callee[0]), TypeKind::FnSig);   // pointer-to-FUNCTION
+        EXPECT_EQ(interner.kind(interner.fnResult(callee[0])), TypeKind::I32);
+        auto const cbParams = interner.fnParams(callee[0]);
+        ASSERT_EQ(cbParams.size(), 4u);
+        EXPECT_EQ(interner.kind(cbParams[0]), TypeKind::Ptr);   // ClientData (void*)
+        EXPECT_EQ(interner.kind(cbParams[2]), TypeKind::I32);   // objc
+        ASSERT_EQ(interner.kind(cbParams[3]), TypeKind::Ptr);   // objv: Tcl_Obj**
+        auto const objvElem = interner.operands(cbParams[3]);
+        ASSERT_EQ(objvElem.size(), 1u);
+        EXPECT_EQ(interner.kind(objvElem[0]), TypeKind::Ptr);   // ptr<ptr<Tcl_Obj>>
+    }
+
+    // C4 PP-macros (TCL_OK/TCL_ERROR/TCL_STATIC/NULL) + the C7 `CONST` compat macro.
+    // tcl.h's `#define CONST const` is the OLD-Tcl objProc form used by 30 of the 44
+    // sqlite src/test*.c (`Tcl_Obj *CONST objv[]`) — the dominant test-TU parse
+    // blocker after the C6 extern-aggregate fix (16 TUs P0001'd 'expected ) got objv'
+    // on the unexpanded CONST). RED-ON-DISABLE: remove the CONST macro from tcl.json
+    // and both the presence check and the sawConst check below fail (and the
+    // shipped_tcl_constcmd example stops compiling).
+    {
+        auto hasMacro = [&](std::string_view name) {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return true;
+            return false;
+        };
+        for (auto const* n : {"TCL_OK", "TCL_ERROR", "TCL_STATIC", "NULL", "CONST"})
+            EXPECT_TRUE(hasMacro(n)) << "missing Tcl macro: " << n;
+        bool sawConst = false;
+        for (auto const& m : desc->macros) {
+            if (m.name == "CONST") {
+                sawConst = true;
+                EXPECT_EQ(m.replacement, "const");     // CONST -> const (the C7 fix)
+                EXPECT_FALSE(m.params.has_value());    // object-like macro
+            }
+        }
+        EXPECT_TRUE(sawConst) << "tcl.json must define the CONST compat macro";
+
+        // C28 (D-FFI-TCL-DESCRIPTOR): the 3 new object-macro constants test1.c uses —
+        // TCL_EVAL_DIRECT=0x040000 (Tcl_EvalObjEx flags @:25561), TCL_LEAVE_ERR_MSG=0x200
+        // (Tcl_GetVar2Ex flags @:29874), TCL_LINK_STRING=4 (Tcl_LinkVar type @:9404).
+        // Value-pinned (a wrong replacement fails loud here; the shipped_tcl_dstring
+        // example also value-checks them at runtime, returning 4/5/6 instead of 42).
+        auto macroRepl = [&](std::string_view name) -> std::string {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return m.replacement;
+            return "<absent>";
+        };
+        EXPECT_EQ(macroRepl("TCL_EVAL_DIRECT"), "262144");
+        EXPECT_EQ(macroRepl("TCL_LEAVE_ERR_MSG"), "512");
+        EXPECT_EQ(macroRepl("TCL_LINK_STRING"), "4");
+        // C37 (D-FFI-TCL-DESCRIPTOR): the 7 new object-macro constants tclsqlite-ex.c uses
+        // (tcl.h-exact, value-pinned so a wrong replacement fails loud) — the Tcl completion
+        // codes (used at TCL_BREAK/CONTINUE/RETURN sites), the channel-mode masks
+        // (TCL_READABLE|TCL_WRITABLE flags @ createIncrblobChannel), and TCL_CHANNEL_VERSION_5
+        // (the cast seeding the Tcl_ChannelType `version` field in the static initializer).
+        EXPECT_EQ(macroRepl("TCL_BREAK"),    "3");
+        EXPECT_EQ(macroRepl("TCL_CONTINUE"), "4");
+        EXPECT_EQ(macroRepl("TCL_RETURN"),   "2");
+        EXPECT_EQ(macroRepl("TCL_READABLE"), "(1<<1)");
+        EXPECT_EQ(macroRepl("TCL_WRITABLE"), "(1<<2)");
+        EXPECT_EQ(macroRepl("TCL_CLOSE_WRITE"), "(1<<2)");
+        EXPECT_EQ(macroRepl("TCL_CHANNEL_VERSION_5"), "((Tcl_ChannelTypeVersion) 0x5)");
+        // C37 tier 2: TCL_VERSION is a tcl.h string macro (nm -D ABSENT), reached via
+        // PACKAGE_VERSION expansion at the Tcl_PkgProvide site. Value-pinned (the C string
+        // literal "8.6", surrounding quotes included in the replacement text).
+        EXPECT_EQ(macroRepl("TCL_VERSION"), "\"8.6\"");
+    }
+}
+
 // MF-2: an unsigned constant at the TOP of its range (ULLONG_MAX) round-trips
 // losslessly — stored as the int64 BIT-PATTERN (UINT64_MAX reinterpreted == -1),
 // which the HIR fold re-reads as uint64. RED-ON-DISABLE: a naive get<int64_t>
@@ -1794,6 +2768,256 @@ TEST(ShippedLibDescriptor, RealWindowsExceptionRecordLayout) {
         << "the inline EXCEPTION_RECORD in EXCEPTION_POINTERS.ExceptionRecord "
            "must intern to the same TypeId as the standalone struct — the "
            "p->ExceptionRecord->member resolution depends on it";
+}
+
+// C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the REAL tcl.json hash cluster.
+// Pins the tcl8.6 LP64 layouts the SQLite testfixture hash API depends on
+// (offsetof-verified vs /usr/include/tcl8.6/tcl.h): Tcl_HashTable = 88B with
+// keyType@60 (the Tcl_GetHashKey macro reads tablePtr->keyType), Tcl_HashEntry =
+// 40B with clientData@24 (Tcl_Get/SetHashValue) + the key UNION @32, Tcl_HashSearch
+// = 24B, and the Tcl_HashKey UNION = 8B with every member overlaid at 0. RED-ON-DISABLE:
+// shift any hash field (e.g. staticBuckets → arr<u64,3>) → keyType@60 / sizeof fail.
+TEST(ShippedLibDescriptor, RealTclHashClusterLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const tclPath = shippedRoot / "tcl.json";
+    ASSERT_TRUE(fs::exists(tclPath)) << tclPath.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(tclPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    auto structNamed = [&](std::string_view n) -> ShippedStruct const* {
+        for (auto const& s : desc->structs) if (s.name == n) return &s;
+        return nullptr;
+    };
+    auto layoutOf = [&](TypeId t) {
+        return computeLayout(t, interner, kNatural16, DataModel::Lp64);
+    };
+
+    // Tcl_HashTable: 88B, keyType@60, findProc@64, typePtr@80.
+    auto const* ht = structNamed("Tcl_HashTable");
+    ASSERT_NE(ht, nullptr);
+    ASSERT_EQ(ht->fields.size(), 11u);
+    EXPECT_EQ(ht->fields[7].name, "keyType");
+    auto htL = layoutOf(ht->typeId);
+    ASSERT_TRUE(htL.has_value());
+    EXPECT_EQ(htL->size, 88u);
+    ASSERT_EQ(htL->fieldOffsets.size(), 11u);
+    EXPECT_EQ(htL->fieldOffsets[7], 60u) << "keyType@60 (Tcl_GetHashKey reads it)";
+    EXPECT_EQ(htL->fieldOffsets[8], 64u) << "findProc@64";
+    EXPECT_EQ(htL->fieldOffsets[10], 80u) << "typePtr@80";
+
+    // Tcl_HashEntry: 40B, clientData@24, key@32.
+    auto const* he = structNamed("Tcl_HashEntry");
+    ASSERT_NE(he, nullptr);
+    ASSERT_EQ(he->fields.size(), 5u);
+    EXPECT_EQ(he->fields[3].name, "clientData");
+    EXPECT_EQ(he->fields[4].name, "key");
+    auto heL = layoutOf(he->typeId);
+    ASSERT_TRUE(heL.has_value());
+    EXPECT_EQ(heL->size, 40u);
+    ASSERT_EQ(heL->fieldOffsets.size(), 5u);
+    EXPECT_EQ(heL->fieldOffsets[3], 24u) << "clientData@24 (Tcl_Get/SetHashValue)";
+    EXPECT_EQ(heL->fieldOffsets[4], 32u) << "the key union @32";
+
+    // Tcl_HashSearch: 24B.
+    auto const* hs = structNamed("Tcl_HashSearch");
+    ASSERT_NE(hs, nullptr);
+    auto hsL = layoutOf(hs->typeId);
+    ASSERT_TRUE(hsL.has_value());
+    EXPECT_EQ(hsL->size, 24u);
+
+    // The Tcl_HashKey UNION: 8B, every member @0; members present.
+    ASSERT_EQ(desc->unions.size(), 1u);
+    auto const& uk = desc->unions[0];
+    EXPECT_EQ(uk.name, "Tcl_HashKey");
+    EXPECT_EQ(interner.kind(uk.typeId), TypeKind::Union);
+    ASSERT_EQ(uk.fields.size(), 4u);
+    EXPECT_EQ(uk.fields[0].name, "oneWordValue");
+    EXPECT_EQ(uk.fields[1].name, "string");
+    auto ukL = layoutOf(uk.typeId);
+    ASSERT_TRUE(ukL.has_value());
+    EXPECT_EQ(ukL->size, 8u) << "max(ptr,ptr,arr<i32,1>,ptr) = 8";
+    for (auto off : ukL->fieldOffsets)
+        EXPECT_EQ(off, 0u) << "union members overlay at offset 0";
+
+    // Tcl_HashEntry.key resolves (BY NAME) to the SAME union TypeId — the member
+    // scope injected on that union is what makes `h->key.oneWordValue` resolve.
+    EXPECT_EQ(he->fields[4].type, uk.typeId)
+        << "Tcl_HashEntry.key must intern to the Tcl_HashKey union TypeId";
+}
+
+// TF-C39 (D-FFI-ZLIB-DESCRIPTOR, SQLite testfixture-link arc 2026-07-21): the REAL
+// zlib.json. SQLite ext/misc/zipfile.c `#include <zlib.h>` and round-trips ZIP entry
+// payloads through raw deflate; this pins the seed descriptor STRUCTURALLY against
+// the config file so a malformed edit / wrong SONAME / shifted field fails loud here
+// — always-on on every leg (no libz needed to READ the descriptor; the RUN witness
+// is examples/c-subset/zlib_roundtrip, linux-only). z_stream is 14 fields / 112 bytes
+// on LP64, offsetof-verified vs /usr/include/zlib.h 1.3 (NOT 15 fields — the real
+// z_stream_s has 14 members) — a wrong offset would be a silent runtime miscompile
+// (the C37 Tcl_ChannelType lesson), so the KEY offsets are byte-pinned. The
+// eager-import safety invariant is pinned too: deflateInit2/inflateInit2 are function
+// MACROS (nm -D ABSENT from libz — they wrap the `_` forms), so they must be `macros`,
+// NEVER symbols (a function-row would plant an undefined import and break every zlib
+// binary's LOAD 127, the tcl.json Tcl_IsShared precedent); the exported `_` forms ARE
+// the symbols.
+//
+// RED-ON-DISABLE: change zlib.json's elf `library` off "libz.so.1" → the library pin
+// fails; shift a z_stream field (e.g. total_in → i32) → the offset/size pin fails;
+// move deflateInit2 from `macros` to `symbols` → the macro/symbol split pin fails.
+TEST(ShippedLibDescriptor, RealZlibDescriptorLayoutAndLinkSurface) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "zlib.json";
+    ASSERT_TRUE(fs::exists(path)) << "zlib.json not found at " << path.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Decode for the elf x86_64 LP64 target (zlib.json is elf/macho; LP64 on both,
+    // so the layout is identical — no variants).
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                         std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    // Provenance + the DT_NEEDED-driving link targets.
+    EXPECT_EQ(desc->header, "zlib.h");
+    ASSERT_EQ(desc->library.count("elf"), 1u);
+    EXPECT_EQ(desc->library.at("elf"), "libz.so.1");            // zlib SONAME
+    ASSERT_EQ(desc->library.count("macho"), 1u);
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libz.1.dylib");   // macOS install name
+    // Per-format gate: elf + macho available, pe NOT (a pe <zlib.h> fails loud — the
+    // sys-mman.json precedent; witnessed by no pe run arm on the example).
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::MachO));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats, ObjectFormatKind::Pe));
+
+    // ── z_stream layout: 14 fields / 112 bytes, offsetof-verified vs zlib.h ──
+    ShippedStruct const* zs = nullptr;
+    for (auto const& s : desc->structs) if (s.name == "z_stream") zs = &s;
+    ASSERT_NE(zs, nullptr) << "z_stream struct absent from zlib.json";
+    ASSERT_EQ(zs->fields.size(), 14u) << "z_stream has 14 members (NOT 15)";
+    // field names in ABI order (a rename/reorder here would misresolve `str.next_in`).
+    EXPECT_EQ(zs->fields[0].name,  "next_in");
+    EXPECT_EQ(zs->fields[1].name,  "avail_in");
+    EXPECT_EQ(zs->fields[2].name,  "total_in");
+    EXPECT_EQ(zs->fields[3].name,  "next_out");
+    EXPECT_EQ(zs->fields[4].name,  "avail_out");
+    EXPECT_EQ(zs->fields[5].name,  "total_out");
+    EXPECT_EQ(zs->fields[10].name, "opaque");
+    EXPECT_EQ(zs->fields[11].name, "data_type");
+    EXPECT_EQ(zs->fields[12].name, "adler");
+    EXPECT_EQ(zs->fields[13].name, "reserved");
+    auto const zsL = computeLayout(zs->typeId, interner, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(zsL.has_value());
+    EXPECT_EQ(zsL->size, 112u) << "sizeof(z_stream) LP64 (deflateInit2_ rejects a wrong size)";
+    ASSERT_EQ(zsL->fieldOffsets.size(), 14u);
+    EXPECT_EQ(zsL->fieldOffsets[0],  0u)   << "next_in@0";
+    EXPECT_EQ(zsL->fieldOffsets[1],  8u)   << "avail_in@8";
+    EXPECT_EQ(zsL->fieldOffsets[2],  16u)  << "total_in@16 (pad after avail_in)";
+    EXPECT_EQ(zsL->fieldOffsets[3],  24u)  << "next_out@24";
+    EXPECT_EQ(zsL->fieldOffsets[5],  40u)  << "total_out@40 (pad after avail_out)";
+    EXPECT_EQ(zsL->fieldOffsets[10], 80u)  << "opaque@80";
+    EXPECT_EQ(zsL->fieldOffsets[11], 88u)  << "data_type@88";
+    EXPECT_EQ(zsL->fieldOffsets[12], 96u)  << "adler@96 (pad after data_type)";
+    EXPECT_EQ(zsL->fieldOffsets[13], 104u) << "reserved@104";
+
+    // zalloc/zfree are FUNCTION POINTERS (alloc_func/free_func — the tcl.json
+    // driver-proc-field precedent), NOT lazily-opaque void*.
+    EXPECT_EQ(zs->fields[8].name, "zalloc");
+    ASSERT_EQ(interner.kind(zs->fields[8].type), TypeKind::Ptr);
+    auto const zallocPointee = interner.operands(zs->fields[8].type);
+    ASSERT_EQ(zallocPointee.size(), 1u);
+    EXPECT_EQ(interner.kind(zallocPointee[0]), TypeKind::FnSig) << "zalloc = alloc_func fn-ptr";
+
+    // ── link surface: exactly 9 exported functions; the two Init2 are MACROS ──
+    auto sym = [&](std::string_view name) -> ShippedSymbol const* {
+        for (auto const& s : desc->symbols) if (s.name == name) return &s;
+        return nullptr;
+    };
+    ASSERT_EQ(desc->symbols.size(), 9u);
+    for (auto const* n : {"zlibVersion", "deflate", "deflateEnd", "deflateBound",
+                          "deflateInit2_", "inflate", "inflateEnd", "inflateInit2_",
+                          "crc32"})
+        EXPECT_NE(sym(n), nullptr) << "missing zlib symbol: " << n;
+    // THE eager-import safety split: deflateInit2/inflateInit2 are NOT libz exports
+    // (nm -D ABSENT — they are function-macros over the `_` forms). A function-row
+    // would plant an undefined import and break every zlib binary's LOAD (exit 127,
+    // the C9 refcount / tcl.json Tcl_IsShared precedent). They ship as `macros`;
+    // the exported `_` forms above ARE the symbols.
+    EXPECT_EQ(sym("deflateInit2"), nullptr) << "deflateInit2 is a macro, not a symbol";
+    EXPECT_EQ(sym("inflateInit2"), nullptr) << "inflateInit2 is a macro, not a symbol";
+
+    // crc32 shape: uLong crc32(uLong, const Bytef*, uInt) → fn(u64, ptr<u8>, u32) -> u64.
+    {
+        auto const* s = sym("crc32");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::U64);
+        auto const ps = interner.fnParams(s->signature);
+        ASSERT_EQ(ps.size(), 3u);
+        EXPECT_EQ(interner.kind(ps[0]), TypeKind::U64);   // uLong crc
+        ASSERT_EQ(interner.kind(ps[1]), TypeKind::Ptr);   // const Bytef*
+        auto const bufPointee = interner.operands(ps[1]);
+        ASSERT_EQ(bufPointee.size(), 1u);
+        EXPECT_EQ(interner.kind(bufPointee[0]), TypeKind::U8);
+        EXPECT_EQ(interner.kind(ps[2]), TypeKind::U32);   // uInt len
+    }
+
+    // ── macros: the two function-macros (arity-pinned) + ZLIB_VERSION + Z_* values ──
+    auto macro = [&](std::string_view name) -> ShippedMacro const* {
+        for (auto const& m : desc->macros) if (m.name == name) return &m;
+        return nullptr;
+    };
+    {
+        auto const* di2 = macro("deflateInit2");
+        ASSERT_NE(di2, nullptr) << "deflateInit2 must be present as a macro";
+        ASSERT_TRUE(di2->params.has_value());
+        EXPECT_EQ(di2->params->size(), 6u);   // strm,level,method,windowBits,memLevel,strategy
+        auto const* ii2 = macro("inflateInit2");
+        ASSERT_NE(ii2, nullptr) << "inflateInit2 must be present as a macro";
+        ASSERT_TRUE(ii2->params.has_value());
+        EXPECT_EQ(ii2->params->size(), 2u);   // strm,windowBits
+    }
+    auto macroRepl = [&](std::string_view name) -> std::string {
+        for (auto const& m : desc->macros) if (m.name == name) return m.replacement;
+        return "<absent>";
+    };
+    EXPECT_EQ(macroRepl("ZLIB_VERSION"),       "\"1.3\"");   // deflateInit2_ major-version check
+    EXPECT_EQ(macroRepl("Z_OK"),               "0");
+    EXPECT_EQ(macroRepl("Z_STREAM_END"),       "1");
+    EXPECT_EQ(macroRepl("Z_NO_FLUSH"),         "0");
+    EXPECT_EQ(macroRepl("Z_FINISH"),           "4");
+    EXPECT_EQ(macroRepl("Z_DEFLATED"),         "8");
+    EXPECT_EQ(macroRepl("Z_DEFAULT_STRATEGY"), "0");
+
+    // ── typedefs: Byte/Bytef = u8 (zipfile.c casts (Byte*)/(Bytef*)); z_streamp is
+    // ptr<z_stream> resolved BY NAME (Option C) to the SAME interned struct. ──
+    auto typedefKind = [&](std::string_view name) -> std::optional<TypeKind> {
+        for (auto const& t : desc->typedefs) if (t.name == name) return interner.kind(t.type);
+        return std::nullopt;
+    };
+    ASSERT_TRUE(typedefKind("Byte").has_value());
+    EXPECT_EQ(*typedefKind("Byte"), TypeKind::U8);
+    ASSERT_TRUE(typedefKind("Bytef").has_value());
+    EXPECT_EQ(*typedefKind("Bytef"), TypeKind::U8);
+    TypeId zStreamP{};
+    for (auto const& t : desc->typedefs) if (t.name == "z_streamp") zStreamP = t.type;
+    ASSERT_TRUE(zStreamP.valid()) << "z_streamp typedef absent";
+    ASSERT_EQ(interner.kind(zStreamP), TypeKind::Ptr);
+    auto const spPointee = interner.operands(zStreamP);
+    ASSERT_EQ(spPointee.size(), 1u);
+    EXPECT_EQ(spPointee[0], zs->typeId)
+        << "z_streamp must point at the ONE interned z_stream (Option C by-name)";
 }
 
 // c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
@@ -3101,6 +4325,56 @@ TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
     errnoAccessors(ObjectFormatKind::Elf, pe, el);
     EXPECT_FALSE(pe);
     EXPECT_TRUE(el);
+}
+
+// SQLite testfixture test_syscall.c: errno.json ships ENOMEM + EDEADLK as REAL
+// constants the test_syscall.c error-name map consumes. ENOMEM AGREES across all
+// three formats (12 — flat, in the low block); EDEADLK DIVERGES (elf 35 / macho
+// 11 / pe 36 — Linux asm-generic/errno.h vs Darwin sys/errno.h vs ucrt errno.h),
+// so it carries per-format `variants` that must decode to the ACTIVE format's
+// number. RED-ON-DISABLE: remove ENOMEM (or either EDEADLK variant), or perturb a
+// value, and the matching per-format EXPECT below fails — a wrong errno number is
+// a silent interop miscompile in the test corpus.
+TEST(ShippedLibDescriptor, RealErrnoEnomemEdeadlkPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto constFor = [&](ObjectFormatKind fmt, char const* name,
+                        std::int64_t& valueOut, TypeKind& kindOut) -> bool {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "errno.json", interner, typeReg, fmt);
+        if (!desc) return false;
+        for (auto const& c : desc->constants) {
+            if (c.name == name) {
+                valueOut = c.value;
+                kindOut  = interner.kind(c.type);
+                return true;
+            }
+        }
+        return false;
+    };
+    struct Case { ObjectFormatKind fmt; char const* name; std::int64_t edeadlk; };
+    Case const cases[] = {
+        { ObjectFormatKind::Elf,   "elf",   35 },
+        { ObjectFormatKind::MachO, "macho", 11 },
+        { ObjectFormatKind::Pe,    "pe",    36 },
+    };
+    for (auto const& tc : cases) {
+        std::int64_t v = -1;
+        TypeKind     k = TypeKind::Void;
+        // ENOMEM: flat, 12 on every format.
+        ASSERT_TRUE(constFor(tc.fmt, "ENOMEM", v, k))
+            << "ENOMEM missing for format " << tc.name;
+        EXPECT_EQ(v, 12) << "ENOMEM for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "ENOMEM type for " << tc.name;
+        // EDEADLK: per-format variant.
+        v = -1;
+        k = TypeKind::Void;
+        ASSERT_TRUE(constFor(tc.fmt, "EDEADLK", v, k))
+            << "EDEADLK missing for format " << tc.name;
+        EXPECT_EQ(v, tc.edeadlk) << "EDEADLK for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "EDEADLK type for " << tc.name;
+    }
 }
 
 // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): windows.json models ULARGE_INTEGER as an

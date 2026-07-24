@@ -1891,6 +1891,26 @@ enum class RelocFormulaKind : std::uint8_t {
     //   lo12 word reuses Aarch64AddAbsLo12 verbatim (same formula,
     //   distinct tls-flagged KIND row on the target).
     Aarch64TprelAddHi12   = 4,
+    // ARM64 R_AARCH64_ADR_GOT_PAGE (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+    // TF-C52): the ADRP word of the `adrp x,:got:sym` + `ldr x,
+    // [x,:got_lo12:sym]` GOT-address macro — materializes an undefined-
+    // extern's address as a live code-form VALUE so a foreign default-PIE
+    // link accepts it (an absolute ADR_PREL_PG_HI21 against a preemptible
+    // symbol is rejected "when making a shared object"). Emitted ONLY into
+    // an ELF relocatable `.o` / static-archive member, which is linked by
+    // a FOREIGN toolchain (gcc/clang) — DSS itself NEVER applies this
+    // reloc (no DSS-apply consumer: the exec path uses copy-relocation,
+    // the PIE path the c117 DSS-local slot). So the `applyExecRelocations`
+    // kernel arm is an EXPLICIT FAIL-LOUD REFUSAL, not an S/A/P formula.
+    // Declaring it a real (non-Linear) kind is what keeps the ET_DYN
+    // slide-safe classifier from mis-treating it as a Linear-absolute-in-
+    // `.text` fixup (D-LK-DYN-TEXT-ABS-RELOC keys `formulaKind == Linear`).
+    Aarch64AdrGotPage     = 5,
+    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-
+    // GOT, TF-C52): the LDR word of the same GOT-address macro (the
+    // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
+    // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
+    Aarch64Ld64GotLo12    = 6,
 };
 
 // Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
@@ -1899,12 +1919,14 @@ enum class RelocFormulaKind : std::uint8_t {
 // on size catches forgetting one half. (architect + type-design
 // 4-agent convergence at post-fold #2 — was previously 3 independent
 // hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
-inline constexpr EnumNameTable<RelocFormulaKind, 5> kRelocFormulaTable{{{
+inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
     { RelocFormulaKind::Linear,               "linear" },
     { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
     { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
     { RelocFormulaKind::Aarch64AddAbsLo12,    "aarch64_add_abs_lo12" },
     { RelocFormulaKind::Aarch64TprelAddHi12,  "aarch64_tprel_add_hi12" },
+    { RelocFormulaKind::Aarch64AdrGotPage,    "aarch64_adr_got_page" },
+    { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
 }}};
 
 [[nodiscard]] DSS_EXPORT std::string_view
@@ -2550,6 +2572,16 @@ struct DSS_EXPORT TargetSchemaData {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
 
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): whether bare `char`
+    // (the distinct `TypeKind::Char`, NOT `signed char`/`unsigned char`) is an
+    // UNSIGNED type on this target. Config-driven, NOT an arch identity branch:
+    // the AArch64 ABI mandates unsigned bare `char`, while x86_64/pe64 use
+    // signed — so `arm64.target.json` declares `"charIsUnsigned": true` and the
+    // x86_64 descriptor omits it. Default false = signed (the C-common default
+    // that keeps x86_64/pe64 byte-identical). Consumed by HIR→MIR lowering (the
+    // char→int promotion's SExt-vs-ZExt decision) via `MirLoweringConfig`.
+    bool charIsUnsigned = false;
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
     // a target without it (arm64 until TLS C2) cannot lay out a TLS
@@ -2804,6 +2836,15 @@ public:
     }
     [[nodiscard]] bool aggregateLayoutLoaded() const noexcept {
         return d_.aggregateLayoutLoaded;
+    }
+
+    // ── Bare-char signedness (TF-C56, D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) ──
+    // True iff bare `char` is an UNSIGNED type on this target (the AArch64 ABI
+    // rule), false = signed (x86_64/pe64; the default). Threaded into
+    // `MirLoweringConfig.charIsUnsigned` so the char→int promotion picks
+    // ZExt (unsigned) vs SExt (signed) with NO arch identity branch.
+    [[nodiscard]] bool charIsUnsigned() const noexcept {
+        return d_.charIsUnsigned;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-LIST-VAR-DESCRIPTORS (SQLite testfixture arc, TF-C43): RUN witness for the three Tcl 8.6 API functions added to tcl.json so the last two testfixture TUs compile -- ext/fts5/fts5_tcl.c (Tcl_SetVar2Ex + Tcl_SplitList) and ext/rtree/test_rtreedoc.c (Tcl_ListObjReplace); all were absent -> S0001. Signatures modeled faithfully from tcl8.6/tclDecls.h reusing proven tcl.json pointer shapes (triple ptr<ptr<ptr<char>>> mirrors Tcl_ListObjGetElements; Tcl_Obj*const objv[] -> ptr<ptr<Tcl_Obj>> as in Tcl_NewListObj). All three exported by libtcl8.6.so (nm -D verified; eager-import law holds). Exercises each against a live interp, value-divergent: Tcl_SplitList('aa bb cc dd') -> argc==4; Tcl_SetVar2Ex/$x=38 read back via Tcl_GetVar2Ex==38; Tcl_ListObjReplace deletes 3 from index 1 of {0 1 2 3 4} -> length 2. exit = xi+argc = 38+4 = 42. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 runs it (libtcl8.6). RED-ON-DISABLE: remove any of the three tcl.json entries -> S0001 at its call site -> this example stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-list-ops-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-list-ops-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

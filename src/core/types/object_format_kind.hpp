@@ -176,6 +176,59 @@ dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
 }
 
+// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-
+//     ADDR-PIE-GOT, TF-C52) ───────────────────────────────────────
+//
+// How code MATERIALIZES the ADDRESS of an undefined/preemptible extern
+// (function OR data) as a LIVE code-form VALUE — an argument, an
+// initializer of an automatic, a returned function pointer: any use
+// that is NOT a call (that folds to a direct branch) and NOT a
+// static-data-item initializer (a separate abs64 data reloc). A
+// property of the OBJECT FORMAT's link contract, exactly like
+// `ExternCallDispatch` / `DataImportBinding` above.
+//
+//   * `got` (ELF relocatable / static-archive member): materialize the
+//     address THROUGH a GOT slot the FINAL (foreign) linker synthesizes
+//     — arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,
+//     [x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). A relocatable
+//     `.o`/`.a` is linked by a foreign default-PIE toolchain (gcc/clang
+//     with no `-no-pie`): an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 +
+//     ADD_ABS_LO12_NC) against a symbol that may bind externally is
+//     REJECTED ("relocation ... which may bind externally can not be
+//     used when making a shared object"). The GOT indirection is what
+//     gcc/clang themselves emit for `&extern` in a default-PIE `.o`, so
+//     it links cleanly. Distinct from `DataImportBinding::GotIndirect`
+//     (the Mach-O __got model, a DSS-resolved lea-of-slot + deref): here
+//     the FOREIGN linker owns the slot, reached via the arm64 GOT-page
+//     relocs, not a DSS-local slot.
+//
+// A format that declares NO `externAddrBinding` materializes an
+// `&extern` value via the ordinary lea (an absolute page-pair on arm64;
+// a PC-relative rel32 on x86_64 — already foreign-PIE-safe there). The
+// DSS-linked EXEC formats never declare it (they use
+// `dataImportBinding: "copy-relocation"` for data + a direct address for
+// functions); the PIE/dyn formats use the c117 DSS-local-slot path. Only
+// the arm64 relocatable + static-archive formats declare `got`. Consumed
+// by MIR→LIR `lowerGlobalAddr` (the value-form arm, keyed on the
+// derived symbol set — never a format/arch identity branch). An unknown
+// VALUE fails loud at load (the closed-enum check).
+enum class ExternAddrBinding : std::uint8_t {
+    Got = 1,  // ELF relocatable: address via a foreign-linker GOT slot
+};
+
+inline constexpr EnumNameTable<ExternAddrBinding, 1> kExternAddrBindingTable{{{
+    { ExternAddrBinding::Got, "got" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+externAddrBindingName(ExternAddrBinding b) noexcept {
+    return kExternAddrBindingTable.name(b);
+}
+[[nodiscard]] constexpr std::optional<ExternAddrBinding>
+externAddrBindingFromName(std::string_view s) noexcept {
+    return kExternAddrBindingTable.fromName(s);
+}
+
 // ── Thread-local access model (D-CSUBSET-THREAD-LOCAL, TLS C1) ─────
 //
 // HOW code reaches a thread-local object's per-thread copy — a property

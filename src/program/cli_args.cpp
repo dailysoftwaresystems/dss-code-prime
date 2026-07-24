@@ -130,6 +130,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::EmptyFilename:       return "EmptyFilename";
         case CliArgsError::UnexpectedPositional: return "UnexpectedPositional";
         case CliArgsError::InvalidDefine:        return "InvalidDefine";
+        case CliArgsError::InvalidJobs:          return "InvalidJobs";
     }
     return "Unknown";
 }
@@ -177,6 +178,10 @@ std::string cliHelpText() {
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
+        "  --jobs <N>             per-CU build parallelism "
+            "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
+            "Only the multi-source build parallelizes; the `=`-form is "
+            "also accepted.\n"
         "  --resolve-library <path>  read a binary's (.so/.dll/.dylib) "
             "export table to resolve + validate this build's externs "
             "against it (repeatable; typically a DSS-built library)\n"
@@ -483,6 +488,33 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // `-I<dir>` / `-I <dir>` / `--include-dir <dir>` / `--include-dir=<dir>`
+            // (repeatable): the C quote-include search path (gcc/clang's `-I`).
+            // Each dir is threaded to every CU's include dirs (searched AFTER the
+            // including file's own directory, C 6.10.2 quote form). The attached
+            // `-I<dir>` form is what real build recipes emit (SQLite's testfixture
+            // uses `-I.`); the spaced + long forms round it out. Structural only
+            // here (a non-empty dir); a nonexistent dir is NOT an error (gcc
+            // parity — it simply contributes no hits, and a genuinely-missing
+            // header still fails loud P0016 downstream).
+            if (a == "-I") {                                   // -I <dir> (space)
+                auto v = takeFlagValue(a, i, argc, argv);
+                if (!v) return std::unexpected(v.error());
+                out.includeDirs.push_back(std::move(*v));
+                continue;
+            }
+            if (a.size() > 2 && a.substr(0, 2) == "-I") {       // -I<dir> (attached)
+                out.includeDirs.push_back(std::string{a.substr(2)});
+                continue;
+            }
+            auto m = valueFlag(a, i, "--include-dir");          // --include-dir <dir>/=<dir>
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                out.includeDirs.push_back(std::move(**m));
+                continue;
+            }
+        }
+        {
             // c162 (D-FF1-READER-CONSUMER): `--resolve-library <path>`
             // (repeatable). Names a binary whose export surface resolves
             // this build's source-declared externs. Structural check only
@@ -532,6 +564,29 @@ parseCliArgs(int argc, char* argv[]) {
         if (a == "--time") {
             out.time = true;
             continue;
+        }
+        {
+            // D-PERF-4-CU-PARALLELISM: `--jobs N` / `--jobs=N` — worker count for
+            // the per-CU build pool. Must be a positive integer (>= 1); a non-
+            // numeric value, trailing junk, or 0 fails loud (InvalidJobs) rather
+            // than silently falling back to auto (which would mask a typo'd -j).
+            auto m = valueFlag(a, i, "--jobs");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                unsigned n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                if (ec != std::errc{} || p != v.data() + v.size() || n == 0) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidJobs,
+                        std::string{"--jobs: '"} + v
+                        + "' is not a positive integer worker count "
+                          "(e.g. --jobs 4; use --jobs 1 for a serial build)"));
+                }
+                out.jobs = n;
+                continue;
+            }
         }
         {
             auto m = valueFlag(a, i, "--suppress");
@@ -602,6 +657,7 @@ parseCliArgs(int argc, char* argv[]) {
          || !out.resolveLibraries.empty()  // c162 (D-FF1-READER-CONSUMER)
          || out.warningsAsErrors
          || out.time
+         || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {

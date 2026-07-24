@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL: a file-scope TENTATIVE definition (no initializer) FOLLOWING an `extern` declaration of the same name must still emit ZERO-INITIALIZED storage (C 6.9.2p2). Pre-fix the extern survived the merge -> an import + no storage -> undefined symbol -> link failure (the extern-in-header-then-define-in-.c pattern; the sqlite full-source `undefined reference to sqlite3BuiltinFunctions` exposed it, the amalgamation masked it). Distinct from extern_definition_merge (extern + INITIALIZED def = rank 1->3, already worked); this is the tentative case (rank 1->2). A struct + an int global, extern-first then tentative, zero-init observable + storage required: 20+21+1 = 42. RED-ON-DISABLE: revert the defining-rank comparison -> extern survives -> import + no storage -> link fails -> the runner reports a failure, not exit 42. The release arm re-witnesses under the shipped pipeline (the tentative globals must survive DCE as addressed storage).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

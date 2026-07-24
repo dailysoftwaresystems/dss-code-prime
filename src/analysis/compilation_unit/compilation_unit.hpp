@@ -304,6 +304,12 @@ private:
     struct TreeParseSidecar {
         std::vector<AmbiguousTypeNameCandidate> candidates;
         std::vector<std::string>                globalTypeNames;
+        // The tree's own global TYPE bindings with their name-token spans —
+        // the oracle's self-definition guard (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-
+        // NAME): a candidate whose (name, span) matches one of THIS tree's
+        // bindings is a typedef's own defining occurrence (C 6.2.1p7) and is
+        // not seeded for that tree's reparse.
+        std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
         std::shared_ptr<SourceBuffer>           source;   // null for addTree trees
         std::shared_ptr<GrammarSchema const>    schema;   // null for addTree trees
         // FC13: when the file went through the C preprocessor, `source` is the

@@ -61,6 +61,36 @@ namespace detail::type_rules {
     }
 }
 
+// C 6.2.5p15 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): the THREE character
+// types — plain `char` (interned as the distinct TypeKind::Char), `signed char`
+// (the 1-byte signed int I8), and `unsigned char` (the 1-byte unsigned int U8).
+// A string literal may initialize an array of ANY of them (C 6.7.9p14). DSS
+// interns the two 1-byte int types as I8/U8 and plain `char` as Char, so the
+// character-type set is exactly {Char, I8, U8}.
+[[nodiscard]] inline constexpr bool isCharacterType(TypeKind k) noexcept {
+    return k == TypeKind::Char || k == TypeKind::I8 || k == TypeKind::U8;
+}
+
+// C 6.7.9p14: may a `<rhsElem>[M]` string-literal array initialize a
+// `<lhsElem>[N]` array slot (element-type compatibility only; the caller checks
+// the N >= M length fit and the string-literal shape)? Two admissible shapes:
+// (1) SAME element kind on both sides — the exact-kind path carrying a WIDE
+// literal (`wchar_t buf[N]=L"…"`, `char16_t[N]=u"…"`) into its matching wide
+// array, and the plain `char[N]="…"` case; (2) a NARROW string literal (element
+// Char) into an array of ANY character type (char / signed char / unsigned
+// char) — `unsigned char z[N]="…"`, `signed char s[N]="…"` (C 6.2.5p15). A wide
+// rhs into a DIFFERENT-kind lhs, or a narrow rhs into a NON-character lhs
+// (`int[N]="…"`), satisfies NEITHER shape → a loud reject. Used in LOCKSTEP by
+// isAssignable (the semantic admit), the cst_to_hir coerce() realize arm (which
+// retypes the literal node to the lhs type so the post-coerce verifier sees an
+// exact match), and asm.cpp's char-array producer (via isCharacterType) — a
+// divergence between the three is a silent miscompile.
+[[nodiscard]] inline constexpr bool stringLiteralArrayInitCompatible(
+    TypeKind lhsElem, TypeKind rhsElem) noexcept {
+    return lhsElem == rhsElem
+        || (rhsElem == TypeKind::Char && isCharacterType(lhsElem));
+}
+
 } // namespace detail::type_rules
 
 // Arithmetic = any integer (signed/unsigned) or float type. Bool/Char/
@@ -153,6 +183,17 @@ namespace detail::type_rules {
 // in all three), so `double d = ptr;` / `int n = aStruct;` stay rejected. Mirrors
 // the charConvertsToArith / intCrossSignednessConverts gates; completes the C
 // arithmetic-conversion matrix. Closes D-CSUBSET-INT-FLOAT-CONVERSION.
+// `floatSameKindNarrows` (default false): admit a WIDER floating type NARROWING into
+// a NARROWER floating lhs (`float f = aDouble;` — F64→F32; F80/F128→F64/F32) — C
+// 6.3.1.4 / 6.5.16.1, an implicit precision-lossy conversion (the value is the nearest
+// representable; gcc's off-by-default `-Wconversion`). WIDENING (rank(rhs) <= rank(lhs),
+// e.g. F32→F64) is admitted UNCONDITIONALLY by the float rank arm above; only narrowing
+// (rank(rhs) > rank(lhs)) is newly gated here. The HIR `coerce()` arithmetic-core arm
+// materializes the width-exact Cast (MIR `FPTrunc` — the SAME makeCast path F32→F64
+// widening already uses, so NO codegen change), so the post-coerce verifier (gate
+// default false) stays strict. The float-ladder MIRROR of `intSameSignednessNarrows`;
+// float→int stays the separate `floatConvertsToInt` policy (this gate is float→float
+// ONLY). Closes D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING.
 // `charArrayFromStringLiteralInit` (default false): admit `char[N] <- char[M]`
 // (N >= M, char element on BOTH sides) — C 6.7.9p14: a string literal initializing
 // a character array zero-fills the trailing N−M bytes (`char x[7] = "hi";`, the
@@ -179,8 +220,23 @@ namespace detail::type_rules {
     bool                                               intSameSignednessNarrows = false,
     bool                                               intConvertsToFloat = false,
     bool                                               floatConvertsToInt = false,
+    bool                                               floatSameKindNarrows = false,
     bool                                               charArrayFromStringLiteralInit = false,
-    bool                                               bitIntConversions = false) noexcept {
+    bool                                               bitIntConversions = false,
+    bool                                               scalarConvertsToBool = false,
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
+    // `Ptr<B>` where BOTH pointees A,B are integer kinds AND
+    // `interner.sameRepresentation(A,B)` — the shipped-FFI-descriptor abstract
+    // width-based `ptr<i64>` accepting a real C `long long*`/`sqlite3_int64*`/
+    // `long*`(LP64) whose pointee is same-REPRESENTATION but distinct-IDENTITY (the
+    // `_Generic`-splitting NAME differs; the bits do not). Passed `true` ONLY by
+    // `checkCallAgainstSig` at a shipped-descriptor DIRECT call-arg (the boundary the
+    // config gate scopes it to — never native C-to-C, never init/assign/return, never
+    // the fn-pointer/indirect paths). Per-target by construction: on LLP64 `long` is
+    // I32 so `long*` vs `ptr<i64>` FAILS `sameRepresentation`'s kind axis → still
+    // rejected, NO format branch. Identity is UNTOUCHED — this is a COMPAT admission
+    // that the coerce() Ptr→Ptr bitcast realizes, never a TypeId merge.
+    bool                                               ffiDescriptorPointeeIntCompat = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -226,7 +282,17 @@ namespace detail::type_rules {
         return intSameSignednessNarrows;          // narrowing: C 6.3.1.3, gated
     }
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
-        return floatRank(rk) <= floatRank(lk);
+        if (floatRank(rk) <= floatRank(lk)) return true;  // widening (F32→F64): always
+        // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING): a WIDER float
+        // narrows to a NARROWER float (`float f = aDouble;`, F80/F128→F64/F32) —
+        // implicit, precision-lossy (gcc's off-by-default `-Wconversion`), value the
+        // nearest representable. Gated on `floatSameKindNarrows`; the HIR `coerce()`
+        // arithmetic-core arm materializes the width-exact Cast (MIR `FPTrunc`, the
+        // SAME makeCast path F32→F64 widening already uses), so the post-coerce verifier
+        // (gate default false) stays strict. The mirror of `intSameSignednessNarrows`
+        // for the single float rank ladder. float→int stays the separate
+        // `floatConvertsToInt` policy (this arm is float→float ONLY).
+        return floatSameKindNarrows;   // narrowing (F64→F32, …): gated
     }
     // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7/§6.5.16.1, D8): a real OR a
     // differently-elemented complex is assignable INTO a complex lhs — real->complex
@@ -273,26 +339,46 @@ namespace detail::type_rules {
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
         return true;
     }
-    // A Bool value WIDENS into any arithmetic slot (C99 6.3.1.2 — `_Bool`
-    // promotes to `int`; a comparison/logical result `Bool` flowing into an
-    // int/float lhs, e.g. `int f(){ return a < b; }`, `int x = a && b;`).
-    // The complete semantic-tier expression typer (`subtreeType`) now types
-    // `a < b` as Bool, so this check actually runs; admitting it makes the
-    // semantic tier AGREE with the HIR `coerce()` (which materializes the
-    // Bool→int Cast). Gated on `boolWidensToArith` so ONLY the pre-coerce
-    // semantic checks admit it — the post-coerce verifier stays strict. This
-    // is the ASSIGNMENT direction only — `Bool` stays out of `isArithmetic`
-    // (above), so binary PROMOTION (`bool + bool`) is unaffected. c48
-    // (D-CSUBSET-BOOL-CHAR-WIDENING): when `charConvertsToArith` also treats
-    // `char` (interned as `TypeKind::Char`, outside the int RANKS) as an
-    // arithmetic slot, a Bool widens into a `char` lhs too — `char c = (a==b);`,
-    // the sqlite `p->nFloor = (p->D==31)` shape. Arithmetic `char = a-b` already
-    // worked via the `charConvertsToArith` arm below (int→char); only the
-    // Bool-RESULT (comparison/logical) flowing into a plain `char` was missed.
+    // An ACTUAL `_Bool` value WIDENS into an arithmetic slot (C99 6.3.1.2 —
+    // `_Bool` promotes to `int`): `int n = flag;`, `f(flag)` to an int/float
+    // param, `char c = flag;`. (A comparison/logical RESULT no longer reaches
+    // here as a Bool — since D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE the semantic
+    // typer `subtreeType` types `a < b` / `a && b` / `!a` as C's `int`, so those
+    // route through the ordinary int arms above; this arm now serves the
+    // remaining GENUINE `_Bool`-typed operands — a `_Bool` variable / a
+    // `_Bool`-returning call.) Gated on `boolWidensToArith` so ONLY the
+    // pre-coerce semantic checks admit it — the post-coerce verifier stays
+    // strict (the HIR `coerce()` materializes the Bool→int Cast). ASSIGNMENT
+    // direction only — `Bool` stays out of `isArithmetic` (above), so binary
+    // PROMOTION (`bool + bool`) is unaffected. c48 (D-CSUBSET-BOOL-CHAR-WIDENING):
+    // when `charConvertsToArith` also treats `char` (interned as `TypeKind::Char`,
+    // outside the int RANKS) as an arithmetic slot, a `_Bool` widens into a `char`
+    // lhs too — `char c = flag;` (the sqlite `p->nFloor = (p->D==31)` shape once
+    // the RHS is an actual Bool). The MIRROR direction (a scalar INTO a `_Bool`
+    // lhs) is the `scalarConvertsToBool` arm just below.
     if (boolWidensToArith && rk == TypeKind::Bool
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
             || floatRank(lk) != 0
             || (charConvertsToArith && lk == TypeKind::Char))) {
+        return true;
+    }
+    // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION / scalar->_Bool): the MIRROR of
+    // the arm above — ANY scalar value converts INTO a `_Bool` lhs (the result is
+    // 0 if the value compares equal to 0, else 1). An arithmetic (int rank / float
+    // / Char / Enum) OR pointer OR `nullptr` rhs is admitted; the HIR `coerce()`
+    // materializes it as the `!= 0` truthiness test — NOT a low-bit-truncating
+    // Cast (so `_Bool b = 2` is true) — reusing the ONE condition-materialization
+    // chokepoint `coerceCondition`. Gated on `scalarConvertsToBool` (a non-C
+    // schema keeps `_Bool` strict; the post-coerce verifier — default false —
+    // stays strict too). Genuinely-INCOMPATIBLE sources (struct / union / void /
+    // FnSig — all rank-0 and non-pointer) are NOT admitted -> they stay a loud
+    // reject. Was the c48-masked gap the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]]
+    // fix unmasked: once `a < b` types `int`, `_Bool b = (a<b)` needs this arm.
+    if (scalarConvertsToBool && lk == TypeKind::Bool
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
+            || floatRank(rk) != 0
+            || rk == TypeKind::Char || rk == TypeKind::Enum
+            || rk == TypeKind::Ptr  || rk == TypeKind::NullptrT)) {
         return true;
     }
     // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
@@ -350,16 +436,19 @@ namespace detail::type_rules {
         return true;
     }
     // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a string literal
-    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `char[N]` is
+    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `<c>[N]` is
     // assignable FROM the string literal's `char[M]` when N >= M (M = the literal's
     // own array length, chars + NUL). Gated on `charArrayFromStringLiteralInit`
     // (the caller sets it only when the init IS a string literal), so an ordinary
-    // array-to-array assignment never reaches here as `true`. Both element types
-    // must be `char` (the C string-literal element); a wide / non-char array stays
-    // out of scope. The same-type (N==M) exact fit already returned above; the
-    // `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`) a loud mismatch.
-    // The HIR `coerce()` realizes it by retyping the literal to `char[N]` so the
-    // MIR producer pads the rodata global to N (no OOB copy).
+    // array-to-array assignment never reaches here as `true`. The element types
+    // must satisfy `stringLiteralArrayInitCompatible` — C 6.2.5p15: a NARROW
+    // literal (`char[M]`) inits an array of ANY character type (char / signed char
+    // / unsigned char, the sqlite `const unsigned char zHex[]="…"` shape), and a
+    // wide literal inits its matching wide array; every other element pairing
+    // (`int[N]="…"`) stays out of scope. The same-type (N==M) exact fit already
+    // returned above; the `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`)
+    // a loud mismatch. The HIR `coerce()` realizes it by retyping the literal to
+    // the lhs `<c>[N]` so the MIR producer pads the rodata global to N (no OOB copy).
     if (charArrayFromStringLiteralInit
         && lk == TypeKind::Array && rk == TypeKind::Array) {
         auto const lhsElem = interner.operands(lhs);
@@ -368,8 +457,8 @@ namespace detail::type_rules {
         auto const rhsLen  = interner.scalars(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()
             && !lhsLen.empty() && !rhsLen.empty()
-            && interner.kind(lhsElem[0]) == TypeKind::Char
-            && interner.kind(rhsElem[0]) == TypeKind::Char
+            && stringLiteralArrayInitCompatible(interner.kind(lhsElem[0]),
+                                                interner.kind(rhsElem[0]))
             && lhsLen[0] >= rhsLen[0]) {
             return true;
         }
@@ -434,6 +523,29 @@ namespace detail::type_rules {
             return true;
         }
     }
+    // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a bare function DESIGNATOR
+    // (`FnSig`, NOT yet decayed to a pointer) assigned/passed to `void*` — the
+    // gcc/POSIX `dlsym` / Tcl `ClientData` idiom (`Tcl_CreateCommand(i, "md5",
+    // MD5DigestToBase16, ...)` hands a bare function name into a `void*`
+    // ClientData parameter). This is the SIBLING of the same-signature
+    // function-to-pointer decay arm just above, but the target is `void*` (an
+    // ERASED pointer) rather than a `Ptr<FnSig>` of the matching signature — so
+    // it is gated on `allowVoidPtrFnConvert`, the SINGLE authoritative gate for
+    // the whole fn<->void* class (Option B). SCOPED STRICTLY to a `Void` lhs
+    // pointee: a designator -> a NON-void object pointer (`char*`, `int*`,
+    // `struct S*`) does NOT match here (lhsElem[0] is not Void) and, with `rk`
+    // == FnSig, matches no Ptr<->Ptr arm below either — it stays a loud reject
+    // regardless of the flag. Function-pointer <-> void* is UB in ISO C but
+    // POSIX-required and representation-identical on LP64/LLP64 (same width,
+    // same bits) -> never a miscompile. The HIR `coerce()` realizes it as the
+    // same FnSig->Ptr Bitcast-over-GlobalAddr the decay above emits.
+    if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
+        auto const lhsElem = interner.operands(lhs);
+        if (!lhsElem.empty()
+            && interner.kind(lhsElem[0]) == TypeKind::Void) {
+            return ptrRules.allowVoidPtrFnConvert;
+        }
+    }
     // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): the two
     // directions of `void*` ↔ `T*` conversion are configured
     // INDEPENDENTLY — they carry different safety characteristics:
@@ -475,16 +587,67 @@ namespace detail::type_rules {
                 interner.kind(rhsElem[0]) == TypeKind::Void;
             // T* → void* direction: lhs is void*, rhs is T* (T != void).
             if (lhsIsVoidPtr && !rhsIsVoidPtr) {
+                // Option-B re-homing (D-LANG-VOIDPTR-FN-CONVERT): when the
+                // NON-void side is a FUNCTION pointer (`Ptr<FnSig> -> void*`),
+                // the whole fn<->void* class routes through the SINGLE
+                // authoritative `allowVoidPtrFnConvert` gate — NOT the generic
+                // object-pointer `implicitToVoidPtr`. For c-subset all three
+                // flags are true (identical behavior); the split lets a
+                // language keep ISO-strict function-pointer typing while still
+                // admitting object `T* -> void*`. An object pointee still uses
+                // `implicitToVoidPtr`.
+                if (interner.kind(rhsElem[0]) == TypeKind::FnSig) {
+                    return ptrRules.allowVoidPtrFnConvert;
+                }
                 return ptrRules.implicitToVoidPtr;
             }
             // void* → T* direction: lhs is T* (T != void), rhs is void*.
             if (!lhsIsVoidPtr && rhsIsVoidPtr) {
+                // Option-B re-homing (mirror): `void* -> Ptr<FnSig>` routes
+                // through the same single fn<->void* gate; an object pointee
+                // uses the generic `implicitFromVoidPtr`.
+                if (interner.kind(lhsElem[0]) == TypeKind::FnSig) {
+                    return ptrRules.allowVoidPtrFnConvert;
+                }
                 return ptrRules.implicitFromVoidPtr;
             }
             // BOTH void: caught by sameType() above (Ptr<Void> ==
             // Ptr<Void> via interning). NEITHER void: distinct typed
             // pointers; fall through to the strict-reject default
-            // below (Ptr<int> → Ptr<float> is NOT implicit).
+            // below (Ptr<int> → Ptr<float> is NOT implicit) — UNLESS the
+            // shipped-descriptor integer-pointee relaxation below admits it.
+        }
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
+        // call-arg boundary ONLY (the sole caller passing this flag true — never
+        // native C-to-C, never init/assign/return), a descriptor's abstract width-
+        // based integer-pointee param (`ptr<i64>`, …) accepts a real C integer
+        // pointer whose pointee is the SAME representation (`long long*` /
+        // `sqlite3_int64*` / `long*`-on-LP64) — the ABI-identical match gcc admits.
+        // Predicate = BOTH pointees are integer kinds (size ∧ signedness ∧ integer-
+        // base-kind, via signedIntRank/unsignedIntRank) AND `sameRepresentation`
+        // (compares kind ∧ extensionKind ∧ operands ∧ scalars, NOT the identity
+        // NAME) — attribute-driven, NO `if(type==long long)`. Per-target by
+        // construction: on LLP64/pe64 `long` is I32, so `long*` vs `ptr<i64>` FAILS
+        // sameRepresentation's kind axis → still rejected, with NO format branch
+        // (Condition 6). A `_BitInt(64)*` fails the extensionKind axis; an
+        // `unsigned long long*` / `double*` / `enum E*` fail the kind/base-kind axes.
+        // Identity is UNTOUCHED — a COMPAT admission the coerce() Ptr→Ptr bitcast
+        // realizes, never a TypeId merge (Condition 1); `_Generic(long:,long long:)`
+        // still distinguishes. Cf. TF-C15/C16/C32 pointer-compat-policy notes +
+        // D-LANG-TYPE-IDENTITY-VOCABULARY / LD-5 (identity nominal).
+        if (ffiDescriptorPointeeIntCompat
+            && !lhsElem.empty() && !rhsElem.empty()) {
+            auto const lpk = interner.kind(lhsElem[0]);
+            auto const rpk = interner.kind(rhsElem[0]);
+            bool const bothInt =
+                (detail::type_rules::signedIntRank(lpk)
+                 || detail::type_rules::unsignedIntRank(lpk))
+                && (detail::type_rules::signedIntRank(rpk)
+                    || detail::type_rules::unsignedIntRank(rpk));
+            if (bothInt
+                && interner.sameRepresentation(lhsElem[0], rhsElem[0])) {
+                return true;
+            }
         }
     }
     // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
@@ -601,13 +764,15 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     // C23 (D-CSUBSET-NULLPTR): `nullptr` (a NullptrT operand) casts explicitly to
-    // any POINTER target (`(T*)nullptr`). Restricted to a Ptr target ONLY — a cast
-    // to an arithmetic type (`(int)nullptr`) is NOT sanctioned by C23, and NO arm
-    // admits NullptrT as the cast TARGET (the one-way constraint holds for casts
-    // too). `(bool)nullptr` is DEFERRED with the implicit nullptr→bool conversion
-    // (D-CSUBSET-NULLPTR-BOOL-CONVERSION — the c-subset has no scalar→bool path).
-    // nullptr lowers to the integer-0 null const → the existing null-const path.
-    if (ok == TypeKind::NullptrT && tk == TypeKind::Ptr) {
+    // any POINTER target (`(T*)nullptr`) AND to `_Bool` (`(bool)nullptr` -> false,
+    // C23 6.3.2.3.2). A cast to a non-bool arithmetic type (`(int)nullptr`) is NOT
+    // sanctioned by C23, and NO arm admits NullptrT as the cast TARGET (the one-way
+    // constraint holds for casts too). Ungated, like the sibling Ptr arm — NullptrT
+    // only exists in a nullptr-declaring schema, so this is inert elsewhere. nullptr
+    // lowers to the integer-0 null const, so `(bool)nullptr` truncates 0 -> false
+    // correctly (D-CSUBSET-NULLPTR-BOOL-CONVERSION, the explicit-cast face).
+    if (ok == TypeKind::NullptrT
+        && (tk == TypeKind::Ptr || tk == TypeKind::Bool)) {
         return true;
     }
     return false;
@@ -713,8 +878,12 @@ namespace detail::type_rules {
 // lattice law — `*` on a function designator (`FnSig`) or a function POINTER
 // (`Ptr<FnSig>`) is the IDENTITY (the designator decays straight back), so the
 // result is the operand type unchanged; a deref node there would lower to a
-// memory LOAD through the code pointer (silent garbage). Otherwise `Ptr<T>`→T;
-// a non-pointer operand → InvalidType (cascade-suppress; deeper tiers wall it).
+// memory LOAD through the code pointer (silent garbage). Otherwise `Ptr<T>`→T.
+// C 6.3.2.1p3 array-to-pointer decay under `*`: an ARRAY operand decays to
+// Ptr<elem> FIRST, so `*arrayOfT` has type `elem` — this law handles it directly
+// (== `arrayOfT[0]`, the Array arm of the sibling `indexResultType`), so the two
+// verbs agree and no caller must pre-decay merely to recover the TYPE. Any other
+// operand → InvalidType (cascade-suppress; deeper tiers wall it).
 [[nodiscard]] inline TypeId
 derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
     if (!operand.valid()) return InvalidType;
@@ -724,6 +893,16 @@ derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
         && interner.kind(interner.operands(operand)[0]) == TypeKind::FnSig)
         return operand;                                              // identity
     if (opk == TypeKind::Ptr) return interner.operands(operand)[0];   // pointee
+    // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `*arrayOfT` (C 6.3.2.1p3
+    // array-decay then C 6.5.3.2 deref) is `elem` — operand[0], the SAME slot
+    // Array/Ptr/Slice all store the element in. C forbids arrays OF functions,
+    // so operand[0] is never a bare FnSig (an array of function POINTERS yields
+    // the pointer via this arm, matching the Ptr path). A degenerate elementless
+    // Array has no element → InvalidType. `*` is NOT a decay-exception (unlike
+    // sizeof/_Alignof/unary &), so the decay belongs in this shared law, exactly
+    // as `indexResultType` decays an Array base for `[]`.
+    if (opk == TypeKind::Array && !interner.operands(operand).empty())
+        return interner.operands(operand)[0];                        // element
     return InvalidType;
 }
 

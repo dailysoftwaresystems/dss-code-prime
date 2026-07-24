@@ -4180,6 +4180,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // `hasIncludeAngle*` KINDS only to recognise-and-reject an angle
             // argument at runtime; see the field doc in preprocess_config.hpp.
             readOptWord("embedDirective",         cfg.embedDirective);
+            // TF-C59 (`#line`; C23 6.10.4 / D-CPP-LINE-DIRECTIVE). OPTIONAL —
+            // absent leaves it empty, so a `#line` hits the generic
+            // unsupported-directive fail-loud (the embed/pragma opt-in model).
+            readOptWord("lineDirective",          cfg.lineDirective);
             readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
@@ -4522,7 +4526,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 19>
+                    static constexpr std::array<std::string_view, 20>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4550,7 +4554,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "variadicMarker",
                             // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
                             // rule that opens a per-declarator function-prototype scope.
-                            "prototypeParamScopeRule"};
+                            "prototypeParamScopeRule",
+                            // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
+                            // after-declarator attribute rules (attrSpec/stdAttr).
+                            "afterDeclaratorAttrRules"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         // `$`-prefixed keys are the codebase-wide documentation
@@ -4727,6 +4734,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readOptionalRuleRole("prototypeParamScopeRule",
                                          dc.prototypeParamScopeRule,
                                          dc.prototypeParamScopeRuleName);
+                    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL LIST of
+                    // after-declarator attribute rules (`attrSpec`, `stdAttr`) —
+                    // the init-detection scans skip a child of these rules so an
+                    // after-declarator `__attribute__((...))` is not mistaken for
+                    // the initializer. Absent ⇒ empty (no after-declarator attr
+                    // suffix). Each entry must be a known rule name (else the load
+                    // fails, like the single-role helper).
+                    if (dj.contains("afterDeclaratorAttrRules")) {
+                        auto const& arr = dj.at("afterDeclaratorAttrRules");
+                        if (!arr.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/afterDeclaratorAttrRules",
+                                      "'declarators.afterDeclaratorAttrRules' "
+                                      "must be an array of rule-name strings");
+                            dOk = false;
+                        } else {
+                            for (auto const& e : arr) {
+                                if (!e.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              dPath + "/afterDeclaratorAttrRules",
+                                              "each entry must be a rule-name string");
+                                    dOk = false;
+                                    continue;
+                                }
+                                std::string const nm = e.get<std::string>();
+                                if (!data.rules->contains(nm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              dPath + "/afterDeclaratorAttrRules",
+                                              std::format("references unknown "
+                                                          "shape '{}'", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.afterDeclaratorAttrRuleNames.push_back(nm);
+                                dc.afterDeclaratorAttrRules.push_back(
+                                    data.rules->find(nm));
+                            }
+                        }
+                    }
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy
@@ -9496,9 +9542,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (!obj.is_object()) {
                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                               "/semantics/pointerConversions",
-                              "'pointerConversions' must be an object "
-                              "with optional `implicitToVoidPtr` and "
-                              "`implicitFromVoidPtr` boolean fields");
+                              "'pointerConversions' must be an object with "
+                              "optional `implicitToVoidPtr`, "
+                              "`implicitFromVoidPtr`, "
+                              "`nullPointerConstantFromIntegerZero`, "
+                              "`nullPointerConstantFromNullptrT`, "
+                              "`allowVoidPtrFnConvert`, and "
+                              "`ffiDescriptorIntPointeeCompat` boolean fields");
                 } else {
                     auto readBool = [&](char const* field, bool& out) {
                         if (!obj.contains(field)) return;
@@ -9524,6 +9574,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("nullPointerConstantFromNullptrT",
                              cfg.pointerConversions
                                  .nullPointerConstantFromNullptrT);
+                    // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): implicit
+                    // function-pointer <-> void* (incl. the bare function
+                    // designator -> void* gcc/POSIX dlsym / Tcl ClientData
+                    // idiom). Default false = ISO-strict; c-subset opts in.
+                    readBool("allowVoidPtrFnConvert",
+                             cfg.pointerConversions.allowVoidPtrFnConvert);
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-FFI-
+                    // descriptor call-arg boundary, admit a real C integer pointer
+                    // into a same-representation descriptor `ptr<i64>`-style param.
+                    // Default false = ISO-strict; c-subset opts in.
+                    readBool("ffiDescriptorIntPointeeCompat",
+                             cfg.pointerConversions.ffiDescriptorIntPointeeCompat);
                     // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
                     // constant at the HIR tier (Fix 1(a)), so its HIR realization
                     // (coerce→Ptr / ternary / condition) REUSES the integer-0
@@ -9557,7 +9619,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (k != "implicitToVoidPtr" &&
                             k != "implicitFromVoidPtr" &&
                             k != "nullPointerConstantFromIntegerZero" &&
-                            k != "nullPointerConstantFromNullptrT") {
+                            k != "nullPointerConstantFromNullptrT" &&
+                            k != "allowVoidPtrFnConvert" &&
+                            k != "ffiDescriptorIntPointeeCompat") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",
@@ -9566,8 +9630,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "unknown 'pointerConversions' "
                                           "field '{}' — expected one of "
                                           "'implicitToVoidPtr', "
-                                          "'implicitFromVoidPtr', or "
-                                          "'nullPointerConstantFromIntegerZero'",
+                                          "'implicitFromVoidPtr', "
+                                          "'nullPointerConstantFromIntegerZero', "
+                                          "'nullPointerConstantFromNullptrT', "
+                                          "'allowVoidPtrFnConvert', or "
+                                          "'ffiDescriptorIntPointeeCompat'",
                                           k));
                         }
                     }
@@ -9613,6 +9680,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'enumConvertsToArith' must be a boolean");
                 } else {
                     cfg.enumConvertsToArith = v.get<bool>();
+                }
+            }
+            // C 6.3.1.2 scalar->_Bool implicit assignment conversion (read by
+            // `isAssignable`'s scalar->Bool arm; D-CSUBSET-NULLPTR-BOOL-CONVERSION).
+            // Opt-in (default false → a non-C schema keeps `_Bool` strict).
+            if (sem.contains("scalarConvertsToBool")) {
+                auto const& v = sem.at("scalarConvertsToBool");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/scalarConvertsToBool",
+                              "'scalarConvertsToBool' must be a boolean");
+                } else {
+                    cfg.scalarConvertsToBool = v.get<bool>();
                 }
             }
             // C 6.3.1.3/6.5.16.1 signed↔unsigned implicit assignment conversion (read
@@ -9665,6 +9745,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'floatConvertsToInt' must be a boolean");
                 } else {
                     cfg.floatConvertsToInt = v.get<bool>();
+                }
+            }
+            // C 6.3.1.4/6.5.16.1 float→float NARROWING implicit assignment conversion
+            // (`float f = aDouble`, read by `isAssignable`'s float rank arm). Opt-in
+            // (default false → a non-C schema keeps floats of different width distinct).
+            if (sem.contains("floatSameKindNarrows")) {
+                auto const& v = sem.at("floatSameKindNarrows");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatSameKindNarrows",
+                              "'floatSameKindNarrows' must be a boolean");
+                } else {
+                    cfg.floatSameKindNarrows = v.get<bool>();
                 }
             }
 

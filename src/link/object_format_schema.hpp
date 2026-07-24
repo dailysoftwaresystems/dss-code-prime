@@ -933,6 +933,31 @@ struct DSS_EXPORT ObjectFormatData {
     // (the closed-enum check — a typo never falls back).
     std::optional<DataImportBinding> dataImportBinding;
 
+    // ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): extern-ADDRESS
+    //     materialization binding ─────────────────────────────────────
+    //
+    // How code MATERIALIZES the ADDRESS of an undefined/preemptible
+    // extern (function OR data) as a LIVE code-form VALUE (an argument,
+    // an automatic's initializer, a returned function pointer) under
+    // THIS format. `got` = through a GOT slot the FINAL (foreign) linker
+    // synthesizes (arm64 ADR_GOT_PAGE + LD64_GOT_LO12_NC), so a foreign
+    // default-PIE link of the emitted relocatable `.o`/`.a` accepts it —
+    // an absolute page-pair against a preemptible symbol is rejected
+    // "when making a shared object". See `ExternAddrBinding`
+    // (core/types/object_format_kind.hpp) for the full rationale.
+    //
+    // `std::nullopt` = the format declared no binding — NOT a silent
+    // default: an `&extern` value then materializes via the ordinary lea
+    // (a PC-relative rel32 on x86_64 — already foreign-PIE-safe; an
+    // absolute page-pair on arm64 — foreign-PIE-safe ONLY for a
+    // DSS-linked exec). Only the arm64 relocatable + static-archive
+    // formats declare `got`; the DSS-linked exec/pie/dyn formats omit it
+    // (they use copy-relocation / the c117 __got path). Consumed by
+    // MIR→LIR `lowerGlobalAddr`'s value-form arm. An unknown VALUE fails
+    // loud at load (the closed-enum check — the externCallDispatch /
+    // dataImportBinding discipline).
+    std::optional<ExternAddrBinding> externAddrBinding;
+
     // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
     //
     // HOW code reaches a thread-local object's per-thread copy under
@@ -1247,6 +1272,17 @@ public:
     [[nodiscard]] std::optional<DataImportBinding>
     dataImportBinding() const noexcept {
         return d_.dataImportBinding;
+    }
+
+    // ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT accessor (TF-C52) ────
+    // The format's extern-ADDRESS materialization binding (`got`), or
+    // nullopt if the format declared none. MIR→LIR reads this to route
+    // an `&extern` VALUE through the arm64 GOT-address macro (adrp:got:
+    // + ldr:got_lo12:) instead of an absolute page-pair lea; nullopt =
+    // the ordinary lea (foreign-PIE-safe only on x86_64 / a DSS exec).
+    [[nodiscard]] std::optional<ExternAddrBinding>
+    externAddrBinding() const noexcept {
+        return d_.externAddrBinding;
     }
 
     // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────

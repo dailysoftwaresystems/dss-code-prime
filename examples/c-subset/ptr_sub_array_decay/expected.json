@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-POINTER-DIFF-ARRAY-DECAY (C 6.5.6p9 + 6.3.2.1p3): `pointer - arrayName` / `array - pointer` / `array - array` is a pointer DIFFERENCE (ptrdiff_t = ELEMENT count) — the array operand decays to Ptr<elem> FIRST, then it is `p - q`. Frontier: sqlite FTS5 fts5TriTokenize `zOut - aBuf` (char aBuf[32]; char *zOut=aBuf) passed DIRECTLY as an int token length (no cast) -> DSS's semantic type-oracle (subtreeType/combineBinary) required BOTH operands already Ptr and never decayed an Array, so `zOut - aBuf` typed Ptr<char> -> the int context failed isAssignable -> error[S0003]. The pointer_minus_array example always CAST `(int)(t - arr)`, and the explicit pointer->int cast absorbed the mistyped Ptr — which is why it never caught this. FIX: the semantic pointer-subtraction arm decays an Array operand to Ptr<elem> (same-pointee guard, matching the HIR combineBinary c65 D-CSUBSET-POINTER-DIFF-EDGE-CASES that ALREADY lowers it via PtrToInt+Sub+SDiv). Every subtraction here is UNCAST so the SEMANTIC decay is under test; a,b (ptr-array), e (array-ptr), f (int-array, stride 4 -> element index 6 NOT 24 bytes) are load-bearing, c (ptr-ptr c40) and d (array-array) are controls. Offsets via io() keep pointers runtime. a+b = 30+12 = 42. RED-ON-DISABLE: revert the semantic pointer-sub array-decay -> `int a = p - buf;` types Ptr<char> into an int lvalue -> error[S0003], does not compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

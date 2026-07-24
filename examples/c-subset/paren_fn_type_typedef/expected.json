@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME (TF-C64): a parenthesized-NAME function-TYPE typedef `typedef int (BinOp)(int, int);` — the pervasive real-tcl.h shape (`typedef int (Tcl_AppInitProc)(Tcl_Interp*)`, ~90 instances). BinOp aliases the FUNCTION type (no `*`); the program uses it as tcl.h does — as the pointee of a callback parameter (`BinOp *op`) — and calls through it: apply(add,40,5)=45 then apply(sub,45,3)=42. ROOT CAUSE this witnesses: the CU type-name oracle harvested BinOp into globalTypeNames AND recorded it as an ambiguous candidate (BinOp is unknown while its OWN `(BinOp)` declarator parses), then SEEDED BinOp for the reparse of the same tree — flipping `(BinOp)` from a parenthesized declarator (BinOp the NAME) to an abstract function-suffix param (BinOp a param TYPE) → S_DeclarationDeclaresNothing. FIX = span-based self-definition exclusion (a candidate whose span equals its own binding span is a typedef's own defining occurrence, C 6.2.1p7, and is not seeded). RED-ON-DISABLE: drop the ownBindingSpans guard in compilation_unit.cpp's oracle seed loop → the typedef reparses abstract → S0017 → the program no longer compiles (compile failure, not exit 42). The `release` arm re-witnesses the fn-type-typedef-typed indirect call survives the full shipped optimizer pipeline (inlining over the new FnSig-typedef shape).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -13,10 +13,10 @@
 # Linux or WSL host:
 #
 #   1. verify the host is Linux / WSL and online
-#   2. use the dss-code-prime checkout at ~/src AS-IS — an EXISTING checkout is
-#      probed on its CURRENT branch (never switched or pulled, so running this
-#      against a live working repo can't clobber your branch/HEAD); DSS_UPDATE_CHECKOUT=1
-#      opts into the old fetch+checkout "$DSS_BRANCH"; an ABSENT dir is freshly cloned
+#   2. use the dss-code-prime checkout at ~/src AS-IS on its CURRENT branch —
+#      NEVER switched or pulled (a probe tests the working tree exactly as it is,
+#      and running this against a live working repo can't clobber your branch/HEAD);
+#      an ABSENT dir is freshly cloned (default branch)
 #   3. clone-or-update  sqlite/sqlite    into  ~/src
 #   4. amalgamate SQLite -> sqlite3.c    (autotools: `make sqlite3.c`, needs tclsh)
 #   5. build dss-code-prime              (its default CMake-4 Release build)
@@ -46,7 +46,7 @@
 # party wrappers). The amalgamation is produced by `./configure && make sqlite3.c`
 # (requires a `tclsh` 8.6+ interpreter), which is what this harness uses.
 #
-# Overridable via env: DSS_REPO_URL DSS_BRANCH DSS_UPDATE_CHECKOUT SQLITE_REPO_URL
+# Overridable via env: DSS_REPO_URL SQLITE_REPO_URL
 #                      SRC_DIR SQLITE_DIR OUT_DIR JOBS  (see the config block below).
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
@@ -67,9 +67,12 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 # ── config (override via environment) ───────────────────────────────────────
+# dss-code-prime is ALWAYS used at its CURRENT branch state — the harness never
+# switches or pulls our own repo (a probe must test the working tree exactly as
+# it is; there is no DSS_BRANCH / DSS_UPDATE_CHECKOUT knob). Only an ABSENT
+# checkout is freshly cloned (its default branch). SQLite, by contrast, DOES
+# clone-or-pull (it is an external dependency, not the thing under test).
 DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
-DSS_BRANCH="${DSS_BRANCH:-main}"                 # branch to check out ONLY when cloning fresh (absent SRC_DIR) or when DSS_UPDATE_CHECKOUT=1; an existing checkout is probed as-is
-DSS_UPDATE_CHECKOUT="${DSS_UPDATE_CHECKOUT:-0}"  # 1 = fetch + checkout "$DSS_BRANCH" + pull --rebase an existing checkout (mutates its branch/HEAD); default 0 = probe the current checkout untouched
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
@@ -242,23 +245,18 @@ else
 fi
 
 # ── Step 2 — dss-code-prime -> ~/src ─────────────────────────────────────────
-# An EXISTING checkout is probed AS-IS on its current branch — the harness must
-# never switch or pull the repo it is run from (a silent `git checkout`/`pull --rebase`
-# would clobber a live working tree, and fails loud when the branch's remote is gone).
-# DSS_UPDATE_CHECKOUT=1 opts back into fetch+checkout "$DSS_BRANCH"; an ABSENT SRC_DIR
-# is always freshly cloned onto DSS_BRANCH (there is no working tree to disturb).
-if [[ -d "$SRC_DIR/.git" && "$DSS_UPDATE_CHECKOUT" != "1" ]]; then
-  step "2/8  Use dss-code-prime at $SRC_DIR (current checkout, no branch switch)"
-  info "probing the CURRENT checkout untouched — set DSS_UPDATE_CHECKOUT=1 to fetch/checkout '$DSS_BRANCH'"
+# dss-code-prime is ALWAYS used at its CURRENT branch state. The harness NEVER
+# switches or pulls our own repo — a probe must test the working tree exactly as
+# it is, and a silent `git checkout`/`pull` would clobber live work. There is no
+# branch knob. An EXISTING checkout is used untouched (on whatever branch it is
+# on); only an ABSENT checkout is freshly cloned (its default branch — there is
+# no working tree to disturb).
+if [[ -d "$SRC_DIR/.git" ]]; then
+  step "2/8  Use dss-code-prime at $SRC_DIR (current checkout, untouched)"
   info "  at $(git -C "$SRC_DIR" rev-parse --short HEAD) on $(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD)"
 else
-  step "2/8  Fetch dss-code-prime -> $SRC_DIR (branch: $DSS_BRANCH)"
-  # Opt-in / fresh-clone path: never mutate a DIRTY working tree — fail loud instead
-  # of silently switching branches over uncommitted work.
-  if [[ -d "$SRC_DIR/.git" && -n "$(git -C "$SRC_DIR" status --porcelain)" ]]; then
-    die "$SRC_DIR has uncommitted changes — refusing to checkout/pull '$DSS_BRANCH' (would clobber your working tree). Commit/stash first, or unset DSS_UPDATE_CHECKOUT to probe the current checkout as-is."
-  fi
-  clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
+  step "2/8  Clone dss-code-prime -> $SRC_DIR (absent — fresh clone, default branch)"
+  clone_or_update "$DSS_REPO_URL" "$SRC_DIR" ""
 fi
 pass "dss-code-prime ready"
 
@@ -356,52 +354,100 @@ compile_time_suffix() {
   t="${t##*$'\n'}"                  # last match (no pipe → no SIGPIPE under pipefail)
   [[ -n "$t" ]] && printf '  (%s)' "$t" || true
 }
+# units + defines are CONSTANT across every leg — hoisted out of the per-leg loop so the
+# merged ELF invocation (below) shares them. EVERY target compiles the real 2-TU CLI:
+# sqlite3.c + shell.c (sqlite3.c FIRST — the multi-TU merge needs the library CU ahead of the
+# driver). shell.c supplies `main`, so the entry-trampoline resolves and a real `sqlite3`
+# binary is emitted for every target. (Compiling the amalgamation ALONE as an -exec was a
+# harness BUG: sqlite3.c is a main-less LIBRARY, so it ALWAYS failed at the entry-trampoline
+# regardless of the compiler — masking that windows/macos DO build a clean binary from the 2-TU.)
+# The pe64 target now compiles sqlite DEFINE-FREE, matching the ELF/Mach-O legs — both former
+# knobs are closed by real compiler support: SQLITE_DISABLE_INTRINSIC dropped at c113 (DSS
+# resolves <intrin.h> via the pe-gated shippedLibs/intrin.json descriptor + lowers __umulh /
+# _ReadWriteBarrier as builtin intrinsics), and SQLITE_OMIT_SEH dropped at c116 (DSS implements
+# the MSVC x64 SEH __try/__except: c114 .pdata/.xdata, c115 the frontend, c116 the filter
+# FUNCLETS + __C_specific_handler scope tables + H1 parent-local recovery — the wal.c
+# SEH_TRY/SEH_EXCEPT guards now CATCH an EXCEPTION_IN_PAGE_ERROR on the mmap'd wal-index →
+# SQLITE_IOERR, exactly like an MSVC build). (D-WIN64-SEH-FUNCLETS / D-WIN64-XMM-UNWIND-RESTORE.)
+declare -a units=("$AMALGAMATION" "$SHELL_C")   # sqlite3.c FIRST, then the CLI driver
+declare -a defines=()
+
+# ── D-PERF-3-HARNESS-MULTI-TARGET: the two same-host ELF legs share ONE dss invocation ──────
+# elf64-x86_64 + elf64-aarch64 are both ObjectFormatKind::Elf, so dss preprocesses + parses the
+# 2-TU sqlite3.c + shell.c ONCE (runCusToTargets builds the front-end once per DISTINCT object-
+# format-kind — program.cpp) and lowers that ONE shared parse to BOTH targets: the ~9.5 M-line
+# amalgamation is scanned once, not twice. A MULTI-target dss run routes each artifact to
+# <output>/<formatName>/<stem> (compileOneTarget, multiTargetBuild arm), so the two ELF binaries
+# land under $OUT_DIR/<formatName>/ — NOT the flat per-label dir a single-target run writes.
+#   pe64 + macho stay SEPARATE single-target invocations (each its OWN ObjectFormatKind, flat
+# output at $OUT_DIR/<label>) — FAULT-ISOLATION: runCusToTargets aborts the whole run before
+# codegen if any CU under a format-kind errored, so we only MERGE legs that are green together
+# (the two ELF legs — the real win) and never couple the foreign-OS compile-only legs to them.
+leg_is_elf() { [[ "${1#*:}" == elf* ]]; }        # <spec>: formatName (post-':') starting elf* ⇒ ObjectFormatKind::Elf
+leg_bindir() {                                   # <label> <spec> → the dir holding this leg's binary
+  # ELF legs: the MERGED invocation routes to $OUT_DIR/<formatName>/ when it carries >1 --target
+  # (dss multiTargetBuild), but FLAT to $OUT_DIR/ when only ONE ELF leg is selected (e.g. a
+  # DSS_OS=linux fast-iteration run → single --target → dss writes flat). pe64/macho: $OUT_DIR/<label>.
+  if leg_is_elf "$2"; then
+    if [[ "$ELF_MULTI" == "1" ]]; then printf '%s' "$OUT_DIR/${2#*:}"; else printf '%s' "$OUT_DIR"; fi
+  else
+    printf '%s' "$OUT_DIR/$1"
+  fi
+}
+leg_log() {                                      # <label> <spec> → this leg's compile log
+  if leg_is_elf "$2"; then printf '%s' "$ELF_LOG"; else printf '%s' "$OUT_DIR/$1/compile.log"; fi
+}
+ELF_LOG="$OUT_DIR/elf-merged-compile.log"        # the merged ELF legs share ONE invocation ⇒ ONE log
+declare -a ELF_TARGET_ARGS=() ELF_LABELS=()
+for entry in "${TARGETS[@]}"; do
+  if leg_is_elf "${entry#*=}"; then
+    ELF_TARGET_ARGS+=(--target "${entry#*=}"); ELF_LABELS+=("${entry%%=*}")
+  fi
+done
+# A dss run with >1 --target routes each artifact to $OUT_DIR/<formatName>/ (multiTargetBuild);
+# with exactly ONE --target it writes FLAT to $OUT_DIR/. Track which so leg_bindir + the lookups
+# resolve the ELF binaries correctly whether the run carries both ELF legs or a single filtered one.
+ELF_MULTI=0
+[[ ${#ELF_LABELS[@]} -gt 1 ]] && ELF_MULTI=1
+if [[ ${#ELF_TARGET_ARGS[@]} -gt 0 ]]; then
+  info "[elf-merged] ${ELF_LABELS[*]} — ONE preprocess+parse (ObjectFormatKind::Elf) shared across ${#ELF_LABELS[@]} leg(s)"
+  # ⚠ GOTCHA (probe a6b65f8b): dss-code-prime returns EXIT 0 even on FATAL compile errors, so
+  # success is read PER-LEG from the DIAGNOSTICS (no `error[`) + the emitted binary below, never
+  # from `$?`. --time asks the compiler to self-report its wall-clock (surfaced per leg below).
+  "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" "${ELF_TARGET_ARGS[@]}" --output "$OUT_DIR" --time "${defines[@]}" >"$ELF_LOG" 2>&1 || true
+fi
+
 for entry in "${TARGETS[@]}"; do
   label="${entry%%=*}"; spec="${entry#*=}"
-  outd="$OUT_DIR/$label"; mkdir -p "$outd"
-  log="$outd/compile.log"
-  # EVERY target compiles the real 2-TU CLI: sqlite3.c + shell.c (sqlite3.c FIRST —
-  # the multi-TU merge needs the library CU ahead of the driver). shell.c supplies
-  # `main`, so the entry-trampoline resolves and a real `sqlite3` binary is emitted
-  # for every target. The ONLY per-target difference is step 7: a RUNNABLE target (in
-  # RUNNERS) is executed for the smoke; a COMPILE-ONLY target (a foreign-OS binary
-  # this host can't exec) is verified to have EMITTED a binary and is not run.
-  # (Compiling the amalgamation ALONE as an -exec was a harness BUG: sqlite3.c is a
-  # main-less LIBRARY, so it ALWAYS failed at the entry-trampoline regardless of the
-  # compiler — masking that windows/macos DO build a clean binary from the 2-TU.)
-  declare -a units=("$AMALGAMATION" "$SHELL_C")   # sqlite3.c FIRST, then the CLI driver
+  # The ONLY per-target difference is step 7: a RUNNABLE target (in RUNNERS) is executed for the
+  # smoke; a COMPILE-ONLY target (a foreign-OS binary this host can't exec) is verified to have
+  # EMITTED a binary and is not run.
   if [[ -n "${RUNNERS[$label]+set}" ]]; then
     local_kind="sqlite3.c + shell.c (2-TU → runnable sqlite3)"
   else
     local_kind="sqlite3.c + shell.c (2-TU → binary emitted; foreign-OS, not run here)"
   fi
-  info "[$label] $spec — $local_kind"
-  # ⚠ GOTCHA (probe a6b65f8b): dss-code-prime returns EXIT 0 even on FATAL compile
-  # errors. So success CANNOT be read from `$?` — it is read from the DIAGNOSTICS.
-  # A clean compile emits NO `error[CODE]:` lines; any `error[` in the merged
-  # stdout+stderr log means the frontier stopped this target. Run the compile
-  # unconditionally (its rc is unreliable either way), then classify by grep.
-  # `--time` asks the compiler to self-report its wall-clock (surfaced below).
-  # The pe64 target now compiles sqlite with NO extra defines. Both former knobs are
-  # closed by real compiler support: SQLITE_DISABLE_INTRINSIC dropped at c113 (DSS
-  # resolves <intrin.h> via the pe-gated shippedLibs/intrin.json descriptor and lowers
-  # __umulh + _ReadWriteBarrier as builtin intrinsics), and SQLITE_OMIT_SEH dropped at
-  # c116 (DSS implements the MSVC x64 SEH __try/__except: c114 .pdata/.xdata, c115 the
-  # __try/__except frontend, c116 the filter FUNCLETS + __C_specific_handler scope
-  # tables + H1 parent-local recovery — the wal.c SEH_TRY/SEH_EXCEPT WAL-recovery
-  # guards now CATCH an EXCEPTION_IN_PAGE_ERROR on the mmap'd wal-index → SQLITE_IOERR,
-  # exactly like an MSVC build). The pe64 sqlite compile is now define-free, matching
-  # the ELF/Mach-O legs. (D-WIN64-SEH-FUNCLETS / D-WIN64-XMM-UNWIND-RESTORE.)
-  declare -a defines=()
-  "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
-  # Success = NO `error[` diagnostics AND a real `sqlite3` binary was emitted (not just
-  # the compile.log). The 2-TU build has a `main`, so every clean target emits one.
-  emitted_bin="$(find "$outd" -maxdepth 1 -type f -name 'sqlite3*' -print -quit 2>/dev/null)"
+  log="$(leg_log "$label" "$spec")"
+  if leg_is_elf "$spec"; then
+    # already built above in the SHARED ELF invocation; classify this leg from the merged log +
+    # its OWN <formatName>/ artifact (fault-isolated per-leg by whether ITS binary emitted).
+    info "[$label] $spec — $local_kind (shared ELF invocation)"
+  else
+    # pe64 / macho: its OWN single-target invocation, flat output at $OUT_DIR/<label>.
+    outd="$OUT_DIR/$label"; mkdir -p "$outd"
+    info "[$label] $spec — $local_kind"
+    "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
+  fi
+  # Success = NO `error[` diagnostics AND a real `sqlite3` binary was emitted (not just the
+  # compile.log). The 2-TU build has a `main`, so every clean target emits one. Merged ELF legs
+  # read their binary from $OUT_DIR/<formatName>/; pe64/macho from $OUT_DIR/<label>. The `|| true`
+  # keeps a missing-dir find (a compile that never reached codegen) fail-loud, not set -e-fatal.
+  bindir="$(leg_bindir "$label" "$spec")"
+  emitted_bin="$(find "$bindir" -maxdepth 1 -type f -name 'sqlite3*' -print -quit 2>/dev/null || true)"
   if grep -qE 'error\[' "$log" || [[ -z "$emitted_bin" ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
-    # A RUNNABLE target's compile miss is a FATAL regression of the sqlite-RUN-green
-    # goal. A COMPILE-ONLY target's miss is a real cross-OS BUILD gap (surfaced below,
-    # non-fatal to the runnable-leg exit — those legs are the RUN-green gate here).
+    # A RUNNABLE target's compile miss is a FATAL regression of the sqlite-RUN-green goal. A
+    # COMPILE-ONLY target's miss is a real cross-OS BUILD gap (non-fatal to the runnable-leg exit).
     if [[ -n "${RUNNERS[$label]+set}" ]]; then
       RUNNABLE_COMPILE_FAILS=$((RUNNABLE_COMPILE_FAILS + 1))
     fi
@@ -409,7 +455,7 @@ for entry in "${TARGETS[@]}"; do
       warn "[$label] compile FAILED$(compile_time_suffix "$log") — first diagnostics from $log:"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
     else
-      warn "[$label] compile FAILED$(compile_time_suffix "$log") — 0 error[ diagnostics but no sqlite3 binary emitted under $outd"
+      warn "[$label] compile FAILED$(compile_time_suffix "$log") — 0 error[ diagnostics but no sqlite3 binary emitted under $bindir"
     fi
   else
     COMPILED["$label"]=1
@@ -447,17 +493,20 @@ run_target() {                    # run_target <label> <binary> <args...>  (stdi
   fi
 }
 for entry in "${TARGETS[@]}"; do
-  label="${entry%%=*}"
+  label="${entry%%=*}"; spec="${entry#*=}"
   # Only RUNNABLE targets are smoke-tested; compile-only ones (windows/macos) skip.
   [[ -n "${RUNNERS[$label]+set}" ]] || continue
   if [[ "${COMPILED[$label]:-0}" != "1" ]]; then
     SMOKE["$label"]="skipped (compile failed)"; warn "[$label] smoke skipped — step 6 did not compile it"
     continue
   fi
-  bin="$(find "$OUT_DIR/$label" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null)"
+  # Merged ELF legs live at $OUT_DIR/<formatName>/ (multi-target routing); pe64/macho at
+  # $OUT_DIR/<label> (flat single-target). leg_bindir resolves the right one per leg.
+  bindir="$(leg_bindir "$label" "$spec")"
+  bin="$(find "$bindir" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null)"
   if [[ -z "$bin" ]]; then
     SMOKE["$label"]="FAIL:no runnable artifact emitted"; SMOKE_FAILS=$((SMOKE_FAILS + 1))
-    warn "[$label] smoke FAIL — no runnable artifact under $OUT_DIR/$label"
+    warn "[$label] smoke FAIL — no runnable artifact under $bindir"
     continue
   fi
   # (1) SQL round-trip: pipe the smoke SQL on stdin, expect exactly "42".
@@ -487,14 +536,16 @@ printf '   compiler : %s @ %s\n' "$DSS_BIN" "$(git -C "$SRC_DIR" rev-parse --sho
 printf '   sqlite   : %s @ %s\n' "$AMALGAMATION" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
 printf '   outputs  : %s\n' "$OUT_DIR"
 for entry in "${TARGETS[@]}"; do
-  label="${entry%%=*}"
+  label="${entry%%=*}"; spec="${entry#*=}"
   compiled="no"; [[ "${COMPILED[$label]:-0}" == "1" ]] && compiled="yes"
   runnable="compile-only"; [[ -n "${RUNNERS[$label]+set}" ]] && runnable="runnable"
   smoke="${SMOKE[$label]:--}"       # "-" for compile-only targets (no smoke)
   if [[ "$compiled" == "yes" ]]; then
     printf '   %-11s : %scompiled%s (%s)  smoke: %s\n' "$label" "$C_GRN" "$C_RST" "$runnable" "$smoke"
   else
-    printf '   %-11s : %sFAILED%s (%s)  see %s/%s/compile.log\n' "$label" "$C_RED" "$C_RST" "$runnable" "$OUT_DIR" "$label"
+    # leg_log resolves the right log: the merged ELF legs share $ELF_LOG; pe64/macho keep
+    # their own $OUT_DIR/<label>/compile.log.
+    printf '   %-11s : %sFAILED%s (%s)  see %s\n' "$label" "$C_RED" "$C_RST" "$runnable" "$(leg_log "$label" "$spec")"
   fi
 done
 

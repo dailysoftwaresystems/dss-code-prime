@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C5 2026-07-17): the RUN witness for the TCL command-introspection layer (Tcl_CmdInfo struct + Tcl_GetCommandInfo/SetCommandInfo/DeleteCommand). The FIRST field-access shipped struct in tcl.json: DSS models Tcl_CmdInfo's 8 fields so `info.isNativeObjectProc`/`info.clientData` resolve + libtcl fills it at the ABI offsets. Registers a command, introspects it (Tcl_GetCommandInfo fills info), asserts info.isNativeObjectProc==1 (a runtime layout witness — offset 0), writes a field + Tcl_SetCommandInfo, evals the command -> 42, deletes it. The Tcl_CmdInfo introspection shape test_backup.c uses. elf-x86_64 only; ubuntu x86_64 CI legs run it (libtcl8.6), native-arm64 arch-gates, win/macos compile-only. RED-ON-DISABLE: revert tcl.json's elf `library` to libc.so.6 -> undefined symbol at load, exit 127.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-cmdinfo-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-cmdinfo-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

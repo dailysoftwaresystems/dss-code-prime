@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C9 2026-07-17): RUN witness for the 39 exported Tcl_* FUNCTIONS + flag macros added to tcl.json (the dominant S0001 'undeclared identifier' blocker after C8 -- 12/44 src/test*.c). A command builds a Tcl list from string objs (Tcl_NewObj/Tcl_ListObjAppendElement/Tcl_NewStringObj), reads it (Tcl_ListObjLength/Tcl_ListObjIndex/Tcl_GetIntFromObj), sums 40+2=42; libtcl calls it back. main uses Tcl_SetVar + TCL_GLOBAL_ONLY + Tcl_ResetResult. Tcl_Incr/DecrRefCount are macros NOT exported by libtcl (deferred D-FFI-TCL-REFCOUNT-MACROS), so they are NOT used here. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 legs run it, native-arm64 arch-gates, windows/macos compile-only. RED-ON-DISABLE: remove a used Tcl_* symbol from tcl.json -> S0001 -> fails to compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-listfuncs-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-listfuncs-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

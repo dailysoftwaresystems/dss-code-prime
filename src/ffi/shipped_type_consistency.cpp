@@ -202,6 +202,14 @@ bool ShippedTypeConsistency::add(std::string_view            origin,
         walk(st.typeId, origin, reporter, ok);
         for (auto const& f : st.fields) walk(f.type, origin, reporter, ok);
     }
+    // `unions` entries: the named-member sibling of `structs` — walk the interned
+    // union tag + each member type through the SAME per-target byte-identity check
+    // (a union `key.objPtr : ptr<Tcl_Obj>` must resolve Tcl_Obj identically to the
+    // typedef, or first-wins injection would strand a divergent, field-scope-less type).
+    for (auto const& un : desc.unions) {
+        walk(un.typeId, origin, reporter, ok);
+        for (auto const& f : un.fields) walk(f.type, origin, reporter, ok);
+    }
     // PER-SYMBOL availability, exactly as the analyzer gates injection: a symbol
     // absent on this format declares nothing here (threads.json ships three
     // per-format `tss_get` rows whose parameter identity differs BY DESIGN —

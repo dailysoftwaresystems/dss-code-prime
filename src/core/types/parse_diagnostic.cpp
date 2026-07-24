@@ -221,6 +221,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_LongDoubleFormatUndeclared";
         case DiagnosticCode::S_InlineAsmNonEmptyTemplate:
             return "S_InlineAsmNonEmptyTemplate";
+        case DiagnosticCode::S_BitfieldMutationUnsupportedBase:
+            return "S_BitfieldMutationUnsupportedBase";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -332,6 +334,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_ArtifactProfileFormatMismatch: return "D_ArtifactProfileFormatMismatch";
         case DiagnosticCode::D_DefineRequiresPreprocess:     return "D_DefineRequiresPreprocess";
         case DiagnosticCode::D_StaticLibFatArchiveUnsupported: return "D_StaticLibFatArchiveUnsupported";
+        case DiagnosticCode::D_CompileUnitNullNoDiagnostic:  return "D_CompileUnitNullNoDiagnostic";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

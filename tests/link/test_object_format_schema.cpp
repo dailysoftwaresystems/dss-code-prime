@@ -192,6 +192,82 @@ TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheAbiTruthTable) {
     }
 }
 
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 relocatable +
+// static-archive formats declare `externAddrBinding: "got"` AND the two
+// GOT-address reloc rows (R_AARCH64_ADR_GOT_PAGE kind 7 nativeId 311,
+// R_AARCH64_LD64_GOT_LO12_NC kind 8 nativeId 312 — kind-coherent with
+// arm64.target.json's `adr_got_page`/`ld64_got_lo12` rows so the assembler's
+// `relocationKind` wire resolves).
+TEST(ObjectFormatSchemaLoader, Arm64RelocatableFormatsDeclareGotExternAddr) {
+    for (char const* name : {"elf64-aarch64-linux",
+                             "elf64-aarch64-linux-staticlib"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        ASSERT_TRUE((*r)->externAddrBinding().has_value()) << name;
+        EXPECT_EQ(*(*r)->externAddrBinding(), ExternAddrBinding::Got) << name;
+
+        auto const* page = (*r)->relocationByName("R_AARCH64_ADR_GOT_PAGE");
+        ASSERT_NE(page, nullptr) << name;
+        EXPECT_EQ(page->kind, RelocationKind{7}) << name;
+        EXPECT_EQ(page->nativeId, 311u) << name;
+
+        auto const* lo12 = (*r)->relocationByName("R_AARCH64_LD64_GOT_LO12_NC");
+        ASSERT_NE(lo12, nullptr) << name;
+        EXPECT_EQ(lo12->kind, RelocationKind{8}) << name;
+        EXPECT_EQ(lo12->nativeId, 312u) << name;
+    }
+}
+
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) NEUTRALITY: the DSS-LINKED
+// arm64 formats (exec / pie / dyn) do NOT declare externAddrBinding — they
+// materialize an extern's address via copy-relocation (exec) / the c117
+// DSS-local __got slot (pie/dyn), never the foreign-linker GOT macro. Pins
+// that only the relocatable + static-archive formats opted in (closure gate
+// #1: exec/pie/dyn output byte-identical).
+TEST(ObjectFormatSchemaLoader, DssLinkedArm64FormatsOmitExternAddrBinding) {
+    for (char const* name : {"elf64-aarch64-linux-exec",
+                             "elf64-aarch64-linux-pie",
+                             "elf64-aarch64-linux-dyn"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        EXPECT_FALSE((*r)->externAddrBinding().has_value())
+            << name << " must NOT declare externAddrBinding (neutrality).";
+    }
+}
+
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): loader round-trip + strict
+// closed-enum rejection — "got" parses; a typo fails LOUD (never a silent
+// degrade to "no GOT-address support"), mirroring externCallDispatch /
+// dataImportBinding.
+TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
+    auto ok = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": { "name": "x", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
+      "externAddrBinding": "got",
+      "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
+    })");
+    ASSERT_TRUE(ok.has_value());
+    ASSERT_TRUE((*ok)->externAddrBinding().has_value());
+    EXPECT_EQ(*(*ok)->externAddrBinding(), ExternAddrBinding::Got);
+
+    // Identical schema except the externAddrBinding VALUE is a typo — must
+    // fail LOUD (the only difference from the valid schema above, so the
+    // rejection is attributable to the closed-enum check, not a missing
+    // field).
+    auto bad = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": { "name": "x", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
+      "externAddrBinding": "plt",
+      "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
+    })");
+    EXPECT_FALSE(bad.has_value())
+        << "an unknown externAddrBinding value must fail loud.";
+}
+
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,

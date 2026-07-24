@@ -4,9 +4,9 @@
 // the matching `*.out.jsonl` golden. `DSS_REFRESH_GOLDENS=1`
 // writes goldens; otherwise a missing golden fails loudly.
 
+#include "core/substrate/thread_pool.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
-#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 #include "lsp_test_helpers.hpp"
 
@@ -26,7 +26,7 @@
 
 using dss::lsp::LspServer;
 using dss::lsp::SchemaCache;
-using dss::lsp::SynchronousExecutor;
+using dss::substrate::SynchronousExecutor;
 using dss::lsp::testing::InMemoryTransport;
 
 namespace fs = std::filesystem;

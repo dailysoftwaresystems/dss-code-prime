@@ -1099,6 +1099,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // diagnostic if a target is asked to lay out an aggregate without declaring
     // its params — a silent wrong-layout is thereby still impossible.
 
+    // ── charIsUnsigned (TF-C56, D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) ──
+    // Whether bare `char` is UNSIGNED on this target (`"charIsUnsigned": true`).
+    // OPTIONAL scalar bool; ABSENT ⇒ false = signed (the x86_64/pe64 default,
+    // the C-common choice). arm64 declares true (the AArch64 ABI rule). A
+    // present value MUST be a boolean (a malformed value fails loud rather than
+    // silently picking a signedness — the two produce opposite high-bit
+    // extensions, a silent-miscompile axis).
+    if (doc.contains("charIsUnsigned")) {
+        if (!doc.at("charIsUnsigned").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/charIsUnsigned",
+                      "'charIsUnsigned' must be a boolean");
+        } else {
+            data.charIsUnsigned = doc.at("charIsUnsigned").get<bool>();
+        }
+    }
+
     // ── tls identity (TLS C1, D-CSUBSET-THREAD-LOCAL — optional) ──
     // The target's static-TLS layout convention: `"tls": { "variant":
     // "variant1"|"variant2", "tcbHeaderBytes": N }`. OPTIONAL like

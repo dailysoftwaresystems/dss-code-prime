@@ -270,6 +270,14 @@ struct DSS_EXPORT CuMirModule {
     // stdout) materializes its address (got-indirect → lea-of-slot + deref).
     // nullopt iff the format declared none (data imports fail loud at link).
     std::optional<DataImportBinding> dataImportBinding;
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the active object
+    // format's extern-ADDRESS materialization binding (`got`), captured
+    // here for the SAME reason as `dataImportBinding` — the LOWER half's
+    // MIR→LIR GlobalAddr value-form arm routes an `&extern` VALUE through
+    // the arm64 GOT-address macro from it. nullopt iff the format declared
+    // none (the ordinary lea — foreign-PIE-safe only for a DSS exec /
+    // x86_64).
+    std::optional<ExternAddrBinding> externAddrBinding;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the active object format's
     // thread-local access block, captured here for the SAME reason as
     // `dataImportBinding` — the LOWER half's MIR→LIR GlobalAddr lowering
@@ -380,6 +388,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding (nullopt = this leg
+                      // has no GOT-address model — an `&extern` value takes
+                      // the ordinary lea).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                       // thread-local access block (nullopt = this leg has
                       // no TLS machinery — MIR→LIR fails loud on a
@@ -449,6 +462,31 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          TargetSchema const&                    target,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
+
+// The members extracted from one-or-more input static archives (parallel):
+// `modules[i]` is a mergeable relocatable object, `names[i]` its `ar` file name.
+struct ExtractedArchiveMembers {
+    std::vector<AssembledModule> modules;
+    std::vector<std::string>     names;   // parallel to `modules`
+};
+
+// Extract EVERY member of each input static `ar` archive (whole-archive), each
+// parsed into a mergeable `AssembledModule` via the same per-format reader the
+// lazy pull uses. Unlike `pullStaticArchiveMembers` (which pulls only the
+// referenced members for an exe/final LINK), this carries ALL members -- a
+// static LIBRARY is a package: a DOWNSTREAM link must be able to pull any of
+// them, so dropping an unreferenced member would silently ship an incomplete
+// library. This is how a merged/"fat" static library bundles the input archives
+// it was handed (D-FF1-STATICLIB-FAT-ARCHIVE): the driver appends these to its
+// own CU-derived members before `linkAndWriteStaticArchive`. Returns `nullopt`
+// (fail loud via `reporter`) on any file-open / archive-parse / member-read
+// failure -- never a silent member omission. An empty `archivePaths` yields an
+// empty result (a valid no-op).
+[[nodiscard]] DSS_EXPORT std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter);
 
 // Link `clientModule` against zero-or-more static `ar` archives, then write the
 // image to `outPath`. When `staticArchives` is empty this is exactly

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-LINK-EXTERN-IMPORT-REFERENCE-GATE (TF-C44, SQLite testfixture-link sub-arc): RUN witness that an UNREFERENCED non-eager `extern` function declaration (`never_referenced_fn`, declared + never called) emits NO dynamic import. Before the fix, DSS's explicit-`extern` producer 3-field-inited HirExternRecord (noLibraryBinding=false), so the FFI synth AUTO-BOUND the symbol to the ELF format-default libc.so.6 and that library-bound row BYPASSED the linker's reference gate (which only touched zero-library rows) -> the ELF dynamic walker emitted a real import -> ld.so failed at LOAD with `undefined symbol: never_referenced_fn` (exit 127). After the fix, `rejectOrDropUnreferencedExterns` DROPS an unreferenced NON-EAGER import whether or not a library bound it (an EAGER `#include`d descriptor import is still kept -> D-FFI-DESCRIPTOR-EAGER-IMPORT untouched) -> the binary carries no spurious import -> it LOADS -> exit 42. This is the shape of the testfixture's declared-but-never-called `Sqlitetestsse_Init`, the sole load-blocker. The `release` optimizedPipeline arm witnesses the shipped optimizer over the dropped-import module. RED-ON-DISABLE: revert the gate to only touch zero-library rows -> never_referenced_fn binds libc.so.6, survives to the walker, and this ELF fails to LOAD (127) instead of 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

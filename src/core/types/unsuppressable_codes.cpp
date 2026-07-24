@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 124> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -546,6 +546,13 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // a silent no-op barrier — the instructions vanish, a miscompile. Same silent-
     // miscompile-guard class as the S_Vla* / S_AtomicNonLockFree siblings above.
     DiagnosticCode::S_InlineAsmNonEmptyTemplate,
+    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
+    // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
+    // member or array-arrow base. Suppressed, the mutation falls to the generic
+    // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
+    // truncation — a silent miscompile. Same silent-miscompile-guard class as the
+    // S_Vla* / S_InlineAsmNonEmptyTemplate siblings above.
+    DiagnosticCode::S_BitfieldMutationUnsupportedBase,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

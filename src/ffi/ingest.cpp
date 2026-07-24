@@ -373,6 +373,11 @@ ingest(std::span<IngestionSource const> sources,
         // (FF1 is the binary-reader ingestion path), but a versioned
         // ExternDeclRef routed here must not silently drop its version.
         meta.version = std::string{ext.version};
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
+        // with the FF5 source-decl path). Eager imports flow through
+        // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
+        // eager ExternDeclRef routed here must not silently drop the field.
+        meta.isEagerImport = ext.isEagerImport;
         // The raw embedded soname, at its semantic home (the DT_SONAME of
         // `importLibrary`). Populated now that the FF1 readers extract it;
         // `ExternImport` carries no separate soname yet, so DT_NEEDED rides
@@ -500,6 +505,10 @@ synthesizeFfiFromSourceDecls(
         // reader. Rides to the MIR ExternImport → the ELF writer's
         // .gnu.version_r. Empty (the default) ⇒ unversioned.
         meta.version = std::string{ext.version};
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (producer
+        // C shipped-descriptor imports) to the MIR ExternImport → the linker's
+        // reference gate, which keeps an eager row even when unreferenced.
+        meta.isEagerImport = ext.isEagerImport;
         // `soname` left empty — same convention as `ingest()`.
 
         ffiMap.set(ext.node, std::move(meta));

@@ -99,6 +99,22 @@ struct DSS_EXPORT ExternImport {
     // Meaningless (stays empty) on formats that carry no symbol versioning
     // (PE/Mach-O ignore it). Rides the LK11 merge's whole-row copy for free.
     std::string   version;
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — a shipped-
+    // library descriptor symbol (a `#include`d library export) DSS binds even
+    // when UNREFERENCED (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). The
+    // linker's reference gate (`rejectOrDropUnreferencedExterns`) KEEPS an eager
+    // row unconditionally; a NON-eager import (a source `extern` decl / bare-
+    // proto synthesis) survives ONLY when a relocation references it — gcc's
+    // "an unused extern declaration emits no import" rule, now uniform across
+    // library-bound AND no-library rows. Set at HIR→MIR from
+    // `FfiMetadata.isEagerImport`; rides the MIR merge's whole-row copy, and the
+    // merge OR-combines it when collapsing duplicate rows of one name (an eager
+    // `#include`d symbol + a hand-written non-eager `extern` of the same name
+    // yields an eager surviving row — order-independent). INVARIANT:
+    // isEagerImport ⟹ non-empty `libraryPath` (a descriptor always ships a
+    // library); the flag never rides an unbound row. FALSE for every non-
+    // descriptor producer (the format-AGNOSTIC default — no arch/format branch).
+    bool          isEagerImport = false;
 };
 
 } // namespace dss

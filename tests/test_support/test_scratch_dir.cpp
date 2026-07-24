@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -65,6 +66,55 @@ TEST(ScratchDirSubstrate, DifferentGroupsLandUnderDifferentSubdirs) {
     ScratchDir a{Location::Temp, "scratch-dir-group-alpha"};
     ScratchDir b{Location::Temp, "scratch-dir-group-beta"};
     EXPECT_NE(a.path().parent_path(), b.path().parent_path());
+}
+
+// TF-C58 (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`) red-on-disable.
+// A STALE directory sitting on the slot the ctor is about to draw must be
+// STEPPED OVER, never reused. `MultipleScratchDirsGetDistinctPaths` above does
+// NOT catch this — the counter advances anyway, so it stayed green through the
+// entire lifetime of the bug. The real failure mode is a directory left behind
+// by a killed run (or a recycled PID), which the old `create_directories` call
+// reported as success: the new ScratchDir then SHARED it and the first
+// `copy_file` died with "File exists", surfacing as a non-deterministic ctest
+// red on a different example each run.
+//
+// The slot is predicted from a probe ScratchDir's own filename, so this pins
+// real ctor behaviour rather than a re-derived path formula.
+// RED-ON-DISABLE: restore `create_directories(path_, ec)` — the ctor then
+// hands back the pre-created stale path and BOTH expectations fail.
+TEST(ScratchDirSubstrate, StaleDirectoryOnTheNextSlotIsNotReused) {
+    fs::path base;
+    std::uint64_t nextIdx = 0;
+    std::string   pidPart;
+    {
+        ScratchDir probe{Location::Temp, "scratch-dir-stale-slot"};
+        base = probe.path().parent_path();
+        auto const name = probe.path().filename().string();
+        auto const dash = name.rfind('-');
+        ASSERT_NE(dash, std::string::npos) << "unexpected slot name: " << name;
+        pidPart = name.substr(0, dash);
+        nextIdx = std::stoull(name.substr(dash + 1)) + 1;
+    }
+
+    // Plant a stale directory (with content, like a killed run would leave)
+    // exactly where the next ScratchDir would land.
+    fs::path const stale = base / (pidPart + "-" + std::to_string(nextIdx));
+    std::error_code ec;
+    fs::create_directories(stale, ec);
+    ASSERT_FALSE(ec) << "could not plant stale dir: " << ec.message();
+    { std::ofstream marker{stale / "main.c"}; marker << "stale\n"; }
+    ASSERT_TRUE(fs::exists(stale / "main.c"));
+
+    {
+        ScratchDir fresh{Location::Temp, "scratch-dir-stale-slot"};
+        EXPECT_NE(fresh.path(), stale)
+            << "ctor reused a stale directory instead of claiming a new slot";
+        EXPECT_TRUE(fs::is_empty(fresh.path()))
+            << "scratch dir must start empty; got a directory holding "
+               "another run's leftovers";
+    }
+
+    fs::remove_all(stale, ec);
 }
 
 // originalCwd accessor pins the captured cwd for tests that need

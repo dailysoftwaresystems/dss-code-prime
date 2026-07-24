@@ -13,6 +13,12 @@
 #include <string>
 #include <vector>
 
+// D-PERF-4-CU-PARALLELISM: forward-declare the substrate executor so the
+// injection surface below is a bare pointer member — no need to pull the
+// thread-pool header (with <thread>/<condition_variable>) into every
+// program.hpp consumer. The compile driver includes the full header.
+namespace dss::substrate { class IExecutor; }
+
 namespace dss {
 
 // Route decision for a list of source files — the SINGLE source of
@@ -191,6 +197,15 @@ public:
         return userDefines_;
     }
 
+    /// The CLI `-I<dir>` / `--include-dir <dir>` quote-include search path
+    /// (the C 6.10.2 quote form), stamped from `CliArgs::includeDirs` by
+    /// `Program::run` before dispatch (the setUserDefines pattern). Every CU
+    /// build threads them onto the `UnitBuilder` via `addIncludeDir`.
+    void setIncludeDirs(std::vector<std::string> d) { includeDirs_ = std::move(d); }
+    [[nodiscard]] std::vector<std::string> const& includeDirs() const noexcept {
+        return includeDirs_;
+    }
+
     /// c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` binaries
     /// whose export surfaces resolve + validate this run's source-declared
     /// externs. `Program::run` stamps this from `CliArgs::resolveLibraries`;
@@ -203,12 +218,36 @@ public:
     [[nodiscard]] std::vector<std::filesystem::path> const&
     resolveLibraries() const noexcept { return resolveLibraries_; }
 
+    /// D-PERF-4-CU-PARALLELISM: inject an executor for the per-CU build loop.
+    /// The N>1 path (`compileUnits`) builds every CU's MIR concurrently; each
+    /// `buildCuMir` is a pure per-CU function (own interner/arenas/SemanticModel
+    /// + a private scratch reporter), so the jobs share no mutable state and the
+    /// driver merges their diagnostics back in CU (source) ORDER after the join
+    /// — byte-deterministic regardless of thread scheduling. Tests inject a
+    /// `SynchronousExecutor` (the single-threaded reference the pool path is
+    /// compared against) or a `ThreadPool`. nullptr (the default) ⇒ the driver
+    /// constructs an internal pool sized from `--jobs` / hardware_concurrency.
+    /// NON-OWNING: the caller owns the executor's lifetime across the compile
+    /// call (mirrors the `pipelineOverride` non-owning-injection pattern).
+    void setExecutor(substrate::IExecutor* e) noexcept { executor_ = e; }
+    [[nodiscard]] substrate::IExecutor* executor() const noexcept { return executor_; }
+
+    /// D-PERF-4-CU-PARALLELISM: the CLI `--jobs N` worker-count override for the
+    /// INTERNAL per-CU build pool (ignored when an executor is injected via
+    /// `setExecutor`). 0 (the default) ⇒ auto = min(hardware_concurrency, CU
+    /// count, 16). `Program::run` stamps this from `CliArgs::jobs`.
+    void setJobs(unsigned n) noexcept { jobs_ = n; }
+    [[nodiscard]] unsigned jobs() const noexcept { return jobs_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define
+    std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
     std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
+    substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
+    unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
 };
 
 } // namespace dss

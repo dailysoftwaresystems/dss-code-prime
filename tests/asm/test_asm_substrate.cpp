@@ -52,7 +52,12 @@ TEST(AsmSubstrate, EmptyLirProducesEmptyAssembledModule) {
     auto result = assemble(empty, **schema, {}, rep);
     EXPECT_TRUE(result.functions.empty());
     EXPECT_EQ(result.expectedFuncCount, 0u);
-    EXPECT_FALSE(result.ok());
+    // D-CSUBSET-TESTTU-SILENT-EXIT1: an empty module is a VALID success
+    // (0 == 0) — a declaration-only TU lowers to a valid empty relocatable
+    // object. RED-ON-DISABLE: restoring the `expectedFuncCount > 0` clause in
+    // AssembledModule::ok() makes this false again (and silently rejects the
+    // whole compile of any declaration-only TU).
+    EXPECT_TRUE(result.ok());
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
@@ -367,13 +372,15 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
     // ok() is the SHAPE check (parallel-index intact), not the
     // SUCCESS check (no encoding errors). Callers that need
     // "every byte encoded successfully" must also check
-    // reporter.errorCount() == 0. Pin BOTH the happy-path shape
-    // AND the broken-shape — a function-count of 0 (default-
-    // constructed module) and a partial run (expectedFuncCount
-    // populated but functions vector shorter) must both report
-    // not-ok.
+    // reporter.errorCount() == 0. Pin the happy-path shape, the
+    // valid-EMPTY shape, AND the broken shape: a MISMATCH
+    // (expectedFuncCount populated but functions vector shorter)
+    // reports not-ok, while a genuinely EMPTY module (0 == 0) is a
+    // VALID success (D-CSUBSET-TESTTU-SILENT-EXIT1).
     AssembledModule empty;
-    EXPECT_FALSE(empty.ok());
+    // RED-ON-DISABLE: restoring `expectedFuncCount > 0` in
+    // AssembledModule::ok() flips this back to false (the silent-reject bug).
+    EXPECT_TRUE(empty.ok()) << "empty (0 == 0) is a valid empty relocatable object";
 
     AssembledModule populated;
     populated.functions.resize(2);
@@ -388,8 +395,8 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
     AssembledModule expectedZero;
     expectedZero.functions.resize(0);
     expectedZero.expectedFuncCount = 0;
-    EXPECT_FALSE(expectedZero.ok())
-        << "empty input is not 'ok' — caller distinguishes via expectedFuncCount";
+    EXPECT_TRUE(expectedZero.ok())
+        << "0 == 0 is a valid empty module (a declaration-only TU)";
 }
 
 // ── Substrate surface: cycle-1 fail-loud diagnostics ──────────────────
@@ -1301,6 +1308,55 @@ TEST(AsmDataSection, MutableSymbolAddressGlobalLowersToData) {
     EXPECT_EQ(r.items[0].section, DataSectionKind::Data)
         << "a mutable symbol-address global stays writable .data";
     EXPECT_FALSE(r.items[0].relocations.empty());
+}
+
+// TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): the DECODE-level proof that an
+// int→ptr absolute-address leaf and a symbol-address (reloc) leaf coexist in ONE
+// aggregate — the `{ "a", (void*)0x5 }` mix. `.a` (offset 0) emits an abs64
+// RELOCATION over a pre-zeroed slot (the linker writes the string's VA); `.b`
+// (offset 8) emits 8 RAW LE bytes (5,0,…) with NO relocation. Byte-exact companion
+// to the end-to-end MIR pin StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf:
+// the classifier produces this MirAggregateValue shape; here the encoder writes it.
+// A plain uint64 Ptr leaf rides the scalar-leaf arm (decodeScalarLiteralBits) — the
+// SAME arm the c80 null-pointer leaf uses, here proven for a NON-zero value.
+TEST(AsmAggregateGlobal, IntToPtrLeafBesideSymbolEncodesRawBytesPlusReloc) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const ptr = ti.pointer(ti.primitive(TypeKind::Void));
+    std::array<TypeId, 2> const f{ptr, ptr};
+    TypeId const s = ti.structType("MixTwo", f);
+    // field 0: a link-time symbol address (a string's rodata global) → reloc.
+    MirLiteralValue sym;
+    sym.value = MirSymbolAddrValue{/*symbol=*/2u, /*addend=*/0};
+    sym.core  = TypeKind::Ptr;
+    // field 1: an int→ptr absolute-address leaf (the classifier's output) → raw bytes.
+    MirLiteralValue itp;
+    itp.value = std::uint64_t{5};
+    itp.core  = TypeKind::Ptr;
+    MirBuilder b;
+    std::uint32_t const lit =
+        b.literalPoolAdd(aggOf({std::move(sym), std::move(itp)}, TypeKind::Struct));
+    b.addGlobal(s, SymbolId{1}, lit, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto const items = lowerMirGlobalsToDataItems(m, ti, kNatural16, DataModel::Lp64,
+                                                  rep, RelocationKind{7});
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(items.size(), 1u);
+    ASSERT_EQ(items[0].bytes.size(), 16u) << "two 8-byte pointer slots";
+    // `.b` (offset 8) holds the raw LE absolute address 5 — NO relocation.
+    std::vector<std::uint8_t> const bTail(items[0].bytes.begin() + 8,
+                                          items[0].bytes.end());
+    std::vector<std::uint8_t> const expectB{5, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(bTail, expectB) << "int→ptr leaf = 8 raw LE bytes at offset 8";
+    // `.a` (offset 0) is a pre-zeroed slot with ONE abs64 relocation.
+    ASSERT_EQ(items[0].relocations.size(), 1u) << "exactly one reloc — the symbol field";
+    EXPECT_EQ(items[0].relocations[0].offset, 0u) << "the reloc sits at the .a symbol slot";
+    EXPECT_EQ(items[0].relocations[0].target.v, 2u);
+    std::vector<std::uint8_t> const aHead(items[0].bytes.begin(),
+                                          items[0].bytes.begin() + 8);
+    std::vector<std::uint8_t> const zero8{0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(aHead, zero8) << "the symbol slot stays zero (linker writes the VA)";
 }
 
 // A TENTATIVE (zero-init, no initializer) global lowers to `.bss` with EMPTY

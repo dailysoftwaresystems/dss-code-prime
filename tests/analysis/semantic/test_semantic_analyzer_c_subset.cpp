@@ -72,6 +72,143 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
 }
 
+// D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture): a file-scope
+// `extern` declaration whose type-specifier is a struct/union/enum aggregate now
+// PARSES (typeBase gained the structSpec/unionSpec/enumSpec arms — the extern path
+// via externDecl→typeRef→typeBase previously omitted them, so `extern struct Foo g;`
+// P0009'd while `static struct`/plain/typedef all worked) AND resolves the extern
+// symbol to the aggregate TypeId, exactly like a `static struct Foo g;` (the type
+// resolver dispatches on the composite node's own rule, not on externDecl — zero
+// semantic change). This is the dominant sqlite-testfixture compile blocker
+// (sqliteInt.h `extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`).
+// RED-ON-DISABLE: revert typeBase's alt list to {typeSpecifierSeq, Identifier,
+// typeofSpecifier} and `assertNoBuilderErrors` fails on the P0009 parse error for
+// every `extern struct/union/enum` line below. The enum form is covered ONLY here
+// (its GLOBAL codegen is a separate pre-existing gap, D-CSUBSET-ENUM-GLOBAL-CODEGEN,
+// so the runtime example extern_aggregate omits it); struct/union/const/pointer are
+// additionally witnessed end-to-end by that example.
+TEST(SemanticAnalyzerCSubset, ExternAggregateSpecifiersParse) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int v; };\n"
+        "union U { int a; };\n"
+        "enum E { EV = 1 };\n"
+        "extern struct S gS;\n"          // extern + struct tag  (was P0009 "got struct")
+        "extern union U gU;\n"           // extern + union tag   (was P0009 "got union")
+        "extern enum E gE;\n"            // extern + enum tag    (was P0009 "got enum")
+        "extern const struct S gC;\n"    // extern + const struct
+        "extern struct S *gP;\n"         // extern + pointer-to-struct
+        "extern struct SB { int w; } gB;\n"  // extern + struct DEFINITION (inline body form)
+    });
+    assertNoBuilderErrors(*cu);          // red-on-disable hook: every extern line above must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"gS", "gU", "gE", "gC", "gP", "gB"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "extern aggregate symbol '" << n << "' was not minted";
+        ASSERT_TRUE(r->type.valid()) << "extern aggregate symbol '" << n << "' has no resolved type";
+    }
+    EXPECT_EQ(in.kind(rec("gS")->type), TypeKind::Struct);
+    EXPECT_EQ(in.kind(rec("gU")->type), TypeKind::Union);
+    EXPECT_EQ(in.kind(rec("gE")->type), TypeKind::Enum);
+    EXPECT_EQ(in.kind(rec("gC")->type), TypeKind::Struct);  // const is a qualifier bit; base kind stays Struct
+    EXPECT_EQ(in.kind(rec("gP")->type), TypeKind::Ptr);     // pointer-to-struct decays to Ptr
+    EXPECT_EQ(in.kind(rec("gB")->type), TypeKind::Struct);  // inline struct-definition-in-extern (body form)
+}
+
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: a MULTI-declarator `extern` mints ONE
+// nonDefiningDeclaration symbol PER declarator, each with its OWN per-declarator
+// pointer/array suffix folded onto the shared head base type — `extern int a, b;`
+// mints a AND b (both int); `extern int *p, arr[3];` mints p (int*) and arr
+// (int[3]). RED-ON-DISABLE: reverting externDecl to the single-declarator spine
+// P0009's on the comma, so `assertNoBuilderErrors` fails (the decl won't parse);
+// a shared-head star (the retired `typeRef` spine) would type `arr`/`b` as Ptr too.
+TEST(SemanticAnalyzerCSubset, ExternMultiDeclaratorMintsPerDeclaratorSymbols) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int a, b;\n"          // two objects, ONE extern declaration
+        "extern int *p, arr[3];\n"    // per-declarator pointer (p) + array (arr)
+    });
+    assertNoBuilderErrors(*cu);       // red-on-disable: the multi-declarator externs must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"a", "b", "p", "arr"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "multi-declarator extern symbol '" << n
+                              << "' was not minted (one symbol per declarator)";
+        ASSERT_TRUE(r->type.valid()) << "extern symbol '" << n << "' has no type";
+        EXPECT_TRUE(r->isExternDeclaration)
+            << "extern symbol '" << n << "' must be a non-defining declaration";
+    }
+    // Per-declarator TYPES: the pointer/array suffix binds to its OWN declarator.
+    EXPECT_EQ(in.kind(rec("a")->type), TypeKind::I32);
+    EXPECT_EQ(in.kind(rec("b")->type), TypeKind::I32);   // NOT a pointer (no shared-head star)
+    EXPECT_EQ(in.kind(rec("p")->type), TypeKind::Ptr);   // `*p` — a pointer
+    EXPECT_EQ(in.kind(rec("arr")->type), TypeKind::Array); // `arr[3]` — an array, not int/ptr
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+// DEFINITION (`extern int f(int){…}`) mints a DEFINING Function (a body present),
+// NOT a non-defining declaration — despite externDecl's `nonDefiningDeclaration`
+// default. The kindByChild body-block discriminator upgrades effectiveKind to
+// Function, and the engine suppresses isExtern for a Function-kind declarator. It
+// contrasts with a bare `extern` PROTOTYPE (Variable-kind, isProto, isExtern — a
+// non-defining declaration) and mirrors a `static` DEFINITION (also Function-kind,
+// defining — the linkage difference is a MIR-tier concern, pinned separately).
+// RED-ON-DISABLE: revert externDeclTail's block arm -> `extern int efd(int x){…}`
+// P0009s (assertNoBuilderErrors fails); revert the isExtern-Function guard -> efd
+// becomes isExternDeclaration (this test's EXPECT_FALSE reds).
+TEST(SemanticAnalyzerCSubset, ExternFunctionDefinitionMintsDefiningFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int efd(int x){ return x + 1; }\n"   // extern DEFINITION (a body)
+        "extern int eproto(void);\n"                 // extern PROTOTYPE (no body)
+        "static int sfd(int x){ return x + 1; }\n"   // static DEFINITION (contrast)
+    });
+    assertNoBuilderErrors(*cu);   // red-on-disable: the extern DEFINITION must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    // The extern function DEFINITION: a DEFINING Function (a body present), NOT a
+    // non-defining declaration and NOT a syntactic prototype.
+    auto const* efd = rec("efd");
+    ASSERT_NE(efd, nullptr) << "the extern function definition must mint a symbol";
+    EXPECT_EQ(efd->kind, DeclarationKind::Function)
+        << "`extern int efd(int){…}` is a function DEFINITION (Function-kind)";
+    EXPECT_FALSE(efd->isExternDeclaration)
+        << "a definition is DEFINING — never a non-defining extern declaration";
+    EXPECT_FALSE(efd->isProtoDeclaration)
+        << "a definition (a body) is not a bare prototype";
+    // The bare extern PROTOTYPE: a NON-DEFINING declaration. Pass-1.5 upgrades a
+    // proto's kind to Function (D-CSUBSET-FN-PROTOTYPE) exactly as for a topLevel
+    // proto, so BOTH efd and eproto are Function-kind — the def-vs-declaration
+    // distinction is isProto/isExtern (below), NOT the kind. This is the contrast
+    // that matters: efd is defining (isExtern=false), eproto is not (isExtern=true).
+    auto const* eproto = rec("eproto");
+    ASSERT_NE(eproto, nullptr);
+    EXPECT_TRUE(eproto->isProtoDeclaration)
+        << "the bare `extern int eproto(void);` is a syntactic proto";
+    EXPECT_TRUE(eproto->isExternDeclaration)
+        << "the bare extern prototype is a NON-defining declaration (unlike the "
+           "extern DEFINITION efd, which is defining)";
+    // The `static` DEFINITION: also a DEFINING Function (contrast — same defining
+    // shape at the semantic tier; the internal-vs-external linkage lives at MIR).
+    auto const* sfd = rec("sfd");
+    ASSERT_NE(sfd, nullptr);
+    EXPECT_EQ(sfd->kind, DeclarationKind::Function);
+    EXPECT_FALSE(sfd->isExternDeclaration);
+}
+
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
 // `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
 // `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`
@@ -827,6 +964,33 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
            "c-subset (only void* gets the universal-pointer pass).";
 }
 
+// D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: `pointer - arrayName` (C 6.5.6p9 + 6.3.2.1p3) —
+// the array operand decays to Ptr<elem> FIRST, so the result is ptrdiff_t (an INTEGER),
+// not a pointer. Used UNCAST in an integer context (the FTS5 `zOut - aBuf` shape, a
+// token length passed as an int), it must be admitted. The semantic type-oracle
+// (subtreeType/combineBinary) previously required BOTH operands already Ptr and never
+// decayed an Array → `z - a` typed Ptr<char> → the int init failed isAssignable →
+// S_TypeMismatch. (The pointer_minus_array example only ever CAST the result
+// `(int)(t - arr)`, so the explicit cast masked this semantic gap.) Now the semantic arm
+// decays the array first, mirroring the HIR combineBinary c65 that already lowers it.
+// RED-ON-DISABLE: revert the semantic pointer-sub array-decay → the two UNCAST sites
+// (`z - a`, `a - z`) type Ptr/Array in an int context → this count becomes 2.
+TEST(SemanticAnalyzerCSubset, PointerMinusArrayTypesAsPointerDifferenceInt) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void){ char a[32]; char *z = a + 5;\n"
+        "  int p = z - a;\n"          // ptr - array   (uncast, integer context)
+        "  int q = a - z;\n"          // array - ptr
+        "  int r = (int)(z - a);\n"   // the CAST control — clean either way
+        "  return p + q + r; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
+           "decays first), not a pointer → S_TypeMismatch, in an uncast int context";
+}
+
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
 //    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
 //
@@ -1244,7 +1408,8 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsInit) {
 // BEHAVIOR (float-zero rejects), NOT the gate in isolation — removing the gate
 // leaves it green via the const-fold backstop. The gate is defense-in-depth that
 // additionally excludes a Char/Bool-typed fold the const-fold step would otherwise
-// fold to 0 (consistent with DSS typing comparisons as Bool, not C's int).
+// fold to 0 (e.g. a bare `_Bool`/`char`-typed constant — NOT a comparison, which
+// now types as C's int per D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE).
 TEST(SemanticAnalyzerCSubset, FloatZeroRejectsAsPointerArg) {
     auto cu = buildShippedUnit("c-subset", {
         "extern void f(void* p);\n"
@@ -2904,6 +3069,37 @@ TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
+// GROUP 10 — GROUPED declarators (D-CSUBSET-GROUPED-DECLARATOR-CONST closed with
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION): the object-forming pointer
+// layer hides inside redundant parens, so declaratorObjectIsConst must DESCEND
+// the group to find it. Each pin flips under revert (drop the group descent):
+// the grouped const-pointer stops violating; the grouped pointer-to-const starts
+// spuriously violating (the head-scan over-approximation returns).
+// `char (* const p)` ≡ `char * const p` — a const POINTER object → `p += 1`
+// violates. RED-ON-DISABLE: without the group descent the layer is invisible,
+// the object falls to the head scan (no const in `char`) → 0 violations.
+TEST(SemanticAnalyzerCSubset, GroupedConstPointerParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char (* const p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const char (*p)` ≡ `const char *p` — a MUTABLE pointer to const → `p += 1`
+// clean. RED-ON-DISABLE: without the group descent the object falls to the head
+// scan, which sees the head `const` and wrongly marks p const → a spurious
+// S_ConstViolation (the pre-fix over-approximation). This is the exact
+// D-CSUBSET-GROUPED-DECLARATOR-CONST closing pin (`const char (*p); p = 0;`).
+TEST(SemanticAnalyzerCSubset, GroupedPointerToConstParamIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char (*p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
 // aliased TypeId (I32). (c-subset's grammar parses the typedef DECL; the
 // alias-in-type-position USE site is exercised generically — see the
@@ -3882,6 +4078,62 @@ TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
 
+// C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): a shipped struct with a
+// UNION-typed field → `e.key.member` resolves to the member type. The union's
+// member NAMES get a `compositeScopeByType` field scope injected (the NEW mechanism
+// mirroring struct-field injection), so the nested `structValue.unionField.member`
+// access resolves — the exact shape of the real `Tcl_GetHashKey` macro's
+// `h->key.oneWordValue` / `h->key.string`. RED-ON-DISABLE: remove the `desc->unions`
+// injection loop in semantic_analyzer.cpp and `e.key.oneWordValue` fails
+// S_NotAComposite (the union value has no member scope).
+TEST(SemanticAnalyzerCSubset, ShippedUnionFieldMemberResolves) {
+    ScratchDir sysDir{Location::Temp, "c34b-union"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk.json",
+        R"JSON({ "header": "hk.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" },
+                 { "name": "Ent",  "type": "struct \"Ent\" { ptr<void>, KeyU }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ],
+             "structs": [ { "name": "Ent", "fields": [
+                 { "name": "cd",  "type": "ptr<void>" },
+                 { "name": "key", "type": "KeyU" } ] } ] })JSON",
+        "#include <hk.h>\n"
+        "int main(void) { Ent e; void *p = e.key.oneWordValue; char *q = e.key.str;"
+        " return (p != 0) + (q != 0); }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "e.key (a union value) must have a member scope so .oneWordValue resolves";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "oneWordValue/str resolve as union members";
+}
+
+// The fail-loud pin: an UNKNOWN union member is rejected. The union member scope IS
+// registered (so this is NOT a non-composite miss), but the member name is absent →
+// S_UndeclaredIdentifier, never a silent wrong-but-runs access.
+TEST(SemanticAnalyzerCSubset, ShippedUnknownUnionMemberFailsLoud) {
+    ScratchDir sysDir{Location::Temp, "c34b-union-bad"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk2.json",
+        R"JSON({ "header": "hk2.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ] })JSON",
+        "#include <hk2.h>\n"
+        "int main(void) { KeyU u; void *p = u.noSuchMember; return p != 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "KeyU IS a composite (union member scope registered) — not a non-composite miss";
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "an unknown union member must fail loud";
+}
+
 // GOAL-2: a user decl of a name WINS over a descriptor constant of the same
 // name — and the skip is SELECTIVE (a different descriptor constant the user
 // does NOT declare is still injected). The descriptor declares CHAR_BIT
@@ -3992,8 +4244,15 @@ TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
         "#include <io.h>\n"
         "int main() { puts(\"hi\"); return 0; }\n");
     ASSERT_EQ(cu->trees().size(), 1u);
-    // Two directives → two recorded descriptor paths (deduped at injection).
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 2u);
+    // Two directives resolving to the SAME descriptor → ONE recorded path
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups at RECORD time — a descriptor reached twice, whether transitively or,
+    // as here, directly-included-twice, is recorded once). The semantic injection
+    // loop's own canonical-path `readDescriptors` dedup already collapsed the
+    // second ref pre-change, so injections + diagnostics are byte-identical; only
+    // the redundant ref is no longer stored. RED-ON-DISABLE of the whole path stays
+    // the injection assertions below (puts minted exactly once).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);
@@ -4037,8 +4296,12 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
         "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     ASSERT_EQ(cu->trees().size(), 1u) << "descriptors are not parsed Trees";
-    // Six directives → six recorded paths (dup repeated); deduped at injection.
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 6u);
+    // Six directives, but `dup` is included TWICE → FIVE distinct recorded paths
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups the repeated `dup` at RECORD time; the semantic loop's canonical-path
+    // dedup already collapsed it pre-change, so the injection result below is
+    // byte-identical — only the redundant `dup` ref is no longer stored).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 5u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);
@@ -5485,6 +5748,135 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
         << "a forward call through a prototype is legal at the semantic tier";
     EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
         << "the prototype is upgraded to a callable Function symbol";
+}
+
+// ── C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE) — a `T x;` where T is a function TYPE
+// (via a typedef) declares a function PROTOTYPE (C 6.7 / 6.9.1p2). This is
+// SQLite test_thread.c's `static Tcl_ObjCmdProc sqlthread_proc;` shape. ──
+//
+// (g) A bare function-typedef declaration + its definition MERGE — exactly like a
+// syntactic `int f(int);` proto. Zero diagnostics, one surviving Function symbol
+// (the definition; the typedef proto absorbed). RED-ON-DISABLE: revert the Pass-1
+// candidate flag + the Pass-1.5 upgrade → the bare `static Fn foo;` is minted an
+// OBJECT → S_InvalidFunctionDeclarator (S0018) at the proto AND, because the
+// object-category clashes with the Function definition, S_RedeclaredSymbol (S0002)
+// at the definition → hasErrors() flips true and countSurvivingFns drops.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "static int foo(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a function-typedef prototype + its definition must merge (C 6.9.1p2)";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u)
+        << "exactly one surviving Function symbol for foo (the definition)";
+}
+
+// (h) The test_thread shape end-to-end: the bare function-typedef proto is
+// forward-CALLED before its definition (as Tcl_CreateObjCommand takes
+// `sqlthread_proc` above its body). Zero diagnostics; the call resolves to the
+// upgraded Function symbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeForwardCallResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "int use(void){return foo(41);}\n"
+        "static int foo(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward call through a function-typedef prototype is legal";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u);
+}
+
+// (i) FAIL-LOUD: a bare typedef-headed object whose type is NOT a function still
+// collides with a same-name function definition. `MyInt foo;` (a real object) then
+// `int foo(int){…}` is a genuine object-vs-function clash — the Pass-1 optimistic
+// merge is a CANDIDATE only; the post-1.5 sweep sees `foo`'s type is not a FnSig
+// and emits the DEFERRED, PRECISE S_RedeclaredSymbol. RED-ON-DISABLE: drop the
+// post-1.5 non-FnSig re-check → the clash STILL fails loud, but via the generic
+// type-compat check as S_IncompatibleRedeclaration instead — so the specific
+// S_RedeclaredSymbol count drops to 0 and this assertion flips red. Exactly one
+// S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefObjectVsFunctionCollisionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyInt;\n"
+        "MyInt foo;\n"
+        "int foo(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef-OBJECT redeclared as a function must fail loud (S0002), not "
+           "be silently accepted as a prototype";
+}
+
+// (j) FAIL-LOUD (no over-broadening): a function-TYPED struct FIELD is not a
+// prototype (a field can never be a function) — it still rejects with
+// S_InvalidFunctionDeclarator. Pass 1 flags ONLY object-declaration rows as
+// candidates, never a struct field, so the S0018 fail-loud is preserved.
+TEST(SemanticAnalyzerCSubset, FnTypedefFunctionTypedStructFieldRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "struct S { Fn f; };\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u)
+        << "a function-typed struct field is not a prototype and must fail loud";
+}
+
+// (k) A function-POINTER OBJECT (`Fn *fp;` — a decorated declarator) is NOT a
+// prototype candidate: its declared type is Ptr<FnSig>, not FnSig. It stays a data
+// object, so a same-name function is a genuine (immediate) collision. Pins that the
+// candidate detection excludes decorated declarators (a star), never treating a
+// function-pointer global as a function.
+TEST(SemanticAnalyzerCSubset, FnTypedefPointerObjectIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn *fp;\n"
+        "int fp(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a function-pointer object redeclared as a function is a collision";
+}
+
+// (l) FAIL-LOUD (F2 hardening): an illegal function-returning-function whose
+// fn-suffix hides behind a redundant-paren group (`Fn (f)(int);` — C 6.7.6.3p1) is
+// NOT a bare prototype. The multi-level UPWARD walk in `declaratorIsUndecoratedName`
+// sees the group-enclosing `directRule`'s `(int)` suffix and rejects the candidate,
+// so the declaration takes the normal path and fails loud
+// (S_InvalidFunctionDeclarator). RED-ON-DISABLE: revert the walk to the single-level
+// check → the group-wrapped suffix escapes → `f` is mis-flagged a candidate, upgraded
+// to a Function proto, and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
+TEST(SemanticAnalyzerCSubset, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (f)(int);\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an illegal function-returning-function (fn-suffix behind a group) must "
+           "fail loud, never be silently accepted as a prototype";
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u);
+}
+
+// (m) A redundant grouping paren that adds NO suffix (`Fn (g);` ≡ `Fn g;`) is still
+// an undecorated bare declarator, so it remains a valid function-typedef prototype
+// and MERGES with its definition. Pins that the upward walk ADMITS pure grouping
+// (rejecting only a group that CARRIES a decoration, as in (l)) — a walk that
+// blanket-rejected any group would spuriously fail this legal proto.
+TEST(SemanticAnalyzerCSubset, FnTypedefRedundantParenGroupIsAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (g);\n"
+        "int g(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a redundant-paren bare declarator is still a prototype (no suffix)";
+    EXPECT_EQ(countSurvivingFns(model, "g"), 1u);
 }
 
 // FC16 (D-CSUBSET-NORETURN): the surviving Function symbol named `name` is
@@ -7280,14 +7672,32 @@ TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 }
 
-// `bool b = nullptr;` is rejected — nullptr→bool is DEFERRED (the c-subset has no
-// scalar→bool conversion; D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it stays consistent
-// with `bool b = 0;` (also a mismatch) rather than admit-then-fail-at-codegen.
-TEST(SemanticAnalyzerCSubset, NullptrToBoolFailsLoud) {
+// `bool b = nullptr;` now CONVERTS to false — C23 6.3.2.3.2 (nullptr -> bool =
+// false), realized once the general scalar->bool conversion landed
+// (D-CSUBSET-NULLPTR-BOOL-CONVERSION closed via `scalarConvertsToBool`). Was a
+// DEFERRED S_TypeMismatch; the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]] fix (a
+// comparison now types `int`) forced the general scalar->bool arm, and
+// nullptr->bool falls out as the NullptrT case.
+TEST(SemanticAnalyzerCSubset, NullptrToBoolConverts) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "nullptr -> bool converts to false (C23 6.3.2.3.2), no longer deferred";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// `bool b = 0;` (a scalar zero) CONVERTS to false via the general scalar->bool
+// conversion (C 6.3.1.2). Pre-D-CSUBSET-NULLPTR-BOOL-CONVERSION this was itself an
+// S_TypeMismatch (the c-subset had NO scalar->bool path — the very inconsistency
+// that kept nullptr->bool deferred); now both assign.
+TEST(SemanticAnalyzerCSubset, ScalarZeroToBoolConverts) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = 0; return b; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "scalar 0 -> bool converts to false (C 6.3.1.2)";
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // The fail-loud operator gate: nullptr in arithmetic (`nullptr + 1`) is rejected —
@@ -8400,6 +8810,53 @@ TEST(SemanticAnalyzerCSubset, AutoInfersIntPass15Visible) {
     EXPECT_EQ(model.lattice().interner().kind(y->type), TypeKind::I32);
 }
 
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION (the PRIMARY red-on-disable
+// pin): a file-scope ARRAY whose ELEMENTS are const pointers — the direct-
+// declarator spelling `int (*const ops[N])(int)` — is a const object (C 6.7.3p9
+// so-qualifies the element; gcc/clang park such a fn-ptr table in relocated-read-
+// only `.data.rel.ro`). Its `SymbolRecord.isConst` must be TRUE so it threads
+// MutabilityAttr → MirGlobal.isConst → the asm relocBearingGlobalSection
+// chokepoint routes it to RelRoConst, not writable `.data`. The const pointer
+// layer hides inside the parenthesized group, so this REDS if declaratorObject-
+// IsConst stops descending the group (the object then falls to the head scan,
+// which sees no `const` in `int` → isConst=false → mis-routed to `.data`). This
+// is the shape of sqlite3.c's `static int (*const sqlite3BuiltinExtensions[])
+// (sqlite3*) = {…};`. A NON-const sibling and the typedef'd spelling anchor the
+// two ends (must-not-over-classify / must-stay-correct).
+TEST(SemanticAnalyzerCSubset, ElementConstFnPtrArrayGlobalIsConst) {
+    auto model = analyzeShipped("c-subset", {
+        "int a(int x){ return x + 10; }\n"
+        "int b(int x){ return x + 20; }\n"
+        "int (*const ops[2])(int) = { a, b };\n"        // array of CONST fn-ptrs
+        "int (*muts[2])(int) = { a, b };\n"             // array of MUTABLE fn-ptrs
+        "typedef int (*op)(int);\n"
+        "const op tab[2] = { a, b };\n"                 // typedef'd spelling
+        "static int (*const exts[])(int) = { a };\n",   // sqlite's inferred static
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* ops = findSymbolNamed(model, "ops");
+    ASSERT_NE(ops, nullptr);
+    EXPECT_TRUE(ops->isConst)
+        << "int (*const ops[2])(int): the array's elements are const pointers "
+           "→ a const object → RelRoConst; the group-hidden `* const` layer must "
+           "be found by descending the parenthesized group";
+    auto const* muts = findSymbolNamed(model, "muts");
+    ASSERT_NE(muts, nullptr);
+    EXPECT_FALSE(muts->isConst)
+        << "int (*muts[2])(int): mutable fn-ptr elements → NOT const (the fix "
+           "keys on the `* const` marker, never merely on the grouping)";
+    auto const* tab = findSymbolNamed(model, "tab");
+    ASSERT_NE(tab, nullptr);
+    EXPECT_TRUE(tab->isConst)
+        << "const op tab[2] (typedef spelling) stays const — the head-const path "
+           "is untouched by the group descent";
+    auto const* exts = findSymbolNamed(model, "exts");
+    ASSERT_NE(exts, nullptr);
+    EXPECT_TRUE(exts->isConst)
+        << "static int (*const exts[])(int) — sqlite's inferred-size const fn-ptr "
+           "table — is a const object too";
+}
+
 // ★C1 — the auto-presence gate: all four specifier-led C89 implicit-int
 // shapes PARSE into the headless rule and MUST stay errors
 // (S_AutoInferenceInvalid, one per declaration). RED-ON-DISABLE: drop the
@@ -8695,11 +9152,12 @@ TEST(SemanticAnalyzerCSubset, AutoFileScopeAndQualifiedStayLoudParseErrors) {
 // pinned EXACTLY for each non-decaying initializer class the arm passes
 // through unchanged — a struct variable (aggregates infer by value, no
 // decay), an enumerator (the enum TYPE, not its underlying int), a
-// comparison (Bool — promoteComparisons), a char variable (Char, not the
-// promoted int), and an unsuffixed float literal (F64 per C 6.4.4.2). All
-// in ONE unit so the block also witnesses the inferred objects USED
-// together (member access through the inferred struct, arithmetic across
-// the rest).
+// comparison (I32 — a comparison RESULT type is C's `int`, C 6.5.8p6, sourced
+// config-drivenly by subtreeType; D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE), a char
+// variable (Char, not the promoted int), and an unsuffixed float literal (F64
+// per C 6.4.4.2). All in ONE unit so the block also witnesses the inferred
+// objects USED together (member access through the inferred struct, arithmetic
+// across the rest).
 TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     auto model = analyzeShipped("c-subset", {
         "struct S { int x; };\n"
@@ -8731,8 +9189,11 @@ TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     EXPECT_EQ(kindOf("e"), TypeKind::Enum)
         << "an enumerator infers the ENUM type (enumConvertsToArith covers "
            "its uses; the type itself stays Enum)";
-    EXPECT_EQ(kindOf("b"), TypeKind::Bool)
-        << "a comparison infers Bool (promoteComparisons)";
+    EXPECT_EQ(kindOf("b"), TypeKind::I32)
+        << "a comparison infers int (C 6.5.8p6: the RESULT type of a relational "
+           "operator is int, sourced config-drivenly — "
+           "D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE; the i1/Bool SSA carrier is the "
+           "separate machine-tier concern)";
     EXPECT_EQ(kindOf("c"), TypeKind::Char)
         << "a char VARIABLE infers Char (the symbol's type, not the "
            "promoted int)";
@@ -9464,24 +9925,39 @@ TEST(SemanticAnalyzerCSubset, LongDoubleLiteralTypesPerAxis) {
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble) {
-    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3). On a
-    // WALLED axis the arm is observable: `x + d` types F80, so it binds an
-    // F80 lhs cleanly and REJECTS an F64 lhs (were the result F64, the two
-    // expectations would invert — a strict both-ways pin of the rank order).
+    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3), so `x + d`
+    // (long double + double) types long double (F80). NOTE: this test formerly proved
+    // the rank via an assignment-rejection PROXY (`double r = x + d;` had to REJECT the
+    // F80->F64 narrowing). D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING now ADMITS that
+    // narrowing, so the proxy is obsolete — the rank is pinned DIRECTLY via the INFERRED
+    // TYPE of the UAC result: `typeof(x + d) pr;` declares `pr` with x+d's type, and the
+    // symbol's resolved TypeKind must be F80 (the exact idiom LongDoubleResolvesPerAxis
+    // uses). The `good` case still also binds an F80 lhs cleanly.
     auto good = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; long double r; r = x + d; }\n"},
+        {"int main(void) { long double x; double d; typeof(x + d) pr;\n"
+         "  long double r; r = x + d; }\n"},
         LongDoubleFormat::X87_80);
     EXPECT_FALSE(good.hasErrors())
-        << "`long double + double` must type long double (F80) — assignable "
-           "into a long double lhs";
+        << "`long double + double` binds an F80 lhs cleanly";
+    auto const* pr = findSymbolNamed(good, "pr");
+    ASSERT_NE(pr, nullptr);
+    ASSERT_TRUE(pr->type.valid());
+    EXPECT_EQ(good.lattice().interner().kind(pr->type), TypeKind::F80)
+        << "`x + d` (long double + double) types long double (F80): typeof(x + d) "
+           "resolves F80, proving the UAC result OUTRANKS double (F64)";
 
-    auto bad = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; double r; r = x + d; }\n"},
+    // Positive control / RED-ON-DISABLE of the RANK: `double + double` types double, so
+    // typeof(d1 + d2) resolves F64. Were the UAC rank broken so `x + d` above typed
+    // double, its EXPECT_EQ(..., F80) would fail. Proves the oracle separates F64/F80.
+    auto ctrl = analyzeWithLongDoubleAxis(
+        {"int main(void) { double d1; double d2; typeof(d1 + d2) pr2; }\n"},
         LongDoubleFormat::X87_80);
-    EXPECT_TRUE(bad.hasErrors())
-        << "`long double + double` into a DOUBLE lhs is a narrowing float "
-           "assignment (F80 -> F64) — must reject, proving the UAC result is "
-           "F80, not F64";
+    auto const* pr2 = findSymbolNamed(ctrl, "pr2");
+    ASSERT_NE(pr2, nullptr);
+    ASSERT_TRUE(pr2->type.valid());
+    EXPECT_EQ(ctrl.lattice().interner().kind(pr2->type), TypeKind::F64)
+        << "`double + double` types double (F64) — the typeof oracle separates the two "
+           "float widths, so the F80 rank pin above is observable";
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldSucceedsOnWalledAxis) {

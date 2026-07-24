@@ -889,25 +889,31 @@ TEST(StaticLink, PeStaticLibDriverEmitsCoffLibWithSecondLinkerMember) {
     EXPECT_EQ(armap[1], "dss_sub");
 }
 
-// RED-ON-DISABLE for the D_StaticLibFatArchiveUnsupported guard (0xD013): a
-// staticlib-target build handed an INPUT static archive via `--resolve-library`
-// fails loud (bundling input archives into a merged "fat" archive is unbuilt)
-// rather than silently dropping the input's members. Remove the guard and the
-// build would (wrongly) succeed, ignoring the input `.a`.
-TEST(StaticLink, StaticLibDriverRejectsInputStaticArchive) {
+// D-FF1-STATICLIB-FAT-ARCHIVE: a staticlib-target build handed INPUT static
+// archives via `--resolve-library` MERGES every one of their members INTO the
+// output library (a "fat"/merged static library), instead of failing loud. The
+// output `.a` carries the CU-derived member AND the input archive's member; its
+// armap is the UNION of both members' exported symbols; and each member re-parses
+// as a real ET_REL. RED-ON-DISABLE: restore the D_StaticLibFatArchiveUnsupported
+// fail-loud in `compileOneTarget` and this build returns rc != 0 (the ASSERT_EQ
+// below flips red) -- the ONLY thing that makes it succeed with 2 members is the
+// merge.
+TEST(StaticLink, StaticLibDriverMergesInputStaticArchive) {
     ScratchDir scratch{Location::InsideRepo, "static-link"};
     auto const dir = scratch.path();
     Schemas const s = loadSchemas();
     ASSERT_TRUE(s.grammar);
 
-    // A real INPUT `.a` on disk (built by this file's own ar writer helper).
+    // A real INPUT `.a` on disk defining `dss_lib_answer` (member "helper.o").
     auto const inputArchive =
-        buildArchive(dir, "libinput.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+        buildArchive(dir, "libinput.a", {{std::string{kLibSrc}, "helper.o"}}, s);
     ASSERT_FALSE(inputArchive.empty());
     ASSERT_TRUE(isArArchiveFile(inputArchive));
 
-    auto const src = writeSrc(dir, "dsslibmath.c",
-                              "int dss_add(int a,int b){ return a+b; }\n");
+    // The CU-derived member defines a DIFFERENT symbol (`dss_extra`) -- so the
+    // two members' armaps are disjoint and the union is unambiguous.
+    auto const src = writeSrc(dir, "dssfat.c",
+                              "int dss_extra(int a){ return a + 1; }\n");
 
     Program p;
     p.setOutputDir(dir);
@@ -916,10 +922,207 @@ TEST(StaticLink, StaticLibDriverRejectsInputStaticArchive) {
     int const rc = p.compileFiles(
         std::vector<std::string>{src.string()}, "c-subset",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
-    EXPECT_NE(rc, 0) << "building a static library WITH an input static archive "
-                        "must fail loud (fat-archive bundling is unbuilt)";
-    EXPECT_EQ(countCode(rep, DiagnosticCode::D_StaticLibFatArchiveUnsupported), 1u)
-        << "the guard must emit D_StaticLibFatArchiveUnsupported exactly once";
+    ASSERT_EQ(rc, 0) << "fat-archive staticlib build must succeed; errs="
+                     << rep.errorCount();
+
+    auto const libPath = dir / "dssfat.a";
+    ASSERT_TRUE(fs::exists(libPath)) << "the driver must emit the fat `.a`";
+    auto const bytes = readFileBytes(libPath);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, libPath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+
+    // TWO members: the CU-derived `dssfat.o` + the MERGED input `helper.o`.
+    ASSERT_EQ(arch->members.size(), 2u)
+        << "one CU member + one merged input-archive member";
+
+    // The armap is the UNION: BOTH `dss_extra` (CU) and `dss_lib_answer` (input).
+    std::vector<std::string> armap;
+    for (auto const& sym : arch->symbols) armap.push_back(sym.name);
+    std::sort(armap.begin(), armap.end());
+    ASSERT_EQ(armap.size(), 2u) << "exactly the two members' exported symbols";
+    EXPECT_EQ(armap[0], "dss_extra");
+    EXPECT_EQ(armap[1], "dss_lib_answer");
+
+    // Both members re-parse as valid ET_REL, each defining its own symbol -- the
+    // merged input member is a REAL relocatable object, not a dropped stub.
+    bool sawExtra = false, sawAnswer = false;
+    for (auto const& m : arch->members) {
+        auto const mb =
+            std::span<std::uint8_t const>{bytes}.subspan(m.dataOffset, m.size);
+        DiagnosticReporter mrep;
+        auto member = elf::readRelocatableObject(mb, *s.target, *s.reloc, mrep);
+        ASSERT_TRUE(member) << "member must parse as ET_REL; errs="
+                            << mrep.errorCount();
+        if (moduleDefinesExternallyVisible(*member, "dss_extra"))      sawExtra  = true;
+        if (moduleDefinesExternallyVisible(*member, "dss_lib_answer")) sawAnswer = true;
+    }
+    EXPECT_TRUE(sawExtra)  << "the CU-derived member must define dss_extra";
+    EXPECT_TRUE(sawAnswer) << "the MERGED input member must define dss_lib_answer";
+}
+
+// The RUNTIME witness for the fat archive (the WHOLE chain, not just structure):
+// build a fat static library that MERGES an input archive's `dss_lib_answer` (=42)
+// member, then static-link `main` (which calls dss_lib_answer) against the FAT lib
+// -> a self-contained exec -> RUN -> exit 42. Proves the merged member survived
+// the double round-trip (input `.a` -> read -> module -> written into the fat `.a`
+// -> read again -> linked into main) and is real, linkable, and runnable. The lib
+// build's rc==0 is itself red-on-disable (the restored fail-loud rejects it).
+TEST(StaticLink, StaticLibFatArchiveExecRunsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    // Input archive: the ONLY definition of dss_lib_answer() = 42.
+    auto const inputArchive =
+        buildArchive(dir, "libanswer.a", {{std::string{kLibSrc}, "answer.o"}}, s);
+    ASSERT_FALSE(inputArchive.empty());
+
+    // Build a FAT static lib: a CU defining an unrelated fn + the merged input.
+    auto const libSrc = writeSrc(dir, "libfat.c",
+                                 "int dss_unrelated(void){ return 7; }\n");
+    Program pLib;
+    pLib.setOutputDir(dir);
+    pLib.setResolveLibraries(std::vector<fs::path>{inputArchive});
+    DiagnosticReporter repLib;
+    ASSERT_EQ(pLib.compileFiles(
+                  std::vector<std::string>{libSrc.string()}, "c-subset",
+                  std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"},
+                  repLib),
+              0) << "fat lib build must succeed; errs=" << repLib.errorCount();
+    auto const fatLib = dir / "libfat.a";
+    ASSERT_TRUE(fs::exists(fatLib));
+
+    // Link main (calls dss_lib_answer) against the FAT lib -- the merged member
+    // is what satisfies main's reference.
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+    Program pMain;
+    pMain.setOutputDir(dir);
+    pMain.setResolveLibraries(std::vector<fs::path>{fatLib});
+    DiagnosticReporter repMain;
+    int const rc = pMain.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, repMain);
+    ASSERT_EQ(rc, 0) << "link against the fat lib must succeed; errs="
+                     << repMain.errorCount();
+    auto const mainPath = dir / "main";
+    ASSERT_TRUE(fs::exists(mainPath));
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+    // RUN (x86_64 Linux host): dss_lib_answer's body -- merged in from
+    // libanswer.a via libfat.a -- is IN the exe -> exit 42.
+    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: exit 42 = dss_lib_answer(), MERGED from "
+           "libanswer.a into libfat.a, pulled by main's link against the fat lib, "
+           "and called.";
+#endif  // __linux__
+}
+
+// D-FF1-STATICLIB-FAT-ARCHIVE (PE) + the SEQUENTIAL-IN-PROCESS shape: the PE/COFF
+// sibling of StaticLibFatArchiveExecRunsFortyTwo, built the way the examples
+// harness's `buildDependencyArtifact` builds it -- THREE sequential in-process
+// `Program` builds into ONE shared output dir:
+//   1. input.lib  (pe64 staticlib) defining dss_input_answer() = 42
+//   2. fatlib.lib (pe64 staticlib) defining dss_fat_extra(), RESOLVING input.lib
+//      -> THE FAT MERGE: fatlib.lib must carry BOTH members.
+//   3. main.exe   (pe64 exec) calling dss_input_answer, RESOLVING ONLY fatlib.lib
+//      -> the sole path to dss_input_answer is the copy the merge carried across.
+//
+// This pins the pe64 fat-archive merge that the `fat_archive_merge` corpus example
+// exercises end-to-end -- but WHITE-BOX (it re-reads the intermediate fatlib.lib
+// and asserts its armap is the UNION of both members' symbols) and in a SINGLE
+// process across three sequential `Program` builds (the exact shape a
+// process-global-state defect would corrupt -- proving there is none). The prior
+// PE tests cover single-CU staticlib EMIT + the pull-from-a-plain-`.a` link; NONE
+// covered the PE fat MERGE. RED-ON-DISABLE: restore the D_StaticLibFatArchive
+// Unsupported fail-loud in compileOneTarget and step 2's build returns rc != 0
+// (ASSERT_EQ(rcFat, 0) flips red); a silent-no-op merge drops dss_input_answer
+// from fatlib.lib's armap (the union ASSERT flips red) AND main.exe faults at load
+// (the exit-42 EXPECT flips red on Windows).
+TEST(StaticLink, PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    constexpr char const* kStaticlibSpec = "x86_64:pe64-x86_64-windows-staticlib";
+
+    // ── Build 1: input.lib (pe64 staticlib) -- the ONLY def of dss_input_answer ──
+    auto const inputSrc = writeSrc(dir, "input.c",
+                                   "int dss_input_answer(void){ return 42; }\n");
+    Program pInput;
+    pInput.setOutputDir(dir);
+    DiagnosticReporter repInput;
+    ASSERT_EQ(pInput.compileFiles(
+                  std::vector<std::string>{inputSrc.string()}, "c-subset",
+                  std::vector<std::string>{kStaticlibSpec}, repInput),
+              0) << "input.lib build must succeed; errs=" << repInput.errorCount();
+    auto const inputLib = dir / "input.lib";
+    ASSERT_TRUE(fs::exists(inputLib)) << "the driver must emit input.lib";
+
+    // ── Build 2: fatlib.lib (pe64 staticlib) RESOLVING input.lib -- THE MERGE ──
+    // Same process, a FRESH Program -- exactly buildDependencyArtifact's shape.
+    auto const fatSrc = writeSrc(dir, "fatlib.c",
+                                 "int dss_fat_extra(void){ return 7; }\n");
+    Program pFat;
+    pFat.setOutputDir(dir);
+    pFat.setResolveLibraries(std::vector<fs::path>{inputLib});
+    DiagnosticReporter repFat;
+    int const rcFat = pFat.compileFiles(
+        std::vector<std::string>{fatSrc.string()}, "c-subset",
+        std::vector<std::string>{kStaticlibSpec}, repFat);
+    ASSERT_EQ(rcFat, 0) << "fat-archive staticlib build (the MERGE) must succeed; "
+                           "errs=" << repFat.errorCount();
+    auto const fatLib = dir / "fatlib.lib";
+    ASSERT_TRUE(fs::exists(fatLib)) << "the driver must emit the fat fatlib.lib";
+
+    // WHITE-BOX: fatlib.lib carries BOTH members and its armap is their UNION --
+    // dss_input_answer (merged from input.lib) MUST be present, or main can never
+    // resolve it. This is the decisive intermediate check the corpus example's
+    // exit code can only assert transitively.
+    auto const fatBytes = readFileBytes(fatLib);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(fatBytes, fatLib.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 2u)
+        << "one CU member (fatlib.o) + one MERGED input-archive member (input.o)";
+    std::vector<std::string> armap;
+    for (auto const& sym : arch->symbols) armap.push_back(sym.name);
+    std::sort(armap.begin(), armap.end());
+    ASSERT_EQ(armap.size(), 2u) << "exactly the two members' exported symbols";
+    EXPECT_EQ(armap[0], "dss_fat_extra")   << "the CU-derived member's symbol";
+    EXPECT_EQ(armap[1], "dss_input_answer")
+        << "THE merge witness: input.lib's symbol MUST be carried into fatlib.lib";
+
+    // ── Build 3: main.exe (pe64 exec) RESOLVING ONLY fatlib.lib ──
+    auto const mainSrc = writeSrc(dir, "main.c",
+                                  "extern int dss_input_answer(void);\n"
+                                  "int main(void){ return dss_input_answer(); }\n");
+    Program pMain;
+    pMain.setOutputDir(dir);
+    pMain.setResolveLibraries(std::vector<fs::path>{fatLib});
+    DiagnosticReporter repMain;
+    int const rcMain = pMain.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, repMain);
+    ASSERT_EQ(rcMain, 0) << "link against the fat lib must succeed; errs="
+                         << repMain.errorCount();
+    auto const mainExe = dir / "main.exe";
+    ASSERT_TRUE(fs::exists(mainExe)) << "the self-contained PE exec must exist";
+
+#if defined(_WIN32)
+    // RUN (Windows host): dss_input_answer's body -- merged input.lib -> fatlib.lib
+    // -> pulled into main -- is IN the exe -> exit 42. A dropped merge would fault-
+    // load here (STATUS_ENTRYPOINT_NOT_FOUND) instead.
+    auto const r = runBinary(mainExe, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "main.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: exit 42 = dss_input_answer(), MERGED from "
+           "input.lib into fatlib.lib across three sequential in-process Program "
+           "builds, pulled by main's link against the fat lib, and called.";
+#endif  // _WIN32
 }
 
 // The Mach-O sibling of the ELF driver witness: an arm64 Mach-O staticlib target

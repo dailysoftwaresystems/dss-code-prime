@@ -19,6 +19,23 @@ static_assert(detail::type_rules::floatRank(TypeKind::F64) > detail::type_rules:
 static_assert(detail::type_rules::signedIntRank(TypeKind::Bool) == 0);
 static_assert(detail::type_rules::unsignedIntRank(TypeKind::Char) == 0);
 static_assert(detail::type_rules::floatRank(TypeKind::I32) == 0);
+// C14 (C 6.2.5p15 / 6.7.9p14): the three character types are {Char, I8=signed
+// char, U8=unsigned char}; a NARROW string literal (element Char) may init an
+// array of ANY of them, a WIDE literal only its same-kind array, and a
+// non-character lhs never. RED-ON-DISABLE (compile-time): revert
+// stringLiteralArrayInitCompatible to char-only and the U8/I8-from-Char asserts
+// below FAIL to compile.
+static_assert(detail::type_rules::isCharacterType(TypeKind::Char));
+static_assert(detail::type_rules::isCharacterType(TypeKind::I8));
+static_assert(detail::type_rules::isCharacterType(TypeKind::U8));
+static_assert(!detail::type_rules::isCharacterType(TypeKind::I16));  // `short` is not a char type
+static_assert(!detail::type_rules::isCharacterType(TypeKind::I32));
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::U8,   TypeKind::Char));  // unsigned char[] = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I8,   TypeKind::Char));  // signed char[]   = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::Char, TypeKind::Char));  // char[]          = "…"
+static_assert(detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I32,  TypeKind::I32));   // wchar_t[] = L"…" (same kind)
+static_assert(!detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::I32, TypeKind::Char));  // int[]  = "…"  → reject
+static_assert(!detail::type_rules::stringLiteralArrayInitCompatible(TypeKind::U8,  TypeKind::I32));   // uchar[] = L"…" → reject
 
 namespace {
 
@@ -45,6 +62,44 @@ TEST(TypeRules, IsArithmeticRejectsNonArithmetic) {
     EXPECT_FALSE(isArithmetic(in, in.primitive(TypeKind::Char)));
     EXPECT_FALSE(isArithmetic(in, in.primitive(TypeKind::Void)));
     EXPECT_FALSE(isArithmetic(in, InvalidType));
+}
+
+// ── Deref / Index result-type laws (C 6.5.3.2 deref, 6.5.2.1 index, with the
+//    6.3.2.1p3 array-to-pointer decay) ──────────────────────────────────────
+// D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `*arrayOfT` decays the array to
+// Ptr<elem> then derefs, so its type is the ELEMENT — EXACTLY `arrayOfT[0]`. The
+// shared `derefResultType` law must therefore type an Array operand directly, as
+// its sibling `indexResultType` already types an Array base. Before the fix the
+// Array arm was absent (Array → InvalidType), which is precisely the unstamped
+// operand the `sizeof(*arr)` silent-fallback miscompile rode into `resolveStamped
+// TypeBelow`'s leaf-descent.
+TEST(TypeRules, DerefOfPointerYieldsPointee) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    EXPECT_EQ(derefResultType(in, in.pointer(i32)).v, i32.v);
+}
+// RED-ON-DISABLE (unit): revert the Array arm in `derefResultType` and every
+// assertion here reds (Array → InvalidType instead of the element).
+TEST(TypeRules, DerefOfArrayYieldsElementNotWholeArray) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    auto a10 = in.array(i32, 10);            // int a[10]
+    EXPECT_EQ(derefResultType(in, a10).v, i32.v) << "*a is the element int, not int[10]";
+    // The deref and index laws must AGREE: *arr == arr[0].
+    EXPECT_EQ(derefResultType(in, a10).v, indexResultType(in, a10).v);
+    // Multi-dim `int m[3][4]`: *m is the ROW int[4], not the whole 2-D array.
+    auto row = in.array(i32, 4);
+    auto m34 = in.array(row, 3);
+    EXPECT_EQ(derefResultType(in, m34).v, row.v) << "*m is int[4] (the row)";
+    // Deref of a POINTER-to-array yields the array (the control the fix must not
+    // disturb): int(*pm)[4]; *pm is int[4].
+    EXPECT_EQ(derefResultType(in, in.pointer(row)).v, row.v);
+}
+TEST(TypeRules, DerefOfNonPointerNonArrayIsInvalid) {
+    auto in = makeInterner();
+    EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::I32)).valid());
+    EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::F64)).valid());
+    EXPECT_FALSE(derefResultType(in, InvalidType).valid());
 }
 
 // Identical TypeIds are trivially assignable (the post-intern equality
@@ -213,6 +268,55 @@ TEST(TypeRules, IsAssignableAdmitsIntFloatWhenGated) {
     EXPECT_FALSE(F2I(pi, f64)) << "float->int gate does NOT admit f64 -> int*";
 }
 
+// Float→float NARROWING (F64→F32, F80/F128→…) is NOT assignable with the gate OFF
+// (the default — a non-C schema). The RED-ON-DISABLE reference for the gated test
+// below. WIDENING (F32→F64) is admitted regardless (the rank arm returns true first),
+// so it is the invariant we must NOT disturb.
+TEST(TypeRules, IsAssignableRejectsFloatNarrowingByDefault) {
+    auto in  = makeInterner();
+    auto f32 = in.primitive(TypeKind::F32);
+    auto f64 = in.primitive(TypeKind::F64);
+    EXPECT_FALSE(isAssignable(in, f32, f64)) << "F64 -> F32 narrowing NOT admitted by default";
+    EXPECT_TRUE (isAssignable(in, f64, f32)) << "F32 -> F64 widening IS admitted (gate-independent)";
+}
+
+// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c-subset), a
+// WIDER floating rhs NARROWS into a NARROWER floating lhs — `float f = aDouble;` (F64→F32,
+// the GEOPOLY `typedef float GeoCoord` assigned from a `double`), F80/F128→F64/F32 — C
+// 6.3.1.4 / 6.5.16.1, precision-lossy (value the nearest representable). WIDENING stays
+// unconditional. coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR
+// FPTrunc — the SAME makeCast path F32→F64 widening uses). RED-ON-DISABLE: the SAME
+// narrowing calls with the gate OFF (IsAssignableRejectsFloatNarrowingByDefault above)
+// REJECT. SCOPE GUARDS: this gate is float→float ONLY — it admits NEITHER float→int (the
+// separate floatConvertsToInt gate) NOR int→float NOR a pointer.
+TEST(TypeRules, IsAssignableAdmitsFloatNarrowingWhenGated) {
+    auto in   = makeInterner();
+    auto i32  = in.primitive(TypeKind::I32);
+    auto f32  = in.primitive(TypeKind::F32);
+    auto f64  = in.primitive(TypeKind::F64);
+    auto f128 = in.primitive(TypeKind::F128);
+    auto pf   = in.pointer(f32);   // float*
+    // floatSameKindNarrows ON (12th arg true); every other gate OFF.
+    auto const N = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/false,
+                            /*intSameSignednessNarrows=*/false,
+                            /*intConvertsToFloat=*/false, /*floatConvertsToInt=*/false,
+                            /*floatSameKindNarrows=*/true);
+    };
+    EXPECT_TRUE(N(f32,  f64))  << "F64 -> F32 narrows (the GEOPOLY float<-double shape)";
+    EXPECT_TRUE(N(f64,  f128)) << "F128 -> F64 narrows (the long-double rung)";
+    EXPECT_TRUE(N(f32,  f128)) << "F128 -> F32 narrows (skipping a rung)";
+    // WIDENING admitted regardless of the gate (the rank arm returns true first).
+    EXPECT_TRUE(N(f64,  f32))  << "F32 -> F64 widens (gate-independent)";
+    EXPECT_TRUE(N(f128, f64))  << "F64 -> F128 widens (gate-independent)";
+    // SCOPE GUARDS: float→float ONLY.
+    EXPECT_FALSE(N(i32, f64)) << "floatSameKindNarrows does NOT admit f64 -> i32 (that is floatConvertsToInt)";
+    EXPECT_FALSE(N(f64, i32)) << "floatSameKindNarrows does NOT admit i32 -> f64 (that is intConvertsToFloat)";
+    EXPECT_FALSE(N(f32, pf))  << "floatSameKindNarrows does NOT admit float* -> f32";
+}
+
 // InvalidType passes through on either side (cascade suppression: a
 // single previous error should not produce a downpour of follow-on
 // type-mismatch diagnostics).
@@ -256,6 +360,34 @@ TEST(TypeRules, IsAssignableDifferentEnumsRemainMismatch) {
         << "different enums stay a mismatch even gated (no over-admission)";
     EXPECT_TRUE(isAssignable(in, a, a, {}, false, false, /*enum=*/true))
         << "same enum is the identity path";
+}
+// C14 (C 6.7.9p14 + 6.2.5p15, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a NARROW
+// string literal (`char[M]`) may initialize an array of ANY character type —
+// char, signed char (I8), unsigned char (U8) — when N >= M. Gated on
+// `charArrayFromStringLiteralInit` (position 8). RED-ON-DISABLE: revert the arm's
+// element check to char-on-both-sides → the U8/I8 EXPECT_TRUEs below fail.
+TEST(TypeRules, IsAssignableStringLiteralInitsAnyCharacterArray) {
+    auto in     = makeInterner();
+    auto charEl = in.primitive(TypeKind::Char);
+    auto char4  = in.array(charEl, 4);                       // the narrow literal "abc" → char[4]
+    auto uchar8 = in.array(in.primitive(TypeKind::U8), 8);
+    auto schar8 = in.array(in.primitive(TypeKind::I8), 8);
+    auto char8  = in.array(charEl, 8);
+    auto int8   = in.array(in.primitive(TypeKind::I32), 8);
+    auto uchar3 = in.array(in.primitive(TypeKind::U8), 3);   // N=3 < M=4 → over-long
+    auto G      = true;   // charArrayFromStringLiteralInit gate (position 9)
+    EXPECT_TRUE(isAssignable(in, uchar8, char4, {}, false, false, false, false, false, false, false, false, G))
+        << "unsigned char[8] <- char[4] string literal (C 6.2.5p15) — the sqlite `const unsigned char zHex[]` shape";
+    EXPECT_TRUE(isAssignable(in, schar8, char4, {}, false, false, false, false, false, false, false, false, G))
+        << "signed char[8] <- char[4] string literal";
+    EXPECT_TRUE(isAssignable(in, char8, char4, {}, false, false, false, false, false, false, false, false, G))
+        << "char[8] <- char[4] string literal (the baseline must still hold)";
+    EXPECT_FALSE(isAssignable(in, int8, char4, {}, false, false, false, false, false, false, false, false, G))
+        << "int[8] <- char[4]: int is NOT a character type → stays a loud mismatch";
+    EXPECT_FALSE(isAssignable(in, uchar3, char4, {}, false, false, false, false, false, false, false, false, G))
+        << "unsigned char[3] <- char[4]: OVER-LONG (N < M) stays a loud mismatch";
+    EXPECT_FALSE(isAssignable(in, uchar8, char4))
+        << "ungated (no string-literal init context) → not admitted";
 }
 // UAC: an enum participates in arithmetic AS its underlying int (`e + 1` types
 // as int, not enum). RED-ON-DISABLE: revert the enum-underlying resolution in
@@ -332,7 +464,8 @@ TEST(TypeRules, NullptrTAssignsToPointerWhenEnabled) {
     // nullptr → any pointer (object or, in the shipped surface, function pointer)
     EXPECT_TRUE(isAssignable(in, voidPtr, nptr, on));
     EXPECT_TRUE(isAssignable(in, intPtr,  nptr, on));
-    // nullptr → int / bool are NOT admitted
+    // nullptr → int is NEVER admitted; nullptr → bool needs `scalarConvertsToBool`
+    // (defaulted OFF here — see ScalarConvertsToBoolWhenGated for the gated-ON case).
     EXPECT_FALSE(isAssignable(in, intT,  nptr, on));
     EXPECT_FALSE(isAssignable(in, boolT, nptr, on));
     // ONE-WAY: nothing converts TO nullptr_t
@@ -350,9 +483,11 @@ TEST(TypeRules, NullptrTInertWhenDisabled) {
     EXPECT_FALSE(isAssignable(in, voidPtr, nptr, off));
 }
 
-// Explicit cast: `(T*)nullptr` is castable; `(int)nullptr` / `(bool)nullptr` are
-// NOT, and nothing casts TO nullptr_t (the one-way constraint holds for casts too).
-TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
+// Explicit cast: `(T*)nullptr` AND `(bool)nullptr` are castable; `(int)nullptr`
+// (a non-bool arithmetic target) is NOT, and nothing casts TO nullptr_t (the
+// one-way constraint holds for casts too). `(bool)nullptr` -> false — C23 6.3.2.3.2
+// (D-CSUBSET-NULLPTR-BOOL-CONVERSION; nullptr lowers to 0, which truncates false).
+TEST(TypeRules, NullptrTExplicitCastToPointerOrBool) {
     auto in = makeInterner();
     TypeId const nptr    = in.primitive(TypeKind::NullptrT);
     TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
@@ -360,9 +495,135 @@ TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
     TypeId const intT    = in.primitive(TypeKind::I32);
     EXPECT_TRUE(isExplicitCastable(in, voidPtr, nptr));    // (void*)nullptr
     EXPECT_FALSE(isExplicitCastable(in, intT,  nptr));     // (int)nullptr  — rejected
-    EXPECT_FALSE(isExplicitCastable(in, boolT, nptr));     // (bool)nullptr — deferred
+    EXPECT_TRUE(isExplicitCastable(in, boolT, nptr));      // (bool)nullptr — C23, -> false
     EXPECT_FALSE(isExplicitCastable(in, nptr, voidPtr));   // nothing → nullptr_t
     EXPECT_FALSE(isExplicitCastable(in, nptr, intT));
+}
+
+// C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION): with `scalarConvertsToBool` ON, a
+// scalar (arithmetic / Char / pointer / nullptr) is assignable INTO a `_Bool` lhs;
+// OFF (the default), every one reverts to a mismatch — the flag genuinely gates the
+// behavior (a non-C schema keeps `_Bool` strict). A non-scalar source (Void here,
+// standing in for struct/union/FnSig — all rank-0, non-pointer) stays LOUD either
+// way. This is the MIRROR of the boolWidensToArith arm (Bool rhs -> arith lhs).
+TEST(TypeRules, ScalarConvertsToBoolWhenGated) {
+    auto in = makeInterner();
+    TypeId const boolT   = in.primitive(TypeKind::Bool);
+    TypeId const intT    = in.primitive(TypeKind::I32);
+    TypeId const dblT    = in.primitive(TypeKind::F64);
+    TypeId const charT   = in.primitive(TypeKind::Char);
+    TypeId const nptr    = in.primitive(TypeKind::NullptrT);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const voidT   = in.primitive(TypeKind::Void);
+    SemanticConfig::PointerConversionRules pr;
+    auto asg = [&](TypeId lhs, TypeId rhs, bool gate) {
+        return isAssignable(in, lhs, rhs, pr,
+            /*boolWidensToArith=*/false, /*charConvertsToArith=*/false,
+            /*enumConvertsToArith=*/false, /*intCrossSignednessConverts=*/false,
+            /*intSameSignednessNarrows=*/false, /*intConvertsToFloat=*/false,
+            /*floatConvertsToInt=*/false, /*floatSameKindNarrows=*/false,
+            /*charArrayFromStringLiteralInit=*/false,
+            /*bitIntConversions=*/false, /*scalarConvertsToBool=*/gate);
+    };
+    // Gated ON: scalar -> Bool admitted for arithmetic / char / pointer / nullptr.
+    EXPECT_TRUE(asg(boolT, intT,    true));
+    EXPECT_TRUE(asg(boolT, dblT,    true));
+    EXPECT_TRUE(asg(boolT, charT,   true));
+    EXPECT_TRUE(asg(boolT, voidPtr, true));
+    EXPECT_TRUE(asg(boolT, nptr,    true));
+    // Gated OFF (default): every one reverts to a mismatch (red-on-disable).
+    EXPECT_FALSE(asg(boolT, intT,    false));
+    EXPECT_FALSE(asg(boolT, dblT,    false));
+    EXPECT_FALSE(asg(boolT, charT,   false));
+    EXPECT_FALSE(asg(boolT, voidPtr, false));
+    EXPECT_FALSE(asg(boolT, nptr,    false));
+    // A genuinely-incompatible (non-scalar) source stays LOUD even gated ON.
+    EXPECT_FALSE(asg(boolT, voidT,   true));
+}
+
+// ── D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3) ─────────────────────────────────────
+// Implicit function-pointer <-> `void*` conversion — the gcc/POSIX dlsym / Tcl
+// ClientData idiom — gated on `allowVoidPtrFnConvert`, the SINGLE authoritative
+// gate for the whole fn<->void* class (Option B). The newly-admitted form is the
+// BARE function DESIGNATOR (`FnSig`, not yet decayed) -> `void*`; the `Ptr<FnSig>`
+// <-> `void*` pointer-to-pointer arms are RE-HOMED onto the same flag. The
+// boundary is Void-pointee-ONLY: a function designator / pointer -> a NON-void
+// object pointer STAYS a loud reject regardless of the flag.
+
+namespace {
+// A bare `int(int)` function signature (a function DESIGNATOR type, NOT yet a
+// pointer) — the un-decayed form the sqlite test_md5 `Tcl_CreateCommand` call
+// passes into a `void*` ClientData parameter.
+TypeId makeIntIntFnSig(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const params[1] = { i32 };
+    return in.fnSig(params, i32, CallConv::CcSysV);
+}
+} // namespace
+
+// (a) + (d): a bare FnSig -> void* ADMITS with the flag on, REJECTS with it off
+// (red-on-disable — the default-false gate genuinely controls the behavior).
+TEST(TypeRules, FnSigToVoidPtrGatedByFlag) {
+    auto in = makeInterner();
+    TypeId const fnSig   = makeIntIntFnSig(in);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    SemanticConfig::PointerConversionRules on;
+    on.allowVoidPtrFnConvert = true;
+    SemanticConfig::PointerConversionRules off;   // defaults false (strict)
+    // `void* p = add40;` (bare designator into void*) — the exact blocker.
+    EXPECT_TRUE(isAssignable(in, voidPtr, fnSig, on))
+        << "bare FnSig -> void* admits when allowVoidPtrFnConvert is on";
+    EXPECT_FALSE(isAssignable(in, voidPtr, fnSig, off))
+        << "RED-ON-DISABLE: reverts to a loud reject when the flag is off";
+}
+
+// (b): the Option-B re-homing — `Ptr<FnSig> -> void*` AND `void* -> Ptr<FnSig>`
+// route through `allowVoidPtrFnConvert`, NOT the generic implicitToVoidPtr /
+// implicitFromVoidPtr. Proven with a config that turns ONLY the fn<->void* gate
+// on (the generic void-ptr flags stay OFF): the conversion still admits, so it
+// cannot be riding the generic flags. With everything off, both reject.
+TEST(TypeRules, VoidPtrFnConvertReHomesPtrToPtrArms) {
+    auto in = makeInterner();
+    TypeId const fnSig   = makeIntIntFnSig(in);
+    TypeId const fnPtr   = in.pointer(fnSig);                       // Ptr<FnSig>
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    SemanticConfig::PointerConversionRules fnOnly;                  // ONLY the fn gate
+    fnOnly.allowVoidPtrFnConvert = true;                           // generic flags stay false
+    SemanticConfig::PointerConversionRules off;                    // all false
+    // Ptr<FnSig> -> void* and void* -> Ptr<FnSig> both admit on the fn gate ALONE.
+    EXPECT_TRUE(isAssignable(in, voidPtr, fnPtr, fnOnly))
+        << "Ptr<FnSig> -> void* rides allowVoidPtrFnConvert, not implicitToVoidPtr";
+    EXPECT_TRUE(isAssignable(in, fnPtr, voidPtr, fnOnly))
+        << "void* -> Ptr<FnSig> rides allowVoidPtrFnConvert, not implicitFromVoidPtr";
+    // RED-ON-DISABLE: with the fn gate off, both revert to a loud reject.
+    EXPECT_FALSE(isAssignable(in, voidPtr, fnPtr, off));
+    EXPECT_FALSE(isAssignable(in, fnPtr, voidPtr, off));
+}
+
+// (c): the FAIL-LOUD boundary — a function designator / function pointer -> a
+// NON-void object pointer (`int*`) STAYS a loud reject regardless of the flag.
+// The new admit is Void-pointee-ONLY; over-admitting here would be a real
+// type-safety hole (a function address reinterpreted as int-typed storage). Even
+// with EVERY void-ptr flag on, a non-void object pointee is out of scope for the
+// fn<->void* class.
+TEST(TypeRules, VoidPtrFnConvertBoundaryStaysLoud) {
+    auto in = makeInterner();
+    TypeId const fnSig  = makeIntIntFnSig(in);
+    TypeId const fnPtr  = in.pointer(fnSig);                        // Ptr<FnSig>
+    TypeId const intPtr = in.pointer(in.primitive(TypeKind::I32));  // int* (non-void)
+    SemanticConfig::PointerConversionRules on;                     // ALL void-ptr flags on
+    on.allowVoidPtrFnConvert = true;
+    on.implicitToVoidPtr     = true;
+    on.implicitFromVoidPtr   = true;
+    SemanticConfig::PointerConversionRules off;
+    // FnSig -> int* : never (the new arm is Void-pointee-only).
+    EXPECT_FALSE(isAssignable(in, intPtr, fnSig, on))
+        << "bare FnSig -> int* stays loud even with every void-ptr flag on";
+    EXPECT_FALSE(isAssignable(in, intPtr, fnSig, off));
+    // Ptr<FnSig> -> int* : two distinct non-void pointees, never implicit.
+    EXPECT_FALSE(isAssignable(in, intPtr, fnPtr, on))
+        << "Ptr<FnSig> -> int* stays loud (distinct non-void pointees)";
+    EXPECT_FALSE(isAssignable(in, intPtr, fnPtr, off));
 }
 
 // ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────
@@ -390,7 +651,7 @@ TEST(TypeRules, IsAssignableBitIntGated) {
     // gate ON — bidirectional BitInt↔int + BitInt↔BitInt(any width)
     auto A = [&](TypeId l, TypeId r) {
         return isAssignable(in, l, r, {}, false, false, false, false, false,
-                            false, false, false, /*bitIntConversions=*/true);
+                            false, false, false, false, /*bitIntConversions=*/true);
     };
     EXPECT_TRUE(A(b4, i32));
     EXPECT_TRUE(A(i32, b4));

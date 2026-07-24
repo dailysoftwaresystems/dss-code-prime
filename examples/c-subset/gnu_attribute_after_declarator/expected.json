@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-GNU-ATTRIBUTE (TF-C62): GNU `__attribute__((...))` in the AFTER-DECLARATOR position with the widened argument grammar — `format(printf,1,2)` (multi-arg), `__nothrow__,__leaf__` (multi-clause), `__nonnull__((1))` (nested paren), `aligned(4)` (number). This is the shape every real C header uses on its prototypes (glibc `__attribute__((__nothrow__,__leaf__))`, Tcl `TCL_FORMAT_PRINTF(1,2)`). The attributes are parse-and-ignore hints — the program must COMPILE and RUN with them present: add(v,12)+deref(&10)+firstv(0,1,2) = 32+10+0 = 42. RED-ON-DISABLE: revert the after-declarator attrSpec slot in initDeclarator -> the first prototype fails P0009 -> the program no longer compiles (compile failure, not exit 42). The release arm re-witnesses the attributed declarations survive the shipped pipeline.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

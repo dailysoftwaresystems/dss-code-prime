@@ -99,6 +99,11 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the target's
+        // bare-`char` signedness exactly as compile_pipeline.cpp does, so an
+        // arm64 target lowers the char→int promotion as ZExt (unsigned) and
+        // x86_64 as SExt (signed). Absent key ⇒ false = signed.
+        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned();
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
@@ -452,6 +457,68 @@ namespace {
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // Active elf/x86_64 (harmless — atomic_int carries no per-format variant).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol);
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: lower a program that calls a shipped
+// descriptor's `fn(ptr<i64>)` with a real C `long long*` arg through the FULL
+// pipeline (scratch descriptor on the system path — the lowerAtomicProgram
+// discipline). Used to witness that the admitted call-arg REALIZES as a Ptr→Ptr
+// bitcast (no width op) and that the HIR verifier stays clean (admit⟺realize).
+[[nodiscard]] Lowered lowerFfiWideProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "ffi-wide-mir"};
+    std::ofstream(sysDir.path() / "ffiwide.json", std::ios::binary) << R"JSON({
+        "header": "ffiwide.h",
+        "library": { "elf": "libscratchffi.so.1", "pe": "scratchffi.dll", "macho": "/usr/lib/libscratchffi.dylib" },
+        "symbols": [
+            { "name": "ffi_take_wide", "signature": "fn(ptr<i64>) -> void", "kind": "function", "linkage": "external" }
+        ]
+    })JSON";
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.setActiveFormat(ObjectFormatKind::Elf);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
                          ObjectFormatKind::Elf, "x86_64");
     DiagnosticReporter hirReporter;
@@ -890,6 +957,104 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
+// TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): bare `char`'s signedness
+// is TARGET-config-driven — the char→int promotion sign-extends (SExt) on a
+// signed-char target (x86_64/pe64) and zero-extends (ZExt) on an unsigned-char
+// target (AArch64). `int f(char c) { return c; }` promotes `c` (char) to the
+// int return type via `mapCast(Char, I32)` — Finding 1's REAL decision site
+// (the former `mapCast`-local `isSignedInt`), routed through the target-aware
+// `isSignedIntKind`. This pins BOTH arms of that one predicate through the full
+// frontend. RED-ON-DISABLE: revert `isSignedIntKind(Char)` to the hard-coded
+// signed set → the arm64 config emits SExt (not ZExt) and the arm64 assertion
+// below flips (0 ZExt / 1 SExt). x86_64 is unchanged (byte-identical).
+TEST(MirLoweringCSubset, BareCharToIntPromotionIsTargetSignednessAware) {
+    constexpr char kSrc[] = "int f(char c) { return c; }";
+
+    // x86_64: bare char is SIGNED ⇒ char→int promotion is SExt (sxtb / movsx).
+    {
+        auto L = lowerCSubset(kSrc, "x86_64", "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(sexts.size(), 1u)
+            << "x86_64: bare char is signed — the char→int promotion must SExt";
+        EXPECT_EQ(zexts.size(), 0u)
+            << "x86_64: no ZExt — char is signed here";
+    }
+
+    // arm64: bare char is UNSIGNED (AArch64 ABI) ⇒ promotion is ZExt (uxtb / movzx).
+    {
+        auto L = lowerCSubset(kSrc, "arm64", "aapcs64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(zexts.size(), 1u)
+            << "arm64: bare char is UNSIGNED — the char→int promotion must ZExt";
+        EXPECT_EQ(sexts.size(), 0u)
+            << "arm64: no SExt — char is unsigned here (the TF-C56 fix)";
+    }
+}
+
+// D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion widens the
+// source to POINTER WIDTH per its signedness BEFORE IntToPtr — SExt a signed
+// narrower int, ZExt an unsigned one, and SKIP a source already at pointer width
+// (byte-identical bare IntToPtr). Previously IntToPtr lowered a narrower source
+// with NO extension (identity mov), so a signed `-1` zero-extended to
+// 0x0000_0000_FFFF_FFFF instead of all-ones — breaking `(u8*)(-1)` sentinels
+// (sqlite) on arm64's >4 GiB addresses. This pins the MIR shape at the combineCast
+// fix site. RED-ON-DISABLE: revert the fix → the narrower arms emit a bare IntToPtr
+// with no SExt/ZExt (the signed arm's `sexts.size()==1` fails).
+TEST(MirLoweringCSubset, IntToPtrExtendsSourceToPointerWidthBySignedness) {
+    // signed narrower (int, 32-bit) → SExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* f(int x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+            << "signed int→ptr must SIGN-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // unsigned narrower (unsigned, 32-bit) → ZExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* g(unsigned x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+            << "unsigned int→ptr must ZERO-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // pointer-width source (long long, 64-bit) → bare IntToPtr, NO extension: the
+    // byte-identical skip (`fromResolved == ptrIntKind`).
+    {
+        auto L = lowerCSubset("void* h(long long x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+            << "a pointer-width source must NOT be extended (byte-identical skip)";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        // Pin the byte-identical invariant directly: the skip must emit NO widening
+        // op at all — not even a same-width Bitcast. Dropping the `fromResolved !=
+        // ptrIntKind` guard would make `mapCast(I64,I64)` return Bitcast → a stray
+        // GPR mov at LIR → byte-identical BREAKS for every pointer-width int→ptr on
+        // x86_64/pe64. SExt/ZExt counts alone would NOT catch that; this does.
+        EXPECT_EQ(collectOps(m, MirOpcode::Bitcast).size(), 0u)
+            << "a pointer-width source must skip cleanly (no Bitcast) — byte-identical";
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+}
+
 // CE4 end-to-end: a ternary initializer folds when cond + selected arm
 // both fold (the unselected arm doesn't need to fold). `int g = 1 ? 7 : x;`
 // — even if `x` were non-constant, cond=true picks the then-arm and the
@@ -1046,6 +1211,165 @@ TEST(MirLoweringCSubset, GlobalWithFloatArithmeticInitializerFoldsThroughCastToI
         << "HR coerce must wrap F64 init in Cast(F64→I32) for int target; "
            "CE5 must fold through that Cast";
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
+}
+
+// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — tryClassifyIntToPtrConst ──
+// An explicit integer-constant→pointer cast in a STATIC/global initializer
+// (`(void*)0x5`) folds to a PLAIN uint64 pointer leaf (core==Ptr) — an ABSOLUTE
+// address, no symbol, no relocation. const-eval refuses the cast-to-pointer, so
+// without the classifier the initializer falls to `runtimeInit`: a SCALAR becomes
+// an init-func store (UINT32_MAX literal + valid initFunc), and an AGGREGATE trips
+// the ConstructAggregate fail-loud (mir.ok == false). Each pin below is therefore
+// RED-ON-DISABLE on the exact wiring it names.
+
+// pin (i): a TOP-LEVEL scalar int→ptr cast folds to a uint64 pointer leaf == 5,
+// core==Ptr, with NO init function. RED-ON-DISABLE: the classifyGlobals scalar-
+// cascade wiring — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
+TEST(MirLoweringCSubset, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
+    auto L = lowerCSubset("static void* p = (void*)0x5;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "the int→ptr cast must fold to a const-init literal, not runtimeInit";
+    EXPECT_FALSE(m.globalInitFunc(g).valid())
+        << "an absolute-address pointer constant needs no __module_init__ store";
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value))
+        << "a folded int→ptr leaf is a plain uint64 (the encoder writes raw LE bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr) << "core==Ptr — pointer-typed, no relocation";
+}
+
+// pin (ii): an ARRAY of int→ptr — `static void* a[] = {(void*)1,(void*)2};` —
+// lowers to an aggregate const-init whose two fields are plain uint64 pointer
+// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the
+// member-loop wiring — the array aggregate would bail to runtimeInit → the
+// ConstructAggregate fail-loud (mir.ok == false).
+TEST(MirLoweringCSubset, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
+    auto L = lowerCSubset("static void* a[] = { (void*)1, (void*)2 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<MirAggregateValue>(lit.value));
+    auto const& agg = std::get<MirAggregateValue>(lit.value);
+    ASSERT_EQ(agg.fields.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[0].value));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[1].value));
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[0].value), 1u);
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[1].value), 2u);
+    EXPECT_EQ(agg.fields[0].core, TypeKind::Ptr);
+    EXPECT_EQ(agg.fields[1].core, TypeKind::Ptr);
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[0].value))
+        << "an absolute integer element must NOT be a relocation";
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[1].value));
+}
+
+// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf.
+// tryClassifyNullPointerConst claims it FIRST (it runs before the int→ptr arm at
+// both sites) and the int→ptr arm would produce the byte-identical leaf anyway, so
+// the standard null-pointer constant is preserved — order intact.
+TEST(MirLoweringCSubset, StaticNullPointerCastStillFoldsToZeroLeaf) {
+    auto L = lowerCSubset("static void* z = (void*)0;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 0u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
+}
+
+// pin (iv): the MIX — `static struct Two X = {"a",(void*)0x5};` — `.a` stays a
+// SYMBOL-ADDRESS (reloc) leaf (the string's link-time rodata address) AND `.b` is
+// a plain uint64 pointer leaf == 5. Guards against the int→ptr arm cannibalizing
+// the symbol-address arm (which runs FIRST in the member loop). RED-ON-DISABLE:
+// the member-loop wiring — `.b` would bail the aggregate to runtimeInit.
+TEST(MirLoweringCSubset, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
+    auto L = lowerCSubset(
+        "struct Two { char* a; void* b; };\n"
+        "static struct Two X = { \"a\", (void*)0x5 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The string literal mints its own rodata global too, so find X by its
+    // aggregate const-init rather than assuming an index.
+    MirAggregateValue const* agg = nullptr;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirAggregateValue>(lit.value)) {
+            agg = &std::get<MirAggregateValue>(lit.value);
+            break;
+        }
+    }
+    ASSERT_NE(agg, nullptr) << "X must lower to a const-init aggregate, not runtimeInit";
+    ASSERT_EQ(agg->fields.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<MirSymbolAddrValue>(agg->fields[0].value))
+        << ".a is a link-time string address — an abs64 RELOCATION leaf, not an int";
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg->fields[1].value))
+        << ".b is the int→ptr absolute-address leaf — a plain uint64 (raw bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(agg->fields[1].value), 5u);
+    EXPECT_EQ(agg->fields[1].core, TypeKind::Ptr);
+}
+
+// pin (v) NEGATIVE: a pure SYMBOL-ADDRESS global — `char* s = "x";` — still routes
+// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer.
+// tryClassifyAsSymbolAddr runs FIRST in the scalar cascade, and the int→ptr arm
+// would nullopt on a non-Cast operand anyway. RED if the int→ptr arm ever swallowed
+// a symbol address (an integer leaf would appear where a reloc belongs).
+TEST(MirLoweringCSubset, StaticStringPointerStaysSymbolAddressNotInteger) {
+    auto L = lowerCSubset("char* s = \"x\";\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    bool foundSymAddr = false;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirSymbolAddrValue>(lit.value)) foundSymAddr = true;
+        EXPECT_FALSE(std::holds_alternative<std::uint64_t>(lit.value) &&
+                     lit.core == TypeKind::Ptr)
+            << "a symbol-address global must not be mis-folded to an absolute integer";
+    }
+    EXPECT_TRUE(foundSymAddr)
+        << "`char* s = \"x\";` must carry a symbol-address reloc leaf";
+}
+
+// pin (vi) BLOCK-SCOPE static (the design-audit's one real correction): a
+// `static void* p = (void*)0x5;` declared INSIDE a function body reaches the SAME
+// classifyGlobals path (static-duration locals lower to module globals) — it folds
+// to the identical uint64 pointer leaf, NOT a runtime store in the function body.
+TEST(MirLoweringCSubset, BlockScopeStaticIntToPtrReachesClassifyGlobals) {
+    auto L = lowerCSubset(
+        "int main(void) { static void* p = (void*)0x5; return (int)(long)p; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Exactly one module global (the block-scope static `p`); its init is the
+    // folded int→ptr leaf, and NO __module_init__ appears for it.
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "a block-scope static int→ptr must fold to a const-init literal";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
 }
 
 // A function writing to a module global lowers the write as
@@ -1741,6 +2065,41 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
 // (dropping linkageSpecifierIgnoredNames) and `f`'s Local binding is overwritten
 // Global by last-wins → localCount flips to 0 → RED. A silent linkage
 // externalization of `static __attribute__((noreturn)) void f` is a miscompile.
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` function DEFINITION
+// has EXTERNAL linkage (binding == Global — the C default for a function; `extern`
+// is the default external linkage, ignored-by-kind in the linkage scan), while a
+// `static` definition of the same shape has INTERNAL linkage (binding == Local).
+// Both are called by main so neither is DCE'd. RED-ON-DISABLE: if the extern
+// definition were mis-lowered with internal linkage (or as a bodyless import), the
+// Local/Global counts flip.
+TEST(MirLoweringCSubsetLinkage, ExternFunctionDefinitionHasExternalLinkage) {
+    auto L = lowerCSubset(
+        "extern int ef(int x){ return x + 1; }\n"   // external linkage (Global)
+        "static int sf(int x){ return x + 2; }\n"   // internal linkage (Local)
+        "int main(void){ return ef(0) + sf(0); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 3u) << "ef + sf + main (all reachable)";
+    // Exactly one function is Local — the `static` sf; the `extern` ef and main are
+    // both external (Global). A count != 1 means the extern definition wrongly took
+    // internal linkage (2) or failed to lower as a Function (0).
+    int localCount = 0, globalCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        auto const b = m.funcBinding(m.funcAt(i));
+        if (b == SymbolBinding::Local)  ++localCount;
+        if (b == SymbolBinding::Global) ++globalCount;
+    }
+    EXPECT_EQ(localCount, 1)
+        << "only the `static` sf is internal (Local); the extern definition is not";
+    EXPECT_EQ(globalCount, 2)
+        << "the `extern` function DEFINITION + main are external (Global)";
+}
+
 TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
     for (char const* src : {
              // `static` BEFORE the attribute.
@@ -2229,6 +2588,62 @@ TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
     EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
 }
 
+// D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field MUTATION in ANY position
+// other than statement plain-`=` — a VALUE-position `(bf.a = v)` / `(bf.a += 1)` /
+// `(bf.a++)` / `(++bf.a)` AND a STATEMENT compound / inc-dec `bf.a += 1;` /
+// `bf.a++;` / `--bf.a;` — must take the READ-MODIFY-WRITE of the allocation unit,
+// NOT a full-unit Store. Before the fix, classifyLvalue / classifyIncDecLvalue
+// bound `&(bf.a)` into a temp pointer and emitted a plain `*p` Deref target, which
+// fell to `emitScalarStore` (a bare full-unit Store — clobbering packed neighbours
+// and skipping truncation). The fix binds the CONTAINING AGGREGATE's address and
+// reconstructs `MemberAccess(Deref(p), field)`, so BOTH forms present a
+// MemberAccess to the ONE RMW chokepoint. `a` sits at bitOffset 4 (after `pad:4`)
+// so the insert MUST Shl by 4; the clear+mask are two Ands and the merge is an Or.
+// RED-ON-DISABLE: revert the classifyMemberLvalue aggregate-address reconstruction
+// and each of these functions loses its Or/Shl (a bare full-unit Store returns).
+TEST(MirLoweringCSubset, BitFieldMutationValueAndCompoundFormsAreReadModifyWrite) {
+    auto L = lowerCSubset(
+        "struct S { unsigned pad : 4; unsigned a : 3; unsigned b : 5; };\n"
+        "unsigned v_assign  (struct S* p, unsigned v){ unsigned x=(p->a =v); return x; }\n"
+        "unsigned v_compound(struct S* p)            { unsigned x=(p->a+=1); return x; }\n"
+        "unsigned v_postinc (struct S* p)            { unsigned x=(p->a++ ); return x; }\n"
+        "unsigned v_preinc  (struct S* p)            { unsigned x=(++p->a ); return x; }\n"
+        "void     s_compound(struct S* p)            { p->a += 1; }\n"
+        "void     s_postinc (struct S* p)            { p->a++;    }\n"
+        "void     s_predec  (struct S* p)            { --p->a;    }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Count an opcode across ALL blocks of a function (a value-position SeqExpr
+    // stays straight-line, but count broadly to be robust to any block split).
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        int n = 0;
+        auto const fn = m.funcAt(fnIdx);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i)
+                if (m.instOpcode(m.blockInstAt(blk, i)) == op) ++n;
+        }
+        return n;
+    };
+    char const* names[7] = {"v_assign", "v_compound", "v_postinc", "v_preinc",
+                            "s_compound", "s_postinc", "s_predec"};
+    for (std::uint32_t fn = 0; fn < 7; ++fn) {
+        EXPECT_GE(countIn(fn, MirOpcode::Or), 1)
+            << names[fn] << ": bit-field mutation must OR the inserted field (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::Shl), 1)
+            << names[fn] << ": bit-field mutation must Shl the value to bitOffset (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::And), 2)
+            << names[fn] << ": RMW clears the field AND masks the value";
+    }
+    // The VALUE-position forms additionally read the STORED (truncated) value back
+    // via the extract path (LShr by bitOffset 4 + And mask) for the SeqExpr yield —
+    // NOT the un-truncated full unit. v_assign (fn 0) is the canonical `x=(bf.a=v)`.
+    EXPECT_GE(countIn(0, MirOpcode::LShr), 1)
+        << "value-position `=` yields the extracted (truncated) stored value";
+}
+
 // FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a bit-field on a 64-BIT BASE
 // (`unsigned long long` / `long long` → a 64-bit allocation unit) now
 // COMPILES + LOWERS end-to-end. Before FC8 the semantic analyzer
@@ -2481,6 +2896,46 @@ TEST(MirLoweringCSubset, NonStringArrayDecaysToPointerNotFailLoud) {
         << "non-string array→pointer decay (local + global) must lower, not "
            "fail loud: "
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): the sqlite getVarint32 fast-path shape —
+// an ARRAY `z` deref'd DIRECTLY (`*(z)`) as the RVALUE of the comma-LEFT
+// assignment `out = (u32)*(z)`, itself the middle operand of a ternary. Pre-fix
+// `*(z)` was a TYPELESS Deref (derefResultType has no Array arm) → H0001 at the
+// HirVerifier → the shape never reached clean MIR. This pins the MIR tier: the
+// full shape LOWERS (hir.ok + mir.ok) and BOTH the array-deref Load (of z[0]) and
+// the comma-LEFT side-effect Store (to `out`) are emitted — the structural guard,
+// on every target leg, that the decay→load lowers and the comma-LEFT side effect
+// is not dropped. The corpus witness (examples/c-subset/array_decay_deref) proves
+// the VALUES (out == 42) end-to-end. RED-ON-DISABLE: revert the combineUnaryOp
+// Deref array-decay → hir.ok flips false (H0001) and this test fails at the first
+// ASSERT.
+TEST(MirLoweringCSubset, DerefOfArrayInCommaTernaryLowersWithLoadAndSideEffectStore) {
+    auto L = lowerCSubset(
+        "typedef unsigned char u8; typedef unsigned int u32;\n"
+        "u32 getv(void) {\n"
+        "    u8 z[4];\n"
+        "    u32 out = 0;\n"
+        "    z[0] = 42;\n"
+        "    u8 n = (u8)((*(z) < (u8)0x80) ? ((out) = (u32)*(z)), 1 : 9);\n"
+        "    return out + (u32)n;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "pre-fix `*(z)` (a DIRECT array deref) was a TYPELESS Deref → H0001: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The array deref `*(z)` reads z[0] → a Load; the comma-LEFT `out = …` side
+    // effect → a Store. Both must survive (a dropped side effect or a lost deref
+    // would remove one).
+    EXPECT_FALSE(collectOps(m, MirOpcode::Load).empty())
+        << "the array-deref `*(z)` must emit a Load of z[0]";
+    EXPECT_FALSE(collectOps(m, MirOpcode::Store).empty())
+        << "the comma-LEFT `out = (u32)*(z)` side effect must emit a Store";
 }
 
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
@@ -4251,6 +4706,62 @@ TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
         << "the I64 operand's conversion to U64 must be a REAL cast inst";
 }
 
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (realize + verifier backstop): the
+// admitted shipped-descriptor call-arg (`long long*` into a `ptr<i64>` param)
+// REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
+// bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
+// AND the HIR verifier stays clean — because the coerce arm RETYPED the arg node to
+// the param type. If the coerce mark→bitcast arm were neutered, `L.hir->ok` would
+// go FALSE (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param
+// `ptr<i64>`) — so this pin is the automated form of that realize red-on-disable.
+//
+// The witness is at the HIR (where coerce runs): the full MIR lowering of a call to
+// an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
+// (ffiMap=nullptr) does not run, so `L.mir.ok` is not asserted here — the whole
+// program links + runs in `examples/c-subset/shipped_tcl_wideint` (the RUN witness).
+TEST(MirLoweringCSubset, FfiDescriptorIntPointeeArgRealizesAsPtrBitcast) {
+    // A `long long*` PARAMETER (no `= 0` init to add an unrelated width cast) passed
+    // straight into the descriptor's `fn(ptr<i64>)`.
+    auto L = lowerFfiWideProgram(
+        "#include <ffiwide.h>\n"
+        "void f(long long *pa){ ffi_take_wide(pa); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "the shipped-descriptor call-arg relaxation must ADMIT `long long*` "
+           "into `ptr<i64>` (LP64) — no S0003";
+    ASSERT_TRUE(L.hir->ok)
+        << "admit⟺realize: the coerce arm retyped the arg to the param type, so the "
+           "HIR verifier is clean; a missing bitcast would fire H_VerifierFailure";
+
+    // Walk the HIR for the synthetic realize Cast: a Ptr→Ptr where BOTH the result
+    // and the operand are Ptr<I64> — same representation, DISTINCT pointee TypeIds
+    // (the descriptor `ptr<i64>` vs the named `long long*`). Ptr→Ptr proves it is a
+    // bitcast, never an int↔ptr or width conversion.
+    auto const& hir = L.hir->hir;
+    auto const& in  = L.model.lattice().interner();
+    auto const isPtrToI64 = [&](TypeId t) {
+        return t.valid() && in.kind(t) == TypeKind::Ptr
+            && in.kind(in.operands(t)[0]) == TypeKind::I64;
+    };
+    bool foundRealizeCast = false;
+    std::vector<HirNodeId> stack{hir.root()};
+    while (!stack.empty()) {
+        HirNodeId const n = stack.back();
+        stack.pop_back();
+        if (hir.kind(n) == HirKind::Cast) {
+            auto const kids = hir.children(n);
+            if (!kids.empty() && isPtrToI64(hir.typeId(n))
+                && isPtrToI64(hir.typeId(kids[0]))
+                && hir.typeId(n).v != hir.typeId(kids[0]).v) {
+                foundRealizeCast = true;
+            }
+        }
+        for (HirNodeId c : hir.children(n)) stack.push_back(c);
+    }
+    EXPECT_TRUE(foundRealizeCast)
+        << "the admitted arg must realize as a Ptr<I64>→Ptr<I64> Cast (a same-rep, "
+           "distinct-identity bitcast) — never a width op";
+}
+
 // `char + 1` promotes char to int (the `alsoPromote` config row): the
 // Add computes at I32 and the char operand is widened by a REAL SExt.
 TEST(MirLoweringCSubset, CharPlusIntPromotesToI32WithSExt) {
@@ -5058,6 +5569,66 @@ vaOverflowArgAreaPayload(Mir const& m, std::uint32_t fi) {
     return false;
 }
 } // namespace
+
+namespace {
+// `sizeof` folds to a `size_t` (u64) Const, stored as the `uint64_t` literal
+// variant — `funcHasConstInt` only inspects the `int64_t` variant, so the sizeof
+// pins below need a both-variant probe (the value is small + non-negative).
+[[nodiscard]] bool funcHasConstUIntEither(Mir const& m, std::uint32_t fi,
+                                          std::uint64_t value) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::uint64_t>(lit.value)
+                && std::get<std::uint64_t>(lit.value) == value)
+                return true;
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == static_cast<std::int64_t>(value))
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `sizeof(*a)` for `int a[10]`
+// folds to the ELEMENT size (4), NEVER the whole-array 40. Pre-fix the shared
+// `derefResultType` law had no Array arm, so the semantic tier left `*a`
+// unstamped and lowerSizeof's `resolveStampedTypeBelow` DFS-descended into the
+// leaf `a`, silently folding sizeof(int[10]) = 40. The (int) cast makes the exit
+// path read the folded size_t constant. RED-ON-DISABLE: revert the Array arm in
+// `derefResultType` — with the lowerSizeof value-form wall present the operand is
+// now UNSTAMPED, so lowering FAILS LOUD (H_UnsupportedLoweringForKind) and no
+// Const 4 is emitted (`L.mir.ok` trips / the const-4 EXPECT reds); revert the
+// wall too and the old DFS restores the silent Const 40 this pins against.
+TEST(MirLoweringCSubset, SizeofDerefArrayFoldsElementNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int a[10]; return (int)sizeof(*a); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 4))
+        << "sizeof(*a) is the element int == 4 (C 6.3.2.1p3 array-decay + 6.5.3.4)";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 40))
+        << "must NOT fold to the whole int[10] (40) — the silent DFS leaf-fallback";
+}
+
+// The 2-D companion: `sizeof(*m)` for `int m[3][4]` is the ROW `int[4]` (16),
+// never the whole 48-byte 2-D array. `*m` decays `int[3][4]` to `int(*)[4]` and
+// derefs to `int[4]`. RED-ON-DISABLE mirrors the 1-D pin above (16 <-> 48).
+TEST(MirLoweringCSubset, SizeofDerefTwoDimArrayFoldsRowNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int m[3][4]; return (int)sizeof(*m); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 16))
+        << "sizeof(*m) is the row int[4] == 16";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 48))
+        << "must NOT fold to the whole int[3][4] (48)";
+}
 
 TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
     auto L = lowerCSubset(

@@ -150,6 +150,27 @@ countOpcodeInModule(Lir const& lir, std::uint16_t op) {
 
 } // namespace
 
+// ── D-CSUBSET-TESTTU-SILENT-EXIT1: empty module is a valid success ────
+//
+// An empty module (0 functions — a declaration-only / all-preprocessed-out
+// TU) materializes to an empty result that is a VALID success: the parallel-
+// index invariant `perFunc.size() == moduleFuncCount()` holds at 0 == 0, so a
+// declaration-only TU lowers to a valid empty relocatable object rather than
+// silently rejecting the whole compile. RED-ON-DISABLE: restoring the
+// `moduleFuncCount() > 0` clause in LirCallconvResult::ok() flips this to false.
+TEST(LirCallconv, EmptyModuleIsOk) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    Lir empty{};                 // 0 functions
+    LirAllocation emptyAlloc{};   // no per-function allocations → ok()
+    ASSERT_TRUE(emptyAlloc.ok());
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(empty, **target, emptyAlloc, rep);
+    EXPECT_TRUE(result.ok());
+    EXPECT_EQ(result.perFunc.size(), 0u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
 // ── D-WIN64-LARGE-FRAME-STACK-PROBE prologue structural pins ──────────
 //
 // The ms_x64 prologue must emit a `stack_probe` op (NOT a plain `sub rsp`)

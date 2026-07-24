@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21, SQLite testfixture-link sub-arc): RUN witness for `extern` on a FUNCTION DEFINITION — `extern int addone(int x){ return x+1; }` (valid C 6.9.1, symmetric with `static int f(){…}`; the Tcl `EXTERN int Sqlite3_Init(Tcl_Interp*){…}` shape that P0009'd ×14 in tclsqlite-ex.c before this cycle). addone is an EXTERNAL-linkage definition — a real Function with an emitted body (NOT an ExternFunction import) via the shared declarator-mode function lowering topLevelDecl's `static`/plain definition arm uses. main calls it with a runtime arg -> addone(41) = exit 42. The `release` optimizedPipeline arm witnesses the shipped optimizer over the extern-linkage function-definition shape (an external-linkage fn is DCE-protected). All 4 targets: a front-end/parse + language-driven semantic/HIR fix, no target-specific codegen. RED-ON-DISABLE (grammar): revert externDeclTail's block arm -> P0009 at the `{`. RED-ON-DISABLE (HIR): mis-lower the definition as an extern DECLARATION -> addone is an unresolved import -> link failure, never 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

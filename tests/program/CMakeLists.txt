@@ -10,6 +10,8 @@ dss_add_test(NAME program/test_static_link
              SOURCES test_static_link.cpp)
 dss_add_test(NAME program/test_cli_args
              SOURCES test_cli_args.cpp)
+dss_add_test(NAME program/test_include_dirs
+             SOURCES test_include_dirs.cpp)
 dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format

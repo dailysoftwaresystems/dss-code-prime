@@ -4,6 +4,8 @@
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"   // HirSourceMap
 
+#include <vector>
+
 namespace dss {
 
 class DiagnosticReporter;
@@ -37,6 +39,32 @@ class TypeInterner;
 // no semantic phase, has no interner to consult). The real pipeline always
 // supplies the interner the semantic phase produced, so these rules always run
 // in production.
+
+// A `goto` may target ANY label in the function, including one nested inside a
+// statement, so "is this subtree a goto-reachable re-entry point?" is "does it
+// contain a LabelStmt?". Template-safe: uses only kind()+children(). Declared
+// before `pathTerminates` (its sole caller) so ordinary lookup resolves it.
+// Part of D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE (the nested-label
+// soundness reset for the block last-reachable-statement rule below).
+template <typename Source>
+[[nodiscard]] bool subtreeContainsLabel(Source const& src, HirNodeId root) {
+    // Iterative worklist, NOT recursion: a `goto` target can nest at ANY depth,
+    // and SQLite emits deeply-nested trees (esp. expressions in dead code) — a
+    // recursive tree-walk has overflowed the stack on SQLite before
+    // (D-PARSE-DEEP-NEST-RECURSION-MEMORY). The heap worklist stays bounded by
+    // subtree SIZE regardless of DEPTH. Gated by the `!reachable` caller so it
+    // only runs in the rare dead-tail region. Template-safe (kind()+children()).
+    std::vector<HirNodeId> work;
+    work.push_back(root);
+    while (!work.empty()) {
+        HirNodeId const n = work.back();
+        work.pop_back();
+        if (src.kind(n) == HirKind::LabelStmt) return true;
+        for (HirNodeId c : src.children(n)) work.push_back(c);
+    }
+    return false;
+}
+
 // Structural-termination predicate. Returns true iff control leaves
 // `id` on EVERY structural path by returning or diverging
 // (`ReturnStmt`, `Unreachable`, or a nested Block/If/Switch whose
@@ -81,8 +109,28 @@ template <typename Source>
             return true;
         case HirKind::Block:
         case HirKind::LabelStmt: {
+            // D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE: a block terminates
+            // (control never falls off its end) iff the position AFTER its last
+            // statement is unreachable. Walk forward tracking reachability: a
+            // (recursively) terminating statement makes subsequent positions
+            // unreachable (so trailing DEAD code after a real terminator — a
+            // `MACRO(...);` null statement, `return x; stmt();` — no longer
+            // spuriously reads as fall-through; this is exactly the dead code
+            // `checkBlockTermination` warns unreachable, so the two rules now
+            // agree). SOUNDNESS: a `goto` can re-enter a label ANYWHERE,
+            // including nested inside a dead-tail child, so a child whose SUBTREE
+            // CONTAINS a label re-establishes reachability (else `{ if(x) goto L;
+            // return 0; if(x){ L: ; } }` — a genuine fall-through — would be
+            // wrongly accepted). The `!reachable` gate confines the subtree scan
+            // to the rare dead region.
             auto kids = src.children(id);
-            return !kids.empty() && pathTerminates(src, kids.back());
+            if (kids.empty()) return false;
+            bool reachable = true;
+            for (HirNodeId child : kids) {
+                if (!reachable && subtreeContainsLabel(src, child)) reachable = true;
+                if (reachable && pathTerminates(src, child)) reachable = false;
+            }
+            return !reachable;
         }
         case HirKind::IfStmt: {
             auto elseB = src.ifElse(id);

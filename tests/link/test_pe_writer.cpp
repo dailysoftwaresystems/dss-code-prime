@@ -241,8 +241,11 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     EXPECT_EQ(readI16LE(bytes, symPtr + 12), 1);
     // Type @ +14 = 0x0020 (DT_FUNCTION)
     EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x0020u);
-    // StorageClass @ +16 = 2 (IMAGE_SYM_CLASS_EXTERNAL)
-    EXPECT_EQ(bytes[symPtr + 16], 2u);
+    // StorageClass @ +16 = 3 (IMAGE_SYM_CLASS_STATIC) — this function has no
+    // ModuleSymbol row, so it is not externally visible → `definedBinding` =
+    // Local → STATIC, not EXTERNAL (TF-C54, D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION; pre-fix it was hardcoded EXTERNAL = 2).
+    EXPECT_EQ(bytes[symPtr + 16], 3u);
     // NumberOfAuxSymbols @ +17 = 0
     EXPECT_EQ(bytes[symPtr + 17], 0u);
 }
@@ -295,6 +298,65 @@ TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) 
     // Symbol 1 = fn B (static) → stays internal `sym_11`.
     EXPECT_EQ(inlineNameAt(symPtr + 18u), "sym_11")
         << "a static (Local-binding) function must stay internal in the .obj";
+
+    // Storage class (COFF symbol record byte @ +16) — TF-C54,
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. NAME and
+    // BINDING are coupled: fn A (Global) → IMAGE_SYM_CLASS_EXTERNAL (2); fn B
+    // (static, Local) → IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s
+    // unrelated `sym_<id>` can never collide with it at a FOREIGN multi-TU
+    // link. COFF has no local-first ordering (unlike ELF) — order unchanged,
+    // only the class flips. RED-ON-DISABLE: pre-fix both were EXTERNAL (2).
+    EXPECT_EQ(bytes[symPtr + 16], 2u)
+        << "externally-visible fn A is IMAGE_SYM_CLASS_EXTERNAL (2)";
+    EXPECT_EQ(bytes[symPtr + 18u + 16], 3u)
+        << "static fn B is IMAGE_SYM_CLASS_STATIC (3), not EXTERNAL — the TF-C54 fix";
+}
+
+// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
+//
+// The relocatable PE/COFF writer cannot faithfully emit a WEAK DEFINED symbol
+// (COFF weak-external — IMAGE_SYM_CLASS_WEAK_EXTERNAL + its aux record — is not
+// wired). Degrading it to IMAGE_SYM_CLASS_EXTERNAL would SILENTLY lose the
+// weak-override semantics, so the writer fails loud instead. RED-ON-DISABLE:
+// reverting the fail-loud arm makes the writer emit the weak fn as EXTERNAL (2)
+// with 0 errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat
+// citing the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) +
+// the PE/Mach-O EXEC arms (weak forced Global / merge-resolved) are unaffected.
+TEST(PeWriter, ObjectWeakDefinedFunctionFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction w;
+    w.symbol = SymbolId{10};
+    w.bytes  = {0xC3};
+    mod.functions.push_back(std::move(w));
+    // A WEAK, externally-visible defined function (the `__attribute__((weak))`
+    // shape c-subset.lang.json produces). `definedBinding` returns Weak.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined symbol must emit no bytes (loud-fail path), never a "
+           "silently-degraded EXTERNAL record";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak def";
+    bool found = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            d.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") !=
+                std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE (the "
+           "COFF weak-external deferral) for future-grep navigability";
 }
 
 // ── String table starts with 4-byte u32 size including itself ──
@@ -610,6 +672,104 @@ TEST(PeWriter, ObjRodataItemEmitsRdataSectionAndDataSymbol) {
         << "COFF data symbols are notype - DTYPE_FUNCTION is fn-only";
     EXPECT_EQ(bytes[s1 + 16], 2u);            // IMAGE_SYM_CLASS_EXTERNAL
     EXPECT_EQ(bytes[s1 + 17], 0u);            // no aux records
+}
+
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54):
+//    the DATA emit site couples name+binding exactly as the function site ──
+//
+// The static→Local storage-class flip lives at a SECOND, fully-duplicated emit
+// site (the data loop), NOT shared with the function loop — the design-audit
+// flagged this data twin as unpinned. A static (Local-binding) DATA item must
+// carve to `sym_<id>` + IMAGE_SYM_CLASS_STATIC (3); the Global half is pinned
+// by ObjRodataItemEmitsRdataSectionAndDataSymbol above (EXTERNAL = 2). This is
+// NOT academic — a string-literal / `static const` rodata is exactly a Local
+// data item, and pre-fix it collided across TUs as a GLOBAL `sym_<id>` (the
+// reader witness uses a `sym_101` rodata static). RED-ON-DISABLE: reverting the
+// data-site ternary (pe.cpp) to a hardcoded EXTERNAL makes this read 2 → red.
+TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {'h', 'i', 0};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    // A STATIC (Local-binding) data item — the `static const` / string-literal
+    // shape. definedBinding → Local → name carved to `sym_42`, class STATIC.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "msg",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // Symbols: fn(0) + data(1). The data symbol record is at symPtr + 18.
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 2u);
+    std::size_t const s1 = symPtr + 18u;
+    EXPECT_TRUE(coffNameEquals(bytes, s1, "sym_42"))
+        << "a static (Local) data item stays internal `sym_<id>`, not its real name";
+    EXPECT_EQ(bytes[s1 + 16], 3u)   // IMAGE_SYM_CLASS_STATIC — THE FIX
+        << "static data emits IMAGE_SYM_CLASS_STATIC (3), not the pre-fix EXTERNAL (2)";
+}
+
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
+// data-site twin of ObjectWeakDefinedFunctionFailsLoud. The data loop has its
+// OWN weak guard (pe.cpp); reverting it silently degrades a weak data def to
+// EXTERNAL with no diagnostic. RED-ON-DISABLE: revert the data-site guard →
+// non-empty bytes + errorCount 0 → this pin goes red.
+TEST(PeWriter, ObjectWeakDefinedDataFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;   // a benign anchor fn so only the DATA is weak
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "anchor",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{10};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakdat",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak data def";
+    bool found = false;
+    for (auto const& dg : rep.all()) {
+        if (dg.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            dg.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE at the data site";
 }
 
 // (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function
@@ -3052,7 +3212,17 @@ TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
 
 TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeTrivialModule({0xC3}, /*fnSym=*/1);
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the colliding extern must be REFERENCED
+    // to survive the reference gate and reach the compound-index duplicate check —
+    // an unreferenced non-eager import is now dropped (which also removes the
+    // collision). A relocation to SymbolId{1} keeps the extern live so the
+    // ambiguous-resolution reject (fn #1 vs extern #1) still fires.
+    AssembledModule mod = makeTrivialModule({0xE8,0,0,0,0, 0xC3}, /*fnSym=*/1);
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{1};          // references SymbolId{1} → keeps the extern live
+    rel.kind   = RelocationKind{1};
+    mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
@@ -3106,7 +3276,13 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    fn.bytes  = {0xC3};
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the extern must be REFERENCED to
+    // survive the reference gate and REACH the walker whose lazy-binding fail-loud
+    // this test exercises — an unreferenced non-eager import is now dropped (which
+    // would leave no extern for the walker to reject). CALL printf so it stays live.
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};   // call rel32 printf; ret
+    fn.relocations.push_back(
+        Relocation{1u, SymbolId{99}, RelocationKind{1}, 0});   // references printf
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});

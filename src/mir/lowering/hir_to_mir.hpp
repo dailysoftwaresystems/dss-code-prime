@@ -92,6 +92,16 @@ struct DSS_EXPORT MirLoweringConfig {
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
 
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): whether bare `char`
+    // (`TypeKind::Char`, NOT `signed char`/`unsigned char`) is UNSIGNED on the
+    // active target, threaded from `TargetSchema::charIsUnsigned()`. The AArch64
+    // ABI mandates unsigned bare `char`; x86_64/pe64 use signed. Read ONLY by
+    // `isSignedIntKind(Char)` — the one target-aware char-signedness predicate
+    // that drives the char→int promotion's SExt (signed) vs ZExt (unsigned)
+    // in `mapCast`. Default false = signed (x86_64/pe64 stay byte-identical).
+    // NO arch identity branch anywhere — the decision is this config bool.
+    bool                  charIsUnsigned = false;
+
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate
     // classification strategy + max-register-bytes, threaded from the resolved
     // `TargetCallingConvention` (the §B-locked HIR→MIR boundary, mirroring how

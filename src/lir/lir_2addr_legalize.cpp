@@ -61,6 +61,12 @@ legalizeTwoAddress(Lir const&          src,
                    DiagnosticReporter& reporter) {
     LirTwoAddrLegalizeResult result;
     if (src.moduleFuncCount() == 0) {
+        // Empty module (a declaration-only / all-preprocessed-out TU): nothing
+        // to legalize. expectedFuncCount stays 0 (== moduleFuncCount()); mark
+        // allFunctionsLegalized vacuously true so `ok()` reports SUCCESS — the
+        // empty module lowers to a valid empty relocatable object rather than
+        // silently rejecting the compile (D-CSUBSET-TESTTU-SILENT-EXIT1).
+        result.allFunctionsLegalized = true;
         return result;
     }
     result.expectedFuncCount = src.moduleFuncCount();

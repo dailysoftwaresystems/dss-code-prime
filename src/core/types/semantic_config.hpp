@@ -319,6 +319,16 @@ struct DSS_EXPORT DeclaratorConfig {
     std::optional<RuleId> arrayStarSuffixRule;
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
+    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL attribute-specifier rules
+    // (`attrSpec`, `stdAttr`) that may appear as an AFTER-DECLARATOR suffix inside
+    // an `initDeclarator` (`void f(void) __attribute__((noreturn));`). The
+    // init-detection scans (which read the "first non-declarator visible child"
+    // as the initializer) MUST skip these, else the attribute is mis-lowered as
+    // the initializer value (S_TypeMismatch). EMPTY ⇒ the language declares no
+    // after-declarator attribute suffix (toy/tsql, and c-subset before this) —
+    // the scans behave exactly as before.
+    std::vector<RuleId>      afterDeclaratorAttrRules;
+    std::vector<std::string> afterDeclaratorAttrRuleNames;
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
     // member-declarator roles — the member-list analogue of
     // `initDeclaratorRule`/`listRule`. `memberDeclaratorRule` is the per-slot
@@ -1977,9 +1987,10 @@ struct DSS_EXPORT SemanticConfig {
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
     //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
-    //     declarators + indirect calls); when the first language
-    //     needs the conversion, another `allowVoidPtrFnConvert: bool`
-    //     opt-in extends this struct.
+    //     declarators + indirect calls). LANDED: the `allowVoidPtrFnConvert`
+    //     opt-in below now gates the whole fn<->void* class (Option B, the
+    //     single authoritative gate) for the gcc/POSIX dlsym / Tcl ClientData
+    //     idiom; c-subset opts in, default false stays ISO-strict.
     //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
     //     step 13.2 audit fold): if a future language needs
     //     per-element-type predicates ("only T* → void* when T ∈
@@ -2038,6 +2049,50 @@ struct DSS_EXPORT SemanticConfig {
         // expression still works via the HIR condition lowering, so nothing real is
         // lost.
         bool nullPointerConstantFromNullptrT = false;
+        // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): implicit function-pointer to/from
+        // `void*` conversion -- INCLUDING the bare function DESIGNATOR (`FnSig`, not
+        // yet decayed) -> `void*` form, the gcc/POSIX `dlsym` / Tcl `ClientData`
+        // idiom (`Tcl_CreateCommand(i, "md5", MD5DigestToBase16, ...)` passes a bare
+        // function name into a `void*` ClientData parameter). Converting between a
+        // function pointer and `void*` is UNDEFINED in ISO C (6.3.2.3 guarantees only
+        // object-pointer to/from `void*`), but POSIX (`dlsym`) REQUIRES it and on
+        // every LP64/LLP64 target a function pointer and `void*` share the SAME
+        // representation and width -- so the conversion is representation-identical
+        // and can NEVER be a miscompile (the HIR realizes it as the same FnSig->Ptr
+        // Bitcast-over-GlobalAddr the function-pointer decay already uses; no MIR
+        // change). This is the SINGLE authoritative gate for the WHOLE fn<->void*
+        // class (Option B): both the bare-designator -> `void*` admit AND the
+        // `Ptr<FnSig>` <-> `void*` pointer-to-pointer arms route through THIS flag
+        // (not the generic object-pointer `implicitToVoidPtr`/`implicitFromVoidPtr`).
+        // Default false = strict (a non-C schema, or a language wanting ISO-strict
+        // function-pointer typing, keeps it rejected). Read by `isAssignable` (admit)
+        // and `coerce()` in `cst_to_hir.cpp` (realize), in lockstep. The boundary is
+        // Void-pointee-ONLY: a function pointer / designator -> a NON-void object
+        // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
+        // this flag.
+        bool allowVoidPtrFnConvert = false;
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a SHIPPED-FFI-DESCRIPTOR
+        // function's CALL-ARGUMENT boundary ONLY, admit a real C integer pointer
+        // (`long long*`, `sqlite3_int64*`, `long*`-on-LP64) into a descriptor
+        // parameter modeled as the abstract width-based `ptr<i64>` (…) whose pointee
+        // is the SAME representation (size ∧ signedness ∧ integer-base-kind, via
+        // TypeInterner::sameRepresentation) but a DISTINCT identity (the `_Generic`-
+        // splitting vocabulary NAME differs). The SQLite testfixture needs it for
+        // `Tcl_GetWideIntFromObj(interp, obj, &wideIntLvalue)`: gcc accepts the
+        // ABI-identical 8-byte pointer, DSS's strict pointer-pointee typing rejected
+        // it S0003. Read by `isAssignable` (admit — the trailing
+        // `ffiDescriptorPointeeIntCompat` arg, passed true ONLY by
+        // `checkCallAgainstSig` at a `isShippedDescriptorFn` DIRECT callee) and by
+        // `cst_to_hir.cpp::coerce` (realize — the node-mark-gated Ptr→Ptr bitcast), in
+        // lockstep. Default FALSE = strict: the boundary is SCOPED — native C-to-C
+        // pointer typing, init/assign/return, and the fn-pointer/indirect call paths
+        // ALL stay strict; identity is NEVER merged (a compat admission, not a
+        // canonicalization — `_Generic(long:,long long:)` still distinguishes). Only
+        // c-subset opts in. Per-target by construction: on LLP64/pe64 `long` is I32,
+        // so `long*` still REFUSES `ptr<i64>` (sameRepresentation's kind axis) with NO
+        // format branch. Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B
+        // gate) — the same admit/realize-in-lockstep discipline.
+        bool ffiDescriptorIntPointeeCompat = false;
     };
     PointerConversionRules pointerConversions;
 
@@ -2066,6 +2121,20 @@ struct DSS_EXPORT SemanticConfig {
     // narrowing). Default false → a non-C schema (toy/tsql) keeps `Enum` strictly
     // distinct from the integer ranks. Closes D-CSUBSET-ENUM-INT-CONVERSION.
     bool enumConvertsToArith = false;
+
+    // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION): a scalar value converts INTO a
+    // `_Bool` lhs in an assignment context — `_Bool b = 5;` / `_Bool b = ptr;` /
+    // `_Bool b = nullptr;` / `_Bool b = (a<b);` — yielding 0 if it compares equal to
+    // 0, else 1. Read by `isAssignable`'s scalar->Bool arm (init / assignment /
+    // call-arg / return), which admits an arithmetic (int rank / float / Char /
+    // Enum) OR pointer OR nullptr rhs into a Bool lhs. The HIR `coerce()` realizes
+    // it as the `!= 0` truthiness test (the SAME condition-materialization `if(x)`
+    // uses — NOT a low-bit-truncating Cast), so the post-coerce verifier (default
+    // false) stays strict. Default false -> a non-C schema (toy/tsql) keeps `_Bool`
+    // strict. The MIRROR of `boolWidensToArith` (Bool rhs -> arith lhs). Closes the
+    // scalar->bool gap the D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE fix unmasked (once
+    // `a<b` types `int`, `_Bool b = (a<b)` needs this arm).
+    bool scalarConvertsToBool = false;
 
     // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed↔unsigned
     // implicit conversion in an ASSIGNMENT context — `int x = u;`, `x = u;`,
@@ -2108,6 +2177,19 @@ struct DSS_EXPORT SemanticConfig {
     // arithmetic-conversion matrix (needed for SQLite).
     bool intConvertsToFloat = false;
     bool floatConvertsToInt = false;
+
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING): admit the
+    // implicit float→float NARROWING assignment conversion — a WIDER floating rhs
+    // into a NARROWER floating lhs (`float f = aDouble;` F64→F32; F80/F128→F64/F32),
+    // precision-lossy (gcc's off-by-default `-Wconversion`), value the nearest
+    // representable. Read by `isAssignable`'s float rank arm (init / assignment /
+    // call-arg / return). WIDENING (F32→F64) stays unconditional. coerce()'s
+    // arithmetic-core arm materializes the width-exact Cast (MIR FPTrunc, the SAME
+    // makeCast path F32→F64 widening uses), so the post-coerce verifier (default
+    // false) stays strict. Default false → a non-C schema (toy/tsql) keeps floats of
+    // different width strictly distinct. The float-ladder mirror of
+    // intSameSignednessNarrows; float→int is the separate floatConvertsToInt gate.
+    bool floatSameKindNarrows = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load

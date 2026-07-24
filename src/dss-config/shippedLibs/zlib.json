@@ -1,0 +1,55 @@
+{
+  "$comment": "D-FFI-ZLIB-DESCRIPTOR (SQLite testfixture-link arc, TF-C39 2026-07-21): the neutral <zlib.h> FFI descriptor. SQLite's ext/misc/zipfile.c does `#include <zlib.h>` (under SQLITE_HAVE_ZLIB) and round-trips ZIP entry payloads through raw-deflate — it is the last compile blocker in the testfixture-link sub-arc after tclsqlite-ex.c went clean (C38). zipfile.c references ONLY: types z_stream/z_streamp/Bytef; functions crc32/deflate/deflateEnd/deflateBound/inflate/inflateEnd + the deflateInit2/inflateInit2 MACROS; constants Z_OK/Z_STREAM_END/Z_NO_FLUSH/Z_FINISH/Z_DEFLATED/Z_DEFAULT_STRATEGY; and it ACCESSES z_stream fields next_in/avail_in/next_out/avail_out/total_out — so the struct layout must be byte-exact. NEED-DRIVEN + MINIMAL (the tcl.json growth discipline): the full zlib API (gzFile/adler32/compress/inflateBack/... ~90 exports) stays OUT until a real consumer needs it. | LAYOUT: z_stream_s is 14 members / 112 bytes on LP64 (elf-x86_64, elf-aarch64, macho-arm64 are all LP64 → identical layout). offsetof-verified vs /usr/include/zlib.h 1.3: next_in@0 avail_in@8 total_in@16 (4B pad after avail_in) next_out@24 avail_out@32 total_out@40 (pad after avail_out) msg@48 state@56 zalloc@64 zfree@72 opaque@80 data_type@88 adler@96 (pad after data_type) reserved@104. uLong→u64, uInt→u32, Bytef→u8 (unsigned char), voidpf/internal_state*→ptr<void>. zalloc/zfree carry the REAL alloc_func/free_func fn-ptr types (the tcl.json Tcl_ChannelType driver-proc-field precedent) so the struct is ABI-faithful, not lazily-opaque. z_stream is modeled in BOTH `typedefs` (a by-name TypeId for the 9 signatures + z_streamp, via Option C D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION) AND `structs` (the field-name scope so `str.next_in` resolves) — byte-identical bodies intern to the ONE z_stream (the Tcl_ChannelType C37 pattern). uInt/uLong are inlined as u32/u64 rather than named typedefs (zipfile.c never spells them; keeps the surface minimal). | LINKAGE: elf library = libz.so.1 (the zlib SONAME; the runtime pkg zlib1g ships libz.so.1 + libz.so.1.x). macho library = /usr/lib/libz.1.dylib (the macOS system-zlib install name). All 9 functions are nm -D EXPORTED T in libz.so.1 (eager-import-safe, D-FFI-DESCRIPTOR-EAGER-IMPORT): deflate/deflateEnd/deflateInit2_/inflate/inflateEnd/inflateInit2_/crc32/zlibVersion are UNVERSIONED `T`; deflateBound is `T deflateBound@@ZLIB_1.2.0` — a DEFAULT-version export (@@), which binds an unversioned import at load exactly like glibc's printf@@GLIBC_2.2.5 that DSS already imports (SAFE, not absent). deflateInit2/inflateInit2 are NOT exported symbols — they are tcl.h-style function-MACROS over the `_` forms — so they ship as `macros`, NEVER function-rows (a deflateInit2 function-row would plant an undefined import and break every zlib binary's LOAD, exit 127). | availableObjectFormats:[elf,macho]: zlib is a Linux (WSL run + ubuntu CI) and macOS (macos-latest CI) system library; a default-Windows pe `#include <zlib.h>` fails LOUD (no zlib.json→pe library; the errno/sys-mman per-format-gate precedent). | sqlite-NEUTRAL: sqlite3.c/shell.c never `#include <zlib.h>` (zipfile.c is a testfixture-only ext under SQLITE_HAVE_ZLIB), so 3.54.0/CRUD-42 are unchanged. RUN witness: examples/c-subset/zlib_roundtrip (a real deflate→inflate round-trip + crc32 cross-check → exit 42) on elf x86_64; macho arm64 CI-run for parity; arm64-elf is COMPILE-verified only (no libz in the /usr/aarch64-linux-gnu qemu sysroot → an arm64-elf RUN arm would false-red the WSL gate).",
+  "header": "zlib.h",
+  "standard": "zlib",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libz.so.1", "macho": "/usr/lib/libz.1.dylib" },
+  "typedefs": [
+    { "name": "Byte",     "type": "u8" },
+    { "name": "Bytef",    "type": "u8" },
+    { "name": "z_stream", "type": "struct \"z_stream\" { ptr<u8>, u32, u64, ptr<u8>, u32, u64, ptr<char>, ptr<void>, ptr<fn(ptr<void>, u32, u32) -> ptr<void>>, ptr<fn(ptr<void>, ptr<void>) -> void>, ptr<void>, i32, u64, u64 }" },
+    { "name": "z_streamp", "type": "ptr<z_stream>" }
+  ],
+  "macros": [
+    { "name": "ZLIB_VERSION",       "replacement": "\"1.3\"" },
+    { "name": "Z_NO_FLUSH",         "replacement": "0" },
+    { "name": "Z_FINISH",           "replacement": "4" },
+    { "name": "Z_OK",               "replacement": "0" },
+    { "name": "Z_STREAM_END",       "replacement": "1" },
+    { "name": "Z_DEFLATED",         "replacement": "8" },
+    { "name": "Z_DEFAULT_STRATEGY", "replacement": "0" },
+    { "name": "deflateInit2", "params": ["strm", "level", "method", "windowBits", "memLevel", "strategy"],
+      "replacement": "deflateInit2_((strm),(level),(method),(windowBits),(memLevel),(strategy), ZLIB_VERSION, (int)sizeof(z_stream))" },
+    { "name": "inflateInit2", "params": ["strm", "windowBits"],
+      "replacement": "inflateInit2_((strm), (windowBits), ZLIB_VERSION, (int)sizeof(z_stream))" }
+  ],
+  "structs": [
+    { "name": "z_stream", "fields": [
+      { "name": "next_in",   "type": "ptr<u8>" },
+      { "name": "avail_in",  "type": "u32" },
+      { "name": "total_in",  "type": "u64" },
+      { "name": "next_out",  "type": "ptr<u8>" },
+      { "name": "avail_out", "type": "u32" },
+      { "name": "total_out", "type": "u64" },
+      { "name": "msg",       "type": "ptr<char>" },
+      { "name": "state",     "type": "ptr<void>" },
+      { "name": "zalloc",    "type": "ptr<fn(ptr<void>, u32, u32) -> ptr<void>>" },
+      { "name": "zfree",     "type": "ptr<fn(ptr<void>, ptr<void>) -> void>" },
+      { "name": "opaque",    "type": "ptr<void>" },
+      { "name": "data_type", "type": "i32" },
+      { "name": "adler",     "type": "u64" },
+      { "name": "reserved",  "type": "u64" }
+    ] }
+  ],
+  "symbols": [
+    { "name": "zlibVersion",   "signature": "fn() -> ptr<char>", "kind": "function", "linkage": "external" },
+    { "name": "deflate",       "signature": "fn(ptr<z_stream>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "deflateEnd",    "signature": "fn(ptr<z_stream>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "deflateBound",  "signature": "fn(ptr<z_stream>, u64) -> u64", "kind": "function", "linkage": "external" },
+    { "name": "deflateInit2_", "signature": "fn(ptr<z_stream>, i32, i32, i32, i32, i32, ptr<char>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "inflate",       "signature": "fn(ptr<z_stream>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "inflateEnd",    "signature": "fn(ptr<z_stream>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "inflateInit2_", "signature": "fn(ptr<z_stream>, i32, ptr<char>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "crc32",         "signature": "fn(u64, ptr<u8>, u32) -> u64", "kind": "function", "linkage": "external" }
+  ]
+}

@@ -405,14 +405,24 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
     EXPECT_EQ(countCode(widen.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "F32 widens implicitly into a double param";
-    auto narrow = analyzeCSubset(
-        "int take(float v) { return 0; }\n"
-        "int main() { int r; r = take(1.5); return 0; }\n");
-    EXPECT_EQ(countCode(narrow.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "unsuffixed 1.5 stays F64 — narrowing into float must "
-           "mismatch, proving the suffix (not the base core) typed "
-           "1.5f";
+    // (Formerly: `take(1.5)` into a float param was expected to MISMATCH, using the
+    // narrowing rejection as a proxy that unsuffixed 1.5 is F64. D-CSUBSET-FLOAT-FROM-
+    // DOUBLE-NARROWING now ADMITS double->float narrowing, so that proxy is obsolete —
+    // the width is pinned DIRECTLY via _Generic SELECTION, which matches on the
+    // controlling expression's TYPE with NO promotion: 1.5f selects the `float:`
+    // association and 1.5 selects `double:`, proving the SUFFIX, not the base core,
+    // typed the literal. selectedGenericArms observes the winning arm at the semantic
+    // tier — no const-fold. RED-ON-DISABLE of the SUFFIX: were 1.5f typed F64 it would
+    // select the double arm ("2") instead of "1".)
+    auto suffixTypes = analyzeCSubset(
+        "int main() {\n"
+        "  _Generic(1.5f, float: 1, double: 2, default: 0);\n"
+        "  _Generic(1.5,  float: 3, double: 4, default: 0);\n"
+        "  return 0; }\n");
+    EXPECT_FALSE(suffixTypes.hasErrors());
+    EXPECT_EQ(selectedGenericArms(suffixTypes), (std::vector<std::string>{"1", "4"}))
+        << "1.5f selects the float association (\"1\") and 1.5 selects double (\"4\") — "
+           "the suffix (not the base core) types the literal F32 vs F64";
 }
 
 // ── FC3.5 sweep-c2: floatLiteralTyping loader validation ────────────────
@@ -682,6 +692,129 @@ TEST(Fc3ShiftResult, ShippedAndAbsentDefaultToPromotedLeft) {
         [](nlohmann::json& ac) { ac.erase("shiftResult"); });
     EXPECT_EQ(arrayDimOf(absent, "arr"), 4)
         << "absent shiftResult → default promotedLeft (back-compat) → 4";
+}
+
+// ── D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-UNARY-
+//    PROMOTION-DRIFT: the SEMANTIC type-oracle (`subtreeType`) reports C's
+//    LANGUAGE result types for operator expressions ─────────────────────────
+//
+// A comparison / logical result is `int` (C 6.5.8p6 relational, 6.5.9p3
+// equality, 6.5.13p3 `&&`, 6.5.14p3 `||`, 6.5.3.3p5 `!`) — NOT the 1-byte i1/Bool
+// SSA carrier the CST→HIR tier emits (that carrier is UNTOUCHED and intentionally
+// divergent: D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE). A unary
+// `+`/`-`/`~` on a sub-int operand integer-promotes to `int` (6.5.3.3p2/p3/p4).
+// BOTH are sourced config-drivenly through `integerPromotedType` — NEVER a
+// hardcoded I32 — proven by the `minRankType` flip (int→4 ↔ long long→8, the
+// same red-on-disable discipline the shift-result verb uses above). The probe
+// folds `sizeof(EXPR)` into `char arr[...]` (subtreeType is the array-dim
+// deriver), so `arrayDimOf(arr)` == sizeof(the expression's RESULT type).
+
+TEST(Fc3ComparisonResult, WholeIsoFamilyResultsTypeInt) {
+    // The ENTIRE ISO family (no sizeof-only special case): relational, equality,
+    // and logical operators. `char` operands make the pre-fix Bool(1) vs post-fix
+    // int(4) split crisp. RED-ON-DISABLE: revert subtreeType's comparison/logical
+    // arms → every dim collapses to 1.
+    auto m = analyzeWithArithMutation(
+        "char a; char b;\n"
+        "long long al; long long bl;\n"
+        "char lt[sizeof(a <  b)];\n"
+        "char gt[sizeof(a >  b)];\n"
+        "char le[sizeof(a <= b)];\n"
+        "char ge[sizeof(a >= b)];\n"
+        "char eq[sizeof(a == b)];\n"
+        "char ne[sizeof(a != b)];\n"
+        "char an[sizeof(a && b)];\n"
+        "char orr[sizeof(a || b)];\n"
+        "char no[sizeof(!a)];\n"
+        "char llcmp[sizeof(al < bl)];\n",
+        [](nlohmann::json&) { /* shipped config */ });
+    EXPECT_FALSE(m.hasErrors());
+    for (char const* n : {"lt", "gt", "le", "ge", "eq", "ne", "an", "orr", "no"}) {
+        EXPECT_EQ(arrayDimOf(m, n), 4)
+            << n << ": a comparison/logical result types as int (4), not Bool (1)";
+    }
+    // WIDTH-INDEPENDENCE hardening pin: `long long < long long` is STILL int (4),
+    // NOT the operands' common type (long long, 8). A regression that typed a
+    // comparison as commonArithType(lhs,rhs) would pass every int/char row above
+    // but be C-wrong here (8 != 4) — this is the row that catches it.
+    EXPECT_EQ(arrayDimOf(m, "llcmp"), 4)
+        << "a comparison of two `long long`s is int (4), never the common type (8)";
+}
+
+TEST(Fc3ComparisonResult, ResultTypeTracksTheConfigInt) {
+    // The result type is sourced from the .lang vocabulary (integerPromotedType
+    // routes Bool through the promote set to `minRankType`), NEVER a hardcoded I32:
+    // widen minRankType int→long long and the SAME `sizeof(a<b)` flips 4→8. A
+    // hardcoded-int implementation would peg BOTH arms at 4 (a dead knob).
+    auto shipped = analyzeWithArithMutation(
+        "int a; int b; char arr[sizeof(a < b)];\n",
+        [](nlohmann::json&) { /* shipped minRankType: int */ });
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped `int` → 4";
+    auto widened = analyzeWithArithMutation(
+        "int a; int b; char arr[sizeof(a < b)];\n",
+        [](nlohmann::json& ac) {
+            ac["integerPromotion"]["minRankType"] = "long long";
+        });
+    EXPECT_EQ(arrayDimOf(widened, "arr"), 8)
+        << "minRankType long long → the comparison result is `long long` → 8 "
+           "(the config-driven flip; a hardcoded I32 would stay 4)";
+}
+
+TEST(Fc3ComparisonResult, GenericControllingExprSelectsIntArm) {
+    // `subtreeType` types a `_Generic` controlling expression (pass2Post too); a
+    // comparison controls as `int`, selecting the `int:` association (C 6.5.1.1).
+    // Pre-fix it controlled as Bool → no int match → the `default:` arm ("0").
+    auto m = analyzeCSubset(
+        "int main(void){ return _Generic((1 < 2), int: 7, default: 0); }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"7"}))
+        << "a comparison controls a _Generic as int → the int: arm wins";
+}
+
+TEST(Fc3ComparisonResult, BoolPrimitiveSizeofStaysOne) {
+    // Surgical guard (mandatory condition): the flip is on the operator RESULT
+    // type ONLY — the `_Bool` PRIMITIVE is untouched, so `sizeof(_Bool)` is still
+    // 1. Reds if a future edit widened the Bool primitive itself.
+    auto m = analyzeWithArithMutation(
+        "_Bool b; char arr[sizeof(b)];\n", [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 1)
+        << "sizeof(_Bool) is 1 — the primitive type is not touched";
+}
+
+TEST(Fc3UnaryPromotion, SubIntUnaryOperatorsPromoteToInt) {
+    // unary `+`/`-`/`~` integer-promote a sub-int operand to int (C 6.5.3.3),
+    // mirroring cst_to_hir's c72 arm so the two typers cannot drift. char→4,
+    // short→4. RED-ON-DISABLE: revert subtreeType's unary arm → neg/bnot/pos fold
+    // to the raw char (1) and negsh to the raw short (2).
+    auto m = analyzeWithArithMutation(
+        "char c; short sh;\n"
+        "char neg[sizeof(-c)];\n"
+        "char bnot[sizeof(~c)];\n"
+        "char pos[sizeof(+c)];\n"
+        "char negsh[sizeof(-sh)];\n",
+        [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "neg"),   4) << "-char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "bnot"),  4) << "~char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "pos"),   4) << "+char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "negsh"), 4) << "-short promotes to int (4), not raw short (2)";
+}
+
+TEST(Fc3UnaryPromotion, ResultTypeTracksTheConfigInt) {
+    // The unary promotion target is the config `minRankType`, not a hardcoded I32:
+    // `sizeof(-c)` flips 4→8 when minRankType widens int→long long.
+    auto shipped = analyzeWithArithMutation(
+        "char c; char arr[sizeof(-c)];\n", [](nlohmann::json&) {});
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped `int` → 4";
+    auto widened = analyzeWithArithMutation(
+        "char c; char arr[sizeof(-c)];\n",
+        [](nlohmann::json& ac) {
+            ac["integerPromotion"]["minRankType"] = "long long";
+        });
+    EXPECT_EQ(arrayDimOf(widened, "arr"), 8)
+        << "minRankType long long → -char promotes to long long → 8 "
+           "(the config-driven flip; a hardcoded I32 would stay 4)";
 }
 
 // ── Format-schema dataModel fail-louds ──────────────────────────────────

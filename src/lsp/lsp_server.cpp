@@ -230,10 +230,10 @@ parseTextDocumentPosition(Request const& req) {
 
 } // namespace
 
-LspServer::LspServer(std::unique_ptr<LspTransport> transport,
-                     std::unique_ptr<IExecutor>    executor,
-                     SchemaCache&                  schemaCache,
-                     LspServerOptions              options)
+LspServer::LspServer(std::unique_ptr<LspTransport>         transport,
+                     std::unique_ptr<substrate::IExecutor> executor,
+                     SchemaCache&                          schemaCache,
+                     LspServerOptions                      options)
     : transport_(std::move(transport))
     , executor_(std::move(executor))
     , schemaCache_(schemaCache)

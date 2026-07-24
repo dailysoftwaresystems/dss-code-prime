@@ -400,9 +400,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // EMPTY (no format-default fallback) so the reference resolves
             // at the link tier (sibling-TU definition, or the LOUD
             // undefined-symbol reject).
+            // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker so a
+            // shipped-descriptor import (producer C) reaches the linker's
+            // reference gate as eager (kept even when unreferenced). Non-eager
+            // source/bare-proto externs leave it false → dropped if unreferenced.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
-                            r.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.isEagerImport});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -562,6 +567,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the active
+    // target's bare-`char` signedness (AArch64 = unsigned; x86_64/pe64 = signed)
+    // so HIR→MIR picks ZExt vs SExt for the char→int promotion — a config bool,
+    // never an arch identity branch. Absent key ⇒ false = signed.
+    mirCfg.charIsUnsigned        = target.charIsUnsigned();
     // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
     // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
     // merge maps MIR symbols to names through `model.recordFor`, so a
@@ -637,6 +647,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
         format.dataImportBinding(),
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): capture the format's
+        // extern-ADDRESS binding now, for the same reason (the LOWER half's
+        // MIR→LIR GlobalAddr value-form arm routes an `&extern` value
+        // through the arm64 GOT-address macro under `got`).
+        format.externAddrBinding(),
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): capture the format's thread-local
         // access block now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects the TLS access sequence; nullopt =
@@ -700,6 +715,12 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
                          std::optional<DataImportBinding>            dataImportBinding,
+                         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                         // format's extern-ADDRESS binding, threaded into
+                         // MIR→LIR exactly like dataImportBinding (nullopt =
+                         // this leg has no GOT-address model; an `&extern`
+                         // value takes the ordinary lea).
+                         std::optional<ExternAddrBinding>            externAddrBinding,
                          // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                          // thread-local access block, threaded into MIR→LIR
                          // exactly like dataImportBinding (nullopt = this leg
@@ -735,7 +756,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           dataImportBinding,
                           tlsAccess,
                           sehScopes,
-                          std::move(wideFloatSoftcallLibrary));
+                          std::move(wideFloatSoftcallLibrary),
+                          // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
+                          // trailing param on lowerToLir (positional-safe).
+                          externAddrBinding);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -779,6 +803,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
         return std::nullopt;
     }
+    // TF-C58 bisect (env-gated, zero-cost when unset): the loop-carried-update check
+    // runs at EACH post-regalloc stage so the pass that drops a back-edge update is
+    // identified by which stage first reports.
+    checkLoopCarriedSpills(legal.lir, target, "post-legalize");
 
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
@@ -825,6 +853,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     auto const asmEntry = reporter.errorCount();
     phase.emplace(substrate::CompilePhase::Encode);
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    checkLoopCarriedSpills(cc.lir, target, "post-callconv");
+    dumpLirFuncs(cc.lir, target, "post-callconv");
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
@@ -1326,6 +1356,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
+        cuMir.externAddrBinding,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
@@ -1354,6 +1385,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding, pre-resolved one
+                      // level up in program.cpp (same shape as
+                      // externCallDispatch / dataImportBinding).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       std::optional<TlsAccessInfo> tlsAccess,
                       std::vector<MirSehScope> sehScopes,
                       // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
@@ -1375,7 +1411,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, dataImportBinding, tlsAccess,
+        externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
@@ -1424,6 +1460,52 @@ bool isArArchiveFile(std::filesystem::path const& path) {
         if (buf[i] != kArGlobalMagic[i]) return false;
     }
     return true;
+}
+
+// Parse ONE `ar` member's raw bytes back into a mergeable `AssembledModule`,
+// dispatching to the per-FORMAT relocatable-object reader by the object-format
+// KIND (the closed-enum agnostic axis, never a format-name branch). A fresh,
+// process-unique CompilationUnitId is minted per member (the merge keys its
+// symbol index by (cuId, SymbolId), so a member must never share a cuId with the
+// client or another member -- the monotonic minter never repeats). A format whose
+// kind has no reader arm fails loud rather than silently mis-parsing a member with
+// the wrong reader. Consuming the reader's `optional` is the read-success signal
+// -- NOT `module.ok()`, which is a tautology for reader output AND false for a
+// data-only member (see elf_object_reader.hpp). THE single member-read chokepoint
+// shared by BOTH the lazy reference-driven pull (`pullStaticArchiveMembers`, the
+// exe/final-link path) AND the whole-archive extraction (`extractStaticArchive-
+// Members`, the fat-static-library path) -- so a new object format lights up for
+// both by construction (the §A.5 multi-site funnel).
+[[nodiscard]] static std::optional<AssembledModule>
+readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
+                        TargetSchema const&           target,
+                        ObjectFormatSchema const&     format,
+                        DiagnosticReporter&           reporter) {
+    CompilationUnitId const memberCu =
+        substrate::mintMonotonicId<CompilationUnitId>();
+    switch (format.kind()) {
+        case ObjectFormatKind::Elf:
+            return elf::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::MachO:
+            return macho::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::Pe:
+            return pe::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        default: {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "archive member reader: object format '{}' (kind {}) has no "
+                "relocatable-object reader -- cannot pull archive members for "
+                "this format.",
+                format.name(), objectFormatKindName(format.kind()));
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+    }
 }
 
 std::optional<std::vector<AssembledModule>>
@@ -1515,46 +1597,11 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
             archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
             static_cast<std::size_t>(member.size)};
 
-        // Fresh, process-unique CompilationUnitId per member: the merge keys its
-        // symbol index by (cuId, SymbolId), so a member must never share a cuId
-        // with the client or another member (the monotonic minter never repeats).
-        CompilationUnitId const memberCu =
-            substrate::mintMonotonicId<CompilationUnitId>();
-        // Dispatch the member read by the format's object-format KIND -- the
-        // relocatable-object reader is per-format (ELF ET_REL c164 / Mach-O
-        // MH_OBJECT c168). A format with no reader arm fails loud rather than
-        // silently mis-parsing a member with the wrong reader (agnostic:
-        // switch on the schema-declared kind, never a format-name branch).
-        std::optional<AssembledModule> member_mod;
-        switch (format.kind()) {
-            case ObjectFormatKind::Elf:
-                member_mod = elf::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::MachO:
-                member_mod = macho::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::Pe:
-                member_mod = pe::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            default: {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "static-link member reader: object format '{}' (kind {}) "
-                    "has no relocatable-object reader -- cannot pull archive "
-                    "members for this format.",
-                    format.name(), objectFormatKindName(format.kind()));
-                reporter.report(std::move(d));
-                return std::nullopt;
-            }
-        }
-        // Consume the reader's optional as the read-success signal -- NOT
-        // `ok()`, which is a tautology for reader output AND false for a
-        // data-only member (see elf_object_reader.hpp).
+        // Parse the member back into a mergeable module via the shared
+        // per-format reader chokepoint (fresh cuId minted inside; a format
+        // with no reader arm fails loud there).
+        auto member_mod =
+            readArchiveMemberModule(memberBytes, target, format, reporter);
         if (!member_mod) return std::nullopt;   // member-read fail-loud
 
         // A pulled member's externally-visible definitions satisfy later
@@ -1571,6 +1618,57 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         pulled.push_back(std::move(*member_mod));
     }
     return pulled;
+}
+
+std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter) {
+    ExtractedArchiveMembers out;
+    for (auto const& archivePath : archivePaths) {
+        std::ifstream in(archivePath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "fat-archive: failed to open input static archive '{}' for "
+                "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
+                archivePath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = ffi::readArArchive(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+            archivePath.filename().string(), reporter);
+        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+
+        // EVERY member, in archive order -- a static LIBRARY packages all of its
+        // objects (unlike the LAZY referenced-subset the exe/final-link path
+        // pulls): a downstream link against this library must be able to pull
+        // ANY member, so dropping an unreferenced one would silently ship an
+        // incomplete library. The member name (long-name-expanded by the reader)
+        // is carried verbatim -- cosmetic (the armap selects members by index),
+        // and `ar` permits duplicate member names; a rare empty name (never from
+        // a well-formed archive) is synthesized so the writer's name belt holds.
+        for (auto const& member : arch->members) {
+            std::span<std::uint8_t const> const memberBytes{
+                bytes.data() + static_cast<std::size_t>(member.dataOffset),
+                static_cast<std::size_t>(member.size)};
+            auto member_mod =
+                readArchiveMemberModule(memberBytes, target, format, reporter);
+            if (!member_mod) return std::nullopt;   // member-read fail-loud
+            out.modules.push_back(std::move(*member_mod));
+            out.names.push_back(
+                member.name.empty()
+                    ? ("member_" + std::to_string(out.names.size()) + ".o")
+                    : member.name);
+        }
+    }
+    return out;
 }
 
 bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,

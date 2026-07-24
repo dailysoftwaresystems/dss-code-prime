@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C22 2026-07-18): RUN witness for the 3 Tcl functions added to tcl.json to clear test6 + test_vfs -- Tcl_AttemptRealloc (char *Tcl_AttemptRealloc(char*, unsigned int); grows a buffer) + Tcl_UtfToLower (int Tcl_UtfToLower(char*); in-place lowercase, returns byte len) + Tcl_AppendObjToObj (void Tcl_AppendObjToObj(Tcl_Obj*, Tcl_Obj*)). All exported libtcl8.6 functions; adding them takes test6 + test_vfs CLEAN (34->36; their P9006 blocker was fixed in C21, S0001 on these was the residual). Cmd (libtcl calls it back on the eval) appends obj \"0\" onto obj \"4\" -> \"40\" parsed to 40 (Tcl_AppendObjToObj + Tcl_GetIntFromObj), grows a 4-byte \"AB\" buffer to 64 (Tcl_AttemptRealloc) then lowercases it to \"ab\" returning 2 (Tcl_UtfToLower) -> 40 + (2 + (s[0]=='a'?0:100)) = 42, value-divergent over values libtcl round-tripped. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 runs it (libtcl8.6). RED-ON-DISABLE: remove any of the 3 from tcl.json -> S0001 -> stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-utfrealloc-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-utfrealloc-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

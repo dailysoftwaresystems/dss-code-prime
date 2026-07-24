@@ -29,6 +29,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/elf_object_reader.hpp"
+#include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "gcc_lib_c164_object.inc"
@@ -40,6 +41,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -208,12 +210,14 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     mod.dataItems.push_back(vtable);
 
     // Real names for the defined symbols (Global -> real name in the .o).
-    // All Global: DSS's writer carves a LOCAL symbol's NAME to `sym_<id>`
-    // (the name carve-out) and emits it STB_GLOBAL, so a Local name does not
-    // round-trip through DSS's OWN writer -- that carve-out is a writer
-    // property, not a reader gap (Local preservation is pinned against the
-    // real gcc fixture below, where `msg` is genuinely STB_LOCAL with a real
-    // name). Here we use Global names so every identity round-trips.
+    // All Global: DSS's writer carves a LOCAL symbol's NAME to `sym_<id>` (the
+    // name carve-out), so a Local symbol's NAME does not round-trip through
+    // DSS's OWN writer -- that carve-out is a writer property, not a reader gap.
+    // (Post-TF-C54 a Local symbol's BINDING now DOES round-trip: the writer
+    // emits it STB_LOCAL and the reader recovers Local -- see the real gcc
+    // fixture below, where `msg` is genuinely STB_LOCAL with a real name, and
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. Only the NAME
+    // is still carved.) Here we use Global names so every identity round-trips.
     mod.symbols = {
         ModuleSymbol{SymbolId{1},  "lib_add",   SymbolBinding::Global, SymbolVisibility::Default},
         ModuleSymbol{SymbolId{2},  "lib_greet", SymbolBinding::Global, SymbolVisibility::Default},
@@ -312,6 +316,100 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     // -- the module is well-formed for the merge --
     EXPECT_EQ(got.expectedFuncCount, 2u);
     EXPECT_TRUE(got.ok());
+}
+
+// TF-C54 hermetic 2-TU witness (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
+// FOREIGN-COLLISION): the ON-DISK static-lib readback + merge path. Two
+// SEPARATELY-compiled TUs each restart the SymbolId counter, so both define the
+// SAME synthetic names -- a `static` function `sym_100` AND a string-literal
+// rodata `sym_101` (neither in module.symbols). This is the hermetic,
+// cross-platform form of the arm64/x86_64 sqlite FOREIGN multi-TU link (which
+// the examples-runner cannot express -- it links DSS-internally by
+// (cuId,SymbolId), never by name): here the collision is reproduced through the
+// writer->reader->merge chain, which keys by NAME exactly as a foreign linker
+// does. Pre-TF-C54 the writer emitted both statics STB_GLOBAL, so the two
+// reconstructed TUs each carried a Global `sym_100`/`sym_101` and the merge
+// fired K_SymbolRedefinedAcrossUnits (the multiple-definition ×thousands).
+// Post-fix they emit STB_LOCAL, read back Local, and the merge keeps each
+// module-private (never name-folded) -> clean. Reverting `definedBinding` ->
+// both read back Global -> the merge redefinition fires -> this goes red.
+TEST(RelocatableObjectReader, TfC54TwoTusCollidingStaticsReadBackLocalMergeClean) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // One TU: a Global exported fn (distinct real name per TU) + a static fn
+    // (sym_100, no ModuleSymbol) + a string-literal rodata (sym_101, no
+    // ModuleSymbol). The colliding ids 100/101 are IDENTICAL across TUs.
+    auto buildTU = [&](std::string const& exportName) {
+        AssembledModule m;
+        m.expectedFuncCount = 2;
+        AssembledFunction pub;
+        pub.symbol = SymbolId{1};
+        pub.bytes  = {0xC3};
+        m.functions.push_back(std::move(pub));
+        AssembledFunction stat;
+        stat.symbol = SymbolId{100};   // `static` helper -- no ModuleSymbol row
+        stat.bytes  = {0xC3};
+        m.functions.push_back(std::move(stat));
+        AssembledData lit;
+        lit.symbol    = SymbolId{101};  // "hi" string literal -- synth rodata
+        lit.section   = DataSectionKind::Rodata;
+        lit.bytes     = {'h', 'i', 0};
+        lit.alignment = Alignment::of<1>();
+        m.dataItems.push_back(std::move(lit));
+        // ONLY the public fn carries a ModuleSymbol row (Global, distinct name).
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, exportName,
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        return m;
+    };
+    // Encode -> ET_REL bytes -> decode as a DISTINCT CU (a foreign linker keys
+    // by name; separate compilations get fresh cuIds, exactly the pull's model).
+    auto encodeDecode = [&](AssembledModule const& m, CompilationUnitId cu) {
+        DiagnosticReporter wrep;
+        auto bytes = elf::encode(m, *loaded.target, *loaded.format, wrep);
+        EXPECT_EQ(wrep.errorCount(), 0u) << "writer must accept the TU";
+        DiagnosticReporter rrep;
+        auto got = elf::readRelocatableObject(bytes, *loaded.target,
+                                              *loaded.format, rrep, cu);
+        EXPECT_TRUE(got.has_value()) << "reader must reconstruct the TU";
+        EXPECT_EQ(rrep.errorCount(), 0u);
+        return got.value();
+    };
+    AssembledModule a = encodeDecode(buildTU("tu_a_export"), CompilationUnitId{1});
+    AssembledModule b = encodeDecode(buildTU("tu_b_export"), CompilationUnitId{2});
+
+    // Readback binding: BOTH synthetic symbols come back STB_LOCAL (the fix).
+    auto bindingOf = [](AssembledModule const& m, std::string const& n)
+        -> std::optional<SymbolBinding> {
+        for (auto const& s : m.symbols) if (s.name == n) return s.binding;
+        return std::nullopt;
+    };
+    ASSERT_TRUE(bindingOf(a, "sym_100").has_value())
+        << "the static fn round-trips as a named LOCAL symbol (sym_100)";
+    EXPECT_EQ(*bindingOf(a, "sym_100"), SymbolBinding::Local)
+        << "a static fn reads back Local (pre-fix it read back Global)";
+    ASSERT_TRUE(bindingOf(a, "sym_101").has_value())
+        << "the string-literal rodata round-trips as a named LOCAL symbol";
+    EXPECT_EQ(*bindingOf(a, "sym_101"), SymbolBinding::Local)
+        << "a synth-rodata string literal reads back Local (pre-fix: Global)";
+
+    // Merge the two reconstructed TUs. The colliding `sym_100`/`sym_101` are
+    // Local -> kept module-private (no cross-CU name fold) -> no redefinition.
+    std::vector<AssembledModule> both{std::move(a), std::move(b)};
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{both.data(), both.size()},
+        *loaded.target, *loaded.format, linkRep);
+    bool sawRedef = false;
+    for (auto const& d : linkRep.all())
+        if (d.code == DiagnosticCode::K_SymbolRedefinedAcrossUnits) sawRedef = true;
+    EXPECT_FALSE(sawRedef)
+        << "no K_SymbolRedefinedAcrossUnits: the colliding statics are Local, "
+           "kept module-private (pre-fix they read back Global and collided "
+           "-- the exact foreign multi-TU sym_<id> multiple-definition)";
+    EXPECT_EQ(linkRep.errorCount(), 0u)
+        << "two TUs with colliding Local sym_<id> must merge cleanly (TF-C54)";
+    EXPECT_TRUE(image.ok());
 }
 
 // STB_LOCAL vs STB_GLOBAL binding is recovered from a REAL object (gcc emits

@@ -68,6 +68,24 @@ rewriteWithAllocation(Lir const&          src,
                       LirAllocation const& alloc,
                       DiagnosticReporter& reporter);
 
+// Diagnostic (D-AS-REGALLOC-LOOP-CARRIED-SPILL-RELOAD-MISSING), ENV-GATED by
+// `DSS_CHECK_LOOP_SPILL=1` and zero-cost when unset. Reports a loop-carried value
+// whose dependency cycle is BROKEN: a register loaded from a spill slot OUTSIDE a
+// loop, USED inside it, never REDEFINED inside it, while the loop STORES that slot —
+// i.e. every iteration reads the same stale value and the update is lost. `stage`
+// labels the pipeline point so the same check can bisect which post-regalloc pass
+// (rewrite / two-address legalize / callconv) drops the loop-carried update.
+DSS_EXPORT void
+checkLoopCarriedSpills(Lir const& lir, TargetSchema const& schema,
+                       char const* stage);
+
+// Companion dump (same gating family): `DSS_DUMP_LIR_MIN_INSTS=<N>` appends every
+// function with >= N instructions — blocks, successors, and each instruction's
+// mnemonic/result/operands — to `DSS_DUMP_LIR_FILE`, prefixed by `stage`. Lets the
+// LIR at a given pipeline point be diffed against the final assembly.
+DSS_EXPORT void
+dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage);
+
 } // namespace dss
 
 // Post-regalloc verifier lives in `lir_verifier.hpp` —

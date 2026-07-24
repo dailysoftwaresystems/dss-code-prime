@@ -25,6 +25,13 @@
     "bss",
     "relro"
   ],
+
+  "$externCallDispatchComment": "D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH — MIRRORED from the `elf64-aarch64-linux` relocatable sibling (kept in hand-sync per this file's header): a staticlib member is a relocatable ET_REL object, so an extern FUNCTION call in a member lowers to a plain `BL` + an R_AARCH64_CALL26 (283) reloc against the SHN_UNDEF extern that the FINAL linker resolves. `direct-plt` is the dispatch; the CALL26 row carries NO `pltNativeId` (AArch64 has no distinct PLT-variant branch reloc — the linker inserts the veneer for an undefined CALL26 transparently). Without this a member that calls libc failed loud (L_RequiredLirOpcodeMissing), so an arm64 libsqlite3.a could not be built.",
+  "externCallDispatch": "direct-plt",
+
+  "$externAddrBindingComment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) -- MIRRORED from the `elf64-aarch64-linux` relocatable sibling (kept in hand-sync per this file's header). A static-archive member is a relocatable ET_REL object linked by a foreign DEFAULT-PIE toolchain, so taking the ADDRESS of an undefined/preemptible extern as a live VALUE must materialize THROUGH a foreign-linker GOT slot (arm64 R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC) -- an absolute page-pair against a preemptible symbol is rejected 'when making a shared object'. Without this an arm64 libsqlite3.a whose members take `&dlsym`/`&stdout`/`&sqlite3_search_count` could not be default-PIE-linked. Same neutrality as the sibling (x86_64 + the DSS-linked exec/pie/dyn formats do NOT declare it).",
+  "externAddrBinding": "got",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
     "class": "elf64",
@@ -149,6 +156,18 @@
       "name": "R_AARCH64_ABS64",
       "kind": 4,
       "nativeId": 257
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry page (ADRP of `:got:sym`). ELF type R_AARCH64_ADR_GOT_PAGE = 311. `kind` = 7 matches arm64.target.json's `adr_got_page` row. Mirrored from the relocatable sibling (hand-sync). Emitted only into archive members; the foreign linker owns the GOT slot.",
+      "name": "R_AARCH64_ADR_GOT_PAGE",
+      "kind": 7,
+      "nativeId": 311
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry low-12 scaled offset (LDR of `[x,:got_lo12:sym]`). ELF type R_AARCH64_LD64_GOT_LO12_NC = 312. `kind` = 8 matches arm64.target.json's `ld64_got_lo12` row. Mirrored from the relocatable sibling (hand-sync).",
+      "name": "R_AARCH64_LD64_GOT_LO12_NC",
+      "kind": 8,
+      "nativeId": 312
     }
   ]
 }

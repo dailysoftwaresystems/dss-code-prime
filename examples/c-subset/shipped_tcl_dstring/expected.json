@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C28 2026-07-20): RUN witness for the 6 need-driven tcl.json items growing the test1.c surface -- Tcl_GetDouble (tclDecls.h:146, exported T), Tcl_DStringAppend (tclDecls.h:382, exported T), the Tcl_DStringLength(dsPtr)->((dsPtr)->length) macro (tcl.h:1014, LENGTH twin of the shipped Tcl_DStringValue, over the C13 Tcl_DString `length` field -- no new layout), and the 3 object-macro constants TCL_EVAL_DIRECT=0x040000 / TCL_LEAVE_ERR_MSG=0x200 / TCL_LINK_STRING=4. Value-divergent: Tcl_DStringAppend builds a 42-byte string INSIDE libtcl (opaque extern), and that byte count -- read back via the Tcl_DStringLength macro -- is the exit code (a broken append / wrong-field macro never yields 42); Tcl_GetDouble's parse is a runtime gate; the 3 constants are value-pinned (wrong value -> 4/5/6). elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 legs run it, native-arm64 arch-gates the run, windows/macos compile-only. Release arm runs the optimizer over the libtcl calls. RED-ON-DISABLE: remove any of the 6 items from tcl.json -> S0001 -> fails to compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-dstring-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-dstring-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

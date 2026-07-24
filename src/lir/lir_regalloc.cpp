@@ -3,6 +3,7 @@
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -385,19 +386,24 @@ collectArgRegisterOccupied(Lir const& lir, TargetSchema const& schema,
                 LirReg const res = lir.instResult(inst);
                 if (res.valid() && res.isPhysical == 0) {
                     LirRegClass const cls = res.regClass();
-                    auto const& pool = (cls == LirRegClass::FPR) ? cc.argFprs
-                                                                 : cc.argGprs;
-                    std::uint32_t const idx = lir.instPayload(inst);
-                    if (idx < pool.size()) {
-                        if (auto ord = schema.registerByName(pool[idx]);
-                            ord.has_value()) {
-                            out.push_back({*ord, cls, /*releasePos=*/pos + 1u,
-                                           static_cast<std::uint32_t>(res.id)});
-                        }
+                    // Shared with the rewriter's spill-scratch forbid
+                    // (D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER) so the
+                    // "which incoming register holds this param" verdict cannot
+                    // drift between the two consumers of the one formula.
+                    auto const inc = lir_pass_util::incomingArgRegister(
+                        schema, cc, cls, lir.instPayload(inst));
+                    if (inc.kind
+                        == lir_pass_util::IncomingArgRegKind::Register) {
+                        out.push_back({inc.ordinal, cls, /*releasePos=*/pos + 1u,
+                                       static_cast<std::uint32_t>(res.id)});
                     }
-                    // idx >= pool.size(): stack-passed param (no incoming
-                    // register to protect); callconv reads it from the
-                    // caller's outgoing area, not an arg register.
+                    // StackPassed: no incoming register to protect (callconv
+                    // reads the param from the caller's outgoing area).
+                    // UnresolvableName: a schema-misconfigured cc register —
+                    // left UNRECORDED here (callconv fails loud on it later),
+                    // preserving this collector's pre-hoist behavior; the
+                    // rewriter's consumer of the same helper fails loud
+                    // directly, as its safety-exclusion role demands.
                 }
             }
             pos += 2u;

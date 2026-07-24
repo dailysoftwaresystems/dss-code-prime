@@ -922,6 +922,20 @@ enum class DiagnosticCode : std::uint16_t {
     // to turn a dropped `asm(...)` into a silent non-emission. Renders error[S0057].
     S_InlineAsmNonEmptyTemplate = 0xE057,
 
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: a bit-field MUTATION in a
+    // compound / inc-dec / value position through a base form the single-field
+    // reconstruction cannot address — a field reached via an ANONYMOUS struct/union
+    // member (needs the intermediate MemberAccess hop chain) or an ARRAY-arrow base
+    // (`sarr->bf`, C 6.3.2.1p3 decay). The bit-field-safe `classifyMemberLvalue`
+    // reconstruction (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->`
+    // bases only; these residual bases would otherwise fall to the generic via-ptr
+    // path, whose full-unit store CLOBBERS packed neighbours + skips truncation — a
+    // silent miscompile. FAIL LOUD instead (statement plain-`=` stays correct via
+    // `lowerAssign`; use a named member, or split the mutation). NON-bit-field
+    // members through the same bases are unaffected (they take the correct generic
+    // scalar store). Renders error[S0058].
+    S_BitfieldMutationUnsupportedBase = 0xE058,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1055,6 +1069,16 @@ enum class DiagnosticCode : std::uint16_t {
     // member's extern FFI surface — are still accepted; only INPUT static
     // archives hit this.)
     D_StaticLibFatArchiveUnsupported = 0xD013,
+    // D_CompileUnitNullNoDiagnostic: the driver's fail-loud belt-and-
+    //   suspenders guard fired — a per-CU build (`buildCuMir`) OR the back-half
+    //   lower (`lowerCuMirToAssembly`) returned a null module WITHOUT any tier
+    //   having reported a diagnostic. Every real tier failure reports its own
+    //   K_/L_/A_/S_/H_ code; a null-with-silent-reporter is a substrate-contract
+    //   violation (the D-PERF-4 buildCuMir-null contract). Mirrors the
+    //   optimizer's X_OptReturnFalseWithoutDiagnostic guard so a future silent
+    //   tier-reject surfaces loudly here instead of exiting 1 with no output
+    //   (the D-CSUBSET-TESTTU-SILENT-EXIT1 class of silent-exit-1 bug).
+    D_CompileUnitNullNoDiagnostic = 0xD014,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -1701,7 +1725,8 @@ enum class DiagnosticCode : std::uint16_t {
     //
     // Per-format codes join the family alongside their LK* cycles.
     //
-    // K_NoMatchingObjectFormat fires in four scenarios:
+    // K_NoMatchingObjectFormat is the general format-capability
+    // fail-loud. The four format-DISPATCH scenarios are:
     //   1. The linker engine's format-dispatch switch reaches
     //      `ObjectFormatKind::Unknown` (the invalid sentinel was
     //      not initialized by the format schema's loader path).
@@ -1719,6 +1744,14 @@ enum class DiagnosticCode : std::uint16_t {
     //      ShStrtab — any missing row fires this code; PE and
     //      Mach-O writers only require SectionKind::Text since
     //      their symbol/string tables don't carry section headers).
+    // Beyond dispatch, it ALSO fires when a walker is correctly
+    // matched but cannot FAITHFULLY EMIT a specific symbol shape it
+    // received — degrading which would be a silent miscompile. The
+    // standing instance is a WEAK DEFINED symbol on a format whose
+    // weak machinery is not wired: the Mach-O MH_DYLIB export arm
+    // (D-LK3-DYLIB-WEAK-EXPORT) and the PE/COFF + Mach-O RELOCATABLE
+    // writers (D-LK-OBJECT-WEAK-DEF-RELOCATABLE, TF-C54) fail loud
+    // here rather than emit the def strong and lose weak semantics.
     // K_FormatLacksImportSupport: a format walker received an
     //   AssembledModule with non-empty `externImports` but its
     //   image-side arm doesn't yet emit import tables. The three

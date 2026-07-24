@@ -55,4 +55,39 @@ resolveIncludePath(std::string_view filename,
 resolveSystemDescriptor(std::string_view                       filename,
                         std::span<std::filesystem::path const> systemDirs);
 
+// ANGLE-form resolution VERDICT (D-INCLUDE-ANGLE-SOURCE-FALLBACK): what an
+// `#include <h>` / `__has_include(<h>)` resolves to, in priority order.
+enum class AngleIncludeKind {
+    Descriptor,  // a shipped `<stem>.json` on systemDirs (the DSS neutral model)
+    Source,      // NO descriptor, but a REAL source header on the -I includeDirs
+    NotFound,    // neither — a fatal miss (fail-loud F_ShippedHeaderNotFound)
+};
+
+struct AngleIncludeResolution {
+    AngleIncludeKind      kind;
+    std::filesystem::path path;  // resolved descriptor/source path; empty on NotFound
+};
+
+// The ONE angle-include resolver funnel (FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK).
+// SHARED by the preprocessor's angle `#include <h>` arm AND its
+// `__has_include(<h>)` operator so their "does this header exist" answers can
+// never drift. Priority (C 6.10.2p2 + the DSS neutral descriptor model):
+//   1. Descriptor — `resolveSystemDescriptor(filename, systemDirs)` (`<stem>.json`).
+//      Keys on descriptor-FILE existence ALONE; per-format availability is the
+//      CALLER's authoritative verdict — an existing-but-format-unavailable
+//      descriptor STILL returns Descriptor (flowing the caller's unchanged
+//      availability path); it does NOT fall through to a source header.
+//   2. Source — NO descriptor, but `filename` names a REAL source header on the
+//      `-I` `includeDirs` (`findInDirs`). The angle form does NOT search the
+//      including file's OWN directory (C 6.10.2p2, UNLIKE quote) — `includeDirs`
+//      alone, never a self-dir prepend. This is the real-header fallback that lets
+//      an angle `<sqlite3.h>`/`<sqlite3ext.h>` (a header on the -I path with no
+//      shipped descriptor) resolve, matching standard C's angle-include search.
+//   3. NotFound — neither. The include is a fatal miss (the caller emits the
+//      unsuppressable F_ShippedHeaderNotFound).
+[[nodiscard]] DSS_EXPORT AngleIncludeResolution
+resolveAngleInclude(std::string_view                       filename,
+                    std::span<std::filesystem::path const> systemDirs,
+                    std::span<std::filesystem::path const> includeDirs);
+
 } // namespace dss

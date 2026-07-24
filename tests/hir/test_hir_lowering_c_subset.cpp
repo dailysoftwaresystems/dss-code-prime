@@ -383,6 +383,163 @@ TEST(HirLoweringCSubset, SiblingStaticLocalsGetDistinctGlobals) {
         << "two sibling statics must mint two DISTINCT module globals";
 }
 
+// D-CSUBSET-BLOCK-SCOPE-EXTERN (TF arc C10, C89 6.7.1): a block-scope `extern`
+// declaration — a FUNCTION prototype (`extern int ex_fn(int);`) AND an OBJECT
+// reference (`extern int ex_obj;`) inside a body — RE-HOMES to the module decls
+// as one ExternFunction + one ExternGlobal (the static-local / block-scope-
+// prototype accumulator pattern) and lowers the STATEMENT to a no-op (an empty
+// Block, the Skip precedent), so the function body carries NO stack VarDecl for
+// either extern name. This is the host-independent structural guard the runtime
+// corpus (`block_scope_extern`, cross-CU → exit 42) pairs with. RED-ON-DISABLE:
+// drop the `k == "ExternDecl"` arm in cst_to_hir.cpp's lowerStmt → the externDecl
+// statement hits the terminal default → "statement maps to unsupported HIR kind
+// 'ExternDecl'" and res->ok goes false. (lowerToHir is CST→HIR only, so the
+// ExternGlobal node is produced here regardless of the MIR-tier data-import
+// state — the import resolves at the LK11 cross-CU merge, witnessed by the
+// runtime example.)
+TEST(HirLoweringCSubset, BlockScopeExternRehomesToModuleDecls) {
+    SemanticModel model = analyzeCSubset(
+        "int use(void) { extern int ex_fn(int); extern int ex_obj; "
+        "return ex_fn(ex_obj); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0, externFns = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function)       ++fns;
+        if (res->hir.kind(d) == HirKind::ExternFunction) ++externFns;
+        if (res->hir.kind(d) == HirKind::ExternGlobal)   ++externGlobals;
+    }
+    EXPECT_EQ(fns, 1u);
+    EXPECT_EQ(externFns, 1u)
+        << "the block-scope extern FUNCTION prototype must re-home to ONE "
+           "module ExternFunction";
+    EXPECT_EQ(externGlobals, 1u)
+        << "the block-scope extern OBJECT must re-home to ONE module ExternGlobal";
+    // Both extern statements lower to no-ops: no stack VarDecl for either name.
+    HirNodeId fn = firstFunction(res->hir);
+    for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+        EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+            << "a block-scope extern must not leave a stack VarDecl in the body";
+}
+
+// D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL (TF-C61): a file-scope
+// TENTATIVE definition (no initializer) that FOLLOWS an `extern` declaration of
+// the same name must emit STORAGE — one module Global — NOT an ExternGlobal
+// import. C 6.9.2p2: a prior `extern` declaration does not stop a later
+// no-initializer declaration from being a tentative definition. Before the fix
+// the extern "survived" the merge (it was the prior binding) and the TU emitted
+// an ExternGlobal + no Global, so the symbol was UNDEFINED and the link failed —
+// the extern-in-header-then-define-in-.c pattern that blocked the full-source
+// sqlite build (`undefined reference to sqlite3BuiltinFunctions`).
+//
+// A SEMANTIC-tier test cannot catch this: extern+tentative merges with zero
+// diagnostics and one surviving symbol EITHER WAY. Only the HIR emission
+// distinguishes Global (storage) from ExternGlobal (import) — this tier is the
+// one that was actually wrong.
+//
+// RED-ON-DISABLE: revert the defining-rank comparison in
+// mergeOrCollideRedeclaration (keep the prior binding whenever the new decl is
+// non-defining) → the extern survives → zero Globals + one ExternGlobal → this
+// asserts the opposite of what a linkable program needs.
+TEST(HirLoweringCSubset, TentativeDefAfterExternEmitsStorageNotImport) {
+    SemanticModel model = analyzeCSubset(
+        "extern int g;\n"
+        "int g;\n"
+        "int main(void){ g += 1; return g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Global)       ++globals;
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    }
+    EXPECT_EQ(globals, 1u)
+        << "the tentative definition must emit ONE zero-init module Global — the "
+           "prior extern does not suppress the definition (C 6.9.2p2)";
+    EXPECT_EQ(externGlobals, 0u)
+        << "no ExternGlobal import may survive — the tentative provides the "
+           "storage locally; an import would leave the symbol undefined at link";
+}
+
+// PRESERVE — a plain `extern int g;` with NO local definition must STILL emit an
+// ExternGlobal import (and zero Globals): the storage genuinely lives elsewhere.
+// This guards the fix against over-reaching (turning every extern into storage).
+// RED-ON-DISABLE: if the rank comparison wrongly promoted a bare extern, this
+// flips to one Global / zero ExternGlobals.
+TEST(HirLoweringCSubset, PlainExternWithoutDefinitionStaysImport) {
+    SemanticModel model = analyzeCSubset(
+        "extern int g;\n"
+        "int use(void){ return g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Global)       ++globals;
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    }
+    EXPECT_EQ(globals, 0u)
+        << "a bare extern with no local definition must NOT emit storage";
+    EXPECT_EQ(externGlobals, 1u)
+        << "a bare extern must stay an ExternGlobal import";
+}
+
+// D-CSUBSET-GNU-ATTRIBUTE (TF-C62): a GNU `__attribute__((...))` in the
+// AFTER-DECLARATOR position, with a widened argument grammar (multi-arg /
+// multi-clause / nested / number), must PARSE and lower cleanly — the attributes
+// are parse-and-ignore hints, so the declaration lowers exactly as if they were
+// absent. Every real C header puts its prototype attributes here (glibc
+// `__attribute__((__nothrow__,__leaf__))`, Tcl `TCL_FORMAT_PRINTF(1,2)`).
+// RED-ON-DISABLE: revert the after-declarator attrSpec slot in initDeclarator
+// (c-subset.lang.json) → the declaration fails P0009 and model.hasErrors().
+// TF-C63 (D-CSUBSET-FORM-FEED-VTAB-WHITESPACE): C 6.4p1 counts VERTICAL TAB
+// (0x0b) and FORM-FEED (0x0c) as white-space. Older Unix sources (real `tcl.h`)
+// use a form-feed at every page boundary; without treating it as whitespace it
+// was an illegal-char `P000E` that desynced the parse (tcl.h: 11 such errors).
+// RED-ON-DISABLE: drop `isMainScanExtraSpace` from the tokenizer dispatch → the
+// form-feed becomes an illegal char and this fails to analyze.
+TEST(HirLoweringCSubset, FormFeedAndVerticalTabAreWhitespace) {
+    SemanticModel model = analyzeCSubset(
+        "int a = 20;\f\n"          // form-feed page break between declarations
+        "\vint b = 22;\f\n"        // vertical tab + form-feed
+        "int main(void){\v return a + b; }\n");   // vtab as inline whitespace
+    ASSERT_FALSE(model.hasErrors())
+        << "vertical tab (0x0b) and form-feed (0x0c) are C 6.4 whitespace — they "
+           "must not be illegal characters that desync the parse";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+TEST(HirLoweringCSubset, GnuAttributeAfterDeclaratorLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "int add(int a, int b) __attribute__((__nothrow__, __leaf__));\n"
+        "int add(int a, int b) { return a + b; }\n"
+        "int deref(const int *p) __attribute__((__nonnull__((1))));\n"
+        "int deref(const int *p) { return *p; }\n"
+        "int v __attribute__((aligned(4))) = 20;\n"
+        "int main(void){ int t=22; return add(v, t); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "after-declarator GNU attributes with multi-clause / nested / number "
+           "args must parse and lower as parse-and-ignore hints";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // The `= 20` initializer must still be found (not shadowed by the
+    // after-declarator attribute): `v` lowers to a Global WITH an initializer.
+    std::size_t globalsWithInit = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::Global) ++globalsWithInit;
+    EXPECT_GE(globalsWithInit, 1u)
+        << "`int v __attribute__((aligned(4))) = 20;` must still lower to a "
+           "Global — the attribute must not be mistaken for the initializer";
+}
+
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
         "void f() { for (int i = 0; i < 10; i = i + 1) {} }");
@@ -1369,6 +1526,77 @@ TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
     EXPECT_EQ(res->hir.kind(decls[2]), HirKind::Function);         // f
 }
 
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+// DEFINITION lowers to a REAL HirKind::Function with an EMITTED body — NOT an
+// ExternFunction import (the pre-cycle mis-lowering, which would DROP the body).
+// It reuses the SAME declarator-mode function lowering topLevelDecl's static/plain
+// definition arm uses. RED-ON-DISABLE: revert lowerExternDeclInto's isFn branch ->
+// addone lowers to a bodyless ExternFunction, this reds.
+TEST(HirLoweringCSubset, ExternFunctionDefinitionLowersToFunctionWithBody) {
+    SemanticModel model = analyzeCSubset(
+        "extern int addone(int x){ return x + 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    ASSERT_EQ(res->hir.kind(decls[0]), HirKind::Function)
+        << "an extern function DEFINITION lowers to a real Function, not an "
+           "ExternFunction import";
+    EXPECT_EQ(res->hir.functionParams(decls[0]).size(), 1u);   // x
+    // The body is EMITTED (`return x + 1;`), never dropped.
+    HirNodeId body = res->hir.functionBody(decls[0]);
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    EXPECT_EQ(res->hir.kind(stmts[0]), HirKind::ReturnStmt)
+        << "the extern function definition's body must be emitted";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION fail-loud (nested function): an `extern` function
+// DEFINITION in BLOCK scope is a nested function (not valid C). It must be rejected
+// loud — NEVER silently hoisted to module scope. RED-ON-DISABLE: drop the block-
+// scope ExternDecl guard -> f is silently hoisted to a module Function.
+TEST(HirLoweringCSubset, NestedExternFunctionDefinitionRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int g(void){ extern int f(void){ return 0; } return 0; }\n");
+    // Fail-loud at SOME tier (never a silent hoist). If the semantic tier already
+    // rejected it, that is fail-loud; otherwise the HIR block-scope guard must.
+    if (model.hasErrors()) { SUCCEED(); return; }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a block-scope extern function DEFINITION (a nested function) must be "
+           "rejected loud, never silently hoisted to module scope";
+    EXPECT_FALSE(r.all().empty());
+    // And no hoisted module Function `f` leaked out.
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    std::size_t moduleFns = 0;
+    for (HirNodeId d : decls)
+        if (res->hir.kind(d) == HirKind::Function) ++moduleFns;
+    EXPECT_LE(moduleFns, 1u) << "only g (or none) — f must NOT be hoisted";
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION fail-loud (override + body): the pathological
+// `extern int f(void) "lib" { … }` — a per-declaration library override AND a body
+// — must fail loud (H_ExternDeclMalformed), never a silent body-drop. The string
+// shifts the kindByChild discriminator off the tail (so it is NOT classified as a
+// definition), and the block would otherwise be dropped by the declaration
+// lowering. RED-ON-DISABLE: drop the string+block guard -> the body is silently
+// dropped and f becomes a bodyless ExternFunction import.
+TEST(HirLoweringCSubset, ExternFunctionDefinitionWithLibraryOverrideRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "extern int f(void) \"lib\" { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the form parses + analyzes; the rejection is at lowering";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternDeclMalformed), 1u)
+        << "a library override on a function definition must fail loud, never "
+           "silently drop the body";
+}
+
 TEST(HirLoweringCSubset, ExternGlobalWithInitializerRejectedLoud) {
     // D-FF2-3: `extern int x = 5;` is a contradiction — extern means
     // "storage lives elsewhere"; an init would either redefine the
@@ -2127,6 +2355,75 @@ TEST(HirLoweringCSubset, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
 }
 
+// ── D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE ───────────────────────────────
+//
+// `pathTerminates` decides a block's termination by its LAST REACHABLE statement,
+// not its literal last child. A trailing dead statement AFTER a real terminator
+// (the `MACRO(...);` null-statement idiom that lowers `;` to an empty Block placed
+// AFTER the `return`) previously made the body read as fall-through → a spurious
+// H_VerifierFailure (H0003) that gcc/clang never emit. These pins assert the four
+// CLEAN shapes emit ZERO H_VerifierFailure. Red-on-disable: revert the Block case
+// to `return !kids.empty() && pathTerminates(src, kids.back())` and every case
+// here goes RED (the empty trailing Block reads as non-terminating).
+[[nodiscard]] std::size_t hirVerifierFailures(std::string src) {
+    SemanticModel model = analyzeCSubset(std::move(src));
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    return countCode(r, DiagnosticCode::H_VerifierFailure);
+}
+
+TEST(HirLoweringCSubset, DeadTailAfterTerminatorDoesNotReadAsFallThrough) {
+    // The minimal trailing null statement — `int m(void){ return 0; ; }`.
+    EXPECT_EQ(hirVerifierFailures("int m(void){ return 0; ; }"), 0u)
+        << "a `;` after `return 0;` (empty trailing Block) must NOT read as "
+           "fall-through — the block terminates at its last REACHABLE statement";
+    // The RECOVER_VFS_WRAPPER shape: every path returns via the if/else, then a
+    // trailing `;` (the `MACRO(...);` null statement) follows the `return rc;`.
+    EXPECT_EQ(hirVerifierFailures(
+                  "int w(int x){ int rc=0; if(x){rc=1;}else{rc=2;} return rc; ; }"),
+              0u)
+        << "trailing `;` after the real terminator must not spuriously fall through";
+    // General precision: a dead NON-label call after a return — `return 0; d2();`.
+    EXPECT_EQ(hirVerifierFailures("int d2(void); int d(void){ return 0; d2(); }"), 0u)
+        << "dead non-label code after a terminator makes later positions "
+           "unreachable — the block still terminates";
+    // Both if/else arms return, then a dead trailing `;`.
+    EXPECT_EQ(hirVerifierFailures("int e(int x){ if(x){return 1;}else{return 2;} ; }"), 0u)
+        << "a both-arms-return if terminates; a trailing `;` does not undo that";
+}
+
+// The negative miscompile-pins: genuine fall-through MUST still fail loud
+// (H_VerifierFailure). These stay RED when the fix is present (they are the
+// behavior that must NOT change) — and are how a WRONG fix is caught.
+TEST(HirLoweringCSubset, GenuineFallThroughStillFailsLoudIncludingNestedLabel) {
+    // A non-void function that just calls a void fn and falls off the end.
+    EXPECT_GE(hirVerifierFailures("void foo(void); int g(int x){ foo(); }"), 1u)
+        << "a genuine fall-through must still emit H_VerifierFailure";
+    // An `if` with no `else` — the then-arm may be skipped, so control falls off.
+    EXPECT_GE(hirVerifierFailures("int h(int x){ if(x) return 1; }"), 1u)
+        << "if-without-else does not terminate on the fall-through path";
+    // A direct fall-through THROUGH a label: `goto L` may reach `L:` which then
+    // falls off the end. The label re-establishes reachability at the dead tail.
+    EXPECT_GE(hirVerifierFailures("int lbl(int x){ if(x) goto L; return 0; L: ; }"), 1u)
+        << "a labeled statement after the terminator is a goto re-entry point — "
+           "the block can still fall through via the label";
+    // ★ THE NESTED-LABEL SOUNDNESS GUARD (the audit's mandatory addition). The
+    // dead tail is an `if` whose BODY contains the label `L:`. `goto L` can re-
+    // enter that nested label and then fall off the end — a GENUINE fall-through.
+    // Only the `subtreeContainsLabel` (deep) reachability reset catches this; the
+    // UNSOUND version (reset only at a DIRECT LabelStmt child) would see the `if`
+    // as a plain dead child, keep `reachable=false`, and WRONGLY accept the body
+    // (a silent miscompile). This pin goes RED against the unsound version.
+    EXPECT_GE(hirVerifierFailures(
+                  "int nested(int x){ if(x) goto L; return 0; if(x){ L: ; } }"),
+              1u)
+        << "a label nested inside a dead-tail statement is still a goto re-entry "
+           "point — the block genuinely falls through and must fail loud";
+}
+
 // VLA C5 (D-CSUBSET-VLA, C99 6.8.6.1p1): a `goto` that jumps INTO the scope of a
 // variable-length array, bypassing its declaration, is FAILED LOUD at HIR verify
 // (H_VlaJumpIntoScope). `goto L` sits BEFORE `int a[n]`; `L:` sits AFTER it, so
@@ -2362,6 +2659,85 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     auto decls = res->hir.moduleDecls(res->hir.root());
     ASSERT_EQ(decls.size(), 1u);
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
+}
+
+// D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the bit-field-safe reconstruction
+// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->` bit-field
+// mutation; a bit-field reached through an ANONYMOUS-member hop chain or an
+// ARRAY-arrow base cannot be addressed by the single-field lvalue, so a
+// compound/inc-dec/value mutation there FAILS LOUD (S_BitfieldMutationUnsupportedBase)
+// rather than silently full-unit-store via the generic via-ptr path (which would
+// clobber the packed neighbour + skip truncation). Statement plain-`=` stays correct
+// (lowerAssign never routes through classifyMemberLvalue), and NON-bit-field members
+// through the same bases are unaffected. RED-ON-DISABLE: drop the `isBitfield`
+// fail-loud arms in classifyMemberLvalue → the anon/array-arrow bit-field mutation
+// silently lowers (0 S0058) into the neighbour-clobbering full-unit store.
+TEST(HirLoweringCSubset, AnonAndArrowBitfieldMutationFailsLoud) {
+    // (1) compound `+=` on an ANON-struct bit-field → fail loud.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
+            << "anon-member bit-field compound mutation must fail loud, not silently "
+               "full-unit-store";
+    }
+    // (2) inc-dec on an anon bit-field (statement + value) → fail loud.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a++; }\n"
+            "unsigned g(struct O* o) { return (++o->a); }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 2u)
+            << "anon-member bit-field inc/dec (statement + value) must both fail loud";
+    }
+    // (3) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT (compiles,
+    //     no fail-loud — it routes through lowerAssign, not classifyMemberLvalue).
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
+            "void f(struct O* o) { o->a = 3; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << "statement plain-`=` on an anon bit-field must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "statement plain-`=` on an anon bit-field is correct — no fail-loud";
+    }
+    // (4) a NON-bit-field anon member compound-assign is UNAFFECTED (generic path).
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct O { struct { int x; int y; }; };\n"
+            "void f(struct O* o) { o->x += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "a non-bit-field anon member takes the correct generic scalar store";
+    }
+    // (5) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay) → fail loud;
+    //     a NON-bit-field array-arrow member is unaffected.
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct S { unsigned a : 4; unsigned b : 4; };\n"
+            "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
+            << "array-arrow bit-field compound mutation must fail loud";
+    }
+    {
+        SemanticModel model = analyzeCSubset(
+            "struct S { int a; int b; };\n"
+            "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "a non-bit-field array-arrow member is unaffected";
+    }
 }
 
 // HR cycle C: an int-typed `return expr;` whose expr type is non-int (e.g.
@@ -5403,6 +5779,137 @@ TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
         auto const kids = res->hir.children(nots[0]);
         ASSERT_EQ(kids.size(), 1u);
         expectDecayCast(kids[0], HirKind::Ref, "`!` operand (g)");
+    }
+}
+
+// c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): unary `*` applied to an ARRAY operand
+// decays the array to Ptr<elem> (C 6.3.2.1p3 — the SAME law as c59's additive
+// decay) BEFORE the Deref types its result. `derefResultType` is Ptr-only (the
+// law SHARED with the semantic-tier typer), so pre-fix `*(arrayName)` reached it
+// as a raw Array → InvalidType → a TYPELESS Deref → H0001 (the sqlite
+// getVarint32(zBuf,…) test3.c:474 blocker; `zBuf` is `unsigned char zBuf[100]`).
+// `arrayName[0]` (Index → indexResultType types an Array base) and `*(arrayName
+// + 0)` (c59) already lowered — this is the DIRECT-deref-of-an-array hole. This
+// pin names the HIR tier: the Deref is TYPED as the element and its operand is
+// the synthetic Array→Ptr decay Cast. The corpus witness (examples/c-subset/
+// array_decay_deref) proves the VALUES end-to-end on every run leg. RED-ON-
+// DISABLE: revert the combineUnaryOp Deref decay arm → the operand stays a raw
+// Array Ref and the Deref is typeless (both asserts flip; the file no longer
+// lowers clean).
+TEST(HirLoweringCSubset, DerefOfArrayOperandDecaysToPointer) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { int a[4]; a[0] = 7; return *(a); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 1u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 1u);
+    HirNodeId const ret = stmts.back();
+    auto const rv = res->hir.returnValue(ret);
+    ASSERT_TRUE(rv.has_value()) << "the last statement is `return *(a);`";
+    HirNodeId const deref = *rv;
+    // `*(a)` is a Deref TYPED as the element (int → I32), NOT the pre-fix
+    // TYPELESS node the HirVerifier reported as H0001.
+    ASSERT_EQ(res->hir.kind(deref), HirKind::Deref) << "`*(a)` lowers to a Deref";
+    TypeId const dt = res->hir.typeId(deref);
+    ASSERT_TRUE(dt.valid())
+        << "the Deref MUST be typed (pre-fix a Deref of an Array was TYPELESS → H0001)";
+    EXPECT_EQ(ti.kind(dt), TypeKind::I32) << "`*(int[4])` yields the element type int";
+    // Its single operand is the synthetic Array→Ptr decay Cast (C 6.3.2.1p3),
+    // Ptr<int>, over the raw Array Ref underneath.
+    auto const kids = res->hir.children(deref);
+    ASSERT_EQ(kids.size(), 1u);
+    HirNodeId const operand = kids[0];
+    ASSERT_EQ(res->hir.kind(operand), HirKind::Cast)
+        << "the Array operand of unary `*` must be wrapped in the coerce decay Cast";
+    TypeId const ct = res->hir.typeId(operand);
+    ASSERT_TRUE(ct.valid());
+    ASSERT_EQ(ti.kind(ct), TypeKind::Ptr) << "the decay Cast carries Ptr<elem>";
+    auto const elem = ti.operands(ct);
+    ASSERT_FALSE(elem.empty());
+    EXPECT_EQ(ti.kind(elem[0]), TypeKind::I32)
+        << "…whose pointee is the ELEMENT type (int)";
+}
+
+// D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION: C 6.5.2.2p6 default ARGUMENT
+// promotions for a SCALAR variadic-tail arg are applied in `coerceCallArg` — a
+// sub-int integer promotes to `int` (a Cast typed I32), a `float` widens to
+// `double` (a Cast typed F64), and an arg already at/above the promotion floor
+// (`int`, `double`, …) passes through with NO cast. The signedness-keyed
+// SExt/ZExt of the integer promotion is mapCast's downstream concern (proven
+// end-to-end — signed -1 vs unsigned 65535 — by the corpus witness
+// examples/c-subset/varargs_default_arg_promotion). RED-ON-DISABLE: revert the
+// scalar promotion in coerceCallArg → the narrow/float arg reaches the Call as
+// its raw I16/I8/F32 (the Cast + type asserts flip); pre-fix this was the
+// silent miscompile that made sqlite's `sqlite3_expert_new` see nArg=-1 as
+// 65535.
+TEST(HirLoweringCSubset, VariadicTailScalarArgGetsDefaultArgPromotion) {
+    // Lower `int main() { <decls> return va(1, x); }` against a variadic `va`,
+    // and report the (nodeKind, typeKind) of the variadic-tail arg `x` (the
+    // Call's LAST child — [callee, fixed `1`, tail `x`]).
+    auto tailArg = [](std::string decls) -> std::pair<HirKind, TypeKind> {
+        SemanticModel model = analyzeCSubset(
+            "int va(int n, ...);\n"
+            "int main() { " + decls + " return va(1, x); }\n");
+        EXPECT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? std::string{}
+                : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& ti = model.lattice().interner();
+        auto ds = res->hir.moduleDecls(res->hir.root());
+        HirNodeId const call = findFirstByKind(
+            res->hir, res->hir.functionBody(ds.back()), HirKind::Call);
+        EXPECT_TRUE(call.valid()) << "main ends in a Call `va(1, x)`";
+        auto const kids = res->hir.children(call);
+        EXPECT_GE(kids.size(), 3u) << "[callee, `1`, `x`]";
+        HirNodeId const arg = kids.back();
+        return {res->hir.kind(arg), ti.kind(res->hir.typeId(arg))};
+    };
+
+    // signed short -1 → integer-promoted to int: a Cast typed I32.
+    {
+        auto [k, t] = tailArg("short x; x = -1;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `short` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // signed char -1 → promoted to int.
+    {
+        auto [k, t] = tailArg("signed char x; x = -1;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `signed char` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // unsigned short → promoted to int (mapCast picks ZExt for the unsigned source).
+    {
+        auto [k, t] = tailArg("unsigned short x; x = 5;");
+        EXPECT_EQ(k, HirKind::Cast) << "an `unsigned short` variadic arg must be promotion-cast";
+        EXPECT_EQ(t, TypeKind::I32) << "…to int (I32)";
+    }
+    // float → widened to double (FPExt): a Cast typed F64.
+    {
+        auto [k, t] = tailArg("float x; x = 1.5f;");
+        EXPECT_EQ(k, HirKind::Cast) << "a `float` variadic arg must widen";
+        EXPECT_EQ(t, TypeKind::F64) << "…to double (F64)";
+    }
+    // int is already at the promotion floor → NO cast (passes through unchanged).
+    {
+        auto [k, t] = tailArg("int x; x = 5;");
+        EXPECT_NE(k, HirKind::Cast) << "an `int` variadic arg must NOT be re-cast";
+        EXPECT_EQ(t, TypeKind::I32);
+    }
+    // double is already double → NO widen.
+    {
+        auto [k, t] = tailArg("double x; x = 1.5;");
+        EXPECT_NE(k, HirKind::Cast) << "a `double` variadic arg must NOT be re-cast";
+        EXPECT_EQ(t, TypeKind::F64);
     }
 }
 

@@ -11,7 +11,15 @@
 //
 // `D-OPT-MEMORYSSA-CLOBBER-WALK` is CLOSED by `mir_memory_clobbers.hpp`
 // (`MirMemoryClobbers` — the pass-wide clobber index + memoized reachability;
-// one build per pass, cheap queries). The region/loop walkers BELOW are kept
+// one build per pass, cheap queries) — but note that closure was a PERFORMANCE
+// re-implementation of the SAME query semantics, NOT a precision upgrade. It
+// did not, by itself, make any consumer loop-aware; the CONSUMER still owns
+// composing the queries into a sound region cover. TF-C58 is the cautionary
+// case: this docblock's old "loop-carried clobber → owned by
+// D-OPT-MEMORYSSA-CLOBBER-WALK" + ":12 that anchor is CLOSED" read together as
+// "handled", while CSE's open-coded three-slice cover silently omitted the
+// back-edge tail → a real miscompile. See `D-OPT-CSE-LOAD-BACKEDGE-TAIL`.
+// The region/loop walkers BELOW are kept
 // as the REFERENCE implementation: they define the query semantics, and the
 // differential tests assert the index's answers equal these walkers' answers
 // on every curated shape. Production consumers (CSE, LICM) query the index.
@@ -139,7 +147,14 @@ namespace detail {
 //   — Pointer arithmetic / GEP-derived may-alias (needs interval analysis)
 //   — Cross-function escape analysis (address-taken propagation)
 //   — Heap-allocation tracking (malloc/calloc-distinct)
-//   — Loop-carried clobber (MemorySSA: `D-OPT-MEMORYSSA-CLOBBER-WALK`)
+//   — Loop-carried clobber is NOT out of scope and is NOT free: `mirMayAlias`
+//     is a pure two-pointer predicate with no notion of control flow, so a
+//     CONSUMER that compares two program POINTS owes a region cover that
+//     includes every path between them — the back edge included. Composing
+//     that cover is the consumer's obligation (`D-OPT-CSE-LOAD-BACKEDGE-TAIL`);
+//     `MirMemoryClobbers::blockReachesItselfAvoiding` is the wrap-detection
+//     primitive provided for it. Do NOT read this bullet as "the index handles
+//     loops for you".
 // Defaults (`StrictTbaa::No` + `charTypesAliasAll = true`) match the
 // MOST CONSERVATIVE direction — a consumer that forgets to thread the
 // per-language values gets soundness, never wrong-No. Production

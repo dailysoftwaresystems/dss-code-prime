@@ -160,6 +160,23 @@ struct DSS_EXPORT SymbolRecord {
     // function POINTER (`int (*fp)(int)`) does NOT set this — its suffix sits on
     // the outer declarator, not the name's direct declarator. Default false.
     bool            isProtoDeclaration = false;
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): TRUE iff this symbol was minted from a
+    // bare, UNDECORATED-name object declaration whose head is a TYPE-NAME reference
+    // (a potential typedef) — e.g. `Fn foo;` / `Tcl_ObjCmdProc foo;`. Such a
+    // declaration IS a function PROTOTYPE (C 6.7 / 6.9.1p2: `T x;` where T is a
+    // function type declares a function) WHEN that type-name resolves to a function
+    // type — but the function-ness is unknowable in Pass 1 (a shipped-descriptor
+    // typedef is not injected until AFTER Pass 1, and user typedefs resolve their
+    // type only in Pass 1.5). So Pass 1 marks the declaration a CANDIDATE: it is
+    // treated as Function-category for a same-name redeclaration merge (so a proto +
+    // its definition MERGE instead of colliding), and Pass 1.5 upgrades it to a real
+    // Function proto once the type resolves to a FnSig. The post-1.5 sweep VERIFIES:
+    // if the resolved type is NOT a function (a genuine object-vs-function clash such
+    // as `MyInt foo; int foo(){}`), the deferred S_RedeclaredSymbol fires there.
+    // Distinct from `isProtoDeclaration` (a SYNTACTIC `name()` proto, known in
+    // Pass 1); only ever set on an object-declaration row (never a struct field or a
+    // parameter). Default false.
+    bool            maybeFnTypedefProto = false;
     // D-CSUBSET-FN-PROTOTYPE: a proto / redundant function redeclaration that a
     // SURVIVING declaration superseded (proto→def: the proto is absorbed and the
     // definition wins the binding; def→proto / proto→proto: the new redundant
@@ -275,6 +292,19 @@ struct DSS_EXPORT SymbolRecord {
     // (determinate cases already work — a Call is a memory barrier and longjmp restores
     // callee-saved+SP), never a silent miscompile. Default false.
     bool            returnsTwice = false;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: TRUE iff this FUNCTION symbol was
+    // MINTED from a resolved shipped-library FFI descriptor (tcl.json, stdio.json,
+    // …) — the descriptor-injection sibling of `isNoreturn`/`returnsTwice`. Set
+    // ONLY in the shipped-lib injection loop for `kind==Function`; the SEPARATE
+    // builtin/intrinsic injection loop deliberately leaves it FALSE (both loops use
+    // `tree==InvalidTree`, so that field cannot distinguish them — this flag is the
+    // discriminator that keeps `_InterlockedCompareExchange`'s `int*`-pointee reject
+    // pinned). Read ONLY by `checkCallAgainstSig` at the DIRECT-symbol call site to
+    // decide whether the config-gated integer-pointee pointer-arg relaxation
+    // (`ptr<i64>` accepting a same-representation `long long*`/`long*`-on-LP64) may
+    // fire AT THE CALL-ARG BOUNDARY (never native C-to-C, never init/assign/return).
+    // Default false → every non-shipped callee stays strict.
+    bool            isShippedDescriptorFn = false;
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's
@@ -437,6 +467,7 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
+                  UnitAttribute<bool>                    ffiIntPointeeCompatNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -453,6 +484,7 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
+          ffiIntPointeeCompatNodes_(std::move(ffiIntPointeeCompatNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -527,6 +559,21 @@ public:
         return nullPointerConstantNodes_.has(id);
     }
 
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
+    // node the analyzer admitted via the shipped-FFI-descriptor integer-pointee
+    // pointer relaxation (a real C integer pointer — `long long*` etc. — passed to
+    // a descriptor `ptr<i64>`-style param whose pointee is same-REPRESENTATION but
+    // distinct-IDENTITY). The CST→HIR `coerce()` reads this to realize the Ptr→Ptr
+    // bitcast that retypes the arg to the param type (admit⟺realize parity, the
+    // `isNullPointerConstant` precedent). False for every other node — the mark is
+    // set ONLY when the relaxation was WHAT admitted the arg (strict-fail-then-relax-
+    // succeed), so a strictly-compatible arg is never marked. Callers MUST guard
+    // `id.valid()` before calling (the UnitAttribute routes by arenaTag; an untagged
+    // InvalidNode is ambiguous in a multi-tree CU).
+    [[nodiscard]] bool isFfiIntPointeeCompat(NodeId id) const {
+        return ffiIntPointeeCompatNodes_.has(id);
+    }
+
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
@@ -594,6 +641,12 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
+    // admitted via the shipped-descriptor integer-pointee pointer relaxation. The
+    // CST→HIR lowerer reads `isFfiIntPointeeCompat` to materialize the Ptr→Ptr
+    // bitcast retyping the arg to the param type. TREE-KEYED UnitAttribute for the
+    // same cross-tree-aliasing reason as `nullPointerConstantNodes_`.
+    UnitAttribute<bool>                                   ffiIntPointeeCompatNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

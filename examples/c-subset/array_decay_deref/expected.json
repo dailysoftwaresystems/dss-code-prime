@@ -1,0 +1,34 @@
+{
+  "$comment": "c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): unary `*` on an ARRAY operand decays the array to Ptr<elem> (C 6.3.2.1p3, the SAME law as c59's additive decay) BEFORE the Deref types its result. Without it `*(arrayName)` kept TypeKind::Array -> derefResultType (Ptr-only) returned InvalidType -> the Deref came out TYPELESS -> error[H0001] (HirKind Deref unresolved, ordinal 43). `arrayName[0]` (Index) and `*(arrayName+0)` (c59) already compiled -> this was the DIRECT-deref-of-array hole. SQLite construct: sqliteInt.h getVarint32(A,B)==(u8)((*(A)<0x80)?((B)=(u32)*(A)),1:slow) and putVarint32(A,B)==(u8)(((u32)(B)<0x80)?(*(A)=(u8)(B)),1:slow), A an `unsigned char zBuf[100]` array deref'd DIRECTLY inside the comma-in-the-middle-of-a-ternary; test3.c:474 `getVarint32(zBuf,out32)` fired two H0001. VALUE-CORRECT + RUNTIME-DRIVEN: bytes seeded via a runtime loop; `out` is assigned SOLELY by the getVarint32 comma-LEFT array-deref side effect -> a dropped side effect or a mis-read deref would NOT be 42. zBuf={42,41,40,39}; getVarint32 rvalue-deref -> out=42; putVarint32 lvalue-deref -> wBuf[0]=42. RED-ON-DISABLE: revert the Deref decay -> both `*(zBuf)` and `*(wBuf)` are typeless -> H0001 (no compile). Pure c-subset -> all 4 targets; pe RUNS on Windows, elf/arm64 RUN on linux/qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

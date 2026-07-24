@@ -175,7 +175,14 @@ jobs:
           NEEDRESTART_SUSPEND: '1'
         run: |
           set -e
-          PKGS=(ninja-build llvm lld "${{ matrix.cc }}" "${{ matrix.cxx }}")
+          # libtcl8.6: REPO-SPECIFIC addition (not in the DSS.DevOps template).
+          # The examples/c-subset/shipped_tcl_eval RUN witness (SQLite testfixture
+          # arc, D-FFI-TCL-DESCRIPTOR) compiles a DSS binary that links
+          # libtcl8.6.so and evaluates a real TCL expression at load; the x86_64
+          # ubuntu legs execute it, so the runtime lib must be present. (The
+          # native-arm64 leg cross-compiles the x86_64-elf target and arch-gates
+          # the run, so it needs no libtcl; windows/macos are compile-only.)
+          PKGS=(ninja-build llvm lld libtcl8.6 "${{ matrix.cc }}" "${{ matrix.cxx }}")
           case "${{ matrix.cc }}" in
             clang-*)
               VER="${{ matrix.cc }}"; VER="${VER#clang-}"

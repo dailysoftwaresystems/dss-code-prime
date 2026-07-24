@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -276,7 +277,50 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
         phase.emplace(substrate::CompilePhase::Parse);
-        Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
+        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: seed the binder sketch's global
+        // scope with the LIVE shipped-descriptor typedef NAMES (`size_t` from
+        // <stddef.h>, the stdint widths, …) BEFORE the FIRST parse. Those
+        // typedefs are injected SEMANTICALLY (post-parse), so without this the
+        // includer parsed `(size_t)(expr)` as a CALL and recorded an
+        // AmbiguousTypeNameCandidate -> UnitBuilder::finish() re-tokenized and
+        // re-parsed the WHOLE TU (~0.75s/TU on the SQLite amalgamation) just to
+        // learn the name is a type. Seeding it up front commits the cast on parse
+        // 1 (parser.cpp NameKind::Type) -> no candidate -> no reparse. This reuses
+        // the EXACT channel the finish() oracle reparse already uses
+        // (ParserConfig::seedGlobalTypeNames -> BinderSketch::seedGlobalType); the
+        // reparse is RETAINED as the residual net for in-buffer FORWARD references
+        // (a typedef used before its own definition in the synthesized buffer),
+        // which no descriptor seed can cover. Interner-free NAME harvest over the
+        // descriptors the preprocessor actually resolved (parent + transitive
+        // `includes` closure), deduped by name. A scratch reporter: a malformed
+        // descriptor is reported ONCE by the semantic read, never here.
+        // ORACLE-ALIGNED (D-PERF-2): `pp.resolvedShippedDescriptors` is now the
+        // AUTHORITATIVELY-LIVE descriptor set (the preprocessor drops a splice whose
+        // offset falls in an `#if 0` dead range), EQUAL to the finish() oracle's
+        // `shippedLibDescriptors`. So seeding resolves EXACTLY the names the finish()
+        // reparse would -- never a superset, never a name from a dead-branch include.
+        // ONE-DIRECTIONAL (P0016): a real in-source binding still SHADOWS a seed
+        // (`lookup` scans bindings newest-first; seeds precede every parse-time
+        // record), so seeding only ever turns Unknown -> Type, never overrides a
+        // Value -- it resolves MORE names, never suppresses a diagnostic.
+        ParserConfig cfg = parserConfigFor(*schema);
+        {
+            std::unordered_set<std::string> seen;
+            for (std::filesystem::path const& desc :
+                 pp.resolvedShippedDescriptors) {
+                DiagnosticReporter scratch{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                if (auto names =
+                        ffi::readShippedLibTypedefNames(desc, scratch)) {
+                    for (auto& n : *names) {
+                        if (seen.insert(n).second) {
+                            cfg.seedGlobalTypeNames.push_back(std::move(n));
+                        }
+                    }
+                }
+            }
+        }
+        Parser p{synth, schema, std::move(stream), std::move(cfg),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
         phase.reset();
@@ -295,6 +339,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         auto& sidecar           = sidecars_.back();
         sidecar.candidates      = std::move(result.typeNameCandidates);
         sidecar.globalTypeNames = std::move(result.globalTypeNames);
+        sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
         sidecar.source          = std::move(synth);
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
@@ -333,6 +378,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     auto& sidecar           = sidecars_.back();
     sidecar.candidates      = std::move(result.typeNameCandidates);
     sidecar.globalTypeNames = std::move(result.globalTypeNames);
+    sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
     sidecar.source          = std::move(src);
     sidecar.schema          = std::move(schema);
     return trees_.back().id();
@@ -611,10 +657,38 @@ CompilationUnit UnitBuilder::finish() && {
             for (std::size_t i = 0; i < trees_.size(); ++i) {
                 auto& sc = sidecars_[i];
                 if (sc.candidates.empty()) continue;
+                // D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME: a typedef name is not
+                // in scope within its OWN declarator (C 6.2.1p7). The oracle
+                // seeds a name as a GLOBAL (position-independent) type for the
+                // whole reparse, so seeding a typedef's OWN name would make its
+                // own parenthesized-name declarator (`typedef int (F);`) reparse
+                // as an abstract function-suffix param (F a param TYPE) instead
+                // of the parenthesized declarator that NAMES F — S0017. A
+                // candidate's span IS its self-defining occurrence exactly when
+                // it equals one of THIS tree's own global-TYPE binding spans (a
+                // byte range uniquely identifies one token in the buffer, so
+                // span equality ⇒ same token ⇒ the definition site). A genuine
+                // cross-file / in-buffer-FORWARD use has a DISTINCT span from
+                // the definition (BothDirectionsResolveInlineInOneBuffer), and a
+                // cross-file typedef's binding lives in ANOTHER tree — neither
+                // is excluded here.
+                auto spanKey = [](SourceSpan s) {
+                    return (static_cast<std::uint64_t>(s.start()) << 32)
+                           | s.end();
+                };
+                std::unordered_set<std::uint64_t> ownBindingSpans;
+                ownBindingSpans.reserve(sc.globalTypeBindings.size());
+                for (auto const& [name, span] : sc.globalTypeBindings) {
+                    (void)name;
+                    ownBindingSpans.insert(spanKey(span));
+                }
                 std::vector<std::string>        seeds;
                 std::unordered_set<std::string> seen;
                 for (auto const& cand : sc.candidates) {
                     if (!oracle.contains(cand.name)) continue;
+                    if (ownBindingSpans.contains(spanKey(cand.span))) {
+                        continue;   // self-defining occurrence — C 6.2.1p7
+                    }
                     if (seen.insert(cand.name).second) {
                         seeds.push_back(cand.name);
                     }
@@ -666,6 +740,7 @@ CompilationUnit UnitBuilder::finish() && {
                 trees_[i]          = std::move(result.tree);
                 sc.candidates      = std::move(result.typeNameCandidates);
                 sc.globalTypeNames = std::move(result.globalTypeNames);
+                sc.globalTypeBindings = std::move(result.globalTypeBindings);
                 ++typeNameReparseCount;
             }
             if (typeNameReparseCount > 0) {

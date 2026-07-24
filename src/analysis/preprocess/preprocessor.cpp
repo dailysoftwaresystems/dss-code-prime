@@ -2,6 +2,7 @@
 
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/include_path_resolve.hpp"
+#include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -370,6 +372,27 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
     stack.pop_back();
 }
 
+// C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE / FINDING-B): the SINGLE
+// per-object-format availability predicate for a config PREDEFINED macro. A
+// macro with a non-empty `availableObjectFormats` set is available ONLY when the
+// active object format is in that set; an EMPTY set means EVERY format; absent an
+// active format only a universal (empty-set) macro is available. Shared by the
+// include-gating pre-scan's definedness oracle (`sbNameDefined`), the value-seed
+// prefix builder (`preprocess`), the `MacroExpander` `predefined_` seed, AND the
+// function-like "<built-in>" prologue filter -- so all four apply ONE filter and
+// can NEVER drift. A divergence between the pre-scan's seed and the authoritative
+// `predefined_` set would be a silent P0016 seam (the pre-scan resolving a
+// value-gated include the authoritative pass reads dead), so this MUST stay the
+// one definition.
+[[nodiscard]] bool predefinedMacroAvailableOnActiveFormat(
+    std::vector<std::string> const&        availableObjectFormats,
+    std::optional<ObjectFormatKind> const& activeFormat) {
+    if (availableObjectFormats.empty()) return true;
+    if (!activeFormat.has_value()) return false;
+    return ffi::objectFormatInAvailabilitySet(availableObjectFormats,
+                                              *activeFormat);
+}
+
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
@@ -394,6 +417,38 @@ struct SynthBuilder {
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
     bool&                                fatal;
+    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2 — supersedes the
+    // C19 `seededDefines` NAME-set): a `#define NAME VALUE\n` prefix for every
+    // command-line `--define` + every OBJECT-like predefined macro available on
+    // the active format, shared by const-ref across EVERY child builder. The
+    // include-gating pre-scan must see these VALUES so a `#if <cmdline/predefined>`
+    // VALUE guard (`#if SQLITE_TEST`, `#if __STDC_VERSION__ >= 201112L`) gating a
+    // quote-`#include` evaluates correctly -- it would otherwise fold to 0 -> a
+    // FALSE-DEAD skip, the un-inlined header's `#define`s vanish, and the drop
+    // surfaces as a spurious P0009/P9006 at the macro's use site
+    // (D-PP-CONDITIONAL-INCLUDE-ORDERING lineage). `build()` prepends this as a
+    // NON-EMITTED span-safe SCAN-BUFFER prefix (its `#define` lines seed
+    // `localMacros` with values whose replacement-token spans slice the SAME
+    // `scanBuf` sbExpand reads). This SUBSUMES C19's definedness-only seed AND
+    // composes with a source `#undef` (which now erases the seeded value from
+    // `localMacros`, unlike the old separate NAME set). The one-directional-
+    // divergence invariant is preserved: the values EXACTLY match the
+    // `<command-line>`/`<built-in>` prologues the authoritative pass sees, so the
+    // pre-scan is more-live only IN LOCKSTEP (P0016 stays closed).
+    std::string const& preScanDefinePrefix;
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: sink for every system-descriptor PARENT
+    // this builder (and its recursive children) SPLICES for an angle `#include <h>`
+    // (or the quote->angle fallback), paired with the SYNTH-BUFFER byte offset of
+    // the splice point. The splice is UN-GATED (it fires for every angle include,
+    // dead branch or not -- D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS);
+    // `preprocess()` then DROPS any record whose offset falls in an AUTHORITATIVE
+    // dead range, so the surviving set == the finish() oracle's authoritatively-live
+    // `shippedLibDescriptors`. Shared by reference across every child builder (like
+    // `includeStack` / `fatal`), so a header spliced deep in a quote-include chain
+    // still reaches `preprocess()`. Raw (parent, offset) pairs (dups allowed);
+    // `preprocess()` dead-filters, then expands the transitive `includes` closure +
+    // dedups once into `PreprocessResult`. EMIT-ONLY.
+    std::vector<std::pair<fs::path, ByteOffset>>& resolvedDescriptorsOut;
     // c17: a SynthBuilder-local object-like macro, tracked from LIVE-branch
     // `#define`s so a `#if FOO`/`#if FOO == 1` guard gating a quote-`#include`
     // evaluates with the macro state visible at the include point. Independent
@@ -408,13 +463,68 @@ struct SynthBuilder {
     // pass (`deadRanges()`), NOT this pre-scan -- so a guard this weaker eval
     // mis-reads only ever causes a loud include skip/resolve, never a silent
     // illegal-char drop.
+    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the replacement is stored
+    // as TEXT, not span-tokens. The map below is SHARED across the whole builder
+    // tree, and a span-token would slice the WRONG buffer in any builder other
+    // than the one that recorded it — `SourceBuffer::slice` CLAMPS rather than
+    // faults, so that failure mode is plausible-wrong-bytes, never a crash. The
+    // text is re-tokenized into the per-evaluation product tail at expansion
+    // time (`sbMintProduct`), the same FC15b mechanism `materializeSignificant`
+    // uses in the authoritative pass.
     struct SbMacro {
-        bool               functionLike = false;
-        std::vector<Token> replacement;  // object-like body (spans in scanBuf)
+        bool        functionLike = false;
+        std::string replacementText;     // object-like body, buffer-independent
     };
-    std::unordered_map<std::string, SbMacro> localMacros;
+    // TF-C60: SHARED BY REFERENCE across every child builder (the
+    // `includeStack`/`fatal`/`resolvedDescriptorsOut` pattern), so the pre-scan's
+    // macro state spans the WHOLE include tree in DOCUMENT ORDER. Before this it
+    // was per-builder: a `#define` arriving via a NESTED include was invisible to
+    // the parent's later `#if` (and a parent's source `#define` invisible to a
+    // child's), the guard folded 0 → FALSE-DEAD → the gated quote-`#include` was
+    // left verbatim → the macro pass forwarded it as inert tokens → the header
+    // was SILENTLY DROPPED (sqlite os_unix.c: sqliteInt.h→os_setup.h defines
+    // SQLITE_OS_UNIX, `#if SQLITE_OS_UNIX` gates `#include "os_common.h"`).
+    std::unordered_map<std::string, SbMacro>& localMacros;
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
+
+    // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY + -PREDEFINED-VALUE-INCLUDE-GATE):
+    // the SINGLE definedness oracle for the include-gating pre-scan's
+    // `#ifdef`/`#ifndef`/`#if defined()`. Before C19 the two DISAGREED -- `#ifdef`
+    // saw only `localMacros`, `#if defined()` also saw `predefinedMacros` -- and
+    // NEITHER saw a command-line `--define`, so a `#ifdef SQLITE_TEST`-gated
+    // quote-`#include` was falsely skipped. Now BOTH consult, in one place: an
+    // in-source `#define` OR a command-line `--define` OR an object-like predefined
+    // (all now materialized in `localMacros` via the C21 value prefix that build()
+    // prepends), OR a config predefined macro via the SHARED per-format filter the
+    // authoritative MacroExpander applies (this arm keeps a FUNCTION-like predefine
+    // -- excluded from the value prefix per FINDING-A -- reporting DEFINED). So the
+    // pre-scan can only ever be MORE live IN LOCKSTEP with the authoritative pass --
+    // never resolving a branch the real pass reads dead (the one-directional
+    // divergence invariant that keeps P0016 closed). C21 IMPROVEMENT: a source
+    // `#undef` of a command-line define now COMPOSES (it erases the value from
+    // `localMacros` and the define is not a predefined, so this reports it
+    // undefined). EDGE (pre-existing + LOUD-not-silent): a `#undef` of a PREDEFINED
+    // name is still not reflected by the predefined for-loop arm -- so the pre-scan
+    // may read MORE-live than the authoritative pass; the effect is at worst a
+    // spurious include-resolve (loud `P_PreprocessorIncludeError`) or a benign
+    // splice-then-elide, NEVER a silent mis-include.
+    [[nodiscard]] bool sbNameDefined(std::string_view n) const {
+        // Option 2 (C21): a command-line `--define`'s definedness now comes from
+        // `localMacros` (the value prefix seeds it via the main-loop `#define`
+        // handler), so the separate C19 `seededDefines` NAME set is gone. KEEP the
+        // predefined arm: a FUNCTION-like predefine (EXCLUDED from the value prefix
+        // per FINDING-A) must still report DEFINED here for `#if defined(NAME)` /
+        // `#ifdef NAME`. The predefined filter is the SHARED helper (FINDING-B) so
+        // it can never drift from the value prefix's predefined subset.
+        if (localMacros.find(std::string{n}) != localMacros.end()) return true;
+        for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+            if (pm.name != n) continue;
+            return predefinedMacroAvailableOnActiveFormat(
+                pm.availableObjectFormats, activeFormat);
+        }
+        return false;
+    }
 
     std::optional<fs::path> resolveQuote(std::string_view filename,
                                          fs::path const& includingDir) const {
@@ -480,35 +590,51 @@ struct SynthBuilder {
     // keep the original bytes (angle) or rewrite them to the angle form (quote
     // fallback), and owns the surrounding `copyVerbatim`. Inert (NotAvailable)
     // when there are no systemDirs.
+    //
+    // `reportMalformed` gates ONLY the malformed-descriptor DIAGNOSTIC (a
+    // confidently-live include). The SPLICE itself is UNGATED (the
+    // D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS change), but the
+    // `P_PreprocessorIncludeError` for a descriptor that exists-but-fails-macro-
+    // decode must stay gated on confident-live: the AUTHORITATIVE pass never reads
+    // the descriptor (the pre-scan is the sole emitter here), so emitting it for a
+    // DEAD-branch include would break C 6.10p1 dead-branch inertness (asymmetric
+    // with the still-gated quote arm). Passing `includeResolvable()` at both call
+    // sites RESTORES the pre-change behavior of this diagnostic exactly: it fired
+    // only on a confidently-live include before, when the whole splice was gated.
+    // On a dead/uncertain branch a malformed descriptor is therefore SILENT here
+    // (the branch is inert; an uncertain-but-live use still fails loud downstream as
+    // the missing macro — the P0016-safe direction), never a silent MISCOMPILE.
     SystemMacroSplice spliceSystemDescriptorMacros(std::string const& headerName,
-                                                   std::string& out) {
+                                                   std::string& out,
+                                                   bool reportMalformed,
+                                                   fs::path* resolvedParentOut = nullptr) {
         if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
         auto descPath = resolveSystemDescriptor(headerName, systemDirs);
         if (!descPath) return SystemMacroSplice::NotAvailable;
-        // If the descriptor declares this header unavailable on the active
+        // If the PARENT descriptor declares this header unavailable on the active
         // object-format, treat it EXACTLY like "no descriptor on the path" — the
         // semantic gate then fails loud + `__has_include` returns false, so all
-        // three descriptor consumers stay consistent (c9 MUST-FIX-3).
+        // three descriptor consumers stay consistent (c9 MUST-FIX-3). This drives
+        // the NotAvailable return (the caller leaves the include verbatim).
         if (activeFormat.has_value()
             && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
             return SystemMacroSplice::NotAvailable;
         }
-        DiagnosticReporter macroRep;
-        // Pass the active object-format so a per-FORMAT macro variant selects the
-        // right replacement; nullopt ⇒ a variants-only macro is not injected.
-        auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
-        if (!macros) {
-            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
-                   SourceSpan::empty(0),
-                   std::string{"shipped-header descriptor malformed (macros): "}
-                       + descPath->generic_string());
-            return SystemMacroSplice::Malformed;
-        }
-        for (auto const& macro : *macros) {
-            // Reconstruct the neutral macro as a `#define` line; the downstream
-            // tokenizer + handleDefine build the MacroDef with the proven
-            // function-like / param / redefinition machinery (an identical
-            // re-define on a double-include is idempotent).
+        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: this angle `#include <h>` (or the
+        // quote->angle fallback) resolved to a format-available descriptor whose
+        // typedef surface the semantic phase will inject. Hand the resolved PARENT
+        // path back to the CALL SITE, which records it together with the SYNTH-
+        // BUFFER splice offset (only known there, after the verbatim copy of
+        // everything up to the directive) so `preprocess()` can DROP the record if
+        // the AUTHORITATIVE pass proves the include dead. NOTE: `out` here is the
+        // caller's LOCAL splice buffer, NOT the synth buffer -- so the synth offset
+        // cannot be read in this function. EMIT-ONLY.
+        if (resolvedParentOut) *resolvedParentOut = *descPath;
+        // Reconstruct one neutral macro as a `#define` line into `out`; the
+        // downstream tokenizer + handleDefine build the MacroDef with the proven
+        // function-like / param / redefinition machinery (an identical re-define on
+        // a double-include is idempotent).
+        auto const spliceMacro = [&out](ffi::ShippedMacro const& macro) {
             std::string def = "#define " + macro.name;
             if (macro.params.has_value()) {
                 def += "(";
@@ -530,6 +656,58 @@ struct SynthBuilder {
             }
             def += "\n";
             out.append(def);
+        };
+        // D-FFI-DESCRIPTOR-INCLUDES: splice the PARENT's macros AND every
+        // transitively-included sibling's, via the SHARED cycle-safe closure walker
+        // (so this macro chokepoint and the import-resolver typed-surface record can
+        // never disagree on the transitive set). Parent-FIRST; each descriptor is
+        // independently gated by the SAME per-format availability check. The
+        // PARENT's macro read drives the return value (Malformed/Spliced) exactly as
+        // pre-closure. A sibling that is format-unavailable, malformed, or an
+        // unresolvable `includes` entry contributes no macros and is SILENT here —
+        // the import-resolver + semantic tiers read the SAME closure and own those
+        // loud diagnostics (F_ShippedLibDescriptorMalformed / F_ShippedHeaderNotFound,
+        // positioned on the `#include` line), mirroring the pre-closure `macroRep`
+        // throwaway discipline (dead-branch inertness preserved). On elf tcl→stdio
+        // this splices tcl.json's macros + stdio.json's (elf: zero — stdio's macros
+        // are pe/macho stdin/stdout/stderr variants), so no elf delta; the path is
+        // exercised for correctness on the other formats.
+        bool parentMacrosMalformed = false;
+        bool sawParent = false;
+        std::unordered_set<std::string> visited;   // per-call (a splice is one root)
+        ffi::forEachDescriptorInClosure(
+            *descPath, systemDirs, visited,
+            [&](fs::path const& p) {
+                bool const isParent = !sawParent;
+                sawParent = true;
+                // Per-descriptor availability (the parent already passed; a sibling
+                // absent on this format contributes no macros — mirrors today's
+                // single-descriptor behavior applied to each closure member).
+                if (activeFormat.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(p, *activeFormat)) {
+                    return;
+                }
+                DiagnosticReporter macroRep;   // throwaway — malformed surfaced downstream
+                // Pass the active object-format so a per-FORMAT macro variant selects
+                // the right replacement; nullopt ⇒ a variants-only macro is not injected.
+                auto macros = ffi::readShippedLibMacros(p, macroRep, activeFormat);
+                if (!macros) { if (isParent) parentMacrosMalformed = true; return; }
+                for (auto const& macro : *macros) spliceMacro(macro);
+            },
+            [&](std::string const&) { /* import resolver owns F_ShippedHeaderNotFound */ });
+
+        if (parentMacrosMalformed) {
+            // Malformed PARENT descriptor: report ONLY on a confidently-live include
+            // (the `reportMalformed` note above). A dead/uncertain branch stays
+            // silent — dead-branch inertness — while the include is left verbatim by
+            // the caller (Malformed != Spliced) and elided by the authoritative pass.
+            if (reportMalformed) {
+                emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"shipped-header descriptor malformed (macros): "}
+                           + descPath->generic_string());
+            }
+            return SystemMacroSplice::Malformed;
         }
         return SystemMacroSplice::Spliced;
     }
@@ -545,7 +723,7 @@ struct SynthBuilder {
     // pass reports it authoritatively). Mirrors the redefinition-tolerant table
     // write (last definition wins; the pre-scan needs no compatibility check).
     void sbTrackDefine(std::vector<PPToken> const& toks, std::size_t nameP,
-                       std::size_t end) {
+                       std::size_t end, SourceBuffer const& buf) {
         std::size_t p = nameP;
         while (p < end && isTrivia(toks[p].tok)) ++p;
         if (p >= end || isNewline(toks[p].tok)
@@ -565,26 +743,104 @@ struct SynthBuilder {
             // No body needed: a function-like invocation forces the conservative
             // direction regardless of the replacement.
         } else {
+            // TF-C60: record the replacement as RAW SOURCE TEXT — buffer-
+            // independent (the shared map outlives this builder's scan buffer)
+            // AND byte-faithful.
+            //
+            // ★ Do NOT join token TEXTS: a PPToken is not always a self-contained
+            // spelling. The tokenizer emits a coalesced literal as an OPENER
+            // token plus a BODY token and then consumes the closing delimiter
+            // with NO token at all (tokenizer.cpp), so `'A'` is the two texts `'`
+            // and `A` — joining them (with or without a separator) LOSES the
+            // closer and yields `' A`, which re-lexes to an unterminated literal.
+            // `#define NL '\n'` guarding a conditional include is ordinary C and
+            // would hard-error. Slicing the source range keeps every byte,
+            // including delimiters the token stream does not carry.
+            //
+            // The range runs from the first significant replacement token to the
+            // END of the directive line (the newline's start, or the last token's
+            // end when the line is unterminated). Taking the whole tail also
+            // captures a trailing closer; any trailing comment re-lexes to trivia
+            // and is dropped by `sbMintProduct`.
+            std::size_t firstStart = 0;
+            std::size_t lineEnd    = 0;
+            bool        haveFirst  = false;
             for (std::size_t q = p; q < end; ++q) {
-                if (isNewline(toks[q].tok)) break;
+                if (isNewline(toks[q].tok)) { lineEnd = toks[q].tok.span.start();
+                                              break; }
                 if (isTrivia(toks[q].tok)) continue;
-                m.replacement.push_back(toks[q].tok);
+                if (!haveFirst) { firstStart = toks[q].tok.span.start();
+                                  haveFirst  = true; }
+                lineEnd = toks[q].tok.span.end();
+            }
+            if (haveFirst && lineEnd > firstStart) {
+                m.replacementText =
+                    std::string{buf.slice(SourceSpan::of(
+                        static_cast<ByteOffset>(firstStart),
+                        static_cast<ByteOffset>(lineEnd)))};
             }
         }
         localMacros[name] = std::move(m);
     }
 
-    // c17: object-like macro expansion over `localMacros` for the
-    // `sbEvalIfOperand` `#if` evaluation. A bounded recursive rescan (so a
-    // `#define A B` / `#define B 1` chain folds, the common object-like case),
-    // with an `active`-set self-reference guard (a `#define X X` freezes to its
-    // own name, matching the full engine) + a depth backstop. FUNCTION-like
-    // names are NEVER expanded here -- an invocation is already detected as
-    // conservative by `sbEvalIfOperand`. Replacement tokens slice against `buf`
-    // (the scan buffer the `#define` came from), so their spans stay valid for
-    // the ICE parser.
+    // TF-C60 (c′): read a token's TEXT product-awarely. A token minted by
+    // `sbMintProduct` spans `[bufLen + productOffset, …)` — past the scan
+    // buffer's end — so slice it from the per-eval PRODUCT string instead.
+    // (`SourceBuffer::slice` would silently CLAMP an out-of-range span to
+    // plausible wrong bytes, so this branch is correctness, not cosmetics.)
+    static std::string_view sbTextOf(Token const& t, SourceBuffer const& buf,
+                                     std::string const& product) {
+        std::size_t const bufLen = buf.text().size();
+        if (t.span.start() >= bufLen) {
+            std::size_t const s = t.span.start() - bufLen;
+            std::size_t const e = t.span.end() - bufLen;
+            if (e <= product.size() && s <= e)
+                return std::string_view{product}.substr(s, e - s);
+            return {};
+        }
+        return buf.slice(t.span);
+    }
+
+    // TF-C60 (c′, the FC15b product-tail pattern): re-tokenize a shared macro's
+    // replacement TEXT into the per-evaluation product string, minting tokens
+    // whose spans point at `[bufLen + productBase, …)` — exactly where
+    // `evaluateIfExpression` slices them from, since it assembles
+    // `combined = synth.text() + productText()` (pp_if_eval). Token KINDS come
+    // from the real tokenizer, so nothing is ever re-lexed across a
+    // substitution boundary (no glue hazard, no `<a/b.h>` byte corruption).
+    std::vector<Token> sbMintProduct(std::string_view spelling,
+                                     SourceBuffer const& buf,
+                                     std::string& product) const {
+        ByteOffset const productBase = static_cast<ByteOffset>(product.size());
+        product.append(spelling);
+        auto tiny = SourceBuffer::fromString(std::string{spelling},
+                                             "<sb-product>");
+        DiagnosticReporter scratch;   // pre-scan diagnostics are never user-facing
+        auto ppToks = tokenizeToPP(tiny, schema, scratch);
+        ByteOffset const bufLen = static_cast<ByteOffset>(buf.text().size());
+        std::vector<Token> out;
+        for (PPToken const& pt : ppToks) {
+            if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
+            if (pt.tok.coreKind == CoreTokenKind::Eof) continue;
+            Token t = pt.tok;
+            t.span  = SourceSpan::of(bufLen + productBase + pt.tok.span.start(),
+                                     bufLen + productBase + pt.tok.span.end());
+            out.push_back(t);
+        }
+        return out;
+    }
+
+    // c17 (reworked TF-C60): object-like macro expansion over the SHARED
+    // `localMacros` for the `sbEvalIfOperand` `#if` evaluation. A bounded
+    // recursive rescan (so a `#define A B` / `#define B 1` chain folds), with an
+    // `active`-set self-reference guard (a `#define X X` freezes to its own
+    // name, matching the full engine) + a depth backstop. FUNCTION-like names
+    // are NEVER expanded here -- an invocation is already detected as
+    // conservative by `sbEvalIfOperand`. Substituted tokens are MINTED into the
+    // per-eval `product` string (never carried as foreign-buffer spans), so the
+    // shared map stays buffer-independent.
     std::vector<Token> sbExpand(std::vector<Token> const& in,
-                                SourceBuffer const& buf,
+                                SourceBuffer const& buf, std::string& product,
                                 std::set<std::string>& active, int depth) const {
         if (depth > 32) return in;   // backstop (a pathological cycle the guard
                                      // missed never loops the host)
@@ -592,13 +848,15 @@ struct SynthBuilder {
         outToks.reserve(in.size());
         for (Token const& t : in) {
             if (t.coreKind == CoreTokenKind::Word) {
-                std::string name{buf.slice(t.span)};
+                std::string name{sbTextOf(t, buf, product)};
                 auto it = localMacros.find(name);
                 if (it != localMacros.end() && !it->second.functionLike
                     && active.find(name) == active.end()) {
                     active.insert(name);
+                    std::vector<Token> minted = sbMintProduct(
+                        it->second.replacementText, buf, product);
                     std::vector<Token> sub =
-                        sbExpand(it->second.replacement, buf, active, depth + 1);
+                        sbExpand(minted, buf, product, active, depth + 1);
                     active.erase(name);
                     for (Token const& s : sub) outToks.push_back(s);
                     continue;
@@ -645,26 +903,45 @@ struct SynthBuilder {
             }
         }
 
+        // TF-C60 (c′): the per-EVALUATION product string. Substituted macro
+        // replacements are minted here; `productCb` hands it to
+        // `evaluateIfExpression`, which slices product-region spans from
+        // `synth.text() + productText()`. Owned per call — it must outlive the
+        // whole evaluation (the ICE slices after the expand callback returns).
+        std::string sbProduct;
+        // FIX-3 completion (post-expansion arm): an object-like macro can EXPAND
+        // TO a function-like macro's NAME (`#define Z ENABLED(1)`), which the
+        // raw-operand check above cannot see. Freezing the expansion here is NOT
+        // conservative — folding an unexpandable identifier to 0 is only the safe
+        // direction at EVEN polarity; `#if !Z` inverts it to TRUE and would
+        // eagerly resolve an authoritatively-DEAD include, re-opening P0016 (the
+        // exact hazard FIX-3 exists to forbid, and now tree-wide, since a
+        // wrongly-spliced header's `#define`s pollute the SHARED map). Record the
+        // uncertainty and let the caller take the conservative skip instead.
+        bool sbPostExpandUncertain = false;
         PpMacroExpand expandCb =
-            [this, &buf](std::vector<Token> const& in) {
+            [this, &buf, &sbProduct,
+             &sbPostExpandUncertain](std::vector<Token> const& in) {
                 std::set<std::string> active;
-                return sbExpand(in, buf, active, 0);
+                std::vector<Token> out = sbExpand(in, buf, sbProduct, active, 0);
+                for (Token const& t : out) {
+                    if (t.coreKind != CoreTokenKind::Word) continue;
+                    auto it =
+                        localMacros.find(std::string{sbTextOf(t, buf, sbProduct)});
+                    if (it != localMacros.end() && it->second.functionLike) {
+                        sbPostExpandUncertain = true;
+                        return in;
+                    }
+                }
+                return out;
             };
         PpIsDefined definedCb = [this](std::string_view n) {
-            if (localMacros.find(std::string{n}) != localMacros.end()) return true;
-            // A config-seeded predefined macro (e.g. `_WIN32`) is also `defined`
-            // in the pre-scan, applying the SAME per-format availability filter
-            // as the authoritative pass — so the two agree on a
-            // `#if defined(_WIN32)`-gated quote-`#include` (never a divergence
-            // that skips a live include).
-            for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
-                if (pm.name != n) continue;
-                if (pm.availableObjectFormats.empty()) return true;
-                if (!activeFormat.has_value()) return false;
-                return ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                          *activeFormat);
-            }
-            return false;
+            // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY): unified with
+            // `#ifdef`/`#ifndef` via `sbNameDefined`. A command-line `--define` is
+            // seen through `localMacros` (the C21 value prefix seeds it), so
+            // `#if defined(SQLITE_TEST)` and `#ifdef SQLITE_TEST` agree AND both see
+            // a command-line define.
+            return sbNameDefined(n);
         };
         // Resolve `__has_include` EXACTLY as the include machinery / the macro
         // pass's callback does (quote = self-dir + includeDirs; angle =
@@ -675,18 +952,41 @@ struct SynthBuilder {
             [this, &includingDir](std::string_view filename,
                                   bool isAngle) -> bool {
             if (isAngle) {
-                auto descPath = resolveSystemDescriptor(filename, systemDirs);
-                if (!descPath) return false;
-                if (activeFormat.has_value()
-                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
-                                                             *activeFormat)) {
-                    return false;
+                // D-INCLUDE-ANGLE-SOURCE-FALLBACK + FC15c: resolve EXACTLY as the
+                // angle `#include <h>` arm does, through the SHARED funnel, so
+                // `__has_include(<h>)` and `#include <h>` can never disagree on
+                // existence. Descriptor -> keep the existing per-format availability
+                // verdict (an unavailable-on-this-format descriptor answers 0,
+                // matching the arm that then leaves the include verbatim). Source ->
+                // a real header on the -I path is includable (the arm textually
+                // splices it) -> 1. NotFound -> 0.
+                //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                //   is NOT an include -- it records NOTHING for the reparse-seed oracle
+                //   (a live `#include <h>` seeds via its own splice; a probe with no
+                //   matching include resolves nothing). Left as a pure existence answer.
+                AngleIncludeResolution const ar =
+                    resolveAngleInclude(filename, systemDirs, includeDirs);
+                switch (ar.kind) {
+                    case AngleIncludeKind::Descriptor:
+                        return !(activeFormat.has_value()
+                                 && !ffi::shippedHeaderAvailableForFormat(
+                                        ar.path, *activeFormat));
+                    case AngleIncludeKind::Source:
+                        return true;
+                    case AngleIncludeKind::NotFound:
+                        return false;
                 }
-                return true;
+                return false;   // unreachable — every AngleIncludeKind handled above
             }
             return resolveQuote(filename, includingDir).has_value();
         };
-        PpProductText productCb = []() { return std::string_view{}; };
+        // TF-C60 (c′): hand the per-eval product tail to the ICE — it assembles
+        // `combined = synth.text() + productText()` and slices minted tokens
+        // (spans at `bufLen + offset`) from the product region. An empty-view
+        // callback here would make every minted span slice past the end (CLAMPED
+        // to garbage) — exactly the silent-wrong-bytes class (b) exists to kill.
+        PpProductText productCb =
+            [&sbProduct]() { return std::string_view{sbProduct}; };
         // FC17.9(h): the pre-scan `__has_embed`, resolving against THIS
         // recursion's `includingDir` (the origin file of every token in the scan
         // buffer), so it AGREES with the authoritative per-origin callback by
@@ -712,6 +1012,14 @@ struct SynthBuilder {
         auto v = evaluateIfExpression(operand, *schema, expandCb, definedCb,
                                       hasIncludeCb, buf, productCb, scratch,
                                       embedCb);
+        // FIX-3 post-expansion arm (see `sbPostExpandUncertain` above): the
+        // expansion produced a function-like macro name, so this weaker pre-scan
+        // cannot decide the guard — take the conservative skip in BOTH polarities
+        // rather than trust a frozen-identifier fold.
+        if (sbPostExpandUncertain) {
+            uncertain = true;
+            return false;
+        }
         if (!v.has_value()) {
             uncertain = true;   // malformed/unsupported -> conservative (skip)
             return false;
@@ -721,8 +1029,9 @@ struct SynthBuilder {
 
     void build(std::shared_ptr<SourceBuffer> const& source,
                std::string& out, LineMap& map) {
-        const char dquote  = '"';
-        const char newline = '\n';
+        const char dquote     = '"';
+        const char angleClose = '>';   // the `<h>` closer (source-fallback drop)
+        const char newline    = '\n';
         if (depth > kMaxIncludeDepth) {
             emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
                    SourceSpan::empty(0),
@@ -731,7 +1040,34 @@ struct SynthBuilder {
             fatal = true;   // splice truncated — PP fatal
             return;
         }
-        std::string spliced;
+        // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): prepend the command-
+        // line/predefined `#define` VALUE prefix as a NON-EMITTED span-safe HEADER
+        // of THIS build's scan buffer, so a `#if <cmdline/predefined>` VALUE guard
+        // (`#if SQLITE_TEST`) evaluates with the macro's value at the include point
+        // -- its replacement tokens slice the SAME `scanBuf` sbExpand reads. Two
+        // LOAD-BEARING invariants keep the prefix un-emittable (so it never
+        // contaminates the output and no diagnostic offset leaks):
+        //   (1) it is prepended as RAW bytes with NO localMap segment (NOT through
+        //       appendWithContinuationSplice), and copyVerbatim is SEGMENT-DRIVEN
+        //       (it emits ONLY bytes covered by a localMap segment) -> the prefix
+        //       is STRUCTURALLY un-copyable; AND
+        //   (2) copiedUpTo starts at prefixLen (below), not 0.
+        // The prefix's `#define` lines are consumed by the main loop's `#define`
+        // handler (seeding `localMacros` with VALUES) and that handler does
+        // `i=lineEndTok-1; continue;` -- it never touches copiedUpTo -- so NO
+        // pre-pass is needed. appendWithContinuationSplice bases each source
+        // segment at the CURRENT out.size() (== prefixLen), so the line-map stays
+        // correct (source at synthStart >= prefixLen).
+        // TF-C60 (Finding 7): the prefix seeds the ROOT build ONLY. `localMacros`
+        // is now SHARED across the builder tree, so a child re-prepending it
+        // would RE-ADD a command-line define the source had `#undef`'d before the
+        // include — breaking the C21 "#undef composes" invariant in the exact
+        // direction the authoritative pass resolves it (its prologue runs ONCE
+        // per TU, then the #undef holds for the rest, children included). The
+        // prefix's second historical role — providing sliceable SPANS for seeded
+        // replacement values — is obsolete: SbMacro now stores replacement TEXT.
+        std::string spliced = (depth == 0) ? preScanDefinePrefix : std::string{};
+        std::size_t const prefixLen = spliced.size();
         LineMap     localMap;
         appendWithContinuationSplice(source->text(), source, 0, spliced,
                                      localMap);
@@ -748,7 +1084,8 @@ struct SynthBuilder {
         const auto angleKind =
             schema->schemaTokens().find(cfg().angleIncludeToken);
 
-        std::size_t copiedUpTo = 0;
+        // C21: start PAST the non-emitted value prefix (load-bearing invariant 2).
+        std::size_t copiedUpTo = prefixLen;
         fs::path const includingDir = fs::path{source->name()}.parent_path();
 
         auto isHash = [&](Token const& t) {
@@ -823,7 +1160,12 @@ struct SynthBuilder {
                 auto textOfTok =
                     [&](Token const& t) { return scanBuf->slice(t.span); };
                 auto isDefinedTok = [&](std::string_view n) {
-                    return localMacros.find(std::string{n}) != localMacros.end();
+                    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): was localMacros-ONLY,
+                    // which diverged from `#if defined()` (definedCb) and missed
+                    // command-line `--define`s + predefined macros -> a
+                    // `#ifdef SQLITE_TEST`-gated quote-`#include` was falsely
+                    // skipped and its `#define`s dropped. Now the SAME oracle.
+                    return sbNameDefined(n);
                 };
                 // The `#if`/`#elif` value comes from the local pre-scan eval;
                 // `sbEvalUncertain` reports whether it was confident.
@@ -925,7 +1267,7 @@ struct SynthBuilder {
             // be scanned as include syntax). ──
             if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
-                sbTrackDefine(toks, j + 1, lineEndTok);
+                sbTrackDefine(toks, j + 1, lineEndTok, *scanBuf);
                 i = lineEndTok - 1;
                 continue;
             }
@@ -947,13 +1289,27 @@ struct SynthBuilder {
             const bool isQuote =
                 quoteKind.valid() && toks[k].tok.schemaKind == quoteKind;
             if (!isQuote) {
-                // c17: a DEAD-branch (or uncertain-group) angle `#include <h>`
-                // does not splice its macros -- the macro pass elides the line +
-                // the post-parse resolver never sees it (the typed surfaces are
-                // not injected for an elided include), so all three descriptor
-                // consumers stay consistent with the conditional decision. Leave
-                // it verbatim for the macro pass to elide.
-                if (!includeResolvable()) continue;
+                // D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS (Option B):
+                // the angle shipped-macro splice is NOT gated on the pre-scan's
+                // (weaker) conditional verdict -- UNLIKE the quote-include INLINE
+                // below, which MUST stay gated on confident-live (P0016) because it
+                // EAGERLY resolves a file. The two differ fundamentally: the angle
+                // splice only EMITS synthetic `#define` lines INSIDE the include's
+                // conditional region (right before the KEPT `#include <h>` line), so
+                // the AUTHORITATIVE MacroExpander pass -- which has the full, correct
+                // macro table and ELIDES dead-branch `#define`s (handleDirective
+                // returns early on !stackActive()) -- is the proper arbiter of the
+                // injected defines' liveness. Gating on the pre-scan here was a BUG:
+                // the pre-scan is BLIND to a quote-included header's `#define`s, so it
+                // CONFIDENTLY folds a `#if <macro-defined-in-a-quote-include>` to 0
+                // (an undefined identifier -> 0, C 6.10.1p4) and mis-marks the branch
+                // dead -- suppressing the splice on VALID, authoritatively-LIVE code
+                // (the errno / test_syscall `#if SQLITE_OS_UNIX` -> `#include <errno.h>`
+                // S0001). One-directional-safe (P0016 preserved): a TRULY-dead branch
+                // still elides the injected defines in the authoritative pass (the
+                // final token stream is byte-identical), so a dead-branch shipped
+                // include never leaks a live macro -- witnessed by the negative pin +
+                // the preprocessor_dead_branch_include example.
                 // D-PP-DESCRIPTOR-MACRO-INJECT: an ANGLE `#include <h>` whose
                 // shipped descriptor declares a `macros` surface — splice a
                 // synthetic `#define` for each into the synth buffer BEFORE the
@@ -978,6 +1334,72 @@ struct SynthBuilder {
                 }
                 std::string const angleName{toks[aBody].text};
                 if (angleName.empty()) continue;
+
+                // D-INCLUDE-ANGLE-SOURCE-FALLBACK: the SHARED angle funnel —
+                // descriptor FIRST (the DSS neutral `<stem>.json` model), else a
+                // REAL source header on the -I includeDirs, else a miss. The SAME
+                // funnel answers `__has_include(<h>)`, so `#include`/`__has_include`
+                // never disagree on existence (FC15c). Descriptor / NotFound both
+                // flow the UNCHANGED macro-splice-or-verbatim path below (Descriptor
+                // keeps the line for the import resolver's typed-surface injection;
+                // NotFound is left verbatim -> the resolver emits the hard
+                // F_ShippedHeaderNotFound). Only Source is new.
+                AngleIncludeResolution const angleRes =
+                    resolveAngleInclude(angleName, systemDirs, includeDirs);
+
+                // SOURCE fallback: a no-descriptor angle header that IS a real source
+                // file on the -I path — splice it TEXTUALLY and DROP the directive,
+                // byte-for-byte like the quote-on-disk arm below, so an angle
+                // `<sqlite3ext.h>` behaves exactly like the quote `"sqlite3ext.h"`
+                // that the 39 clean ext TUs already use (its macros + typedefs inline
+                // into THIS TU; a CrossTreeRef would carry neither). GATED on
+                // includeResolvable() for the SAME P0016 reason as the quote arm: an
+                // EAGER file inline in a dead/uncertain branch is forbidden — left
+                // verbatim, the authoritative pass elides a truly-dead one, and a
+                // wrongly-skipped live one fails loud downstream (never a silent
+                // miscompile). A dead/uncertain-branch source include therefore falls
+                // through to the descriptor arm which (no descriptor) leaves it
+                // verbatim. Mirrors the quote arm's includeStack + circular guard.
+                if (angleRes.kind == AngleIncludeKind::Source
+                    && includeResolvable()) {
+                    const ByteOffset dStart = toks[i].tok.span.start();
+                    // Directive end: past the angle body, consuming the '>' closer if
+                    // it physically follows (mirrors the quote arm's closing-quote
+                    // consume). `toks[aBody]` spans the header name; '>' is next.
+                    ByteOffset dirEnd = toks[aBody].tok.span.end();
+                    if (dirEnd < spliced.size() && spliced[dirEnd] == angleClose) {
+                        ++dirEnd;
+                    }
+                    std::error_code ec;
+                    fs::path canon = fs::weakly_canonical(angleRes.path, ec);
+                    if (ec) canon = angleRes.path;
+                    if (std::find(includeStack.begin(), includeStack.end(), canon)
+                        != includeStack.end()) {
+                        emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"circular include of "} + angleName);
+                        continue;
+                    }
+                    auto headerBuf = SourceBuffer::fromFile(angleRes.path);
+                    if (!headerBuf) {
+                        emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"system include unreadable: "} + angleName);
+                        continue;
+                    }
+                    copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                    includeStack.push_back(canon);
+                    SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
+                                       rep, depth + 1, includeStack, fatal,
+                                       preScanDefinePrefix, resolvedDescriptorsOut,
+                                       localMacros};
+                    child.build(headerBuf, out, map);
+                    includeStack.pop_back();
+                    out.push_back(newline);
+                    copiedUpTo = dirEnd;   // DROP the directive — content is inlined
+                    continue;
+                }
+
                 // Splice the descriptor's macros into a LOCAL buffer FIRST (so a
                 // NotAvailable outcome touches neither `out` nor the line-map). On
                 // NotAvailable (no descriptor / unavailable) OR Malformed (already
@@ -987,12 +1409,28 @@ struct SynthBuilder {
                 // resolver still injects the typed surfaces (a typed-only
                 // descriptor splices zero macros but the line is still kept).
                 std::string defs;
-                if (spliceSystemDescriptorMacros(angleName, defs)
+                fs::path    splicedParent;
+                // Splice UNGATED (the authoritative pass arbitrates liveness), but
+                // report a malformed descriptor ONLY on a confidently-live include
+                // (`includeResolvable()`) — restoring the pre-change dead-branch
+                // inertness of that diagnostic.
+                if (spliceSystemDescriptorMacros(angleName, defs,
+                                                 /*reportMalformed=*/includeResolvable(),
+                                                 &splicedParent)
                     != SystemMacroSplice::Spliced) {
                     continue;
                 }
                 const ByteOffset dStart = toks[i].tok.span.start();
                 copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: record the resolved parent +
+                // the SYNTH-BUFFER offset of the splice point (`out.size()` now, after
+                // the verbatim copy up to the directive, before the spliced `#define`s
+                // land -> the offset sits INSIDE the include's conditional region).
+                // `preprocess()` drops this record if the offset lies in an
+                // AUTHORITATIVE dead range, so the seed set matches the finish() oracle
+                // EXACTLY (never a superset). EMIT-ONLY.
+                resolvedDescriptorsOut.push_back(
+                    {splicedParent, static_cast<ByteOffset>(out.size())});
                 out.append(defs);
                 copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
                 continue;
@@ -1045,8 +1483,14 @@ struct SynthBuilder {
                 // NOR a shipped descriptor stays the same hard error as before.
                 if (!filename.empty()) {
                     std::string defs;
+                    fs::path    splicedParent;
+                    // This fallback is reached only PAST the quote arm's
+                    // `includeResolvable()` gate (below), so the include is
+                    // confidently-live here — report a malformed descriptor loud.
                     SystemMacroSplice const sr =
-                        spliceSystemDescriptorMacros(filename, defs);
+                        spliceSystemDescriptorMacros(filename, defs,
+                                                     /*reportMalformed=*/includeResolvable(),
+                                                     &splicedParent);
                     if (sr != SystemMacroSplice::NotAvailable) {
                         // Malformed already emitted its own error; on Spliced the
                         // macros are in `defs`. Either way rewrite quote→angle:
@@ -1054,6 +1498,14 @@ struct SynthBuilder {
                         // `#include <filename>` in place of the quote bytes.
                         copyVerbatim(spliced, localMap, copiedUpTo, dirStart,
                                      out, map);
+                        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: record the resolved
+                        // parent + the synth-buffer splice offset (`out.size()` after
+                        // the verbatim copy, before the spliced `#define`s). This
+                        // fallback is past `includeResolvable()`, so the branch is
+                        // pre-scan-live; the dead-range filter in `preprocess()` stays
+                        // the authority. EMIT-ONLY.
+                        resolvedDescriptorsOut.push_back(
+                            {splicedParent, static_cast<ByteOffset>(out.size())});
                         out.append(defs);
                         out.append("#include <");
                         out.append(filename);
@@ -1065,6 +1517,11 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"quote include not found: "} + filename);
+                // TF-C60 (Finding 5): DROP the directive so the macro pass's
+                // unresolved-live-quote-include fail-loud does not re-report the
+                // same problem a second time. This error is the sole reporter.
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;
                 continue;
             }
             std::error_code ec;
@@ -1075,6 +1532,8 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"circular include of "} + filename);
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
             }
             auto headerBuf = SourceBuffer::fromFile(*resolved);
@@ -1082,6 +1541,8 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"quote include unreadable: "} + filename);
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
             }
 
@@ -1089,7 +1550,8 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
-                               depth + 1, includeStack, fatal};
+                               depth + 1, includeStack, fatal, preScanDefinePrefix,
+                               resolvedDescriptorsOut, localMacros};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -1239,12 +1701,12 @@ public:
             // UNCONDITIONALLY only when the filter is empty; a format-restricted
             // macro stays unseeded absent a format (it is meaningless without
             // one). This lets `_WIN32` be predefined for the pe target ONLY.
-            if (!pm.availableObjectFormats.empty()) {
-                if (!activeFormat_.has_value()) continue;
-                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                        *activeFormat_)) {
-                    continue;
-                }
+            // FINDING-B (C21): the SHARED per-format filter, so this authoritative
+            // `predefined_` seed can never drift from the pre-scan's value prefix +
+            // sbNameDefined.
+            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                        activeFormat_)) {
+                continue;
             }
             // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
             // NOT seeded here — it lowers to a `#define name(params) value`
@@ -1317,6 +1779,16 @@ public:
 
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
+
+    // D-PERF-1 effectiveness metric: the total FRONT-splice token-moves the macro
+    // pass performed -- `(consumed + produced)` summed across every `spliceOver`.
+    // With the front-consumed deque each splice's PHYSICAL cost IS exactly this
+    // (pop_front the consumed run + push_front the replacement), so the metric is
+    // the pass's real splice work and stays LINEAR in the token count; a strict
+    // test pins it <= k*N. (The old mid-vector erase+insert did the SAME logical
+    // token-moves but ALSO shifted the whole tail per call -- the O(n^2) wall-clock
+    // the deque removes.) Surfaced onto `PreprocessResult::macroTokenMoves`.
+    [[nodiscard]] std::size_t tokenMoves() const noexcept { return tokenMoves_; }
 
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING, authoritative dead-regions): the
     // dead conditional byte ranges this pass recorded (see `deadRanges_`).
@@ -1631,13 +2103,42 @@ private:
             // only when the conditional stack is ACTIVE (the dead-branch gate
             // above already returned for an elided include), so it is reached
             // ONLY for a LIVE include -- which `SynthBuilder` resolved/spliced
-            // for a quote form (now CONDITIONAL-aware: a DEAD-branch quote
-            // include is left verbatim + reaches HERE only if live) and passed
-            // through for an angle form (to the post-parse import resolver). The
-            // line's text is forwarded so the resolver still sees the angle form
-            // (its tokens are inert to the parser). The former ordering hazard
-            // (a dead-branch quote include resolved upstream) no longer exists:
-            // SynthBuilder gates quote resolution on its own conditional scan.
+            // for a quote form and passed through for an angle form (to the
+            // post-parse import resolver). The angle line's text is forwarded so
+            // the resolver still sees it (its tokens are inert to the parser).
+            //
+            // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE, the fail-loud
+            // half): a QUOTE include reaching THIS arm was NOT spliced by the
+            // pre-scan — and this arm is authoritatively LIVE — so forwarding it
+            // as inert tokens SILENTLY DROPS the header (the old comment's
+            // "fails loud downstream" claim was false; nothing downstream ever
+            // failed). Sharing the macro state makes the pre-scan lockstep on
+            // ORDINARY object-like guards, so what remains is a guard this
+            // weaker evaluator cannot decide. ★ Do NOT name a single cause in
+            // the message: the code-audit reached this arm from FIVE distinct
+            // ones (a function-like guard, an object-like macro expanding TO a
+            // function-like name, a descriptor-injected macro the pre-scan never
+            // tracks [D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED], an expansion
+            // chain past the depth backstop, and — before it was fixed — a
+            // literal whose closer the replacement text had lost). Naming one
+            // sends users chasing the wrong thing.
+            {
+                std::size_t q = skipTrivia(in, p + 1);
+                if (q < end && quoteIncludeKind_.valid()
+                    && in[q].schemaKind == quoteIncludeKind_) {
+                    std::string_view nameTx =
+                        (q + 1 < end && !isNewline(in[q + 1])) ? text(in[q + 1])
+                                                               : std::string_view{};
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                           synth_->id(), in[q].span,
+                           std::string{"quote #include \""} + std::string{nameTx}
+                               + "\" is LIVE here but the include pre-scan could "
+                                 "not evaluate its conditional guard, so the "
+                                 "header was never spliced; refusing to silently "
+                                 "drop it");
+                    return end;
+                }
+            }
             for (std::size_t q = start; q < end; ++q) body.push_back(in[q]);
         } else if (!cfg().embedDirective.empty()
                    && word == cfg().embedDirective) {
@@ -1651,6 +2152,14 @@ private:
             // hard-coded "embed"; an empty field (a language with no `#embed`)
             // skips this arm -> the generic unsupported-directive fail-loud below.
             handleEmbed(in, p, end, body);
+        } else if (!cfg().lineDirective.empty()
+                   && word == cfg().lineDirective) {
+            // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE). Reached ONLY for a LIVE
+            // `#line` (the dead-branch gate above already returned, so a `#line`
+            // in an elided branch is skipped with no diagnostic — the
+            // #define/#include/#pragma/#embed parity). The line's tokens are NOT
+            // forwarded into `body`: a directive is not program text.
+            handleLine(in, p + 1, end);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
                    synth_->id(), in[p].span,
@@ -1747,26 +2256,37 @@ private:
             [this](std::vector<Token> const& toks) { return expandTokens(toks); };
         PpIsDefined definedCb =
             [this](std::string_view n) { return isDefined(n); };
-        // FC15c: `__has_include` resolves a header EXACTLY as the include
-        // machinery would (Finding 3): quote form = self-dir + includeDirs
-        // (`resolveIncludePath`); angle form = `<stem>.json` on systemDirs
-        // (`resolveSystemDescriptor` -- the SHARED mapping the import resolver
-        // also calls, so the two never disagree).
+        // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
+        // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
+        // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
+        // the SynthBuilder pre-scan callback AND the angle `#include <h>` arm, so
+        // all three route through the SAME `resolveAngleInclude` funnel — a
+        // descriptor / source / miss verdict that can never drift. Quote form =
+        // self-dir + includeDirs (`resolveIncludePath`), unchanged.
         PpHasInclude hasIncludeCb =
             [this](std::string_view filename, bool isAngle) -> bool {
             if (isAngle) {
-                auto descPath = resolveSystemDescriptor(filename, systemDirs_);
-                if (!descPath) return false;  // no descriptor on the path
-                // c9 (Phase-2): per-target truth — when the active object-format is
-                // known, a header whose descriptor excludes it reports NOT available
-                // (agreeing with the `#include` semantic gate + the macro-splice).
-                // nullopt activeFormat_ = pure existence (unchanged pre-c9 behavior).
-                if (activeFormat_.has_value()
-                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
-                                                             *activeFormat_)) {
-                    return false;
+                // Descriptor -> per-target availability (c9: an unavailable-on-this-
+                // format header reports NOT available, agreeing with the `#include`
+                // gate + macro-splice; nullopt activeFormat_ = pure existence).
+                // Source -> a real header on the -I path is includable (the arm
+                // textually splices it) -> 1. NotFound -> 0.
+                //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
+                //   does NOT seed -- the un-gated angle-`#include` splice is the SOLE
+                //   recorder, so the seed set stays == the finish() oracle's live set.
+                AngleIncludeResolution const ar =
+                    resolveAngleInclude(filename, systemDirs_, includeDirs_);
+                switch (ar.kind) {
+                    case AngleIncludeKind::Descriptor:
+                        return !(activeFormat_.has_value()
+                                 && !ffi::shippedHeaderAvailableForFormat(
+                                        ar.path, *activeFormat_));
+                    case AngleIncludeKind::Source:
+                        return true;
+                    case AngleIncludeKind::NotFound:
+                        return false;
                 }
-                return true;
+                return false;   // unreachable — every AngleIncludeKind handled above
             }
             return resolveIncludePath(filename, includingDir_, includeDirs_)
                 .has_value();
@@ -2216,6 +2736,105 @@ private:
         }
     }
 
+    // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE): `#line digits ["file"]` sets the
+    // PRESUMED line — and optionally the presumed file name — reported by
+    // `__LINE__`/`__FILE__` for the lines that FOLLOW. Records a per-origin entry
+    // consumed by `presumedLine`/`presumedFile`.
+    //
+    // The MACRO-EXPANDED operand form (6.10.4p4 — `#line SOME_MACRO`) is NOT yet
+    // handled: such an operand is not a digit sequence, so it hits the fail-loud
+    // below rather than being silently mis-numbered. Anchored
+    // `D-CPP-LINE-DIRECTIVE-MACRO-OPERAND`; generated C (lemon/bison/flex) always
+    // emits the literal-digit form, which is what unblocks sqlite's `parse.c`.
+    void handleLine(std::vector<Token> const& in, std::size_t p,
+                    std::size_t end) {
+        std::size_t const dirTok = p;          // first operand token (span source)
+        p = skipTrivia(in, p);
+        if (p >= end || isNewline(in[p])) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   (p < end ? in[p].span : SourceSpan::empty(0)),
+                   "#line requires a line number");
+            return;
+        }
+        std::string_view const numTx = text(in[p]);
+        if (numTx.empty()
+            || numTx.find_first_not_of("0123456789") != std::string_view::npos) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[p].span,
+                   std::string{"#line requires a digit sequence — got: "}
+                       + std::string{numTx});
+            return;
+        }
+        unsigned long long n = 0;
+        for (char const c : numTx) {
+            n = n * 10ull + static_cast<unsigned long long>(c - '0');
+            if (n > 2147483647ull) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[p].span, "#line number out of range");
+                return;
+            }
+        }
+        // C23 6.10.4p2 constrains the digit sequence to 1..2147483647 — the range
+        // is TWO-sided. `#line 0` was silently accepted before (gcc
+        // -pedantic-errors rejects it), which would make `__LINE__` 0.
+        if (n == 0) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[p].span, "#line number out of range");
+            return;
+        }
+        LineDirectiveRec rec;
+        rec.presumedLine = static_cast<std::uint32_t>(n);
+
+        // OPTIONAL "file" operand (6.10.4p3): absent => presumed name UNCHANGED.
+        std::size_t const q = skipTrivia(in, p + 1);
+        if (q < end && !isNewline(in[q])) {
+            // A quoted operand is TWO tokens, exactly as `#include`/`#embed` see
+            // it: the OPENER (config kind `quoteIncludeToken`, which consumed only
+            // the `"`) followed by the coalesced BODY token whose text is the raw
+            // bytes between the quotes. Keying on the CONFIG kind + position keeps
+            // this agnostic — never a hard-coded `"` scan of one token's text.
+            if (quoteIncludeKind_.valid() && in[q].schemaKind == quoteIncludeKind_
+                && q + 1 < end && !isNewline(in[q + 1])) {
+                rec.file    = std::string{text(in[q + 1])};
+                rec.hasFile = true;
+                // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
+                // ignoring tokens after the operand would let an unsupported
+                // form be half-honoured (`#line 5 "f" <anything>`).
+                std::size_t const t = skipTrivia(in, q + 2);
+                if (t < end && !isNewline(in[t])) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), in[t].span,
+                           std::string{"unexpected token after the #line file "
+                                       "operand: "} + std::string{text(in[t])});
+                    return;
+                }
+            } else {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[q].span,
+                       "#line file operand must be a \"quoted\" string");
+                return;
+            }
+        }
+
+        // Key by the ORIGIN buffer the directive physically sits in, so a header
+        // and its includer keep independent numbering.
+        if (lineMap_ == nullptr || lineMap_->empty()) return;
+        // Resolve from the LAST token of the directive line, not the first: a
+        // directive may span several PHYSICAL lines (a `\` continuation, or a
+        // block comment across lines), and `#line N` renumbers the line after the
+        // directive ENDS. Keying on the first token made every such directive
+        // silently off-by-one per extra line. `end` is one past the terminating
+        // newline, so `end-1` is that newline (or the last real token at EOF with
+        // no trailing newline) — identical for the single-line case.
+        std::size_t const spanTok =
+            (end > 0 && end - 1 < in.size() && end - 1 >= dirTok) ? end - 1
+                                                                  : dirTok;
+        LineMap::Resolved const r = lineMap_->resolve(in[spanTok].span.start());
+        if (r.origin == nullptr) return;
+        rec.physLine = r.origin->lineCol(r.offset).line;
+        lineDirs_[static_cast<void const*>(r.origin)].push_back(std::move(rec));
+    }
+
     void handleUndef(std::vector<Token> const& in, std::size_t p,
                      std::size_t end) {
         p = skipTrivia(in, p);
@@ -2244,7 +2863,7 @@ private:
     // newlines (`FOO\n(1)` is a valid call: once the directive line itself is
     // stripped, C 6.10.3p10/p11 treat the name and the `(` as adjacent across
     // white space, including line breaks). Returns in.size() if none.
-    static std::size_t nextSignificant(std::span<ExpToken const> in,
+    static std::size_t nextSignificant(std::deque<ExpToken> const& in,
                                        std::size_t from) {
         std::size_t j = from;
         while (j < in.size()
@@ -2285,7 +2904,7 @@ private:
     // macro NAME's hide set with the CLOSE paren's). On EOF before the matching
     // close, emits a fail-loud diagnostic and returns std::nullopt.
     std::optional<std::vector<std::vector<ExpToken>>>
-    collectArgs(std::span<ExpToken const> in, std::size_t open,
+    collectArgs(std::deque<ExpToken> const& in, std::size_t open,
                 std::string const& macroName, std::size_t& past,
                 std::vector<ExpToken>& separators, HideSet& closeHide) {
         std::vector<std::vector<ExpToken>> args;
@@ -2711,30 +3330,100 @@ private:
     // the synth buffer -- a Number for `__LINE__`/Constant, a StringStart +
     // StringLiteral pair for `__FILE__`/`__DATE__`/`__TIME__` (exactly as a
     // stringize product). Dispatches ONLY on `def.kind`, never the name.
+    // ── TF-C59 `#line` presumed-position map (C23 6.10.4 / D-CPP-LINE-DIRECTIVE) ──
+    // One record per `#line` DIRECTIVE, keyed by the ORIGIN buffer it appeared in
+    // (a header and its includer each keep their own numbering) and the PHYSICAL
+    // line the directive itself sat on. `#line N` renumbers the line FOLLOWING the
+    // directive to N, hence the `-1` in the arithmetic below.
+    //
+    // Stored per-origin and appended in source order, so the lookup is "the last
+    // directive at or before this physical line". Directives are encountered in
+    // increasing line order within a buffer, so the vector is sorted by
+    // construction — no sort, and a reverse scan finds the active record.
+    struct LineDirectiveRec {
+        std::uint32_t physLine     = 0;      // line the `#line` itself is on
+        std::uint32_t presumedLine = 0;      // N — the number given to physLine+1
+        std::string   file;                  // presumed name (empty => inherit)
+        bool          hasFile      = false;  // operand present (6.10.4p3)
+    };
+    std::unordered_map<void const*, std::vector<LineDirectiveRec>> lineDirs_;
+
+    // The active record for (origin, physLine), or nullptr when no `#line`
+    // precedes that line in that buffer.
+    [[nodiscard]] LineDirectiveRec const* activeLineDir(
+        void const* origin, std::uint32_t physLine) const {
+        auto const it = lineDirs_.find(origin);
+        if (it == lineDirs_.end()) return nullptr;
+        LineDirectiveRec const* best = nullptr;
+        for (auto const& rec : it->second) {
+            // No early `break`: a full scan returns the last-applicable record
+            // regardless of append order, matching `presumedFile`'s reverse scan.
+            // Records ARE appended in increasing order today (one forward pass
+            // per origin), but that invariant lives in SourceBuffer, not here —
+            // an include/buffer cache would break it silently, and the two
+            // lookups would then disagree. ~50 records for lemon's parse.c.
+            if (rec.physLine < physLine) best = &rec;
+        }
+        return best;
+    }
+
+    // PRESUMED line for a physical line: N + (physLine - directiveLine - 1).
+    [[nodiscard]] std::uint32_t presumedLine(void const* origin,
+                                             std::uint32_t physLine) const {
+        LineDirectiveRec const* const rec = activeLineDir(origin, physLine);
+        if (rec == nullptr) return physLine;
+        return rec->presumedLine + (physLine - rec->physLine - 1u);
+    }
+
+    // PRESUMED file name. C23 6.10.4p3: the file operand is OPTIONAL and when
+    // omitted the presumed name is left UNCHANGED — so walk back to the most
+    // recent record that actually CARRIED a name, and leave `name` untouched if
+    // none did. (A `#line N` after a `#line M "f"` keeps reporting "f".)
+    void presumedFile(void const* origin, std::uint32_t physLine,
+                      std::string& name) const {
+        auto const it = lineDirs_.find(origin);
+        if (it == lineDirs_.end()) return;
+        for (auto r = it->second.rbegin(); r != it->second.rend(); ++r) {
+            if (r->physLine >= physLine) continue;
+            if (r->hasFile) { name = r->file; return; }
+        }
+    }
+
     std::vector<Token> materializePredefined(PredefinedMacroDef const& def,
                                              ByteOffset invOffset) {
         switch (def.kind) {
         case PredefinedMacroKind::Line: {
-            // C 6.10.8.1: the LINE number of the macro's INVOCATION. Resolve the
-            // invocation offset through the line-map to its ORIGIN buffer +
-            // offset, then read the 1-based origin line. Null/empty line-map ->
-            // line 1 (defensive; a real TU always has a map).
+            // C 6.10.8.1: the LINE number of the macro's INVOCATION -- but the
+            // PRESUMED one, which `#line` may have remapped (C23 6.10.4p2-3).
+            // Resolve the invocation offset through the line-map to its ORIGIN
+            // buffer + offset, read the 1-based PHYSICAL line, then apply any
+            // active `#line` for that origin. Null/empty line-map -> line 1
+            // (defensive; a real TU always has a map).
             std::uint32_t line = 1;
             if (lineMap_ != nullptr && !lineMap_->empty()) {
                 LineMap::Resolved const r = lineMap_->resolve(invOffset);
-                if (r.origin != nullptr) line = r.origin->lineCol(r.offset).line;
+                if (r.origin != nullptr) {
+                    line = r.origin->lineCol(r.offset).line;
+                    line = presumedLine(r.origin, line);
+                }
             }
             return materializeSignificant(std::to_string(line));
         }
         case PredefinedMacroKind::File: {
-            // C 6.10.8.1: the presumed NAME of the current source file. Resolve
+            // C 6.10.8.1: the PRESUMED NAME of the current source file. Resolve
             // the invocation offset to its ORIGIN buffer so a `__FILE__` inside an
-            // `#include`'d header reports the HEADER's name, not the main file's.
+            // `#include`'d header reports the HEADER's name, not the main file's,
+            // then let an active `#line "file"` override it (C23 6.10.4p3 -- the
+            // file operand is OPTIONAL, and when omitted the presumed name is
+            // left UNCHANGED, so the override only applies when one was given).
             // `\` -> `/` normalized, then quoted as a C string literal.
             std::string name = "<source>";   // defensive synth name
             if (lineMap_ != nullptr && !lineMap_->empty()) {
                 LineMap::Resolved const r = lineMap_->resolve(invOffset);
-                if (r.origin != nullptr) name = std::string{r.origin->name()};
+                if (r.origin != nullptr) {
+                    name = std::string{r.origin->name()};
+                    presumedFile(r.origin, r.origin->lineCol(r.offset).line, name);
+                }
             }
             for (char& c : name) {
                 if (c == '\\') c = '/';
@@ -2869,10 +3558,30 @@ private:
             truncated_ = true;   // stream is now truncated — PP fatal
             return in;
         }
-        std::size_t i = 0;
-        while (i < in.size()) {
-            ExpToken const& t = in[i];
-            if (!isWord(t.tok)) { out.push_back(t); ++i; continue; }
+        // D-PERF-1: the working stream is a FRONT-CONSUMED deque -- the cursor is
+        // ALWAYS the front. The loop consumes `work` strictly front-to-back and
+        // every splice happens AT the front (`spliceOver(work, 0, ...)`), so a
+        // pop_front + push_front is O(consumed + repl) per expansion instead of the
+        // O(n) mid-vector tail-shift the old `std::vector` cursor paid PER
+        // expansion -> the O(n^2) macro pass is gone. `out` still accumulates the
+        // passed-over tokens IN ORDER (byte-identical output). (The backstop above
+        // still reads/returns the vector `in`, so its truncation semantics stay
+        // exactly as before; `in` is moved-FROM here and not touched again.)
+        std::deque<ExpToken> work(std::make_move_iterator(in.begin()),
+                                  std::make_move_iterator(in.end()));
+        while (!work.empty()) {
+            // Audit fix #2 (UAF ordering): COPY the front token before any
+            // pop/splice below -- `t.tok`, `t.hide`, `t.invOffset`, `t.tok.span`
+            // and `name` must all stay valid across the pop_front/push_front that
+            // `spliceOver` (or the emit-then-pop arms) perform on `work`. A
+            // REFERENCE into `work.front()` would dangle the instant the front is
+            // popped.
+            ExpToken t = work.front();
+            if (!isWord(t.tok)) {
+                out.push_back(std::move(t));
+                work.pop_front();
+                continue;
+            }
             const std::string name{text(t.tok)};
             auto it = table_.find(name);
             // Not a `#define`d macro, OR M is in THIS token's hide set (Prosser:
@@ -2903,12 +3612,12 @@ private:
                         for (Token const& v : value) {
                             repl.push_back(ExpToken{v, t.hide, t.invOffset});
                         }
-                        spliceOver(in, i, i + 1, repl);
+                        spliceOver(work, 0, 1, repl);
                         continue;   // rescan from the materialized value
                     }
                 }
-                out.push_back(t);
-                ++i;
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             MacroDef const& def = it->second;
@@ -2936,28 +3645,28 @@ private:
                 // (`#define OBJ a ##`). `#` (stringize) does NOT apply to object-like
                 // macros (C 6.10.3.2) and there is none to handle here.
                 repl = collapsePastes(std::move(repl), hs, t.invOffset);
-                spliceOver(in, i, i + 1, repl);
+                spliceOver(work, 0, 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }
             // FUNCTION-like: an invocation ONLY if the next significant token is
             // the configured `(`. Otherwise emit the name VERBATIM (C 6.10.3p10:
             // a function-like name not followed by `(` is not an invocation).
-            std::size_t openIdx = nextSignificant(in, i + 1);
-            if (openIdx >= in.size() || !isParenOpen(in[openIdx].tok)) {
-                out.push_back(t);
-                ++i;
+            std::size_t openIdx = nextSignificant(work, 1);
+            if (openIdx >= work.size() || !isParenOpen(work[openIdx].tok)) {
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             std::size_t past = 0;
             std::vector<ExpToken> separators;  // depth-1 commas (for __VA_ARGS__)
             HideSet closeHide;                 // close-paren hide set (Prosser ∩)
             auto argsOpt =
-                collectArgs(in, openIdx, name, past, separators, closeHide);
+                collectArgs(work, openIdx, name, past, separators, closeHide);
             if (!argsOpt) {
                 // Unterminated invocation already reported: emit the name as-is
                 // and resume after it (do NOT swallow the rest of the stream).
-                out.push_back(t);
-                ++i;
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             std::vector<std::vector<ExpToken>> args = std::move(*argsOpt);
@@ -2990,8 +3699,16 @@ private:
                            + std::to_string(def.params.size())
                            + " argument(s) but got "
                            + std::to_string(args.size()));
-                out.push_back(t);
-                i = past;     // skip past the malformed call close paren
+                // Audit fix #1 (the silent-miscompile seam): emit the name, then
+                // pop `past` tokens TOTAL off the front -- the name at index 0 PLUS
+                // the malformed `(...)` in `[1, past)` -- pushing NOTHING back. The
+                // old vector code did `i = past` (advance the cursor past the whole
+                // malformed call). In the deque model that MUST become an explicit
+                // pop of `past` front tokens; leaving it a no-op (or popping only
+                // the name) would re-scan/re-expand the malformed args -> a SILENT
+                // divergence from the byte-identical output.
+                out.push_back(std::move(t));
+                for (std::size_t k = 0; k < past; ++k) work.pop_front();
                 continue;
             }
             // The Prosser function-like hide set:
@@ -3067,22 +3784,27 @@ private:
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
             // exposed at the substitution's tail re-pairs with the parent's `(`.
-            spliceOver(in, i, past, substituted);
-            // resume at i (rescan the substitution + the trailing parent stream)
+            spliceOver(work, 0, past, substituted);
+            continue;   // rescan the substitution + the trailing parent stream
         }
         return out;
     }
 
     // Replace `in[from, to)` with `repl` (the freshly produced tokens) and leave
-    // the cursor implicitly at `from` for a rescan. Both regions can be large;
-    // a vector splice (erase + insert) is the textbook realization and the
-    // rewritten-token volume is bounded by the hide set, so this is fine.
-    static void spliceOver(std::vector<ExpToken>& in, std::size_t from,
-                           std::size_t to, std::vector<ExpToken> const& repl) {
-        in.erase(in.begin() + static_cast<std::ptrdiff_t>(from),
-                 in.begin() + static_cast<std::ptrdiff_t>(to));
-        in.insert(in.begin() + static_cast<std::ptrdiff_t>(from),
-                  repl.begin(), repl.end());
+    // the cursor implicitly at `from` (== the FRONT) for a rescan. D-PERF-1: the
+    // stream is a FRONT-CONSUMED deque and the cursor is ALWAYS the front, so
+    // every call site passes `from == 0`. Pop `[from, to)` off the front, then
+    // push `repl` at the front in REVERSE so `repl[0]` becomes the new front (the
+    // rescan continues there). FRONT ops only -> O(repl + consumed) per expansion,
+    // NOT the O(n) mid-vector tail-shift the old vector erase+insert paid PER
+    // expansion -> the O(n^2) macro pass is gone. Non-`static` so it can bump the
+    // effectiveness counter. (`from` is always 0; the loop-form pop keeps this
+    // general + correct — no hard assert that could fire in a release build.)
+    void spliceOver(std::deque<ExpToken>& in, std::size_t from, std::size_t to,
+                    std::vector<ExpToken> const& repl) {
+        for (std::size_t k = from; k < to; ++k) in.pop_front();
+        for (auto it = repl.rbegin(); it != repl.rend(); ++it) in.push_front(*it);
+        tokenMoves_ += (to - from) + repl.size();
     }
 
     std::shared_ptr<SourceBuffer>        synth_;
@@ -3092,6 +3814,8 @@ private:
     // RETURNS the input verbatim (truncating the expansion). Surfaced via
     // `truncated()` so `preprocess()` can flag the result fatal.
     bool                                 truncated_ = false;
+    // D-PERF-1: accumulated FRONT-splice token-move count (see `tokenMoves()`).
+    std::size_t                          tokenMoves_ = 0;
     SchemaTokenId                        hashKind_{};
     SchemaTokenId                        parenOpen_{};
     SchemaTokenId                        parenClose_{};
@@ -3206,12 +3930,11 @@ PreprocessResult preprocess(
         std::string builtinText;
         for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
             if (!pm.isFunctionLike) continue;
-            if (!pm.availableObjectFormats.empty()) {
-                if (!activeFormat.has_value()) continue;
-                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
-                                                        *activeFormat)) {
-                    continue;
-                }
+            // FINDING-B (C21): the SHARED per-format filter (same as the pre-scan
+            // value prefix / sbNameDefined / the predefined_ seed).
+            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                        activeFormat)) {
+                continue;
             }
             builtinText += "#define ";
             builtinText += pm.name;
@@ -3255,6 +3978,51 @@ PreprocessResult preprocess(
         fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
+    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
+    // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
+    // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
+    // `#if __STDC_VERSION__ >= 201112L`) gating a quote-`#include` evaluates
+    // correctly, the pre-scan must see the macro's VALUE -- not just its
+    // definedness. Built from:
+    //   (a) every command-line `--define`, parsed EXACTLY like the `<command-line>`
+    //       prologue above (VALUE defaults to 1) -- so the pre-scan is more-live
+    //       only IN LOCKSTEP with the authoritative pass (the one-directional-
+    //       divergence invariant that keeps P0016 closed); PLUS
+    //   (b) every OBJECT-like predefined macro available on the active format, via
+    //       the SHARED filter (FINDING-B) the authoritative `predefined_` seed +
+    //       `sbNameDefined` use -- so the sets cannot drift. FINDING-A: FUNCTION-
+    //       like predefines (`isFunctionLike`) are EXCLUDED -- a bare `#if NAME`
+    //       (no call) must fold to 0 in the pre-scan exactly as in the authoritative
+    //       pass; value-seeding one would make the pre-scan MORE-live -> a silent
+    //       P0016 re-open.
+    // Each SynthBuilder prepends this as a NON-EMITTED span-safe scanBuf prefix (see
+    // build()). Function-scope: it outlives every (recursive) SynthBuilder, held by
+    // const-ref + threaded into children.
+    std::string preScanDefinePrefix;
+    for (std::string const& d : userDefines) {
+        auto const eq = d.find('=');
+        std::string const name =
+            (eq == std::string::npos) ? d : d.substr(0, eq);
+        std::string const val =
+            (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+        preScanDefinePrefix += "#define ";
+        preScanDefinePrefix += name;
+        preScanDefinePrefix += ' ';
+        preScanDefinePrefix += val;
+        preScanDefinePrefix += '\n';
+    }
+    for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+        if (pm.isFunctionLike) continue;   // FINDING-A: never value-seed a call macro
+        if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
+                                                    activeFormat)) {
+            continue;
+        }
+        preScanDefinePrefix += "#define ";
+        preScanDefinePrefix += pm.name;
+        preScanDefinePrefix += ' ';
+        preScanDefinePrefix += pm.value;
+        preScanDefinePrefix += '\n';
+    }
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder is conditional-
     // aware ONLY to gate quote-`#include` splicing (a dead-branch quote include
     // must not resolve -- the P0016 fix). The dead-region byte set used to
@@ -3262,9 +4030,29 @@ PreprocessResult preprocess(
     // it comes from the AUTHORITATIVE `MacroExpander` pass below (`deadRanges()`),
     // whose liveness sees the full macro table (predefined + header-supplied), so
     // the illegal-char oracle can never diverge from the real branch decision.
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: each system descriptor the SynthBuilder
+    // SPLICES for an angle `#include <h>`, paired with the synth-buffer byte offset
+    // of the splice point. The splice is UN-GATED (it fires for a dead-branch include
+    // too); the closure block below DROPS any pair whose offset lies in an
+    // AUTHORITATIVE dead range (`expander.deadRanges()`), leaving exactly the
+    // authoritatively-live set the finish() oracle's `shippedLibDescriptors` holds.
+    // Threaded by reference into the SynthBuilder (and its recursive children).
+    std::vector<std::pair<fs::path, ByteOffset>> resolvedParents;
+    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the ROOT owns the pre-scan
+    // macro map; every child builder threads it by reference, so `#define`s flow
+    // across include boundaries in document order (both directions).
+    std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
-                         *result.diagnostics, 0, includeStack, result.fatal};
-    builder.build(mainSource, synthText, result.lineMap);
+                         *result.diagnostics, 0, includeStack, result.fatal,
+                         preScanDefinePrefix, resolvedParents, preScanMacros};
+    {
+        // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
+        // main file + every quote-#include, + the line-map). Nests under the
+        // outer Preprocess scope, so its self-time is subtracted there.
+        substrate::PhaseTimers::Scope ppSplice{
+            substrate::CompilePhase::PreprocessSplice};
+        builder.build(mainSource, synthText, result.lineMap);
+    }
 
     // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
     // text does not exist in the spliced prefix. Their spelling must reach the
@@ -3290,7 +4078,12 @@ PreprocessResult preprocess(
     // a survival oracle keyed on "did the Error token reach the parser" would
     // wrongly drop those).
     DiagnosticReporter provisionalTokDiags;
-    auto ppToks = tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
+    auto ppToks = [&] {
+        // D-PERF-1 sub-timing: the single tokenize of the synth buffer.
+        substrate::PhaseTimers::Scope ppTok{
+            substrate::CompilePhase::PreprocessTokenize};
+        return tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
+    }();
     std::vector<Token> synthTokens;
     synthTokens.reserve(ppToks.size());
     for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
@@ -3306,7 +4099,17 @@ PreprocessResult preprocess(
                            prefixLen,     &result.lineMap,
                            includeDirs,   systemDirs,   activeFormat,
                            fs::path{mainSource->name()}.parent_path()};
-    std::vector<Token> finalTokens = expander.run(synthTokens);
+    std::vector<Token> finalTokens;
+    {
+        // D-PERF-1 sub-timing: the macro pass (table build + stream expansion +
+        // conditional elision) — the dominant preprocess stage on macro-heavy TUs.
+        substrate::PhaseTimers::Scope ppExpand{
+            substrate::CompilePhase::PreprocessExpand};
+        finalTokens = expander.run(synthTokens);
+        // D-PERF-1: surface the macro pass's front-splice token-move total (the
+        // O(n^2)->O(n) effectiveness metric; a strict test asserts it <= k*N).
+        result.macroTokenMoves = expander.tokenMoves();
+    }
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.
     result.fatal = result.fatal || expander.truncated();
@@ -3322,13 +4125,19 @@ PreprocessResult preprocess(
     // suppressed. ALL other tokenizer diagnostics forward unconditionally. The
     // span ids are unchanged (still the prefix buffer), so the later
     // `remapBuffers` re-homes them onto the final synth buffer exactly as before.
+    // A byte offset is in an AUTHORITATIVE dead conditional region (`#if 0 …
+    // #endif`) iff it falls in one of `expander.deadRanges()`. Those ranges are in
+    // synthText coordinates (the expander ran over `prefixBuffer`, built from
+    // `synthText`), so an offset recorded during the synth-buffer build maps
+    // DIRECTLY. SHARED by the illegal-char oracle below AND the descriptor-seed
+    // filter after it (D-PERF-2), so both read the SAME authoritative liveness.
+    auto byteInDeadRegion = [&](ByteOffset b) {
+        for (auto const& [ds, de] : expander.deadRanges()) {
+            if (b >= ds && b < de) return true;
+        }
+        return false;
+    };
     {
-        auto byteInDeadRegion = [&](ByteOffset b) {
-            for (auto const& [ds, de] : expander.deadRanges()) {
-                if (b >= ds && b < de) return true;
-            }
-            return false;
-        };
         for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
             if (d.code == DiagnosticCode::P_IllegalChar
                 && byteInDeadRegion(d.span.start())) {
@@ -3381,6 +4190,38 @@ PreprocessResult preprocess(
         static_cast<ByteOffset>(result.synthBuffer->size()));
     finalTokens.push_back(eof);
     result.tokens = std::move(finalTokens);
+
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: turn the raw splice records into the
+    // authoritatively-live descriptor set the first-parse typedef seed harvests.
+    // (1) DROP any record whose splice offset lies in an AUTHORITATIVE dead range
+    //     (`byteInDeadRegion`) -- the splice is UN-GATED (it fires for a dead-branch
+    //     angle include too, D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS),
+    //     so THIS filter is what makes the surviving set == the finish() oracle's
+    //     authoritatively-live `shippedLibDescriptors` (never a superset -> the seed
+    //     can never resolve a name the reparse would not). An include the pre-scan
+    //     mis-judged dead but the full macro table makes LIVE was still spliced +
+    //     recorded, and its offset is NOT in a dead range, so it is KEPT (C30-safe).
+    // (2) EXPAND each surviving PARENT to its TRANSITIVE `includes` closure and dedup
+    //     CU-wide via the SHARED cycle-safe walker (`forEachDescriptorInClosure`, the
+    //     same one the macro-splice + import-resolver tiers use), so the seed set can
+    //     never disagree with the transitive surface actually injected. ONE `visited`
+    //     set across every parent -> each descriptor appears once, keyed by weakly-
+    //     canonical path. An `includes` entry that resolves to no descriptor is a
+    //     config error the import resolver surfaces LOUD (F_ShippedHeaderNotFound on
+    //     the `#include`); silent here to avoid a double-report.
+    // EMIT-ONLY -- populates a new output field, changes no preprocess behavior.
+    {
+        std::unordered_set<std::string> visited;
+        for (auto const& [parent, off] : resolvedParents) {
+            if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
+            ffi::forEachDescriptorInClosure(
+                parent, systemDirs, visited,
+                [&](fs::path const& p) {
+                    result.resolvedShippedDescriptors.push_back(p);
+                },
+                [](std::string const&) { /* import resolver owns the loud miss */ });
+        }
+    }
 
     return result;
 }

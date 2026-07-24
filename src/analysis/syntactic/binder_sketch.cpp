@@ -99,7 +99,7 @@ void BinderSketch::closeScope() {
     liveScopeIsDominator_.pop_back();
 }
 
-void BinderSketch::record(std::string name, bool isType) {
+void BinderSketch::record(std::string name, bool isType, SourceSpan span) {
     if (name.empty()) return;   // anonymous/malformed decl — nothing to bind
     // A composite/typedef TYPE tag (C11 6.2.1) belongs to the nearest enclosing
     // NAMESPACE scope (block or file), not an interior declarator-dominator
@@ -120,6 +120,7 @@ void BinderSketch::record(std::string name, bool isType) {
         .name   = std::move(name),
         .scope  = scope,
         .isType = isType,
+        .span   = span,
     });
 }
 
@@ -150,6 +151,15 @@ std::vector<std::string> BinderSketch::globalTypeNames() const {
     std::vector<std::string> out;
     for (auto const& b : bindings_) {
         if (b.scope == 0 && b.isType) out.push_back(b.name);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, SourceSpan>>
+BinderSketch::globalTypeBindings() const {
+    std::vector<std::pair<std::string, SourceSpan>> out;
+    for (auto const& b : bindings_) {
+        if (b.scope == 0 && b.isType) out.emplace_back(b.name, b.span);
     }
     return out;
 }

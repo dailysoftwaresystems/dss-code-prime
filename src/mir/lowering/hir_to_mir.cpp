@@ -587,6 +587,14 @@ struct Lowerer {
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
                            || tk == TypeKind::F64 || tk == TypeKind::F80
                            || tk == TypeKind::F128);
+        // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char` is absent
+        // here → classified UNSIGNED for Div/Rem/Shr (UDiv/UMod/LShr), TARGET-BLIND
+        // (and opposite the mir_to_lir widen arms' signed default — the scattered-
+        // but-dead inconsistency the TF-C56 audit flagged). DEAD: C's usual
+        // arithmetic conversions promote a char operand to `int` before any binary
+        // op, so `tk` here is always a post-UAC kind, never a bare `Char`. Route
+        // through the target `charIsUnsigned` (or fail loud) if a non-promoting
+        // frontend ever feeds a raw narrow Char.
         bool const isSigned = (tk == TypeKind::I8 || tk == TypeKind::I16
                             || tk == TypeKind::I32 || tk == TypeKind::I64
                             || tk == TypeKind::I128);
@@ -658,17 +666,20 @@ struct Lowerer {
         }
     }
 
-    [[nodiscard]] static MirOpcode mapCast(TypeKind from, TypeKind to) noexcept {
+    // D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): NON-static (reads
+    // `config` via `isSignedIntKind`) — the char→int promotion's SExt-vs-ZExt
+    // decision must consult the target's bare-`char` signedness. The former
+    // local `isSignedInt` lambda (a target-blind duplicate that hard-coded Char
+    // as signed) is DELETED; both the widen-direction (:700) and the
+    // int↔float sign (:711/:714) now route through the ONE target-aware member
+    // `isSignedIntKind`, so no site can disagree about char's sign.
+    [[nodiscard]] MirOpcode mapCast(TypeKind from, TypeKind to) const noexcept {
         auto isInt = [](TypeKind k) noexcept {
             return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
                 || k == TypeKind::I64 || k == TypeKind::I128
                 || k == TypeKind::U8  || k == TypeKind::U16 || k == TypeKind::U32
                 || k == TypeKind::U64 || k == TypeKind::U128
                 || k == TypeKind::Char || k == TypeKind::Byte || k == TypeKind::Bool;
-        };
-        auto isSignedInt = [](TypeKind k) noexcept {
-            return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
-                || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
         };
         auto isFloat = [](TypeKind k) noexcept {
             return k == TypeKind::F16 || k == TypeKind::F32
@@ -697,7 +708,7 @@ struct Lowerer {
             if (fw == 0 || tw == 0) return MirOpcode::Invalid;
             if (tw <  fw) return MirOpcode::Trunc;
             if (tw == fw) return MirOpcode::Bitcast;
-            return isSignedInt(from) ? MirOpcode::SExt : MirOpcode::ZExt;
+            return isSignedIntKind(from) ? MirOpcode::SExt : MirOpcode::ZExt;
         }
         if (isFloat(from) && isFloat(to)) {
             int const fw = bitWidth(from);
@@ -708,10 +719,10 @@ struct Lowerer {
             return MirOpcode::FPExt;
         }
         if (isInt(from)   && isFloat(to)) {
-            return isSignedInt(from) ? MirOpcode::SIToFP : MirOpcode::UIToFP;
+            return isSignedIntKind(from) ? MirOpcode::SIToFP : MirOpcode::UIToFP;
         }
         if (isFloat(from) && isInt(to)) {
-            return isSignedInt(to) ? MirOpcode::FPToSI : MirOpcode::FPToUI;
+            return isSignedIntKind(to) ? MirOpcode::FPToSI : MirOpcode::FPToUI;
         }
         if (from == TypeKind::Ptr && isInt(to))   return MirOpcode::PtrToInt;
         if (isInt(from)   && to == TypeKind::Ptr) return MirOpcode::IntToPtr;
@@ -873,11 +884,24 @@ struct Lowerer {
     // target / format identity anywhere — the limb work is generic MIR (Add/Sub/And/…/
     // Gep + Br/CondBr over the closed verb set), agnostic by construction.
 
-    // Signed native integer kind (the `mapCast` local `isSignedInt`, hoisted for the
-    // wide-op reuse). Char is signed on both shipped targets' data models.
-    [[nodiscard]] static bool isSignedIntKind(TypeKind k) noexcept {
+    // Signed native integer kind — the ONE target-aware char-signedness
+    // chokepoint (drives every SExt-vs-ZExt / SIToFP-vs-UIToFP in `mapCast`
+    // AND the wide-`_BitInt` op reuse). NON-static: it reads `config`.
+    //
+    // ★ D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): bare `char`
+    // (`TypeKind::Char`, distinct from `signed char`/`unsigned char` = I8/U8)
+    // is signed on x86_64/pe64 but UNSIGNED on AArch64 per its ABI — so its
+    // sign is TARGET-config-driven (`config.charIsUnsigned`), NOT an arch
+    // identity branch and NOT a hard-coded set membership (the former comment
+    // "Char is signed on both shipped targets" was the false premise: it made
+    // DSS-arm64 emit SExt for `char c=(char)0x80; c<0`, wrongly true). The real
+    // signed int kinds (I8/I16/I32/I64/I128) are unconditional; only Char
+    // consults the target. Default `charIsUnsigned=false` ⇒ signed ⇒ x86_64/
+    // pe64 codegen is byte-identical to before.
+    [[nodiscard]] bool isSignedIntKind(TypeKind k) const noexcept {
+        if (k == TypeKind::Char) return !config.charIsUnsigned;
         return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
-            || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
+            || k == TypeKind::I64 || k == TypeKind::I128;
     }
 
     // A C floating type (the F-prefixed kinds). Used to fail loud on a float<->WIDE
@@ -3565,6 +3589,47 @@ struct Lowerer {
             std::array<MirInstId, 1> extOps{operand};
             castOperand = mir.addInst(ext, extOps,
                                       interner.primitive(TypeKind::I32));
+        }
+        // D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion must
+        // extend the source to POINTER WIDTH per the SOURCE's signedness — sign-extend
+        // a signed narrower int (SExt), zero-extend an unsigned one (ZExt), truncate a
+        // wider one (Trunc). This is the universal C convention (= `(uintptr_t)(intptr_t)`)
+        // that real code relies on: sqlite's `(const u8*)(-1)` max-pointer sentinel must
+        // be all-ones, not 0x0000_0000_FFFF_FFFF. Previously IntToPtr lowered as an
+        // identity `mov`, so a narrower source was NOT extended (a 32-bit `-1` became
+        // 0x0000_0000_FFFF_FFFF → on arm64, whose addresses exceed 4 GiB, this broke the
+        // sentinel and cascaded through sqlite's expr.test). Mirrors the sub-int→float
+        // promotion above and the synth_threads_shim explicit-SExt pattern. A source
+        // already AT pointer width (`fromResolved == ptrIntKind`) is SKIPPED → the emit
+        // below is a byte-identical bare IntToPtr. AGNOSTIC: pointer width is config-
+        // driven (`config.dataModel`), signedness rides the ONE `isSignedIntKind`
+        // chokepoint (so a `char*` cast honors `config.charIsUnsigned`) — no arch branch.
+        if (mop == MirOpcode::IntToPtr) {
+            std::uint64_t const ptrBytes =
+                scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8);
+            bool const srcSigned = isSignedIntKind(fromResolved);
+            TypeKind ptrIntKind{};
+            switch (ptrBytes) {
+                case 8: ptrIntKind = srcSigned ? TypeKind::I64 : TypeKind::U64; break;
+                case 4: ptrIntKind = srcSigned ? TypeKind::I32 : TypeKind::U32; break;
+                default:
+                    unsupported(node, std::format(
+                        "int→pointer conversion for a {}-byte pointer width has no "
+                        "integer kind", ptrBytes));
+                    return InvalidMirInst;
+            }
+            if (fromResolved != ptrIntKind) {
+                MirOpcode const ptrExt = mapCast(fromResolved, ptrIntKind);
+                if (ptrExt == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "int→pointer source width conversion from TypeKind {} has no "
+                        "MIR opcode", static_cast<unsigned>(fromResolved)));
+                    return InvalidMirInst;
+                }
+                std::array<MirInstId, 1> ptrExtOps{operand};
+                castOperand = mir.addInst(ptrExt, ptrExtOps,
+                                          interner.primitive(ptrIntKind));
+            }
         }
         std::array<MirInstId, 1> ops{castOperand};
         return mir.addInst(mop, ops, t);
@@ -10731,6 +10796,10 @@ struct Lowerer {
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
                 row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker
+                // (a shipped-descriptor DATA export, e.g. a library global) so
+                // the reference gate keeps it even when unreferenced.
+                row.isEagerImport = meta->isEagerImport;
                 row.isData      = true;
                 // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int
                 // e;` — carry the declaration's thread-storage duration on
@@ -10879,6 +10948,10 @@ struct Lowerer {
             row.mangledName = meta->mangledName;
             row.libraryPath = meta->importLibrary;
             row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker onto
+            // the import row so the linker's reference gate keeps a shipped-
+            // descriptor import (producer C) even when this TU never calls it.
+            row.isEagerImport = meta->isEagerImport;
             externImports.push_back(std::move(row));
             functionSymbols.insert(sym.v);
         }
@@ -11254,6 +11327,14 @@ struct Lowerer {
                 agg.fields.push_back(std::move(*ip));
                 continue;
             }
+            // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit int-const→
+            // pointer cast member — `(void*)0x5`. AFTER the specific handlers (so the
+            // null-pointer `(void*)0` and the SQLITE_INT_TO_PTR AddressOf-Index shape
+            // are claimed by their own arms first), BEFORE the generic fold fallback.
+            if (auto itp = tryClassifyIntToPtrConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*itp));
+                continue;
+            }
             ConstEvalResult const r =
                 evaluateConstant(hir, interner, literals, child, env, opts);
             if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
@@ -11369,6 +11450,45 @@ struct Lowerer {
         if (!layout) return std::nullopt;
         std::uint64_t const value = static_cast<std::uint64_t>(idxVal)
                                   * static_cast<std::uint64_t>(layout->size);
+        MirLiteralValue leaf;
+        leaf.value = value;
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
+    // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit integer-constant→
+    // pointer cast in a static initializer — `(void*)0x5`, `(T*)0x1000`,
+    // `((Tcl_ChannelTypeVersion)0x5)`. C permits an integer-constant address in a
+    // STATIC-storage pointer initializer (6.6/6.3.2.3); its value IS the integer,
+    // an ABSOLUTE address with NO symbol and NO relocation (gcc/clang emit the same
+    // bytes). const-eval refuses a cast-to-pointer (invariant: "pointer targets
+    // remain non-foldable", const_eval.cpp) so peel the pointer Cast and fold its
+    // INTEGER operand → a plain `uint64_t` leaf (core=Ptr); the encoder's scalar-leaf
+    // arm writes 8 raw LE bytes. Sibling of the null-pointer (c67/c80) and null-base
+    // array-index (c68/c80) classifiers. CONSERVATIVE: fires ONLY on an explicit
+    // Cast whose operand folds to a PLAIN integer (int64/uint64 arm) — a symbol
+    // address (HirAddressValue), an AddressOf/Index (the SQLITE_INT_TO_PTR shape,
+    // claimed by tryClassifyNullBaseIndexConst which runs FIRST), an aggregate, a
+    // float, or a fold-failure all yield nullopt → the earlier symbol-addr path or
+    // the whole-aggregate bail / runtimeInit fail-loud still governs.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyIntToPtrConst(HirNodeId node, EvalEnvironment const& env,
+                             EvalOptions const& opts) {
+        TypeId const ty = hir.typeId(node);
+        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr) return std::nullopt;
+        if (hir.kind(node) != HirKind::Cast) return std::nullopt;   // explicit int→ptr cast only
+        auto kids = hir.children(node);
+        if (kids.size() != 1) return std::nullopt;
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, kids[0], env, opts);
+        if (!r.value.has_value()) return std::nullopt;
+        std::uint64_t value = 0;
+        if (std::holds_alternative<std::int64_t>(r.value->value))
+            value = static_cast<std::uint64_t>(std::get<std::int64_t>(r.value->value));
+        else if (std::holds_alternative<std::uint64_t>(r.value->value))
+            value = std::get<std::uint64_t>(r.value->value);
+        else
+            return std::nullopt;   // not a plain integer (address/aggregate/float) → not this idiom
         MirLiteralValue leaf;
         leaf.value = value;
         leaf.core  = TypeKind::Ptr;
@@ -11513,6 +11633,17 @@ struct Lowerer {
                         // `(void*)&((char*)0)[X]` at file scope: a pointer-
                         // valued INTEGER constant (no symbol, no reloc).
                         pg.constInit = std::move(*ip);
+                    } else if (auto itp = tryClassifyIntToPtrConst(*initN,
+                                                                   env, opts)) {
+                        // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): the
+                        // TOP-LEVEL scalar sibling — `void* p = (void*)0x5;`
+                        // (the tcl.h `((Tcl_ChannelTypeVersion)0x5)` shape).
+                        // const-eval refuses the cast-to-pointer, so the
+                        // explicit int→ptr cast folds to a plain uint64 pointer
+                        // leaf (an ABSOLUTE address, no symbol, no reloc). AFTER
+                        // the null-pointer + null-base-index arms, BEFORE
+                        // runtimeInit — same order as the aggregate member loop.
+                        pg.constInit = std::move(*itp);
                     } else {
                         pg.runtimeInit = *initN;
                     }
