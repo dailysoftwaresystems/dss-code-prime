@@ -5,6 +5,7 @@
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/glob_match.hpp"  // D-AP2-SOURCES-GLOB: expand sources[] patterns
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -1218,15 +1219,87 @@ int Program::compileProject(
     setArtifactName(pc.artifactName);
     setPerFormatOutputSubdir(true);
 
-    // Route by source COUNT via the shared `routesToMultiUnit` threshold
-    // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
-    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒
-    // the single-CU path (`compileFiles`). The delegate validates each
-    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains
-    // `rep` at its end (runCusToTargets), so we do NOT drain here.
-    return routesToMultiUnit(pc.sources.size())
-        ? compileUnits(pc.sources, pc.language, pc.targets, rep)
-        : compileFiles(pc.sources, pc.language, pc.targets, rep);
+    // D-AP2-SOURCES-GLOB: expand any glob pattern in `sources[]` into its
+    // matching files BEFORE the multi-vs-single-CU routing count is taken — so a
+    // `"src/**/*.c"` entry routes EXACTLY as if its matches had been listed
+    // literally (a 2-match glob ⇒ 2 concrete sources ⇒ count 2 ⇒ `compileUnits`).
+    // A driver pre-pass, NOT the loader: `parseProjectConfig` stays a pure JSON
+    // parser (it holds the raw pattern), the filesystem side lives here.
+    //   * LITERAL entry (no `* ? [` metacharacter) — kept VERBATIM (unchanged
+    //     behavior; a missing literal still fails DOWNSTREAM at CU build, and is
+    //     NOT newly rejected here).
+    //   * GLOB entry — expanded against the filesystem (base = the process
+    //     working directory, the same base a literal source uses; an absolute
+    //     pattern resolves directly). Matches are sorted (deterministic CU order).
+    //     ZERO matches is a FAIL-LOUD error (`D_FileNotFound` naming the pattern)
+    //     — a source pattern that names nothing is a mistake, not an empty no-op.
+    //     A mid-expansion filesystem I/O error fails loud (`D_DirectoryScanFailed`).
+    // The delegate then drains `rep` (runCusToTargets), so these early fail-loud
+    // sites drain here and return, mirroring the gate sites above.
+    std::vector<std::string> expandedSources;
+    expandedSources.reserve(pc.sources.size());
+    for (auto const& entry : pc.sources) {
+        if (!hasGlobMetacharacters(entry)) {
+            expandedSources.push_back(entry);  // literal — verbatim, unchanged
+            continue;
+        }
+        std::error_code ec;
+        std::size_t const before = expandedSources.size();
+        if (!expandGlob(entry, expandedSources, ec)) {
+            emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
+                       "project sources: filesystem error expanding glob pattern '"
+                       + entry + "': " + ec.message());
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+        if (expandedSources.size() == before) {
+            emitDriver(rep, DiagnosticCode::D_FileNotFound,
+                       "project sources: glob pattern '" + entry
+                       + "' matched no files (relative to the working directory) "
+                         "— a source pattern that matches nothing is an error; "
+                         "check the pattern and that the files exist.");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+    }
+
+    // Cross-entry de-duplication: a file matched by TWO overlapping entries — two
+    // overlapping globs (`src/*.c` + `src/**/*.c`), or a literal alongside a glob
+    // that also matches it — must compile ONCE, not once per entry. Without this,
+    // `compileUnits` would build a DUPLICATE CU per repeat ⇒ a duplicate-symbol
+    // LINK error the diagnostic can't tie back to the manifest. A redundant
+    // overlap should just work — the UNION of unique files, each compiled once —
+    // matching build-system expectations. Dedup on a NORMALIZED key
+    // (`lexically_normal().generic_string()`) because a literal is kept verbatim
+    // (`./main.c`) while glob output is already normalized (`main.c`) — the SAME
+    // file via different strings, which a plain string-dedup would miss. FIRST
+    // occurrence wins (deterministic order) and keeps its ORIGINAL string (a
+    // literal stays verbatim; only later duplicates are dropped). Absolute-vs-
+    // relative spellings of the same file is an accepted un-caught extreme edge —
+    // `lexically_normal` covers the realistic `./` / `..` / literal-vs-glob cases.
+    {
+        std::vector<std::string> deduped;
+        deduped.reserve(expandedSources.size());
+        std::unordered_set<std::string> seen;
+        seen.reserve(expandedSources.size());
+        for (auto& s : expandedSources) {
+            std::string key = fs::path{s}.lexically_normal().generic_string();
+            if (seen.insert(std::move(key)).second) {
+                deduped.push_back(std::move(s));
+            }
+        }
+        expandedSources = std::move(deduped);
+    }
+
+    // Route by the EXPANDED source COUNT via the shared `routesToMultiUnit`
+    // threshold (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
+    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒ the
+    // single-CU path (`compileFiles`). The delegate validates each
+    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains `rep` at
+    // its end (runCusToTargets), so we do NOT drain here.
+    return routesToMultiUnit(expandedSources.size())
+        ? compileUnits(expandedSources, pc.language, pc.targets, rep)
+        : compileFiles(expandedSources, pc.language, pc.targets, rep);
 }
 
 int Program::transpile(

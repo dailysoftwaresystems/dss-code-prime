@@ -30,9 +30,15 @@ namespace dss {
 //                         deferred, D-AP2-TARGET-NAME-DEFAULT-FORMAT).
 //                         Spec FORMAT is validated downstream by the
 //                         delegated compile path (D_InvalidTargetSpec).
-//   * `sources`         — literal source paths. Glob expansion (e.g.
-//                         `src/**/*.c`) is deferred (D-AP2-SOURCES-GLOB);
-//                         AP2 routes over the literal file count.
+//   * `sources`         — source paths OR glob patterns. The LOADER keeps each
+//                         entry VERBATIM (a glob string is a valid non-empty
+//                         source string — no filesystem here). `Program::
+//                         compileProject` then EXPANDS any entry containing a
+//                         glob metacharacter (`* ? [`) against the filesystem
+//                         BEFORE the routing count is taken (D-AP2-SOURCES-GLOB,
+//                         via `core/types/glob_match.hpp`); a metacharacter-free
+//                         entry stays literal. Base = the process working
+//                         directory; a zero-match pattern fails loud there.
 //   * `output`          — artifact output hint. Parsed + type-validated
 //                         (a user-authored schema field); its path
 //                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2

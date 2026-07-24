@@ -24,6 +24,7 @@
 // NOT yet drive artifact shape — that is D-AP2-COMPILATION-CONTEXT).
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/glob_match.hpp"          // D-AP2-SOURCES-GLOB: matcher + expander
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
@@ -41,6 +42,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 using namespace dss;
@@ -1558,3 +1560,477 @@ TEST(CompileProjectManifestFlags, ResolveLibrariesMergeComposesPreexistingWithMa
            "path is probed (append, not replace); a manifest-only replace would "
            "drop it and its name would never appear in a diagnostic";
 }
+
+// ════════════════════════════════════════════════════════════════
+// D-AP2-SOURCES-GLOB — `sources[]` glob expansion (Cycle C)
+//
+// A manifest source entry may be a glob PATTERN (`"src/**/*.c"`); the driver
+// (`Program::compileProject`) expands it against the filesystem BEFORE the
+// multi-vs-single-CU routing count is taken, so a pattern routes exactly as if
+// its matches had been listed literally. The LOADER stays a pure JSON parser
+// (holds the raw pattern); the filesystem side is a driver pre-pass over the
+// `core/types/glob_match.hpp` matcher + expander.
+//
+// Three test tiers, cheapest first:
+//   1. the LOADER keeps a glob string verbatim (no expansion);
+//   2. DIRECT unit tests of the pure matcher (`globMatch` / `hasGlobMetacharacters`)
+//      and the filesystem expander (`expandGlob`) — the strongest coverage;
+//   3. BEHAVIORAL compileProject proofs (route/compile-level host-agnostic; one
+//      host-gated build+run of a 2-file glob that proves BOTH TUs linked).
+// ════════════════════════════════════════════════════════════════
+
+// ── 1. Loader keeps a glob string verbatim ──────────────────────
+// A glob string is a valid non-empty source string; the loader must NOT expand
+// it (that is the driver's job). Pins that pc.sources holds the raw pattern.
+TEST(ProjectConfigLoader, GlobSourceStringKeptVerbatim) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["src/**/*.c"]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(pc->sources.size(), 1u);
+    EXPECT_EQ(pc->sources[0], "src/**/*.c")
+        << "the loader must NOT expand — it holds the raw pattern (expansion is "
+           "the driver's job in compileProject)";
+}
+
+// ── 2a. The literal-vs-glob predicate (hasGlobMetacharacters) ────
+TEST(GlobMatch, HasMetacharactersDetectsGlobVsLiteral) {
+    EXPECT_TRUE(hasGlobMetacharacters("*.c"));
+    EXPECT_TRUE(hasGlobMetacharacters("a?b.c"));
+    EXPECT_TRUE(hasGlobMetacharacters("[abc].c"));
+    EXPECT_TRUE(hasGlobMetacharacters("src/**/*.c"));
+    // literals — kept verbatim by the driver (no filesystem walk).
+    EXPECT_FALSE(hasGlobMetacharacters("main.c"));
+    EXPECT_FALSE(hasGlobMetacharacters("src/sub/file-name_1.2.c"));
+    EXPECT_FALSE(hasGlobMetacharacters("/abs/path/to/main.c"));
+    EXPECT_FALSE(hasGlobMetacharacters("C:/win/path/main.c"));
+}
+
+// ── 2b. `*` stays within one path segment (never crosses '/') ────
+TEST(GlobMatch, StarStaysWithinOneSegment) {
+    EXPECT_TRUE(globMatch("*.c", "x.c"));
+    EXPECT_TRUE(globMatch("*.c", "main.c"));
+    EXPECT_TRUE(globMatch("a*", "abc"));
+    EXPECT_TRUE(globMatch("a*d", "ad"));       // '*' matches empty
+    EXPECT_FALSE(globMatch("*.c", "x.h"));
+    EXPECT_FALSE(globMatch("*.c", "sub/x.c"))
+        << "a single '*' must NOT cross a path separator";
+    EXPECT_TRUE(globMatch("src/*.c", "src/x.c"));
+    EXPECT_FALSE(globMatch("src/*.c", "src/sub/x.c"));
+}
+
+// ── 2c. `**` crosses segments (recursive) ───────────────────────
+TEST(GlobMatch, DoubleStarCrossesSegments) {
+    EXPECT_TRUE(globMatch("**/*.c", "x.c"));       // ** matches zero segments
+    EXPECT_TRUE(globMatch("**/*.c", "sub/x.c"));
+    EXPECT_TRUE(globMatch("**/*.c", "a/b/c/x.c"));
+    EXPECT_TRUE(globMatch("a/**/b", "a/b"));       // zero intermediate
+    EXPECT_TRUE(globMatch("a/**/b", "a/x/b"));
+    EXPECT_TRUE(globMatch("a/**/b", "a/x/y/b"));
+    EXPECT_FALSE(globMatch("a/**/b", "a/x/y/c"));
+    EXPECT_FALSE(globMatch("**/*.c", "x.h"));
+}
+
+// ── 2d. `?` and `[...]` character classes ───────────────────────
+TEST(GlobMatch, QuestionAndCharClasses) {
+    EXPECT_TRUE(globMatch("?.c", "a.c"));
+    EXPECT_FALSE(globMatch("?.c", "ab.c"));        // '?' is EXACTLY one char
+    EXPECT_TRUE(globMatch("[a-c].c", "b.c"));
+    EXPECT_FALSE(globMatch("[a-c].c", "d.c"));
+    EXPECT_TRUE(globMatch("[!a-c].c", "d.c"));     // negation
+    EXPECT_FALSE(globMatch("[!a-c].c", "a.c"));
+    EXPECT_TRUE(globMatch("[abc]x", "bx"));
+    EXPECT_TRUE(globMatch("v[0-9].c", "v7.c"));
+    EXPECT_FALSE(globMatch("v[0-9].c", "vx.c"));
+}
+
+// ── 2e. Literal segments + anchored-vs-floating patterns ────────
+TEST(GlobMatch, LiteralAndAnchoredVsFloating) {
+    EXPECT_TRUE(globMatch("main.c", "main.c"));
+    EXPECT_FALSE(globMatch("main.c", "main.h"));
+    EXPECT_FALSE(globMatch("main.c", "x/main.c"))   // anchored — no leading dirs
+        << "a literal pattern is anchored: it must match the WHOLE relative path";
+    EXPECT_TRUE(globMatch("**/main.c", "x/main.c")); // floating via **
+    EXPECT_TRUE(globMatch("src/*/main.c", "src/a/main.c"));
+    EXPECT_FALSE(globMatch("src/*/main.c", "src/main.c"));
+}
+
+// ── 2e². Multi-`*` backtracking within a segment ────────────────
+// Two-pointer wildcard backtracking must handle several stars in one segment.
+TEST(GlobMatch, MultiStarBacktrackingWithinSegment) {
+    EXPECT_TRUE(globMatch("a*b*c", "abc"));       // both stars empty
+    EXPECT_TRUE(globMatch("a*b*c", "axxbyyc"));
+    EXPECT_TRUE(globMatch("*a*", "baaa"));
+    EXPECT_TRUE(globMatch("a*a*a", "aaaa"));       // greedy first star must backtrack
+    EXPECT_TRUE(globMatch("a*a*a", "aXaYa"));
+    EXPECT_FALSE(globMatch("a*b*c", "axxbyy"));    // no trailing 'c'
+    EXPECT_FALSE(globMatch("a*a*a", "aa"));        // too few 'a's for a-a-a
+}
+
+// ── 2e³. Multi-`**` backtracking across segments ────────────────
+TEST(GlobMatch, MultiDoubleStarBacktracking) {
+    EXPECT_TRUE(globMatch("**/a/b", "a/x/a/b"));   // the ** must re-anchor 'a/b'
+    EXPECT_TRUE(globMatch("**/a/**/b", "x/a/y/z/b"));
+    EXPECT_TRUE(globMatch("**/a/b", "a/b"));       // ** matches zero segments
+    EXPECT_FALSE(globMatch("**/a/b", "a/x/b"));    // no 'a' immediately before 'b'
+    EXPECT_FALSE(globMatch("**/a/b", "a/b/c"));    // trailing 'c'
+}
+
+// ── 2e⁴. Char-class forms: `[^…]`, literal-`]`-first, unterminated `[` ─
+// These forms are implemented; pin each so a matcher regression is caught.
+TEST(GlobMatch, CharClassNegationCaretAndLiteralBracketForms) {
+    // `[^...]` negation — the same semantics as `[!...]`, the other spelling.
+    EXPECT_TRUE(globMatch("[^a-c].c", "d.c"));
+    EXPECT_FALSE(globMatch("[^a-c].c", "b.c"));
+    // a literal ']' as the FIRST class member: `[]abc]` matches ']' or a/b/c.
+    EXPECT_TRUE(globMatch("[]abc]", "]"));
+    EXPECT_TRUE(globMatch("[]abc]", "b"));
+    EXPECT_FALSE(globMatch("[]abc]", "d"));
+    // an UNTERMINATED '[' (no closing ']') is a literal '['.
+    EXPECT_TRUE(globMatch("[abc", "[abc"));
+    EXPECT_FALSE(globMatch("[abc", "a"));
+}
+
+// ── 2f. expandGlob: two matches, SORTED + deduped, feed the route ─
+// The EXPANDED count is what `routesToMultiUnit` sees — the crux of this cycle.
+TEST(ExpandGlob, TwoMatchesSortedDedupedRoutesMulti) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "b.c", "int b(void){return 0;}\n");
+    writeText(dir / "a.c", "int a(void){return 0;}\n");
+    writeText(dir / "note.txt", "not a source\n");   // must NOT match *.c
+
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
+    EXPECT_FALSE(ec);
+    ASSERT_EQ(out.size(), 2u) << "the glob matches a.c + b.c, excludes note.txt";
+    EXPECT_EQ(std::filesystem::path{out[0]}.filename().string(), "a.c")
+        << "sorted lexicographically → a.c before b.c (deterministic CU order)";
+    EXPECT_EQ(std::filesystem::path{out[1]}.filename().string(), "b.c");
+    EXPECT_TRUE(routesToMultiUnit(out.size()))
+        << "2 matches → the multi-CU route, exactly as two literal sources would";
+}
+
+// ── 2g. expandGlob: `**` descends subdirectories ────────────────
+TEST(ExpandGlob, RecursiveDoubleStarDescendsSubdirs) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "top.c", "int t(void){return 0;}\n");
+    std::filesystem::create_directories(dir / "sub" / "deep");
+    writeText(dir / "sub" / "mid.c", "int m(void){return 0;}\n");
+    writeText(dir / "sub" / "deep" / "low.c", "int l(void){return 0;}\n");
+
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "**" / "*.c").generic_string(), out, ec));
+    EXPECT_FALSE(ec);
+    EXPECT_EQ(out.size(), 3u)
+        << "** must match top.c, sub/mid.c, AND sub/deep/low.c (recursive)";
+}
+
+// ── 2h. expandGlob: a single `*` does NOT descend ───────────────
+TEST(ExpandGlob, SingleStarDoesNotDescend) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "top.c", "int t(void){return 0;}\n");
+    std::filesystem::create_directories(dir / "sub");
+    writeText(dir / "sub" / "nested.c", "int n(void){return 0;}\n");
+
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
+    EXPECT_FALSE(ec);
+    ASSERT_EQ(out.size(), 1u)
+        << "'*.c' matches only the top level (sub/nested.c is one level too deep)";
+    EXPECT_EQ(std::filesystem::path{out[0]}.filename().string(), "top.c");
+}
+
+// ── 2i. expandGlob: zero match is NOT an error at the helper level ─
+// (The DRIVER turns an empty expansion into a fail-loud diagnostic — the helper
+// itself returns true + appends nothing, leaving the policy to the caller.)
+TEST(ExpandGlob, ZeroMatchAppendsNothingNotAnError) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "a.c", "int a(void){return 0;}\n");
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "*.cpp").generic_string(), out, ec));
+    EXPECT_FALSE(ec);
+    EXPECT_TRUE(out.empty()) << "no .cpp files ⇒ nothing appended, no I/O error";
+}
+
+// A base directory that does not exist is likewise ZERO matches, not an I/O
+// error (distinct from an unreadable dir, which fails loud).
+TEST(ExpandGlob, NonexistentBaseIsZeroMatchNotError) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "nope" / "*.c").generic_string(), out, ec));
+    EXPECT_FALSE(ec);
+    EXPECT_TRUE(out.empty());
+}
+
+// expandGlob APPENDS (never clears) — the InputResolver convention.
+TEST(ExpandGlob, AppendsToExistingOutput) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "one.c", "int one(void){return 0;}\n");
+    std::vector<std::string> out{"pre-existing.c"};
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0], "pre-existing.c") << "the pre-existing entry is preserved";
+    EXPECT_EQ(std::filesystem::path{out[1]}.filename().string(), "one.c");
+}
+
+// ── 3. Behavioral proofs through compileProject ─────────────────
+
+// A zero-match source glob FAILS LOUD (D_FileNotFound naming the pattern) — a
+// source pattern that names nothing is a mistake, not an empty no-op. Host-
+// agnostic (rejected before any emit).
+TEST(CompileProjectGlob, ZeroMatchPatternFailsLoud) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "real.c", "int main(void){return 0;}\n");  // exists, but no *.zzz
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + (dir / "*.zzz").generic_string() + "\"]\n}";
+    auto const proj = dir / "zero.dss-project.json";
+    writeText(proj, manifest);
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(proj.string(), rep), 1)
+        << "a zero-match source glob must fail the build";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 1u)
+        << "the zero-match fail-loud uses D_FileNotFound, naming the pattern";
+}
+
+// A LITERAL entry (no glob metacharacter) is kept VERBATIM — unchanged behavior:
+// an existing literal source still resolves + compiles, routing by literal count.
+// Host-agnostic (fixed cross-target ELF, never run).
+TEST(CompileProjectGlob, LiteralEntryUnchanged) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const src = dir / "solo.c";
+    writeText(src, "int main(void){return 0;}\n");
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + src.generic_string() + "\"]\n}";  // literal, no metachar
+    auto const proj = dir / "lit.dss-project.json";
+    writeText(proj, manifest);
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "a metacharacter-free source is kept verbatim + still compiles";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u);
+    // 1 literal → single-CU route → the per-format-subdir artifact <formatName>/solo.
+    EXPECT_TRUE(std::filesystem::exists(
+        dir / "out" / "elf64-x86_64-linux-exec" / "solo"));
+}
+
+// A `**` recursive glob spanning a subdirectory expands + compiles: main.c (top)
+// calls other() defined in sub/other.c; the glob matches BOTH → 2 CUs → the
+// linker merges them → a real ELF executable on disk. Host-agnostic (asserts the
+// artifact bytes exist; DSS cross-emits, so never run here).
+// RED-ON-DISABLE: without expansion, "<dir>/**/*.c" is ONE bogus literal "file"
+// → count 1 → compileFiles opens it → file-not-found → rc ≠ 0.
+TEST(CompileProjectGlob, RecursiveGlobExpandsAndCompiles) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c",
+              "int other(void);\nint main(void){ return other(); }\n");
+    std::filesystem::create_directories(dir / "sub");
+    writeText(dir / "sub" / "other.c", "int other(void){ return 42; }\n");
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + (dir / "**" / "*.c").generic_string() + "\"]\n}";
+    auto const proj = dir / "rec.dss-project.json";
+    writeText(proj, manifest);
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "** must expand to main.c + sub/other.c (2 CUs) and link";
+    // main.c sorts before sub/other.c → source stem "main".
+    EXPECT_TRUE(std::filesystem::exists(
+        dir / "out" / "elf64-x86_64-linux-exec" / "main"))
+        << "the merged 2-CU image must emit";
+}
+
+// A MIX of one LITERAL and one GLOB entry: the literal is kept + the glob is
+// expanded, and the combined count routes correctly (2 → multi-CU). Host-
+// agnostic. RED-ON-DISABLE: without expansion the glob is a bogus "file" → the
+// build opens it → rc ≠ 0.
+TEST(CompileProjectGlob, MixLiteralAndGlobCombine) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    // literal main.c at the top; the glob covers a SEPARATE subdir (so the two
+    // entries never overlap into a duplicate source).
+    writeText(dir / "main.c",
+              "int helper(void);\nint main(void){ return helper(); }\n");
+    std::filesystem::create_directories(dir / "lib");
+    writeText(dir / "lib" / "helper.c", "int helper(void){ return 42; }\n");
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + (dir / "main.c").generic_string() + "\", \""
+        + (dir / "lib" / "*.c").generic_string() + "\"]\n}";
+    auto const proj = dir / "mix.dss-project.json";
+    writeText(proj, manifest);
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the literal main.c + the expanded lib/*.c must combine into 2 CUs";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u);
+    // the literal entry keeps its position (index 0) → source stem "main".
+    EXPECT_TRUE(std::filesystem::exists(
+        dir / "out" / "elf64-x86_64-linux-exec" / "main"));
+}
+
+// ── Host-gated build+RUN: the 2-match glob links BOTH translation units ──
+// The strongest routing proof — a small 2-file program where main (TU1) calls a
+// function defined in the second file (TU2). Built host-native + RUN: exit 42
+// proves the glob expanded to 2 concrete sources that were BOTH compiled + linked
+// (the multi-CU route). Mirrors the Cycle-A/B defines build+run host gate.
+// RED-ON-DISABLE: without glob expansion, "<dir>/*.c" is ONE bogus literal "file"
+// → count 1 → compileFiles opens "<dir>/*.c" literally → file-not-found → rc ≠ 0
+// (so this ASSERT_EQ(...,0) itself goes red).
+#if defined(_WIN32) || (defined(__linux__) && (defined(__x86_64__) || defined(__amd64__)))
+namespace {
+#if defined(_WIN32)
+constexpr std::string_view kGlobHostSpec   = "x86_64:pe64-x86_64-windows-exec";
+constexpr std::string_view kGlobHostFormat = "pe64-x86_64-windows-exec";
+constexpr std::string_view kGlobHostExt    = ".exe";
+#else
+constexpr std::string_view kGlobHostSpec   = "x86_64:elf64-x86_64-linux-exec";
+constexpr std::string_view kGlobHostFormat = "elf64-x86_64-linux-exec";
+constexpr std::string_view kGlobHostExt    = "";
+#endif
+}  // namespace
+
+TEST(CompileProjectGlob, MultiCuGlobBuildsAndRunsBothTus) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    using dss::test_support::runBinary;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    // main.c sorts first + calls other(), which is defined in the SECOND file.
+    writeText(dir / "main.c",
+              "int other(void);\nint main(void){ return other(); }\n");
+    writeText(dir / "other.c", "int other(void){ return 42; }\n");
+    writeText(dir / "README.txt", "not a source\n");  // the *.c glob must exclude it
+
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + std::string{kGlobHostSpec} + "\"],\n"
+        + "  \"sources\": [\"" + (dir / "*.c").generic_string() + "\"]\n}";
+    auto const proj = dir / "multi.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the *.c glob must expand to main.c + other.c (2 CUs) and link";
+    auto const exe = dir / std::string{kGlobHostFormat}
+                   / (std::string{"main"} + std::string{kGlobHostExt});
+    ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+    auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "both TUs linked: main (TU1) calls other (TU2) → 42 (red-on-disable "
+           "if the glob were treated as one bogus literal file)";
+}
+
+// Cross-entry DEDUP: a literal `<dir>/./main.c` overlaps a glob `<dir>/*.c` that
+// ALSO matches main.c — the SHARED file must compile ONCE. The literal keeps its
+// verbatim `./` spelling while the glob emits the NORMALIZED path, so the two
+// point at the same file via DIFFERENT strings — a plain string-dedup would miss
+// it; the normalized-key dedup catches it. The union (main.c once + other.c once)
+// links + runs → 42.
+//
+// RED-ON-DISABLE — TWO independent levers, both caught by this ASSERT_EQ(...,0):
+//   * remove the cross-entry dedup block  → main.c is TWO CUs (literal + glob),
+//   * weaken it to a plain STRING dedup    → `./main.c` != `main.c` still TWO CUs,
+// either way ⇒ duplicate `main` symbol ⇒ a LINK error ⇒ rc ≠ 0.
+TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    using dss::test_support::runBinary;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c",
+              "int other(void);\nint main(void){ return other(); }\n");
+    writeText(dir / "other.c", "int other(void){ return 42; }\n");
+
+    // Entry 0: a literal with a `./` component (kept verbatim, un-normalized).
+    // Entry 1: a glob matching BOTH main.c and other.c (emits normalized paths).
+    std::string const literalDotMain = dir.generic_string() + "/./main.c";
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + std::string{kGlobHostSpec} + "\"],\n"
+        + "  \"sources\": [\"" + literalDotMain + "\", \""
+        + (dir / "*.c").generic_string() + "\"]\n}";
+    auto const proj = dir / "dedup.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the shared main.c (literal ./main.c + glob *.c) must dedup to ONE CU "
+           "by normalized path — no duplicate symbols";
+    auto const exe = dir / std::string{kGlobHostFormat}
+                   / (std::string{"main"} + std::string{kGlobHostExt});
+    ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+    auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "the deduped union (main.c once + other.c once) links + runs → 42";
+}
+#endif  // host-native exec (Windows or Linux-x86_64)

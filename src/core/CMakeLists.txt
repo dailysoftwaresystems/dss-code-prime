@@ -16,6 +16,7 @@ add_library(core OBJECT
     types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
     types/include_path_resolve.cpp
+    types/glob_match.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/target_schema.cpp
