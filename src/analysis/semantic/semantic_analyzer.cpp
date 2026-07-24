@@ -4353,6 +4353,33 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     bool const priorNonDef = priorRec.isProtoDeclaration
                              || priorRec.isExternDeclaration
                              || priorRec.isTentativeDefinition;
+    // D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL: the surviving binding must
+    // be the MOST-DEFINING of the merged declarations, because emission keys off
+    // the survivor's flags. Defining rank: a REAL (initialized) definition emits
+    // storage AND collides with another → 3; a TENTATIVE definition emits storage
+    // but merges → 2; an EXTERN/proto declaration emits NO storage (an import row
+    // or nothing) → 1. The old routing kept the PRIOR binding whenever the new
+    // decl was non-defining, so `extern int g;` then `int g;` kept the EXTERN
+    // (rank 1) and dropped the tentative (rank 2) — the whole TU then emitted an
+    // import and no storage, and the link failed with an undefined symbol. This
+    // is the extern-in-header-then-define-in-.c pattern, so it blocked essentially
+    // every multi-file C program (the amalgamation masked it). Comparing ranks
+    // makes the tentative win over the extern, while leaving every prior case
+    // byte-identical (`priorNonDef && !newNonDef` was exactly "new rank 3 beats a
+    // prior rank < 3").
+    auto definingRank = [](SymbolRecord const& r, bool nonDef) -> int {
+        if (r.isTentativeDefinition) return 2;
+        if (r.isExternDeclaration || r.isProtoDeclaration) return 1;
+        // `nonDef` is derived at both call sites from exactly {isProto, isExtern,
+        // isTentative}, all matched above — so a non-defining record always took
+        // one of the earlier arms and the `nonDef ? 1` branch is unreachable
+        // today. Kept defensively: if a future flag makes a record non-defining
+        // without one of those three, it ranks as a declaration (1), not a
+        // definition (3) — the conservative direction (never invent storage).
+        return nonDef ? 1 : 3;
+    };
+    int const priorRank = definingRank(priorRec, priorNonDef);
+    int const newRank   = definingRank(s.symbols.at(newId), newNonDef);
     // Precise declaration category: a proto (kind Variable + isProtoDeclaration,
     // pre-upgrade) counts as Function; Variable / Type / Table stay distinct.
     auto category = [](SymbolRecord const& r) {
@@ -4416,11 +4443,15 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             }
             s.reporter.report(std::move(d));
         }
-        if (priorNonDef && !newNonDef) {
-            // nonDefining → definition: the DEFINITION wins the binding; the prior
-            // non-defining decl is absorbed (a proto/extern declarator emits no HIR
-            // node — see the topLevelDecl proto-skip and lowerExternDeclInto's
-            // absorbed-skip).
+        if (newRank > priorRank) {
+            // The NEW declaration is more-defining (rank) than the prior, so it
+            // wins the binding and the prior is absorbed. Covers the classic
+            // nonDefining → definition (proto/extern → real def, rank 1→3) AND the
+            // D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL case
+            // (extern → tentative, rank 1→2): the tentative must survive so it
+            // emits the zero-init global instead of the extern emitting an import.
+            // The absorbed prior emits no HIR node (the topLevelDecl proto-skip /
+            // lowerExternDeclInto absorbed-skip).
             s.scopes.injectBinding(bindScope, name, newId);
             priorRec.isAbsorbedProto = true;
             s.nodeToSymbol.set(nameNode, newId);

@@ -424,6 +424,71 @@ TEST(HirLoweringCSubset, BlockScopeExternRehomesToModuleDecls) {
             << "a block-scope extern must not leave a stack VarDecl in the body";
 }
 
+// D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL (TF-C61): a file-scope
+// TENTATIVE definition (no initializer) that FOLLOWS an `extern` declaration of
+// the same name must emit STORAGE — one module Global — NOT an ExternGlobal
+// import. C 6.9.2p2: a prior `extern` declaration does not stop a later
+// no-initializer declaration from being a tentative definition. Before the fix
+// the extern "survived" the merge (it was the prior binding) and the TU emitted
+// an ExternGlobal + no Global, so the symbol was UNDEFINED and the link failed —
+// the extern-in-header-then-define-in-.c pattern that blocked the full-source
+// sqlite build (`undefined reference to sqlite3BuiltinFunctions`).
+//
+// A SEMANTIC-tier test cannot catch this: extern+tentative merges with zero
+// diagnostics and one surviving symbol EITHER WAY. Only the HIR emission
+// distinguishes Global (storage) from ExternGlobal (import) — this tier is the
+// one that was actually wrong.
+//
+// RED-ON-DISABLE: revert the defining-rank comparison in
+// mergeOrCollideRedeclaration (keep the prior binding whenever the new decl is
+// non-defining) → the extern survives → zero Globals + one ExternGlobal → this
+// asserts the opposite of what a linkable program needs.
+TEST(HirLoweringCSubset, TentativeDefAfterExternEmitsStorageNotImport) {
+    SemanticModel model = analyzeCSubset(
+        "extern int g;\n"
+        "int g;\n"
+        "int main(void){ g += 1; return g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Global)       ++globals;
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    }
+    EXPECT_EQ(globals, 1u)
+        << "the tentative definition must emit ONE zero-init module Global — the "
+           "prior extern does not suppress the definition (C 6.9.2p2)";
+    EXPECT_EQ(externGlobals, 0u)
+        << "no ExternGlobal import may survive — the tentative provides the "
+           "storage locally; an import would leave the symbol undefined at link";
+}
+
+// PRESERVE — a plain `extern int g;` with NO local definition must STILL emit an
+// ExternGlobal import (and zero Globals): the storage genuinely lives elsewhere.
+// This guards the fix against over-reaching (turning every extern into storage).
+// RED-ON-DISABLE: if the rank comparison wrongly promoted a bare extern, this
+// flips to one Global / zero ExternGlobals.
+TEST(HirLoweringCSubset, PlainExternWithoutDefinitionStaysImport) {
+    SemanticModel model = analyzeCSubset(
+        "extern int g;\n"
+        "int use(void){ return g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Global)       ++globals;
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    }
+    EXPECT_EQ(globals, 0u)
+        << "a bare extern with no local definition must NOT emit storage";
+    EXPECT_EQ(externGlobals, 1u)
+        << "a bare extern must stay an ExternGlobal import";
+}
+
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
         "void f() { for (int i = 0; i < 10; i = i + 1) {} }");
