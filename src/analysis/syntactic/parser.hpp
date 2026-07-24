@@ -31,10 +31,16 @@ namespace dss {
 //     (typedefs / struct tags / …, per `semantics.declarations`), the
 //     export surface the oracle harvests. Empty for binder-less
 //     languages.
+//   * `globalTypeBindings` — the same GLOBAL-scope TYPE names paired with
+//     the source span of their declaring name-token. The oracle's SELF-
+//     DEFINITION channel: a candidate whose span equals its own binding
+//     span is a typedef's own defining occurrence (C 6.2.1p7) and must
+//     NOT be seeded (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
 struct DSS_EXPORT ParseResult {
     Tree                                    tree;
     std::vector<AmbiguousTypeNameCandidate> typeNameCandidates;
     std::vector<std::string>                globalTypeNames;
+    std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
     // c108 (D-PARSE-FLAT-CHAIN-WORK-LINEAR): total token-stream accesses (peek +
     // advance, incl. speculative re-scans) the parse performed — the DETERMINISTIC
     // total-work proxy that replaced a flaky wall-clock O(N²) guard. O(N) for a

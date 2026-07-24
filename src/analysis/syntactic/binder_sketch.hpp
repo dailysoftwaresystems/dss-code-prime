@@ -13,6 +13,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace dss {
@@ -119,7 +120,10 @@ public:
     void closeScope();   // aborts on global-scope underflow (caller bug)
 
     // ── bindings ──
-    void record(std::string name, bool isType);
+    // `span` is the source span of the declaring name-token — carried so the
+    // CU oracle can tell a name's OWN defining occurrence apart from a USE of
+    // it (globalTypeBindings / D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
+    void record(std::string name, bool isType, SourceSpan span);
     [[nodiscard]] NameKind lookup(std::string_view name) const noexcept;
 
     // Seed a TYPE binding into the GLOBAL scope before parsing — the
@@ -131,6 +135,18 @@ public:
     // re-consumed; the oracle runs once per CU). The CU oracle unions
     // these across all trees.
     [[nodiscard]] std::vector<std::string> globalTypeNames() const;
+
+    // Global-scope TYPE bindings paired with the source span of their
+    // declaring name-token (a superset of globalTypeNames carrying the
+    // definition site). The CU oracle's SELF-DEFINITION channel: a typedef
+    // name is not in scope within its own declarator (C 6.2.1p7), so an
+    // ambiguous-type-name candidate whose span EQUALS its own binding span
+    // must NOT be oracle-seeded — otherwise `typedef int (F);` reparses with
+    // F seeded and mis-commits `(F)` as an abstract function-suffix param.
+    // Seeds (scope-0, oracle-injected on a reparse) carry an empty span and
+    // never coincide with a real token, so they are inert here.
+    [[nodiscard]] std::vector<std::pair<std::string, SourceSpan>>
+        globalTypeBindings() const;
 
     // ── ambiguous-site records (triage rule 4) ──
     void recordCandidate(AmbiguousTypeNameCandidate c);
@@ -159,6 +175,9 @@ private:
         std::string   name;
         std::uint32_t scope  = 0;     // owning scope id (0 = global)
         bool          isType = false;
+        // Span of the declaring name-token. Empty for oracle-injected seeds
+        // (they carry no source token) — see globalTypeBindings.
+        SourceSpan    span   = SourceSpan::empty(0);
     };
 
     std::unordered_map<std::uint32_t, BinderDecl> byRule_;

@@ -339,6 +339,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         auto& sidecar           = sidecars_.back();
         sidecar.candidates      = std::move(result.typeNameCandidates);
         sidecar.globalTypeNames = std::move(result.globalTypeNames);
+        sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
         sidecar.source          = std::move(synth);
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
@@ -377,6 +378,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     auto& sidecar           = sidecars_.back();
     sidecar.candidates      = std::move(result.typeNameCandidates);
     sidecar.globalTypeNames = std::move(result.globalTypeNames);
+    sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
     sidecar.source          = std::move(src);
     sidecar.schema          = std::move(schema);
     return trees_.back().id();
@@ -655,10 +657,38 @@ CompilationUnit UnitBuilder::finish() && {
             for (std::size_t i = 0; i < trees_.size(); ++i) {
                 auto& sc = sidecars_[i];
                 if (sc.candidates.empty()) continue;
+                // D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME: a typedef name is not
+                // in scope within its OWN declarator (C 6.2.1p7). The oracle
+                // seeds a name as a GLOBAL (position-independent) type for the
+                // whole reparse, so seeding a typedef's OWN name would make its
+                // own parenthesized-name declarator (`typedef int (F);`) reparse
+                // as an abstract function-suffix param (F a param TYPE) instead
+                // of the parenthesized declarator that NAMES F — S0017. A
+                // candidate's span IS its self-defining occurrence exactly when
+                // it equals one of THIS tree's own global-TYPE binding spans (a
+                // byte range uniquely identifies one token in the buffer, so
+                // span equality ⇒ same token ⇒ the definition site). A genuine
+                // cross-file / in-buffer-FORWARD use has a DISTINCT span from
+                // the definition (BothDirectionsResolveInlineInOneBuffer), and a
+                // cross-file typedef's binding lives in ANOTHER tree — neither
+                // is excluded here.
+                auto spanKey = [](SourceSpan s) {
+                    return (static_cast<std::uint64_t>(s.start()) << 32)
+                           | s.end();
+                };
+                std::unordered_set<std::uint64_t> ownBindingSpans;
+                ownBindingSpans.reserve(sc.globalTypeBindings.size());
+                for (auto const& [name, span] : sc.globalTypeBindings) {
+                    (void)name;
+                    ownBindingSpans.insert(spanKey(span));
+                }
                 std::vector<std::string>        seeds;
                 std::unordered_set<std::string> seen;
                 for (auto const& cand : sc.candidates) {
                     if (!oracle.contains(cand.name)) continue;
+                    if (ownBindingSpans.contains(spanKey(cand.span))) {
+                        continue;   // self-defining occurrence — C 6.2.1p7
+                    }
                     if (seen.insert(cand.name).second) {
                         seeds.push_back(cand.name);
                     }
@@ -710,6 +740,7 @@ CompilationUnit UnitBuilder::finish() && {
                 trees_[i]          = std::move(result.tree);
                 sc.candidates      = std::move(result.typeNameCandidates);
                 sc.globalTypeNames = std::move(result.globalTypeNames);
+                sc.globalTypeBindings = std::move(result.globalTypeBindings);
                 ++typeNameReparseCount;
             }
             if (typeNameReparseCount > 0) {

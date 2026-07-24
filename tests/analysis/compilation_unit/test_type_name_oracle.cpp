@@ -258,6 +258,71 @@ TEST(TypeNameOracle, BothDirectionsResolveInlineInOneBuffer) {
            " still uses the oracle";
 }
 
+// D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME (TF-C64): a parenthesized-NAME typedef
+// (`typedef int (F);` / the function-type `typedef int (F)(int);` — pervasive in
+// real tcl.h as `typedef int (Tcl_AppInitProc)(Tcl_Interp*)`) records its OWN
+// name as an ambiguous type-name candidate: while its `(F)` declarator parses, F
+// is not yet in scope (C 6.2.1p7), so `fnSuffix`'s requireKnownType guard rolls
+// back to the parenthesized-declarator reading AND records F. F is ALSO harvested
+// into globalTypeNames (it IS a typedef). WITHOUT the self-definition guard the
+// oracle would resolve F against the union, SEED it, and REPARSE — flipping `(F)`
+// to an abstract function-suffix param (F a param TYPE) → S_DeclarationDeclares-
+// Nothing. The guard suppresses the seed for a candidate whose span EQUALS its
+// own binding span, so the correct first-parse tree (F is the NAME) stands with
+// NO reparse. This is the red-on-disable pin: dropping the `ownBindingSpans`
+// guard makes ALL THREE assertions flip (errors appear, reparse count 1, the
+// parenthesized declarator is replaced by the abstract fnSuffix form).
+TEST(TypeNameOracle, ParenNameTypedefIsNotSelfSeeded) {
+    TempDir dir;
+    auto main = dir.write(
+        "main.c",
+        "typedef int (F)(int);\n"          // fn-TYPE typedef, paren name
+        "typedef int (G);\n"               // bare paren name
+        "int main(void) { return 0; }\n");
+
+    UnitBuilder b{loadShippedSchema("c-subset")};
+    b.addFile(main);
+    auto cu = std::move(b).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "a parenthesized-name typedef must not be re-broken by an oracle "
+           "self-seed (S_DeclarationDeclaresNothing)";
+    // Both candidates (F, G) are self-defining occurrences → suppressed →
+    // seeds empty → the tree is NOT reparsed (the first parse is correct).
+    EXPECT_EQ(cu.typeNameReparseCount(), 0u)
+        << "the typedef's own name must not trigger a self-seeded reparse";
+    // F/G are NAMES: the `(F)` parses as a parenthesized declarator, not an
+    // abstract function-suffix. (A bad self-seed replaces this with fnSuffix.)
+    EXPECT_TRUE(treeHasRule(cu.trees()[0], "parenDeclarator"));
+    EXPECT_FALSE(treeHasRule(cu.trees()[0], "fnSuffix"))
+        << "neither typedef's `(F)`/`(G)` may parse as a function-suffix param";
+}
+
+// A parenthesized-name typedef DEFINED, then legitimately USED as a cast AFTER
+// its definition (declare-before-use): the use commits on the FIRST parse (F is
+// bound by the time the cast parses), so the ONLY candidate is F's self-defining
+// occurrence — suppressed. The def stands (F is the NAME) AND the cast resolves,
+// with NO reparse. Guards the interaction of the self-def exclusion with a real
+// same-tree use of the same name.
+TEST(TypeNameOracle, ParenNameTypedefThenCastUseNeedsNoReparse) {
+    TempDir dir;
+    auto main = dir.write(
+        "main.c",
+        "typedef int (F);\n"
+        "int main(void) { return (F)0; }\n");
+
+    UnitBuilder b{loadShippedSchema("c-subset")};
+    b.addFile(main);
+    auto cu = std::move(b).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    EXPECT_EQ(cu.typeNameReparseCount(), 0u);
+    EXPECT_TRUE(treeHasRule(cu.trees()[0], "parenDeclarator"));
+    EXPECT_TRUE(treeHasRule(cu.trees()[0], "castExpr"));
+}
+
 // ── D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION ─────────────────────────────────────
 //
 // A shipped SYSTEM descriptor's typedefs are injected SEMANTICALLY (post-parse),
