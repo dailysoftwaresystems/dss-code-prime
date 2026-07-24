@@ -431,11 +431,24 @@ static std::optional<CuMirModule> buildCuMirImpl(
         //        `extern int puts;` the user did not #include) → fall through
         //        to the format-default library (`externLibraryByFormat`), the
         //        gcc implicit-libc semantics -- NOT a fail-loud;
-        //      * GENUINE typo (in NEITHER a named binary NOR any shipped
-        //        descriptor, e.g. `dss_lib_answr`) → FAIL LOUD
-        //        `F_FfiResolveLibrarySymbolAbsent`. That is the meaningful,
-        //        false-positive-scarce validation: reading a real export
-        //        table proves an own-library symbol exists at compile time.
+        //      * anything else → route to the UNBOUND channel (precedence 1's
+        //        empty-library shape) and let the LINK tier decide. TF-C66
+        //        (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture): this stage is
+        //        PER-CU, so it cannot know the symbol is defined by a SIBLING
+        //        TU of the same multi-TU build (sqlite's own `sqlite3_version`
+        //        etc. -- the 185-TU testfixture declared 2770 such externs and
+        //        a compile-time fail-loud here false-positived on every one).
+        //        The link tier has the whole merged picture and already
+        //        implements the exact right policy (rejectOrDropUnreferenced-
+        //        Externs, c143/c150): a sibling-TU definition RESOLVES the
+        //        reference; an unreferenced declaration is DROPPED; a
+        //        referenced-but-undefined symbol (the genuine typo, e.g.
+        //        `dss_lib_answr`) REJECTS LOUD with K_SymbolUndefined on any
+        //        exec-flavor image. The typo protection is preserved -- it
+        //        moved to the tier that can judge it soundly (the same tier
+        //        every C toolchain reports undefined symbols from).
+        //        F_FfiResolveLibrarySymbolAbsent is retired from this path
+        //        (kept in the enum for diagnostic-name stability).
         //
         // The binary read is NON-DUPLICATIVE of the JSON/shipped path
         // precisely because a DSS-BUILT library has no shipped descriptor --
@@ -490,15 +503,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // (ii) The governed externs `ingest()` did NOT bind (absent from
             // ffiMap) split by the shipped-descriptor oracle: a KNOWN system
             // symbol falls through to `synthesize` (format-default library);
-            // a GENUINE typo fails loud. `shippedNames == nullopt` (config
+            // everything else routes UNBOUND (empty library -- precedence 1's
+            // channel) so the LINK tier resolves a sibling-TU definition,
+            // drops an unreferenced declaration, or rejects a referenced-
+            // undefined symbol LOUD (K_SymbolUndefined) -- see the precedence
+            // comment above (TF-C66). `shippedNames == nullopt` (config
             // discovery failed) ⇒ treat every symbol as possibly-known and
-            // fall through -- never a false-positive fail-loud.
+            // fall through -- never a false-positive.
             auto const shippedNames = ffi::collectShippedExternSymbolNames();
-            std::string libList;
-            for (std::size_t k = 0; k < opts.resolveLibraries.size(); ++k) {
-                if (k) libList += ", ";
-                libList += opts.resolveLibraries[k].filename().generic_string();
-            }
             std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
             for (auto const& g : binaryGoverned) {
                 if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
@@ -508,17 +520,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
                 if (known) {
                     fallThrough.push_back(g);  // system symbol -> format-default
                 } else {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::F_FfiResolveLibrarySymbolAbsent;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "declared extern '{}' is not exported by any "
-                        "--resolve-library binary [{}] and is not a known "
-                        "system symbol -- a genuine typo or a missing library. "
-                        "Fix the spelling, #include the header that declares "
-                        "it, or add the defining library to --resolve-library.",
-                        g.canonicalName, libList);
-                    reporter.report(std::move(d));
+                    // Unknown to the named binaries AND the descriptors:
+                    // hand it to the link tier with NO library binding. The
+                    // c86 no-library marker makes FF5 leave the import row's
+                    // library EMPTY, which is exactly the shape the link
+                    // gate governs (resolve / drop / loud-undefined).
+                    ffi::ExternDeclRef unbound = g;
+                    unbound.libraryOverride = {};
+                    unbound.noLibraryBinding = true;
+                    fallThrough.push_back(std::move(unbound));
                 }
             }
 

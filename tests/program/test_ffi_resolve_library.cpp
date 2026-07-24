@@ -143,18 +143,22 @@ int buildOne(fs::path const& outDir,
 //
 // A GENUINELY-UNKNOWN declared extern -- absent from the resolve-library's
 // export surface AND from every shipped descriptor (a typo like
-// `dss_absent_symbol`, NOT a bare system call) -- fails the compile LOUD with
-// F_FfiResolveLibrarySymbolAbsent, naming the symbol + the library, and emits
-// NO artifact. This is the meaningful typo-catch: reading a real export table
-// proves an own-library symbol exists at compile time. RED-ON-DISABLE: drop
-// the descriptor-aware fail-loud arm in compile_pipeline step 2.5 and this
-// main would silently mis-bind to the format-default library (dangling import,
-// caught only at link/load). Distinct from a bare system extern, which the
-// MixedBareSystemExternAndOwnLibraryBothResolve test proves DOES fall through.
+// `dss_absent_symbol`, NOT a bare system call) -- fails the build LOUD and
+// emits NO artifact. TF-C66 moved the verdict to the LINK tier: the per-CU
+// stage routes the unmatched extern UNBOUND (empty library), and the link
+// gate (rejectOrDropUnreferencedExterns, c143/c150) rejects the REFERENCED-
+// undefined symbol with K_SymbolUndefined on an exec image -- the tier that
+// can also see a sibling-TU definition (which the retired compile-time
+// verdict could not; it false-positived on every in-build symbol of a
+// multi-TU compile -- see SiblingTuDefinitionResolvesUnderResolveLibrary).
+// RED-ON-DISABLE: drop the unbound routing in compile_pipeline step 2.5(ii)
+// and the typo'd extern mis-binds to the format-default library (a dangling
+// import deferred to the loader). Distinct from a bare system extern, which
+// the MixedBareSystemExternAndOwnLibraryBothResolve test proves falls through.
 //
 // Host-native dynamic format so the library builds cleanly on every leg
 // (Windows -> PE .dll; else -> ELF .so; the reader + the validation are
-// host-agnostic -- no artifact is RUN here, the compile fails first).
+// host-agnostic -- no artifact is RUN here, the build fails first).
 TEST(FfiResolveLibraryRoundTrip, GenuinelyUnknownExternFailsLoud) {
 #if defined(_WIN32)
     std::string const libTarget  = "x86_64:pe64-x86_64-windows-dll";
@@ -187,16 +191,91 @@ TEST(FfiResolveLibraryRoundTrip, GenuinelyUnknownExternFailsLoud) {
                             execTarget, mainRep);
     EXPECT_NE(rc, 0)
         << "a declared extern absent from the resolve-library must FAIL "
-           "the compile (validation policy)";
+           "the build (link-tier undefined-symbol policy)";
     EXPECT_GT(::dss::test_support::countCode(
-                  mainRep, DiagnosticCode::F_FfiResolveLibrarySymbolAbsent),
+                  mainRep, DiagnosticCode::K_SymbolUndefined),
               0u)
-        << "the fail-loud must be F_FfiResolveLibrarySymbolAbsent "
-           "specifically -- reading the export table found no such symbol";
+        << "the fail-loud must be K_SymbolUndefined -- the referenced extern "
+           "is unbound (not in the resolve-library, not a descriptor name) "
+           "and no linked TU defines it (TF-C66 link-tier verdict)";
     EXPECT_FALSE(fs::exists(dir / "main_typo"))
-        << "no ELF artifact on a failed compile";
+        << "no ELF artifact on a failed build";
     EXPECT_FALSE(fs::exists(dir / "main_typo.exe"))
-        << "no PE artifact on a failed compile";
+        << "no PE artifact on a failed build";
+}
+
+// ── TF-C66: sibling-TU definition + --resolve-library (all hosts) ──────────
+//
+// The regression the TF-C66 reroute fixes: a MULTI-TU build where TU A
+// declares `extern int dss_in_build(void);` and TU B DEFINES it, compiled
+// WITH `--resolve-library <lib>` where the symbol is (correctly) NOT in the
+// library's exports and NOT a shipped-descriptor name. The retired per-CU
+// compile-time verdict false-positived here (F_FfiResolveLibrarySymbolAbsent
+// on a symbol the build itself defines -- the sqlite 185-TU testfixture hit
+// this 2770 times); the link tier resolves the reference against the sibling
+// definition and the program RUNS. RED-ON-DISABLE: restore the per-CU
+// fail-loud arm and this build errors spuriously.
+TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary) {
+#if defined(_WIN32)
+    std::string const libTarget   = "x86_64:pe64-x86_64-windows-dll";
+    std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
+    std::string const libArtifact = "dsslib.dll";
+    std::string const exeArtifact = "decl.exe";
+#else
+    std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
+    std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";
+    std::string const libArtifact = "dsslib.so";
+    std::string const exeArtifact = "decl";
+#endif
+    ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
+    auto const dir = scratch.path();
+    // The --resolve-library binary is present + ACTIVE (dsslib exports
+    // dss_lib_answer), but the program never touches it -- so the exec carries
+    // NO dll/so dependency to resolve at load (isolating the routing under
+    // test from a dll-search confound). TU A declares the in-build symbol; TU
+    // B defines it (returns 42). dss_in_build is "binary-governed" (no
+    // override, not a bare no-lib ref) yet absent from the library and from
+    // every descriptor -- exactly the class TF-C66 reroutes to the link tier.
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    auto const declSrc = writeSrc(
+        dir, "decl.c",
+        "extern int dss_in_build(void);\n"
+        "int main(void){ return dss_in_build(); }\n");
+    auto const defSrc = writeSrc(dir, "def.c",
+                                 "int dss_in_build(void){ return 42; }\n");
+
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), libTarget, libRep), 0);
+    auto const libPath = dir / libArtifact;
+    ASSERT_TRUE(fs::exists(libPath));
+    ASSERT_FALSE(libraryExportsSymbol(libPath, "dss_in_build"))
+        << "precondition: the library must NOT export the in-build symbol";
+
+    DiagnosticReporter rep;
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries({libPath});
+    // compileUnits = N SEPARATE CUs linked into one exec -- the exact path the
+    // CLI `--compile a.c b.c` and the sqlite testfixture use (compileFiles
+    // would fold both into ONE multi-file CU, a different link model).
+    int const rc = p.compileUnits(
+        std::vector<std::string>{declSrc.string(), defSrc.string()},
+        "c-subset", std::vector<std::string>{execTarget}, rep);
+    ASSERT_EQ(rc, 0)
+        << "an extern DEFINED BY A SIBLING TU must not fail resolve-library "
+           "validation (the TF-C66 false-positive)";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_SymbolUndefined),
+              0u);
+
+    auto const exePath = dir / exeArtifact;
+    ASSERT_TRUE(fs::exists(exePath)) << "the multi-TU exec must be emitted";
+    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "the sibling-TU definition (42) must resolve + run under an active "
+           "--resolve-library";
 }
 
 // ── Eager --resolve-library path validation (all hosts) -- MEDIUM fold ─────
