@@ -43,6 +43,19 @@ namespace {
     return c == ' ' || c == '\t' || c == '\r';
 }
 
+// C 6.4p1 white-space characters ALSO include VERTICAL TAB (0x0b) and FORM-FEED
+// (0x0c) — the page-break controls older Unix sources sprinkle between sections
+// (real `tcl.h` has a form-feed at every page boundary). They are treated as
+// whitespace ONLY in the MAIN scan (the dispatch loop's whitespace branch), NOT
+// in `coreKindForByte` / `isAsciiSpace` — those feed BODY-MODE classification
+// (string/comment/directive bodies), where a `\v`/`\f` is ordinary body content
+// and re-classifying it as Whitespace would drive `resolveMeaning` down the
+// synthetic path for a non-body kind (a fatal drift-guard). Universal lexical
+// whitespace, not a language choice.
+[[nodiscard]] constexpr bool isMainScanExtraSpace(char c) noexcept {
+    return c == '\v' || c == '\f';
+}
+
 // UTF-8 leading bytes are 0xC2..0xF4. Bytes 0x80..0xBF are continuation
 // bytes — only valid as the tail of a multi-byte sequence; appearing
 // at token start signals malformed UTF-8 and lands in the illegal-char
@@ -954,7 +967,7 @@ TokenizeResult Tokenizer::tokenize() && {
             }
             continue;
         }
-        if (isAsciiSpace(c)) {
+        if (isAsciiSpace(c) || isMainScanExtraSpace(c)) {
             r.advance(1);
             emit(CoreTokenKind::Whitespace, wsKind);
             continue;

@@ -591,6 +591,19 @@ struct ResolvedMeaning {
     return false;
 }
 
+// TF-C62: the built-in TRIVIA kinds the tokenizer pre-resolves DIRECTLY
+// (`emit(Whitespace, wsKind)` / `emit(Newline, newlineKind)`), like a built-in
+// literal. Reaching synthesis for one is LEGITIMATE, not drift: a whitespace
+// byte the per-lexeme table does not list — vertical-tab (0x0b) / form-feed
+// (0x0c), the C 6.4 whitespace controls older sources (real `tcl.h`) use as page
+// breaks. Space/tab/CR never reach here (they DO have lexeme entries → the fast
+// path). Universal built-in kinds; the same category the literal allowance is.
+[[nodiscard]] bool isBuiltinTriviaKind(GrammarSchema const& schema,
+                                       SchemaTokenId id) noexcept {
+    const auto name = schema.schemaTokens().name(id);
+    return name == "Whitespace" || name == "Newline";
+}
+
 // Synthesize a `ResolvedMeaning` for a tokenizer-pre-resolved kind that
 // has no entry in the per-lexeme schema table (numeric literals like
 // `5`, body-mode default tokens like `StringChar`). The synthesized
@@ -617,6 +630,7 @@ struct ResolvedMeaning {
     std::span<ScopeKind const> scopes) noexcept {
     if (!(bodyKinds.contains(preResolved)
           || isBuiltinLiteralKind(schema, preResolved)
+          || isBuiltinTriviaKind(schema, preResolved)
           || schema.isModeIntroducedKind(preResolved))) {
         tbFatal("resolveMeaning synthesizing for a kind that is neither "
                 "a body-mode defaultToken, a built-in literal, nor a "

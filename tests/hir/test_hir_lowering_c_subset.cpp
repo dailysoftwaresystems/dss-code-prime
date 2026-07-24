@@ -497,6 +497,25 @@ TEST(HirLoweringCSubset, PlainExternWithoutDefinitionStaysImport) {
 // `__attribute__((__nothrow__,__leaf__))`, Tcl `TCL_FORMAT_PRINTF(1,2)`).
 // RED-ON-DISABLE: revert the after-declarator attrSpec slot in initDeclarator
 // (c-subset.lang.json) → the declaration fails P0009 and model.hasErrors().
+// TF-C63 (D-CSUBSET-FORM-FEED-VTAB-WHITESPACE): C 6.4p1 counts VERTICAL TAB
+// (0x0b) and FORM-FEED (0x0c) as white-space. Older Unix sources (real `tcl.h`)
+// use a form-feed at every page boundary; without treating it as whitespace it
+// was an illegal-char `P000E` that desynced the parse (tcl.h: 11 such errors).
+// RED-ON-DISABLE: drop `isMainScanExtraSpace` from the tokenizer dispatch → the
+// form-feed becomes an illegal char and this fails to analyze.
+TEST(HirLoweringCSubset, FormFeedAndVerticalTabAreWhitespace) {
+    SemanticModel model = analyzeCSubset(
+        "int a = 20;\f\n"          // form-feed page break between declarations
+        "\vint b = 22;\f\n"        // vertical tab + form-feed
+        "int main(void){\v return a + b; }\n");   // vtab as inline whitespace
+    ASSERT_FALSE(model.hasErrors())
+        << "vertical tab (0x0b) and form-feed (0x0c) are C 6.4 whitespace — they "
+           "must not be illegal characters that desync the parse";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
 TEST(HirLoweringCSubset, GnuAttributeAfterDeclaratorLowersClean) {
     SemanticModel model = analyzeCSubset(
         "int add(int a, int b) __attribute__((__nothrow__, __leaf__));\n"
