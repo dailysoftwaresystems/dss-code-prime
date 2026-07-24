@@ -9,6 +9,9 @@
         { "when": { "format": "macho" }, "type": "i64 \"long long\"" },
         { "when": { "format": "pe" },    "type": "i64" }
     ] },
+    { "name": "off64_t",     "variants": [
+        { "when": { "format": "elf" },   "type": "i64 \"long\"" }
+    ] },
     { "name": "ssize_t",     "variants": [
         { "when": { "format": "elf" },   "type": "i64 \"long\"" },
         { "when": { "format": "macho" }, "type": "i64 \"long\"" },
