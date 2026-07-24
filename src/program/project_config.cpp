@@ -96,6 +96,51 @@ bool readRequiredStringArray(json const& doc,
     return true;
 }
 
+// Read an OPTIONAL array of non-empty strings. Mirrors
+// `readRequiredStringArray` EXCEPT the required-ness: an ABSENT field
+// leaves `out` empty and returns true (no diagnostic), and a
+// present-but-EMPTY `[]` is allowed (⇒ empty list, no "must contain at
+// least one entry" error). A present value that is NOT an array, or an
+// entry that is not a non-empty string, still fails loud C_MalformedJson
+// (never a silent drop). Used for the OPTIONAL compile-flag arrays
+// (`includes` / `defines` / `resolveLibraries`).
+bool readOptionalStringArray(json const& doc,
+                             char const* key,
+                             std::vector<std::string>& out,
+                             std::string_view label,
+                             DiagnosticReporter& rep) {
+    out.clear();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) {
+        return true;  // absent ⇒ empty (the caller left `out` empty); no error
+    }
+    json const& v = doc.at(key);
+    if (!v.is_array()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         std::string{"field '"} + key + "' must be an array of strings");
+        return false;
+    }
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        json const& e = v[i];
+        if (!e.is_string()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] must be a string");
+            return false;
+        }
+        std::string s = e.get<std::string>();
+        if (s.empty()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] must be a non-empty string");
+            return false;
+        }
+        out.push_back(std::move(s));
+    }
+    // A present-but-empty `[]` is ALLOWED (the one difference from
+    // readRequiredStringArray) — no "at least one entry" check here.
+    return true;
+}
+
 } // namespace
 
 std::optional<ProjectConfig>
@@ -125,6 +170,7 @@ parseProjectConfig(std::string_view jsonText,
     // less-actionable "missing required field 'language'".
     static constexpr std::string_view kKnownKeys[] = {
         "language", "artifactProfile", "targets", "sources", "output",
+        "includes", "defines", "resolveLibraries",
     };
     for (auto it = doc.begin(); it != doc.end(); ++it) {
         std::string const& key = it.key();
@@ -135,7 +181,8 @@ parseProjectConfig(std::string_view jsonText,
         if (!known) {
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                              "unknown field '" + key + "' (recognized fields: "
-                             "language, artifactProfile, targets, sources, output)");
+                             "language, artifactProfile, targets, sources, output, "
+                             "includes, defines, resolveLibraries)");
             return std::nullopt;
         }
     }
@@ -148,6 +195,19 @@ parseProjectConfig(std::string_view jsonText,
     if (!readRequiredStringArray(doc, "targets", pc.targets, sourceLabel, rep))
         return std::nullopt;
     if (!readRequiredStringArray(doc, "sources", pc.sources, sourceLabel, rep))
+        return std::nullopt;
+
+    // The OPTIONAL compile-flag arrays (the file-driven counterparts of the
+    // CLI `-I` / `--define` / `--resolve-library`). Absent ⇒ empty (no error);
+    // present must be an array of non-empty strings (else C_MalformedJson); a
+    // present-but-empty `[]` is allowed. `Program::compileProject` threads
+    // these (merge/append) onto the Program's current state.
+    if (!readOptionalStringArray(doc, "includes", pc.includes, sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalStringArray(doc, "defines", pc.defines, sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalStringArray(doc, "resolveLibraries", pc.resolveLibraries,
+                                 sourceLabel, rep))
         return std::nullopt;
 
     // `output` is an OPTIONAL user-authored hint: validate its type when

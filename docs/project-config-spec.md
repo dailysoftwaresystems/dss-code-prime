@@ -14,11 +14,14 @@
 
 ```jsonc
 {
-  "language":        "c-subset",                       // required — resolves to a shipped .lang.json
-  "artifactProfile": "cli",                            // required — one profile (see §3)
-  "targets":         ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
-  "sources":         ["src/main.c"],                   // required — ≥1 source path (literal; no glob yet)
-  "output":          "dist/myprog"                     // optional — see §6 (parsed, not yet routed)
+  "language":         "c-subset",                       // required — resolves to a shipped .lang.json
+  "artifactProfile":  "cli",                            // required — one profile (see §3)
+  "targets":          ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
+  "sources":          ["src/main.c"],                   // required — ≥1 source path (literal; no glob yet)
+  "output":           "dist/myprog",                    // optional — see §6 (parsed, not yet routed)
+  "includes":         ["vendor/include"],               // optional — quote-include dirs   (mirrors CLI -I)
+  "defines":          ["NDEBUG", "MAX=64"],             // optional — NAME[=VALUE] macros   (mirrors CLI --define)
+  "resolveLibraries": ["dist/libfoo.so"]                // optional — extern-resolving libs (mirrors CLI --resolve-library)
 }
 ```
 
@@ -36,6 +39,15 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `targets` | **yes** | non-empty array of non-empty strings | Each entry is a `"<targetName>:<formatName>"` spec (e.g. `"x86_64:elf64-x86_64-linux-exec"`). One artifact is produced per target. |
 | `sources` | **yes** | non-empty array of non-empty strings | The source files. Literal paths today (no glob — `D-AP2-SOURCES-GLOB`). Resolved relative to the process working directory. |
 | `output` | no | non-empty string when present | A user output hint. **Parsed + type-validated, but its path routing is not yet wired** (`D-AP2-OUTPUT-ROUTING`) — artifacts currently land at the per-target convention (§5). |
+| `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
+| `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). |
+| `resolveLibraries` | no | array of non-empty strings | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>` (`Program::setResolveLibraries`). |
+
+**The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
+empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
+that is not an array, or an entry that is not a non-empty string, fails loud (`C_MalformedJson`). At build time
+`Program::compileProject` **appends** these onto the Program's current state — so a manifest value **adds to**
+(never replaces) any flag `Program::run` already stamped from the command line. The two sources compose.
 
 **Unknown top-level keys are rejected** (`C_MalformedJson`) — a typo like `"ouput"` fails loud rather
 than being silently ignored, matching the grammar/target/format loaders.

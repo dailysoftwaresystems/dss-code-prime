@@ -1121,6 +1121,42 @@ int Program::compileProject(
         }
     }
 
+    // Thread the manifest's OPTIONAL compile-flag arrays onto the SAME
+    // Program state the CLI stamps in `Program::run` (setIncludeDirs `-I` /
+    // setUserDefines `--define` / setResolveLibraries `--resolve-library`),
+    // which `compileFiles`/`compileUnits` read at CU-build time. MERGE
+    // (append), not replace: `Program::run` may already have stamped the CLI
+    // flags before dispatching here, so the manifest ADDS to them (the two
+    // sources compose) rather than clobbering them. `resolveLibraries` entries
+    // are strings mapped to filesystem paths exactly as the CLI stamp does.
+    // Empty arrays (absent field, or a present `[]`) append nothing — a no-op.
+    //
+    // Contract: this APPENDS onto the PERSISTENT Program state (the setters
+    // mutate the members read at build time), matching `Program::run`'s
+    // single-use CLI-stamp contract — a Program is built fresh per invocation
+    // (`Program::run` constructs one, tests construct one per call), so the
+    // append runs exactly once. A REUSED Program passed through `compileProject`
+    // twice would double-append; that is out of contract (single-use), not a
+    // supported reuse mode.
+    {
+        std::vector<std::string> mergedIncludes = includeDirs();
+        mergedIncludes.reserve(mergedIncludes.size() + pc.includes.size());
+        mergedIncludes.insert(mergedIncludes.end(),
+                              pc.includes.begin(), pc.includes.end());
+        setIncludeDirs(std::move(mergedIncludes));
+
+        std::vector<std::string> mergedDefines = userDefines();
+        mergedDefines.reserve(mergedDefines.size() + pc.defines.size());
+        mergedDefines.insert(mergedDefines.end(),
+                             pc.defines.begin(), pc.defines.end());
+        setUserDefines(std::move(mergedDefines));
+
+        std::vector<fs::path> mergedLibs = resolveLibraries();
+        mergedLibs.reserve(mergedLibs.size() + pc.resolveLibraries.size());
+        for (auto const& s : pc.resolveLibraries) mergedLibs.emplace_back(s);
+        setResolveLibraries(std::move(mergedLibs));
+    }
+
     // Route by source COUNT via the shared `routesToMultiUnit` threshold
     // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
     // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒

@@ -37,12 +37,28 @@ namespace dss {
 //                         (a user-authored schema field); its path
 //                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2
 //                         uses the existing per-target output convention.
+//   * `includes`        — OPTIONAL quote-include search dirs; the file-driven
+//                         counterpart of the CLI `-I <dir>`. Empty when absent.
+//   * `defines`         — OPTIONAL `NAME[=VALUE]` macros; the counterpart of
+//                         the CLI `--define`. Empty when absent.
+//   * `resolveLibraries`— OPTIONAL library paths whose export surfaces resolve
+//                         this build's externs; the counterpart of the CLI
+//                         `--resolve-library <path>`. Empty when absent.
+//   The three flag arrays MERGE (append) onto the Program's current state in
+//   `Program::compileProject` — they ADD to any CLI-provided flags, never
+//   replace them. A present-but-empty `[]` is allowed (⇒ empty list).
 struct DSS_EXPORT ProjectConfig {
     std::string              language;
     std::string              artifactProfile;
     std::vector<std::string> targets;
     std::vector<std::string> sources;
     std::optional<std::string> output;   // nullopt iff the field is absent
+    // OPTIONAL compile-flag fields (empty when the field is absent). Each maps
+    // to the same Program state as the matching CLI flag; see the field notes
+    // above. Threaded (merge/append) by Program::compileProject.
+    std::vector<std::string> includes;         // → setIncludeDirs      (CLI -I <dir>)
+    std::vector<std::string> defines;          // → setUserDefines      (CLI --define NAME[=VALUE])
+    std::vector<std::string> resolveLibraries; // → setResolveLibraries (CLI --resolve-library <path>)
 };
 
 // Parse a project config from JSON text. `sourceLabel` names the input

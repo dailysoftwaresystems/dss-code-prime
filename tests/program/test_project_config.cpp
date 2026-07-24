@@ -29,10 +29,12 @@
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
 #include "program/project_config.hpp"
+#include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <span>
@@ -229,6 +231,121 @@ TEST(ProjectConfigLoader, EmptyOutputStringFailsLoud) {
     auto pc = parseProjectConfig(R"({
       "language": "c-subset", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "output": ""
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// ── Loader: OPTIONAL compile-flag arrays (includes/defines/resolveLibraries)
+// The file-driven counterparts of the CLI `-I` / `--define` /
+// `--resolve-library`. Absent ⇒ empty; a present `[]` ⇒ empty (no error);
+// a present value must be an array of non-empty strings (else C_MalformedJson).
+
+// Populated → each field parses EXACTLY (sizes AND contents).
+TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "includes": ["inc", "vendor/include"],
+      "defines": ["NDEBUG", "MAX=64"],
+      "resolveLibraries": ["libfoo.so", "libbar.a"]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(pc->includes.size(), 2u);
+    EXPECT_EQ(pc->includes[0], "inc");
+    EXPECT_EQ(pc->includes[1], "vendor/include");
+    ASSERT_EQ(pc->defines.size(), 2u);
+    EXPECT_EQ(pc->defines[0], "NDEBUG");
+    EXPECT_EQ(pc->defines[1], "MAX=64");
+    ASSERT_EQ(pc->resolveLibraries.size(), 2u);
+    EXPECT_EQ(pc->resolveLibraries[0], "libfoo.so");
+    EXPECT_EQ(pc->resolveLibraries[1], "libbar.a");
+}
+
+// Each field ABSENT → empty vector (the default; no error).
+TEST(ProjectConfigLoader, FlagArraysAbsentAreEmpty) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_TRUE(pc->includes.empty());
+    EXPECT_TRUE(pc->defines.empty());
+    EXPECT_TRUE(pc->resolveLibraries.empty());
+}
+
+// A present-but-empty `[]` → empty vector, NO diagnostic (the one allowed
+// difference from a REQUIRED array, which rejects `[]` as C_MissingField).
+TEST(ProjectConfigLoader, FlagArraysEmptyBracketsAllowedNoDiagnostic) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "includes": [], "defines": [], "resolveLibraries": []
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_TRUE(pc->includes.empty());
+    EXPECT_TRUE(pc->defines.empty());
+    EXPECT_TRUE(pc->resolveLibraries.empty());
+}
+
+// REJECT: a non-array value (a string where an array is required).
+TEST(ProjectConfigLoader, NonArrayIncludesFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "includes": "not-an-array"
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// REJECT: a non-string entry (a number in the array).
+TEST(ProjectConfigLoader, NonStringDefineEntryFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "defines": [1]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// REJECT: an empty-string entry (fails loud like the required-array helper).
+TEST(ProjectConfigLoader, EmptyStringIncludeEntryFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "includes": [""]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// REJECT: a non-array resolveLibraries (the third field, same rule).
+TEST(ProjectConfigLoader, NonArrayResolveLibrariesFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "resolveLibraries": 42
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// Regression: an UNKNOWN top-level key is STILL rejected after the three
+// new recognized fields were added to kKnownKeys (a typo must not slip in
+// alongside the new vocabulary).
+TEST(ProjectConfigLoader, UnknownKeyStillRejected) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "includ": ["x"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
@@ -728,4 +845,449 @@ TEST(CompileProjectIntegration, RealCliProjectEmitsElfExecutable) {
     EXPECT_EQ(hdr[1], static_cast<unsigned char>('E'));
     EXPECT_EQ(hdr[2], static_cast<unsigned char>('L'));
     EXPECT_EQ(hdr[3], static_cast<unsigned char>('F'));
+}
+
+// ════════════════════════════════════════════════════════════════
+// Behavioral threading proof — the manifest's OPTIONAL compile-flag
+// arrays (includes / defines / resolveLibraries) actually TAKE EFFECT
+// end-to-end through compileProject, not merely PARSE (the loader tests
+// above). Each has a RED-ON-DISABLE arm: drop the merge-stamp in
+// Program::compileProject and the "on" case regresses to the "off"
+// outcome. These reach the SAME Program state the CLI stamps
+// (setIncludeDirs / setUserDefines / setResolveLibraries), which
+// compileFiles/compileUnits read at CU-build time.
+// ════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A JSON array literal from string entries (each quoted). Empty ⇒ "[]".
+std::string jsonStrArray(std::vector<std::string> const& items) {
+    std::string s = "[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) s += ", ";
+        s += "\"" + items[i] + "\"";
+    }
+    s += "]";
+    return s;
+}
+
+void writeText(std::filesystem::path const& p, std::string_view text) {
+    std::ofstream f{p, std::ios::binary};
+    f << text;
+}
+
+// True iff ANY emitted diagnostic's message text contains `needle` — the
+// resolveLibraries compose proof scans for the pre-stamped CLI library's name
+// across every F_FileOpenFailed (order-independent).
+bool anyMessageContains(DiagnosticReporter const& rep, std::string_view needle) {
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// ── `defines` — the real exit-code proof (host-native exec) ──────
+// A source whose exit code REFLECTS the define: 42 when DSS_PROJ_GATE is
+// defined, 7 otherwise. Built host-native (PE on Windows, ELF on Linux-
+// x86_64) and RUN, so exit 42 vs 7 is the exact behavioral discriminator.
+// Compiled out on other hosts (arm64/macOS) exactly like the ELF FFI round-
+// trip; the compile-only includes/resolveLibraries proofs below run on every
+// leg (so the merge-stamp still has cross-target coverage there).
+#if defined(_WIN32) || (defined(__linux__) && (defined(__x86_64__) || defined(__amd64__)))
+namespace {
+#if defined(_WIN32)
+constexpr std::string_view kHostExecSpec     = "x86_64:pe64-x86_64-windows-exec";
+constexpr std::string_view kHostExecArtifact = "gate.exe";  // PE ⇒ .exe
+#else
+constexpr std::string_view kHostExecSpec     = "x86_64:elf64-x86_64-linux-exec";
+constexpr std::string_view kHostExecArtifact = "gate";      // ELF exec ⇒ no ext
+#endif
+
+constexpr std::string_view kGateSrc =
+    "int main(void){\n"
+    "#ifdef DSS_PROJ_GATE\n"
+    "  return 42;\n"
+    "#else\n"
+    "  return 7;\n"
+    "#endif\n"
+    "}\n";
+
+// A source whose exit code is the manifest-supplied VALUE of RETVAL — proves
+// NAME=VALUE substitution (not just presence). Without the define, RETVAL is an
+// undeclared identifier → the source does not compile (the acceptable negative).
+constexpr std::string_view kValueSrc =
+    "int main(void){ return RETVAL; }\n";
+
+// Build `src` through compileProject with a manifest carrying `defines`, into
+// `dir` (setOutputDir → single-target artifact at <dir>/gate[.exe]). The
+// manifest source path is ABSOLUTE (generic separators — valid in JSON and on
+// Windows) so no cwd change is needed. Returns the compileProject rc.
+int buildDefineProject(std::filesystem::path const& dir,
+                       std::string_view src,
+                       std::vector<std::string> const& defines,
+                       DiagnosticReporter& rep) {
+    auto const srcPath = dir / "gate.c";
+    writeText(srcPath, src);
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + std::string{kHostExecSpec} + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+        + "  \"defines\": " + jsonStrArray(defines) + "\n}";
+    auto const projPath = dir / "gate.dss-project.json";
+    writeText(projPath, manifest);
+
+    Program prog;
+    prog.setOutputDir(dir);   // single target ⇒ artifact at <dir>/<stem><ext>
+    return prog.compileProject(projPath.string(), rep);
+}
+}  // namespace
+
+TEST(CompileProjectManifestFlags, DefinesThreadToCompileExitCode) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    using dss::test_support::runBinary;
+
+    // (on) manifest defines:["DSS_PROJ_GATE"] → the #ifdef branch → exit 42.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildDefineProject(scratch.path(), kGateSrc, {"DSS_PROJ_GATE"}, rep), 0)
+            << "the gated source must compile with the manifest define";
+        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u)
+            << "manifest defines:[DSS_PROJ_GATE] must define the gate → exit 42";
+    }
+    // (off) RED-ON-DISABLE: the SAME source, define REMOVED from the manifest
+    // → the #else branch → exit 7. If the merge-stamp were dropped (defines
+    // never threaded), the (on) case above would ALSO fall to #else and return
+    // 7 — so 42-vs-7 is the exact discriminator that the define took effect.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildDefineProject(scratch.path(), kGateSrc, {}, rep), 0)
+            << "the gated source must still compile with no manifest define";
+        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 7u)
+            << "no manifest define → the #else branch → exit 7 (red-on-disable)";
+    }
+}
+
+// ── `defines` NAME=VALUE substitution — the VALUE reaches codegen ─
+// DefinesThreadToCompileExitCode proves a bare `#ifdef` sees the define;
+// this proves the VALUE substitutes: manifest defines:["RETVAL=42"] with
+// `int main(){ return RETVAL; }` → exit 42. RED-ON-DISABLE (acceptable
+// negative): WITHOUT the define, RETVAL is undeclared → the source does not
+// compile, so the 42 provably came from the manifest value. Host-gated exactly
+// like DefinesThreadToCompileExitCode (it RUNS the artifact).
+TEST(CompileProjectManifestFlags, DefineValueSubstitutesExitCode) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    using dss::test_support::runBinary;
+
+    // (value present) RETVAL=42 substitutes → exit 42.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildDefineProject(scratch.path(), kValueSrc, {"RETVAL=42"}, rep), 0)
+            << "the source must compile with the manifest NAME=VALUE define";
+        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u)
+            << "manifest defines:[RETVAL=42] must substitute the VALUE 42 → exit 42";
+    }
+    // (value absent) RED-ON-DISABLE: no manifest define → RETVAL undeclared →
+    // the source does not compile (so the 42 above came from the manifest).
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        DiagnosticReporter rep;
+        EXPECT_NE(buildDefineProject(scratch.path(), kValueSrc, {}, rep), 0)
+            << "without the manifest define, RETVAL is undeclared → no compile";
+    }
+}
+#endif  // host-native exec (Windows or Linux-x86_64)
+
+// ── `includes` — compile-only proof (host-agnostic, every leg) ───
+// The test_include_dirs.cpp pattern driven through compileProject: a quote-
+// include resolvable ONLY via the manifest include dir. A fixed cross-target
+// ELF (never RUN), so it compiles on every host/leg. RED-ON-DISABLE: drop the
+// includes merge-stamp and the "with" case regresses to the P0016 of "without".
+TEST(CompileProjectManifestFlags, IncludesThreadToCompile) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "inc");
+    writeText(dir / "inc" / "gate_hdr.h", "#define ANSWER 42\n");
+    auto const srcPath = dir / "uses_inc.c";
+    writeText(srcPath,
+              "#include \"gate_hdr.h\"\nint main(void){ return ANSWER; }\n");
+
+    auto manifest = [&](std::vector<std::string> const& includes) {
+        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+            + "  \"artifactProfile\": \"cli\",\n"
+            + "  \"targets\": [\"" + target + "\"],\n"
+            + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+            + "  \"includes\": " + jsonStrArray(includes) + "\n}";
+    };
+
+    // (without) the manifest include dir → the quote-include fails loud P0016.
+    {
+        auto const proj = dir / "no_inc.dss-project.json";
+        writeText(proj, manifest({}));
+        Program prog;
+        prog.setOutputDir(dir / "out_no");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        EXPECT_NE(rc, 0)
+            << "a quote-include unreachable without the manifest include dir must fail";
+        EXPECT_GT(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u)
+            << "the fail-loud must be the P0016 quote-include-not-found";
+    }
+    // (with) the manifest include dir → resolves + compiles clean (rc 0).
+    {
+        auto const proj = dir / "with_inc.dss-project.json";
+        writeText(proj, manifest({(dir / "inc").generic_string()}));
+        Program prog;
+        prog.setOutputDir(dir / "out_yes");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        ASSERT_EQ(rc, 0) << "the manifest include dir must resolve the quote-include";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u);
+    }
+}
+
+// ── `resolveLibraries` — compile-only proof (host-agnostic) ──────
+// The eager --resolve-library path probe opens every named library at compile
+// time, EVEN when the TU has no externs (the FFI MissingResolveLibraryPath...
+// pin). So a manifest naming a NONEXISTENT library must fail loud
+// F_FileOpenFailed — proving resolveLibraries threaded to the compile.
+// RED-ON-DISABLE: with resolveLibraries absent/[] the same source compiles
+// clean. Fixed cross-target ELF (never RUN).
+TEST(CompileProjectManifestFlags, ResolveLibrariesThreadToCompile) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const srcPath = dir / "noextern.c";
+    writeText(srcPath, "int main(void){ return 7; }\n");
+    auto const missing = dir / "does_not_exist_lib.bin";  // never created
+
+    auto manifest = [&](std::vector<std::string> const& libs) {
+        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+            + "  \"artifactProfile\": \"cli\",\n"
+            + "  \"targets\": [\"" + target + "\"],\n"
+            + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+            + "  \"resolveLibraries\": " + jsonStrArray(libs) + "\n}";
+    };
+
+    // (with a MISSING lib) → the eager path probe fails loud F_FileOpenFailed.
+    {
+        auto const proj = dir / "with_lib.dss-project.json";
+        writeText(proj, manifest({missing.generic_string()}));
+        Program prog;
+        prog.setOutputDir(dir / "out_lib");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        EXPECT_NE(rc, 0)
+            << "a missing manifest resolveLibraries path must fail the compile";
+        EXPECT_GT(countCode(rep, DiagnosticCode::F_FileOpenFailed), 0u)
+            << "the eager --resolve-library probe must see the manifest lib (threaded)";
+    }
+    // (without) RED-ON-DISABLE: no manifest library → the same source compiles
+    // clean (no eager probe fires).
+    {
+        auto const proj = dir / "no_lib.dss-project.json";
+        writeText(proj, manifest({}));
+        Program prog;
+        prog.setOutputDir(dir / "out_nolib");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        EXPECT_EQ(rc, 0)
+            << "no manifest resolveLibraries → clean compile (red-on-disable)";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_FileOpenFailed), 0u);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// MERGE (append), not replace — the locked threading semantics. The
+// strong proof is COMPOSITION of two NON-EMPTY sets: a pre-stamped CLI
+// value (as if `Program::run` stamped a CLI flag) and a DIFFERENT
+// manifest value, where BOTH are required for success. A guarded-replace
+// regression — e.g. `if (!pc.includes.empty()) setIncludeDirs(pc.includes)`
+// — would drop the pre-stamped CLI value yet pass an empty-array test, so
+// the empty-array case alone is NOT sufficient. One compose test per field.
+// ════════════════════════════════════════════════════════════════
+
+// `includes` compose: pre-stamp CLI dirA (holds a.h) + manifest dirB (holds
+// b.h); a source needs a header from EACH. Both resolve → the two dir sets
+// composed. RED-ON-DISABLE (manifest-only replace): dirA dropped → a.h
+// unresolved → P0016 (asserted directly as the "no pre-stamp" negative below).
+TEST(CompileProjectManifestFlags, IncludesMergeComposesPreexistingWithManifest) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "dirA");
+    std::filesystem::create_directories(dir / "dirB");
+    writeText(dir / "dirA" / "a.h", "#define A_OK 1\n");
+    writeText(dir / "dirB" / "b.h", "#define B_OK 1\n");
+    auto const srcPath = dir / "uses_both.c";
+    // a.h resolves ONLY via dirA (the pre-stamped CLI dir); b.h ONLY via dirB
+    // (the manifest dir) — both are required, so the compile succeeds iff the
+    // two dir sets composed.
+    writeText(srcPath,
+              "#include \"a.h\"\n#include \"b.h\"\n"
+              "int main(void){ return A_OK + B_OK - 2; }\n");
+
+    auto manifest = [&](std::vector<std::string> const& includes) {
+        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+            + "  \"artifactProfile\": \"cli\",\n"
+            + "  \"targets\": [\"" + target + "\"],\n"
+            + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+            + "  \"includes\": " + jsonStrArray(includes) + "\n}";
+    };
+
+    // (compose) CLI dirA pre-stamped + manifest dirB → BOTH a.h and b.h resolve.
+    {
+        auto const proj = dir / "compose.dss-project.json";
+        writeText(proj, manifest({(dir / "dirB").generic_string()}));
+        Program prog;
+        prog.setIncludeDirs({(dir / "dirA").generic_string()});  // as if CLI -I dirA
+        prog.setOutputDir(dir / "out_compose");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        ASSERT_EQ(rc, 0)
+            << "the pre-stamped CLI dir (dirA) and the manifest dir (dirB) must "
+               "COMPOSE — both a.h and b.h resolve (append, not replace)";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u);
+    }
+    // (negative — the manifest-only replace direction) NO pre-stamp → only
+    // dirB is in effect → a.h is unreachable → P0016. This is exactly what a
+    // guarded-replace regression would reduce the compose case to.
+    {
+        auto const proj = dir / "noprestamp.dss-project.json";
+        writeText(proj, manifest({(dir / "dirB").generic_string()}));
+        Program prog;  // no setIncludeDirs — only the manifest dirB
+        prog.setOutputDir(dir / "out_noprestamp");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        EXPECT_NE(rc, 0)
+            << "with only the manifest dir (dirB), a.h is unreachable → fail";
+        EXPECT_GT(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u);
+    }
+}
+
+// `defines` compose: pre-stamp CLI `CLI_ONE=1` + manifest `MANIFEST_TWO=2`, with
+// a source that references BOTH macros. Compose → `return 1 + 2 - 3;` compiles.
+// RED-ON-DISABLE (manifest-only replace): CLI_ONE dropped → an undeclared
+// identifier → compile error (asserted as the "no pre-stamp" negative below).
+// Host-agnostic (compile-only, cross-target ELF).
+TEST(CompileProjectManifestFlags, DefinesMergeComposesPreexistingWithManifest) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const srcPath = dir / "uses_both_defs.c";
+    // Both macros must be defined or the identifier is undeclared (compile
+    // error) — the compose requirement. (=0 keeps the exit clean if ever run.)
+    writeText(srcPath, "int main(void){ return CLI_ONE + MANIFEST_TWO - 3; }\n");
+
+    auto manifest = [&](std::vector<std::string> const& defines) {
+        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+            + "  \"artifactProfile\": \"cli\",\n"
+            + "  \"targets\": [\"" + target + "\"],\n"
+            + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+            + "  \"defines\": " + jsonStrArray(defines) + "\n}";
+    };
+
+    // (compose) CLI CLI_ONE=1 pre-stamped + manifest MANIFEST_TWO=2 → both
+    // substitute → the source compiles.
+    {
+        auto const proj = dir / "compose_def.dss-project.json";
+        writeText(proj, manifest({"MANIFEST_TWO=2"}));
+        Program prog;
+        prog.setUserDefines({"CLI_ONE=1"});  // as if CLI --define CLI_ONE=1
+        prog.setOutputDir(dir / "out_compose_def");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        ASSERT_EQ(rc, 0)
+            << "the pre-stamped CLI define (CLI_ONE) and the manifest define "
+               "(MANIFEST_TWO) must COMPOSE — both substitute (append, not replace)";
+    }
+    // (negative — the manifest-only replace direction) NO pre-stamp → CLI_ONE
+    // undeclared → compile fails.
+    {
+        auto const proj = dir / "nocli_def.dss-project.json";
+        writeText(proj, manifest({"MANIFEST_TWO=2"}));
+        Program prog;  // no setUserDefines — only the manifest define
+        prog.setOutputDir(dir / "out_nocli_def");
+        DiagnosticReporter rep;
+        int const rc = prog.compileProject(proj.string(), rep);
+        EXPECT_NE(rc, 0)
+            << "with only the manifest define, CLI_ONE is undeclared → fail";
+    }
+}
+
+// `resolveLibraries` compose: pre-stamp CLI `cli_only_lib.bin` + manifest
+// `manifest_only_lib.bin`, BOTH nonexistent. The eager --resolve-library probe
+// opens EVERY entry of the merged list, so under compose the CLI path is probed
+// and its name appears in a F_FileOpenFailed diagnostic. RED-ON-DISABLE
+// (manifest-only replace): the CLI path is dropped → never probed → its name
+// never appears (the CLI path is FIRST in the merge, so this holds whether the
+// probe reports all failures or stops at the first). Host-agnostic.
+TEST(CompileProjectManifestFlags, ResolveLibrariesMergeComposesPreexistingWithManifest) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const srcPath = dir / "noextern2.c";
+    writeText(srcPath, "int main(void){ return 0; }\n");
+    auto const cliLib      = dir / "cli_only_lib.bin";       // never created
+    auto const manifestLib = dir / "manifest_only_lib.bin";  // never created
+
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+        + "  \"resolveLibraries\": "
+        + jsonStrArray({manifestLib.generic_string()}) + "\n}";
+    auto const proj = dir / "compose_lib.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setResolveLibraries({cliLib});  // as if CLI --resolve-library cli_only_lib.bin
+    prog.setOutputDir(dir / "out_compose_lib");
+    DiagnosticReporter rep;
+    int const rc = prog.compileProject(proj.string(), rep);
+    EXPECT_NE(rc, 0) << "both missing libs must fail the eager probe";
+    EXPECT_GT(countCode(rep, DiagnosticCode::F_FileOpenFailed), 0u);
+    EXPECT_TRUE(anyMessageContains(rep, "cli_only_lib"))
+        << "the pre-stamped CLI library must SURVIVE the manifest merge — its "
+           "path is probed (append, not replace); a manifest-only replace would "
+           "drop it and its name would never appear in a diagnostic";
 }
