@@ -170,7 +170,7 @@ parseProjectConfig(std::string_view jsonText,
     // less-actionable "missing required field 'language'".
     static constexpr std::string_view kKnownKeys[] = {
         "language", "artifactProfile", "targets", "sources", "output",
-        "includes", "defines", "resolveLibraries",
+        "artifactName", "includes", "defines", "resolveLibraries",
     };
     for (auto it = doc.begin(); it != doc.end(); ++it) {
         std::string const& key = it.key();
@@ -182,7 +182,7 @@ parseProjectConfig(std::string_view jsonText,
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                              "unknown field '" + key + "' (recognized fields: "
                              "language, artifactProfile, targets, sources, output, "
-                             "includes, defines, resolveLibraries)");
+                             "artifactName, includes, defines, resolveLibraries)");
             return std::nullopt;
         }
     }
@@ -228,6 +228,43 @@ parseProjectConfig(std::string_view jsonText,
             return std::nullopt;
         }
         pc.output = std::move(o);
+    }
+
+    // `artifactName` is an OPTIONAL base NAME for the emitted binary (the
+    // per-platform-subdir routing in Program::compileProject reads it). Validate
+    // when present, fail loud on a malformed value (never a silent no-op):
+    //   * wrong type / empty string            → C_MalformedJson
+    //   * contains a path separator ('/' or '\') → C_MalformedJson — it is a
+    //     bare NAME, not a path; the DIRECTORY comes from `--output` (+ the
+    //     per-format subdir). This is an EARLY, clear parse-time guard for the
+    //     common `"dist/app"` mistake.
+    // NOTE: this separator check is NOT the containment boundary — a denylist of
+    // two chars cannot prove a name stays inside the output dir (a bare ".." has
+    // no separator, and a Windows drive-relative "D:app" has none either, yet
+    // both escape once joined onto the output dir). The REAL boundary is a
+    // lexically-normalized parent-path check at the ROUTING site
+    // (compileOneTarget → D_ArtifactNameEscapesOutputDir), where the output dir
+    // is known. This loader check just fails the common case earlier + clearer.
+    // Absent ⇒ nullopt ⇒ the source stem names the artifact (unchanged).
+    if (doc.contains("artifactName")) {
+        json const& v = doc.at("artifactName");
+        if (!v.is_string()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a string");
+            return std::nullopt;
+        }
+        std::string a = v.get<std::string>();
+        if (a.empty()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a non-empty string when present");
+            return std::nullopt;
+        }
+        if (a.find('/') != std::string::npos || a.find('\\') != std::string::npos) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a bare file name (no path separators)");
+            return std::nullopt;
+        }
+        pc.artifactName = std::move(a);
     }
 
     return pc;

@@ -166,6 +166,34 @@ public:
     [[nodiscard]] std::optional<std::filesystem::path> const&
     outputDir() const noexcept { return outputDir_; }
 
+    /// D-AP2-OUTPUT-ROUTING (project artifactName + per-platform subdir):
+    /// the OPTIONAL base NAME for the emitted binary — nullopt ⇒ the source
+    /// stem (the unchanged default). `Program::compileProject` stamps this
+    /// from the manifest's `artifactName`; the CLI path (`Program::run`)
+    /// never sets it, so `--compile` output names stay byte-identical.
+    /// Threaded to `compileOneTarget` (via `runCusToTargets`) alongside
+    /// `outputDir`, where `artifactName.value_or(sourceStem)` names the file.
+    void setArtifactName(std::optional<std::string> name) {
+        artifactName_ = std::move(name);
+    }
+    [[nodiscard]] std::optional<std::string> const&
+    artifactName() const noexcept { return artifactName_; }
+
+    /// D-AP2-OUTPUT-ROUTING (project per-platform subdir): when set, EVERY
+    /// target's artifact routes into a `<outputDir>/<formatName>/` subdir —
+    /// including a SINGLE-target build (which is otherwise flat). Multi-target
+    /// builds already subdir by formatName; this forces the same layout for
+    /// single-target project builds so a project's output is consistently
+    /// per-platform. `Program::compileProject` sets it true; the CLI path
+    /// (`Program::run`) leaves it false, so `--compile` single-target output
+    /// stays FLAT (byte-identical). Threaded to `compileOneTarget` (via
+    /// `runCusToTargets`) where the subdir decision is
+    /// `multiTargetBuild || perFormatOutputSubdir`.
+    void setPerFormatOutputSubdir(bool on) noexcept { perFormatOutputSubdir_ = on; }
+    [[nodiscard]] bool perFormatOutputSubdir() const noexcept {
+        return perFormatOutputSubdir_;
+    }
+
     /// D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): override the
     /// MIR-optimizer pipeline for the next compileFiles/Directory call.
     /// When set, replaces the JSON-loaded default at compile_pipeline
@@ -241,6 +269,8 @@ public:
 
 private:
     std::optional<std::filesystem::path>   outputDir_;
+    std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
+    bool                                   perFormatOutputSubdir_ = false;  // D-AP2-OUTPUT-ROUTING: project ⇒ force <formatName>/ subdir
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define

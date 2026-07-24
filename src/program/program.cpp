@@ -224,12 +224,21 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 // Returns true on success; emits via `reporter` on failure.
 //
 // `outputDir` (D-LK10-ENTRY Slice C companion): when set, the
-// emitted binary lands at `<outputDir>/<sourceStem><ext>` for
-// single-target builds, or `<outputDir>/<formatName>/<sourceStem>
-// <ext>` for multi-target builds (the multi-target qualifier
-// disambiguates same-named outputs across formats). When unset,
-// the legacy `<cwd>/target/<formatName>/<sourceStem><ext>`
-// convention applies — keeps existing call sites unchanged.
+// emitted binary lands at `<outputDir>/<name><ext>` for
+// single-target builds, or `<outputDir>/<formatName>/<name><ext>`
+// for multi-target builds (the multi-target qualifier disambiguates
+// same-named outputs across formats). When unset, the legacy
+// `<cwd>/target/<formatName>/<name><ext>` convention applies —
+// keeps existing call sites unchanged.
+//
+// The artifact base `<name>` = `artifactName.value_or(sourceStem)`: a
+// project manifest's `artifactName` overrides the source stem; nullopt
+// (the CLI path, and a project without the field) keeps the source stem
+// (unchanged). `perFormatOutputSubdir` (D-AP2-OUTPUT-ROUTING) forces the
+// `<formatName>/` subdir even for a single-target `--output` build — a
+// PROJECT build sets it so every platform's artifact is consistently
+// per-platform-subdir'd; the CLI path leaves it false, so `--compile`
+// single-target output stays flat (byte-identical).
 [[nodiscard]] bool compileOneTarget(std::span<CompilationUnit const> cus,
                                     GrammarSchema const&   grammar,
                                     std::string const&     sourceStem,
@@ -237,6 +246,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
                                     bool                   multiTargetBuild,
+                                    std::optional<std::string> const& artifactName,
+                                    bool                   perFormatOutputSubdir,
                                     CompileOptions const&  compileOpts,
                                     // D-PERF-4-CU-PARALLELISM: the per-CU build
                                     // executor (nullptr ⇒ an internal pool sized
@@ -326,16 +337,23 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         std::distance(span.data(), abi->cc));
 
     // Output path convention (cycle 2 v1; plan 6 owns the
-    // authoritative artifact-profile-driven scheme):
-    //   default      : <cwd>/target/<formatName>/<sourceStem><ext>
-    //   --output dir : <dir>/<sourceStem><ext>               (single target)
-    //                  <dir>/<formatName>/<sourceStem><ext>  (multi target)
-    // `formatName` already encodes machine+OS, so we don't add a
+    // authoritative artifact-profile-driven scheme). The artifact base
+    // `<name>` = `artifactName.value_or(sourceStem)` (a project manifest's
+    // `artifactName` overrides the stem; nullopt keeps it — the CLI path):
+    //   default      : <cwd>/target/<formatName>/<name><ext>
+    //   --output dir : <dir>/<name><ext>               (single target, flat)
+    //                  <dir>/<formatName>/<name><ext>  (multi target, OR any
+    //                                                   project build via
+    //                                                   perFormatOutputSubdir)
+    // A PROJECT build sets `perFormatOutputSubdir` (D-AP2-OUTPUT-ROUTING) so
+    // even its single-target output lands under `<formatName>/` — consistently
+    // per-platform. The CLI single-target path leaves it false ⇒ flat
+    // (unchanged). `formatName` already encodes machine+OS, so we don't add a
     // separate `<targetName>` subdir (redundant + bloats the path).
     auto const ext = parsed->outputExtension(**formatR);
     fs::path outDir;
     if (outputDir.has_value()) {
-        outDir = multiTargetBuild
+        outDir = (multiTargetBuild || perFormatOutputSubdir)
                    ? (*outputDir / parsed->formatName)
                    : *outputDir;
     } else {
@@ -355,7 +373,32 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                    + outDir.generic_string() + "': " + ec.message());
         return false;
     }
-    auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
+    auto const outPath =
+        outDir / (artifactName.value_or(sourceStem) + std::string{ext});
+
+    // Containment BOUNDARY (D-AP2-OUTPUT-ROUTING). The loader validates a
+    // project's `artifactName` as a bare name (it rejects '/' and '\'), but a
+    // separator DENYLIST does not prove containment — two OS-agnostic vectors
+    // still escape the routed tree:
+    //   * a differing ROOT-NAME (Windows drive-relative "D:app"): `operator/`
+    //     REPLACES `outDir` when the RHS root-name differs ⇒ the artifact lands
+    //     on another drive;
+    //   * a bare ".." (no separator ⇒ survives the loader): `outDir / ".."`
+    //     normalizes to outDir's PARENT.
+    // Enforce the real invariant here, where `outDir` is known: the resolved
+    // artifact must be a DIRECT CHILD of `outDir`. Comparing lexically-normalized
+    // paths is OS-agnostic and uniformly also catches NTFS ADS. This is a NO-OP
+    // for the CLI path — there `artifactName` is nullopt ⇒ the name is the source
+    // STEM (always a bare filename) ⇒ always a direct child ⇒ never fires.
+    if (outPath.lexically_normal().parent_path() != outDir.lexically_normal()) {
+        emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
+                   "artifact name '" + artifactName.value_or(sourceStem)
+                   + "' resolves outside the output directory '"
+                   + outDir.generic_string()
+                   + "' — it must be a bare file name (no path separators, no "
+                     "drive/root prefix, and not '.' or '..').");
+        return false;
+    }
 
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
     // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
@@ -807,6 +850,12 @@ int runCusToTargets(
     std::vector<std::string> const&             targets,
     DiagnosticReporter&                         rep,
     std::optional<std::filesystem::path> const& outputDir,
+    // D-AP2-OUTPUT-ROUTING: the project artifactName override (nullopt ⇒
+    // source stem) + the force-`<formatName>/`-subdir flag, threaded verbatim
+    // to `compileOneTarget` alongside `outputDir` (the CLI path passes
+    // nullopt/false ⇒ output byte-identical).
+    std::optional<std::string> const&           artifactName,
+    bool                                        perFormatOutputSubdir,
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
     std::vector<std::filesystem::path> const&   resolveLibraries,
@@ -890,7 +939,8 @@ int runCusToTargets(
         bool const ok = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
             grammar, sourceStem, spec, scratch,
-            outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts,
+            outputDir, /*multiTargetBuild*/ targets.size() > 1u,
+            artifactName, perFormatOutputSubdir, compileOpts,
             executor, jobsOverride);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
@@ -1157,6 +1207,17 @@ int Program::compileProject(
         setResolveLibraries(std::move(mergedLibs));
     }
 
+    // D-AP2-OUTPUT-ROUTING (artifactName + per-platform subdir): stamp the
+    // manifest's OPTIONAL `artifactName` (nullopt ⇒ the source stem names the
+    // binary — unchanged) and FORCE the per-format subdir for EVERY project
+    // build. Multi-target builds already subdir by formatName; setting this
+    // makes a SINGLE-target project build subdir the same way, so a project's
+    // output is consistently `<outputDir>/<formatName>/<artifactName-or-stem>
+    // <ext>` per platform. The CLI path (`Program::run`) sets NEITHER, so a
+    // `--compile` build's names + single-target flat layout stay byte-identical.
+    setArtifactName(pc.artifactName);
+    setPerFormatOutputSubdir(true);
+
     // Route by source COUNT via the shared `routesToMultiUnit` threshold
     // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
     // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒
@@ -1342,7 +1403,7 @@ int Program::compileFiles(
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
         buildCus, *grammar, sourceStem, targets, rep,
-        outputDir_, compileConfig_,
+        outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
         resolveLibraries_, executor_, jobs_);
 }
@@ -1422,7 +1483,8 @@ int Program::compileUnits(
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
         buildCus, *grammar, sourceStem,
-        targets, rep, outputDir_, compileConfig_,
+        targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
+        compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
         resolveLibraries_, executor_, jobs_);
 }

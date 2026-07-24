@@ -37,6 +37,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -231,6 +232,78 @@ TEST(ProjectConfigLoader, EmptyOutputStringFailsLoud) {
     auto pc = parseProjectConfig(R"({
       "language": "c-subset", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "output": ""
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// ── Loader: OPTIONAL `artifactName` (Cycle B — D-AP2-OUTPUT-ROUTING) ─────
+// A bare NAME for the emitted binary (no extension / path separators). Absent
+// ⇒ nullopt (the source stem names the artifact). Present must be a non-empty
+// string with no `/` or `\` (else C_MalformedJson).
+
+TEST(ProjectConfigLoader, ArtifactNamePresentParses) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "artifactName": "myapp"
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(pc->artifactName.has_value());
+    EXPECT_EQ(*pc->artifactName, "myapp");
+}
+
+TEST(ProjectConfigLoader, ArtifactNameAbsentIsNullopt) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(pc->artifactName.has_value());
+}
+
+TEST(ProjectConfigLoader, EmptyArtifactNameFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "artifactName": ""
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, WrongTypeArtifactNameFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "artifactName": 42
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// A path-like value is rejected — artifactName is a bare NAME, not a path
+// (the directory comes from `--output` + the per-format subdir). Both
+// separators are rejected so it never silently escapes the routed output tree.
+TEST(ProjectConfigLoader, ArtifactNameWithForwardSlashFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "artifactName": "foo/bar"
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ArtifactNameWithBackslashFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "artifactName": "a\\b"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
@@ -600,6 +673,13 @@ TEST(ProjectConfigDiagnostics, DArtifactProfileFormatMismatchRoundTrip) {
               "D0011");
 }
 
+TEST(ProjectConfigDiagnostics, DArtifactNameEscapesOutputDirRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ArtifactNameEscapesOutputDir),
+              "D_ArtifactNameEscapesOutputDir");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_ArtifactNameEscapesOutputDir),
+              "D0015");
+}
+
 // ── Routing: routesToMultiUnit (the shared >1 threshold) ────────
 
 TEST(RoutesToMultiUnit, SingleAndZeroRouteToSingleUnit) {
@@ -900,9 +980,13 @@ namespace {
 #if defined(_WIN32)
 constexpr std::string_view kHostExecSpec     = "x86_64:pe64-x86_64-windows-exec";
 constexpr std::string_view kHostExecArtifact = "gate.exe";  // PE ⇒ .exe
+constexpr std::string_view kHostExecFormat   = "pe64-x86_64-windows-exec";
+constexpr std::string_view kHostExecExt      = ".exe";
 #else
 constexpr std::string_view kHostExecSpec     = "x86_64:elf64-x86_64-linux-exec";
 constexpr std::string_view kHostExecArtifact = "gate";      // ELF exec ⇒ no ext
+constexpr std::string_view kHostExecFormat   = "elf64-x86_64-linux-exec";
+constexpr std::string_view kHostExecExt      = "";
 #endif
 
 constexpr std::string_view kGateSrc =
@@ -921,9 +1005,11 @@ constexpr std::string_view kValueSrc =
     "int main(void){ return RETVAL; }\n";
 
 // Build `src` through compileProject with a manifest carrying `defines`, into
-// `dir` (setOutputDir → single-target artifact at <dir>/gate[.exe]). The
-// manifest source path is ABSOLUTE (generic separators — valid in JSON and on
-// Windows) so no cwd change is needed. Returns the compileProject rc.
+// `dir` (setOutputDir → the Cycle-B per-format-subdir artifact at
+// <dir>/<formatName>/gate[.exe] — a project build forces the <formatName>/
+// subdir for EVERY platform, including single-target). The manifest source path
+// is ABSOLUTE (generic separators — valid in JSON and on Windows) so no cwd
+// change is needed. Returns the compileProject rc.
 int buildDefineProject(std::filesystem::path const& dir,
                        std::string_view src,
                        std::vector<std::string> const& defines,
@@ -940,7 +1026,7 @@ int buildDefineProject(std::filesystem::path const& dir,
     writeText(projPath, manifest);
 
     Program prog;
-    prog.setOutputDir(dir);   // single target ⇒ artifact at <dir>/<stem><ext>
+    prog.setOutputDir(dir);   // project build ⇒ artifact at <dir>/<formatName>/<stem><ext>
     return prog.compileProject(projPath.string(), rep);
 }
 }  // namespace
@@ -956,7 +1042,8 @@ TEST(CompileProjectManifestFlags, DefinesThreadToCompileExitCode) {
         DiagnosticReporter rep;
         ASSERT_EQ(buildDefineProject(scratch.path(), kGateSrc, {"DSS_PROJ_GATE"}, rep), 0)
             << "the gated source must compile with the manifest define";
-        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        auto const exe = scratch.path() / std::string{kHostExecFormat}
+                       / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
         auto const r = runBinary(exe, std::chrono::milliseconds{5000});
         ASSERT_TRUE(r.spawned) << r.diagnostic;
@@ -973,7 +1060,8 @@ TEST(CompileProjectManifestFlags, DefinesThreadToCompileExitCode) {
         DiagnosticReporter rep;
         ASSERT_EQ(buildDefineProject(scratch.path(), kGateSrc, {}, rep), 0)
             << "the gated source must still compile with no manifest define";
-        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        auto const exe = scratch.path() / std::string{kHostExecFormat}
+                       / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
         auto const r = runBinary(exe, std::chrono::milliseconds{5000});
         ASSERT_TRUE(r.spawned) << r.diagnostic;
@@ -1001,7 +1089,8 @@ TEST(CompileProjectManifestFlags, DefineValueSubstitutesExitCode) {
         DiagnosticReporter rep;
         ASSERT_EQ(buildDefineProject(scratch.path(), kValueSrc, {"RETVAL=42"}, rep), 0)
             << "the source must compile with the manifest NAME=VALUE define";
-        auto const exe = scratch.path() / std::string{kHostExecArtifact};
+        auto const exe = scratch.path() / std::string{kHostExecFormat}
+                       / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
         auto const r = runBinary(exe, std::chrono::milliseconds{5000});
         ASSERT_TRUE(r.spawned) << r.diagnostic;
@@ -1018,7 +1107,185 @@ TEST(CompileProjectManifestFlags, DefineValueSubstitutesExitCode) {
             << "without the manifest define, RETVAL is undeclared → no compile";
     }
 }
+
+// ── `artifactName` + per-platform subdir routing (Cycle B) ───────
+namespace {
+// Build `int main(){return 42;}` through compileProject with a manifest carrying
+// an OPTIONAL artifactName, into `dir` via setOutputDir. RUNS-capable artifact
+// (host-native exec). The source stem is "app", so the no-artifactName arm's
+// default-stem artifact is <formatName>/app<ext>. Returns the compileProject rc.
+int buildRoutingProject(std::filesystem::path const& dir,
+                        std::optional<std::string> const& artifactName,
+                        DiagnosticReporter& rep) {
+    auto const srcPath = dir / "app.c";
+    writeText(srcPath, "int main(void){ return 42; }\n");
+    std::string manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + std::string{kHostExecSpec} + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"]";
+    if (artifactName) {
+        manifest += ",\n  \"artifactName\": \"" + *artifactName + "\"";
+    }
+    manifest += "\n}";
+    auto const projPath = dir / "app.dss-project.json";
+    writeText(projPath, manifest);
+    Program prog;
+    prog.setOutputDir(dir);
+    return prog.compileProject(projPath.string(), rep);
+}
+}  // namespace
+
+// A project build routes each target's artifact to
+// <output>/<formatName>/<artifactName-or-stem><ext> — the per-format subdir is
+// forced for EVERY project build, INCLUDING single-target. Host-gated (RUNS the
+// artifact) exactly like the defines exit-code proof.
+//
+// RED-ON-DISABLE (two independent levers, both caught by asserting the routed
+// path EXISTS + the flat path does NOT):
+//   * artifactName threading dropped → the binary keeps the SOURCE STEM
+//     ("app") ⇒ <formatName>/myapp<ext> is absent ⇒ the "with" arm goes RED.
+//   * perFormatOutputSubdir dropped → the subdir decision falls back to
+//     multiTargetBuild-only ⇒ a single-target build lands FLAT at
+//     <dir>/myapp<ext> (or <dir>/app<ext>) ⇒ the routed <formatName>/ path is
+//     absent AND the asserted-absent flat path now EXISTS ⇒ both arms go RED.
+TEST(CompileProjectManifestFlags, ArtifactNameRoutesToPerFormatSubdir) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    using dss::test_support::runBinary;
+
+    // (with artifactName "myapp") → <dir>/<formatName>/myapp<ext>, runs → 42.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const dir = scratch.path();
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildRoutingProject(dir, std::string{"myapp"}, rep), 0)
+            << "the artifactName project must compile + emit";
+        auto const routed = dir / std::string{kHostExecFormat}
+                          / (std::string{"myapp"} + std::string{kHostExecExt});
+        ASSERT_TRUE(std::filesystem::exists(routed))
+            << "artifactName must name the binary AND land under <formatName>/; "
+               "expected " << routed.string();
+        // Forced-subdir proof: a "multiTargetBuild only" regression would place
+        // a single-target build FLAT here — assert it is NOT.
+        auto const flat = dir / (std::string{"myapp"} + std::string{kHostExecExt});
+        EXPECT_FALSE(std::filesystem::exists(flat))
+            << "a single-target PROJECT build must be under <formatName>/, not flat";
+        auto const r = runBinary(routed, std::chrono::milliseconds{5000});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u) << "the routed artifact must run → exit 42";
+    }
+    // (no artifactName) → the SOURCE STEM ("app") names the binary, STILL under
+    // <formatName>/ (the forced subdir). myapp-vs-app is the name discriminator;
+    // the subdir presence is the forced-subdir proof.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const dir = scratch.path();
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildRoutingProject(dir, std::nullopt, rep), 0)
+            << "the no-artifactName project must compile + emit";
+        auto const routed = dir / std::string{kHostExecFormat}
+                          / (std::string{"app"} + std::string{kHostExecExt});
+        ASSERT_TRUE(std::filesystem::exists(routed))
+            << "default-stem artifact must land under <formatName>/; expected "
+            << routed.string();
+        auto const flat = dir / (std::string{"app"} + std::string{kHostExecExt});
+        EXPECT_FALSE(std::filesystem::exists(flat))
+            << "a single-target PROJECT build must be under <formatName>/, not flat";
+    }
+}
+
 #endif  // host-native exec (Windows or Linux-x86_64)
+
+// ── CLI path unchanged — single-target `--compile` stays FLAT ────
+// Cycle B forces the per-format subdir for PROJECT builds only. The CLI path
+// (compileFiles/compileUnits with setOutputDir, NO setPerFormatOutputSubdir /
+// artifactName — exactly what Program::run stamps) must be byte-identical: a
+// single-target compile still emits FLAT at <outputDir>/<sourceStem><ext>, NOT
+// under a <formatName>/ subdir. Host-agnostic (fixed cross-target ELF, never
+// run) so it pins the CLI layout on every leg. The disk-side pipeline twin is
+// test_compile_pipeline.cpp's
+// `Program_CompileFiles.OutputFlagSingleTargetPlacesArtifactFlat`.
+TEST(CompileProjectManifestFlags, CliSingleTargetStaysFlatNotSubdir) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";  // ELF exec ⇒ no ext
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const srcPath = dir / "cliflat.c";
+    writeText(srcPath, "int main(void){ return 0; }\n");
+    auto const outDir = dir / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);   // NO setPerFormatOutputSubdir / setArtifactName
+    DiagnosticReporter rep;
+    int const rc = prog.compileFiles({srcPath.string()}, "c-subset", {target}, rep);
+    ASSERT_EQ(rc, 0) << "the CLI single-target compile must succeed";
+    // FLAT: <outDir>/cliflat (source stem, no <formatName>/ subdir interposed).
+    EXPECT_TRUE(std::filesystem::exists(outDir / "cliflat"))
+        << "CLI single-target must stay flat at <outDir>/<stem>";
+    EXPECT_FALSE(std::filesystem::exists(
+        outDir / "elf64-x86_64-linux-exec" / "cliflat"))
+        << "the project per-format subdir must NOT leak into the CLI path";
+}
+
+// ── `artifactName` containment BOUNDARY (Cycle B robustness) ─────
+// The loader validates `artifactName` as a bare name (rejects '/' and '\'), but
+// a separator denylist does NOT prove containment: a bare ".." has no separator,
+// so it SURVIVES the loader, yet `outDir / ".."` normalizes to outDir's PARENT —
+// an escape from the routed output tree. The routing site's containment postcheck
+// (compileOneTarget) must reject it fail-loud. Host-agnostic (fixed cross-target
+// ELF exec ⇒ ext = "" so ".." stays "..", never run) so it pins the boundary on
+// every leg. The same postcheck also covers the Windows drive-relative ("D:app")
+// and NTFS-ADS vectors uniformly (a lexically-normalized parent-path compare, not
+// a per-vector denylist) — not separately unit-tested here to avoid drive-letter
+// fragility.
+//
+// RED-ON-DISABLE: delete the containment postcheck and this exact-code count
+// drops to 0 — the routing would instead carry `<outDir>/..` to the linker,
+// which then fails with an unrelated write error (or, on a writable escape
+// target, LEAKS a file outside --output). The `D_ArtifactNameEscapesOutputDir`
+// count is the lever.
+TEST(CompileProjectManifestFlags, ArtifactNameDotDotEscapeFailsLoud) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";  // ELF exec ⇒ no ext
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const srcPath = dir / "esc.c";
+    writeText(srcPath, "int main(void){ return 0; }\n");
+    auto const outDir = dir / "out";
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
+        + "  \"artifactName\": \"..\"\n}";
+    auto const proj = dir / "esc.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    DiagnosticReporter rep;
+    int const rc = prog.compileProject(proj.string(), rep);
+    EXPECT_NE(rc, 0)
+        << "a '..' artifactName escapes --output and must fail the build";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactNameEscapesOutputDir), 1u)
+        << "the routing containment boundary must reject the '..' escape";
+    // No artifact leaked: the '..' resolves toward <out> (the routed subdir's
+    // parent); assert <out> holds only the <formatName>/ subdir, no emitted file.
+    bool leaked = false;
+    if (std::filesystem::exists(outDir)) {
+        for (auto const& e : std::filesystem::directory_iterator(outDir)) {
+            if (e.is_regular_file()) { leaked = true; break; }
+        }
+    }
+    EXPECT_FALSE(leaked)
+        << "no artifact must be written outside the routed <formatName>/ subdir";
+}
 
 // ── `includes` — compile-only proof (host-agnostic, every leg) ───
 // The test_include_dirs.cpp pattern driven through compileProject: a quote-

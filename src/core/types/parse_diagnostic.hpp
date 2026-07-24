@@ -1079,6 +1079,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   tier-reject surfaces loudly here instead of exiting 1 with no output
     //   (the D-CSUBSET-TESTTU-SILENT-EXIT1 class of silent-exit-1 bug).
     D_CompileUnitNullNoDiagnostic = 0xD014,
+    // D_ArtifactNameEscapesOutputDir (Cycle B, D-AP2-OUTPUT-ROUTING): a project
+    //   manifest's `artifactName` — validated by the loader as a bare name (it
+    //   rejects '/' and '\') — nonetheless RESOLVED to a path OUTSIDE the routed
+    //   output directory when joined onto it. The loader's separator denylist is
+    //   necessary but NOT sufficient for containment; two OS-agnostic vectors
+    //   slip past it:
+    //     * a differing ROOT-NAME (e.g. Windows drive-relative "D:app"):
+    //       `outDir / "D:app"` — std::filesystem::path::operator/ REPLACES the
+    //       left operand when the right has a different root-name, so the
+    //       artifact lands on another drive, outside --output;
+    //     * a `..` component (no separator ⇒ survives the loader): `outDir / ".."`
+    //       lexically-normalizes to outDir's PARENT.
+    //   The routing site (`compileOneTarget`) enforces the real invariant — the
+    //   resolved artifact must be a DIRECT CHILD of the output dir — and fails
+    //   loud here. Remediation-distinct from `D_OutputDirCreateFailed` (0xD00A):
+    //   that is an I/O mkdir failure (fix disk/permissions); this is a
+    //   name-containment violation (fix the manifest's `artifactName` to a plain
+    //   filename). The CLI `--compile` path never trips it — there the name is
+    //   the source STEM (always a bare filename), always a direct child.
+    D_ArtifactNameEscapesOutputDir = 0xD015,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

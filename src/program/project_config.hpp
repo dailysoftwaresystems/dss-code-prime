@@ -37,6 +37,15 @@ namespace dss {
 //                         (a user-authored schema field); its path
 //                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2
 //                         uses the existing per-target output convention.
+//   * `artifactName`    — OPTIONAL base NAME for the emitted binary (no
+//                         extension, no path separators — a name, not a path).
+//                         Absent ⇒ the source stem (unchanged). A project build
+//                         routes each target's artifact to `<outputDir>/
+//                         <formatName>/<artifactName-or-stem><ext>` — the
+//                         per-platform subdir applies to EVERY project build
+//                         (single- or multi-target). This is the artifactName +
+//                         subdir half of D-AP2-OUTPUT-ROUTING (the
+//                         `output`-field-as-output-dir half stays deferred).
 //   * `includes`        — OPTIONAL quote-include search dirs; the file-driven
 //                         counterpart of the CLI `-I <dir>`. Empty when absent.
 //   * `defines`         — OPTIONAL `NAME[=VALUE]` macros; the counterpart of
@@ -53,6 +62,11 @@ struct DSS_EXPORT ProjectConfig {
     std::vector<std::string> targets;
     std::vector<std::string> sources;
     std::optional<std::string> output;   // nullopt iff the field is absent
+    // OPTIONAL base NAME for the emitted binary (no extension / path
+    // separators). nullopt ⇒ the source stem. In a project build each target's
+    // artifact routes to `<outputDir>/<formatName>/<artifactName-or-stem><ext>`
+    // (the artifactName + per-format-subdir half of D-AP2-OUTPUT-ROUTING).
+    std::optional<std::string> artifactName;  // nullopt iff the field is absent
     // OPTIONAL compile-flag fields (empty when the field is absent). Each maps
     // to the same Program state as the matching CLI flag; see the field notes
     // above. Threaded (merge/append) by Program::compileProject.
