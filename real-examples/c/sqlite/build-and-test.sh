@@ -2,60 +2,59 @@
 #
 # real-examples/c/sqlite/build-and-test.sh
 # ─────────────────────────────────────────────────────────────────────────────
-# SQLite-readiness probe harness for DSS Code Prime.
+# SQLite UNIT-CORPUS harness for DSS Code Prime — full-source, no amalgamation.
 #
-# Windows companion: build-and-test.ps1 makes the pe64 leg a fully RUNNABLE target
-# (this .sh runs on Linux, so windows/macos stay compile-only here — a Linux host
-# cannot execute a .exe). The .ps1 invokes WSL to amalgamate, then compiles + RUNS
-# sqlite3.exe natively on Windows.
+# Clone the repo and run ONE command to prove DSS Code Prime builds SQLite from
+# its REAL sources (no amalgamation) into the Tcl `testfixture` and runs SQLite's
+# own `.test` unit corpus GREEN — on the native host AND on arm64 under qemu.
 #
-# Drives the full "can DSS Code Prime build SQLite?" pipeline end-to-end on a
-# Linux or WSL host:
+# Windows companion: build-and-test.ps1 does the same for the pe64 leg.
 #
-#   1. verify the host is Linux / WSL and online
+# The pipeline, end-to-end on a Linux (or WSL) host — macOS runs the native leg:
+#
+#   1. verify the host is Linux / WSL / macOS and online
 #   2. use the dss-code-prime checkout at ~/src AS-IS on its CURRENT branch —
-#      NEVER switched or pulled (a probe tests the working tree exactly as it is,
-#      and running this against a live working repo can't clobber your branch/HEAD);
+#      NEVER switched or pulled (a probe tests the working tree exactly as it is);
 #      an ABSENT dir is freshly cloned (default branch)
 #   3. clone-or-update  sqlite/sqlite    into  ~/src
-#   4. amalgamate SQLite -> sqlite3.c    (autotools: `make sqlite3.c`, needs tclsh)
+#   4. configure SQLite + derive the FULL-SOURCE `testfixture` recipe from the
+#      canonical `make -n testfixture USE_AMALGAMATION=0` — the exact TU list
+#      (every src/*.c + ext/**/*.c + generated parse.c/opcodes.c/ctime.c/… that
+#      the reference build compiles), the -D defines, and the sqlite -I dirs.
+#      DSS compiles the WHOLE source set (it cannot consume gcc's libsqlite3.a),
+#      so the core sources inside that .a are recovered via `ar t`.
 #   5. build dss-code-prime              (its default CMake-4 Release build)
-#   6. compile with dss-code-prime for windows + macos + linux + linux-arm64:
-#        - EVERY target → 2-TU sqlite3.c + shell.c = a real `sqlite3` CLI binary
-#          (shell.c supplies `main`, so the entry-trampoline resolves on every OS)
-#        - RUNNABLE targets (the host's native legs) are then executed (step 7);
-#          COMPILE-ONLY targets are verified to have EMITTED a binary, not run
-#                                        -> ~/src/dss-code-prime/build/real-examples/c/sqlite/<label>/
-#   7. test each runnable CLI with a SQLite smoke unit (SELECT sum → 42 +
-#        --version → 3.54.0) against EXPECTED output: x86_64-linux NATIVE +
-#        arm64-linux under qemu-aarch64 (QEMU_LD_PREFIX = the aarch64 sysroot)
-#   8. summarise results + exit non-zero if an expected step failed for the
-#        sqlite-RUN-green goal: a RUNNABLE-target compile miss OR a runnable-target
-#        smoke miss. A COMPILE-ONLY target that fails to build a clean binary is a
-#        real cross-OS gap — REPORTED as a warning, but not fatal to the runnable exit.
+#   6. stage the third-party HEADERS DSS parses agnostically (real tcl8.6 + zlib,
+#      NO descriptor — D-FFI-SHIPPED-LIBS-OS-ONLY) and obtain the per-leg LIBS the
+#      fixture links + runs against (host libtcl/libz; arm64 via ports .deb extract)
+#   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
+#      from a generated `.dss-project.json` manifest (dss --project mode):
+#        - host  → the native ELF/Mach-O target (runs directly)
+#        - arm64 → elf64-aarch64 (Linux x86_64 host only; runs under qemu-aarch64)
+#      each leg's manifest declares c-subset / cli / the leg's
+#      <targetName>:<formatName> target / the ~185 TUs (absolute `sources`) / the
+#      sqlite+tcl8.6+zlib include dirs / the recipe defines / the leg's
+#      libtcl8.6.so + libz.so.1 (resolveLibraries); the build routes the binary
+#      to <out>/<leg>/<formatName>/testfixture.
+#   8. run SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
+#      runnable leg (DSS_TIER: veryquick[default] | quick | full | all), parse
+#      "N errors out of M tests", and classify each failing test against the
+#      documented non-DSS confounds (WAL set-lock wall-clock timing, an env
+#      error-message text diff, the OOM-oracle recover faults). GREEN = every
+#      failure is a known confound (0 genuine DSS miscompiles).
+#   9. summarise + exit non-zero if any leg has a GENUINE (non-confound) unit
+#      failure, a compile miss, or a fixture crash.
 #
-# DESIGN: every step is idempotent and FAIL-LOUD. The compiler is young, so step 6
-# is the current FRONTIER — sqlite3.c + shell.c (dense C) will surface unsupported
-# constructs and the harness reports exactly where it stopped, per target. Re-run
-# it as the compiler matures; the green frontier advances down the steps. NOTE:
-# dss-code-prime exits 0 even on fatal compile errors, so step 6 reads success from
-# the DIAGNOSTICS (no `error[` line), not the exit code (probe a6b65f8b).
+# DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
+# fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
+# line) + the emitted binary, never `$?` (probe a6b65f8b).
 #
-# NOTE on amalgamation: the canonical `sqlite/sqlite` repo is AUTOTOOLS, not CMake
-# (there is no root CMakeLists.txt — the CMake "amalgamation" projects are third-
-# party wrappers). The amalgamation is produced by `./configure && make sqlite3.c`
-# (requires a `tclsh` 8.6+ interpreter), which is what this harness uses.
-#
-# Overridable via env: DSS_REPO_URL SQLITE_REPO_URL
-#                      SRC_DIR SQLITE_DIR OUT_DIR JOBS  (see the config block below).
+# Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
+#                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  ARM64_LIBDIR
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
-# ── bash 4+ required (associative arrays / `declare -A` below) ────────────────
-# macOS ships bash 3.2 (no `declare -A`). If we're running under an old bash,
-# re-exec under a newer one (Homebrew's `bash`) so the rest of the script — which
-# uses associative arrays for RUNNERS + the target map — parses. Linux hosts have
-# bash 4+/5 already, so this is a no-op there. This block itself is 3.2-safe.
+# ── bash 4+ required (associative arrays / `declare -A`) — macOS ships 3.2 ─────
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   for _newer_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
     if [ -n "$_newer_bash" ] && [ -x "$_newer_bash" ] && "$_newer_bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
@@ -66,12 +65,9 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   exit 1
 fi
 
-# ── config (override via environment) ───────────────────────────────────────
-# dss-code-prime is ALWAYS used at its CURRENT branch state — the harness never
-# switches or pulls our own repo (a probe must test the working tree exactly as
-# it is; there is no DSS_BRANCH / DSS_UPDATE_CHECKOUT knob). Only an ABSENT
-# checkout is freshly cloned (its default branch). SQLite, by contrast, DOES
-# clone-or-pull (it is an external dependency, not the thing under test).
+# ── config (override via environment) ────────────────────────────────────────
+# dss-code-prime is ALWAYS used at its CURRENT branch — the harness never switches
+# or pulls our own repo. SQLite DOES clone-or-pull (external dependency).
 DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
@@ -80,12 +76,24 @@ OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 LANGUAGE="c-subset"
 MIN_CMAKE_MAJOR=4
+# DSS_TIER: which unit-corpus tier to run — veryquick (default, ~331k tests, ~6min
+# native) | quick | full | all. Bigger tiers take far longer (all.test under qemu is
+# hours). DSS_TEST_FILE overrides with a single .test path (fast plumbing check).
+DSS_TIER="${DSS_TIER:-veryquick}"
+# DSS_CONFIG: the compiler pipeline the testfixture is built with — RELEASE by
+# default. This is load-bearing, not just speed: release-only optimizer bugs
+# (regalloc/LICM) are exactly what the corpus must catch, so the fixture MUST
+# exercise the full optimizer; a debug fixture would run the corpus green while
+# masking a release miscompile (and run far slower). Override to `debug` only to
+# isolate whether a corpus failure is optimizer-induced.
+DSS_CONFIG="${DSS_CONFIG:-release}"
+# DSS_CONFOUNDS: ERE patterns (space/newline-separated) for KNOWN non-DSS unit
+# failures — a failing test matching any is not counted against green. Defaults
+# to the documented set (WAL set-lock wall-clock timing on a fast/uncontended box;
+# a zipfile error-message-text env diff; the recover-fault OOM-oracle class).
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
-# The RUNNABLE leg is host-adaptive: an artifact runs NATIVELY only on a host
-# whose (OS, arch) matches the target's. On Linux the ELF legs run (x86_64
-# native + arm64 under qemu); on macOS the native Mach-O leg runs directly.
-# uname -s → OS; uname -m → arch (normalized to the target-spec vocabulary).
 HOST_OS=""
 case "$(uname -s)" in
   Linux)  HOST_OS="linux"  ;;
@@ -96,62 +104,42 @@ case "$(uname -m)" in
   arm64|aarch64) HOST_ARCH="arm64"  ;;
   x86_64|amd64)  HOST_ARCH="x86_64" ;;
 esac
+# the host's native target spec — a full `<targetName>:<formatName>` pair (what
+# both the CLI --target and a project manifest's targets[] require), keyed by
+# (OS, arch). targetName ∈ {x86_64, arm64} (a shipped .target.json); formatName
+# is the shipped exec object-format for that arch+OS.
+host_target_spec() {
+  case "$HOST_OS/$HOST_ARCH" in
+    linux/x86_64) echo "x86_64:elf64-x86_64-linux-exec"   ;;
+    linux/arm64)  echo "arm64:elf64-aarch64-linux-exec"   ;;
+    macos/arm64)  echo "arm64:macho64-arm64-darwin-exec"  ;;
+    macos/x86_64) echo "x86_64:macho64-x86_64-darwin-exec";;
+  esac
+}
 
-# os-label = <targetName>:<formatName>  (the deliverable OSes; --target is repeatable).
-# Two Linux legs (x86_64 native + arm64 under qemu) are the RUNNABLE targets — they
-# compile the real `sqlite3` CLI (sqlite3.c + shell.c, 2-TU) and run the smoke unit
-# (step 7). Which legs RUN is HOST-ADAPTIVE (see RUNNERS below): on a Linux host the
-# two Linux legs run + windows/macos are compile-only; on a macOS (Apple-Silicon) host
-# the NATIVE macho leg runs + the rest are compile-only. Non-runnable legs are: the
-# amalgamation-only single-TU compile is the deliverable-surface witness there.
-declare -a TARGETS=(
-  "windows=x86_64:pe64-x86_64-windows-exec"
-  "macos=arm64:macho64-arm64-darwin-exec"
-  "linux=x86_64:elf64-x86_64-linux-exec"
-  "linux-arm64=arm64:elf64-aarch64-linux-exec"
-)
-# RUNNERS: the label -> run-command PREFIX for every target runnable ON THIS HOST.
-# HOST-ADAPTIVE (the runnable leg follows the host OS + arch):
-#   * Linux host → the two ELF legs: x86_64-linux runs NATIVELY (empty prefix);
-#     arm64-linux runs under user-mode qemu (QEMU_LD_PREFIX → the aarch64 sysroot).
-#   * macOS host → the NATIVE Mach-O leg (empty prefix), but ONLY when the host arch
-#     matches the `macos` target arch (arm64): an arm64 Mach-O runs natively on Apple
-#     Silicon. On an Intel Mac the arm64 leg is not native (nothing runs a Mach-O off
-#     its arch) and macho64-x86_64-darwin-exec is not yet a runnable CLI, so macOS-
-#     x86_64 has NO runnable leg (every target stays compile-only).
-# A label ABSENT from RUNNERS is COMPILE-ONLY: step 6 STILL builds it as the full 2-TU
-# CLI (sqlite3.c + shell.c → a real binary), but step 7 skips the smoke (this host
-# cannot exec a foreign-OS binary). This map is the SINGLE source of "what is runnable
-# and how" — the smoke (step 7) keys on it; step 6 compiles every target the same way.
-declare -A RUNNERS=()
-case "$HOST_OS" in
-  linux)
-    RUNNERS["linux"]=""
-    RUNNERS["linux-arm64"]="qemu-aarch64"
-    ;;
-  macos)
-    # the `macos` target is arm64:macho64-arm64-darwin-exec — native only on arm64.
-    [[ "$HOST_ARCH" == "arm64" ]] && RUNNERS["macos"]=""
-    ;;
-esac
-# QEMU_SYSROOT: the aarch64 sysroot qemu resolves the ELF interpreter + shared libs
-# against (Debian/Ubuntu cross package `libc6-arm64-cross` installs it here).
+# ── LEGS: label -> "spec|runner-prefix|libsrc" ───────────────────────────────
+# The "host" leg is always the native target (runs directly). On a Linux x86_64
+# host the "arm64" cross leg is added: elf64-aarch64 compiled here + RUN under
+# user-mode qemu-aarch64 (QEMU_LD_PREFIX → the aarch64 sysroot; LD_LIBRARY_PATH →
+# the staged arm64 tcl/zlib). libsrc selects which tcl/zlib libraries the leg's
+# fixture links + runs against ("host" | "arm64").
 QEMU_SYSROOT="${QEMU_SYSROOT:-/usr/aarch64-linux-gnu}"
-
-# DSS_OS: optional comma-separated target-label filter for FAST iteration (e.g.
-# DSS_OS=linux compiles only the x86_64-linux leg — faster while ONE target is the
-# active frontier). Default (unset) = every deliverable target; the FINAL green run
-# leaves DSS_OS unset to verify windows + macos + both Linux legs together.
-if [[ -n "${DSS_OS:-}" ]]; then
-  declare -a _dss_filtered=()
-  for _t in "${TARGETS[@]}"; do
-    case ",${DSS_OS}," in *",${_t%%=*},"*) _dss_filtered+=("$_t");; esac
+declare -A LEG_SPEC=() LEG_PREFIX=() LEG_LIBSRC=()
+declare -a LEG_ORDER=()
+add_leg() { LEG_ORDER+=("$1"); LEG_SPEC["$1"]="$2"; LEG_PREFIX["$1"]="$3"; LEG_LIBSRC["$1"]="$4"; }
+_hspec="$(host_target_spec)"
+[[ -n "$_hspec" ]] && add_leg "host" "$_hspec" "" "host"
+if [[ "$HOST_OS" == "linux" && "$HOST_ARCH" == "x86_64" ]]; then
+  add_leg "arm64" "arm64:elf64-aarch64-linux-exec" "qemu-aarch64" "arm64"
+fi
+# DSS_LEGS: comma-separated filter (e.g. DSS_LEGS=host) for fast iteration.
+if [[ -n "${DSS_LEGS:-}" ]]; then
+  declare -a _filtered=()
+  for _l in "${LEG_ORDER[@]}"; do
+    case ",${DSS_LEGS}," in *",${_l},"*) _filtered+=("$_l");; esac
   done
-  if [[ ${#_dss_filtered[@]} -eq 0 ]]; then
-    echo "DSS_OS='${DSS_OS}' matched no target label (windows|macos|linux|linux-arm64)" >&2
-    exit 2
-  fi
-  TARGETS=("${_dss_filtered[@]}")
+  [[ ${#_filtered[@]} -gt 0 ]] || { echo "DSS_LEGS='${DSS_LEGS}' matched no leg (have: ${LEG_ORDER[*]})" >&2; exit 2; }
+  LEG_ORDER=("${_filtered[@]}")
 fi
 
 # ── logging / fail-loud ──────────────────────────────────────────────────────
@@ -167,17 +155,17 @@ warn()  { printf '%s ! %s%s\n' "$C_YLW" "$*" "$C_RST"; }
 die()   { printf '%s ✗ ERROR: %s%s\n' "$C_RED" "$*" "$C_RST" >&2; exit 1; }
 trap 'die "failed at line $LINENO (command: $BASH_COMMAND)"' ERR
 
-# ── package install helpers (host-aware: apt on Linux/WSL, Homebrew on macOS) ─
+# ── package install helpers (apt on Linux/WSL, Homebrew on macOS) ─────────────
 SUDO=""; [[ "$(id -u)" -eq 0 ]] || SUDO="sudo"
 APT_UPDATED=0
 pkg_install() {                 # pkg_install <apt-pkg> [<brew-pkg=apt-pkg>]
   local apt_pkg="$1" brew_pkg="${2:-$1}"
   if [[ "$HOST_OS" == "macos" ]]; then
-    command -v brew >/dev/null 2>&1 || die "Homebrew not found — install it from https://brew.sh, then re-run (needed for: $brew_pkg)."
+    command -v brew >/dev/null 2>&1 || die "Homebrew not found — install from https://brew.sh, then re-run (needed for: $brew_pkg)."
     info "installing (brew): $brew_pkg"
     brew list "$brew_pkg" >/dev/null 2>&1 || brew install "$brew_pkg"
   else
-    command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS. Install missing tools manually: $apt_pkg"
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS. Install manually: $apt_pkg"
     if [[ "$APT_UPDATED" -eq 0 ]]; then $SUDO apt-get update -y >/dev/null; APT_UPDATED=1; fi
     info "installing (apt): $apt_pkg"
     $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$apt_pkg" >/dev/null
@@ -187,13 +175,11 @@ ensure_cmd() {                  # ensure_cmd <command> <apt-pkg> [<brew-pkg>]
   command -v "$1" >/dev/null 2>&1 || pkg_install "$2" "${3:-$2}"
 }
 
-# resolve a repo's default branch (origin/HEAD) — sqlite's may be master/trunk, not main
-default_branch() {
+default_branch() {              # origin/HEAD (sqlite's may be master/trunk, not main)
   local r=""
   r="$(git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" || true
   printf '%s' "${r#origin/}"
 }
-
 clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-empty>
   local url="$1" dir="$2" want="${3:-}"
   if [[ -d "$dir/.git" ]]; then
@@ -212,10 +198,11 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
   info "  at $(git -C "$dir" rev-parse --short HEAD) on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
 }
 
-# ── Step 1 — host is supported (Linux/WSL or macOS) and online ───────────────
-step "1/8  Host check (Linux / WSL / macOS, online)"
+# ── Step 1 — host supported + online ─────────────────────────────────────────
+step "1/9  Host check (Linux / WSL / macOS, online)"
 [[ -n "$HOST_OS"   ]] || die "unsupported host OS — uname -s = '$(uname -s)' (need Linux/WSL or macOS/Darwin)."
 [[ -n "$HOST_ARCH" ]] || die "unsupported host arch — uname -m = '$(uname -m)' (need arm64/aarch64 or x86_64)."
+[[ ${#LEG_ORDER[@]} -gt 0 ]] || die "no runnable leg for this host ($HOST_OS/$HOST_ARCH)."
 if [[ "$HOST_OS" == "macos" ]]; then
   info "host: macOS ($HOST_ARCH, $(uname -r))"
 elif grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
@@ -223,58 +210,47 @@ elif grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
 else
   info "host: native Linux ($HOST_ARCH, $(uname -r))"
 fi
-if [[ ${#RUNNERS[@]} -eq 0 ]]; then
-  warn "no NATIVE runnable leg on this host ($HOST_OS/$HOST_ARCH) — every target is compile-only"
-else
-  info "runnable leg(s) on this host: ${!RUNNERS[*]}"
-fi
+info "legs: ${LEG_ORDER[*]}   tier: $DSS_TIER"
 ensure_cmd curl curl
 curl -fsS --max-time 20 -o /dev/null https://github.com || die "offline — cannot reach https://github.com."
 pass "$HOST_OS/$HOST_ARCH host is online"
-
-# baseline build prerequisites (git for clones; a C compiler + make for SQLite's
-# configure). On macOS these come from the Xcode Command Line Tools (git/make/cc,
-# `xcode-select --install`); on Linux from apt build-essential.
 ensure_cmd git git
 if [[ "$HOST_OS" == "macos" ]]; then
-  command -v cc >/dev/null 2>&1 || die "no C compiler (cc) — run 'xcode-select --install' to get the Xcode Command Line Tools."
-  command -v make >/dev/null 2>&1 || die "no 'make' — run 'xcode-select --install' (Xcode Command Line Tools)."
+  command -v cc >/dev/null 2>&1 || die "no C compiler (cc) — run 'xcode-select --install'."
+  command -v make >/dev/null 2>&1 || die "no 'make' — run 'xcode-select --install'."
 else
   ensure_cmd gcc build-essential
   ensure_cmd make build-essential
+  ensure_cmd ar binutils
 fi
 
-# ── Step 2 — dss-code-prime -> ~/src ─────────────────────────────────────────
-# dss-code-prime is ALWAYS used at its CURRENT branch state. The harness NEVER
-# switches or pulls our own repo — a probe must test the working tree exactly as
-# it is, and a silent `git checkout`/`pull` would clobber live work. There is no
-# branch knob. An EXISTING checkout is used untouched (on whatever branch it is
-# on); only an ABSENT checkout is freshly cloned (its default branch — there is
-# no working tree to disturb).
+# ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
 if [[ -d "$SRC_DIR/.git" ]]; then
-  step "2/8  Use dss-code-prime at $SRC_DIR (current checkout, untouched)"
+  step "2/9  Use dss-code-prime at $SRC_DIR (current checkout, untouched)"
   info "  at $(git -C "$SRC_DIR" rev-parse --short HEAD) on $(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD)"
 else
-  step "2/8  Clone dss-code-prime -> $SRC_DIR (absent — fresh clone, default branch)"
+  step "2/9  Clone dss-code-prime -> $SRC_DIR (absent — fresh clone, default branch)"
   clone_or_update "$DSS_REPO_URL" "$SRC_DIR" ""
 fi
 pass "dss-code-prime ready"
 
-# ── Step 3 — sqlite -> ~/src ─────────────────────────────────────────────────
-step "3/8  Fetch sqlite/sqlite -> $SQLITE_DIR (default branch)"
+# ── Step 3 — sqlite ──────────────────────────────────────────────────────────
+step "3/9  Fetch sqlite/sqlite -> $SQLITE_DIR (default branch)"
 clone_or_update "$SQLITE_REPO_URL" "$SQLITE_DIR" ""
+[[ -f "$SQLITE_DIR/test/$DSS_TIER.test" || -n "${DSS_TEST_FILE:-}" ]] || \
+  die "tier '$DSS_TIER' has no $SQLITE_DIR/test/$DSS_TIER.test (expected veryquick|quick|full|all)."
 pass "sqlite ready"
 
-# ── Step 4 — amalgamate -> sqlite3.c + shell.c (autotools; needs tclsh) ───────
-step "4/8  Amalgamate SQLite (autotools: make sqlite3.c shell.c)"
-# mksqlite3c.tcl needs tclsh 8.6+. macOS ships 8.5 (too old) → install Homebrew
-# tcl-tk (keg-only, so prepend its bin to PATH); Debian's `tcl` metapackage is 8.6+.
+# ── Step 4 — configure + derive the full-source testfixture recipe ───────────
+step "4/9  Derive the full-source testfixture recipe (make -n testfixture)"
+# mksqlite3c.tcl + the fixture link need tclsh 8.6+ and the Tcl dev files
+# (tclConfig.sh — configure detects Tcl through it). apt: tcl (8.6+) + tcl-dev.
 ensure_tclsh() {
   local ver=""
   command -v tclsh >/dev/null 2>&1 && ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
   if [[ -z "$ver" ]] || ! awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}"; then
     [[ -n "$ver" ]] && info "tclsh ${ver} is < 8.6 — installing a newer tcl"
-    pkg_install tcl tcl-tk                       # apt: tcl (8.6+) / brew: tcl-tk
+    pkg_install tcl tcl-tk
     if [[ "$HOST_OS" == "macos" ]]; then
       local tclbin; tclbin="$(brew --prefix tcl-tk 2>/dev/null)/bin"
       [[ -d "$tclbin" ]] && export PATH="$tclbin:$PATH"
@@ -283,295 +259,373 @@ ensure_tclsh() {
   fi
   command -v tclsh >/dev/null 2>&1 || die "tclsh not found after install."
   ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
-  awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}" || die "tclsh ${ver:-none} is < 8.6 (mksqlite3c.tcl needs 8.6+)."
+  awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}" || die "tclsh ${ver:-none} is < 8.6."
   info "tclsh $ver ($(command -v tclsh))"
 }
 ensure_tclsh
+# Tcl dev files (headers + tclConfig.sh) — configure needs them to emit the recipe.
+if [[ "$HOST_OS" == "macos" ]]; then
+  pkg_install tcl tcl-tk
+else
+  command -v dpkg >/dev/null 2>&1 && dpkg -s tcl-dev >/dev/null 2>&1 || pkg_install tcl-dev tcl-tk
+  command -v dpkg >/dev/null 2>&1 && dpkg -s zlib1g-dev >/dev/null 2>&1 || pkg_install zlib1g-dev zlib
+fi
 BLD="$SQLITE_DIR/bld-dss"
 mkdir -p "$BLD"
-# sqlite3.c is the amalgamated LIBRARY (no main); shell.c is the CLI DRIVER (its
-# `main` opens a DB + runs SQL) — the runnable `sqlite3` binary is the two linked
-# together. `make sqlite3.c shell.c` produces BOTH in the autotools build dir.
-( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null && make -s sqlite3.c shell.c )
-AMALGAMATION="$BLD/sqlite3.c"
-SHELL_C="$BLD/shell.c"
-[[ -f "$AMALGAMATION" ]] || die "amalgamation not produced at $AMALGAMATION"
-[[ -f "$SHELL_C" ]] || die "CLI driver shell.c not produced at $SHELL_C (needed for the runnable 2-TU sqlite3 binary)"
-pass "amalgamation: $AMALGAMATION ($(wc -l < "$AMALGAMATION") lines, $(du -h "$AMALGAMATION" | cut -f1))"
-pass "CLI driver : $SHELL_C ($(wc -l < "$SHELL_C") lines)"
+( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null )
+# Build the reference fixture BEST-EFFORT: it generates every derived .c
+# (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a, which the DSS
+# TU set needs. A link-stage miss (e.g. a Tcl lib quirk) is tolerated — we only
+# harvest the byproducts + the recipe, not gcc's binary.
+info "building the reference testfixture (generates derived sources + libsqlite3.a)"
+( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$JOBS" >/dev/null 2>&1 ) || \
+  warn "reference gcc testfixture did not fully link (tolerated — harvesting generated sources + recipe)"
+# Emit the recipe: with testfixture removed but its prereqs built, `make -n` prints
+# the single testfixture cc/link command (the source of TUs + defines + -I dirs).
+rm -f "$BLD/testfixture"
+RECIPE="$OUT_DIR/testfixture-recipe.txt"
+mkdir -p "$OUT_DIR"
+( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
+# `make -n testfixture` is essentially ONE cc command (the fixture link); join its
+# backslash-continuations, then extract each token-type from the whole blob.
+BLOB="$(sed ':a;N;$!ba;s/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
+# defines: -DNAME[=VALUE]  →  DSS `--define NAME[=VALUE]` (strip make's literal "" so
+# SQLITE_PRIVATE="" becomes an EMPTY value, and drop bare shell quoting).
+mapfile -t RECIPE_DEFS < <(printf '%s\n' "$BLOB" | grep -oE '\-D[A-Za-z0-9_]+(=[^ ]*)?' | sed 's/^-D//; s/"//g' | sort -u)
+# sqlite include dirs off the recipe (ext/**, src, .).
+mapfile -t SQLITE_INCS < <(printf '%s\n' "$BLOB" | grep -oE '\-I ?[^ ]+' | sed 's/^-I *//' | grep -v '^\.$' | sort -u)
+# TU set (1): every .c the recipe names directly (the test/ext harness sources +
+# the generated testfixture entry). Most tokens are ABSOLUTE ($(TOP)/…); the few
+# the recipe names RELATIVELY (ctime.c/fts5.c/parse.c/tclsqlite-ex.c) live in the
+# build dir $BLD (make -n's CWD), so an unrooted token is resolved against $BLD
+# too. Without this the generated `tclsqlite-ex.c` — which DEFINES the Tcl
+# `Sqlite3_Init` the fixture links against and is NOT a libsqlite3.a member (so
+# TU-set-2 can't recover it) — is silently dropped and the link fails on an
+# undefined `Sqlite3_Init`.
+declare -A TU=()
+while IFS= read -r c; do
+  [[ -n "$c" ]] || continue
+  if   [[ -f "$c"      ]]; then TU["$c"]=1
+  elif [[ -f "$BLD/$c" ]]; then TU["$BLD/$c"]=1
+  fi
+done < <(printf '%s\n' "$BLOB" | tr ' ' '\n' | grep -E '\.c$' | sort -u)
+# TU set (2): the CORE sources compiled into libsqlite3.a — DSS can't consume the
+# gcc archive, so recover each member's .c (members live in src/, ext/**, or bld/).
+AR="$BLD/libsqlite3.a"; [[ -f "$BLD/.libs/libsqlite3.a" ]] && AR="$BLD/.libs/libsqlite3.a"
+declare -A TU_BASENAME=()      # basename -> path (dedup generated .c aliased in bld/ & bld/tsrc/)
+if [[ -f "$AR" ]]; then
+  while read -r obj; do
+    base="${obj%.o}"
+    hit="$(find "$SQLITE_DIR/src" "$SQLITE_DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | grep -v '/tsrc/' | head -1)"
+    [[ -z "$hit" ]] && hit="$(find "$SQLITE_DIR/src" "$SQLITE_DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | head -1)"
+    [[ -n "$hit" ]] && TU["$hit"]=1
+  done < <(ar t "$AR" 2>/dev/null | grep '\.o$')
+fi
+# de-alias generated .c that exist under both bld/ and bld/tsrc/ (same file, two paths)
+declare -A TU_FINAL=()
+for f in "${!TU[@]}"; do
+  b="$(basename "$f")"
+  if [[ -n "${TU_BASENAME[$b]:-}" ]]; then continue; fi
+  TU_BASENAME["$b"]="$f"; TU_FINAL["$f"]=1
+done
+mapfile -t TUS < <(printf '%s\n' "${!TU_FINAL[@]}" | sort)
+[[ ${#TUS[@]} -ge 150 ]]       || die "recipe derivation yielded only ${#TUS[@]} TUs (<150) — recipe parse broke; see $RECIPE"
+[[ ${#RECIPE_DEFS[@]} -ge 18 ]] || die "recipe derivation yielded only ${#RECIPE_DEFS[@]} defines (<18) — recipe parse broke; see $RECIPE"
+pass "recipe: ${#TUS[@]} TUs, ${#RECIPE_DEFS[@]} defines, ${#SQLITE_INCS[@]} sqlite -I dirs"
 
-# ── Step 5 — build dss-code-prime (its default CMake-4 Release build) ────────
-step "5/8  Build dss-code-prime (CMake ${MIN_CMAKE_MAJOR}+ Release)"
+# ── Step 5 — build dss-code-prime (CMake-4 Release) ──────────────────────────
+step "5/9  Build dss-code-prime (CMake ${MIN_CMAKE_MAJOR}+ Release)"
 cmake_major() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\).*/\1/p'; }
-ensure_cmake() {                # the project requires CMake >= 4.0 (root CMakeLists: cmake_minimum_required(VERSION 4.0))
+ensure_cmake() {
   local major; major="$(cmake_major)"
   if [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]]; then info "cmake: $(cmake --version | sed -n '1p')"; return; fi
-  if [[ "$HOST_OS" == "macos" ]]; then      # macOS → Homebrew (the Kitware tarball below is Linux-only)
+  if [[ "$HOST_OS" == "macos" ]]; then
     warn "CMake ${MIN_CMAKE_MAJOR}+ required (found: ${major:-none}) — installing via Homebrew"
-    pkg_install cmake cmake
-    hash -r; major="$(cmake_major)"
-    [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || \
-      die "CMake ${MIN_CMAKE_MAJOR}+ install failed via brew (got '${major:-none}'). Run 'brew install cmake' and re-run."
-    info "cmake: $(cmake --version | sed -n '1p') (Homebrew)"
-    return
+    pkg_install cmake cmake; hash -r; major="$(cmake_major)"
+    [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || die "CMake ${MIN_CMAKE_MAJOR}+ install failed via brew."
+    info "cmake: $(cmake --version | sed -n '1p') (Homebrew)"; return
   fi
   warn "CMake ${MIN_CMAKE_MAJOR}+ required (found: ${major:-none}) — installing the official Kitware Linux binary"
   ensure_cmd tar tar
   local arch json ver url dest
-  arch="$(uname -m)"            # x86_64 | aarch64 — matches Kitware's release asset names
+  arch="$(uname -m)"
   json="$(curl -fsSL https://api.github.com/repos/Kitware/CMake/releases/latest)"
   ver="$(printf '%s\n' "$json" | sed -n 's/.*"tag_name": *"v\([0-9.]*\)".*/\1/p')"; ver="${ver%%$'\n'*}"
   [[ -n "$ver" ]] || die "could not resolve the latest CMake version from the GitHub API."
   url="https://github.com/Kitware/CMake/releases/download/v${ver}/cmake-${ver}-linux-${arch}.tar.gz"
   dest="$HOME/.local/cmake-${ver}"
   info "downloading CMake ${ver} ($arch) from Kitware"
-  rm -rf "$dest"; mkdir -p "$dest"          # clean re-extract (idempotent on re-run)
+  rm -rf "$dest"; mkdir -p "$dest"
   curl -fsSL "$url" | tar -xz --strip-components=1 -C "$dest"
-  export PATH="$dest/bin:$PATH"; hash -r
-  major="$(cmake_major)"
-  [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || \
-    die "CMake ${MIN_CMAKE_MAJOR}+ install failed (got '${major:-none}'). Install a 4.x build from https://github.com/Kitware/CMake/releases and re-run."
+  export PATH="$dest/bin:$PATH"; hash -r; major="$(cmake_major)"
+  [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || die "CMake ${MIN_CMAKE_MAJOR}+ install failed."
   info "cmake: $(cmake --version | sed -n '1p') (Kitware $ver)"
 }
 ensure_cmake
 ( cd "$SRC_DIR" && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$JOBS" )
 DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
-[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $SRC_DIR/build after the build."
+[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $SRC_DIR/build."
 pass "dss-code-prime built: $DSS_BIN"
 
-# ── Step 6 — compile the 2-TU sqlite3.c + shell.c CLI for every target OS ─────
-step "6/8  Compile SQLite with dss-code-prime (windows + macos + linux + linux-arm64)"
-mkdir -p "$OUT_DIR"
-declare -A COMPILED                 # label -> 1 on success
-COMPILE_FAILS=0                     # total compile misses (all targets — reporting)
-RUNNABLE_COMPILE_FAILS=0           # compile misses on RUNNABLE targets only (fatal)
-# Surface the COMPILER's own `--time` line ("dss-code-prime: compile time <dur>",
-# captured in the log) as a "(compile time <dur>)" suffix — the timing is done by
-# dss-code-prime; the harness only passes --time and echoes the result.
-compile_time_suffix() {
-  local t=""
-  t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null)" || true
-  t="${t##*$'\n'}"                  # last match (no pipe → no SIGPIPE under pipefail)
-  [[ -n "$t" ]] && printf '  (%s)' "$t" || true
+# ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
+step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
+# Headers are leg-INDEPENDENT: DSS parses the host tcl8.6/zlib headers agnostically
+# (ABI is irrelevant at parse). tcl8.6 headers sit in a private subdir (safe on -I);
+# zlib.h sits directly in /usr/include (would shadow the OS descriptors) → stage a
+# private copy of just zlib.h + zconf.h.
+THIRD_PARTY_INCS=()
+# Portable multi-root find. A hardcoded start-dir list mixes Linux + macOS paths
+# (e.g. `/opt/homebrew/*`, `/usr/lib64`); `find` EXITS NON-ZERO on a start dir
+# that does not exist on this host, which under `set -Eeuo pipefail` would abort
+# the whole harness. Restrict the search to the roots that EXIST (a genuinely
+# absent header/lib is still caught by the explicit `… || die` checks below).
+# Usage: find_in <dir>... -- <find-expr>...   (stderr suppressed).
+find_in() {
+  local -a roots=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do [[ -d "$1" ]] && roots+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && shift
+  [[ ${#roots[@]} -gt 0 ]] || return 0
+  find "${roots[@]}" "$@" 2>/dev/null
 }
-# units + defines are CONSTANT across every leg — hoisted out of the per-leg loop so the
-# merged ELF invocation (below) shares them. EVERY target compiles the real 2-TU CLI:
-# sqlite3.c + shell.c (sqlite3.c FIRST — the multi-TU merge needs the library CU ahead of the
-# driver). shell.c supplies `main`, so the entry-trampoline resolves and a real `sqlite3`
-# binary is emitted for every target. (Compiling the amalgamation ALONE as an -exec was a
-# harness BUG: sqlite3.c is a main-less LIBRARY, so it ALWAYS failed at the entry-trampoline
-# regardless of the compiler — masking that windows/macos DO build a clean binary from the 2-TU.)
-# The pe64 target now compiles sqlite DEFINE-FREE, matching the ELF/Mach-O legs — both former
-# knobs are closed by real compiler support: SQLITE_DISABLE_INTRINSIC dropped at c113 (DSS
-# resolves <intrin.h> via the pe-gated shippedLibs/intrin.json descriptor + lowers __umulh /
-# _ReadWriteBarrier as builtin intrinsics), and SQLITE_OMIT_SEH dropped at c116 (DSS implements
-# the MSVC x64 SEH __try/__except: c114 .pdata/.xdata, c115 the frontend, c116 the filter
-# FUNCLETS + __C_specific_handler scope tables + H1 parent-local recovery — the wal.c
-# SEH_TRY/SEH_EXCEPT guards now CATCH an EXCEPTION_IN_PAGE_ERROR on the mmap'd wal-index →
-# SQLITE_IOERR, exactly like an MSVC build). (D-WIN64-SEH-FUNCLETS / D-WIN64-XMM-UNWIND-RESTORE.)
-declare -a units=("$AMALGAMATION" "$SHELL_C")   # sqlite3.c FIRST, then the CLI driver
-declare -a defines=()
-
-# ── D-PERF-3-HARNESS-MULTI-TARGET: the two same-host ELF legs share ONE dss invocation ──────
-# elf64-x86_64 + elf64-aarch64 are both ObjectFormatKind::Elf, so dss preprocesses + parses the
-# 2-TU sqlite3.c + shell.c ONCE (runCusToTargets builds the front-end once per DISTINCT object-
-# format-kind — program.cpp) and lowers that ONE shared parse to BOTH targets: the ~9.5 M-line
-# amalgamation is scanned once, not twice. A MULTI-target dss run routes each artifact to
-# <output>/<formatName>/<stem> (compileOneTarget, multiTargetBuild arm), so the two ELF binaries
-# land under $OUT_DIR/<formatName>/ — NOT the flat per-label dir a single-target run writes.
-#   pe64 + macho stay SEPARATE single-target invocations (each its OWN ObjectFormatKind, flat
-# output at $OUT_DIR/<label>) — FAULT-ISOLATION: runCusToTargets aborts the whole run before
-# codegen if any CU under a format-kind errored, so we only MERGE legs that are green together
-# (the two ELF legs — the real win) and never couple the foreign-OS compile-only legs to them.
-leg_is_elf() { [[ "${1#*:}" == elf* ]]; }        # <spec>: formatName (post-':') starting elf* ⇒ ObjectFormatKind::Elf
-leg_bindir() {                                   # <label> <spec> → the dir holding this leg's binary
-  # ELF legs: the MERGED invocation routes to $OUT_DIR/<formatName>/ when it carries >1 --target
-  # (dss multiTargetBuild), but FLAT to $OUT_DIR/ when only ONE ELF leg is selected (e.g. a
-  # DSS_OS=linux fast-iteration run → single --target → dss writes flat). pe64/macho: $OUT_DIR/<label>.
-  if leg_is_elf "$2"; then
-    if [[ "$ELF_MULTI" == "1" ]]; then printf '%s' "$OUT_DIR/${2#*:}"; else printf '%s' "$OUT_DIR"; fi
-  else
-    printf '%s' "$OUT_DIR/$1"
-  fi
+tcl_header_dir() {
+  local d=""
+  local cfg; cfg="$(find_in /usr/lib /usr/lib64 /usr/local/lib /opt/homebrew/lib -- -name tclConfig.sh | head -1)"
+  [[ -n "$cfg" ]] && d="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_INCLUDE_SPEC#-I}" )"
+  [[ -n "$d" && -f "$d/tcl.h" ]] || d="$(dirname "$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -name tcl.h -path '*tcl8*' | head -1)")"
+  [[ -f "$d/tcl.h" ]] || d="$(dirname "$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -name tcl.h | head -1)")"
+  printf '%s' "$d"
 }
-leg_log() {                                      # <label> <spec> → this leg's compile log
-  if leg_is_elf "$2"; then printf '%s' "$ELF_LOG"; else printf '%s' "$OUT_DIR/$1/compile.log"; fi
-}
-ELF_LOG="$OUT_DIR/elf-merged-compile.log"        # the merged ELF legs share ONE invocation ⇒ ONE log
-declare -a ELF_TARGET_ARGS=() ELF_LABELS=()
-for entry in "${TARGETS[@]}"; do
-  if leg_is_elf "${entry#*=}"; then
-    ELF_TARGET_ARGS+=(--target "${entry#*=}"); ELF_LABELS+=("${entry%%=*}")
-  fi
+TCL_INC="$(tcl_header_dir)"
+[[ -f "$TCL_INC/tcl.h" ]] || die "tcl.h not found — install tcl-dev / tcl8.6-dev (or brew tcl-tk)."
+ZINC="$BLD/zinc"; mkdir -p "$ZINC"
+ZH="$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -maxdepth 3 -name zlib.h | head -1)"
+[[ -n "$ZH" ]] || die "zlib.h not found — install zlib1g-dev (or brew zlib)."
+cp -f "$ZH" "$ZINC/"
+for zc in "$(dirname "$ZH")/zconf.h" $(find_in /usr/include -- -maxdepth 3 -name zconf.h); do
+  [[ -f "$zc" ]] && { cp -f "$zc" "$ZINC/"; break; }
 done
-# A dss run with >1 --target routes each artifact to $OUT_DIR/<formatName>/ (multiTargetBuild);
-# with exactly ONE --target it writes FLAT to $OUT_DIR/. Track which so leg_bindir + the lookups
-# resolve the ELF binaries correctly whether the run carries both ELF legs or a single filtered one.
-ELF_MULTI=0
-[[ ${#ELF_LABELS[@]} -gt 1 ]] && ELF_MULTI=1
-if [[ ${#ELF_TARGET_ARGS[@]} -gt 0 ]]; then
-  info "[elf-merged] ${ELF_LABELS[*]} — ONE preprocess+parse (ObjectFormatKind::Elf) shared across ${#ELF_LABELS[@]} leg(s)"
-  # ⚠ GOTCHA (probe a6b65f8b): dss-code-prime returns EXIT 0 even on FATAL compile errors, so
-  # success is read PER-LEG from the DIAGNOSTICS (no `error[`) + the emitted binary below, never
-  # from `$?`. --time asks the compiler to self-report its wall-clock (surfaced per leg below).
-  "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" "${ELF_TARGET_ARGS[@]}" --output "$OUT_DIR" --time "${defines[@]}" >"$ELF_LOG" 2>&1 || true
-fi
+THIRD_PARTY_INCS=("$TCL_INC" "$ZINC")
+info "tcl headers: $TCL_INC   zlib headers: $ZINC (staged)"
 
-for entry in "${TARGETS[@]}"; do
-  label="${entry%%=*}"; spec="${entry#*=}"
-  # The ONLY per-target difference is step 7: a RUNNABLE target (in RUNNERS) is executed for the
-  # smoke; a COMPILE-ONLY target (a foreign-OS binary this host can't exec) is verified to have
-  # EMITTED a binary and is not run.
-  if [[ -n "${RUNNERS[$label]+set}" ]]; then
-    local_kind="sqlite3.c + shell.c (2-TU → runnable sqlite3)"
-  else
-    local_kind="sqlite3.c + shell.c (2-TU → binary emitted; foreign-OS, not run here)"
+# host libraries (the native leg links + runs against these)
+find_first() { local n; for n in "$@"; do local h; h="$(find_in /usr/lib /lib /usr/local/lib /opt/homebrew/lib -- -name "$n" | head -1)"; [[ -n "$h" ]] && { printf '%s' "$h"; return; }; done; }
+HOST_TCL_LIB="$(find_first 'libtcl8.6.so' 'libtcl8.6.so.0' 'libtcl8.6.dylib')"
+HOST_Z_LIB="$(find_first 'libz.so' 'libz.so.1' 'libz.dylib')"
+[[ -n "$HOST_TCL_LIB" ]] || die "host libtcl8.6 not found (install tcl-dev / brew tcl-tk)."
+[[ -n "$HOST_Z_LIB"   ]] || die "host libz not found (install zlib1g-dev / brew zlib)."
+info "host libs: $HOST_TCL_LIB  +  $HOST_Z_LIB"
+
+# arm64 libraries (only if an arm64 leg is selected) — Ubuntu ports .deb extract,
+# NO apt-source surgery: resolve the exact .deb from the ports Packages index, then
+# dpkg-deb -x and harvest the runtime .so. qemu resolves libc/libm from the sysroot.
+ARM64_LIBDIR="${ARM64_LIBDIR:-$HOME/.cache/dss-code-prime/arm64libs}"
+ensure_arm64_libs() {
+  if [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" && -e "$ARM64_LIBDIR/libz.so.1" ]]; then
+    info "arm64 libs cached: $ARM64_LIBDIR ($(ls "$ARM64_LIBDIR" | tr '\n' ' '))"; return
   fi
-  log="$(leg_log "$label" "$spec")"
-  if leg_is_elf "$spec"; then
-    # already built above in the SHARED ELF invocation; classify this leg from the merged log +
-    # its OWN <formatName>/ artifact (fault-isolated per-leg by whether ITS binary emitted).
-    info "[$label] $spec — $local_kind (shared ELF invocation)"
-  else
-    # pe64 / macho: its OWN single-target invocation, flat output at $OUT_DIR/<label>.
-    outd="$OUT_DIR/$label"; mkdir -p "$outd"
-    info "[$label] $spec — $local_kind"
-    "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
+  ensure_cmd curl curl; ensure_cmd dpkg-deb dpkg; ensure_cmd gzip gzip; ensure_cmd qemu-aarch64 qemu-user
+  mkdir -p "$ARM64_LIBDIR"
+  local work; work="$(mktemp -d)"
+  local codename; codename="$( . /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-noble}" )"
+  local baseurl="http://ports.ubuntu.com/ubuntu-ports"
+  local idx="$work/Packages"
+  info "arm64 libs: fetching ports index ($codename/main)"
+  curl -fsSL "$baseurl/dists/$codename/main/binary-arm64/Packages.gz" | gzip -d > "$idx" || die "cannot fetch ports arm64 Packages index for '$codename'."
+  local pkg rel
+  for pkg in libtcl8.6 zlib1g libtommath1; do
+    rel="$(awk -v p="$pkg" '$1=="Package:"{c=$2} $1=="Filename:"&&c==p{print $2; exit}' "$idx")"
+    [[ -n "$rel" ]] || { warn "arm64 $pkg not in ports index (skipping — may be optional)"; continue; }
+    info "  downloading $pkg:arm64"
+    curl -fsSL "$baseurl/$rel" -o "$work/$pkg.deb" || die "download failed: $pkg ($baseurl/$rel)"
+    dpkg-deb -x "$work/$pkg.deb" "$work/root"
+  done
+  find "$work/root" \( -name 'libtcl8.6.so*' -o -name 'libz.so*' -o -name 'libtommath.so*' \) \
+    -exec cp -Pa {} "$ARM64_LIBDIR/" \; 2>/dev/null || true
+  # ensure the DT_NEEDED soname link exists (tcl bakes libtcl8.6.so.0)
+  if [[ ! -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]]; then
+    local rt; rt="$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so*' | head -1)"
+    [[ -n "$rt" ]] && ln -sf "$(basename "$rt")" "$ARM64_LIBDIR/libtcl8.6.so.0"
   fi
-  # Success = NO `error[` diagnostics AND a real `sqlite3` binary was emitted (not just the
-  # compile.log). The 2-TU build has a `main`, so every clean target emits one. Merged ELF legs
-  # read their binary from $OUT_DIR/<formatName>/; pe64/macho from $OUT_DIR/<label>. The `|| true`
-  # keeps a missing-dir find (a compile that never reached codegen) fail-loud, not set -e-fatal.
-  bindir="$(leg_bindir "$label" "$spec")"
-  emitted_bin="$(find "$bindir" -maxdepth 1 -type f -name 'sqlite3*' -print -quit 2>/dev/null || true)"
-  if grep -qE 'error\[' "$log" || [[ -z "$emitted_bin" ]]; then
+  # a plain `.so` alias for --resolve-library introspection
+  [[ -e "$ARM64_LIBDIR/libtcl8.6.so" ]] || ln -sf "$(basename "$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so.0' | head -1)")" "$ARM64_LIBDIR/libtcl8.6.so" 2>/dev/null || true
+  rm -rf "$work"
+  [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]] || die "arm64 libtcl8.6 not obtained under $ARM64_LIBDIR."
+  [[ -e "$ARM64_LIBDIR/libz.so.1"      ]] || die "arm64 libz not obtained under $ARM64_LIBDIR."
+  info "arm64 libs staged: $(ls "$ARM64_LIBDIR" | tr '\n' ' ')"
+}
+for leg in "${LEG_ORDER[@]}"; do
+  [[ "${LEG_LIBSRC[$leg]}" == "arm64" ]] && { ensure_arm64_libs; break; }
+done
+# resolve each leg's (tcl,z) library pair for --resolve-library + runtime.
+leg_tcl_lib() { case "${LEG_LIBSRC[$1]}" in arm64) find_first_in "$ARM64_LIBDIR" libtcl8.6.so libtcl8.6.so.0 ;; *) printf '%s' "$HOST_TCL_LIB" ;; esac; }
+leg_z_lib()   { case "${LEG_LIBSRC[$1]}" in arm64) find_first_in "$ARM64_LIBDIR" libz.so.1 libz.so ;;          *) printf '%s' "$HOST_Z_LIB"   ;; esac; }
+find_first_in() { local d="$1"; shift; local n; for n in "$@"; do [[ -e "$d/$n" ]] && { printf '%s' "$d/$n"; return; }; done; }
+pass "headers + libraries ready for: ${LEG_ORDER[*]}"
+
+# ── Step 7 — build the full-source testfixture with dss-code-prime, per leg ──
+step "7/9  Build the full-source testfixture (dss-code-prime --project), per leg"
+declare -A FIXTURE=()          # leg -> binary path (on success)
+declare -A COMPILE_OK=()
+COMPILE_FAILS=0
+# the per-leg manifest is emitted as clean JSON by python3 (a harness dep now).
+ensure_cmd python3 python3
+# The leg-INDEPENDENT include-dir set: the sqlite recipe dirs + the staged
+# third-party tcl8.6/zlib headers + the build tree ($BLD, which resolves the
+# recipe's relative `-I.`). These dirs, the TU list (${TUS[@]}) and the recipe
+# defines (${RECIPE_DEFS[@]}, already `-D`-stripped) are the SAME inputs the
+# per-file CLI fed; here they populate a `.dss-project.json` manifest instead.
+declare -a INC_DIRS=()
+for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"); done
+
+# generate_manifest <spec> <tcl-lib> <z-lib> <out-manifest> — write a project
+# manifest reproducing the recipe: language c-subset, profile cli, ONE target
+# (the leg's <targetName>:<formatName> spec), artifactName testfixture, the full
+# TU set as ABSOLUTE `sources`, the `includes` dirs, the `defines` (a leading
+# `-D` stripped defensively; an empty SQLITE_PRIVATE= value preserved), and the
+# leg's (tcl, z) libraries as `resolveLibraries`. The arrays reach python3 via
+# the ENVIRONMENT (newline-joined) — never argv — so 185 paths can't overflow
+# ARG_MAX or trip quoting. Echoes the array counts for the build log.
+generate_manifest() {
+  local spec="$1" tcl_lib="$2" z_lib="$3" out="$4"
+  MANIFEST_SPEC="$spec" MANIFEST_TCL="$tcl_lib" MANIFEST_Z="$z_lib" \
+  MANIFEST_TUS="$(printf '%s\n' "${TUS[@]}")" \
+  MANIFEST_INCS="$(printf '%s\n' "${INC_DIRS[@]}")" \
+  MANIFEST_DEFS="$(printf '%s\n' "${RECIPE_DEFS[@]}")" \
+  python3 - "$out" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+def lines(name):
+    return [x for x in os.environ.get(name, "").splitlines() if x]
+def strip_d(d):
+    return d[2:] if d.startswith("-D") else d   # RECIPE_DEFS is pre-stripped; defensive
+manifest = {
+    "language":         "c-subset",
+    "artifactProfile":  "cli",
+    "targets":          [os.environ["MANIFEST_SPEC"]],
+    "artifactName":     "testfixture",
+    "sources":          lines("MANIFEST_TUS"),
+    "includes":         lines("MANIFEST_INCS"),
+    "defines":          [strip_d(d) for d in lines("MANIFEST_DEFS")],
+    "resolveLibraries": [os.environ["MANIFEST_TCL"], os.environ["MANIFEST_Z"]],
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+print("sources=%d includes=%d defines=%d" % (
+    len(manifest["sources"]), len(manifest["includes"]), len(manifest["defines"])))
+PY
+}
+compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
+for leg in "${LEG_ORDER[@]}"; do
+  spec="${LEG_SPEC[$leg]}"; fmt="${spec##*:}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
+  manifest="$outd/$leg.dss-project.json"
+  mkdir -p "$outd"
+  tcl_lib="$(leg_tcl_lib "$leg")"; z_lib="$(leg_z_lib "$leg")"
+  [[ -n "$tcl_lib" && -n "$z_lib" ]] || die "[$leg] could not resolve tcl/zlib libraries."
+  info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "$tcl_lib"), $(basename "$z_lib"))"
+  counts="$(generate_manifest "$spec" "$tcl_lib" "$z_lib" "$manifest")" \
+    || die "[$leg] manifest generation failed (python3) — see above."
+  info "[$leg] manifest → $manifest ($counts)"
+  # A project build routes each target to <output>/<formatName>/<artifactName>.
+  # dss-code-prime returns EXIT 0 even on fatal errors → judge from `error[` + the binary.
+  "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
+  bin="$outd/$fmt/testfixture"
+  if grep -qE 'error\[' "$log" || [[ ! -x "$bin" ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
-    # A RUNNABLE target's compile miss is a FATAL regression of the sqlite-RUN-green goal. A
-    # COMPILE-ONLY target's miss is a real cross-OS BUILD gap (non-fatal to the runnable-leg exit).
-    if [[ -n "${RUNNERS[$label]+set}" ]]; then
-      RUNNABLE_COMPILE_FAILS=$((RUNNABLE_COMPILE_FAILS + 1))
-    fi
     if grep -qE 'error\[' "$log"; then
-      warn "[$label] compile FAILED$(compile_time_suffix "$log") — first diagnostics from $log:"
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
     else
-      warn "[$label] compile FAILED$(compile_time_suffix "$log") — 0 error[ diagnostics but no sqlite3 binary emitted under $bindir"
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
     fi
   else
-    COMPILED["$label"]=1
-    pass "[$label] compiled -> $emitted_bin$(compile_time_suffix "$log")"
+    FIXTURE["$leg"]="$bin"; COMPILE_OK["$leg"]=1
+    pass "[$leg] testfixture -> $bin$(compile_time_suffix "$log")"
   fi
 done
 
-# ── Step 7 — test the runnable sqlite3 CLIs against EXPECTED output ───────────
-step "7/8  Test SQLite (smoke: SELECT sum → 42, --version → 3.54.0)"
-# The smoke unit is a REAL SQL round-trip through the dss-built `sqlite3` CLI:
-#   CREATE a table, INSERT 1 and 41, SELECT sum(x) → must print 42 (an
-#   in-memory DB exercises the parser, VDBE, b-tree, and aggregation), AND
-#   `--version` must print SQLite's version string 3.54.0. Each runnable target
-#   (x86_64-linux NATIVE + arm64-linux under qemu) runs BOTH against the EXPECTED
-#   text — a wrong number, a crash (no output), or a version mismatch is a fail.
-SQL_SMOKE='CREATE TABLE t(x);
-INSERT INTO t VALUES(1);
-INSERT INTO t VALUES(41);
-SELECT sum(x) FROM t;'
-EXPECT_SUM="42"
-EXPECT_VERSION_PREFIX="3.54.0"    # the CLI prints "3.54.0 <date> <hash>"; match the version token
-declare -A SMOKE                  # label -> PASS / FAIL:<reason> / skipped
-SMOKE_FAILS=0
-# Resolve a target's run wrapper: native (empty prefix) runs the ELF directly;
-# arm64 runs under qemu-aarch64 with QEMU_LD_PREFIX → the aarch64 sysroot (so the
-# dynamic loader + libc.so.6 resolve). The examples runner merges child stderr into
-# stdout; we do the same (2>&1) so a crash's diagnostics ride the captured output.
-run_target() {                    # run_target <label> <binary> <args...>  (stdin forwarded)
-  local label="$1" bin="$2"; shift 2
-  local pfx="${RUNNERS[$label]}"
+# ── Step 8 — run the .test UNIT CORPUS through each leg's fixture ─────────────
+step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failures"
+TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
+[[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
+read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
+declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
+UNIT_FAILS=0
+run_leg() {                    # run_leg <leg> <bin> <args...>
+  local leg="$1" bin="$2"; shift 2
+  local pfx="${LEG_PREFIX[$leg]}"
   if [[ -z "$pfx" ]]; then
     "$bin" "$@" 2>&1
   else
-    QEMU_LD_PREFIX="$QEMU_SYSROOT" "$pfx" "$bin" "$@" 2>&1
+    QEMU_LD_PREFIX="$QEMU_SYSROOT" LD_LIBRARY_PATH="$ARM64_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$pfx" "$bin" "$@" 2>&1
   fi
 }
-for entry in "${TARGETS[@]}"; do
-  label="${entry%%=*}"; spec="${entry#*=}"
-  # Only RUNNABLE targets are smoke-tested; compile-only ones (windows/macos) skip.
-  [[ -n "${RUNNERS[$label]+set}" ]] || continue
-  if [[ "${COMPILED[$label]:-0}" != "1" ]]; then
-    SMOKE["$label"]="skipped (compile failed)"; warn "[$label] smoke skipped — step 6 did not compile it"
-    continue
+for leg in "${LEG_ORDER[@]}"; do
+  if [[ "${COMPILE_OK[$leg]:-0}" != "1" ]]; then
+    UNIT_VERDICT["$leg"]="skipped (compile failed)"; warn "[$leg] corpus skipped — step 7 did not compile the fixture"; continue
   fi
-  # Merged ELF legs live at $OUT_DIR/<formatName>/ (multi-target routing); pe64/macho at
-  # $OUT_DIR/<label> (flat single-target). leg_bindir resolves the right one per leg.
-  bindir="$(leg_bindir "$label" "$spec")"
-  bin="$(find "$bindir" -maxdepth 1 -type f -perm -u+x -print -quit 2>/dev/null)"
-  if [[ -z "$bin" ]]; then
-    SMOKE["$label"]="FAIL:no runnable artifact emitted"; SMOKE_FAILS=$((SMOKE_FAILS + 1))
-    warn "[$label] smoke FAIL — no runnable artifact under $bindir"
-    continue
+  bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
+  runlog="$OUT_DIR/$leg/corpus.log"
+  info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
+  ( cd "$rundir" && run_leg "$leg" "$bin" "$TEST_FILE" ) > "$runlog" 2>&1 || true
+  # summary "N errors out of M tests"; canonical failure list "Failures on these tests: …"
+  summary="$(grep -E '[0-9]+ errors? out of [0-9]+ tests' "$runlog" | tail -1 || true)"
+  faillist="$(sed -n 's/^Failures on these tests:[[:space:]]*//p' "$runlog" | tail -1 || true)"
+  if [[ -z "$summary" ]]; then
+    UNIT_VERDICT["$leg"]="FAIL:fixture did not complete the suite (crash?) — see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
+    tail -4 "$runlog" 2>/dev/null | sed 's/^/      /'; continue
   fi
-  # (1) SQL round-trip: pipe the smoke SQL on stdin, expect exactly "42".
-  sql_out="$(printf '%s\n' "$SQL_SMOKE" | run_target "$label" "$bin" 2>&1 || true)"
-  # (2) version: `--version` prints the version string; match the 3.54.0 token.
-  ver_out="$(run_target "$label" "$bin" --version </dev/null 2>&1 || true)"
-  reasons=""
-  if [[ "$(printf '%s' "$sql_out" | tr -d '[:space:]')" != "$EXPECT_SUM" ]]; then
-    reasons="SELECT sum(x)!=$EXPECT_SUM (got: $(printf '%s' "$sql_out" | head -c 120 | tr '\n' ' '))"
+  nerr="$(printf '%s' "$summary" | grep -oE '^[0-9]+' || echo 0)"
+  declare -a real=() confound=()
+  for t in $faillist; do
+    is_c=0
+    for p in "${CONFOUND_PATTERNS[@]}"; do [[ "$t" =~ $p ]] && { is_c=1; break; }; done
+    if [[ "$is_c" == 1 ]]; then confound+=("$t"); else real+=("$t"); fi
+  done
+  # conservative: if the summary reports errors but the fixture printed no
+  # classifiable failure list, treat the run as RED (unclassified).
+  if [[ "$nerr" -gt 0 && -z "$faillist" ]]; then
+    UNIT_VERDICT["$leg"]="FAIL:$nerr error(s) but no 'Failures on these tests:' list to classify — see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — $summary (unclassifiable)"; continue
   fi
-  case "$ver_out" in
-    "$EXPECT_VERSION_PREFIX"*) ;;   # ok — version line leads with 3.54.0
-    *) reasons="${reasons:+$reasons; }--version!=$EXPECT_VERSION_PREFIX* (got: $(printf '%s' "$ver_out" | head -c 120 | tr '\n' ' '))" ;;
-  esac
-  if [[ -z "$reasons" ]]; then
-    SMOKE["$label"]="PASS"
-    pass "[$label] smoke PASS — SELECT sum → 42, --version → $EXPECT_VERSION_PREFIX"
+  if [[ ${#real[@]} -eq 0 ]]; then
+    if [[ ${#confound[@]} -eq 0 ]]; then
+      UNIT_VERDICT["$leg"]="PASS ($summary)"
+      pass "[$leg] corpus GREEN — $summary"
+    else
+      UNIT_VERDICT["$leg"]="PASS ($summary; ${#confound[@]} known non-DSS confound(s): ${confound[*]})"
+      pass "[$leg] corpus GREEN — $summary; all ${#confound[@]} failure(s) are known non-DSS confounds: ${confound[*]}"
+    fi
   else
-    SMOKE["$label"]="FAIL:$reasons"; SMOKE_FAILS=$((SMOKE_FAILS + 1))
-    warn "[$label] smoke FAIL — $reasons"
+    UNIT_VERDICT["$leg"]="FAIL:${#real[@]} genuine unit failure(s): ${real[*]}"
+    UNIT_FAILS=$((UNIT_FAILS + 1))
+    warn "[$leg] corpus FAIL — $summary; ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
+    [[ ${#confound[@]} -gt 0 ]] && info "      (+${#confound[@]} known confound(s) ignored: ${confound[*]})"
   fi
+  unset real confound
 done
 
-# ── Step 8 — results ─────────────────────────────────────────────────────────
-step "8/8  Results"
+# ── Step 9 — results ─────────────────────────────────────────────────────────
+step "9/9  Results"
 printf '   compiler : %s @ %s\n' "$DSS_BIN" "$(git -C "$SRC_DIR" rev-parse --short HEAD)"
-printf '   sqlite   : %s @ %s\n' "$AMALGAMATION" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
-printf '   outputs  : %s\n' "$OUT_DIR"
-for entry in "${TARGETS[@]}"; do
-  label="${entry%%=*}"; spec="${entry#*=}"
-  compiled="no"; [[ "${COMPILED[$label]:-0}" == "1" ]] && compiled="yes"
-  runnable="compile-only"; [[ -n "${RUNNERS[$label]+set}" ]] && runnable="runnable"
-  smoke="${SMOKE[$label]:--}"       # "-" for compile-only targets (no smoke)
-  if [[ "$compiled" == "yes" ]]; then
-    printf '   %-11s : %scompiled%s (%s)  smoke: %s\n' "$label" "$C_GRN" "$C_RST" "$runnable" "$smoke"
+printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
+printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
+printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
+for leg in "${LEG_ORDER[@]}"; do
+  spec="${LEG_SPEC[$leg]}"
+  if [[ "${COMPILE_OK[$leg]:-0}" == "1" ]]; then
+    printf '   %-6s (%s): %scompiled%s   units: %s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}"
   else
-    # leg_log resolves the right log: the merged ELF legs share $ELF_LOG; pe64/macho keep
-    # their own $OUT_DIR/<label>/compile.log.
-    printf '   %-11s : %sFAILED%s (%s)  see %s\n' "$label" "$C_RED" "$C_RST" "$runnable" "$(leg_log "$label" "$spec")"
+    printf '   %-6s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
   fi
 done
-
-# COMPILE-ONLY targets (foreign-OS binaries this host can't exec) now build the real
-# 2-TU CLI and are EXPECTED to emit a clean binary — so a miss here is a genuine
-# cross-OS BUILD regression, not a "known frontier". Surface it loudly, but keep it
-# NON-FATAL to the runnable-leg exit: the legs that actually RUN on this host are the
-# RUN-green gate, and a foreign-OS target is run-verified via its NATIVE runner
-# (build-and-test.ps1 on Windows; an Apple-Silicon host for macOS).
-compile_only_fails=$((COMPILE_FAILS - RUNNABLE_COMPILE_FAILS))
-if [[ "$compile_only_fails" -gt 0 ]]; then
-  printf '\n%s%d compile-only target(s) did not build a clean binary — a real cross-OS build gap; inspect the compile.log.%s\n' "$C_YLW" "$compile_only_fails" "$C_RST"
-  printf '%sNon-fatal to the runnable-leg exit (foreign-OS targets are run-verified via their native runner).%s\n' "$C_YLW" "$C_RST"
-fi
-
-# Exit non-zero if an EXPECTED step failed for the sqlite-RUN-green goal: a RUNNABLE
-# target's compile miss (step 6) OR a runnable target's smoke miss (step 7). These
-# are the real regressions — the two Linux legs must build the CLI AND run the SQL.
-if [[ "$RUNNABLE_COMPILE_FAILS" -gt 0 ]]; then
-  printf '\n%s%d RUNNABLE target(s) did not compile — the sqlite-RUN-green frontier is at step 6.%s\n' "$C_RED" "$RUNNABLE_COMPILE_FAILS" "$C_RST"
-  printf '%sInspect the per-target compile.log diagnostics to pick the next compiler feature to land.%s\n' "$C_RED" "$C_RST"
+if [[ "$COMPILE_FAILS" -gt 0 ]]; then
+  printf '\n%s%d leg(s) failed to compile the testfixture — inspect the compile.log diagnostics.%s\n' "$C_RED" "$COMPILE_FAILS" "$C_RST"
   exit 1
 fi
-if [[ "$SMOKE_FAILS" -gt 0 ]]; then
-  printf '\n%s%d runnable target(s) compiled but FAILED the SQL smoke — the RUN frontier.%s\n' "$C_RED" "$SMOKE_FAILS" "$C_RST"
-  printf '%sInspect the smoke reasons above (a wrong sum / a crash / a version mismatch).%s\n' "$C_RED" "$C_RST"
+if [[ "$UNIT_FAILS" -gt 0 ]]; then
+  printf '\n%s%d leg(s) had genuine unit failures (non-confound) — the corpus is not green.%s\n' "$C_RED" "$UNIT_FAILS" "$C_RST"
   exit 1
 fi
-pass "every RUNNABLE target compiled (2-TU) + passed the SQL smoke — SQLite builds AND runs with dss-code-prime"
+pass "every leg compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime"
