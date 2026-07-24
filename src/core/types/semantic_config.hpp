@@ -319,6 +319,16 @@ struct DSS_EXPORT DeclaratorConfig {
     std::optional<RuleId> arrayStarSuffixRule;
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
+    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL attribute-specifier rules
+    // (`attrSpec`, `stdAttr`) that may appear as an AFTER-DECLARATOR suffix inside
+    // an `initDeclarator` (`void f(void) __attribute__((noreturn));`). The
+    // init-detection scans (which read the "first non-declarator visible child"
+    // as the initializer) MUST skip these, else the attribute is mis-lowered as
+    // the initializer value (S_TypeMismatch). EMPTY ⇒ the language declares no
+    // after-declarator attribute suffix (toy/tsql, and c-subset before this) —
+    // the scans behave exactly as before.
+    std::vector<RuleId>      afterDeclaratorAttrRules;
+    std::vector<std::string> afterDeclaratorAttrRuleNames;
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
     // member-declarator roles — the member-list analogue of
     // `initDeclaratorRule`/`listRule`. `memberDeclaratorRule` is the per-slot

@@ -8032,6 +8032,7 @@ struct Lowerer {
                 for (NodeId c : visible(d)) {
                     if (isToken(c)) continue;
                     if (tree().rule(c).v == dc.declaratorRule.v) continue;
+                    if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62
                     init = lowerExprOrBraceInit(c, type);
                     break;
                 }
@@ -8958,12 +8959,25 @@ struct Lowerer {
     // initializer — an initDeclarator with a visible Internal child that is NOT the
     // declarator (the `= initValue` subtree). Used to reject an extern-with-
     // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
+    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): is `c` an AFTER-DECLARATOR attribute node
+    // (`attrSpec`/`stdAttr`) rather than the initializer? The init-detection scans
+    // must skip these so `void f(void) __attribute__((noreturn));` is not
+    // mis-lowered with the attribute as its init value (S_TypeMismatch).
+    [[nodiscard]] bool isAfterDeclaratorAttr(NodeId c, DeclaratorConfig const& dc) {
+        if (isToken(c)) return false;
+        RuleId const r = tree().rule(c);
+        for (RuleId ar : dc.afterDeclaratorAttrRules)
+            if (r.v == ar.v) return true;
+        return false;
+    }
+
     [[nodiscard]] bool
     initDeclaratorHasInitializer(NodeId d, DeclaratorConfig const& dc) {
         if (tree().rule(d).v != dc.initDeclaratorRule.v) return false;
         for (NodeId c : visible(d)) {
             if (isToken(c)) continue;
             if (tree().rule(c).v == dc.declaratorRule.v) continue;
+            if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62: not the init
             return true;   // a non-declarator internal child = the initializer
         }
         return false;

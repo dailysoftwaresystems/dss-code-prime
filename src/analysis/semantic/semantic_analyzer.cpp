@@ -2498,6 +2498,11 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
+            // TF-C62: an after-declarator attribute is not the initializer.
+            bool isAttr = false;
+            for (RuleId ar : cfg.declarators->afterDeclaratorAttrRules)
+                if (tree.rule(c).v == ar.v) { isAttr = true; break; }
+            if (isAttr) continue;
             initNode = c;
             break;
         }
@@ -4080,6 +4085,21 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 // `declaratorRule` — structurally identical to how the HIR global-init lowering
 // finds the init (cst_to_hir.cpp `lowerVarLikeInto`), so the two cannot drift.
 // Config-driven on the resolved rule ROLES (no keyword / `=`-token identity).
+// TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): is `c` an AFTER-DECLARATOR attribute node
+// (`attrSpec`/`stdAttr` in an `initDeclarator`)? Every init-detection scan below
+// (which reads the "first non-declarator visible child" as the initializer) MUST
+// skip these, else `void f(void) __attribute__((format(printf,1,2)));` mis-reads
+// the attribute as the init value and type-checks its args → S_TypeMismatch.
+[[nodiscard]] inline bool isAfterDeclaratorAttrNode(Tree const& tree,
+                                                    DeclaratorConfig const& dc,
+                                                    NodeId c) {
+    if (tree.kind(c) != NodeKind::Internal) return false;
+    RuleId const r = tree.rule(c);
+    for (RuleId ar : dc.afterDeclaratorAttrRules)
+        if (r.v == ar.v) return true;
+    return false;
+}
+
 [[nodiscard]] bool declaratorHasInitializer(Tree const& tree,
                                             DeclaratorConfig const& dc,
                                             NodeId dNode) {
@@ -4088,6 +4108,7 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;   // skip the `=` token
         if (tree.rule(c) == dc.declaratorRule) continue;    // the declarator itself
+        if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
         return true;   // any other internal child IS the initValue
     }
     return false;
@@ -5219,6 +5240,7 @@ initializerNodeOf(Tree const& tree, NodeId dNode, DeclaratorConfig const& dc) {
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == dc.declaratorRule.v) continue;
+        if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
         return c;   // the `= init` value subtree
     }
     return {};
@@ -5492,6 +5514,7 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == dc.declaratorRule) continue;
+            if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
             initNode = c;
             break;
         }
@@ -8213,6 +8236,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             if (tree.kind(c) != NodeKind::Internal) continue;
                             if (tree.rule(c) == cfg.declarators->declaratorRule)
                                 continue;
+                            if (isAfterDeclaratorAttrNode(tree,
+                                    *cfg.declarators, c)) continue;   // TF-C62
                             initNode = c;
                             break;
                         }

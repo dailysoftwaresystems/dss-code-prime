@@ -587,15 +587,31 @@
       "alt": [ "StaticKeyword", "ConstexprKeyword", "ThreadLocalKeyword", "ThreadLocalC23Keyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
-      "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
+      "$comment": "GNU `__attribute__((...))`. FC4 c1 grew the parenthesized-string form `visibility(\"hidden\")`. TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) generalizes the ARGUMENT to `attrArgs` (a balanced list of identifiers / numbers / strings / nested parens) so real-header forms parse — `aligned(16)` (number), `__format__(__printf__,1,2)` (multi-arg), `__nonnull__((1,3))` (nested). It also admits a COMMA-separated run of further clauses (`__nothrow__, __leaf__`) via `attrClauseTail`. THE FIRST CLAUSE'S NAME stays a DIRECT child of attrSpec (so extractOneAttrClause + linkageFrom see it); ARGS live in the `attrArgs` subtree (so linkageFrom's `attributeArgRule` handling skips arg tokens for the specifier scan, keeping only a lone composite string). The trailing clauses nest under `attrClauseTail` so they don't pollute the first-clause name scan (multi-clause HONORING is a pinned follow-up; the first clause is honored).",
       "sequence": [
         "AttributeKeyword", "ParenOpen", "ParenOpen",
         { "optional": { "sequence": [
             "Identifier",
-            { "optional": { "sequence": [ "ParenOpen", "stringLiteralExpr", "ParenClose" ] } }
+            { "optional": "attrArgs" },
+            { "repeat": { "sequence": [ "Comma", "attrClauseTail" ] } }
         ] } },
         "ParenClose", "ParenClose"
       ]
+    },
+    "attrClauseTail": {
+      "$comment": "TF-C62: a NON-FIRST clause in a comma-separated `__attribute__((a, b))` run — name + optional args, nested so it doesn't add a direct-child identifier to attrSpec's first-clause name scan.",
+      "sequence": [ "Identifier", { "optional": "attrArgs" } ]
+    },
+    "attrArgs": {
+      "$comment": "TF-C62: the parenthesized ARGUMENT of one GNU attribute — a balanced `( ... )` holding a comma-separated list of arg items (an identifier, an integer/float literal, a string, or a NESTED `attrArgs` for `__nonnull__((1))`-style double parens). This is the `attributeArgRule` linkageFrom + extractOneAttrClause treat specially: its tokens are NOT scanned as linkage specifiers, but a LONE string inside it pairs with the preceding attribute name for the composite key (`visibility(\"hidden\")` -> `visibility:hidden`).",
+      "sequence": [ "ParenOpen", { "optional": "attrArgList" }, "ParenClose" ]
+    },
+    "attrArgList": {
+      "sequence": [ "attrArgItem", { "repeat": { "sequence": [ "Comma", "attrArgItem" ] } } ]
+    },
+    "attrArgItem": {
+      "$comment": "TF-C62: one attribute argument atom. The alt FIRST sets are disjoint (Identifier / IntLiteral / FloatLiteral / string-openers / ParenOpen) so the list stays predictive. Operator-expression args (`aligned(2*x)`) are residue — they fail loud, never silently mis-parse; a real header needing them is the follow-up.",
+      "alt": [ "Identifier", "IntLiteral", "FloatLiteral", "stringLiteralExpr", "attrArgs" ]
     },
     "stdAttr": {
       "$comment": "C23 [[...]] attribute specifier (D14: parsed, semantically IGNORED — linkageSpecifierIgnoredRules skips the whole subtree in the linkage scan). Namespaced `[[gnu::attr]]` and a parenthesized string argument are accepted; richer argument forms are residue.",
@@ -673,8 +689,10 @@
     },
 
     "initDeclarator": {
+      "$comment": "TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): an OPTIONAL after-declarator `__attribute__((...))` run (`void f(void) __attribute__((noreturn));`, `Tcl_Panic(...) TCL_FORMAT_PRINTF(1,2);`) sits between the declarator and the optional initializer. FIRST(attrSpec) = {AttributeKeyword} is disjoint from AssignOp/Comma/EndStatement, so it stays predictive (no speculation). The C23 `[[...]]` stdAttr rides here too. A run (repeat) admits `f() __attribute__((a)) __attribute__((b))`. These attributes are IGNORED for linkage (they are after the specifier prefix linkageFrom reads); the semantic attribute scan can still reach them via the declarator subtree — noreturn-after-declarator honoring is a pinned follow-up, parse-and-ignore is the first-increment behavior.",
       "sequence": [
         "declarator",
+        { "repeat": { "alt": [ "attrSpec", "stdAttr" ] } },
         { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
       ]
     },
@@ -1408,6 +1426,7 @@
       "arraySuffixModifierTokens": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "StarOp" ],
       "initDeclaratorRule": "initDeclarator",
       "listRule":           "initDeclaratorList",
+      "afterDeclaratorAttrRules": ["attrSpec", "stdAttr"],
       "memberDeclaratorRule": "structMemberDeclarator",
       "memberListRule":       "structMemberDeclaratorList"
     },

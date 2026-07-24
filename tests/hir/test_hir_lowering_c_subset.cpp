@@ -489,6 +489,38 @@ TEST(HirLoweringCSubset, PlainExternWithoutDefinitionStaysImport) {
         << "a bare extern must stay an ExternGlobal import";
 }
 
+// D-CSUBSET-GNU-ATTRIBUTE (TF-C62): a GNU `__attribute__((...))` in the
+// AFTER-DECLARATOR position, with a widened argument grammar (multi-arg /
+// multi-clause / nested / number), must PARSE and lower cleanly — the attributes
+// are parse-and-ignore hints, so the declaration lowers exactly as if they were
+// absent. Every real C header puts its prototype attributes here (glibc
+// `__attribute__((__nothrow__,__leaf__))`, Tcl `TCL_FORMAT_PRINTF(1,2)`).
+// RED-ON-DISABLE: revert the after-declarator attrSpec slot in initDeclarator
+// (c-subset.lang.json) → the declaration fails P0009 and model.hasErrors().
+TEST(HirLoweringCSubset, GnuAttributeAfterDeclaratorLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "int add(int a, int b) __attribute__((__nothrow__, __leaf__));\n"
+        "int add(int a, int b) { return a + b; }\n"
+        "int deref(const int *p) __attribute__((__nonnull__((1))));\n"
+        "int deref(const int *p) { return *p; }\n"
+        "int v __attribute__((aligned(4))) = 20;\n"
+        "int main(void){ int t=22; return add(v, t); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "after-declarator GNU attributes with multi-clause / nested / number "
+           "args must parse and lower as parse-and-ignore hints";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // The `= 20` initializer must still be found (not shadowed by the
+    // after-declarator attribute): `v` lowers to a Global WITH an initializer.
+    std::size_t globalsWithInit = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::Global) ++globalsWithInit;
+    EXPECT_GE(globalsWithInit, 1u)
+        << "`int v __attribute__((aligned(4))) = 20;` must still lower to a "
+           "Global — the attribute must not be mistaken for the initializer";
+}
+
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
         "void f() { for (int i = 0; i < 10; i = i + 1) {} }");

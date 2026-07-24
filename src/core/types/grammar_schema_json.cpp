@@ -4526,7 +4526,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 19>
+                    static constexpr std::array<std::string_view, 20>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4554,7 +4554,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "variadicMarker",
                             // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
                             // rule that opens a per-declarator function-prototype scope.
-                            "prototypeParamScopeRule"};
+                            "prototypeParamScopeRule",
+                            // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
+                            // after-declarator attribute rules (attrSpec/stdAttr).
+                            "afterDeclaratorAttrRules"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         // `$`-prefixed keys are the codebase-wide documentation
@@ -4731,6 +4734,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readOptionalRuleRole("prototypeParamScopeRule",
                                          dc.prototypeParamScopeRule,
                                          dc.prototypeParamScopeRuleName);
+                    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL LIST of
+                    // after-declarator attribute rules (`attrSpec`, `stdAttr`) —
+                    // the init-detection scans skip a child of these rules so an
+                    // after-declarator `__attribute__((...))` is not mistaken for
+                    // the initializer. Absent ⇒ empty (no after-declarator attr
+                    // suffix). Each entry must be a known rule name (else the load
+                    // fails, like the single-role helper).
+                    if (dj.contains("afterDeclaratorAttrRules")) {
+                        auto const& arr = dj.at("afterDeclaratorAttrRules");
+                        if (!arr.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/afterDeclaratorAttrRules",
+                                      "'declarators.afterDeclaratorAttrRules' "
+                                      "must be an array of rule-name strings");
+                            dOk = false;
+                        } else {
+                            for (auto const& e : arr) {
+                                if (!e.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              dPath + "/afterDeclaratorAttrRules",
+                                              "each entry must be a rule-name string");
+                                    dOk = false;
+                                    continue;
+                                }
+                                std::string const nm = e.get<std::string>();
+                                if (!data.rules->contains(nm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              dPath + "/afterDeclaratorAttrRules",
+                                              std::format("references unknown "
+                                                          "shape '{}'", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.afterDeclaratorAttrRuleNames.push_back(nm);
+                                dc.afterDeclaratorAttrRules.push_back(
+                                    data.rules->find(nm));
+                            }
+                        }
+                    }
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy
