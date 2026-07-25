@@ -202,6 +202,58 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 
 ## C. The cycle — ten steps (+ design-review gate at 3.5 · self-audit gate at 8.5)
 
+### Step C.0 — DELEGATION IS THE DEFAULT (read before every step below)
+
+**Every step of this cycle that is not inherently serial runs in a SUBAGENT. This is not an
+optimization — it is how the cycle is meant to execute, and it does not require the user to
+ask for it each time.** Some host configurations ship an ambient "don't spawn agents unless
+asked" default; **this skill overrides it.** A project rule beats an ambient default, and
+the reason is concrete: the orchestrator's context is the cycle's scarcest resource. Reading
+300 lines of a pass to learn one API, or grepping four files to find a config field, burns
+budget that should be spent on judgment — deciding, gating, and landing. An agent absorbs
+that reading and hands back a conclusion.
+
+**The failure this prevents, observed repeatedly:** the orchestrator does everything inline,
+runs low on context mid-cycle, and ends the turn with design notes instead of shipped code —
+cycle after cycle. If you find yourself opening a large file mainly to *learn* something,
+that is a delegation you skipped.
+
+**Delegate by default:**
+
+| step | agent | notes |
+|---|---|---|
+| 1–2 pick / clear blockers | `Explore` or `general-purpose` | when it means sweeping plans, the registry, or `src/` to locate work |
+| 3 plan | `Plan` / `feature-dev:code-architect` | returns the execution plan; you judge it |
+| **3.5 design-audit** | **independent `general-purpose`** | MUST be a fresh agent — the point is that it did not author the plan |
+| 4 implement | one agent per DISJOINT file set, **in parallel** | see the parallelism rule below |
+| 5 review & fold | `pr-review-toolkit:*` / `feature-dev:code-reviewer` | |
+| 7–8 deferrals + cross-plan | `general-purpose` | mechanical registry/plan reconciliation |
+| **8.5 code-audit** | **independent `general-purpose`, READ-ONLY** | must not be the agent that wrote the code |
+
+**PARALLELISM:** when a step splits into disjoint file sets — engine `.cpp` vs `*.json`
+config vs `examples/` corpus vs `tests/` — launch those agents IN ONE MESSAGE so they run
+concurrently, and tell each agent explicitly which paths it owns and which it must not
+touch. Overlapping writes are the only real hazard; disjointness removes it.
+
+**★ DO NOT DELEGATE — the orchestrator keeps these:**
+- **Step 6, the gate** (builds, ctest, the 3-leg run, the sqlite re-probe). A delegated
+  build/gate agent reliably **yields mid-build** — it kicks the build off, reports "standing
+  by", and leaves an orphaned detached job. This has bitten this project repeatedly. Drive
+  builds yourself, FOREGROUND-BLOCKING, or via a harness-tracked `run_in_background` command
+  that re-invokes you on exit. If you *do* hand a build to an agent, say FOREGROUND-BLOCKING
+  in the prompt and treat a "standing by" reply as a failed step.
+- **Step 9, commit & push**, and every §B decision. Those are judgment and authority.
+- **Verifying an agent's claim.** An agent reporting "done, all green" is a claim, not
+  evidence (§B: green ≠ clean). Re-run the gate yourself. A delegated agent that refutes its
+  own pre-registered hypothesis mid-task is doing it RIGHT — read its reasoning, do not
+  rubber-stamp it.
+
+**Prompt quality is the whole game.** A vague prompt returns vague work you must redo. Give
+each agent: the exact files it owns, the invariants it must not break (§A — agnosticism,
+fail-loud, strict tests), the house comment style, the specific traps already known (the
+eager-import law, closed descriptor key sets, `--define` not `-D`, capture rc directly), and
+what to REPORT BACK. Tell it what NOT to do as explicitly as what to do.
+
 ### Step 0 — Orient
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
   means **this cycle finishes it** (it is the priority).
@@ -235,8 +287,10 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 - If a blocker is itself gated / a hard stop / a fork → **§B gate**.
 
 ### Step 3 — Plan with feature-dev
-- Run `/feature-dev:feature-dev` on the priority to produce the execution plan (understand →
-  design → build sequence). Keep its TodoWrite list as the cycle's working plan.
+- **DELEGATE (§C.0).** Run `/feature-dev:feature-dev`, or hand the priority to a `Plan` /
+  `feature-dev:code-architect` agent, to produce the execution plan (understand → design →
+  build sequence). Keep its TodoWrite list as the cycle's working plan. The orchestrator
+  JUDGES the plan; it should not be the one reading the subsystem to write it.
 - If the plan exposes an architectural fork or a pending definition → **§B gate**.
 
 ### Step 3.5 — Design-audit the plan before lock (the plan-lock gate)
@@ -277,6 +331,12 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
   post-build auditor's independence on the *code* stays intact.
 
 ### Step 4 — Implement
+- **DELEGATE, IN PARALLEL (§C.0).** Split the plan by DISJOINT file sets — engine `.cpp/.hpp`
+  vs `src/dss-config/**.json` vs `examples/` vs `tests/` — and launch one agent per set IN
+  ONE MESSAGE so they run concurrently. Name each agent's owned paths and its forbidden
+  paths explicitly. Hand each the §A invariants, the house comment style, and the known
+  traps for its area. The orchestrator integrates and verifies; it does not hand-type every
+  edit.
 - Build the **best long-term, agnostic** solution (§A). Extend config vocabulary, never
   branch the engine on identity.
 - Tests are strict (§A.5). Diagnostics fail loud (§A.4).
