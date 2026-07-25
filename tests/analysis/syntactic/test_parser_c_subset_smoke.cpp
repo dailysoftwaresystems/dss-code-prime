@@ -973,6 +973,159 @@ TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {
     EXPECT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
 }
 
+// ── Trailing type-qualifier on a type-specifier head (C 6.7.1: decl-specifiers
+//    in ANY order) ─────────────────────────────────────────────────────────────
+//
+// D-CSUBSET-STRUCT-MULTI-DECLARATOR / D-CSUBSET-EXTERN-MULTI-DECLARATOR: the head
+// `typeRefAllowingStruct` (shared by externDecl + struct/union fields) now takes a
+// TRAILING `{repeat headQualifier}` (was `{optional ConstKeyword}`, const-only),
+// symmetric with its leading slot and topLevelHead's trailing slot. So a base type
+// FOLLOWED by a cv-qualifier — `LONG volatile` == `volatile LONG` (C 6.7.1) — parses
+// on BOTH a typedef-name and a builtin base. The pre-fix const-only slot P0009'd at a
+// trailing `volatile`. Motivating case: sqlite `src/test1.c:9346`
+// `extern LONG volatile sqlite3_os_type;` (LONG = windows.json) under #if
+// SQLITE_OS_WIN. A parser-level test needs no `typedef` for LONG: externDecl is
+// committed by `extern`, so `typeBaseAllowingStruct`'s Identifier arm reads LONG as
+// the type (an UNKNOWN typedef is a later SEMANTIC S0006, not a parse error).
+
+// PRIMARY (RED-ON-DISABLE): `extern LONG volatile d;` — a typedef-name base + a
+// trailing `volatile`. The `volatile` is a `rule:headQualifier` AFTER the
+// `typeBaseAllowingStruct` base (NOT a declarator: a keyword can't be a
+// declarator/typedef-name, so `d` stays the sole declarator). RED-ON-DISABLE:
+// revert the trailing slot to `{optional ConstKeyword}` -> P0009 "expected
+// 'Identifier', 'ParenOpen', 'StarOp' or 'BracketOpen' -- got 'volatile'".
+TEST(ParserCSubsetSmoke, ExternTypedefNameTrailingQualifierParses) {
+    auto h = loadAndTokenize("extern LONG volatile d;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern LONG volatile d;` (typedef-name + trailing qualifier) must parse";
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:externDecl\n"
+        "  rule:externSpecifiers\n"
+        "    tok:\"extern\"\n"
+        "  rule:typeRefAllowingStruct\n"
+        "    rule:typeBaseAllowingStruct\n"
+        "      tok:\"LONG\"\n"
+        "    rule:headQualifier\n"
+        "      tok:\"volatile\"\n"
+        "  rule:initDeclaratorList\n"
+        "    rule:initDeclarator\n"
+        "      rule:declarator\n"
+        "        rule:directDeclarator\n"
+        "          tok:\"d\"\n"
+        "  rule:externDeclTail\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
+}
+
+// The SAME trailing-qualifier gap on a BUILTIN base under `extern` —
+// `extern int volatile d;` ALSO P0009'd before this fix (both externDecl and struct
+// fields consume the one const-only trailing slot). The trailing `volatile` rides a
+// `headQualifier` AFTER the base `typeSpecifierSeq`. RED-ON-DISABLE: same revert.
+TEST(ParserCSubsetSmoke, ExternBuiltinTrailingQualifierParses) {
+    auto h = loadAndTokenize("extern int volatile d;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern int volatile d;` (builtin base + trailing qualifier) must parse";
+    const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
+    ASSERT_NE(head, NodeId{});
+    constexpr std::string_view kExpectedHead =
+        "rule:typeRefAllowingStruct\n"
+        "  rule:typeBaseAllowingStruct\n"
+        "    rule:typeSpecifierSeq\n"
+        "      tok:\"int\"\n"
+        "  rule:headQualifier\n"
+        "    tok:\"volatile\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, head), kExpectedHead);
+}
+
+// Multiple trailing qualifiers, any order — `extern LONG const volatile cv;` — the
+// `{repeat}` admits a RUN. Exactly TWO trailing `headQualifier` children (const,
+// volatile) after the base. RED-ON-DISABLE: the const-only `{optional}` slot admits
+// at most the single leading `const`, so `volatile` P0009s.
+TEST(ParserCSubsetSmoke, ExternTrailingQualifierRunParses) {
+    auto h = loadAndTokenize("extern LONG const volatile cv;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`extern LONG const volatile cv;` (trailing qualifier run) must parse";
+    const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
+    ASSERT_NE(head, NodeId{});
+    std::size_t headQualifiers = 0;
+    for (NodeId c : t.children(head)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "headQualifier")
+            ++headQualifiers;
+    }
+    EXPECT_EQ(headQualifiers, 2u)
+        << "the trailing `{repeat headQualifier}` must consume BOTH const and volatile";
+}
+
+// The OTHER consumer of `typeRefAllowingStruct` — a struct member head. Before the
+// fix `struct S { int volatile x; };` P0009'd at `volatile` exactly like the extern
+// case (proving the gap was in the SHARED head rule, not extern-specific). The
+// leading form `struct S { volatile int x; };` already parsed. RED-ON-DISABLE: same
+// revert -> P0009 in the field head.
+TEST(ParserCSubsetSmoke, StructMemberTrailingQualifierParses) {
+    auto h = loadAndTokenize("struct S { int volatile x; };");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "`struct S { int volatile x; };` (member trailing qualifier) must parse";
+    const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
+    ASSERT_NE(head, NodeId{});
+    // The field head is BYTE-IDENTICAL to the extern builtin head — the trailing
+    // `volatile` rides a headQualifier AFTER the base, proving the gap was in the
+    // SHARED `typeRefAllowingStruct` rule (not extern-specific).
+    constexpr std::string_view kExpectedHead =
+        "rule:typeRefAllowingStruct\n"
+        "  rule:typeBaseAllowingStruct\n"
+        "    rule:typeSpecifierSeq\n"
+        "      tok:\"int\"\n"
+        "  rule:headQualifier\n"
+        "    tok:\"volatile\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, head), kExpectedHead);
+}
+
+// Regression guards: the forms that ALREADY parsed before the fix must keep parsing
+// — the LEADING qualifier on a typedef-name (`extern volatile LONG e;`), and the
+// top-level trailing/leading forms that route through topLevelHead (already
+// `{repeat headQualifier}`): `int volatile f;`, `volatile LONG g;`,
+// `LONG volatile h = 0;`. All parser-level (an unknown typedef-name is a later
+// SEMANTIC error, never a parse error).
+TEST(ParserCSubsetSmoke, TypeHeadQualifierOrderRegressionForms) {
+    for (std::string_view source : {
+             std::string_view{"extern volatile LONG e;"},
+             std::string_view{"int volatile f;"},
+             std::string_view{"volatile LONG g;"},
+             std::string_view{"LONG volatile h = 0;"},
+         }) {
+        auto h = loadAndTokenize(std::string{source});
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto result = std::move(p).parse();
+        auto const& t = result.tree;
+        ASSERT_NE(t.root(), InvalidNode) << source;
+        EXPECT_FALSE(t.diagnostics().hasErrors())
+            << "must still parse (qualifier order is free per C 6.7.1): " << source;
+    }
+}
+
 // Array declarator: expression-side `a[0]` is pinned by
 // `ArrayIndexParsesAsPostfix`; this trio is the declarator-side
 // complement (v2-gap-catalog row 12). The trio together exercises
