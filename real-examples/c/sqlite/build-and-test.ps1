@@ -98,9 +98,12 @@
 # `strftime` sourced from ucrtbase.dll (legacy msvcrt is C89), and the genuinely-
 # Windows kernel32/msvcrt symbols added to the pe shipped-lib descriptors.
 #
-# ★ KNOWN remaining pe64 issue (anchored, NOT masked): `fpconv1-2.0` — the ms_x64
-#   sibling of the SysV variadic-FP release miscompile
-#   (D-OPT-SQLITE-FPCONV1-MSX64-VARIADIC-FP); a genuine compiler bug, fixed separately.
+# ★ KNOWN remaining pe64 issue (anchored, NOT a DSS bug): `fpconv1-2.0` — legacy
+#   msvcrt.dll's `sprintf` renders `%e` to ~17 significant digits while sqlite's own
+#   dtoa is full-precision, and fpconv1-2.0 compares the two (a GCC build linking
+#   msvcrt.dll fails IDENTICALLY; DSS's codegen was disasm-verified correct). It is
+#   resolved by the pe->UCRT migration's Phase 3 (printf-family -> ucrtbase,
+#   full-precision dtoa) — D-FFI-PE-CRT-UCRT-MIGRATION.
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
