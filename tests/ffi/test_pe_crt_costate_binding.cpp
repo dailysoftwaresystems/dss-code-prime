@@ -74,20 +74,52 @@ namespace {
 // consumes a CRT-owned object. Membership is a property of the SURFACE, not of
 // how many symbols happen to be exported, and each entry names the coupling:
 //
-//   malloc  — the heap itself (malloc/realloc/free)
-//   stdlib  — malloc/free/realloc/atexit + exit's stream teardown
-//   string  — `strdup`/`_strdup` RETURN a CRT-heap pointer the caller frees
-//   stdio   — the FILE* table; fopen/fclose/fread must pair within one CRT
-//   io      — the CRT fd table (_open/_read/_close) that stdio is layered on
-//   errno   — the per-CRT errno slot every failing call above writes
-//   direct  — _getcwd RETURNS a CRT-heap buffer when passed NULL; sets errno
-//   process — _spawn/_exec inherit the CRT's fd table and set errno
+//   malloc   — the heap itself (malloc/realloc/free)
+//   stdlib   — malloc/free/realloc/atexit + exit's stream teardown
+//   string   — `strdup`/`_strdup` RETURN a CRT-heap pointer the caller frees
+//   stdio    — the FILE* table; fopen/fclose/fread must pair within one CRT
+//   io       — the CRT fd table (_open/_read/_close) that stdio is layered on
+//   errno    — the per-CRT errno slot every failing call above writes
+//   direct   — _getcwd RETURNS a CRT-heap buffer when passed NULL; sets errno
+//   process  — _spawn/_exec inherit the CRT's fd table and set errno
+//   sys/stat — `_fstat` CONSUMES a CRT fd minted by io.json's _open
 //
-// A descriptor NOT listed here is stateless (value->value: ctype, mem*, math)
-// and may cross runtimes freely — that is exactly why Phase 1 could flip
-// ctype/memory/tgmath alone while these eight stayed behind.
+// THE MEMBERSHIP RULE, and how sys/stat got here: a descriptor belongs in this
+// group when its surface accepts or returns a value carrying RUNTIME-OWNED
+// IDENTITY — a heap block only its own allocator can free, a FILE*, an fd, the
+// errno slot. It is NOT about "touches per-runtime state" in general: time.json
+// keeps a static `struct tm` yet stays out, because a tm is a plain POD record
+// any runtime can read.
+//
+// sys/stat was MISSING from this list in the first draft, and that omission was
+// not caught by any test — it was caught by the SQLite corpus, which began
+// crashing at vtabH-3.5 once sys/stat.json was pointed at ucrtbase while io.json
+// still bound msvcrt. test_fs.c does `struct stat sBuf; fstat(pCsr->fd, &sBuf)`:
+// the fd is an index into the OWNING runtime's descriptor table, so msvcrt's fd
+// handed to UCRT's _fstat64i32 resolves against a table that never saw it. A
+// standalone repro (msvcrt `_open` -> ucrtbase `_fstat64i32`) reproduced it
+// exactly: process death, 0xC0000409. `_fstat` takes an `int fd` — by the rule
+// above that alone puts sys/stat in the group, regardless of the fact that its
+// OTHER entry points (`_wstat`, `_stat64`) take paths and would have been safe
+// to move alone. Half-moving a descriptor is the same hazard as half-moving the
+// group.
+//
+// A descriptor NOT listed here either is stateless (value->value: ctype, mem*,
+// math) or its per-runtime state is a PLAIN POD the other runtime can safely
+// read. time.json is the second kind and worth spelling out, because "has
+// per-runtime state" is not by itself disqualifying: localtime/gmtime return a
+// pointer into the CRT's static `struct tm`, but that is an ordinary POD record
+// with a published layout, not a runtime-owned handle — reading it across CRTs
+// is well-defined. (That is precisely why the interim strftime->ucrtbase
+// per-symbol override worked while the rest of time.json was still msvcrt.)
+// What puts a descriptor IN the group is state carrying runtime-owned IDENTITY
+// — a heap block only its allocator can free, a FILE*/fd only its own table can
+// resolve, the errno slot a failing call writes. That distinction is why Phase 1
+// could flip ctype/memory/tgmath and Phase 2 time/sys-stat, while these eight
+// must move together.
 constexpr char const* kCoStateGroup[] = {
     "malloc", "stdlib", "string", "stdio", "io", "errno", "direct", "process",
+    "sys/stat",
 };
 
 // Reads `library.pe` out of one descriptor. nullopt = the descriptor declares no
