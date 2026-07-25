@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: this .dll schema declares WHY it cannot carry a per-program stack reserve, so a `stackReserve` / `--stack-reserve` request against it is REFUSED with an actionable remedy instead of silently writing a field nothing reads. The optionalHeader below DOES carry sizeOfStackReserve/sizeOfStackCommit (1 MiB / 4 KiB) and they are INERT for a DLL: the Windows loader sizes a thread's stack from the EXECUTABLE that loads the module (its own header) or from CreateThread's explicit dwStackSize -- documented Win32 semantics (`dwStackSize` of 0 \"uses the default size for the executable\"), and MEASURED on this machine: 12 unrelated Microsoft system DLLs (ntdll, ucrtbase, kernel32, msvcrt, shell32, crypt32, user32, gdi32, ole32, advapi32, ws2_32, wintrust) all carry the IDENTICAL untuned 0x40000, while 8 system EXEs carry tuned VARYING values (0x80000 / 0x100000) with SizeOfStackCommit spread over 8 KiB..1008 KiB. Uniformity across unrelated DLLs vs per-program tuning on EXEs is the signature of a field nothing reads. NOTE the values here are DSS's 1 MiB convention, not MS's 0.25 MiB -- deliberately left alone: the field is inert either way, so changing it would be churn with no observable effect.",
+
+  "stackReserveUnsupportedReason": "loader-ignores-field",
+
   "format": {
     "name": "pe64-x86_64-windows-dll",
     "version": "1.0",

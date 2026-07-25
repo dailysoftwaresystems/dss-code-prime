@@ -61,6 +61,14 @@
     "libraryPath": "kernel32.dll"
   },
 
+  "$stackReserveControlComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: this format CAN carry a per-PROGRAM stack reserve, so it declares the capability; PRESENCE is what the linker gate reads (`ObjectFormatSchema::stackReserveControl()`), never a format identity. A program's required stack is a property of ITS deepest call chain, not of the format, so the `optionalHeader.sizeOfStackReserve` value below is only the DEFAULT (1 MiB — the MSVC/Windows convention); a project manifest `stackReserve` / CLI `--stack-reserve` OVERRIDES it. MEASURED motivation: the sqlite full-source testfixture dies at `e_fkey-63.1.1` (1000 levels of nested trigger recursion) at 1 MiB — and so does a GCC-built native testfixture at a MATCHED 1 MiB reserve (bisected minimum 1.75 MB gcc / 3.38 MB DSS), so this is a genuine per-program need, not a codegen workaround (the ~1.93x frame-size gap is separately anchored, D-CODEGEN-FRAME-SIZE-VS-NATIVE-2X). vehicle `pe-optional-header` = IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve at optional-header offset +72, written by `src/link/format/pe.cpp`'s image arm. NOTE the deliberate asymmetry with the SIBLING schemas: `pe64-x86_64-windows-dll.format.json` has the SAME header field but declares NO capability (the loader IGNORES a DLL's SizeOfStackReserve — the .exe's value governs the main thread, and other threads take the .exe default or an explicit CreateThread size), and the `.obj` schema has no optional header at all. That is exactly why the capability is per-FORMAT config: an `if (kind == pe)` engine branch would happily write a field nothing reads. ELF declares nothing because no ELF image field carries a stack SIZE (PT_GNU_STACK encodes EXECUTABILITY; the size is a runtime/`ulimit -s` property) — a request on an ELF target fails LOUD rather than being dropped. minimumBytes = 65536 (the Windows 64 KiB allocation granularity — the smallest reserve the VM manager can actually distinguish); maximumBytes = 4294967296 (4 GiB — a reserve is VIRTUAL address space so a generous cap is right; the bound exists to fail a fat-fingered value loud at link instead of shipping an image the loader refuses); granularityBytes = 4096 (page). A request outside the range or off the granularity is REFUSED, never clamped or rounded.",
+  "stackReserveControl": {
+    "vehicle": "pe-optional-header",
+    "minimumBytes": 65536,
+    "maximumBytes": 4294967296,
+    "granularityBytes": 4096
+  },
+
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
   "artifactProfiles": ["cli"],
 

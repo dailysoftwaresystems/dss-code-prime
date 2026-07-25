@@ -255,7 +255,18 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     // executor (nullptr ⇒ an internal pool sized
                                     // via `jobsOverride`) + the `--jobs` override.
                                     substrate::IExecutor*  injectedExecutor,
-                                    unsigned               jobsOverride) {
+                                    unsigned               jobsOverride,
+                                    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the
+                                    // per-PROGRAM image knobs (stack reserve),
+                                    // forwarded verbatim to the link step. The
+                                    // linker gates them against THIS target's
+                                    // format capability — which is why the
+                                    // request travels per-target rather than
+                                    // being resolved once for the whole build:
+                                    // a multi-target project may name one
+                                    // format that can carry it and one that
+                                    // cannot, and the second must fail loud.
+                                    ImageRequest const&    imageRequest) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -591,7 +602,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
             }
         }
         return linkAndWriteStaticArchive(members, memberNames,
-                                         **targetR, **formatR, outPath, reporter);
+                                         **targetR, **formatR, outPath, reporter,
+                                         imageRequest);
     }
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
@@ -609,7 +621,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         // no static archives this is `linkAndWrite({mod})`, unchanged.
         return linkAndWriteWithStaticArchives(
             std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-            **targetR, **formatR, outPath, reporter);
+            **targetR, **formatR, outPath, reporter, imageRequest);
     }
 
     // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
@@ -879,7 +891,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // `linkAndWrite({mod})`, unchanged.
     return linkAndWriteWithStaticArchives(
         std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-        **targetR, **formatR, outPath, reporter);
+        **targetR, **formatR, outPath, reporter, imageRequest);
 }
 
 // c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
@@ -924,7 +936,13 @@ int runCusToTargets(
     // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
     // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
     substrate::IExecutor*                       executor,
-    unsigned                                    jobsOverride) {
+    unsigned                                    jobsOverride,
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM image knobs
+    // (stack reserve), threaded verbatim to `compileOneTarget` — which
+    // hands them to the link step, where the format's DECLARED capability
+    // gates them. Passed PER TARGET, not resolved once: two targets of one
+    // build can differ in whether their format can carry the request.
+    ImageRequest const&                         imageRequest) {
     // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
     // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
     // every format (activeFormat is inert) → a single nullopt-keyed build, no
@@ -1003,7 +1021,7 @@ int runCusToTargets(
             grammar, sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u,
             artifactName, perFormatOutputSubdir, compileOpts,
-            executor, jobsOverride);
+            executor, jobsOverride, imageRequest);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }
@@ -1048,6 +1066,12 @@ int Program::run(int argc, char* argv[]) {
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
     setJobs(args.jobs);  // D-PERF-4-CU-PARALLELISM: --jobs N per-CU build pool width
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--stack-reserve <bytes>` — the
+    // per-PROGRAM stack reserve the emitted image should carry. Stamped HERE,
+    // before the dispatch fork, so it applies to EVERY compile-producing mode.
+    // `compileProject` then applies a manifest `stackReserve` ONLY IF this
+    // stamp left it unset — the CLI WINS (see there).
+    setStackReserveBytes(args.stackReserveBytes);
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
     // surface to resolve + validate this run's externs. Map the CLI strings to
@@ -1279,6 +1303,25 @@ int Program::compileProject(
     // `--compile` build's names + single-target flat layout stay byte-identical.
     setArtifactName(pc.artifactName);
     setPerFormatOutputSubdir(true);
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the manifest's OPTIONAL
+    // `stackReserve` (bytes).
+    //
+    // PRECEDENCE — the CLI `--stack-reserve` WINS; the manifest value applies
+    // ONLY IF `Program::run` left the stamp unset. The three flag ARRAYS above
+    // MERGE because appending composes: `-I a` + manifest `["b"]` sensibly
+    // means both. A SCALAR cannot compose — one of the two numbers must be the
+    // answer — so it needs an explicit rule, and "an explicit command-line
+    // argument overrides a committed configuration file" is the universal one
+    // (cmake, cargo, gcc). It is also the only rule that lets a user probe a
+    // different reserve (bisecting a stack overflow is exactly the motivating
+    // workflow) without editing — and risking committing — the manifest.
+    //
+    // NOTE this reads the member rather than clobbering it, so the CLI stamp
+    // survives; the manifest never overwrites a supplied flag.
+    if (!stackReserveBytes().has_value() && pc.stackReserveBytes.has_value()) {
+        setStackReserveBytes(pc.stackReserveBytes);
+    }
 
     // D-AP2-SOURCES-GLOB: expand any glob pattern in `sources[]` into its
     // matching files BEFORE the multi-vs-single-CU routing count is taken — so a
@@ -1539,7 +1582,10 @@ int Program::compileFiles(
         buildCus, *grammar, sourceStem, targets, rep,
         outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_, executor_, jobs_);
+        resolveLibraries_, executor_, jobs_,
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
+        // request (nullopt = the format default stands).
+        ImageRequest{stackReserveBytes_});
 }
 
 int Program::compileUnits(
@@ -1620,7 +1666,10 @@ int Program::compileUnits(
         targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
         compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_, executor_, jobs_);
+        resolveLibraries_, executor_, jobs_,
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
+        // request (nullopt = the format default stands).
+        ImageRequest{stackReserveBytes_});
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

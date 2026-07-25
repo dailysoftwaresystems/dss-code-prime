@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: a shared library carries an image header but NO field for a stack size (there is no LC_MAIN in a MH_DYLIB / no stack-size field in an ELF ET_DYN), and a loaded library never owns a thread's stack anyway, so a `stackReserve` / `--stack-reserve` request is REFUSED with an actionable remedy rather than silently dropped.",
+
+  "stackReserveUnsupportedReason": "no-image-field",
+
   "$dataModelComment": "LP64 (64-bit Darwin: int 32, long 64, ptr 64) -- same as the x86_64 exec/object siblings.",
   "dataModel": "LP64",
 

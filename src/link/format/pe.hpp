@@ -4,6 +4,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/image_request.hpp"
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -36,10 +37,18 @@
 
 namespace dss::pe {
 
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
+// STACK-DEPTH). Defaults to empty so every existing caller is unchanged.
+// This walker implements the `pe-optional-header` stack-reserve vehicle for
+// the **exec** flavor only; it RE-CHECKS the schema's declared capability
+// rather than trusting the linker gate, because `pe::encode` is a public
+// entry point AND this same walker serves the .dll flavor, whose schema
+// declares no capability (the loader ignores a DLL's SizeOfStackReserve).
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter);
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request = {});
 
 } // namespace dss::pe

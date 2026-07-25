@@ -21,6 +21,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/pe.hpp"
+#include "link/image_request.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
@@ -29,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -3778,3 +3780,305 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
 // (PeWriter.TdataItemRejectsLoudUntilTlsC3 removed — TLS C3 LANDED: a pe64
 // thread-local item now EMITS the .tls section + IMAGE_TLS_DIRECTORY64 +
 // _tls_index. The landed behavior is pinned by the PeExecTls.* suite above.)
+
+
+// ═════════════════════════════════════════════════════════════════
+// D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM stack-reserve
+// request (`ImageRequest::stackReserveBytes`), pinned END-TO-END
+// through the REAL pipeline — `linker::link` → the capability gate →
+// `pe::encode` → IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve.
+//
+// The failure mode every pin below exists to close is the KNOB THAT
+// LIES: a build that reports SUCCESS while the emitted image's stack
+// is not the number the build asked for. So each test asserts the
+// NON-DEFAULT byte value at its spec offset (a test that still passed
+// when the override never reached the header would be worthless), an
+// EXACT diagnostic code + count on every refusal, and — for the
+// unused-feature path — BYTE-IDENTITY with the pre-feature image.
+//
+// Layout (already pinned by LoadBearingOptionalHeaderFieldsPinned-
+// ByteForByte): the PE32+ optional header starts at file offset 0x98,
+// so SizeOfStackReserve (PE/COFF §3.4, optional-header +72) is the u64
+// at 0xE0 and SizeOfStackCommit (+80) the u64 at 0xE8.
+// ═════════════════════════════════════════════════════════════════
+
+namespace {
+
+// IMAGE_OPTIONAL_HEADER64 file offsets (OH64 base 0x98 + spec offset).
+constexpr std::size_t kOhStackReserveOff = 0xE0;  // +72, u64
+constexpr std::size_t kOhStackCommitOff  = 0xE8;  // +80, u64
+constexpr std::size_t kOhHeapReserveOff  = 0xF0;  // +88, u64
+constexpr std::size_t kOhSubsystemOff    = 0xDC;  // +68, u16
+constexpr std::size_t kOhDllCharacterOff = 0xDE;  // +70, u16
+
+// What the SHIPPED pe64-x86_64-windows-exec schema declares. Kept as
+// named constants so a descriptor edit that moves a bound shows up as a
+// deliberate test edit rather than a silently-still-passing assertion.
+// (The bounds themselves are pinned field-by-field in
+// tests/link/test_object_format_schema.cpp.)
+constexpr std::uint64_t kShippedDefaultReserve = 0x100000ull;      // 1 MiB
+constexpr std::uint64_t kShippedMinReserve     = 65536ull;         // 64 KiB
+constexpr std::uint64_t kShippedMaxReserve     = 4294967296ull;    // 4 GiB
+// A NON-DEFAULT, in-range, granularity-aligned request. 4 MiB is the
+// value the sqlite full-source testfixture actually needs.
+constexpr std::uint64_t kOverrideReserve       = 4194304ull;       // 4 MiB
+
+// One trivial `ret` function linked through the REAL pipeline against
+// the SHIPPED exec schema. `linker::link` — never a hand-built header —
+// is the whole point: the gate and the walker both sit on this path.
+[[nodiscard]] LinkedImage
+linkTrivialExec(Loaded const&       loaded,
+                DiagnosticReporter& rep,
+                ImageRequest const& request) {
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    return linker::link(mod, *loaded.target, *loaded.format, rep, request);
+}
+
+} // namespace
+
+TEST(PeExecWriter, StackReserveOverrideReachesHeaderAndSlidesNoOtherByte) {
+    // THE knob-that-lies guard. A 4 MiB request must be what the Windows
+    // loader reads out of SizeOfStackReserve — not the schema's declared
+    // 1 MiB default. RED-on-disable: drop the `request.stackReserveBytes
+    // .value_or(...)` in pe.cpp's encodeExec (or the ImageRequest
+    // thread-through anywhere along linker::link → pe::encode →
+    // encodeExec) and 0xE0 reads 0x100000 while the link still reports
+    // success — exactly the silent no-op this capability exists to
+    // eliminate.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter repDef;
+    LinkedImage const def = linkTrivialExec(loaded, repDef, ImageRequest{});
+    for (auto const& d : repDef.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repDef.errorCount(), 0u);
+    ASSERT_TRUE(def.ok());
+    ASSERT_GT(def.bytes.size(), kOhStackReserveOff + 8u);
+
+    DiagnosticReporter repReq;
+    LinkedImage const got = linkTrivialExec(
+        loaded, repReq, ImageRequest{.stackReserveBytes = kOverrideReserve});
+    for (auto const& d : repReq.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repReq.errorCount(), 0u);
+    ASSERT_TRUE(got.ok());
+    ASSERT_GT(got.bytes.size(), kOhStackReserveOff + 8u);
+
+    // (1) The requested value — NOT the default — is in the header.
+    EXPECT_EQ(readU64LE(got.bytes, kOhStackReserveOff), kOverrideReserve)
+        << "the per-PROGRAM request must reach "
+           "IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve";
+    EXPECT_NE(readU64LE(got.bytes, kOhStackReserveOff), kShippedDefaultReserve)
+        << "a header still carrying the schema default means the override "
+           "was silently dropped";
+
+    // (2) The override wrote the RIGHT field: the neighbours on either
+    //     side of it keep their shipped values (a u64 written one slot
+    //     early/late would show up here even if 0xE0 happened to match).
+    EXPECT_EQ(readU16LE(got.bytes, kOhSubsystemOff), 3u);        // WINDOWS_CUI
+    EXPECT_EQ(readU16LE(got.bytes, kOhDllCharacterOff), 0x8160u);
+    EXPECT_EQ(readU64LE(got.bytes, kOhStackCommitOff), 0x1000ull)
+        << "SizeOfStackCommit must be untouched by a RESERVE request";
+    EXPECT_EQ(readU64LE(got.bytes, kOhHeapReserveOff), 0x100000ull)
+        << "SizeOfHeapReserve is a different knob entirely";
+
+    // (3) The strongest layout pin available: the override image and the
+    //     default image are the same SIZE, and EVERY byte that differs
+    //     between them lies inside the 8-byte SizeOfStackReserve field.
+    //     Nothing slid, no second field was quietly co-written, no
+    //     size/checksum/alignment recompute leaked out. (The differing
+    //     COUNT is not 8 — 0x100000 and 0x400000 happen to share seven of
+    //     their eight bytes — so the subset relation, plus the exact u64
+    //     equality above, is what states the invariant honestly.)
+    ASSERT_EQ(got.bytes.size(), def.bytes.size())
+        << "a stack-reserve request must not change the image SIZE";
+    std::vector<std::size_t> differing;
+    for (std::size_t i = 0; i < got.bytes.size(); ++i) {
+        if (got.bytes[i] != def.bytes[i]) differing.push_back(i);
+    }
+    EXPECT_FALSE(differing.empty())
+        << "the override produced a byte-identical image -- it never "
+           "reached the header at all";
+    for (std::size_t const off : differing) {
+        EXPECT_TRUE(off >= kOhStackReserveOff
+                    && off < kOhStackReserveOff + 8u)
+            << "byte at file offset 0x" << std::hex << off << std::dec
+            << " changed, but only SizeOfStackReserve [0xE0,0xE8) may";
+    }
+}
+
+TEST(PeExecWriter, AbsentStackReserveRequestIsByteIdenticalToTheDefaultPath) {
+    // The feature must be provably INERT when unused: every pre-existing
+    // build is byte-for-byte what it was before the knob existed. Three
+    // call shapes are compared — the pre-feature 4-argument call, an
+    // explicitly EMPTY ImageRequest, and an EXPLICIT request that happens
+    // to equal the schema default (which proves the override path writes
+    // that field and nothing else).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    // The pre-feature call shape: NO request argument at all.
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter repNoArg;
+    LinkedImage const noArg =
+        linker::link(mod, *loaded.target, *loaded.format, repNoArg);
+    for (auto const& d : repNoArg.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repNoArg.errorCount(), 0u);
+    ASSERT_TRUE(noArg.ok());
+    ASSERT_GT(noArg.bytes.size(), kOhStackReserveOff + 8u);
+    EXPECT_EQ(readU64LE(noArg.bytes, kOhStackReserveOff),
+              kShippedDefaultReserve)
+        << "an unrequested reserve must stay the schema's declared 1 MiB";
+
+    DiagnosticReporter repEmpty;
+    LinkedImage const empty = linkTrivialExec(loaded, repEmpty, ImageRequest{});
+    ASSERT_EQ(repEmpty.errorCount(), 0u);
+    EXPECT_EQ(empty.bytes, noArg.bytes)
+        << "an EMPTY ImageRequest must produce a byte-identical image";
+
+    // An explicit request equal to the declared default is legal (in
+    // range, 4096-aligned) and must land on the same bytes.
+    DiagnosticReporter repSame;
+    LinkedImage const same = linkTrivialExec(
+        loaded, repSame,
+        ImageRequest{.stackReserveBytes = kShippedDefaultReserve});
+    ASSERT_EQ(repSame.errorCount(), 0u);
+    EXPECT_EQ(same.bytes, noArg.bytes)
+        << "requesting exactly the default must write exactly the default "
+           "-- the override touches SizeOfStackReserve and nothing else";
+}
+
+TEST(PeExecWriter, OutOfRangeOrMisalignedStackReserveRequestFailsLoud) {
+    // The request is REFUSED, never clamped and never rounded: an image
+    // whose stack silently differs from the number the build asked for is
+    // undiagnosable at runtime. Each row must produce a FAILED link with
+    // EXACTLY ONE K_InvalidStackReserveRequest — asserting the code, not
+    // merely that "an error happened" (a K_SymbolUndefined would satisfy
+    // the weaker form while the range check was gone).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    struct Row { std::uint64_t want; char const* why; };
+    for (Row const row : {
+             // Below minimumBytes (65536). Page-aligned + under the cap,
+             // so ONLY the minimum check can reject it.
+             Row{4096ull,
+                 "4096 is below the declared minimumBytes (65536)"},
+             // Above maximumBytes (4 GiB). Page-aligned + over the
+             // minimum, so ONLY the maximum check can reject it.
+             Row{8589934592ull,
+                 "8 GiB is above the declared maximumBytes (4 GiB)"},
+             // In range on BOTH bounds but off the 4096-byte
+             // granularity by one byte — the silent-round trap.
+             Row{4194305ull,
+                 "4 MiB + 1 is in range but off the 4096-byte granularity"}}) {
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, *loaded.target, *loaded.format, rep,
+                         ImageRequest{.stackReserveBytes = row.want});
+        EXPECT_FALSE(img.ok()) << row.why;
+        EXPECT_TRUE(img.bytes.empty())
+            << row.why << " -- a refused request must emit NO image";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_InvalidStackReserveRequest),
+                  1u)
+            << row.why;
+        EXPECT_EQ(rep.errorCount(), 1u)
+            << row.why << " -- the gate runs FIRST and returns, so the "
+                          "refusal is the only diagnostic";
+    }
+}
+
+TEST(PeExecWriter, DllAndObjSchemasRefuseAStackReserveRequest) {
+    // CAPABILITY, not KIND, is what gates. All three shipped pe64
+    // schemas are `kind: pe` and the dll even carries the very same
+    // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve field — but only the
+    // EXEC schema declares `stackReserveControl`, because the Windows
+    // loader ignores a DLL's copy (the .exe's value governs the main
+    // thread) and a relocatable .obj has no optional header at all.
+    // An `if (kind == pe)` engine branch would happily write a field
+    // nothing reads; these pins are what forbid one.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto dll = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dll.has_value());
+    auto obj = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(obj.has_value());
+
+    // The asymmetry, stated: same kind, opposite answers.
+    auto exec = loadShippedExec();
+    ASSERT_TRUE(exec.format);
+    EXPECT_EQ(exec.format->kind(), ObjectFormatKind::Pe);
+    EXPECT_TRUE(exec.format->stackReserveControl().has_value());
+
+    for (ObjectFormatSchema const* fmt : {&**dll, &**obj}) {
+        EXPECT_EQ(fmt->kind(), ObjectFormatKind::Pe) << fmt->name();
+        ASSERT_FALSE(fmt->stackReserveControl().has_value())
+            << fmt->name() << " must declare NO stackReserveControl";
+
+        // (a) The linker gate — the single chokepoint every image
+        //     emission passes through.
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, **target, *fmt, rep,
+                         ImageRequest{.stackReserveBytes = kOverrideReserve});
+        EXPECT_FALSE(img.ok()) << fmt->name();
+        EXPECT_TRUE(img.bytes.empty()) << fmt->name();
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << fmt->name() << " must refuse the request, not drop it";
+        EXPECT_EQ(rep.errorCount(), 1u) << fmt->name();
+
+        // (b) The WALKER's own re-check. `pe::encode` is a PUBLIC entry
+        //     point, so a caller that bypasses linker::link must still be
+        //     refused — the same walker serves exec/dll/obj and only the
+        //     declared capability tells them apart.
+        DiagnosticReporter repW;
+        auto const bytes =
+            pe::encode(mod, **target, *fmt, repW,
+                       ImageRequest{.stackReserveBytes = kOverrideReserve});
+        EXPECT_TRUE(bytes.empty())
+            << fmt->name() << " -- pe::encode must refuse a request it "
+                              "cannot honour, even off the linker path";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      repW, DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << fmt->name();
+    }
+}
+
+TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
+    // minimumBytes and maximumBytes are INCLUSIVE: the gate compares
+    // `want < min` / `want > max`, never `<=` / `>=`. RED-on-disable:
+    // flip either comparison to its non-strict form and the matching
+    // boundary request is refused, failing here. Both values also land
+    // in the header, so an "accepted but dropped" regression is caught
+    // by the same test.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    for (std::uint64_t const want : {kShippedMinReserve, kShippedMaxReserve}) {
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, *loaded.target, *loaded.format, rep,
+                         ImageRequest{.stackReserveBytes = want});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual << " (want=" << want << ")";
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << want << " sits exactly ON a declared bound and must be "
+                       "ACCEPTED";
+        ASSERT_TRUE(img.ok()) << want;
+        ASSERT_GT(img.bytes.size(), kOhStackReserveOff + 8u) << want;
+        EXPECT_EQ(readU64LE(img.bytes, kOhStackReserveOff), want)
+            << "the boundary value must reach the header verbatim";
+        EXPECT_NE(readU64LE(img.bytes, kOhStackReserveOff),
+                  kShippedDefaultReserve)
+            << want << " must not silently fall back to the default";
+    }
+}

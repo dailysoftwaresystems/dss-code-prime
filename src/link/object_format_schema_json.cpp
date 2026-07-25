@@ -211,6 +211,16 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // compiler-synthesized shim) is an ELF/PE/Mach-O native-
             // runtime notion — dead data on WASM/SPIR-V.
             "librarySynthesis",
+            // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-program stack-
+            // reserve capability names an ELF/PE/Mach-O image header field.
+            // WASM/SPIR-V have no such field (a WASM module's stack is the
+            // embedder's; SPIR-V has no call stack of this shape), so a
+            // top-level declaration would be dead data whose request the
+            // walker would silently drop.
+            "stackReserveControl",
+            // ... and its remedy axis: WASM/SPIR-V do not participate in the
+            // stack-reserve conversation at all, so neither key belongs.
+            "stackReserveUnsupportedReason",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -683,6 +693,204 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
             }
             if (ok) data.librarySynthesis = info;
+        }
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `stackReserveControl` block —
+    // WHETHER this format can carry a per-PROGRAM stack reserve, and (if so)
+    // WHERE it lands + the legal request range. PRESENCE is the capability:
+    // the linker gate asks `stackReserveControl().has_value()`, never a
+    // format identity, which is what lets the PE **exec** format declare it
+    // while the PE **dll** (same kind, same header struct, but the loader
+    // ignores the field) declares nothing. A PRESENT block is strict — the
+    // vehicle is a closed verb and all three bounds are REQUIRED, because a
+    // capability that does not state its own legal range cannot validate a
+    // request and a defaulted range would silently admit an absurd value.
+    if (doc.contains("stackReserveControl")) {
+        auto const& sr = doc.at("stackReserveControl");
+        if (!sr.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/stackReserveControl",
+                      "'stackReserveControl' must be an object { \"vehicle\": "
+                      "\"pe-optional-header\", \"minimumBytes\": N, "
+                      "\"maximumBytes\": N, \"granularityBytes\": N }");
+        } else {
+            StackReserveControl info{};
+            bool ok = true;
+            if (!sr.contains("vehicle") || !sr.at("vehicle").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/stackReserveControl/vehicle",
+                          "'stackReserveControl.vehicle' is required and must "
+                          "be a string — accepted: \"pe-optional-header\" "
+                          "(IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve)");
+                ok = false;
+            } else {
+                auto const s = sr.at("vehicle").get<std::string>();
+                auto const v = stackReserveVehicleFromName(s);
+                if (!v.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/stackReserveControl/vehicle",
+                              std::format("unknown stackReserveControl vehicle "
+                                          "'{}' — accepted: "
+                                          "\"pe-optional-header\". A vehicle "
+                                          "ships only WITH the walker arm that "
+                                          "writes it, so a format can never "
+                                          "declare a reserve no walker emits.",
+                                          s));
+                    ok = false;
+                } else {
+                    info.vehicle = *v;
+                }
+            }
+            // The three REQUIRED bounds. `is_number_unsigned` rejects a
+            // negative and a float in one check (nlohmann types `-1` as a
+            // SIGNED integer and `1.5` as a float), so a `"minimumBytes": -1`
+            // can never wrap into a huge u64.
+            auto const readBound = [&](char const* key, std::uint64_t& out) {
+                auto const ptr = std::string{"/stackReserveControl/"} + key;
+                if (!sr.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'stackReserveControl.{}' is required "
+                                          "— a declared capability must state "
+                                          "its own legal request range", key));
+                    ok = false;
+                    return;
+                }
+                if (!sr.at(key).is_number_unsigned()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'stackReserveControl.{}' must be a "
+                                          "non-negative integer byte count",
+                                          key));
+                    ok = false;
+                    return;
+                }
+                out = sr.at(key).get<std::uint64_t>();
+            };
+            readBound("minimumBytes",     info.minimumBytes);
+            readBound("maximumBytes",     info.maximumBytes);
+            readBound("granularityBytes", info.granularityBytes);
+
+            // Internal coherence — a range that cannot admit ANY value, or a
+            // zero granularity (a modulo-by-zero at the request gate), is
+            // dead config that would fail every request for the wrong reason.
+            if (ok && info.granularityBytes == 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/granularityBytes",
+                          "'granularityBytes' must be > 0 (a request is "
+                          "alignment-checked against it; 0 admits nothing)");
+                ok = false;
+            }
+            if (ok && info.minimumBytes == 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/minimumBytes",
+                          "'minimumBytes' must be > 0 (a zero-byte stack "
+                          "reserve cannot start a program)");
+                ok = false;
+            }
+            if (ok && info.maximumBytes < info.minimumBytes) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/maximumBytes",
+                          std::format("'maximumBytes' ({}) must be >= "
+                                      "'minimumBytes' ({}) — the declared "
+                                      "range admits no value",
+                                      info.maximumBytes, info.minimumBytes));
+                ok = false;
+            }
+            if (ok && (info.minimumBytes % info.granularityBytes) != 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/minimumBytes",
+                          std::format("'minimumBytes' ({}) must itself be a "
+                                      "multiple of 'granularityBytes' ({}) — "
+                                      "otherwise the smallest legal request is "
+                                      "unreachable",
+                                      info.minimumBytes,
+                                      info.granularityBytes));
+                ok = false;
+            }
+            // Vehicle ↔ format.kind coherence. A vehicle NAMES a structure of
+            // one image format, so declaring `pe-optional-header` on an ELF
+            // schema is dead config whose request the ELF walker would
+            // silently drop — the exact silent-drop this capability exists to
+            // prevent. Expressed as a TABLE (the `kCrossKindRules` idiom
+            // above), not an if-chain: config vocabulary checked against
+            // config vocabulary, evaluated generically.
+            struct VehicleKindRule {
+                StackReserveVehicle vehicle;
+                ObjectFormatKind    kind;
+            };
+            constexpr VehicleKindRule kVehicleKinds[] = {
+                { StackReserveVehicle::PeOptionalHeader, ObjectFormatKind::Pe },
+            };
+            if (ok) {
+                for (auto const& rule : kVehicleKinds) {
+                    if (rule.vehicle == info.vehicle && rule.kind != data.kind) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            "/stackReserveControl/vehicle",
+                            std::format(
+                                "stackReserveControl vehicle '{}' names a "
+                                "structure of the '{}' image format, but this "
+                                "schema declares kind '{}'. The '{}' walker "
+                                "would silently DROP a stack-reserve request "
+                                "routed to it. Fix the vehicle or the "
+                                "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
+                                "DEPTH.",
+                                stackReserveVehicleName(info.vehicle),
+                                objectFormatKindName(rule.kind),
+                                objectFormatKindName(data.kind),
+                                objectFormatKindName(data.kind)));
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) data.stackReserveControl = info;
+        }
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `stackReserveUnsupportedReason` —
+    // the REMEDY axis. Not a second capability: it declares WHY this format
+    // cannot carry a reserve, so the refusal can tell the user where the
+    // property actually lives for THIS artifact (a PE dll's inert header
+    // field, a relocatable object's absent one, an ELF `ulimit`, an
+    // unimplemented Mach-O walker arm). Optional — a format that declares
+    // neither key still REFUSES a request, just with the generic message.
+    if (doc.contains("stackReserveUnsupportedReason")) {
+        auto const& sru = doc.at("stackReserveUnsupportedReason");
+        if (!sru.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/stackReserveUnsupportedReason",
+                      "'stackReserveUnsupportedReason' must be a string — "
+                      "accepted: \"runtime-controlled\", "
+                      "\"loader-ignores-field\", \"no-image-field\", "
+                      "\"walker-not-implemented\"");
+        } else if (data.stackReserveControl.has_value()) {
+            // Contradictory config: a format cannot both DECLARE the
+            // capability and explain why it lacks it. Reject rather than pick
+            // one silently — a schema in this state means the author changed
+            // their mind and left the losing key behind, and whichever the
+            // engine ignored would be a lie sitting in the config.
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      "/stackReserveUnsupportedReason",
+                      "a format must not declare BOTH 'stackReserveControl' "
+                      "(it CAN carry a stack reserve) and "
+                      "'stackReserveUnsupportedReason' (why it CANNOT) — the "
+                      "two are mutually exclusive. Delete whichever no longer "
+                      "applies. D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.");
+        } else {
+            auto const s = sru.get<std::string>();
+            auto const r = stackReserveUnsupportedReasonFromName(s);
+            if (!r.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveUnsupportedReason",
+                          std::format("unknown stackReserveUnsupportedReason "
+                                      "'{}' — accepted: "
+                                      "\"runtime-controlled\", "
+                                      "\"loader-ignores-field\", "
+                                      "\"no-image-field\", "
+                                      "\"walker-not-implemented\"",
+                                      s));
+            } else {
+                data.stackReserveUnsupportedReason = *r;
+            }
         }
     }
 

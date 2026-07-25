@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: ELF has NO image field for a stack SIZE on ANY flavor -- PT_GNU_STACK encodes stack EXECUTABILITY, not size. The kernel sizes the initial thread's stack from the process limit (`ulimit -s` / setrlimit RLIMIT_STACK) and further threads from pthread_attr_setstacksize, so nothing the linker writes can change it. A `stackReserve` / `--stack-reserve` request is therefore REFUSED with that remedy rather than silently dropped -- which is also why the sqlite full tier passes on Linux (8 MiB by default) and overflowed on Windows at 1 MiB.",
+
+  "stackReserveUnsupportedReason": "runtime-controlled",
+
   "format": {
     "name": "elf64-x86_64-linux-exec",
     "version": "1.0",

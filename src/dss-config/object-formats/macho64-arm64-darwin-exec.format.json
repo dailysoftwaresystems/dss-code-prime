@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: Mach-O CAN express a per-program stack reserve -- `LC_MAIN.stacksize` is a genuine equivalent of the PE optional header's SizeOfStackReserve -- but NO DSS walker arm writes it yet, so this schema deliberately declares no `stackReserveControl` and a request is REFUSED. Shipping the capability without the walker would let a request be accepted and silently dropped; declaring the gap keeps it VISIBLE. TRACKED as [[D-LK-MACHO-STACK-RESERVE-LC-MAIN]] -- and that registry row is the point: unlike the other three reason verbs (`runtime-controlled`, `loader-ignores-field`, `no-image-field`), which state PERMANENT facts about a platform, this one names a gap that is OURS and is CLOSABLE, so it carries a trigger and defined closing work in the backlog rather than only a well-written comment (the comment tells whoever HITS it; the row is what keeps it from being forgotten). When the macho walker arm lands, this key is replaced by a `stackReserveControl` block with a `macho-lc-main` vehicle and this format moves to the positive side of the linker gate's coverage sweep.",
+
+  "stackReserveUnsupportedReason": "walker-not-implemented",
+
   "format": {
     "name": "macho64-arm64-darwin-exec",
     "version": "1.0",

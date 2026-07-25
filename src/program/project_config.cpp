@@ -171,6 +171,7 @@ parseProjectConfig(std::string_view jsonText,
     static constexpr std::string_view kKnownKeys[] = {
         "language", "artifactProfile", "targets", "sources", "output",
         "artifactName", "includes", "defines", "resolveLibraries",
+        "stackReserve",
     };
     for (auto it = doc.begin(); it != doc.end(); ++it) {
         std::string const& key = it.key();
@@ -182,7 +183,8 @@ parseProjectConfig(std::string_view jsonText,
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                              "unknown field '" + key + "' (recognized fields: "
                              "language, artifactProfile, targets, sources, output, "
-                             "artifactName, includes, defines, resolveLibraries)");
+                             "artifactName, includes, defines, resolveLibraries, "
+                             "stackReserve)");
             return std::nullopt;
         }
     }
@@ -265,6 +267,43 @@ parseProjectConfig(std::string_view jsonText,
             return std::nullopt;
         }
         pc.artifactName = std::move(a);
+    }
+
+    // `stackReserve` (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) is an OPTIONAL
+    // per-PROGRAM stack-reserve request, in BYTES — the file-driven twin of
+    // the CLI `--stack-reserve`. It belongs in the MANIFEST because the
+    // number is a property of THIS program's deepest call chain (the
+    // motivating case: 1000 levels of nested SQL trigger recursion overflow
+    // the Windows 1 MiB default), so it travels with the project rather than
+    // with an invocation.
+    //
+    // Validated for SHAPE only here — a positive integer byte count.
+    // `is_number_unsigned()` rejects a negative and a float in one check
+    // (nlohmann types `-1` as a SIGNED integer and `4.5` as a float), so a
+    // `-1` can never wrap into a huge u64. RANGE and ALIGNMENT are NOT
+    // decided here: those bounds are declared by the chosen OBJECT FORMAT
+    // (`stackReserveControl` in its `.format.json`) and enforced at the
+    // linker gate, which also REFUSES a request outright on a format that
+    // declares no such capability. Absent ⇒ nullopt ⇒ the format's declared
+    // default stands (unchanged behavior).
+    if (doc.contains("stackReserve")) {
+        json const& v = doc.at("stackReserve");
+        if (!v.is_number_unsigned()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'stackReserve' must be a non-negative "
+                             "integer byte count (e.g. 4194304 for 4 MiB)");
+            return std::nullopt;
+        }
+        std::uint64_t const n = v.get<std::uint64_t>();
+        if (n == 0) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'stackReserve' must be greater than zero "
+                             "when present — a zero-byte stack reserve cannot "
+                             "start a program. Omit the field to take the "
+                             "object format's declared default.");
+            return std::nullopt;
+        }
+        pc.stackReserveBytes = n;
     }
 
     return pc;

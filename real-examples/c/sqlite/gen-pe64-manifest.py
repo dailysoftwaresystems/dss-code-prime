@@ -86,6 +86,33 @@ def main(argv=None):
         sys.stderr.write("gen-pe64-manifest.py: error: no TUs (empty %s)\n" % args.tus)
         return 1
 
+    # ── stackReserve: why this is here, and why THIS number ────────────────────
+    # sqlite's `full`/`all` tiers contain e_fkey-63.1.x, which recurses to
+    # SQLITE_MAX_TRIGGER_DEPTH (1000) levels of NESTED TRIGGER through a
+    # PREPARE-TIME codegen cycle (sqlite3DeleteFrom -> sqlite3GenerateRowDelete
+    # -> sqlite3FkActions -> sqlite3CodeRowTriggerDirect -> getRowTrigger ->
+    # codeRowTrigger -> ...). Windows' DEFAULT process stack is 1 MiB; Linux
+    # gives 8 MiB, which is exactly why this never surfaced on the elf legs.
+    #
+    # MEASURED (not guessed), same machine, same test file, reserve matched by
+    # patching the PE header so the comparison is controlled:
+    #   * a NATIVE gcc-built testfixture ALSO stack-overflows at 1 MiB. Its own
+    #     bisected minimum is 1.75 MiB. So this is NOT merely a DSS defect —
+    #     no compiler passes this test at the Windows default.
+    #   * DSS's bisected minimum is 3.38 MiB (~1.93x gcc's, tracked separately
+    #     as D-CODEGEN-FRAME-SIZE-VS-NATIVE-2X — that gap is real and is why
+    #     2 MiB would fix gcc and NOT fix DSS).
+    # Upstream sets no /STACK in Makefile.msc and no -Wl,--stack anywhere; its
+    # CI does not hit this because it tests on Linux. e_fkey.test itself already
+    # self-gates the 63.x block against high-stack (ASan) builds.
+    #
+    # 8 MiB = 2.4x DSS's measured minimum, and is deliberately the SAME figure
+    # Linux hands the process for free — so the pe64 leg is asking for parity
+    # with the leg that already passes, not for an arbitrary indulgence. Sizing
+    # off gcc's 1.75 MiB would be the trap: it is the wrong compiler's number.
+    # Full evidence: D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.
+    stack_reserve = 8 * 1024 * 1024
+
     manifest = {
         "language":         "c-subset",
         "artifactProfile":  "cli",
@@ -95,6 +122,7 @@ def main(argv=None):
         "includes":         includes,
         "defines":          defines,
         "resolveLibraries": args.resolve_library,
+        "stackReserve":     stack_reserve,
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

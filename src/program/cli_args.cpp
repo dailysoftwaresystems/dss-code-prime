@@ -131,6 +131,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::UnexpectedPositional: return "UnexpectedPositional";
         case CliArgsError::InvalidDefine:        return "InvalidDefine";
         case CliArgsError::InvalidJobs:          return "InvalidJobs";
+        case CliArgsError::InvalidStackReserve:  return "InvalidStackReserve";
     }
     return "Unknown";
 }
@@ -185,6 +186,15 @@ std::string cliHelpText() {
         "  --resolve-library <path>  read a binary's (.so/.dll/.dylib) "
             "export table to resolve + validate this build's externs "
             "against it (repeatable; typically a DSS-built library)\n"
+        "  --stack-reserve <bytes>  stack reserve to request in the emitted "
+            "image, in bytes (e.g. 4194304 = 4 MiB). Overrides the object "
+            "format's default; a project manifest's `stackReserve` key is "
+            "the file-driven equivalent and this flag WINS over it. Only "
+            "formats that declare the capability accept it (a PE .exe does; "
+            "an ELF image has no stack-size field -- there it is a runtime "
+            "`ulimit -s` property) -- a request a format cannot carry is "
+            "REFUSED, never silently dropped. The `=`-form is also "
+            "accepted.\n"
         "\n"
         "Diagnostic options:\n"
         "  --warnings-as-errors   promote every Warning to Error\n"
@@ -589,6 +599,47 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--stack-reserve <bytes>`
+            // / `--stack-reserve=<bytes>` — the per-PROGRAM stack reserve the
+            // emitted image should carry (the DSS spelling of MSVC `/STACK` /
+            // GNU ld `-Wl,--stack`). Must be a positive integer byte count; a
+            // non-numeric value, trailing junk, or 0 fails loud
+            // (InvalidStackReserve) rather than silently falling back to the
+            // format default — a request that vanishes is the exact failure
+            // this capability exists to prevent.
+            //
+            // Deliberately NOT validated for RANGE or ALIGNMENT here: those
+            // bounds are declared by the chosen OBJECT FORMAT
+            // (`stackReserveControl`), which the CLI parser has not resolved
+            // yet, so the linker gate owns that check. Parsing what is
+            // syntactically a byte count is all this layer can honestly do.
+            auto m = valueFlag(a, i, "--stack-reserve");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                std::uint64_t n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                // `ec` catches non-numeric AND overflow; because `n` is
+                // UNSIGNED, from_chars also rejects a leading '-' as
+                // invalid_argument, so negatives need no separate branch.
+                // `p != end` catches trailing junk (`4096x` must not silently
+                // become 4096).
+                if (ec != std::errc{} || p != v.data() + v.size() || n == 0) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidStackReserve,
+                        std::string{"--stack-reserve: '"} + v
+                        + "' is not a positive integer byte count "
+                          "(e.g. --stack-reserve 4194304 for 4 MiB). The "
+                          "value must be in the range the target's object "
+                          "format declares; a format that cannot carry a "
+                          "stack reserve rejects the request outright."));
+                }
+                out.stackReserveBytes = n;
+                continue;
+            }
+        }
+        {
             auto m = valueFlag(a, i, "--suppress");
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
@@ -639,6 +690,28 @@ parseCliArgs(int argc, char* argv[]) {
             "--schema-dir=<path> is only meaningful with --lsp — "
             "pass --lsp to enter LSP mode"));
     }
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--stack-reserve` asks for a field
+    // in an EMITTED IMAGE, so it is meaningless in any mode that emits no
+    // image — `--transpile` writes translated SOURCE, `--lsp` serves a
+    // protocol, `--help` prints text. Accepting it there would silently
+    // discard the request, which is the same silent-drop this capability
+    // exists to eliminate (the linker gate can only refuse a request that
+    // reaches it; in these modes nothing ever does). Mirrors the established
+    // `--schema-dir` mode-gate above, and uses the same error kind.
+    //
+    // Mode::None is deliberately EXCLUDED: bare `--stack-reserve` with no
+    // mode flag falls through to the generic no-mode guard below, whose
+    // message ("pick exactly one of ...") is the more useful one there.
+    if (out.stackReserveBytes.has_value() && mode != Mode::None
+     && mode != Mode::Compile && mode != Mode::Directory
+     && mode != Mode::Project) {
+        return std::unexpected(make_error(
+            CliArgsError::NoModeSelected,
+            "--stack-reserve requests a field in an emitted IMAGE, so it is "
+            "only meaningful for a mode that produces one (--compile / "
+            "--directory / --project). Transpile emits source and --lsp "
+            "emits nothing, so the request would be silently discarded."));
+    }
     if (out.helpMode || out.lspMode) {
         // Help + LSP modes don't need compile options.
         return out;
@@ -658,6 +731,9 @@ parseCliArgs(int argc, char* argv[]) {
          || out.warningsAsErrors
          || out.time
          || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
+         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve without a
+         // mode flag would silently discard the request.
+         || out.stackReserveBytes.has_value()
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {

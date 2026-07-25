@@ -267,6 +267,27 @@ public:
     void setJobs(unsigned n) noexcept { jobs_ = n; }
     [[nodiscard]] unsigned jobs() const noexcept { return jobs_; }
 
+    /// D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM stack reserve
+    /// this build requests of the emitted image, in BYTES. nullopt (the
+    /// default) ⇒ the object format's declared default stands.
+    ///
+    /// Sources + PRECEDENCE: `Program::run` stamps the CLI
+    /// `--stack-reserve`; `Program::compileProject` then applies the
+    /// manifest's `stackReserve` ONLY IF the CLI supplied none — i.e. the
+    /// CLI WINS. (The three flag ARRAYS merge, because appending composes;
+    /// a scalar cannot merge, so it needs an explicit precedence rule, and
+    /// "explicit command line beats committed file" is the universal one.)
+    ///
+    /// The value is carried, not honoured, at this tier: whether the target
+    /// format can express a stack reserve at all — and whether the value is
+    /// within the range that format DECLARES — is decided at the linker
+    /// gate, which REFUSES rather than drops.
+    void setStackReserveBytes(std::optional<std::uint64_t> n) noexcept {
+        stackReserveBytes_ = n;
+    }
+    [[nodiscard]] std::optional<std::uint64_t>
+    stackReserveBytes() const noexcept { return stackReserveBytes_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
@@ -278,6 +299,9 @@ private:
     std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
     substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
     unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
+    // `stackReserve` (nullopt = the format's declared default).
+    std::optional<std::uint64_t>           stackReserveBytes_;
 };
 
 } // namespace dss

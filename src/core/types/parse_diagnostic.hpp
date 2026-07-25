@@ -1987,7 +1987,29 @@ enum class DiagnosticCode : std::uint16_t {
     //   the GNU `/SYM64/` 64-bit-armap case, out of scope, see
     //   D-FF1-AR-BSD-VARIANT). Fail loud rather than truncate a field.
     K_ArchiveFieldOverflow         = 0x8018,
-    // K-NEXT-SLOT: 0x8019 — grep this marker before adding a K_* code.
+    // K_FormatLacksStackReserveControl (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH):
+    //   the build requested a per-PROGRAM stack reserve (project manifest
+    //   `stackReserve` / CLI `--stack-reserve`) but the chosen object format
+    //   declares NO `stackReserveControl` capability, so nothing in the
+    //   emitted image can carry the request. Fires from the linker's
+    //   pre-walker gate (and, defensively, from a walker reached directly).
+    //   Fail loud rather than drop: an image whose stack is silently NOT what
+    //   the program asked for crashes at a depth the user cannot diagnose --
+    //   the motivating case is a 1000-deep trigger recursion overflowing the
+    //   Windows 1 MiB default. Suppressing it would restore the silent drop,
+    //   so the code is unsuppressable.
+    K_FormatLacksStackReserveControl = 0x8019,
+    // K_InvalidStackReserveRequest (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH): the
+    //   format CAN carry a stack reserve, but the requested value violates
+    //   the range the format DECLARED (below `minimumBytes`, above
+    //   `maximumBytes`, not a multiple of `granularityBytes`) or would break
+    //   an image invariant the walker enforces (PE: SizeOfStackCommit must
+    //   not exceed SizeOfStackReserve). Distinct remediation from the code
+    //   above -- "pick a legal value" vs "this format cannot do it at all".
+    //   Never silently clamped or rounded: a rounded reserve is a knob that
+    //   lies about the number it was given.
+    K_InvalidStackReserveRequest   = 0x801A,
+    // K-NEXT-SLOT: 0x801B — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

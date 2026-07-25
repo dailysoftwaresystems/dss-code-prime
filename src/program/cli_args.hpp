@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/input_resolver.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -148,6 +149,26 @@ struct DSS_EXPORT CliArgs {
     // (InvalidJobs); the number is stored verbatim and clamped to the CU count at
     // pool construction. Threaded to `Program::setJobs`.
     unsigned                      jobs = 0;
+
+    // `--stack-reserve <bytes>` / `--stack-reserve=<bytes>`
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH): the per-PROGRAM stack reserve
+    // this build asks the emitted image to carry, in BYTES. nullopt (the
+    // default / absent) = take the object format's declared default.
+    //
+    // The required stack is a property of the PROGRAM (its deepest call
+    // chain), not of the format, which is why it cannot be a fixed number in
+    // a `.format.json` — MSVC spells the same request `/STACK`, GNU ld
+    // `-Wl,--stack`. Zero, non-numeric, and trailing junk fail loud
+    // (InvalidStackReserve); the value is NOT rounded here — whether it is
+    // in range and correctly aligned is decided at the linker gate against
+    // the bounds the chosen FORMAT declares, and a format that declares no
+    // stack-reserve capability at all REFUSES the request rather than
+    // dropping it. Threaded to `Program::setStackReserveBytes`.
+    //
+    // PRECEDENCE: this CLI flag WINS over a project manifest's
+    // `stackReserve` key when both are present (see
+    // `Program::compileProject`).
+    std::optional<std::uint64_t>  stackReserveBytes;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the
@@ -170,6 +191,11 @@ enum class CliArgsError : std::uint8_t {
                                 // supported — use a config predefine)
     InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
                                 // zero, or trailing junk (`--jobs 0`, `--jobs x`)
+    InvalidStackReserve = 14,   // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH:
+                                // --stack-reserve with a non-numeric value, a
+                                // zero, or trailing junk. RANGE/alignment is
+                                // NOT decided here — that is the linker gate's
+                                // job, against the format's declared bounds.
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

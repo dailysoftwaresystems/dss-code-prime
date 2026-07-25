@@ -397,6 +397,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ArchiveMemberNameInvalid";
         case DiagnosticCode::K_ArchiveFieldOverflow:
             return "K_ArchiveFieldOverflow";
+        case DiagnosticCode::K_FormatLacksStackReserveControl:
+            return "K_FormatLacksStackReserveControl";
+        case DiagnosticCode::K_InvalidStackReserveRequest:
+            return "K_InvalidStackReserveRequest";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

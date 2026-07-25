@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1282,4 +1284,357 @@ TEST(StaticLibraryFormats, UnknownContainerSpellingFailsLoud) {
     }
     EXPECT_TRUE(sawContainer)
         << "an unknown container spelling must fail loud at /container";
+}
+
+// ── D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `stackReserveControl` ─────────────
+//
+// WHETHER a format can carry a per-PROGRAM stack reserve, WHERE it lands
+// (the closed `vehicle` verb) and the legal request range. PRESENCE is the
+// capability — the linker gate asks `stackReserveControl().has_value()`,
+// never a format identity — so the shipped pins below are the "capability,
+// not kind" statement: the pe64 **exec** declares it while its same-kind
+// **dll** sibling (identical header struct, but the loader ignores a DLL's
+// copy) declares nothing.
+//
+// A PRESENT block is strict: the vehicle is a closed verb, all three bounds
+// are REQUIRED, and every internal-coherence rule is a LOAD reject. A
+// defaulted or silently-degraded block would admit an absurd request, and a
+// vehicle whose walker never runs would silently DROP one — the two failure
+// modes this whole capability exists to eliminate.
+
+namespace {
+
+// `base` + a `stackReserveControl` block, spliced into a schema that is
+// otherwise VALID (the positive control below asserts the base loads
+// cleanly with a good block). Every rejection is therefore attributable to
+// the block alone — nothing else in the document can be at fault.
+std::string peWithStackReserveControl(std::string_view blockJson) {
+    return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
+      "pe": {"machine": 34404},
+      "stackReserveControl": )"} + std::string{blockJson} + R"(
+    })";
+}
+
+std::string elfWithStackReserveControl(std::string_view blockJson) {
+    return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"synth-elf","version":"1.0","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "stackReserveControl": )"} + std::string{blockJson} + R"(
+    })";
+}
+
+// The one block every rejection case is a single-field mutation of.
+constexpr std::string_view kValidPeStackReserveBlock = R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })";
+
+// Reject + EXACT attribution: the load fails AND carries exactly one
+// diagnostic at `path`, coded `code`. Stronger than the file's
+// `expectRejected` (bare `EXPECT_FALSE`), which would still pass if the
+// loader rejected the document for a completely unrelated reason.
+void expectRejectedAt(std::string_view jsonText, std::string_view path,
+                      DiagnosticCode code, std::string_view why) {
+    auto r = ObjectFormatSchema::loadFromText(jsonText);
+    ASSERT_FALSE(r.has_value()) << why;
+    std::size_t n = 0;
+    for (auto const& d : r.error()) {
+        if (d.path == path) {
+            ++n;
+            EXPECT_EQ(d.code, code) << why << " (at " << path << ")";
+        }
+    }
+    EXPECT_EQ(n, 1u) << why << " -- expected exactly one diagnostic at "
+                     << path;
+}
+
+}  // namespace
+
+TEST(StackReserveControl, ShippedPeExecDeclaresCapabilityWithExactBounds) {
+    // The SHIPPED numbers, pinned field-by-field. minimumBytes = the
+    // Windows 64 KiB allocation granularity; maximumBytes = 4 GiB (a
+    // reserve is VIRTUAL address space, so the cap exists to fail a
+    // fat-fingered value loud rather than ship an unstartable image);
+    // granularityBytes = one page. RED-on-disable: edit any number in
+    // pe64-x86_64-windows-exec.format.json and this fails before the
+    // changed range can silently admit or refuse a request.
+    auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const src = (*r)->stackReserveControl();
+    ASSERT_TRUE(src.has_value())
+        << "pe64 exec must declare stackReserveControl -- without it every "
+           "per-program request fails K_FormatLacksStackReserveControl";
+    EXPECT_EQ(src->vehicle, StackReserveVehicle::PeOptionalHeader);
+    EXPECT_EQ(src->minimumBytes, 65536ull);
+    EXPECT_EQ(src->maximumBytes, 4294967296ull);
+    EXPECT_EQ(src->granularityBytes, 4096ull);
+    // The capability declares the RANGE; the optional header declares the
+    // DEFAULT a request overrides. Both must hold for the override
+    // semantics to mean anything.
+    EXPECT_EQ((*r)->peOptionalHeader().sizeOfStackReserve, 1048576ull)
+        << "1 MiB (the MSVC/Windows convention) is the default a request "
+           "replaces";
+    // The declared default must itself be inside the declared range —
+    // otherwise the no-request path emits a value the request path would
+    // refuse.
+    EXPECT_GE((*r)->peOptionalHeader().sizeOfStackReserve, src->minimumBytes);
+    EXPECT_LE((*r)->peOptionalHeader().sizeOfStackReserve, src->maximumBytes);
+}
+
+TEST(StackReserveControl, ShippedSiblingsDeclareNoCapability) {
+    // "Capability, not kind." The pe64 **dll** is the load-bearing row: it
+    // is the SAME `kind: pe` as the exec and carries the SAME
+    // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve field, yet declares
+    // NOTHING — the Windows loader ignores a DLL's copy, so writing it
+    // would be a silent no-op knob. The `.obj` has no optional header at
+    // all, and no ELF/Mach-O image field carries a stack SIZE
+    // (PT_GNU_STACK encodes EXECUTABILITY; the size is a runtime
+    // `ulimit -s` property).
+    for (auto const* name : {"pe64-x86_64-windows-dll",
+                             "pe64-x86_64-windows",
+                             "pe64-x86_64-windows-staticlib",
+                             "elf64-x86_64-linux-exec",
+                             "elf64-aarch64-linux-exec",
+                             "elf64-x86_64-linux",
+                             "macho64-x86_64-darwin-exec",
+                             "macho64-arm64-darwin-exec"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        EXPECT_FALSE((*r)->stackReserveControl().has_value())
+            << name << " must NOT declare stackReserveControl -- a request "
+                       "against it has to fail LOUD, never be dropped";
+    }
+    // Spelled out: same kind, same header field, opposite answer.
+    auto dll = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dll.has_value());
+    EXPECT_EQ((*dll)->kind(), ObjectFormatKind::Pe);
+    EXPECT_EQ((*dll)->peOptionalHeader().sizeOfStackReserve, 1048576ull)
+        << "the dll HAS the field (it just isn't honoured) -- which is "
+           "precisely why the capability cannot be inferred from the kind";
+}
+
+TEST(StackReserveControl, VehicleEnumRoundTrip) {
+    EXPECT_EQ(stackReserveVehicleName(StackReserveVehicle::PeOptionalHeader),
+              "pe-optional-header");
+    EXPECT_EQ(stackReserveVehicleFromName("pe-optional-header"),
+              std::optional{StackReserveVehicle::PeOptionalHeader});
+    // A vehicle ships only WITH the walker arm that writes it — the
+    // natural second row (Mach-O LC_MAIN.stacksize) is NOT vocabulary yet.
+    EXPECT_FALSE(stackReserveVehicleFromName("macho-lc-main").has_value());
+    EXPECT_FALSE(stackReserveVehicleFromName("").has_value());
+}
+
+TEST(StackReserveControl, ValidBlockLoadsAndIsExposedVerbatim) {
+    // The positive control for every rejection case below: this exact
+    // base + block loads cleanly, so each sad path differs from a LOADING
+    // document in exactly one field.
+    auto r = ObjectFormatSchema::loadFromText(
+        peWithStackReserveControl(kValidPeStackReserveBlock));
+    ASSERT_TRUE(r.has_value())
+        << "the sad-path base schema must itself be valid";
+    auto const src = (*r)->stackReserveControl();
+    ASSERT_TRUE(src.has_value());
+    EXPECT_EQ(src->vehicle, StackReserveVehicle::PeOptionalHeader);
+    EXPECT_EQ(src->minimumBytes, 65536ull);
+    EXPECT_EQ(src->maximumBytes, 4294967296ull);
+    EXPECT_EQ(src->granularityBytes, 4096ull);
+
+    // Omitting the block entirely is the honest "no capability" state —
+    // never an error, never a defaulted-in block.
+    auto none = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
+      "pe": {"machine": 34404}
+    })");
+    ASSERT_TRUE(none.has_value());
+    EXPECT_FALSE((*none)->stackReserveControl().has_value());
+}
+
+TEST(StackReserveControl, UnknownVehicleRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "vehicle": "pe-optional-headers",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })"),
+        "/stackReserveControl/vehicle", DiagnosticCode::C_MalformedJson,
+        "an unknown vehicle must fail loud -- a silent degrade to 'no "
+        "capability' would turn every request into a spurious refusal");
+}
+
+TEST(StackReserveControl, MissingVehicleRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })"),
+        "/stackReserveControl/vehicle", DiagnosticCode::C_MissingField,
+        "vehicle is REQUIRED -- a defaulted vehicle would route a request "
+        "to a walker arm the format never claimed");
+}
+
+TEST(StackReserveControl, EachMissingBoundRejected) {
+    // All three bounds are REQUIRED: a capability that does not state its
+    // own legal range cannot validate a request, and a defaulted range
+    // would silently admit an absurd value. One arm per bound so a
+    // regression that drops only ONE required-check is caught.
+    struct Row { char const* block; char const* path; char const* why; };
+    for (Row const row : {
+             Row{R"({
+        "vehicle": "pe-optional-header",
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })",
+                 "/stackReserveControl/minimumBytes",
+                 "minimumBytes is required"},
+             Row{R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "granularityBytes": 4096
+      })",
+                 "/stackReserveControl/maximumBytes",
+                 "maximumBytes is required"},
+             Row{R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296
+      })",
+                 "/stackReserveControl/granularityBytes",
+                 "granularityBytes is required"}}) {
+        expectRejectedAt(peWithStackReserveControl(row.block), row.path,
+                         DiagnosticCode::C_MissingField, row.why);
+    }
+}
+
+TEST(StackReserveControl, NegativeBoundRejectedNeverWrapsToHugeU64) {
+    // The `is_number_unsigned` pin. nlohmann types `-1` as a SIGNED
+    // integer, so a `get<std::uint64_t>()` on it would WRAP to
+    // 18446744073709551615 and silently declare a 16-exabyte maximum. One
+    // arm per bound — the check lives in a shared lambda, but a
+    // regression could plausibly bypass it for a single call site.
+    for (auto const* key : {"minimumBytes", "maximumBytes",
+                            "granularityBytes"}) {
+        std::string block = R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })";
+        // Retarget the one field under test to -1.
+        auto const pos = block.find(std::string{"\""} + key + "\": ");
+        ASSERT_NE(pos, std::string::npos) << key;
+        auto const valueStart = block.find(':', pos) + 2u;
+        auto const valueEnd   = block.find_first_of(",\n}", valueStart);
+        block.replace(valueStart, valueEnd - valueStart, "-1");
+        expectRejectedAt(peWithStackReserveControl(block),
+                         std::string{"/stackReserveControl/"} + key,
+                         DiagnosticCode::C_MalformedJson,
+                         "a NEGATIVE bound must reject -- it must never wrap "
+                         "into a huge u64");
+    }
+}
+
+TEST(StackReserveControl, ZeroGranularityRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 0
+      })"),
+        "/stackReserveControl/granularityBytes",
+        DiagnosticCode::C_MalformedJson,
+        "granularityBytes 0 is a modulo-by-zero at the request gate and "
+        "admits nothing");
+}
+
+TEST(StackReserveControl, ZeroMinimumRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 0,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })"),
+        "/stackReserveControl/minimumBytes", DiagnosticCode::C_MalformedJson,
+        "a zero-byte stack reserve cannot start a program");
+}
+
+TEST(StackReserveControl, MaximumBelowMinimumRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4096,
+        "granularityBytes": 4096
+      })"),
+        "/stackReserveControl/maximumBytes", DiagnosticCode::C_MalformedJson,
+        "an inverted range admits NO value -- every request would be "
+        "refused for the wrong reason");
+}
+
+TEST(StackReserveControl, MinimumNotMultipleOfGranularityRejected) {
+    expectRejectedAt(
+        peWithStackReserveControl(R"({
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65537,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      })"),
+        "/stackReserveControl/minimumBytes", DiagnosticCode::C_MalformedJson,
+        "a minimumBytes off the granularity makes the smallest legal "
+        "request unreachable");
+}
+
+TEST(StackReserveControl, PeVehicleOnElfSchemaRejected) {
+    // Vehicle ↔ format.kind coherence. A vehicle NAMES a structure of ONE
+    // image format, so `pe-optional-header` on an ELF schema is dead
+    // config whose request the ELF walker would silently DROP — the exact
+    // silent-drop this capability exists to prevent. RED-on-disable:
+    // delete the kVehicleKinds table walk in object_format_schema_json.cpp
+    // and this schema loads, arming a stack-reserve request that never
+    // reaches any header.
+    expectRejectedAt(elfWithStackReserveControl(kValidPeStackReserveBlock),
+                     "/stackReserveControl/vehicle",
+                     DiagnosticCode::C_MalformedJson,
+                     "a PE vehicle on an ELF schema must fail loud");
+}
+
+TEST(StackReserveControl, WasmSchemaRejectsTheWholeBlock) {
+    // WASM/SPIR-V have no image field of this shape at all (a WASM
+    // module's stack is the embedder's), so the block joins the
+    // universal-field reject list: a top-level declaration is dead data
+    // the walker would silently ignore.
+    expectRejectedAt(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "ILP32",
+      "format": {"name":"synth-wasm","version":"0.1","kind":"wasm"},
+      "stackReserveControl": {
+        "vehicle": "pe-optional-header",
+        "minimumBytes": 65536,
+        "maximumBytes": 4294967296,
+        "granularityBytes": 4096
+      }
+    })",
+                     "/stackReserveControl", DiagnosticCode::C_MalformedJson,
+                     "a wasm schema must reject stackReserveControl -- no "
+                     "such image field exists to carry it");
+}
+
+TEST(StackReserveControl, NonObjectBlockRejected) {
+    expectRejectedAt(peWithStackReserveControl("4194304"),
+                     "/stackReserveControl",
+                     DiagnosticCode::C_MalformedJson,
+                     "a scalar in place of the block must fail loud rather "
+                     "than be read as a bare byte count");
 }

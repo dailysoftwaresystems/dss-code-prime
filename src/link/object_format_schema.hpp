@@ -994,6 +994,37 @@ struct DSS_EXPORT ObjectFormatData {
     // pe/macho declare it. An unknown VALUE fails loud at load.
     std::optional<LibrarySynthesis> librarySynthesis;
 
+    // ── D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: stack-reserve capability ──
+    //
+    // Whether THIS format can record a per-PROGRAM stack reserve in the
+    // emitted image (`"stackReserveControl"` in the JSON): the closed
+    // VEHICLE naming the header field / load command it lands in, plus the
+    // declared legal range a request is validated against. See
+    // `StackReserveControl` (core/types/object_format_kind.hpp).
+    //
+    // `std::nullopt` = this format cannot express a stack reserve. NOT a
+    // silent default: `linker::link` fails loud
+    // (`K_FormatLacksStackReserveControl`) on a project/CLI request against
+    // a nullopt format, because silently dropping the request would ship an
+    // image whose stack is NOT what the program asked for — the exact
+    // knob-that-lies class. Declared by the PE **exec** format only: PE
+    // **dll** omits it (the loader ignores a DLL's SizeOfStackReserve), ELF
+    // omits it (no image field carries a stack SIZE — `PT_GNU_STACK` is
+    // executability; the size is a runtime/`ulimit` property), Mach-O omits
+    // it until an `LC_MAIN.stacksize` walker arm lands. An unknown VEHICLE,
+    // or one incoherent with `format.kind`, fails loud at load.
+    std::optional<StackReserveControl> stackReserveControl;
+
+    // The REMEDY axis of the same anchor (`"stackReserveUnsupportedReason"`):
+    // WHY this format cannot carry a stack reserve, as a closed verb the
+    // diagnostic turns into an actionable remedy. Mutually exclusive with
+    // `stackReserveControl` (declaring both is contradictory config and fails
+    // loud at load). OPTIONAL: a format that declares neither still REFUSES a
+    // request — just with the generic message. See
+    // `StackReserveUnsupportedReason` (core/types/object_format_kind.hpp) for
+    // why each of the four verbs exists and what it tells the user to do.
+    std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -1305,6 +1336,28 @@ public:
     [[nodiscard]] std::optional<LibrarySynthesis> const&
     librarySynthesis() const noexcept {
         return d_.librarySynthesis;
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the format's stack-reserve
+    // capability (vehicle + declared legal range), or `std::nullopt` if this
+    // format cannot express a per-program stack reserve at all. THE
+    // capability query the linker gate asks — presence, never a format
+    // identity — so PE-exec (declares) and PE-dll (does not) diverge from
+    // config alone. A request against a nullopt format is a fail-loud.
+    [[nodiscard]] std::optional<StackReserveControl>
+    stackReserveControl() const noexcept {
+        return d_.stackReserveControl;
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: WHY this format cannot carry a
+    // stack reserve, as a closed verb the refusal diagnostic turns into an
+    // actionable remedy (`stackReserveUnsupportedRemedy`). `std::nullopt`
+    // ⇒ the format declared no reason; the refusal still fires, with the
+    // generic message. Never consulted when `stackReserveControl()` has a
+    // value — the two are mutually exclusive by load-time validation.
+    [[nodiscard]] std::optional<StackReserveUnsupportedReason>
+    stackReserveUnsupportedReason() const noexcept {
+        return d_.stackReserveUnsupportedReason;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

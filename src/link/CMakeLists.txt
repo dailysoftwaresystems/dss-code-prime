@@ -1,6 +1,7 @@
 add_library(link OBJECT
     cross_cu_resolve.cpp
     entry_trampoline.cpp
+    image_request.cpp
     linker.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp

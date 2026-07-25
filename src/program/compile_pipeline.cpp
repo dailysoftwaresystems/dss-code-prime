@@ -1492,11 +1492,12 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
                   TargetSchema const&              target,
                   ObjectFormatSchema const&        format,
                   std::filesystem::path const&     outPath,
-                  DiagnosticReporter&              reporter) {
+                  DiagnosticReporter&              reporter,
+                  ImageRequest const&              request) {
     // c97: link phase — resolution + byte emission + image write.
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(modules, target, format, reporter);
+    auto image = linker::link(modules, target, format, reporter, request);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
@@ -1746,10 +1747,11 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                                     TargetSchema const&                    target,
                                     ObjectFormatSchema const&              format,
                                     std::filesystem::path const&           outPath,
-                                    DiagnosticReporter&                    reporter) {
+                                    DiagnosticReporter&                    reporter,
+                                    ImageRequest const&                    request) {
     if (staticArchives.empty()) {
         return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
-                            target, format, outPath, reporter);
+                            target, format, outPath, reporter, request);
     }
     auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
                                            target, format, reporter);
@@ -1766,7 +1768,7 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
     combined.push_back(std::move(clientModule));
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
-                        target, format, outPath, reporter);
+                        target, format, outPath, reporter, request);
 }
 
 // c163 (D-LK-STATIC-ARCHIVE-WRITER): link N assembled CUs into N relocatable
@@ -1777,7 +1779,8 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                                TargetSchema const&              target,
                                ObjectFormatSchema const&        format,
                                std::filesystem::path const&     outPath,
-                               DiagnosticReporter&              reporter) {
+                               DiagnosticReporter&              reporter,
+                               ImageRequest const&              request) {
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const entry = reporter.errorCount();
 
@@ -1818,8 +1821,13 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i) {
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
+        // so the capability gate fires on the archive path too. No archive
+        // format declares a stack-reserve capability (an `ar` member carries no
+        // image headers), so a request here is REFUSED on the first member —
+        // never silently swallowed by a build that reports success.
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter);
+                                  target, format, reporter, request);
         if (!image.ok() || !tierClean(reporter, entry)) {
             return false;
         }

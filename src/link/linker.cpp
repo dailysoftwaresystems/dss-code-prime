@@ -581,9 +581,39 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 LinkedImage link(std::span<AssembledModule const> modules,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
-                 DiagnosticReporter&       reporter) {
+                 DiagnosticReporter&       reporter,
+                 ImageRequest const&       request) {
     LinkedImage image;
     image.format = objectFormatSchema.kind();
+
+    // ── Per-PROGRAM image-request gate (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) ──
+    //
+    // Runs FIRST, before any module work: a request the chosen format cannot
+    // honour is a build error regardless of what the modules contain, and
+    // reporting it up-front costs the user nothing.
+    //
+    // The decision itself lives in `enforceImageRequest` (link/image_request)
+    // so the gate and every walker arm share ONE implementation -- the first
+    // cut split them and the PE walker ended up checking the CAPABILITY but
+    // not the declared BOUNDS, which let a direct `pe::encode` call write an
+    // out-of-range reserve and report success.
+    //
+    // What it asks is a declared CAPABILITY, never a format identity: the
+    // capability is not even uniform within one kind -- `pe64-...-exec`
+    // declares it (the Windows loader reads SizeOfStackReserve) while
+    // `pe64-...-dll` does not (the loader IGNORES a DLL's copy of the same
+    // field), so an `if (kind == Pe)` branch here would write a field nothing
+    // reads. ELF declares nothing because no ELF image field carries a stack
+    // SIZE at all.
+    //
+    // This is the chokepoint every compile-driven emission passes through, so
+    // a request can never slip past into a walker that would drop it silently
+    // -- the whole failure mode being a build that reports success while
+    // emitting an image whose stack is not what was asked for.
+    if (!enforceImageRequest(request, objectFormatSchema, "linker", reporter)) {
+        image.resolvedFuncCount = 0;
+        return image;
+    }
 
     // D-LK4-3 — N==0 is a caller error; N>1 (cross-CU) builds the collision-proof
     // compound-key index + validates each CU, then fail-louds: the multi-CU image
@@ -1064,8 +1094,15 @@ LinkedImage link(std::span<AssembledModule const> modules,
                                   objectFormatSchema, reporter);
         break;
     case ObjectFormatKind::Pe:
+        // `request` is threaded ONLY to the walkers that implement a
+        // declared vehicle for one of its fields (today: PE, for
+        // `stackReserveControl.vehicle = pe-optional-header`). The other
+        // walkers take no request BY CONSTRUCTION: their formats declare no
+        // capability, so the gate above has already refused any request that
+        // would reach them. A new vehicle lands WITH its walker's parameter,
+        // never before — so "declared but silently dropped" is unreachable.
         image.bytes = pe::encode(module, targetSchema,
-                                 objectFormatSchema, reporter);
+                                 objectFormatSchema, reporter, request);
         break;
     case ObjectFormatKind::MachO:
         image.bytes = macho::encode(module, targetSchema,
@@ -1118,9 +1155,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
 LinkedImage link(AssembledModule const&    module,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
-                 DiagnosticReporter&       reporter) {
+                 DiagnosticReporter&       reporter,
+                 ImageRequest const&       request) {
     return link(std::span<AssembledModule const>{&module, 1},
-                targetSchema, objectFormatSchema, reporter);
+                targetSchema, objectFormatSchema, reporter, request);
 }
 
 } // namespace dss::linker

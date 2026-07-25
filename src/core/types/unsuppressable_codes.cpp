@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 125> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 127> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -278,6 +278,15 @@ constexpr std::array<DiagnosticCode, 125> kUnsuppressableCodes{{
     // (D-LK4-RODATA-BSS-INVARIANT).
     DiagnosticCode::K_DuplicateDataSymbol,
     DiagnosticCode::K_BssDataHasBytes,
+    // K_FormatLacksStackReserveControl / K_InvalidStackReserveRequest
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) — the per-program stack-reserve
+    // request gate. Suppressing either restores EXACTLY the silent drop the
+    // capability exists to prevent: the build would report success while
+    // emitting an image whose stack is NOT the size the program asked for,
+    // and the failure surfaces later as a stack overflow at a recursion depth
+    // with no diagnostic trail back to the dropped request.
+    DiagnosticCode::K_FormatLacksStackReserveControl,
+    DiagnosticCode::K_InvalidStackReserveRequest,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating

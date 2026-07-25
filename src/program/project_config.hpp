@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -79,6 +80,18 @@ struct DSS_EXPORT ProjectConfig {
     std::vector<std::string> includes;         // → setIncludeDirs      (CLI -I <dir>)
     std::vector<std::string> defines;          // → setUserDefines      (CLI --define NAME[=VALUE])
     std::vector<std::string> resolveLibraries; // → setResolveLibraries (CLI --resolve-library <path>)
+    // OPTIONAL per-PROGRAM stack reserve in BYTES (manifest key
+    // `stackReserve`; D-SQLITE-PE64-FULL-TIER-STACK-DEPTH). nullopt iff the
+    // field is absent ⇒ the object format's declared default stands.
+    //
+    // Unlike the three arrays above, this is a SCALAR and therefore cannot
+    // merge — so it has an explicit PRECEDENCE rule instead: the CLI
+    // `--stack-reserve` WINS; the manifest value applies only when the CLI
+    // supplied none (`Program::compileProject`). Rationale: an explicit
+    // command-line argument overriding a committed file is the universal
+    // convention, and it is the only rule that lets a user probe a different
+    // reserve without editing (and risking committing) the manifest.
+    std::optional<std::uint64_t> stackReserveBytes;
 };
 
 // Parse a project config from JSON text. `sourceLabel` names the input

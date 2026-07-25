@@ -10,6 +10,7 @@
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
+#include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
 #include "mir/merge/synth_seh_funclets.hpp"  // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
@@ -429,12 +430,16 @@ lowerMergedToAssembly(MergedMirModule&    merged,
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's
 // cross-CU merge (LK11a resolution + LK11b byte emission). Returns true iff the
 // image is `ok()`, no link-tier error fired, and `writeImage` committed bytes.
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
+// STACK-DEPTH); it is forwarded verbatim to `linker::link`, which gates it
+// against the format's DECLARED capability. Defaults to empty.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWrite(std::span<AssembledModule const> modules,
              TargetSchema const&              target,
              ObjectFormatSchema const&        format,
              std::filesystem::path const&     outPath,
-             DiagnosticReporter&              reporter);
+             DiagnosticReporter&              reporter,
+             ImageRequest const&              request = {});
 
 // -- c165 (D-LK-STATIC-LINK): STATIC linking against `ar` archives --------------
 //
@@ -520,7 +525,8 @@ linkAndWriteWithStaticArchives(AssembledModule                        clientModu
                                TargetSchema const&                    target,
                                ObjectFormatSchema const&              format,
                                std::filesystem::path const&           outPath,
-                               DiagnosticReporter&                    reporter);
+                               DiagnosticReporter&                    reporter,
+                               ImageRequest const&                    request = {});
 
 // c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-
 // LINK): link N assembled CUs into N RELOCATABLE object members and bundle them
@@ -545,12 +551,20 @@ linkAndWriteWithStaticArchives(AssembledModule                        clientModu
 // `--emit staticlib` flag routing here + the `.a`/`.lib` extension policy +
 // member naming) is the named follow-up D-FF1-AR-STATICLIB-DRIVER-WIRING; this
 // is the shipped composition it will call.
+//
+// `request` (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) is forwarded to EVERY member
+// link so the capability gate fires here too. No relocatable/archive format
+// declares a stack-reserve capability -- a static archive carries no image
+// headers at all -- so a request routed here is REFUSED. That is the point:
+// accepting the parameter and ignoring it is what would let the request vanish
+// on a `staticlib` target.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                           std::span<std::string const>     memberNames,
                           TargetSchema const&              target,
                           ObjectFormatSchema const&        format,
                           std::filesystem::path const&     outPath,
-                          DiagnosticReporter&              reporter);
+                          DiagnosticReporter&              reporter,
+                          ImageRequest const&              request = {});
 
 } // namespace dss

@@ -400,6 +400,190 @@ struct DSS_EXPORT LibrarySynthesis {
     std::string         libraryPath;
 };
 
+// ── Per-PROGRAM stack-reserve control (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) ─
+//
+// WHERE — if anywhere — an object format can record "this PROGRAM needs N
+// bytes of stack". The required stack is a property of the PROGRAM (its
+// deepest call chain), not of the format, so it cannot live as a fixed
+// number in a `.format.json`: the measured motivating case is sqlite's
+// `e_fkey-63.1.1` (1000 levels of nested trigger recursion), which
+// stack-overflows at the Windows 1 MiB default even when built by GCC.
+// Every real toolchain exposes it as a link-time request (MSVC `/STACK`,
+// GNU ld `-Wl,--stack`); this block is how a format DECLARES that it can
+// carry one, so the engine asks the CAPABILITY and never the identity.
+//
+// The capability is NOT uniform across formats, and — critically — not even
+// uniform within one format KIND:
+//   * PE **executable** — IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve is
+//     exactly this field, read by the Windows loader when it commits the
+//     initial thread's stack. Declares the block.
+//   * PE **dll** — has the same header field, but the loader IGNORES it
+//     (the .exe's value governs the main thread; other threads take the
+//     .exe default or an explicit CreateThread size). Declares NOTHING: an
+//     `if (kind == pe)` engine branch would silently write a field nothing
+//     reads. This asymmetry is the reason the capability is per-FORMAT
+//     config rather than a kind test.
+//   * Mach-O executable — `LC_MAIN.stacksize` is a genuine equivalent.
+//     NOT declared yet: no walker arm implements it (see the vehicle enum).
+//   * ELF — has NO image field for stack SIZE. `PT_GNU_STACK` encodes
+//     EXECUTABILITY, not size; the size comes from the kernel/`ulimit -s`
+//     (or `-z stacksize` on the few linkers that honour it). Declares
+//     nothing, so a request on an ELF target fails LOUD.
+//
+// WHICH header field / load command a declared reserve lands in. A vehicle
+// names a structure of ONE image format, so the loader cross-checks it
+// against `format.kind` (a config-coherence rule, not an engine branch):
+// declaring `pe-optional-header` on an ELF schema is dead config whose
+// request the ELF walker would silently drop.
+//
+// Exactly ONE vehicle ships today because exactly one walker arm
+// implements one (`src/link/format/pe.cpp`). `macho-lc-main` is the
+// natural second row and lands WITH its walker arm — never before it, or
+// a Mach-O schema could declare a reserve that is silently dropped.
+enum class StackReserveVehicle : std::uint8_t {
+    // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve (PE/COFF §3.4), at
+    // optional-header offset +72. Implemented by pe.cpp's image arm.
+    PeOptionalHeader = 1,
+};
+
+inline constexpr EnumNameTable<StackReserveVehicle, 1> kStackReserveVehicleTable{{{
+    { StackReserveVehicle::PeOptionalHeader, "pe-optional-header" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveVehicleName(StackReserveVehicle v) noexcept {
+    return kStackReserveVehicleTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<StackReserveVehicle>
+stackReserveVehicleFromName(std::string_view s) noexcept {
+    return kStackReserveVehicleTable.fromName(s);
+}
+
+// The format's stack-reserve capability block (`"stackReserveControl"` in
+// `.format.json`). Presence IS the capability: a format that omits it
+// cannot express a per-program stack reserve, and a request against it
+// fails loud (`K_FormatLacksStackReserveControl`) rather than being
+// silently dropped.
+//
+// The three bounds make the REQUEST validation config-driven: the engine
+// range-checks a request against the numbers the FORMAT declares, so no
+// PE-specific constant is baked into shared substrate. All three are
+// REQUIRED when the block is present — a capability that does not state
+// its own legal range cannot validate anything, and a defaulted range
+// would silently admit an absurd value.
+// ── WHY a format cannot carry a stack reserve (the remedy axis) ─────
+//
+// The refusal above is only half the job. A user who asked for 4 MiB needs to
+// know WHERE the property actually lives for THIS artifact, and that differs
+// sharply between formats that all merely "declare no capability":
+//
+//   * a PE **dll** HAS the header field and it is INERT (measured: 12
+//     unrelated Microsoft system DLLs -- ntdll, ucrtbase, kernel32, msvcrt,
+//     shell32, crypt32, ... -- all carry the IDENTICAL untuned 0x40000, while
+//     8 system EXEs carry tuned, VARYING values [0x80000 / 0x100000] with
+//     SizeOfStackCommit spread across 8 KiB..1008 KiB. Uniformity across
+//     unrelated DLLs versus per-program tuning on EXEs is the signature of a
+//     field nothing reads. Documented Win32 semantics agree: CreateThread's
+//     `dwStackSize` "uses the default size for the EXECUTABLE" when zero --
+//     the executable's, not the loaded module's). Remedy: the host .exe.
+//   * a relocatable object / static archive / dylib has NO such field at all.
+//     Remedy: the final link that produces the executable.
+//   * ELF has no image field on ANY flavor -- the size is set by the OS at
+//     process/thread start. Remedy: `ulimit -s` / setrlimit.
+//   * Mach-O exec COULD carry it (`LC_MAIN.stacksize`) but no DSS walker arm
+//     writes it. Remedy: none -- an honest, named compiler gap.
+//
+// Those four remedies cannot be derived from any other declared verb without
+// asking WHICH FORMAT this is, so the reason is DECLARED, one closed verb per
+// schema, and the engine looks the remedy up in the table below. Declaring the
+// reason is OPTIONAL: a format that omits it still fails LOUD, just with the
+// generic message (fail-closed degrades to less-specific, never to silent).
+enum class StackReserveUnsupportedReason : std::uint8_t {
+    // The OS sets the stack at process/thread start; no image field has a say.
+    RuntimeControlled   = 1,
+    // The header HAS the field, but this platform's loader does not read it.
+    LoaderIgnoresField  = 2,
+    // This artifact form has no header field for a stack size at all.
+    NoImageField        = 3,
+    // The format CAN express it, but no DSS walker arm writes it yet.
+    // UNLIKE the three verbs above — which are PERMANENT facts about a
+    // platform — this one names a gap that is OURS and is CLOSABLE, so it is
+    // tracked as a real backlog item with a trigger and defined closing work:
+    // D-LK-MACHO-STACK-RESERVE-LC-MAIN. A comment tells whoever HITS the gap;
+    // the registry row is what keeps it from being forgotten.
+    WalkerNotImplemented = 4,
+};
+
+inline constexpr EnumNameTable<StackReserveUnsupportedReason, 4>
+kStackReserveUnsupportedReasonTable{{{
+    { StackReserveUnsupportedReason::RuntimeControlled,    "runtime-controlled"    },
+    { StackReserveUnsupportedReason::LoaderIgnoresField,   "loader-ignores-field"  },
+    { StackReserveUnsupportedReason::NoImageField,         "no-image-field"        },
+    { StackReserveUnsupportedReason::WalkerNotImplemented, "walker-not-implemented"},
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveUnsupportedReasonName(StackReserveUnsupportedReason r) noexcept {
+    return kStackReserveUnsupportedReasonTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<StackReserveUnsupportedReason>
+stackReserveUnsupportedReasonFromName(std::string_view s) noexcept {
+    return kStackReserveUnsupportedReasonTable.fromName(s);
+}
+
+// The REMEDY prose, one row per declared reason. Kept beside the vocabulary so
+// the verb and its explanation cannot drift apart, and looked up by the
+// diagnostic through a generic table walk — the engine never asks which format
+// it is holding, only which reason that format DECLARED.
+inline constexpr EnumNameTable<StackReserveUnsupportedReason, 4>
+kStackReserveUnsupportedRemedyTable{{{
+    { StackReserveUnsupportedReason::RuntimeControlled,
+      "on this platform the stack size is a RUNTIME property, not an image "
+      "property: the kernel sizes the initial thread's stack from the process "
+      "limit (`ulimit -s` / setrlimit RLIMIT_STACK) and additional threads "
+      "from pthread_attr_setstacksize. Nothing the linker writes can change "
+      "it, so raise the limit where the program RUNS." },
+    { StackReserveUnsupportedReason::LoaderIgnoresField,
+      "this artifact's header does contain the field, but the platform loader "
+      "IGNORES it for a module of this kind -- a thread's stack is sized from "
+      "the EXECUTABLE that loads this module (its own header) or explicitly "
+      "at thread creation (Win32 CreateThread `dwStackSize`). Writing the "
+      "field here would produce a build that reports success and changes "
+      "NOTHING, so request the reserve on the EXECUTABLE instead." },
+    { StackReserveUnsupportedReason::NoImageField,
+      "this artifact form carries no image header field for a stack size at "
+      "all -- it is an input to a later link, not a loadable program. Request "
+      "the reserve on the build that produces the final EXECUTABLE image." },
+    { StackReserveUnsupportedReason::WalkerNotImplemented,
+      "this format CAN express a stack reserve, but no DSS walker arm writes "
+      "it yet, so the request cannot be honoured. This is a named compiler "
+      "gap, not a property of the platform -- the request is refused rather "
+      "than silently dropped so the gap stays visible. Tracked as "
+      "D-LK-MACHO-STACK-RESERVE-LC-MAIN." },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveUnsupportedRemedy(StackReserveUnsupportedReason r) noexcept {
+    return kStackReserveUnsupportedRemedyTable.name(r);
+}
+
+struct DSS_EXPORT StackReserveControl {
+    StackReserveVehicle vehicle = StackReserveVehicle::PeOptionalHeader;
+    // Smallest honourable request. Below this the image is legal but the
+    // program cannot start (the loader must still commit the initial
+    // stack pages), so a smaller request is rejected rather than emitted.
+    std::uint64_t minimumBytes     = 0;
+    // Largest honourable request — the "absurd value" boundary. A reserve
+    // is VIRTUAL address space, so a generous cap is correct; the point is
+    // that a fat-fingered 0x100000000000 fails loud at link instead of
+    // producing an image the loader refuses to start.
+    std::uint64_t maximumBytes     = 0;
+    // Required alignment of a request, in bytes (page granularity on PE).
+    // A misaligned request is rejected rather than silently rounded — a
+    // silent round is the knob-that-lies class.
+    std::uint64_t granularityBytes = 0;
+};
+
 // THE single source of truth for the extern-call-site SHAPE selection
 // (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a
 // pointer slot (x86_64 `FF 15 disp32` = `call [RIP+disp]`); the LIR

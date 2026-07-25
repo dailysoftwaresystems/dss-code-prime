@@ -1,6 +1,9 @@
 {
   "$comment": "STATIC LIBRARY (`ar` archive of relocatable members) for elf64-x86_64-linux. c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING). IDENTICAL to the `elf64-x86_64-linux` relocatable format -- its ELF ET_REL x86_64 SysV members are written by the SAME relocatable writer + the same sections[]/relocations[] rows -- PLUS exactly `container: \"archive\"` + `artifactProfiles: [\"staticlib\"]` + the `-staticlib` name. The archive framing itself is FORMAT-BLIND (src/link/format/ar.cpp): the SysV `.a` armap for ELF/Mach-O, the Microsoft `.lib` 2nd linker member for PE (flavor threaded from kind() in linkAndWriteStaticArchive). No writer code is format-specific to the archive. Kept in sync with the relocatable sibling by hand: any section/reloc change there must mirror here.",
   "dssObjectFormatVersion": 1,
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: ELF has NO image field for a stack SIZE on ANY flavor -- PT_GNU_STACK encodes stack EXECUTABILITY, not size. The kernel sizes the initial thread's stack from the process limit (`ulimit -s` / setrlimit RLIMIT_STACK) and further threads from pthread_attr_setstacksize, so nothing the linker writes can change it. A `stackReserve` / `--stack-reserve` request is therefore REFUSED with that remedy rather than silently dropped -- which is also why the sqlite full tier passes on Linux (8 MiB by default) and overflowed on Windows at 1 MiB.",
+  "stackReserveUnsupportedReason": "runtime-controlled",
+
   "format": {
     "name": "elf64-x86_64-linux-staticlib",
     "version": "1.0",

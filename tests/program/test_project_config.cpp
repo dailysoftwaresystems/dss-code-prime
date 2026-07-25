@@ -36,6 +36,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -59,6 +60,17 @@ std::size_t countCode(DiagnosticReporter const& rep, DiagnosticCode code) {
 
 bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
     return countCode(rep, code) > 0;
+}
+
+// First human message carried for `code` (stored in `actual` by the
+// `report()` shim) — for the §7-#3 actionable-message pin and the
+// loader's unknown-key "recognized fields" pin.
+std::string firstMessageForCode(DiagnosticReporter const& rep,
+                                DiagnosticCode code) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
 }
 
 std::span<std::string const> asSpan(std::vector<std::string> const& v) {
@@ -426,6 +438,127 @@ TEST(ProjectConfigLoader, UnknownKeyStillRejected) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
 }
 
+// ── Loader: OPTIONAL `stackReserve` (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) ──
+// A per-PROGRAM stack-reserve request in BYTES — the file-driven twin of the
+// CLI `--stack-reserve`. Absent ⇒ nullopt (the object format's declared
+// default stands). Present is validated for SHAPE ONLY: a POSITIVE unsigned
+// JSON integer (so a negative, a float, a string, and 0 each fail
+// C_MalformedJson). RANGE + ALIGNMENT belong to the linker gate, against the
+// bounds the chosen FORMAT declares — deliberately not decided here.
+
+TEST(ProjectConfigLoader, StackReservePresentParsesExactValue) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "stackReserve": 4194304
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(pc->stackReserveBytes.has_value());
+    EXPECT_EQ(*pc->stackReserveBytes, std::uint64_t{4194304});   // 4 MiB
+}
+
+// A >4 GiB value must round-trip EXACTLY (2^33 does not fit in a 32-bit
+// `unsigned`): a narrowing of the field or of the `get<>` target would
+// truncate the request silently — the exact-value compare is the lever.
+TEST(ProjectConfigLoader, StackReserveAboveFourGiBRoundTripsExactly) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "stackReserve": 8589934592
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(pc->stackReserveBytes.has_value());
+    EXPECT_EQ(*pc->stackReserveBytes, std::uint64_t{8589934592});   // 2^33
+}
+
+TEST(ProjectConfigLoader, StackReserveAbsentIsNullopt) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(pc->stackReserveBytes.has_value())
+        << "absent ⇒ nullopt; the object format's declared default stands";
+}
+
+// 0 is a shape-legal unsigned integer but cannot start a program — rejected
+// explicitly (never silently normalized to "no request").
+TEST(ProjectConfigLoader, ZeroStackReserveFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "stackReserve": 0
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(rep.errorCount(), 1u) << "exactly one Error, no diagnostic noise";
+}
+
+// A negative must NOT wrap into a huge u64 — `is_number_unsigned()` types
+// `-4096` as a SIGNED integer, so it is rejected before any `get<uint64_t>`.
+TEST(ProjectConfigLoader, NegativeStackReserveFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "stackReserve": -4096
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+}
+
+// A float is not a byte count — rejected rather than truncated toward 4096.
+TEST(ProjectConfigLoader, FloatStackReserveFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "stackReserve": 4096.5
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+}
+
+// A STRING (the natural typo — every other manifest field is a string) must
+// reject, never be coerced by a lenient parse.
+TEST(ProjectConfigLoader, StringStackReserveFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "stackReserve": "4096"
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+}
+
+// The unknown-key guard STILL fails loud after `stackReserve` joined the
+// closed key set — a TYPO on the new key ("stackReserv") must not slip in
+// beside it — AND the "recognized fields" remediation list must NAME the new
+// key (a key added to kKnownKeys but not to the message leaves the user with
+// a reject they cannot act on).
+TEST(ProjectConfigLoader, UnknownKeyStillRejectedAndMessageNamesStackReserve) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "stackReserv": 4194304
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    ASSERT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::C_MalformedJson);
+    EXPECT_NE(m.find("stackReserv'"), std::string::npos)
+        << "the message must quote the offending typo; got: " << m;
+    EXPECT_NE(m.find("stackReserve"), std::string::npos)
+        << "the recognized-fields list must name the new key; got: " << m;
+}
+
 // ── Predicate: artifactProfileSupported ─────────────────────────
 
 TEST(ArtifactProfilePredicate, SupportedProfileInSet) {
@@ -760,16 +893,6 @@ std::string matrixProjectJson(std::string_view language,
         + "\",\n  \"artifactProfile\": \"" + std::string{profile}
         + "\",\n  \"targets\": [\"" + std::string{targetSpec}
         + "\"],\n  \"sources\": [\"ap4-absent-source.c\"]\n}";
-}
-
-// First human message carried for `code` (stored in `actual` by the
-// `report()` shim) — for the §7-#3 actionable-message pin.
-std::string firstMessageForCode(DiagnosticReporter const& rep,
-                                DiagnosticCode code) {
-    for (auto const& d : rep.all()) {
-        if (d.code == code) return d.actual;
-    }
-    return {};
 }
 
 // Drive `compileProject` on a scratch project file. Location::Temp + NO
@@ -1559,6 +1682,151 @@ TEST(CompileProjectManifestFlags, ResolveLibrariesMergeComposesPreexistingWithMa
         << "the pre-stamped CLI library must SURVIVE the manifest merge — its "
            "path is probed (append, not replace); a manifest-only replace would "
            "drop it and its name would never appear in a diagnostic";
+}
+
+// ════════════════════════════════════════════════════════════════
+// `stackReserve` PRECEDENCE — the CLI `--stack-reserve` WINS
+// (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH)
+//
+// The three flag ARRAYS above MERGE because appending composes. A SCALAR
+// cannot compose — one of the two numbers must be the answer — so it carries
+// an explicit rule instead: `Program::run` stamps the CLI flag, and
+// `compileProject` applies the manifest's `stackReserve` ONLY IF that stamp
+// left it unset. These tests drive the rule at the Program tier by
+// pre-stamping `setStackReserveBytes` exactly as `Program::run` would.
+//
+// TWO independent assertions per case, because the getter alone would still
+// pass if the value never reached the pipeline:
+//   (a) `prog.stackReserveBytes()` holds the WINNING number after the call;
+//   (b) the number the LINKER was handed is that same winner — read back out
+//       of the linker's own refusal message, which quotes the requested byte
+//       count. So the winner is proven to have travelled Program → CU build →
+//       ImageRequest → linker, not merely to have survived in a member.
+//
+// The (b) channel exists because the fixed cross-target here is an ELF exec,
+// which declares NO `stackReserveControl` capability — so ANY request is
+// REFUSED fail-loud (K_FormatLacksStackReserveControl) rather than silently
+// dropped. That refusal is exactly what makes the requested value observable
+// on every leg without running a binary. (If ELF ever gained the capability,
+// these two arms would need re-pointing at a format that has none — the
+// third case below is unaffected.)
+//
+// The NEITHER case is the control: it compiles CLEAN (rc 0, zero refusals),
+// proving the failures above are CAUSED by the threaded request and that a
+// build with no request is unchanged behavior.
+// ════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Build `int main(void){return 0;}` through compileProject against a fixed
+// cross-target ELF exec (host-agnostic, never RUN), with an OPTIONAL manifest
+// `stackReserve` and an OPTIONAL pre-stamped CLI value. `prog` is the
+// CALLER's so `stackReserveBytes()` is readable after the call. Returns the
+// compileProject rc.
+int buildStackReserveProject(std::filesystem::path const& dir,
+                             std::optional<std::uint64_t> manifestReserve,
+                             std::optional<std::uint64_t> cliReserve,
+                             Program& prog,
+                             DiagnosticReporter& rep) {
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    auto const srcPath = dir / "stack.c";
+    writeText(srcPath, "int main(void){ return 0; }\n");
+    std::string manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"]";
+    if (manifestReserve) {
+        manifest += ",\n  \"stackReserve\": " + std::to_string(*manifestReserve);
+    }
+    manifest += "\n}";
+    auto const projPath = dir / "stack.dss-project.json";
+    writeText(projPath, manifest);
+
+    if (cliReserve) {
+        prog.setStackReserveBytes(cliReserve);  // as if CLI --stack-reserve <n>
+    }
+    prog.setOutputDir(dir / "out");
+    return prog.compileProject(projPath.string(), rep);
+}
+
+constexpr std::uint64_t kCliReserve      = 8388608;  // 8 MiB — the CLI number
+constexpr std::uint64_t kManifestReserve = 4194304;  // 4 MiB — the manifest's
+
+}  // namespace
+
+// (CLI + manifest, DIFFERENT values) → the CLI value wins, end to end.
+// RED-ON-DISABLE: drop the `!stackReserveBytes().has_value()` guard in
+// `Program::compileProject` (i.e. let the manifest clobber unconditionally)
+// and BOTH the getter and the linker message flip to the manifest's 4194304.
+TEST(CompileProjectManifestFlags, StackReserveCliWinsOverManifest) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    Program prog;
+    DiagnosticReporter rep;
+    int const rc = buildStackReserveProject(
+        scratch.path(), kManifestReserve, kCliReserve, prog, rep);
+
+    // (a) the surviving stamp is the CLI value — the manifest never overwrote it.
+    ASSERT_TRUE(prog.stackReserveBytes().has_value());
+    EXPECT_EQ(*prog.stackReserveBytes(), kCliReserve)
+        << "the CLI --stack-reserve must WIN over the manifest 'stackReserve'";
+
+    // (b) that same value is what reached the linker (quoted in its refusal).
+    EXPECT_NE(rc, 0)
+        << "an ELF image declares no stackReserveControl — the request must be "
+           "REFUSED, never silently dropped";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl), 1u);
+    EXPECT_TRUE(anyMessageContains(rep, std::to_string(kCliReserve)))
+        << "the linker must have been handed the CLI value (8388608)";
+    EXPECT_FALSE(anyMessageContains(rep, std::to_string(kManifestReserve)))
+        << "the manifest value (4194304) must never reach the linker when the "
+           "CLI supplied one";
+}
+
+// (manifest only, NO CLI stamp) → the manifest value lands, end to end.
+// RED-ON-DISABLE: drop the manifest stamp in `Program::compileProject` and the
+// getter falls to nullopt AND the refusal disappears (the build goes green).
+TEST(CompileProjectManifestFlags, StackReserveManifestLandsWithoutCliStamp) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    Program prog;   // no setStackReserveBytes — the manifest is the only source
+    DiagnosticReporter rep;
+    int const rc = buildStackReserveProject(
+        scratch.path(), kManifestReserve, std::nullopt, prog, rep);
+
+    ASSERT_TRUE(prog.stackReserveBytes().has_value())
+        << "with no CLI stamp the manifest 'stackReserve' must apply";
+    EXPECT_EQ(*prog.stackReserveBytes(), kManifestReserve);
+
+    EXPECT_NE(rc, 0);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl), 1u);
+    EXPECT_TRUE(anyMessageContains(rep, std::to_string(kManifestReserve)))
+        << "the linker must have been handed the manifest value (4194304)";
+}
+
+// (NEITHER) the control — no request anywhere ⇒ nullopt, the build compiles
+// CLEAN, and the format-capability gate never fires. Without this arm the two
+// cases above could not distinguish "the request was threaded" from "this
+// build fails for some unrelated reason".
+TEST(CompileProjectManifestFlags, StackReserveAbsentEverywhereCompilesClean) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    Program prog;
+    DiagnosticReporter rep;
+    int const rc = buildStackReserveProject(
+        scratch.path(), std::nullopt, std::nullopt, prog, rep);
+
+    EXPECT_FALSE(prog.stackReserveBytes().has_value())
+        << "no CLI flag and no manifest key ⇒ nullopt ⇒ the format default stands";
+    EXPECT_EQ(rc, 0) << "an unrequested stack reserve must not disturb the build";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl), 0u);
 }
 
 // ════════════════════════════════════════════════════════════════

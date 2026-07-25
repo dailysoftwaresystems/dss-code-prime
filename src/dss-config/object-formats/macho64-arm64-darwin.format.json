@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: this artifact form has NO image header field for a stack size (a relocatable object / static archive is an INPUT to a later link, not a loadable program), so a `stackReserve` / `--stack-reserve` request against it is REFUSED with an actionable remedy -- request the reserve on the build that produces the final EXECUTABLE image -- rather than silently dropped.",
+
+  "stackReserveUnsupportedReason": "no-image-field",
+
   "format": {
     "name": "macho64-arm64-darwin",
     "version": "1.0",
