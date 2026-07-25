@@ -1,36 +1,116 @@
 #!/usr/bin/env pwsh
-# build-and-test.ps1 — the WINDOWS (pe64) RUNNABLE harness for SQLite-on-DSS.
+# real-examples/c/sqlite/build-and-test.ps1
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLite UNIT-CORPUS harness for DSS Code Prime — Windows pe64, full-source
+# (no amalgamation). The pe64 mirror of build-and-test.sh.
 #
-# The native-Windows companion to build-and-test.sh. The .sh runs on a Linux/WSL
-# host and treats `windows` as COMPILE-ONLY (a Linux host cannot execute a .exe).
-# This script makes the Windows pe64 leg a FULLY RUNNABLE target: it builds
-# dss-code-prime with MSVC, compiles SQLite to a real pe64 `sqlite3.exe`, RUNS it,
-# and smoke-tests a live SQL round-trip — the same "SELECT sum → 42, --version →
-# 3.54.0" witness the .sh runs for the Linux legs, now on Windows.
+# Clone the repo and run ONE command to prove DSS Code Prime builds SQLite from
+# its REAL sources (no amalgamation) into the Tcl `testfixture.exe` and runs
+# SQLite's own `.test` unit corpus on a native Windows pe64 binary.
 #
-# ── AMALGAMATION VIA WSL (user decision 2026-07-06) ──────────────────────────
-# SQLite's amalgamation (`./configure && make sqlite3.c shell.c`) is autotools +
-# tclsh — inherently a Unix build. Rather than reproduce it on Windows, this
-# script INVOKES WSL to amalgamate (clone/update sqlite + make sqlite3.c shell.c
-# in the WSL tree), then copies the two amalgamated TUs onto Windows for the
-# native DSS compile + run. WSL is a hard prerequisite.
+# The pipeline mirrors the .sh, adapted to a Windows host + the single pe64 leg:
 #
-# ── NO --define KNOBS (since c116) ───────────────────────────────────────────
-# The pe64 compile needs NO extra defines. Both former knobs are closed by real
-# compiler support: SQLITE_DISABLE_INTRINSIC dropped at c113 (DSS resolves
-# <intrin.h> via the pe-gated shippedLibs/intrin.json descriptor + the
-# _ReadWriteBarrier/_byteswap builtins), SQLITE_OMIT_SEH dropped at c116 (DSS
-# emits x64 SEH filter funclets + __C_specific_handler scope tables, so
-# sqlite's wal.c __try/__except compiles and catches for real).
+#   1. verify the host is Windows + WSL is available + online
+#   2. use the dss-code-prime checkout AS-IS on its CURRENT branch (never
+#      switched/pulled — a probe tests the working tree exactly as it is)
+#   3+4. VIA WSL: clone-or-update sqlite/sqlite, configure, and derive the
+#      FULL-SOURCE testfixture recipe from the canonical
+#      `make -n testfixture USE_AMALGAMATION=0` (the ~185-TU list, the -D
+#      defines, the sqlite -I dirs) exactly as the .sh does — then STAGE the
+#      sqlite sources + the generated derived sources + the real tcl8.6/zlib
+#      HEADERS onto a Windows path, and emit the recipe in Windows paths.
+#      (SQLite's build is autotools + tclsh — inherently Unix; the sources are
+#      portable C, so the pe64 compile reuses the SAME TU set.)
+#   5. locate (or build) a Windows dss-code-prime.exe (Release preferred)
+#   6. resolve the pe64 tcl + zlib LIBRARIES the fixture links against: for pe64
+#      `--resolve-library` reads a DLL's EXPORT table (`.edata`) — so this points
+#      at real DLLs (tcl86.dll + zlib1.dll), NOT an import .lib. git-for-Windows
+#      ships both with the full public API; override with $env:TCL_DLL/$env:ZLIB_DLL.
+#   7. generate a `.dss-project.json` (language c-subset / profile cli / target
+#      x86_64:pe64-x86_64-windows-exec / artifactName testfixture / the 185 TUs
+#      as absolute `sources` / the sqlite+tcl+zlib include dirs / the recipe
+#      defines / the two DLLs as resolveLibraries) and build it:
+#        dss-code-prime --project <manifest> --config=release --output <out>
+#      → <out>/pe64-x86_64-windows-exec/testfixture.exe
+#   8. run SQLite's `.test` UNIT CORPUS through the dss-built fixture
+#      (DSS_TIER: veryquick[default] | quick | full | all), parse
+#      "N errors out of M tests", classify failures against the documented
+#      non-DSS confounds. GREEN = every failure is a known confound.
+#   9. summarise + exit non-zero on any genuine failure / compile miss / crash.
 #
-# ── PREREQUISITES ────────────────────────────────────────────────────────────
-#   Windows + WSL (Debian/Ubuntu) with git/gcc/make/tcl; MSVC + CMake 4+ for the
-#   DSS Windows build. Run from anywhere — paths resolve relative to this script.
+# DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
+# fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
+# line) + the emitted binary, never $LASTEXITCODE.
 #
-# ── OVERRIDES (env vars) ─────────────────────────────────────────────────────
-#   $env:DSS_JOBS     parallel build jobs (default: CPU count)
-#   $env:SQLITE_WSL_DIR   WSL path for the sqlite clone (default: ~/src/sqlite)
-#   $env:SKIP_DSS_BUILD   "1" to reuse an existing Release binary (fast re-runs)
+# ─────────────────────────────────────────────────────────────────────────────
+# ★★ KNOWN pe64-testfixture BLOCKERS (the UNPROVEN half — as of 2026-07-24) ★★
+#
+# The pe64 full-source testfixture is NOT yet green. What is ALREADY PROVEN
+# (validated in a scratchpad de-risk this cycle): the pe64 target, DSS parsing
+# the REAL tcl8.6 headers agnostically, the pe64 `--resolve-library` path
+# reading tcl86.dll's EXPORT table (a one-file Tcl smoke builds a real
+# testfixture-shaped .exe + resolves Tcl_CreateInterp/Tcl_Eval today), the
+# `--project` manifest path, and 183/185 TUs compiling clean. What remains are
+# THREE front-end gaps, each hit ONLY on the Windows leg (the code they sit in
+# is `_WIN32`/`SQLITE_OS_WIN`-gated, so the Linux/macOS arc never compiled it).
+# None is a linker / pe64-codegen / resolve-library-mechanism gap. Do NOT paper
+# over them — each is a follow-up compiler cycle (the pe64 analogue of the Linux
+# testfixture TF-C arc):
+#
+#   B1  [config, trivial]  tcl.h / tclDecls.h — the legacy single-underscore
+#       MSVC alias `_declspec` is not neutralized. Under DSS's pe profile
+#       (_MSC_VER=1943, __GNUC__ undefined) tcl.h picks
+#       `#define TCL_NORETURN _declspec(noreturn)` (tcl.h ~line 159); DSS
+#       neutralizes `__declspec` (double underscore, c-subset.lang.json:67) but
+#       NOT `_declspec`, so it leaks as raw tokens and derails the parser at the
+#       first EXTERN declaration. FIX: add a `_declspec` pe predefine mirroring
+#       `__declspec` in src/dss-config/sources/c-subset.lang.json:
+#         { "name": "_declspec", "kind": "constant", "value": "",
+#           "params": ["x"], "availableObjectFormats": ["pe"] }
+#
+#   B2  [parser, small]  src/test1.c:9346 — `extern LONG volatile sqlite3_os_type;`
+#       (inside `#if SQLITE_OS_WIN`; LONG is windows.json's `i32 "long"`). DSS's
+#       C parser accepts a type-qualifier AFTER a builtin type-specifier
+#       (`int volatile x`) and BEFORE a typedef-name (`volatile LONG x`), but NOT
+#       a trailing qualifier on a typedef-name (`LONG volatile x`). Minimal repro
+#       (target-agnostic, reproduces on elf64): `typedef long LONG; extern LONG
+#       volatile d;`  FIX (grammar): allow a type-qualifier to follow a
+#       typedef-name type-specifier (C 6.7.1 — specifiers/qualifiers, any order).
+#
+#   B3  [FFI surface, multi-cycle]  With B1+B2 cleared the 185-TU compile advances
+#       to a body of ~27 unresolved Windows/CRT/math symbols (fail-loud S0001,
+#       + cascading S000D member-access errors) referenced by the Windows-gated
+#       and Unix-oriented test sources — the pe64 analogue of the Linux arc's
+#       per-cycle OS-symbol additions (isnan/pread64/…). The worklist:
+#         · kernel32 (test1.c Win section): CreateEvent OpenEvent SetEvent
+#           LockFile UnlockFile + EVENT_MODIFY_STATE
+#         · msvcrt CRT (test1.c/test_quota.c): _set_abort_behavior _CALL_REPORTFAULT
+#           _commit _chsize_s _stati64
+#         · CRT low-level I/O by POSIX name (test_fs.c): open close read fstat —
+#           test_fs.c:72 gates <unistd.h> on `!_WIN32 || __MSVCRT__`; DSS defines
+#           _WIN32 but not __MSVCRT__, so they need <io.h>/<sys/stat.h> pe mappings
+#         · math (func.c): log2 trunc acosh asinh atanh   · time (date.c): localtime_r
+#       These need new/extended pe shipped-lib descriptors (windows.json / io.json
+#       / math.json / time.json …). NOTE a recipe-provenance nuance: this recipe
+#       is derived from a LINUX `make -n testfixture`, so some surface reflects
+#       Unix-oriented test helpers; a native Windows `nmake -f Makefile.msc`
+#       testfixture recipe would compile a somewhat different TU set. The core
+#       Win32 (events/locking) + msvcrt surface is genuinely needed either way.
+#
+# Until B1–B3 land, step 7 FAILS LOUD on the first `error[` and the harness exits
+# non-zero at the build — the honest state of the unproven half.
+#
+#   $env:DSS_PE64_PENDING_FIXES_SHIM = "1"   — OPT-IN, OFF by default. Simulates
+#       ONLY B1+B2 (injects the `_declspec(x)=` define + rewrites the one test1.c
+#       line in the STAGED copy) to ADVANCE the build past the parser to the B3
+#       FFI wall — where it then fails loud with the unresolved-symbol list (the
+#       B3 worklist above). It does NOT green the build (B3 remains); its value is
+#       diagnostic. Prints a loud warning; the summary marks the run SHIMMED.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
+#                      DSS_TIER  DSS_CONFIG  DSS_TEST_FILE  DSS_CONFOUNDS
+#                      TCL_DLL  ZLIB_DLL  TCL_LIBRARY
 
 $ErrorActionPreference = 'Stop'
 
@@ -41,155 +121,368 @@ function Pass($m) { Write-Host " [OK] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host " [!]  $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host " [X] ERROR: $m" -ForegroundColor Red; exit 1 }
 
-# The repo root: this script lives at real-examples/c/sqlite/, so root = ../../../.
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
-$Jobs     = if ($env:DSS_JOBS) { $env:DSS_JOBS } else { [Environment]::ProcessorCount }
+# ── config (override via environment) ────────────────────────────────────────
+# This script lives at real-examples/c/sqlite/, so repo root = ../../../.
+$RepoRoot     = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+$Jobs         = if ($env:DSS_JOBS) { $env:DSS_JOBS } else { [Environment]::ProcessorCount }
 $SqliteWslDir = if ($env:SQLITE_WSL_DIR) { $env:SQLITE_WSL_DIR } else { '$HOME/src/sqlite' }
-$Work     = Join-Path $RepoRoot 'build\real-examples\c\sqlite\windows'
-$Spec     = 'x86_64:pe64-x86_64-windows-exec'
+$Work         = Join-Path $RepoRoot 'build\real-examples\c\sqlite\windows'
+$Spec         = 'x86_64:pe64-x86_64-windows-exec'
+$Fmt          = ($Spec -split ':')[1]
+# DSS_TIER: which unit-corpus tier — veryquick (default) | quick | full | all.
+$Tier         = if ($env:DSS_TIER) { $env:DSS_TIER } else { 'veryquick' }
+# DSS_CONFIG: RELEASE by default (load-bearing — the corpus must exercise the
+# full optimizer to catch release-only miscompiles; a debug fixture would run
+# green while masking a release bug, and far slower).
+$Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
+# DSS_CONFOUNDS: space-separated .NET-regex patterns for KNOWN non-DSS unit
+# failures (a failing test matching any is not counted against green). Same set
+# as the .sh: WAL set-lock wall-clock timing, a zipfile error-text env diff,
+# the recover-fault OOM-oracle class.
+$Confounds    = if ($env:DSS_CONFOUNDS) { $env:DSS_CONFOUNDS -split '\s+' } `
+                else { @('^walsetlk-', '^walsetlk\.', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
+# pe64 resolve-library targets: DLLs with export tables (NOT import .libs).
+# git-for-Windows ships a full Tcl 8.6 + zlib runtime; override if you have a
+# dedicated Tcl dev kit (Magicsplat/ActiveTcl).
+$GitMingwBin  = 'C:\Program Files\Git\mingw64\bin'
+$TclDll       = if ($env:TCL_DLL)  { $env:TCL_DLL }  else { Join-Path $GitMingwBin 'tcl86.dll' }
+$ZlibDll      = if ($env:ZLIB_DLL) { $env:ZLIB_DLL } else { Join-Path $GitMingwBin 'zlib1.dll' }
+# Tcl runtime script library (init.tcl …) — testfixture needs it at RUN time.
+$TclLibrary   = if ($env:TCL_LIBRARY) { $env:TCL_LIBRARY } else { 'C:\Program Files\Git\mingw64\lib\tcl8.6' }
+$Shim         = ($env:DSS_PE64_PENDING_FIXES_SHIM -eq '1')
 
-# The smoke witness — identical to the .sh's.
-$SqlSmoke = "CREATE TABLE t(x);INSERT INTO t VALUES(1);INSERT INTO t VALUES(41);SELECT sum(x) FROM t;"
-$ExpectSum = '42'
-$ExpectVersionPrefix = '3.54.0'
+$Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + headers
+$OutDir       = Join-Path $Work 'out'
+$Manifest     = Join-Path $Work 'testfixture.pe64.dss-project.json'
+$GenPy        = Join-Path $PSScriptRoot 'gen-pe64-manifest.py'
 
-# ── Step 1 — host is Windows + WSL is available ──────────────────────────────
-Step '1/6  Host check (Windows + WSL)'
-if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) { Die "this harness targets Windows (the pe64 RUN leg); use build-and-test.sh on Linux/WSL." }
+# Convert C:\path → /mnt/c/path (a backslash Windows path through `wsl wslpath`
+# gets its backslashes stripped — do it manually, as the .sh companion does).
+function ToWslPath($p) {
+  $full = (Resolve-Path -LiteralPath $p).Path
+  '/mnt/' + $full.Substring(0,1).ToLowerInvariant() + ($full.Substring(2) -replace '\\','/')
+}
+
+# ── Step 1 — host is Windows + WSL + online ──────────────────────────────────
+Step '1/9  Host check (Windows + WSL, online)'
+if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) {
+  Die "this harness targets Windows (the pe64 leg); use build-and-test.sh on Linux/WSL/macOS."
+}
 $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
-if (-not $wsl) { Die "wsl.exe not found — WSL is required to amalgamate SQLite (autotools + tclsh). Install WSL + a Debian/Ubuntu distro." }
-# A trivial WSL round-trip confirms a distro is installed and responsive.
+if (-not $wsl) { Die "wsl.exe not found — WSL is required to derive the sqlite recipe (autotools + tclsh). Install WSL + a Debian/Ubuntu distro." }
 $probe = & wsl.exe bash -c 'echo wsl-ok' 2>&1
-if ($LASTEXITCODE -ne 0 -or "$probe".Trim() -ne 'wsl-ok') { Die "WSL is present but a bash round-trip failed (got: '$probe'). Ensure a distro is installed + running." }
+if ($LASTEXITCODE -ne 0 -or "$probe".Trim() -ne 'wsl-ok') { Die "WSL is present but a bash round-trip failed (got: '$probe')." }
+$python3 = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python3) { $python3 = Get-Command python -ErrorAction SilentlyContinue }
+if (-not $python3) { Die "python3 not found on PATH — needed to generate the .dss-project.json manifest." }
+try {
+  $null = Invoke-WebRequest -Uri 'https://github.com' -Method Head -TimeoutSec 20 -UseBasicParsing
+} catch { Die "offline — cannot reach https://github.com ($($_.Exception.Message))." }
+Info "host: Windows ($([Environment]::OSVersion.Version))   leg: $Spec   tier: $Tier   config: $Config"
+if ($Shim) { Warn "DSS_PE64_PENDING_FIXES_SHIM=1 — the two pending compiler fixes will be SIMULATED (see the header). This is NOT a clean build." }
 Pass "Windows host + WSL online"
 
-# ── Step 2 — amalgamate SQLite VIA WSL (autotools: make sqlite3.c shell.c) ────
-Step '2/6  Amalgamate SQLite in WSL (autotools: make sqlite3.c shell.c)'
+# ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
+Step "2/9  Use dss-code-prime at $RepoRoot (current checkout, untouched)"
+$dssHead = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
+$dssBranch = (& git -C $RepoRoot rev-parse --abbrev-ref HEAD 2>$null)
+Info "  at $dssHead on $dssBranch"
+Pass "dss-code-prime checkout ready"
+
+# ── Step 3+4 — derive the full-source recipe + stage to Windows (VIA WSL) ────
+Step '3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL)'
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-# The amalgamation runs in WSL (autotools + tclsh are inherently Unix). The bash
-# below is written to a temp .sh and run via `wsl bash <file>` — the most robust
-# way to hand a multi-line script to WSL (no `bash -c` arg-quoting hazards). It:
-#   * FAILS LOUD (not apt-install) if a tool is missing — this is a user-local
-#     Windows+WSL harness, not CI with passwordless sudo; a clear "install X" beats
-#     a cryptic sudo prompt. All four (git/gcc/make/tclsh) are the .sh's Step-4 deps.
-#   * REUSES an existing checkout at $DIR whether it's a git clone, a fossil
-#     checkout, or a plain copy (sqlite's canonical repo is fossil; the github
-#     mirror is git) — it only `git clone`s when $DIR is absent. Keyed on the
-#     presence of `configure`, so it never clone-clobbers a non-empty dir.
-$amalgamateScript = @'
-set -euo pipefail
-for t in git gcc make tclsh; do
+if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+$StageWsl = ToWslPath $Stage
+# The WSL derivation reproduces the .sh's Step-4 recipe logic (make -n
+# testfixture USE_AMALGAMATION=0 → TUs + defines + -I dirs, with the
+# libsqlite3.a core recovered via `ar t`), then STAGES the sqlite sources +
+# generated derived sources + real tcl8.6/zlib headers onto the Windows-visible
+# $Stage dir and writes the recipe as three files IN WINDOWS PATHS:
+#   $Stage/tus.txt  $Stage/includes.txt  $Stage/defines.txt
+# (via `wslpath -m`, the forward-slash Windows form the manifest wants).
+$deriveScript = @'
+set -Eeuo pipefail
+for t in git gcc make ar tclsh; do
   command -v "$t" >/dev/null 2>&1 || {
-    echo "MISSING tool: $t — install the amalgamation toolchain, e.g.:" >&2
-    echo "    sudo apt-get install -y git build-essential tcl tcl-dev" >&2
+    echo "MISSING tool: $t — install the recipe toolchain, e.g.:" >&2
+    echo "    sudo apt-get install -y git build-essential tcl tcl-dev zlib1g-dev" >&2
     exit 1; }
 done
 DIR="__SQLITE_WSL_DIR__"
-if [ -x "$DIR/configure" ]; then
-  [ -d "$DIR/.git" ] && git -C "$DIR" pull --rebase --quiet 2>/dev/null || true
-elif [ -d "$DIR/.git" ]; then
+STAGE="__STAGE_WSL__"
+# clone-or-update sqlite (external dependency — DOES pull)
+if [ -d "$DIR/.git" ]; then
+  git -C "$DIR" fetch --all --prune --quiet || true
   git -C "$DIR" pull --rebase --quiet 2>/dev/null || true
-else
+elif [ ! -e "$DIR/configure" ]; then
   mkdir -p "$(dirname "$DIR")"
   git clone --quiet https://github.com/sqlite/sqlite.git "$DIR"
 fi
 [ -x "$DIR/configure" ] || { echo "no ./configure in $DIR — not a SQLite checkout" >&2; exit 1; }
 BLD="$DIR/bld-dss"; mkdir -p "$BLD"
-( cd "$BLD" && "$DIR/configure" >/dev/null 2>&1 && make -s sqlite3.c shell.c )
-[ -f "$BLD/sqlite3.c" ] || { echo "amalgamation not produced at $BLD/sqlite3.c" >&2; exit 1; }
-[ -f "$BLD/shell.c" ]   || { echo "shell.c not produced at $BLD/shell.c" >&2; exit 1; }
-# Emit the Windows-visible paths of the three TUs (sqlite3.h is beside sqlite3.c),
-# each on its own marker line so PowerShell parses them unambiguously.
-echo "AMALGAMATED-C=$(wslpath -w "$BLD/sqlite3.c")"
-echo "AMALGAMATED-SHELL=$(wslpath -w "$BLD/shell.c")"
-echo "AMALGAMATED-H=$(wslpath -w "$BLD/sqlite3.h")"
-'@
-$amalgamateScript = $amalgamateScript.Replace('__SQLITE_WSL_DIR__', $SqliteWslDir) -replace "`r`n", "`n"
-$tmpSh = Join-Path $Work 'amalgamate.sh'
-Set-Content -LiteralPath $tmpSh -Value $amalgamateScript -NoNewline -Encoding ascii
-# Convert C:\path\file → /mnt/c/path/file MANUALLY — passing a backslash Windows
-# path through `wsl.exe wslpath` strips the backslashes (arg mangling).
-function ToWslPath($p) {
-  $full = (Resolve-Path -LiteralPath $p).Path
-  '/mnt/' + $full.Substring(0,1).ToLowerInvariant() + ($full.Substring(2) -replace '\\','/')
+( cd "$BLD" && "$DIR/configure" >/dev/null 2>&1 )
+# best-effort reference build → generates every derived .c (parse.c/opcodes.c/
+# ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a (a Tcl-link miss is tolerated —
+# we only harvest byproducts + the recipe, not gcc's binary).
+( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$(nproc 2>/dev/null || echo 4)" >/dev/null 2>&1 ) || true
+rm -f "$BLD/testfixture"
+RECIPE="$STAGE/testfixture-recipe.txt"
+( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
+BLOB="$(sed ':a;N;$!ba;s/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
+# defines (-DNAME[=VALUE]) — strip make's literal "" and -D
+mapfile -t RECIPE_DEFS < <(printf '%s\n' "$BLOB" | grep -oE '\-D[A-Za-z0-9_]+(=[^ ]*)?' | sed 's/^-D//; s/"//g' | sort -u)
+# sqlite -I dirs (drop the bare `.`; it is $BLD, added explicitly below)
+mapfile -t SQLITE_INCS < <(printf '%s\n' "$BLOB" | grep -oE '\-I ?[^ ]+' | sed 's/^-I *//' | grep -v '^\.$' | sort -u)
+# TU set (1): every .c the recipe names (absolute, or relative → $BLD)
+declare -A TU=()
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  if   [ -f "$c" ];      then TU["$c"]=1
+  elif [ -f "$BLD/$c" ]; then TU["$BLD/$c"]=1
+  fi
+done < <(printf '%s\n' "$BLOB" | tr ' ' '\n' | grep -E '\.c$' | sort -u)
+# TU set (2): the core sources inside libsqlite3.a (DSS can't consume the .a)
+AR="$BLD/libsqlite3.a"; [ -f "$BLD/.libs/libsqlite3.a" ] && AR="$BLD/.libs/libsqlite3.a"
+if [ -f "$AR" ]; then
+  while read -r obj; do
+    base="${obj%.o}"
+    hit="$(find "$DIR/src" "$DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | grep -v '/tsrc/' | head -1)"
+    [ -z "$hit" ] && hit="$(find "$DIR/src" "$DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | head -1)"
+    [ -n "$hit" ] && TU["$hit"]=1
+  done < <(ar t "$AR" 2>/dev/null | grep '\.o$')
+fi
+# de-alias generated .c that exist under both bld/ and bld/tsrc/ (dedup by basename)
+declare -A SEEN=(); declare -a TUS=()
+for f in $(printf '%s\n' "${!TU[@]}" | sort); do
+  b="$(basename "$f")"; [ -n "${SEEN[$b]:-}" ] && continue; SEEN[$b]="$f"; TUS+=("$f")
+done
+[ ${#TUS[@]} -ge 150 ]        || { echo "recipe yielded only ${#TUS[@]} TUs (<150) — see $RECIPE" >&2; exit 1; }
+[ ${#RECIPE_DEFS[@]} -ge 18 ] || { echo "recipe yielded only ${#RECIPE_DEFS[@]} defines (<18)" >&2; exit 1; }
+
+# ── stage: sqlite sources + generated derived sources + tcl8.6/zlib headers ──
+mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc" "$STAGE/test"
+cp -r "$DIR/src" "$STAGE/sqlite/src"
+cp -r "$DIR/ext" "$STAGE/sqlite/ext"
+cp "$BLD"/*.c "$STAGE/sqlite/bld/" 2>/dev/null || true
+cp "$BLD"/*.h "$STAGE/sqlite/bld/" 2>/dev/null || true
+# the .test corpus + its tcl harness (tester.tcl …) — testfixture.exe runs these
+cp -r "$DIR/test/." "$STAGE/test/" 2>/dev/null || true
+# real tcl8.6 headers (parsed agnostically — NO descriptor, D-FFI-SHIPPED-LIBS-OS-ONLY)
+TCLH="$( . "$(find /usr/lib -name tclConfig.sh 2>/dev/null | head -1)" >/dev/null 2>&1; printf '%s' "${TCL_INCLUDE_SPEC#-I}" )"
+[ -f "$TCLH/tcl.h" ] || TCLH="$(dirname "$(find /usr/include -name tcl.h -path '*tcl8*' 2>/dev/null | head -1)")"
+[ -f "$TCLH/tcl.h" ] || { echo "tcl.h not found in WSL — apt-get install tcl-dev" >&2; exit 1; }
+cp "$TCLH"/*.h "$STAGE/tclinc/"
+# zlib headers (staged privately so they never shadow anything on -I)
+ZH="$(find /usr/include -maxdepth 3 -name zlib.h 2>/dev/null | head -1)"
+[ -f "$ZH" ] || { echo "zlib.h not found in WSL — apt-get install zlib1g-dev" >&2; exit 1; }
+cp "$ZH" "$STAGE/zinc/"; cp "$(dirname "$ZH")/zconf.h" "$STAGE/zinc/" 2>/dev/null || true
+
+# remap a WSL path under $DIR or the header dirs → its STAGED location, then → a
+# forward-slash Windows path (wslpath -m).
+win() { wslpath -m "$1"; }
+remap() {
+  local p="$1"
+  case "$p" in
+    "$DIR"/src/*)  echo "$STAGE/sqlite/src/${p#"$DIR"/src/}" ;;
+    "$DIR"/ext/*)  echo "$STAGE/sqlite/ext/${p#"$DIR"/ext/}" ;;
+    "$BLD")        echo "$STAGE/sqlite/bld" ;;                    # the -I build dir itself → staged bld
+    "$BLD"/*)      echo "$STAGE/sqlite/bld/$(basename "$p")" ;;   # a generated TU under it
+    "$DIR"/*)      echo "$STAGE/sqlite/${p#"$DIR"/}" ;;
+    "$TCLH")       echo "$STAGE/tclinc" ;;
+    "$TCLH"/*)     echo "$STAGE/tclinc/${p#"$TCLH"/}" ;;
+    *)             echo "$p" ;;   # already staged / third-party
+  esac
 }
-$tmpShWsl = ToWslPath $tmpSh
-$wslOut = & wsl.exe bash -l $tmpShWsl 2>&1
-if ($LASTEXITCODE -ne 0) { Die "WSL amalgamation failed:`n$($wslOut -join "`n")" }
-function Marker($k) { ($wslOut | Select-String -Pattern "^$k=(.+)$" | Select-Object -Last 1).Matches[0].Groups[1].Value }
-$srcSqlite3C = Marker 'AMALGAMATED-C'
-$srcShellC   = Marker 'AMALGAMATED-SHELL'
-$srcSqlite3H = Marker 'AMALGAMATED-H'
-if (-not ($srcSqlite3C -and $srcShellC -and $srcSqlite3H)) { Die "amalgamation did not emit the 3 TU paths:`n$($wslOut -join "`n")" }
+# tus.txt (Windows paths)
+: > "$STAGE/tus.txt"
+for f in "${TUS[@]}"; do s="$(remap "$f")"; [ -f "$s" ] && win "$s" >> "$STAGE/tus.txt"; done
+# includes.txt: the sqlite -I dirs (remapped) + $BLD + tcl + zlib
+: > "$STAGE/includes.txt"
+{ echo "$BLD"; for d in "${SQLITE_INCS[@]}"; do echo "$d"; done; } | while read -r d; do
+  [ -n "$d" ] || continue; s="$(remap "$d")"; [ -d "$s" ] && win "$s" >> "$STAGE/includes.txt"
+done
+win "$STAGE/tclinc" >> "$STAGE/includes.txt"
+win "$STAGE/zinc"   >> "$STAGE/includes.txt"
+# defines.txt
+printf '%s\n' "${RECIPE_DEFS[@]}" > "$STAGE/defines.txt"
+# the staged test dir (Windows path) for the corpus run
+win "$STAGE/test" > "$STAGE/testdir.win.txt"
 
-# Copy the amalgamation onto Windows (shell.c #includes "sqlite3.h", so all three
-# must sit adjacent — the same 3-file rule the pe64 probe uses).
-Copy-Item -Force -LiteralPath $srcSqlite3C -Destination (Join-Path $Work 'sqlite3.c')
-Copy-Item -Force -LiteralPath $srcShellC   -Destination (Join-Path $Work 'shell.c')
-Copy-Item -Force -LiteralPath $srcSqlite3H -Destination (Join-Path $Work 'sqlite3.h')
-$amLines = (Get-Content (Join-Path $Work 'sqlite3.c') | Measure-Object -Line).Lines
-Pass "amalgamation copied to $Work (sqlite3.c: $amLines lines)"
+echo "RECIPE-TUS=$(wc -l < "$STAGE/tus.txt")"
+echo "RECIPE-DEFS=$(wc -l < "$STAGE/defines.txt")"
+echo "RECIPE-INCS=$(wc -l < "$STAGE/includes.txt")"
+echo "SQLITE-HEAD=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null)"
+'@
+$deriveScript = $deriveScript.Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageWsl) -replace "`r`n", "`n"
+$tmpSh = Join-Path $Work 'derive.sh'
+Set-Content -LiteralPath $tmpSh -Value $deriveScript -NoNewline -Encoding ascii
+$deriveOut = & wsl.exe bash -l (ToWslPath $tmpSh) 2>&1
+if ($LASTEXITCODE -ne 0) { Die "WSL recipe derivation failed:`n$($deriveOut -join "`n")" }
+function Marker($k) { ($deriveOut | Select-String -Pattern "^$k=(.+)$" | Select-Object -Last 1).Matches[0].Groups[1].Value }
+$nTus = Marker 'RECIPE-TUS'; $nDefs = Marker 'RECIPE-DEFS'; $nIncs = Marker 'RECIPE-INCS'
+$sqliteHead = Marker 'SQLITE-HEAD'
+if (-not (Test-Path "$Stage\tus.txt")) { Die "recipe derivation produced no tus.txt:`n$($deriveOut -join "`n")" }
+Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
-# ── Step 3 — build dss-code-prime (MSVC Release) ─────────────────────────────
-Step '3/6  Build dss-code-prime (MSVC, Release)'
-$DssBin = Join-Path $RepoRoot 'build\bin\dss\Release\dss-code-prime.exe'
-if ($env:SKIP_DSS_BUILD -eq '1' -and (Test-Path $DssBin)) {
+# ── Step 5 — locate (or build) a Windows dss-code-prime.exe ──────────────────
+# Picks the NEWEST existing binary (build-rel Release / build MSVC / build-dbg
+# Ninja-Debug) — newest-wins deliberately avoids a STALE Release binary that
+# predates a project-config field (the exact trap that fails loud below). With
+# no binary present (a fresh clone) it configures + builds Release into build-rel.
+Step '5/9  Locate / build dss-code-prime (newest existing, else build Release)'
+function Find-Dss {
+  $cands = @(
+    (Join-Path $RepoRoot 'build-rel\bin\dss\dss-code-prime.exe'),
+    (Join-Path $RepoRoot 'build\bin\dss\Release\dss-code-prime.exe'),
+    (Join-Path $RepoRoot 'build\bin\dss\dss-code-prime.exe'),
+    (Join-Path $RepoRoot 'build-dbg\bin\dss\dss-code-prime.exe')
+  ) | Where-Object { Test-Path $_ } | Sort-Object { (Get-Item $_).LastWriteTime } -Descending
+  return ($cands | Select-Object -First 1)
+}
+if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
+  $DssBin = (Resolve-Path $env:DSS_BIN).Path
+  Info "using \$env:DSS_BIN — $DssBin"
+} elseif ($env:SKIP_DSS_BUILD -eq '1') {
+  $DssBin = Find-Dss
+  if (-not $DssBin) { Die "SKIP_DSS_BUILD=1 but no dss-code-prime.exe found under build-rel/build/build-dbg." }
   Info "SKIP_DSS_BUILD=1 — reusing $DssBin"
 } else {
-  if (-not (Test-Path (Join-Path $RepoRoot 'build'))) {
-    & cmake -S $RepoRoot -B (Join-Path $RepoRoot 'build') -DCMAKE_BUILD_TYPE=Release
-    if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" }
+  $DssBin = Find-Dss
+  if (-not $DssBin) {
+    Info "no existing binary — configuring + building Release (build-rel)"
+    $bdir = Join-Path $RepoRoot 'build-rel'
+    if (-not (Test-Path $bdir)) { & cmake -S $RepoRoot -B $bdir -DCMAKE_BUILD_TYPE=Release; if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" } }
+    & cmake --build $bdir --config Release --target dss-code-prime -j $Jobs
+    if ($LASTEXITCODE -ne 0) { Die "dss-code-prime build failed" }
+    $DssBin = Find-Dss
   }
-  & cmake --build (Join-Path $RepoRoot 'build') --config Release --target dss-code-prime -j $Jobs
-  if ($LASTEXITCODE -ne 0) { Die "dss-code-prime build failed" }
 }
-if (-not (Test-Path $DssBin)) { Die "dss-code-prime.exe not found at $DssBin after the build." }
-Pass "dss-code-prime built: $DssBin"
+if (-not $DssBin -or -not (Test-Path $DssBin)) { Die "dss-code-prime.exe not found." }
+$dssAge = (Get-Item $DssBin).LastWriteTime
+Info "compiler: $DssBin  (built $dssAge)"
+Warn "if the build below fails with a stale-manifest-field error (e.g. unknown 'artifactName'), this binary predates the project-config extensions — rebuild it (delete build-rel or set SKIP_DSS_BUILD off)."
+Pass "dss-code-prime located"
 
-# ── Step 4 — compile SQLite to pe64 (2-TU, NO defines — SEH on) ──────────────
-Step '4/6  Compile SQLite -> sqlite3.exe (pe64, 2-TU, no defines)'
-$OutDir = Join-Path $Work 'out'
-if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
-# sqlite3.c FIRST (the multi-TU merge needs the library CU ahead of the driver),
-# then shell.c (the CLI driver). NO --define: c113/c116 closed both knobs.
-$log = Join-Path $Work 'compile.log'
-& $DssBin --language c-subset --target $Spec --time `
-    --compile (Join-Path $Work 'sqlite3.c') (Join-Path $Work 'shell.c') `
-    --output $OutDir *>&1 | Tee-Object -FilePath $log | Out-Null
-# GOTCHA: dss-code-prime returns exit 0 even on FATAL compile errors — success is
-# read from the DIAGNOSTICS, not $LASTEXITCODE. Any `error[CODE]:` line = a miss.
-$errCount = (Select-String -Path $log -Pattern '^error\[' -AllMatches).Count
-if ($errCount -gt 0) {
-  Get-Content $log | Select-String -Pattern '^error\[' | Select-Object -First 5 | ForEach-Object { Info $_.Line }
-  Die "pe64 compile emitted $errCount error[...] diagnostic(s) — see $log"
+# ── Step 6 — pe64 tcl + zlib libraries (resolve-library = DLL export tables) ──
+Step '6/9  Resolve-library DLLs (tcl + zlib export surfaces) for pe64'
+if (-not (Test-Path $TclDll))  { Die "Tcl DLL not found: $TclDll — install git-for-Windows (ships tcl86.dll) or a Tcl dev kit, or set \$env:TCL_DLL." }
+if (-not (Test-Path $ZlibDll)) { Die "zlib DLL not found: $ZlibDll — set \$env:ZLIB_DLL to a zlib1.dll." }
+Info "tcl : $TclDll"
+Info "zlib: $ZlibDll"
+if (-not (Test-Path $TclLibrary)) { Warn "Tcl script library not at $TclLibrary — the corpus RUN needs it (set \$env:TCL_LIBRARY)." }
+Pass "pe64 resolve-library DLLs ready"
+
+# ── Step 7 — generate the manifest + build the testfixture (dss --project) ───
+Step "7/9  Build the full-source testfixture (dss-code-prime --project, $Config)"
+$extraDefineArgs = @()
+if ($Shim) {
+  # B1 shim: neutralize the legacy `_declspec` MSVC alias (stands in for the
+  # pending c-subset.lang.json pe predefine). Loud, opt-in, NOT a clean build.
+  Warn "SHIM: injecting define `_declspec(x)=` (simulates the pending B1 config fix)"
+  $extraDefineArgs = @('--extra-define', '_declspec(x)=')
+  # B2 shim: rewrite the one Windows-only trailing-qualifier line in the STAGED
+  # test1.c (never the WSL/upstream source) to the parse-equivalent form.
+  $t1 = Join-Path $Stage 'sqlite\src\test1.c'
+  if (Test-Path $t1) {
+    $c = Get-Content -Raw -LiteralPath $t1
+    $c2 = $c -replace 'extern\s+LONG\s+volatile\s+sqlite3_os_type;', 'extern volatile LONG sqlite3_os_type;'
+    if ($c2 -ne $c) { Set-Content -LiteralPath $t1 -Value $c2 -NoNewline; Warn "SHIM: rewrote test1.c `LONG volatile` -> `volatile LONG` (simulates the pending B2 parser fix)" }
+  }
 }
-# `--output X` writes the artifact INTO X as a directory (X/<name>.exe) — flatten.
-$exe = Get-ChildItem -Path $OutDir -Recurse -Filter '*.exe' -File | Select-Object -First 1
-if (-not $exe) { Die "no sqlite3.exe emitted under $OutDir" }
-$Sqlite3Exe = Join-Path $Work 'sqlite3.exe'
-Copy-Item -Force -LiteralPath $exe.FullName -Destination $Sqlite3Exe
+$genArgs = @(
+  $GenPy,
+  '--tus',      (Join-Path $Stage 'tus.txt'),
+  '--includes', (Join-Path $Stage 'includes.txt'),
+  '--defines',  (Join-Path $Stage 'defines.txt'),
+  '--target',   $Spec,
+  '--resolve-library', $TclDll,
+  '--resolve-library', $ZlibDll,
+  '--artifact-name', 'testfixture'
+) + $extraDefineArgs + @('--output', $Manifest)
+$genOut = & $python3.Source @genArgs 2>&1
+if ($LASTEXITCODE -ne 0) { Die "manifest generation failed:`n$($genOut -join "`n")" }
+Info "manifest -> $Manifest ($genOut)"
+
+if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$log = Join-Path $Work 'compile.log'
+# dss-code-prime returns exit 0 even on FATAL errors → judge from `error[` + the binary.
+& $DssBin --project $Manifest --config="$Config" --output $OutDir --time *>&1 |
+  Tee-Object -FilePath $log | Out-Null
+$errCount = (Select-String -Path $log -Pattern 'error\[' -AllMatches).Count
+$fixture  = Join-Path $OutDir "$Fmt\testfixture.exe"
 $ctime = (Get-Content $log | Select-String -Pattern 'compile time (\S+)' | Select-Object -Last 1)
 $ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
-Pass "compiled: $Sqlite3Exe$ctimeSuffix"
-
-# ── Step 5 — smoke: a live SQL round-trip + --version ────────────────────────
-Step '5/6  Smoke test (SELECT sum -> 42, --version -> 3.54.0)'
-$sqlOut = ($SqlSmoke | & $Sqlite3Exe 2>&1 | Out-String).Trim()
-$verOut = (& $Sqlite3Exe --version 2>&1 | Out-String).Trim()
-$reasons = @()
-if (($sqlOut -replace '\s','') -ne $ExpectSum) {
-  $reasons += "SELECT sum(x) != $ExpectSum (got: '$($sqlOut.Substring(0, [Math]::Min(120, $sqlOut.Length)))')"
+if ($errCount -gt 0 -or -not (Test-Path $fixture)) {
+  Get-Content $log | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
+  if (-not $Shim) {
+    Warn "the pe64 testfixture is the UNPROVEN half — see the KNOWN BLOCKERS header (B1 `_declspec`, B2 `LONG volatile`)."
+    Warn "to exercise the rest of the pipeline while the two compiler fixes are pending: re-run with \$env:DSS_PE64_PENDING_FIXES_SHIM='1'."
+  }
+  Die "pe64 build FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture.exe. See $log"
 }
-if (-not $verOut.StartsWith($ExpectVersionPrefix)) {
-  $reasons += "--version != $ExpectVersionPrefix* (got: '$($verOut.Substring(0, [Math]::Min(120, $verOut.Length)))')"
-}
-if ($reasons.Count -gt 0) { Die ("[windows] smoke FAIL — " + ($reasons -join '; ')) }
-Pass "[windows] smoke PASS — SELECT sum -> 42, --version -> $ExpectVersionPrefix"
+Pass "testfixture -> $fixture$ctimeSuffix$(if ($Shim) { '  [SHIMMED build]' })"
 
-# ── Step 6 — summary ─────────────────────────────────────────────────────────
-Step '6/6  Summary'
-Pass "Windows pe64 leg is RUNNABLE: dss-built sqlite3.exe runs a live SQL round-trip."
-Info "  binary : $Sqlite3Exe"
-Info "  version: $verOut"
-Write-Host "`n [OK] SQLite-on-DSS Windows (pe64) harness: PASS" -ForegroundColor Green
+# ── Step 8 — run the .test UNIT CORPUS through the fixture ────────────────────
+Step "8/9  Run SQLite unit corpus ($Tier.test) + classify failures"
+$StagedTestDir = (Get-Content -Raw (Join-Path $Stage 'testdir.win.txt')).Trim()
+$TestFile = if ($env:DSS_TEST_FILE) { $env:DSS_TEST_FILE } else { Join-Path $StagedTestDir "$Tier.test" }
+if (-not (Test-Path $TestFile)) { Die "test file not found: $TestFile (tier '$Tier')." }
+# tcl86.dll + zlib1.dll must be loadable at runtime (put them on PATH); TCL_LIBRARY
+# points the Tcl runtime at its script library.
+$runEnvPath = (Split-Path $TclDll) + ';' + (Split-Path $ZlibDll) + ';' + $env:PATH
+$rundir = Join-Path $Work 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
+New-Item -ItemType Directory -Force -Path $rundir | Out-Null
+$runlog = Join-Path $Work 'corpus.log'
+Info "[pe64] running $Tier.test via $([System.IO.Path]::GetFileName($fixture)) …"
+$oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
+Push-Location $rundir
+try {
+  $env:PATH = $runEnvPath; if (Test-Path $TclLibrary) { $env:TCL_LIBRARY = $TclLibrary }
+  & $fixture $TestFile *>&1 | Tee-Object -FilePath $runlog | Out-Null
+} finally { $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib; Pop-Location }
+
+$summary  = (Get-Content $runlog | Select-String -Pattern '(\d+) errors? out of (\d+) tests' | Select-Object -Last 1)
+$faillist = (Get-Content $runlog | Select-String -Pattern '^Failures on these tests:\s*(.+)$' | Select-Object -Last 1)
+$unitVerdict = ''; $unitFail = $false
+if (-not $summary) {
+  $unitVerdict = "FAIL: fixture did not complete the suite (crash?) — see $runlog"; $unitFail = $true
+  Warn "[pe64] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
+  Get-Content $runlog -Tail 6 | ForEach-Object { Info "      $_" }
+} else {
+  $nerr = [int]$summary.Matches[0].Groups[1].Value
+  $fails = if ($faillist) { ($faillist.Matches[0].Groups[1].Value -split '\s+' | Where-Object { $_ }) } else { @() }
+  $real = @(); $confound = @()
+  foreach ($t in $fails) {
+    $isc = $false
+    foreach ($p in $Confounds) { if ($t -match $p) { $isc = $true; break } }
+    if ($isc) { $confound += $t } else { $real += $t }
+  }
+  if ($nerr -gt 0 -and $fails.Count -eq 0) {
+    $unitVerdict = "FAIL: $nerr error(s) but no classifiable 'Failures on these tests:' list — see $runlog"; $unitFail = $true
+    Warn "[pe64] corpus FAIL — $($summary.Matches[0].Value) (unclassifiable)"
+  } elseif ($real.Count -eq 0) {
+    $unitVerdict = "PASS ($($summary.Matches[0].Value)$(if ($confound.Count) { "; $($confound.Count) known confound(s): $($confound -join ' ')" }))"
+    Pass "[pe64] corpus GREEN — $($summary.Matches[0].Value)$(if ($confound.Count) { "; all $($confound.Count) failure(s) are known non-DSS confounds: $($confound -join ' ')" })"
+  } else {
+    $unitVerdict = "FAIL: $($real.Count) genuine unit failure(s): $($real -join ' ')"; $unitFail = $true
+    Warn "[pe64] corpus FAIL — $($summary.Matches[0].Value); $($real.Count) GENUINE DSS failure(s): $($real -join ' ')"
+    if ($confound.Count) { Info "      (+$($confound.Count) known confound(s) ignored: $($confound -join ' '))" }
+  }
+}
+
+# ── Step 9 — results ─────────────────────────────────────────────────────────
+Step '9/9  Results'
+Info "compiler : $DssBin @ $dssHead"
+Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
+Info "recipe   : $nTus TUs, $nDefs defines"
+Info "tier     : $Tier.test   outputs: $Work"
+Info "pe64 ($Spec): compiled$(if ($Shim) { ' [SHIMMED]' })   units: $unitVerdict"
+if ($Shim) {
+  Warn "This run used DSS_PE64_PENDING_FIXES_SHIM — the two pending compiler fixes (B1 `_declspec`, B2 `LONG volatile`) were SIMULATED. It is NOT a clean pass; land the compiler fixes and re-run without the shim."
+}
+if ($unitFail) { Write-Host "`n [X] pe64 leg had genuine unit failures (non-confound) — the corpus is not green." -ForegroundColor Red; exit 1 }
+Pass "pe64 leg compiled the full-source testfixture + ran the $Tier unit corpus GREEN$(if ($Shim) { ' (SHIMMED — not a clean pass)' })"
 exit 0

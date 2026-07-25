@@ -91,7 +91,13 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # failures — a failing test matching any is not counted against green. Defaults
 # to the documented set (WAL set-lock wall-clock timing on a fast/uncontended box;
 # a zipfile error-message-text env diff; the recover-fault OOM-oracle class).
-DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault}"
+# (date-2.4c is gcc-EXONERATED — a GCC-built testfixture fails it identically
+# [expected NULL, got a date], so it is a sqlite date-format/version/env diff, not
+# a DSS miscompile. NOTE: fpconv1-2.0 is DELIBERATELY NOT a confound — a debug DSS
+# fixture + a GCC fixture both pass it while a release DSS fixture fails all 500k
+# values, so it is a GENUINE release-optimizer fp miscompile [D-OPT-SQLITE-FPCONV1-
+# RELEASE-FP-MISCOMPILE] the harness MUST flag red until fixed.)
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 HOST_OS=""
@@ -568,9 +574,16 @@ for leg in "${LEG_ORDER[@]}"; do
   runlog="$OUT_DIR/$leg/corpus.log"
   info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
   ( cd "$rundir" && run_leg "$leg" "$bin" "$TEST_FILE" ) > "$runlog" 2>&1 || true
-  # summary "N errors out of M tests"; canonical failure list "Failures on these tests: …"
+  # summary "N errors out of M tests"; the failing test names come from BOTH the
+  # canonical "Failures on these tests: …" summary AND the per-failure markers the
+  # fixture prints inline (`! <name> expected:` / `! <name> got:`). Many
+  # testfixture builds emit ONLY the inline markers and NOT the summary line, so
+  # relying on the summary alone leaves failures UNCLASSIFIED — a false RED here,
+  # and a latent false GREEN if a future edit treats empty as clean. Union + dedup.
   summary="$(grep -E '[0-9]+ errors? out of [0-9]+ tests' "$runlog" | tail -1 || true)"
   faillist="$(sed -n 's/^Failures on these tests:[[:space:]]*//p' "$runlog" | tail -1 || true)"
+  faillist="$faillist $(grep -oE '^! [A-Za-z0-9_.:-]+ (expected|got):' "$runlog" 2>/dev/null | sed -E 's/^! ([A-Za-z0-9_.:-]+) .*/\1/')"
+  faillist="$(printf '%s\n' $faillist | sort -u | tr '\n' ' ')"
   if [[ -z "$summary" ]]; then
     UNIT_VERDICT["$leg"]="FAIL:fixture did not complete the suite (crash?) — see $runlog"
     UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
@@ -586,8 +599,8 @@ for leg in "${LEG_ORDER[@]}"; do
   # conservative: if the summary reports errors but the fixture printed no
   # classifiable failure list, treat the run as RED (unclassified).
   if [[ "$nerr" -gt 0 && -z "$faillist" ]]; then
-    UNIT_VERDICT["$leg"]="FAIL:$nerr error(s) but no 'Failures on these tests:' list to classify — see $runlog"
-    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — $summary (unclassifiable)"; continue
+    UNIT_VERDICT["$leg"]="FAIL:$nerr error(s) but no failure markers ('Failures on these tests:' / '! <name>') to classify — see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — $summary (unclassifiable — no failure markers)"; continue
   fi
   if [[ ${#real[@]} -eq 0 ]]; then
     if [[ ${#confound[@]} -eq 0 ]]; then
