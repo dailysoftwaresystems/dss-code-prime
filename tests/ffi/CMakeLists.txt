@@ -14,3 +14,10 @@ dss_add_test(NAME ffi/test_shipped_lib_descriptor SOURCES test_shipped_lib_descr
 dss_add_test(NAME ffi/test_shipped_type_consistency SOURCES test_shipped_type_consistency.cpp)
 target_link_libraries(dss_ffi_test_shipped_type_consistency
                       PRIVATE nlohmann_json::nlohmann_json)
+# D-FFI-PE-CRT-UCRT-MIGRATION: the co-state-group binding invariant — the pe C
+# runtime may be mid-migration, but the descriptors that exchange CRT-owned
+# objects must never be split across two runtimes. Reads the shipped descriptors'
+# JSON directly (like the sweep above), hence the same json link.
+dss_add_test(NAME ffi/test_pe_crt_costate_binding SOURCES test_pe_crt_costate_binding.cpp)
+target_link_libraries(dss_ffi_test_pe_crt_costate_binding
+                      PRIVATE nlohmann_json::nlohmann_json)
