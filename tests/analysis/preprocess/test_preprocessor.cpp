@@ -2358,14 +2358,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // 11 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
     // D-CSUBSET-BITINT — C23 6.2.5, the mandatory bit-precise max width 8388608 + the
     // FC17.9(h) C23 `#embed` trichotomy macros `__STDC_EMBED_NOT_FOUND__`/`_FOUND__`/
-    // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 10 pe-gated = 21: the pe-gated set is the c95
+    // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 11 pe-gated = 22: the pe-gated set is the c95
     // Windows selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
-    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec). NO macho-gated
+    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec) + the legacy
+    // single-underscore `_declspec` alias (B1, D-SQLITE-PE64-TESTFIXTURE-FRONTEND). NO macho-gated
     // macros remain: `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho
     // trampolines — <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
     // `__STDC_NO_VLA__` (a VLA-supporting impl must not define it).
-    EXPECT_EQ(pms.size(), 21u)
-        << "c-subset declares 11 un-gated + 10 pe-gated predefined macros (no macho-gated)";
+    EXPECT_EQ(pms.size(), 22u)
+        << "c-subset declares 11 un-gated + 11 pe-gated predefined macros (no macho-gated)";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2386,9 +2387,11 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) are un-gated (every "
            "format); __STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
-    EXPECT_EQ(peGated, 10u)
+    EXPECT_EQ(peGated, 11u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
-           "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";
+           "_MSC_VER/__int64/__forceinline/__declspec (c105) + _declspec (the legacy "
+           "single-underscore MSVC alias; tcl.h's TCL_NORETURN under the pe profile, "
+           "D-SQLITE-PE64-TESTFIXTURE-FRONTEND B1) are pe-gated";
 }
 
 // LOADER fail-loud (c95): a `predefinedMacros.availableObjectFormats` naming an
@@ -3844,7 +3847,7 @@ TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
 // EXACTLY as in the authoritative pass; value-seeding it would make the pre-scan
 // MORE-live -> a silent P0016 re-open. The prefix builder therefore SKIPS
 // `isFunctionLike` predefines (mirroring the MacroExpander ctor + the <built-in>
-// prologue). NOTE: the c-subset schema's ONLY function-like predefine is
+// prologue). NOTE: the c-subset schema's function-like predefines are `_declspec` (B1) +
 // `__declspec` (pe-only, value ""), a WEAK red-on-disable witness -- wrongly
 // value-seeding it yields an object-like EMPTY macro, so `#if __declspec` -> empty
 // operand -> uncertain -> conservative skip -> NO error, the SAME outcome as the

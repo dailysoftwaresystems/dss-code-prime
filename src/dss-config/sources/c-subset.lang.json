@@ -65,6 +65,7 @@
       { "name": "__int64",             "kind": "constant", "value": "long long", "availableObjectFormats": ["pe"] },
       { "name": "__forceinline",       "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
       { "name": "__declspec",          "kind": "constant", "value": "", "params": ["x"], "availableObjectFormats": ["pe"] },
+      { "name": "_declspec",           "kind": "constant", "value": "", "params": ["x"], "availableObjectFormats": ["pe"] },
       { "name": "__stdcall",           "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
       { "name": "__cdecl",             "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
       { "name": "__fastcall",          "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
