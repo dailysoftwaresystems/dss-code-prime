@@ -11324,6 +11324,22 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             (void)typeConsistency.add(desc->header, *desc, s.reporter);
 
             for (auto const& sym : desc->symbols) {
+                // Per-SYMBOL `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC):
+                // the EFFECTIVE per-format image map for THIS symbol is the descriptor
+                // map with the symbol's own `library` MERGED OVER it (symbol keys WIN;
+                // a format the symbol OMITS inherits the descriptor's entry — the same
+                // "a missing format key inherits" semantics the map already carries).
+                // Empty `sym.library` (almost every symbol) ⇒ a plain copy of
+                // `desc->library`, byte-identical to the pre-override image. Computed
+                // ONCE here so BOTH the goal-2 SUPPRESSED path (a user bare-proto
+                // redeclaration of an overridden symbol must bind the override too) AND
+                // the injected path carry it. AGNOSTIC: a generic map union — no
+                // name/arch/format identity branch.
+                std::unordered_map<std::string, std::string> effectiveLibrary =
+                    desc->library;
+                for (auto const& [ovFmt, ovImage] : sym.library)
+                    effectiveLibrary.insert_or_assign(ovFmt, ovImage);
+
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.
                 if (userDeclaredNames.contains(sym.name)) {
                     // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): record the
@@ -11345,7 +11361,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         || ffi::objectFormatInAvailabilitySet(
                                sym.availableObjectFormats, *s.activeFormat)) {
                         suppressedShippedLibraries.emplace(sym.name,
-                            SuppressedShippedSymbol{desc->library, sym.version});
+                            SuppressedShippedSymbol{std::move(effectiveLibrary),
+                                                    sym.version});
                     }
                     continue;
                 }
@@ -11397,7 +11414,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
                 shippedExterns.push_back(ShippedExternSymbol{
-                    id, sym.name, sym.signature, desc->library,
+                    id, sym.name, sym.signature, std::move(effectiveLibrary),
                     sym.kind == ffi::ShippedSymbolKind::Function,
                     sym.synthesize,   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
                     sym.version});    // D-LK-ELF-SYMBOL-VERSIONING (c156)

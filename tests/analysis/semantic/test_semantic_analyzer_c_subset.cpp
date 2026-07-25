@@ -4028,6 +4028,52 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     EXPECT_EQ(model.lattice().interner().kind(ext.signature), TypeKind::FnSig);
 }
 
+// Per-SYMBOL `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC): a symbol
+// that carries its own `library` map has THAT map MERGED OVER the descriptor's at
+// injection (symbol keys WIN; a format the symbol OMITS inherits the descriptor's
+// entry), while a SIBLING with no override binds the descriptor default unchanged.
+// This is the mechanism the pe `strftime`->ucrtbase.dll date4 fix uses — bind ONE
+// symbol to a different image than its header default without moving the whole
+// descriptor. RED-ON-DISABLE: revert the injector to pass `desc->library` instead
+// of the merged `effectiveLibrary`, and the override symbol's `pe` entry reverts
+// to the descriptor default (msvcrt.dll) → the `over->library.at("pe")` assertion
+// flips from "ucrtbase.dll" to "msvcrt.dll".
+TEST(SemanticAnalyzerCSubset, ShippedPerSymbolLibraryOverrideMergesOverDescriptor) {
+    ScratchDir sysDir{Location::Temp, "ff11-symlib"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "tt.json",
+        R"JSON({ "header": "tt.h", "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+             "symbols": [
+                 { "name": "over",  "signature": "fn() -> i32", "library": { "pe": "ucrtbase.dll" } },
+                 { "name": "plain", "signature": "fn() -> i32" } ] })JSON",
+        "#include <tt.h>\nint main() { return over() + plain(); }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "both descriptor symbols must resolve";
+
+    ASSERT_EQ(model.shippedExterns().size(), 2u);
+    ShippedExternSymbol const* over  = nullptr;
+    ShippedExternSymbol const* plain = nullptr;
+    for (auto const& ext : model.shippedExterns()) {
+        if (ext.name == "over")  over  = &ext;
+        if (ext.name == "plain") plain = &ext;
+    }
+    ASSERT_NE(over,  nullptr);
+    ASSERT_NE(plain, nullptr);
+    // The OVERRIDE symbol: `pe` is the override image (ucrtbase.dll — symbol wins),
+    // `elf` INHERITS the descriptor default (libc.so.6 — the omitted-key semantics,
+    // NOT dropped). Both entries present → the merge, not a replace.
+    ASSERT_EQ(over->library.size(), 2u);
+    EXPECT_EQ(over->library.at("pe"),  "ucrtbase.dll");
+    EXPECT_EQ(over->library.at("elf"), "libc.so.6");
+    // The SIBLING with no override binds the descriptor default on EVERY format —
+    // byte-identical to the pre-override behavior.
+    ASSERT_EQ(plain->library.size(), 2u);
+    EXPECT_EQ(plain->library.at("pe"),  "msvcrt.dll");
+    EXPECT_EQ(plain->library.at("elf"), "libc.so.6");
+}
+
 // ── Item 1: shipped-header CONSTANTS + TYPEDEFS via the neutral descriptor ────
 
 // A shipped CONSTANT injects + folds in CONSTANT-EXPRESSION position (an array

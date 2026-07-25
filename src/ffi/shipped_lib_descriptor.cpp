@@ -588,6 +588,48 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     }
 }
 
+// Decode a per-object-format `library` MAP node ({"pe":"msvcrt.dll",
+// "elf":"libc.so.6"}) into `out`. Each KEY must be a known object-format name
+// (the `objectFormatKindFromName` vocabulary — a typo like "pee" fails loud
+// HERE, not at a user's link); each VALUE must be a string. A NON-OBJECT node is
+// a SHAPE error → emits + returns false (the caller ABORTS: the descriptor-level
+// map hard-returns nullopt, a per-symbol override skips that symbol). Per-KEY
+// errors (unknown format / non-string value) are collect-all (emitted + skipped;
+// the overall read still fails via the caller's errorCount delta). The SHARED
+// chokepoint for the descriptor-level `library` AND the per-symbol `library`
+// override — so the two validations can NEVER drift (the decodeShippedAvailability
+// precedent). AGNOSTIC: the key set is the object-format vocabulary, never an
+// `if (key == "pe")` identity branch. `ctx` is the caller's already-quoted
+// diagnostic context (e.g. "'p'" for the root, "'p' symbols[3]" for a symbol);
+// `field` is the map's spelling ("library"). (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC)
+[[nodiscard]] bool decodeLibraryMap(json const& node, std::string const& ctx,
+                                    std::string const& field,
+                                    DiagnosticReporter& reporter,
+                                    std::unordered_map<std::string, std::string>& out) {
+    if (!node.is_object()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+            + "' must be a per-object-format object, e.g. "
+              "{\"pe\":\"msvcrt.dll\",\"elf\":\"libc.so.6\"}");
+        return false;
+    }
+    for (auto const& kv : node.items()) {
+        if (!objectFormatKindFromName(kv.key()).has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "' has unknown object-format key '" + kv.key()
+                + "' (expected one of the object-format names, e.g. "
+                  "\"pe\"/\"elf\"/\"macho\")");
+            continue;
+        }
+        if (!kv.value().is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "." + kv.key() + "' must be a string");
+            continue;
+        }
+        out.emplace(kv.key(), kv.value().get<std::string>());
+    }
+    return true;
+}
+
 // Decode the optional `includes` array (the transitive sibling-header NAMES, plan
 // D-FFI-DESCRIPTOR-INCLUDES) into `out`. Each entry must be a NON-EMPTY string (a
 // header NAME later resolved via `resolveSystemDescriptor`'s `<stem>.json`
@@ -848,30 +890,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // resolution. AGNOSTIC: the key set is the `objectFormatKindFromName`
     // vocabulary, never an `if (key == "pe")` identity branch.
     if (doc.contains("library")) {
-        if (!doc.at("library").is_object()) {
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + path.generic_string()
-                    + "': 'library' must be a per-object-format object, e.g. "
-                      "{\"pe\":\"msvcrt.dll\",\"elf\":\"libc.so.6\"}");
+        // SHARED chokepoint with the per-symbol `library` override (in the symbol
+        // loop below) so the two decodes can NEVER drift. A non-object node hard-
+        // fails the whole read (a malformed descriptor-level map is unrecoverable —
+        // there is nothing left to bind); per-key errors ride the errorCount delta.
+        if (!decodeLibraryMap(doc.at("library"),
+                              std::string{"'"} + path.generic_string() + "'",
+                              "library", reporter, out.library))
             return std::nullopt;
-        }
-        for (auto const& kv : doc.at("library").items()) {
-            if (!objectFormatKindFromName(kv.key()).has_value()) {
-                emitMalformed(reporter,
-                    std::string{"shipped-lib descriptor '"} + path.generic_string()
-                        + "': 'library' has unknown object-format key '" + kv.key()
-                        + "' (expected one of the object-format names, e.g. "
-                          "\"pe\"/\"elf\"/\"macho\")");
-                continue;
-            }
-            if (!kv.value().is_string()) {
-                emitMalformed(reporter,
-                    std::string{"shipped-lib descriptor '"} + path.generic_string()
-                        + "': 'library." + kv.key() + "' must be a string");
-                continue;
-            }
-            out.library.emplace(kv.key(), kv.value().get<std::string>());
-        }
     }
 
     // (2.5) Optional `availableObjectFormats` — the per-target AVAILABILITY set
@@ -1405,6 +1431,22 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         std::vector<std::string> symAvail;
         decodeShippedAvailability(sym, at, reporter, symAvail);
 
+        // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
+        // image for THIS symbol alone, SAME shape as the descriptor-level `library`
+        // map. Absent ⇒ empty (the symbol inherits the descriptor's map). Present ⇒
+        // the RAW override, which the semantic injector MERGES over the descriptor
+        // map (symbol keys win; an omitted format inherits the descriptor's) — so a
+        // single symbol can bind a different image than its header default (pe
+        // `strftime`→ucrtbase while the rest of <time.h> stays on msvcrt). Validated
+        // through the SAME `decodeLibraryMap` chokepoint as the descriptor-level map
+        // (unknown format key / non-string value fail loud); a non-object node skips
+        // this symbol (the symbol-loop collect-all pattern). AGNOSTIC: a generic
+        // per-format map, no name/arch/format identity branch.
+        std::unordered_map<std::string, std::string> symLibrary;
+        if (sym.contains("library")
+            && !decodeLibraryMap(sym.at("library"), at, "library", reporter, symLibrary))
+            continue;
+
         // FC3 c1: optional per-data-model signature override
         // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
         // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
@@ -1467,7 +1509,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
                                  "kind", "linkage", "availableObjectFormats",
-                                 "noreturn", "returnsTwice", "synthesize", "version"});
+                                 "noreturn", "returnsTwice", "synthesize", "version",
+                                 "library"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -1496,7 +1539,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         out.symbols.push_back(
             ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
                           noreturn, returnsTwice, std::move(synthesize),
-                          std::move(version)});
+                          std::move(version), std::move(symLibrary)});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-

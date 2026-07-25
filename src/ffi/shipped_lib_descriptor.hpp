@@ -190,6 +190,23 @@ struct DSS_EXPORT ShippedSymbol {
     // case). A flat string is also accepted (arch-invariant). ELF-only
     // semantics; carried but unused on PE/Mach-O.
     std::string version;
+    // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
+    // image for THIS symbol alone, SAME shape as the descriptor-level `library`
+    // map ("pe"/"elf"/"macho" -> image name). EMPTY (default, almost every
+    // symbol) means the symbol INHERITS the descriptor's map, byte-identical to
+    // the pre-override image. When NON-EMPTY the semantic injector MERGES it OVER
+    // the descriptor map (symbol keys WIN; a format the symbol OMITS inherits the
+    // descriptor's entry — the same "a missing format key inherits" semantics the
+    // descriptor map itself has). This lets ONE symbol bind a DIFFERENT image than
+    // its header's default — e.g. pe `strftime`->`ucrtbase.dll` (C99-complete
+    // `%e`/`%F`/`%R`) while the rest of <time.h> stays on the legacy `msvcrt.dll`
+    // (whose bare `time`/`localtime`/... have no ucrtbase export, so the whole
+    // descriptor cannot move). This field is the RAW declared override — the merge
+    // lives at INJECTION, where the descriptor map is in scope. Keys are the
+    // `objectFormatKindFromName` vocabulary; an unknown key / non-string value
+    // fails loud on read (the SAME `decodeLibraryMap` chokepoint the
+    // descriptor-level map uses).
+    std::unordered_map<std::string, std::string> library;
 };
 
 // True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21

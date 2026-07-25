@@ -262,6 +262,102 @@ TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {
 
 // ── c156: per-symbol `version` (D-LK-ELF-SYMBOL-VERSIONING) ───────────────────
 
+// ── per-symbol `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC) ──────
+
+// A symbol carrying its own `library` map decodes the RAW per-symbol override
+// (pe->ucrtbase) onto `ShippedSymbol.library`; a sibling with no `library` field
+// gets an EMPTY map (it inherits the descriptor's at injection). The descriptor-
+// level `library` is unchanged — this layer stores the RAW override, and the
+// merge is the semantic injector's job. RED-ON-DISABLE: drop the per-symbol
+// `library` decode (or the field) and the override symbol's map goes empty.
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideDecodesRawMap) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "time_like.json", R"JSON({
+        "header": "time.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "strftime", "signature": "fn() -> i32", "library": { "pe": "ucrtbase.dll" } },
+            { "name": "time",     "signature": "fn() -> i64" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 2u);
+    // The override symbol carries its RAW per-symbol map (pe->ucrtbase). The
+    // descriptor-level map is NOT merged in here (that is the injector's job).
+    EXPECT_EQ(desc->symbols[0].name, "strftime");
+    ASSERT_EQ(desc->symbols[0].library.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].library.at("pe"), "ucrtbase.dll");
+    // The sibling declares no override → empty map (inherits at injection).
+    EXPECT_EQ(desc->symbols[1].name, "time");
+    EXPECT_TRUE(desc->symbols[1].library.empty());
+    // The descriptor-level map is untouched by the per-symbol override.
+    EXPECT_EQ(desc->library.at("pe"), "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"), "libc.so.6");
+}
+
+// An unknown per-symbol `library` object-format KEY fails loud (the SAME closed
+// `objectFormatKindFromName` vocabulary the descriptor-level `library` map uses —
+// the shared `decodeLibraryMap` chokepoint).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideUnknownFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "bogus": "x.dll" } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // unknown format key → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A per-symbol `library` VALUE that is not a string fails loud (mirrors the
+// descriptor-level map's non-string-value rejection via `decodeLibraryMap`).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideNonStringValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib2.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "pe": 123 } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // non-string value → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A per-symbol `library` that is not an OBJECT fails loud (a shape error — the
+// `decodeLibraryMap` non-object branch, which skips the symbol; the read then
+// fails via the "declares nothing"/errorCount delta).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideNonObjectFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib3.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": "msvcrt.dll" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // non-object library → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── c156: per-symbol `version` (D-LK-ELF-SYMBOL-VERSIONING) ───────────────────
+
 // A flat `"version": "GLIBC_2.3"` (arch-invariant) decodes onto the symbol.
 TEST(ShippedLibDescriptor, SymbolVersionFlatStringDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
