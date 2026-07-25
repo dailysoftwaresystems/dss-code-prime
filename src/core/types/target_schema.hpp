@@ -788,11 +788,16 @@ struct DSS_EXPORT TargetCallingConvention {
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `__va_list_tag` layout + register-
     // save-area geometry for `va_start`/`va_arg`/`va_end` in a variadic CALLEE.
-    // ENGAGED (SysV AMD64) ⇒ the semantic phase injects `__va_list_tag`, HIR→MIR
-    // lowers the va_arg diamond, and the LIR prologue spills the arg registers.
-    // ABSENT (Win64 / AAPCS64 this cycle — a different variadic ABI) ⇒ a variadic
-    // function body using va_start fails LOUD ("variadic callee unsupported for
-    // this CC"), never silently mis-walked. One field selects support agnostically.
+    // ENGAGED today for EVERY shipped calling convention, each via its own
+    // `VaListLayout::strategy`: sysv_amd64 = SysVRegisterSave (the __va_list_tag
+    // register-save-area this field was originally named for); ms_x64 + apple_arm64
+    // = HomogeneousPointer (FC12b / FC12c — `va_list` is a plain pointer into a
+    // contiguous arg area); aapcs64 = Aapcs64DualCursor (FC12c — the dual gr/vr-
+    // offset `__va_list` struct). ABSENT ⇒ the target/CC declares NO variadic-
+    // callee model at all; a variadic function body using va_start then fails
+    // LOUD ("variadic callee unsupported for this CC"), never silently mis-walked.
+    // One field selects support — and which of the three lowering strategies —
+    // fully agnostically, never a per-CC-name branch.
     std::optional<VaListLayout> vaListLayout;
 };
 

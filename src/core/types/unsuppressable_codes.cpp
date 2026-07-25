@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 124> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 125> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -36,6 +36,19 @@ constexpr std::array<DiagnosticCode, 124> kUnsuppressableCodes{{
     DiagnosticCode::D_TargetAbiModelUnsupportedByDriver,
     DiagnosticCode::D_TargetMachineCodeMismatch,
     DiagnosticCode::D_TargetAbiModelMismatch,
+    // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
+    // D-FFI-PE-CRT-UCRT-MIGRATION, 2026-07-25): the driver's shim-synthesis
+    // seam found a `synthesize` recipe id belonging to no known shim family
+    // — a lockstep break between the descriptor loader's closed `kRecipes`
+    // guard and the family split that feeds each synth pass. Suppressed, the
+    // recipe would fall out of BOTH passes and the shim symbol would go
+    // undefined with no diagnostic — a silently-undefined function that
+    // breaks the binary's LOAD at user runtime (the eager-import law's
+    // failure mode), not the build. It also replaces both seams' former
+    // borrow of the linker-band `K_NoMatchingObjectFormat`, itself a member
+    // below — so this entry PRESERVES the non-suppressible property rather
+    // than granting a new one.
+    DiagnosticCode::D_SynthRecipeFamilyUnknown,
 
     // F_* FFI band — architectural exclusions on the FF5 ingest path
     // (WASM/SPIR-V abiModels don't take FF4 mangling; empty canonical

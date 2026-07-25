@@ -17,6 +17,7 @@
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
@@ -724,25 +725,85 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // A no-op when the map is empty. ★ The merge's step-3c pre-registers each referenced-
     // only shim symbol with a merged id + a `symbolNames` entry (else the clone would abort
     // on a shim `GlobalAddr`), so a shim that is NOT collapsed onto a genuine user def lands
-    // here as a not-defined/not-imported vocab name and IS synthesized — multi-CU threads
-    // works (a 2-file pe64 witness runs → 42). A shim collapsed onto a real user def is a
+    // here as a not-defined/not-imported vocab name and IS synthesized — multi-CU synthesis
+    // works. ★ EVIDENCE, corrected 2026-07-25: this used to claim "a 2-file pe64 witness
+    // runs → 42" for THREADS, and no such example was ever shipped — every c11_threads /
+    // pthread / thread_local example is single-source, so the claim pointed at a witness
+    // that does not exist. The real coverage is: for <threads.h>, the unit test
+    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h>, a genuine 2-TU
+    // runtime witness, `examples/c-subset/shipped_sprintf_ucrt_crosscu` (exit 42, release
+    // arm, pe64) — which exercises THIS code path, and is red-on-disable proven: neutering
+    // the va-leaf refusal in `opt/passes/inlining.cpp` fails it (exit 50) while the
+    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry matters because
+    // this seam synthesizes PRE-optimize while compile_pipeline's synthesizes POST — see
+    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY. A shim collapsed onto a real user def is a
     // DEFINED symbol → filtered out → correctly not re-synthesized.
     {
         std::unordered_set<std::uint32_t> definedOrImported;
         for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
             definedOrImported.insert(merged->mir.funcSymbol(merged->mir.funcAt(i)).v);
         for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
-        std::unordered_map<std::uint32_t, std::string> mergedRecipes;
+        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION the reconstructed recipe map by
+        // `dss::ffi::shimFamilyOf` BEFORE calling either synth pass — the SAME split
+        // `lowerCuMirToAssembly` applies to the single-CU `threadsRecipes` map
+        // (compile_pipeline.cpp), for the identical reason: each pass fails loud on a
+        // recipe id it has no switch arm for (its own anti-vocab-drift backstop), so one
+        // pass seeing the other family's ids would abort a build that never should have
+        // failed. A `nullopt` family is an INTERNAL INVARIANT BREACH (the descriptor
+        // loader already rejects an unknown `synthesize` id at READ time via the same
+        // closed-vocab table `shimFamilyOf` reads), never a silently-dropped recipe —
+        // reported with the DRIVER-band internal-invariant code
+        // `D_SynthRecipeFamilyUnknown`, the SAME code the single-CU seam emits, and not
+        // the linker's `K_NoMatchingObjectFormat` (which would send an operator to the
+        // object-format config for what is a recipe-table defect).
+        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
             std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
-            if (dss::ffi::isKnownSynthesizeRecipe(bare)
-                && definedOrImported.find(symV) == definedOrImported.end())
-                mergedRecipes.emplace(symV, bare);
+            if (!dss::ffi::isKnownSynthesizeRecipe(bare)
+                || definedOrImported.find(symV) != definedOrImported.end()) {
+                continue;
+            }
+            auto const family = dss::ffi::shimFamilyOf(bare);
+            if (!family.has_value()) {
+                dss::report(reporter, DiagnosticCode::D_SynthRecipeFamilyUnknown,
+                            DiagnosticSeverity::Error,
+                            std::format(
+                                "synthesize recipe '{}' (symbol {{ {} }}) belongs to no "
+                                "known shim family (D-FFI-PE-CRT-UCRT-MIGRATION) — "
+                                "internal invariant breach: the descriptor loader should "
+                                "have rejected an unknown recipe id at read time "
+                                "(isKnownSynthesizeRecipe)",
+                                bare, symV));
+                return false;
+            }
+            switch (*family) {
+            case dss::ffi::ShimFamily::Threads: mergedThreadsRecipes.emplace(symV, bare); break;
+            case dss::ffi::ShimFamily::Stdio:   mergedStdioRecipes.emplace(symV, bare);   break;
+            }
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                   mergedRecipes, (*formatR)->librarySynthesis(),
+                                   mergedThreadsRecipes, (*formatR)->librarySynthesis(),
                                    fmtKind, merged->externImports, reporter)) {
             return false;  // internal invariant breach (vocab/switch drift) — reported.
+        }
+        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
+        // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
+        // `mergedStdioRecipes` is empty. The va_list strategy is read from the SAME
+        // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
+        // index was derived from — no second lookup, no format-name branch. A CC that
+        // declares no `vaListLayout` propagates as `nullopt`, NOT as a defaulted strategy:
+        // "nothing declared" must stay distinguishable from a real declaration all the way
+        // to the synth pass, which refuses it loudly (the single-CU seam threads the same
+        // optional through `CuMirModule::vaListStrategy`). Consulted only if a stdio recipe
+        // actually appears.
+        std::optional<VaListStrategy> vaListStrategy;
+        if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
+            vaListStrategy = abi->cc->vaListLayout->strategy;
+        }
+        if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
+                                 mergedStdioRecipes, vaListStrategy,
+                                 merged->externImports, reporter)) {
+            return false;  // recipe/helper-import/va-strategy mismatch — reported.
         }
     }
 

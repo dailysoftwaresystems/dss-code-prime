@@ -38,6 +38,7 @@
 #include "mir/merge/mir_merge.hpp"
 #include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
+#include "mir/merge/synth_stdio_shim.hpp"       // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION P3)
 #include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -2303,4 +2304,240 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
 
     MirVerifier verifier{mm, &hi};
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): synthesizeStdioShim ───────────────────
+//
+// The <stdio.h> printf-family sibling of the SynthThreadsShim suite above. The modern
+// UCRT (`ucrtbase.dll`) exports NO concrete `sprintf` — only the common core
+// `__stdio_common_vsprintf` — so the pe `sprintf` row in stdio.json carries
+// `synthesize: "sprintf"` and this pass supplies the body. NOTHING about that surface was
+// unit-covered when it landed; these tests are that cover.
+//
+// Two properties carry the weight, and BOTH fail SILENTLY rather than loudly if they
+// regress (wrong text at runtime, never a compile or link error):
+//   * the body must route through the module's ALREADY-IMPORTED UCRT core and mint no
+//     import of its own (the "the helpers are ordinary descriptor imports" contract — the
+//     eager-import law is what proves the core really exists as an export, so a
+//     self-minted import would bypass that proof);
+//   * the body must carry the `VaHomeArgAreaAddr` leaf, which is simultaneously (a) the
+//     Win64 `va_list` value `&home[namedArgCount]`, (b) lir_callconv's prologue-spill
+//     signal, and (c) the ONLY thing making the inliner refuse to splice the shim into a
+//     caller (src/opt/passes/inlining.cpp). Under the MULTI-CU driver the shim is
+//     synthesized PRE-optimize, so the release pipeline's Inlining pass really is offered
+//     this body — see examples/c-subset/shipped_sprintf_ucrt_crosscu for the end-to-end
+//     runtime witness of that seam.
+
+namespace {
+
+// The shim's caller-side scaffold: one `main` that references `sprintf` (pre-minted
+// SymbolId{10}, seeded into functionSymbols by the CST→HIR seam so the reference lowered
+// to a GlobalAddr against a NOT-yet-defined callee) and returns.
+Mir buildSprintfCaller(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
+    std::array<TypeId, 2> const sp{pCh, pCh};
+    TypeId const sprintfSig = in.fnSig(sp, i32, CallConv::CcMS64, /*isVariadic=*/true);
+
+    MirBuilder mb;
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});   // main
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
+    MirInstId const ga  = mb.addGlobalAddr(SymbolId{10}, in.pointer(sprintfSig));
+    MirInstId const co[] = {ga, buf, buf};
+    mb.addInst(MirOpcode::Call, co, i32);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// The UCRT core as an ORDINARY descriptor import — exactly what stdio.json's pe
+// `__stdio_common_vsprintf` row produces, bound to ucrtbase.dll.
+std::vector<ExternImport> ucrtCoreImports() {
+    ExternImport core;
+    core.symbol      = SymbolId{20};
+    core.mangledName = "__stdio_common_vsprintf";
+    core.libraryPath = "ucrtbase.dll";
+    core.isData      = false;
+    return {core};
+}
+
+// Locate a definition by its SymbolId value.
+std::optional<MirFuncId> findFuncBySymbol(Mir const& mir, std::uint32_t symV) {
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == symV) return f;
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+// The HAPPY PATH, asserted STRUCTURALLY rather than "it returned true": the referenced
+// `sprintf` becomes a DEFINED variadic function whose single block carries the
+// `VaHomeArgAreaAddr` leaf at the right named-arg count and calls the module's existing
+// UCRT core — while the import list is left EXACTLY as it was found.
+//
+// RED-ON-DISABLE (each assertion independently): drop the `ap` operand from the ops array
+// and the leaf assertion reds; point `coreAddr` at a freshly minted symbol and the
+// "callee is SymbolId{20}" assertion reds; have the pass push its own ExternImport and
+// the "imports unchanged" assertion reds.
+TEST(SynthStdioShim, SprintfSynthesizesVariadicBodyOverImportedUcrtCore) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    std::vector<ExternImport> const before = externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                    externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    // (a) SymbolId{10} (sprintf) is now a DEFINED module function, and main survived.
+    auto const shim = findFuncBySymbol(mir, 10u);
+    ASSERT_TRUE(shim.has_value()) << "sprintf must be a synthesized definition";
+    EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must be cloned verbatim";
+    EXPECT_EQ(mir.moduleFuncCount(), 2u) << "exactly one shim appended (main + sprintf)";
+
+    // (b) The shim's OWN signature is VARIADIC with the 2 FIXED params (buf, fmt) —
+    // `...` is a marker, so a non-variadic sig here would mean the Win64 prologue never
+    // spills the home area at all and `ap` would point at uninitialized stack.
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "the sprintf shim must itself be variadic";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sprintf's FIXED arity is (buf, fmt)";
+
+    // (c) The body: exactly one VaHomeArgAreaAddr, payload == the named-arg slot count
+    // (2), and a Call whose CALLEE operand is a GlobalAddr to the imported core.
+    ASSERT_EQ(mir.funcBlockCount(*shim), 1u) << "every printf-family recipe is single-block";
+    MirBlockId const b = mir.funcBlockAt(*shim, 0);
+    std::uint32_t vaLeaves = 0;
+    std::uint32_t calls    = 0;
+    std::optional<std::uint32_t> calleeSym;
+    for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
+        MirInstId const id = mir.blockInstAt(b, i);
+        if (mir.instOpcode(id) == MirOpcode::VaHomeArgAreaAddr) {
+            ++vaLeaves;
+            EXPECT_EQ(mir.instPayload(id), 2u)
+                << "the va leaf is &home[namedArgCount]; sprintf's named count is 2";
+        }
+        if (mir.instOpcode(id) == MirOpcode::Call) {
+            ++calls;
+            auto const ops = mir.instOperands(id);
+            ASSERT_FALSE(ops.empty());
+            if (mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr)
+                calleeSym = mir.globalAddrSymbol(ops[0]).v;
+            // callee + (opts, buf, count, fmt, locale, ap) == 7 operands.
+            EXPECT_EQ(ops.size(), 7u) << "__stdio_common_vsprintf takes 6 arguments";
+        }
+    }
+    EXPECT_EQ(vaLeaves, 1u)
+        << "exactly one VaHomeArgAreaAddr: the va_list value, the prologue-spill signal, "
+           "AND the inliner's refusal trigger (src/opt/passes/inlining.cpp)";
+    EXPECT_EQ(calls, 1u) << "the shim forwards through exactly one core call";
+    ASSERT_TRUE(calleeSym.has_value()) << "the shim must call through a GlobalAddr";
+    EXPECT_EQ(*calleeSym, 20u)
+        << "the shim must call the module's ALREADY-IMPORTED __stdio_common_vsprintf";
+
+    // (d) The pass mints NO import — the cores are ordinary descriptor imports, which is
+    // what makes the eager-import law their existence proof. `sprintf` itself must never
+    // be imported (ucrtbase exports no such symbol; importing it would break every
+    // binary's LOAD).
+    ASSERT_EQ(externs.size(), before.size()) << "synthesizeStdioShim must mint no import";
+    for (std::size_t i = 0; i < externs.size(); ++i)
+        EXPECT_EQ(externs[i].mangledName, before[i].mangledName);
+    for (auto const& e : externs)
+        EXPECT_NE(e.mangledName, "sprintf") << "sprintf must NEVER be an import";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the stdio-shim-synthesized module must verify";
+}
+
+// An EMPTY recipe map is a clean no-op — and it must short-circuit BEFORE the va-strategy
+// check, so it stays clean even with NO strategy resolved (every elf/macho build and
+// every pe TU that includes no printf family). Locks the pass to a pure DATA gate, never
+// a format check. RED-ON-DISABLE: move the `recipeBySymbol.empty()` early return below
+// the strategy gate and this reds.
+TEST(SynthStdioShim, EmptyRecipeMapIsNoOpEvenWithNoVaStrategy) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+    std::size_t const before = mir.moduleFuncCount();
+
+    std::unordered_map<std::uint32_t, std::string> const recipes;   // empty
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_EQ(mir.moduleFuncCount(), before) << "no shim appended for an empty map";
+    EXPECT_TRUE(externs.empty()) << "no import planted for an empty map";
+}
+
+// FAIL-LOUD (1/3): a recipe id with NO switch arm. The family split routes every Stdio id
+// here, so an id this pass cannot build MUST be a reported error AND a `false` return —
+// never a silently missing definition (which surfaces, if at all, as an undefined symbol
+// far downstream, and on pe as a 0xC0000139 at LOAD).
+TEST(SynthStdioShim, UnknownRecipeIdFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "no_such_recipe"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                     externs, rep))
+        << "a recipe with no synth arm MUST fail loud, never silently skip the definition";
+    EXPECT_TRUE(rep.hasErrors())
+        << "the refusal must carry a real diagnostic, not a bare false";
+}
+
+// FAIL-LOUD (2/3): the UCRT core is NOT among the module's imports — i.e. stdio.json
+// declared a `synthesize` row without the `__stdio_common_v*` row it needs. Unchecked,
+// this is exactly the drift that yields a shim calling nothing.
+TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs;   // NO __stdio_common_vsprintf
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                     externs, rep))
+        << "an unimported UCRT core MUST fail loud (descriptor/pass drift)";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
+}
+
+// FAIL-LOUD (3/3): NO va-list strategy resolved. `CuMirModule::vaListStrategy` is
+// `std::optional` precisely so UNRESOLVED is distinguishable from resolved — the shape it
+// replaced defaulted a missing strategy to SysVRegisterSave, which READS as "the target
+// declared SysV" when the truth is "nobody ever asked the target". With a real stdio
+// recipe in hand that ambiguity must be an ERROR: the alternative is forwarding a va_list
+// under a guessed ABI, which miscompiles silently.
+TEST(SynthStdioShim, NulloptVaListStrategyWithRecipesFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep))
+        << "recipes present + NO resolved va_list strategy MUST fail loud, never default";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
+}
+
+// FAIL-LOUD (bonus): a RESOLVED but unimplemented strategy. Only the HomogeneousPointer
+// (Win64) arm is built — no elf/macho descriptor declares a stdio synthesize recipe, so a
+// SysVRegisterSave arm would be a speculative build. Refusing is right; silently emitting
+// the Win64 forward under a SysV target would be a wrong-ABI miscompile. Distinct from the
+// nullopt case above: this one is "the target ANSWERED, with a model we don't implement".
+TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::SysVRegisterSave,
+                                     externs, rep))
+        << "an unimplemented va_list model MUST fail loud, never forward under a wrong ABI";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }

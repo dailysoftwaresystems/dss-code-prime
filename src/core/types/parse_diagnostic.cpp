@@ -336,6 +336,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_StaticLibFatArchiveUnsupported: return "D_StaticLibFatArchiveUnsupported";
         case DiagnosticCode::D_CompileUnitNullNoDiagnostic:  return "D_CompileUnitNullNoDiagnostic";
         case DiagnosticCode::D_ArtifactNameEscapesOutputDir: return "D_ArtifactNameEscapesOutputDir";
+        case DiagnosticCode::D_SynthRecipeFamilyUnknown:     return "D_SynthRecipeFamilyUnknown";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

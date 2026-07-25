@@ -209,16 +209,42 @@ struct DSS_EXPORT ShippedSymbol {
     std::unordered_map<std::string, std::string> library;
 };
 
-// True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21
-// recipes: the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/call_once/
-// thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only — deferred, see the
-// .cpp vocab list.) The SINGLE source of truth shared by the descriptor loader (which
-// rejects an unknown `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND
-// the driver's multi-CU merged-module recipe reconstruction (program.cpp). The synth pass
-// (`synthesizeThreadsShim`) has the matching per-recipe body switch PER VEHICLE (pe→win32/
-// kernel32, macho→pthread/libSystem); a vocab id with no switch arm fails loud at synth
-// (they cannot silently diverge). (D-CSUBSET-C11-THREADS-HEADER)
+// True iff `id` is a member of the CLOSED synth-recipe vocabulary — 22 recipes spanning
+// TWO families:
+//   * <threads.h> (21): the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/
+//     call_once/thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only —
+//     deferred, see the .cpp vocab list.)
+//   * <stdio.h> (1): `sprintf` — the whole shipped printf family for now; each further
+//     recipe lands with its own descriptor row, its UCRT core row, and a runtime witness.
+// The SINGLE source of truth shared by the descriptor loader (which rejects an unknown
+// `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND the driver's multi-CU
+// merged-module recipe reconstruction (program.cpp). Each family's synth pass has the
+// matching per-recipe body switch — `synthesizeThreadsShim` PER VEHICLE (pe→win32/kernel32,
+// macho→pthread/libSystem), `synthesizeStdioShim` over the UCRT `__stdio_common_v*` cores;
+// a vocab id with no switch arm fails loud at synth (they cannot silently diverge).
+// (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
 [[nodiscard]] DSS_EXPORT bool isKnownSynthesizeRecipe(std::string_view id);
+
+// Which SHIM FAMILY a recipe id belongs to. There is ONE recipe map
+// (`CstToHirResult::synthRecipeBySymbol`) but more than one synthesis pass, and each pass
+// FAIL-LOUDS on a recipe it has no arm for — deliberately, as its anti-vocab-drift
+// backstop. So the driver seam partitions the map by family and hands each pass only its
+// own entries; without that, adding <stdio.h> recipes would make the <threads.h> pass
+// reject them and break the build before the stdio pass ever ran.
+//
+// The primary anti-drift guard is UPSTREAM of this: the descriptor loader already rejects
+// an unknown `synthesize` value at READ time (a typo never reaches a pass at all). This
+// split is what keeps each pass's own "no arm for MY family's id" check meaningful.
+// (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
+enum class ShimFamily : std::uint8_t {
+    Threads,   // <threads.h> over kernel32 (win32) / libSystem (pthread)
+    Stdio,     // <stdio.h> printf family over the UCRT __stdio_common_v* cores
+};
+
+// nullopt ⇔ !isKnownSynthesizeRecipe(id) — the two are kept in lockstep by construction
+// (both read the same table), so a new recipe cannot be admitted by the loader while
+// being invisible to the family split.
+[[nodiscard]] DSS_EXPORT std::optional<ShimFamily> shimFamilyOf(std::string_view id);
 
 // One decoded named CONSTANT — the neutral form of a header's object-like
 // `#define CHAR_BIT 8` surface (a macro that IS a compile-time constant). A C

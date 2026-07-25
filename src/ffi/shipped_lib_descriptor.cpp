@@ -800,31 +800,72 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
 
 } // namespace
 
-// FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER + Cycle-2 D-CSUBSET-C11-THREADS-TRAMPOLINES):
-// the CLOSED pe64 <threads.h> synth-recipe vocabulary — 21 recipes, each named for the
-// C11 function it implements (the `synthesize` value MUST equal the symbol name). Grouped
-// by family for auditability. Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2
-// adds thrd_create (a branchless SINGLE block — DIRECT-PASS to CreateThread, no closure:
-// the C11 int(*)(void*) start routine has the SAME x64 ABI as the Win32 DWORD(*)(void*)),
+namespace {
+
+// FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER + Cycle-2 D-CSUBSET-C11-THREADS-TRAMPOLINES) +
+// D-FFI-PE-CRT-UCRT-MIGRATION Phase 3: the CLOSED pe64 synth-recipe vocabulary — 22
+// recipes across TWO families: 21 <threads.h> + 1 <stdio.h>. Each is named for the C
+// function it implements (the `synthesize` value MUST equal the symbol name); rows are
+// grouped by family for auditability.
+//
+// <threads.h> (21): Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2 adds
+// thrd_create (a branchless SINGLE block — DIRECT-PASS to CreateThread, no closure: the
+// C11 int(*)(void*) start routine has the SAME x64 ABI as the Win32 DWORD(*)(void*)),
 // call_once (SINGLE block over InitOnceExecuteOnce, via the module-scoped __dss_once_tramp
 // adapter the synth pass emits once + address-takes), and thrd_join (the first MULTI-block
 // recipe — `WaitForSingleObject; if(res) GetExitCodeThread; CloseHandle`, its canonical
 // StructCfMarkers rederived module-wide after finish()). STILL deferred: thrd_equal · the
 // timed-waits AND thrd_sleep (a pe timespec read has an unverified time_t/long-width
 // layout — a wrong offset is a silent miscompile → elf-FFI-only, D-CSUBSET-C11-THREADS-
-// TIMED). A closed `contains`-check — never an `if (id == ...)` chain that could silently
-// drift; MUST stay in lock-step with the synth pass switch (a vocab id with no arm fails
-// loud).
+// TIMED).
+//
+// <stdio.h> (1): `sprintf` alone — the printf-family increment's deliberate first and only
+// step. This table is the loader's ADVERTISED vocabulary, so it lists what actually ships:
+// a row here with no descriptor row and no synth arm would advertise a recipe that cannot
+// be used. Each further printf-family recipe lands together with its stdio.json row, its
+// `__stdio_common_v*` core's symbol row, and a runtime witness.
+//
+// A closed `contains`-check — never an `if (id == ...)` chain that could silently drift;
+// MUST stay in lock-step with each family's synth-pass switch (a vocab id with no arm
+// fails loud there).
+//
+// The ONE recipe table, tagged by family. Both `isKnownSynthesizeRecipe` (the loader's
+// read-time guard) and `shimFamilyOf` (the seam's pass partition) read it, so a recipe
+// can never be admitted by one and invisible to the other.
+struct RecipeRow {
+    std::string_view id;
+    ShimFamily       family;
+};
+constexpr RecipeRow kRecipes[] = {
+    // <threads.h> — synthesized over kernel32 (pe) / libSystem pthread (macho).
+    {"mtx_init", ShimFamily::Threads},      {"mtx_lock", ShimFamily::Threads},
+    {"mtx_unlock", ShimFamily::Threads},    {"mtx_trylock", ShimFamily::Threads},
+    {"mtx_destroy", ShimFamily::Threads},   {"cnd_init", ShimFamily::Threads},
+    {"cnd_signal", ShimFamily::Threads},    {"cnd_broadcast", ShimFamily::Threads},
+    {"cnd_wait", ShimFamily::Threads},      {"cnd_destroy", ShimFamily::Threads},
+    {"tss_create", ShimFamily::Threads},    {"tss_get", ShimFamily::Threads},
+    {"tss_set", ShimFamily::Threads},       {"tss_delete", ShimFamily::Threads},
+    {"thrd_current", ShimFamily::Threads},  {"thrd_yield", ShimFamily::Threads},
+    {"thrd_exit", ShimFamily::Threads},     {"thrd_detach", ShimFamily::Threads},
+    // Cycle 2 (direct-pass / trampoline / multi-block)
+    {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
+    {"call_once", ShimFamily::Threads},
+    // <stdio.h> printf family — synthesized over the UCRT __stdio_common_v* cores, which
+    // ucrtbase exports in place of any concrete printf/sprintf/… (D-FFI-PE-CRT-UCRT-
+    // MIGRATION Phase 3). `sprintf` is the ONLY shipped stdio recipe; see the note above.
+    {"sprintf", ShimFamily::Stdio},
+};
+
+} // namespace
+
 bool isKnownSynthesizeRecipe(std::string_view id) {
-    static constexpr std::string_view kRecipes[] = {
-        "mtx_init", "mtx_lock", "mtx_unlock", "mtx_trylock", "mtx_destroy",
-        "cnd_init", "cnd_signal", "cnd_broadcast", "cnd_wait", "cnd_destroy",
-        "tss_create", "tss_get", "tss_set", "tss_delete",
-        "thrd_current", "thrd_yield", "thrd_exit", "thrd_detach",
-        "thrd_create", "thrd_join", "call_once",   // Cycle 2 (direct-pass / trampoline / multi-block)
-    };
-    for (auto r : kRecipes) if (r == id) return true;
+    for (auto const& r : kRecipes) if (r.id == id) return true;
     return false;
+}
+
+std::optional<ShimFamily> shimFamilyOf(std::string_view id) {
+    for (auto const& r : kRecipes) if (r.id == id) return r.family;
+    return std::nullopt;
 }
 
 std::optional<ShippedLibDescriptor>

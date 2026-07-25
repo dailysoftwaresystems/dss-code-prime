@@ -1099,6 +1099,29 @@ enum class DiagnosticCode : std::uint16_t {
     //   filename). The CLI `--compile` path never trips it — there the name is
     //   the source STEM (always a bare filename), always a direct child.
     D_ArtifactNameEscapesOutputDir = 0xD015,
+    // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
+    //   D-FFI-PE-CRT-UCRT-MIGRATION): the driver's shim-synthesis seam
+    //   partitions the one `synthesize` recipe map by `ffi::shimFamilyOf`
+    //   before handing each family's entries to its own synth pass — and a
+    //   recipe id came back with NO family. That is an INTERNAL INVARIANT
+    //   BREACH, never a user error: `readShippedLibDescriptor` already
+    //   rejects an unknown `synthesize` id at READ time
+    //   (F_ShippedLibDescriptorMalformed) from the SAME closed `kRecipes`
+    //   table `shimFamilyOf` reads, so an unfamilied id here means the
+    //   loader's guard and the family split have drifted out of lockstep —
+    //   a code defect, remediated in `shipped_lib_descriptor.cpp`, not in
+    //   any user file. Same class as `D_CompileUnitNullNoDiagnostic` /
+    //   `X_OptReturnFalseWithoutDiagnostic`: a substrate-contract guard
+    //   that should be unreachable and must be deafening if reached.
+    //   Remediation-distinct from `K_NoMatchingObjectFormat` (0x8xxx),
+    //   which BOTH seams previously borrowed: that is the LINKER's
+    //   format-walker dispatch invariant and points an operator at the
+    //   object-format config — the wrong end of the pipeline for a recipe
+    //   table drift. Both seams (compile_pipeline.cpp single-CU +
+    //   program.cpp merged) emit THIS code. Unsuppressable (see
+    //   `unsuppressable_codes.cpp`): a suppressed table drift would let the
+    //   recipe fall out of both passes and ship a silently-undefined shim.
+    D_SynthRecipeFamilyUnknown = 0xD016,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

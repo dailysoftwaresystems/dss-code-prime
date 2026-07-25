@@ -316,6 +316,24 @@ struct DSS_EXPORT CuMirModule {
     // LOWER half's `synthesizeThreadsShim` can C-mangle its native helper-import names for
     // the format (macho prepends `_`) — the SAME applyCMangling the FFI ingest uses.
     ObjectFormatKind objectFormat = ObjectFormatKind::Unknown;
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's va_list
+    // lowering strategy, captured here for the SAME reason as `librarySynthesis`/
+    // `objectFormat` — the LOWER half sees only this struct, and `synthesizeStdioShim`'s
+    // variadic-forwarding arm (a printf-family shim forwards its caller's va_list into the
+    // UCRT `__stdio_common_v*` core) needs the target's va_list model to pick the right MIR
+    // leaf (VaHomeArgAreaAddr on HomogeneousPointer/Win64) or fail loud (SysVRegisterSave —
+    // no stdio-synthesize descriptor exists on that model yet).
+    //
+    // ★ OPTIONAL, DEFAULTED EMPTY — deliberately, and for the same reason its two siblings
+    // above keep "absent" representable (`librarySynthesis` is an optional; `objectFormat`
+    // defaults to an `Unknown` SENTINEL, not to a real format). A default of any REAL
+    // strategy would make "the resolved CC declares no `vaListLayout`" indistinguishable
+    // downstream from "the resolved CC declares SysVRegisterSave": a config gap would then
+    // arrive at the synth pass wearing a legitimate strategy's face and be refused (or, one
+    // day, ACCEPTED) for the wrong reason, with a diagnostic pointing at the wrong end of
+    // the pipeline. `synthesizeStdioShim` fails loud on nullopt. Consulted only when a
+    // stdio recipe actually appears — an empty recipe map is a clean no-op either way.
+    std::optional<VaListStrategy> vaListStrategy;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the

@@ -3801,6 +3801,213 @@ TEST(ShippedLibDescriptor, SynthesizeNameMismatchFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ── D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `shimFamilyOf`, the recipe→pass split ──
+//
+// There is ONE recipe map but MORE THAN ONE synthesis pass, and each pass fails loud on
+// a recipe it has no arm for — deliberately, as its own anti-vocab-drift backstop. So
+// both driver seams (compile_pipeline.cpp single-CU, program.cpp multi-CU) PARTITION the
+// map by `shimFamilyOf` before calling either pass. That makes the partition load-bearing
+// in a way the loader's own vocabulary check is not: a recipe the split sends to the
+// WRONG pass turns a build that should succeed into a hard failure, and a recipe the
+// split cannot classify at all is treated by both seams as an internal invariant breach.
+//
+// The documented contract is a BICONDITIONAL — `shimFamilyOf(id) == nullopt` ⇔
+// `!isKnownSynthesizeRecipe(id)` — held "by construction" because both functions scan the
+// same `kRecipes` table. "By construction" is exactly the kind of claim that stops being
+// true the day someone gives one of them a fast path, an early-out or a second table, so
+// it is asserted here over EVERY id rather than sampled.
+
+namespace {
+
+// THE PINNED RECIPE VOCABULARY, id → family. This is the test's independent model of
+// `kRecipes` (which is file-local to shipped_lib_descriptor.cpp and cannot be enumerated
+// from outside), and it is cross-checked in BOTH directions below:
+//   * forwards — every id here must be known AND map to this family;
+//   * backwards — `EveryShippedSynthesizeTagIsPinnedToItsFamily` walks the REAL shipped
+//     descriptors and requires the set of `synthesize` tags they declare to be EXACTLY
+//     this set, so adding a recipe to `kRecipes` + a descriptor without updating this
+//     table reds, and so does deleting one.
+// The residual blind spot is honest and inert: a row added to `kRecipes` that NO shipped
+// descriptor declares is invisible here — but it is also unreachable, since the only way
+// a recipe id reaches a synthesis pass is a descriptor's `synthesize` tag.
+struct RecipeExpectation {
+    char const* id;
+    ShimFamily  family;
+};
+constexpr RecipeExpectation kPinnedRecipes[] = {
+    // <threads.h> over kernel32 (win32) / libSystem (pthread) — 18 non-trampoline …
+    {"mtx_init", ShimFamily::Threads},      {"mtx_lock", ShimFamily::Threads},
+    {"mtx_unlock", ShimFamily::Threads},    {"mtx_trylock", ShimFamily::Threads},
+    {"mtx_destroy", ShimFamily::Threads},   {"cnd_init", ShimFamily::Threads},
+    {"cnd_signal", ShimFamily::Threads},    {"cnd_broadcast", ShimFamily::Threads},
+    {"cnd_wait", ShimFamily::Threads},      {"cnd_destroy", ShimFamily::Threads},
+    {"tss_create", ShimFamily::Threads},    {"tss_get", ShimFamily::Threads},
+    {"tss_set", ShimFamily::Threads},       {"tss_delete", ShimFamily::Threads},
+    {"thrd_current", ShimFamily::Threads},  {"thrd_yield", ShimFamily::Threads},
+    {"thrd_exit", ShimFamily::Threads},     {"thrd_detach", ShimFamily::Threads},
+    // … + the 3 trampolines.
+    {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
+    {"call_once", ShimFamily::Threads},
+    // <stdio.h> printf family over the UCRT __stdio_common_v* cores. `sprintf` is the
+    // ONLY one: the increment deliberately ships one recipe with a runtime witness rather
+    // than four speculative bodies. snprintf/fprintf/vfprintf appear in the NEGATIVE list
+    // below precisely so re-adding a body without re-pinning it here reds.
+    {"sprintf", ShimFamily::Stdio},
+};
+
+// Ids that must NOT be recipes. Three groups, each catching a different regression:
+//   * the RETIRED stdio ids — a speculative body sneaking back into `kRecipes` reds here;
+//   * DEFERRED threads ids (thrd_sleep + the timed waits stay elf-FFI-only) — promoting
+//     one to a synth recipe without a body reds here;
+//   * ordinary near-misses: plain libc names, a typo, case variants, the empty string.
+constexpr char const* kNonRecipes[] = {
+    "snprintf", "fprintf", "vfprintf",                       // retired stdio arms
+    "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
+    "printf", "sscanf", "puts", "fputs", "__stdio_common_vsprintf",
+    "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
+};
+
+} // namespace
+
+// EXHAUSTIVE forward pin: every id in the vocabulary is known, maps to its declared
+// family, and the two predicates AGREE. Sampling two ids (as the pre-existing
+// `SynthesizeTagDecodesForKnownRecipe` does for `isKnownSynthesizeRecipe`) cannot catch a
+// family typo on the 19th row; walking the whole table costs nothing and does.
+//
+// RED-ON-DISABLE: flip any one `kRecipes` row's family tag (e.g. make `sprintf` Threads)
+// and this reds on that id alone — and the corresponding real build breaks, because the
+// threads pass would then be handed a recipe it has no arm for.
+TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
+    std::size_t threads = 0, stdio = 0;
+    for (auto const& r : kPinnedRecipes) {
+        EXPECT_TRUE(isKnownSynthesizeRecipe(r.id))
+            << "pinned recipe '" << r.id << "' vanished from the closed vocabulary";
+        auto const fam = shimFamilyOf(r.id);
+        ASSERT_TRUE(fam.has_value())
+            << "pinned recipe '" << r.id << "' belongs to NO family — the driver seams "
+               "treat that as an internal invariant breach and abort the build";
+        EXPECT_EQ(*fam, r.family)
+            << "recipe '" << r.id << "' is routed to the WRONG synthesis pass";
+        (r.family == ShimFamily::Threads ? threads : stdio) += 1;
+    }
+    // The shape of the vocabulary itself, so a silent addition/removal is visible.
+    EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
+    EXPECT_EQ(stdio, 1u)
+        << "the <stdio.h> family ships EXACTLY `sprintf` — one recipe with a runtime "
+           "witness, not four speculative bodies";
+}
+
+// THE LOCKSTEP INVARIANT, asserted as the biconditional the header documents rather than
+// as two independent spot-checks: over every pinned id, every deliberate non-recipe, AND a
+// systematically generated mutation neighbourhood (each id truncated by one character and
+// each id with a character appended), `shimFamilyOf(id).has_value()` must EQUAL
+// `isKnownSynthesizeRecipe(id)`.
+//
+// RED-ON-DISABLE: give either function an early-out the other lacks — e.g. make
+// `shimFamilyOf` return `ShimFamily::Stdio` for anything starting with "s", or have
+// `isKnownSynthesizeRecipe` short-circuit true on a prefix — and the mutation sweep reds
+// even though every hand-written sample would still pass.
+TEST(ShippedLibDescriptor, ShimFamilyOfAndIsKnownRecipeStayInLockstep) {
+    std::unordered_set<std::string> const known = [] {
+        std::unordered_set<std::string> s;
+        for (auto const& r : kPinnedRecipes) s.insert(r.id);
+        return s;
+    }();
+
+    auto biconditional = [](std::string_view id) {
+        EXPECT_EQ(shimFamilyOf(id).has_value(), isKnownSynthesizeRecipe(id))
+            << "lockstep broken for '" << id
+            << "': shimFamilyOf and isKnownSynthesizeRecipe disagree";
+    };
+
+    for (auto const& r : kPinnedRecipes) biconditional(r.id);
+
+    for (auto const* n : kNonRecipes) {
+        biconditional(n);
+        EXPECT_FALSE(isKnownSynthesizeRecipe(n))
+            << "'" << n << "' must NOT be a synth recipe";
+        EXPECT_FALSE(shimFamilyOf(n).has_value())
+            << "'" << n << "' must belong to NO shim family";
+    }
+
+    // The generated neighbourhood: one character off in each direction. Skip a mutation
+    // that happens to collide with a real recipe (none do today; the guard keeps the
+    // sweep correct if the vocabulary later grows a pair like `tss_get`/`tss_gets`).
+    for (auto const& r : kPinnedRecipes) {
+        std::string const id{r.id};
+        std::string const shorter = id.substr(0, id.size() - 1);
+        std::string const longer  = id + "x";
+        for (auto const& m : {shorter, longer}) {
+            biconditional(m);
+            if (known.find(m) == known.end()) {
+                EXPECT_FALSE(isKnownSynthesizeRecipe(m))
+                    << "a one-character mutation of '" << id << "' ('" << m
+                    << "') must not be admitted by the CLOSED vocabulary";
+            }
+        }
+    }
+}
+
+// BACKWARD pin, against the REAL shipped descriptors: the set of `synthesize` tags any
+// descriptor under src/dss-config/shippedLibs declares must be EXACTLY `kPinnedRecipes`,
+// and each must resolve to the family pinned there. This is what makes the forward table
+// self-maintaining — ship a new recipe and this reds until it is pinned; retire one and
+// this reds until the pin is removed.
+//
+// Reads through the REAL `readShippedLibDescriptor` (never a text scrape), mirroring
+// `AllShippedDescriptorsDecode`'s sweep + va_list binding.
+TEST(ShippedLibDescriptor, EveryShippedSynthesizeTagIsPinnedToItsFamily) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+
+    std::unordered_set<std::string> declared;
+    for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const namedTypes = sysvVaListBinding(interner);
+        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                             DataModel::Lp64, std::nullopt,
+                                             std::nullopt, namedTypes);
+        ASSERT_TRUE(desc.has_value())
+            << "shipped descriptor failed to load: " << entry.path().generic_string();
+        for (auto const& s : desc->symbols) {
+            if (s.synthesize.empty()) continue;
+            declared.insert(s.synthesize);
+            // The loader already rejects an unknown id at READ time; this asserts the
+            // SECOND half — that the id is also CLASSIFIABLE, which is what the driver
+            // seams need and what the loader does not check.
+            auto const fam = shimFamilyOf(s.synthesize);
+            ASSERT_TRUE(fam.has_value())
+                << "shipped recipe '" << s.synthesize << "' in "
+                << entry.path().generic_string() << " belongs to no shim family";
+            bool pinned = false;
+            for (auto const& r : kPinnedRecipes) {
+                if (s.synthesize == r.id) {
+                    pinned = true;
+                    EXPECT_EQ(*fam, r.family)
+                        << "shipped recipe '" << s.synthesize << "' changed family";
+                }
+            }
+            EXPECT_TRUE(pinned)
+                << "shipped recipe '" << s.synthesize
+                << "' is not pinned in kPinnedRecipes — add it (with its family) so the "
+                   "vocabulary stays covered";
+        }
+    }
+
+    EXPECT_EQ(declared.size(), std::size(kPinnedRecipes))
+        << "the shipped descriptors and kPinnedRecipes must declare the SAME recipe set";
+    for (auto const& r : kPinnedRecipes) {
+        EXPECT_TRUE(declared.find(r.id) != declared.end())
+            << "pinned recipe '" << r.id
+            << "' is declared by NO shipped descriptor — it is unreachable, so either "
+               "ship it or retire it from the vocabulary";
+    }
+}
+
 // ── FC17.9(c) (D-CSUBSET-SETJMP): setjmp.json descriptor decode ───────────────
 
 // The `returnsTwice` symbol bit decodes (default false) exactly like `noreturn`, and

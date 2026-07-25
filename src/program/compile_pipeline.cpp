@@ -31,6 +31,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
 #include "opt/passes/prune_unreachable.hpp"
@@ -685,6 +686,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
     cuMir.librarySynthesis = format.librarySynthesis();
     cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's va_list strategy so
+    // the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding model.
+    // Reuses `analyzeVaStrategy` (computed above from the SAME resolved CC for the semantic
+    // `va_list`-type injection) rather than re-resolving the CC a second time. The optional
+    // is assigned THROUGH — its EMPTINESS is part of the signal, not noise to be defaulted
+    // away: a CC that declares no `vaListLayout` must reach the synth pass as "nothing
+    // declared", which that pass refuses loudly, rather than as a real strategy it could
+    // not tell from a genuine declaration. Consulted only if a stdio recipe appears.
+    cuMir.vaListStrategy = analyzeVaStrategy;
     return cuMir;
 }
 
@@ -1312,6 +1322,43 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         }
     }
 
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.threadsRecipes` (the single
+    // combined synthesize-recipe map CST→HIR seeded — its name predates the <stdio.h>
+    // family and is now a misnomer) by `dss::ffi::shimFamilyOf` BEFORE calling EITHER synth
+    // pass. Each pass fails loud on a recipe id it has no switch arm for (its own anti-
+    // vocab-drift backstop), so handing the WHOLE map to one pass would make it reject the
+    // other family's ids and abort a build that never should have failed. A `nullopt`
+    // family here is an INTERNAL INVARIANT BREACH, not a user error: the descriptor loader
+    // (`readShippedLibDescriptor`) already rejects an unknown `synthesize` id at READ time
+    // via the same closed-vocab table `shimFamilyOf` reads, so a recipe reaching this point
+    // with no family means the loader and this switch have drifted out of lockstep. It is
+    // reported with the DRIVER-band internal-invariant code `D_SynthRecipeFamilyUnknown`
+    // (the `D_CompileUnitNullNoDiagnostic` class) — never the linker's
+    // `K_NoMatchingObjectFormat`, which would point an operator at the object-format config
+    // for what is a recipe-table defect. The merged-module seam (program.cpp) emits the
+    // SAME code for the SAME breach.
+    std::unordered_map<std::uint32_t, std::string> threadsRecipes, stdioRecipes;
+    for (auto const& [symV, recipe] : cuMir.threadsRecipes) {
+        auto const family = dss::ffi::shimFamilyOf(recipe);
+        if (!family.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::D_SynthRecipeFamilyUnknown;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "synthesize recipe '{}' (symbol {{ {} }}) belongs to no known shim "
+                "family (D-FFI-PE-CRT-UCRT-MIGRATION) — internal invariant breach: the "
+                "descriptor loader should have rejected an unknown recipe id at read "
+                "time (isKnownSynthesizeRecipe)",
+                recipe, symV);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        switch (*family) {
+        case dss::ffi::ShimFamily::Threads: threadsRecipes.emplace(symV, recipe); break;
+        case dss::ffi::ShimFamily::Stdio:   stdioRecipes.emplace(symV, recipe);   break;
+        }
+    }
+
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): single-CU
     // counterpart of the merge-path shim synth (program.cpp). Supply a definition for every
     // <threads.h> shim symbol the descriptor tagged (mtx_lock etc.) over the format's synth
@@ -1320,9 +1367,22 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // optimized; the appended shims are lowered like any other function). The interner is
     // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
     if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
-                               cuMir.threadsRecipes, cuMir.librarySynthesis,
+                               threadsRecipes, cuMir.librarySynthesis,
                                cuMir.objectFormat, cuMir.externImports, reporter)) {
         return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
+    }
+
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling — see
+    // `synth_stdio_shim.hpp` for the full contract. A clean no-op when `stdioRecipes` is
+    // empty (every elf/macho build and every pe TU that includes no <stdio.h> printf
+    // family). `cuMir.vaListStrategy` is the RESOLVED CC's va_list model (captured at BUILD
+    // time in `buildCuMirImpl`, above) — the shim's variadic-forwarding arm reads it to pick
+    // the HomogeneousPointer MIR leaf or fail loud on a strategy this pass has no arm for
+    // (SysVRegisterSave, until a consumer exists).
+    if (!synthesizeStdioShim(cuMir.mir, model.lattice().interner(),
+                             stdioRecipes, cuMir.vaListStrategy,
+                             cuMir.externImports, reporter)) {
+        return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
 
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
