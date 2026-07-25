@@ -43,19 +43,14 @@
 # line) + the emitted binary, never $LASTEXITCODE.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# ★★ KNOWN pe64-testfixture BLOCKERS (the UNPROVEN half — as of 2026-07-24) ★★
+# ★★ pe64-testfixture — front-end + FFI closure RESOLVED (2026-07-25) ★★
 #
-# The pe64 full-source testfixture is NOT yet green. What is ALREADY PROVEN
-# (validated in a scratchpad de-risk this cycle): the pe64 target, DSS parsing
-# the REAL tcl8.6 headers agnostically, the pe64 `--resolve-library` path
-# reading tcl86.dll's EXPORT table (a one-file Tcl smoke builds a real
-# testfixture-shaped .exe + resolves Tcl_CreateInterp/Tcl_Eval today), the
-# `--project` manifest path, and 183/185 TUs compiling clean. What remains are
-# THREE front-end gaps, each hit ONLY on the Windows leg (the code they sit in
-# is `_WIN32`/`SQLITE_OS_WIN`-gated, so the Linux/macOS arc never compiled it).
-# None is a linker / pe64-codegen / resolve-library-mechanism gap. Do NOT paper
-# over them — each is a follow-up compiler cycle (the pe64 analogue of the Linux
-# testfixture TF-C arc):
+# The pe64 full-source testfixture BUILDS + LINKS + RUNS the veryquick unit corpus
+# via the pe64 target, DSS parsing the REAL tcl8.6 headers agnostically, the pe64
+# `--resolve-library` path (tcl86.dll/zlib1.dll export tables), and the `--project`
+# manifest. THREE Windows-only front-end gaps (each `_WIN32`/`SQLITE_OS_WIN`-gated,
+# so the Linux/macOS arc never compiled them) were closed as real compiler cycles —
+# documented below for the record:
 #
 #   B1  [config, trivial]  tcl.h / tclDecls.h — the legacy single-underscore
 #       MSVC alias `_declspec` is not neutralized. Under DSS's pe profile
@@ -97,15 +92,15 @@
 #       testfixture recipe would compile a somewhat different TU set. The core
 #       Win32 (events/locking) + msvcrt surface is genuinely needed either way.
 #
-# Until B1–B3 land, step 7 FAILS LOUD on the first `error[` and the harness exits
-# non-zero at the build — the honest state of the unproven half.
+# ★ B3 was closed by an AGNOSTIC recipe auto-config (gen-pe64-manifest.py drops the
+# Linux host-feature probes `HAVE_*`/`config.h` + adds `SQLITE_OS_WIN`, so SQLite
+# self-configures its Windows build → the Unix symbols evaporate), the C99 math +
+# `strftime` sourced from ucrtbase.dll (legacy msvcrt is C89), and the genuinely-
+# Windows kernel32/msvcrt symbols added to the pe shipped-lib descriptors.
 #
-#   $env:DSS_PE64_PENDING_FIXES_SHIM = "1"   — OPT-IN, OFF by default. Simulates
-#       ONLY B1+B2 (injects the `_declspec(x)=` define + rewrites the one test1.c
-#       line in the STAGED copy) to ADVANCE the build past the parser to the B3
-#       FFI wall — where it then fails loud with the unresolved-symbol list (the
-#       B3 worklist above). It does NOT green the build (B3 remains); its value is
-#       diagnostic. Prints a loud warning; the summary marks the run SHIMMED.
+# ★ KNOWN remaining pe64 issue (anchored, NOT masked): `fpconv1-2.0` — the ms_x64
+#   sibling of the SysV variadic-FP release miscompile
+#   (D-OPT-SQLITE-FPCONV1-MSX64-VARIADIC-FP); a genuine compiler bug, fixed separately.
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
@@ -149,7 +144,6 @@ $TclDll       = if ($env:TCL_DLL)  { $env:TCL_DLL }  else { Join-Path $GitMingwB
 $ZlibDll      = if ($env:ZLIB_DLL) { $env:ZLIB_DLL } else { Join-Path $GitMingwBin 'zlib1.dll' }
 # Tcl runtime script library (init.tcl …) — testfixture needs it at RUN time.
 $TclLibrary   = if ($env:TCL_LIBRARY) { $env:TCL_LIBRARY } else { 'C:\Program Files\Git\mingw64\lib\tcl8.6' }
-$Shim         = ($env:DSS_PE64_PENDING_FIXES_SHIM -eq '1')
 
 $Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + headers
 $OutDir       = Join-Path $Work 'out'
@@ -179,7 +173,6 @@ try {
   $null = Invoke-WebRequest -Uri 'https://github.com' -Method Head -TimeoutSec 20 -UseBasicParsing
 } catch { Die "offline — cannot reach https://github.com ($($_.Exception.Message))." }
 Info "host: Windows ($([Environment]::OSVersion.Version))   leg: $Spec   tier: $Tier   config: $Config"
-if ($Shim) { Warn "DSS_PE64_PENDING_FIXES_SHIM=1 — the two pending compiler fixes will be SIMULATED (see the header). This is NOT a clean build." }
 Pass "Windows host + WSL online"
 
 # ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
@@ -278,6 +271,13 @@ cp "$TCLH"/*.h "$STAGE/tclinc/"
 ZH="$(find /usr/include -maxdepth 3 -name zlib.h 2>/dev/null | head -1)"
 [ -f "$ZH" ] || { echo "zlib.h not found in WSL — apt-get install zlib1g-dev" >&2; exit 1; }
 cp "$ZH" "$STAGE/zinc/"; cp "$(dirname "$ZH")/zconf.h" "$STAGE/zinc/" 2>/dev/null || true
+# un-configure the Linux ./configure edit for the pe TARGET: the staged zconf.h has
+# `#if 1 → #define Z_HAVE_UNISTD_H` (a ./configure host-probe result ~line 444) which
+# forces `#include <unistd.h>` — absent on windows (F001D). Flip ONLY that guard to
+# `#if 0` in the STAGED copy (target-appropriate header staging — the zconf.h analog of
+# gen-pe64-manifest.py's HAVE_/Z_HAVE_ host-probe drop). The sibling Z_HAVE_STDARG_H
+# `#if 1` block is deliberately left intact (<stdarg.h> exists on pe).
+perl -0777 -pi -e 's{#if 1(\s*/\* was set to #if 1 by \./configure \*/\s*\n#  define Z_HAVE_UNISTD_H)}{#if 0$1}' "$STAGE/zinc/zconf.h"
 
 # remap a WSL path under $DIR or the header dirs → its STAGED location, then → a
 # forward-slash Windows path (wslpath -m).
@@ -343,7 +343,7 @@ function Find-Dss {
 }
 if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
   $DssBin = (Resolve-Path $env:DSS_BIN).Path
-  Info "using \$env:DSS_BIN — $DssBin"
+  Info "using `$env:DSS_BIN — $DssBin"
 } elseif ($env:SKIP_DSS_BUILD -eq '1') {
   $DssBin = Find-Dss
   if (-not $DssBin) { Die "SKIP_DSS_BUILD=1 but no dss-code-prime.exe found under build-rel/build/build-dbg." }
@@ -377,20 +377,6 @@ Pass "pe64 resolve-library DLLs ready"
 # ── Step 7 — generate the manifest + build the testfixture (dss --project) ───
 Step "7/9  Build the full-source testfixture (dss-code-prime --project, $Config)"
 $extraDefineArgs = @()
-if ($Shim) {
-  # B1 shim: neutralize the legacy `_declspec` MSVC alias (stands in for the
-  # pending c-subset.lang.json pe predefine). Loud, opt-in, NOT a clean build.
-  Warn "SHIM: injecting define `_declspec(x)=` (simulates the pending B1 config fix)"
-  $extraDefineArgs = @('--extra-define', '_declspec(x)=')
-  # B2 shim: rewrite the one Windows-only trailing-qualifier line in the STAGED
-  # test1.c (never the WSL/upstream source) to the parse-equivalent form.
-  $t1 = Join-Path $Stage 'sqlite\src\test1.c'
-  if (Test-Path $t1) {
-    $c = Get-Content -Raw -LiteralPath $t1
-    $c2 = $c -replace 'extern\s+LONG\s+volatile\s+sqlite3_os_type;', 'extern volatile LONG sqlite3_os_type;'
-    if ($c2 -ne $c) { Set-Content -LiteralPath $t1 -Value $c2 -NoNewline; Warn "SHIM: rewrote test1.c `LONG volatile` -> `volatile LONG` (simulates the pending B2 parser fix)" }
-  }
-}
 $genArgs = @(
   $GenPy,
   '--tus',      (Join-Path $Stage 'tus.txt'),
@@ -417,13 +403,9 @@ $ctime = (Get-Content $log | Select-String -Pattern 'compile time (\S+)' | Selec
 $ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
 if ($errCount -gt 0 -or -not (Test-Path $fixture)) {
   Get-Content $log | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-  if (-not $Shim) {
-    Warn "the pe64 testfixture is the UNPROVEN half — see the KNOWN BLOCKERS header (B1 `_declspec`, B2 `LONG volatile`)."
-    Warn "to exercise the rest of the pipeline while the two compiler fixes are pending: re-run with \$env:DSS_PE64_PENDING_FIXES_SHIM='1'."
-  }
   Die "pe64 build FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture.exe. See $log"
 }
-Pass "testfixture -> $fixture$ctimeSuffix$(if ($Shim) { '  [SHIMMED build]' })"
+Pass "testfixture -> $fixture$ctimeSuffix"
 
 # ── Step 8 — run the .test UNIT CORPUS through the fixture ────────────────────
 Step "8/9  Run SQLite unit corpus ($Tier.test) + classify failures"
@@ -445,7 +427,17 @@ try {
 } finally { $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib; Pop-Location }
 
 $summary  = (Get-Content $runlog | Select-String -Pattern '(\d+) errors? out of (\d+) tests' | Select-Object -Last 1)
+# The testfixture reports failures two ways: the canonical "Failures on these
+# tests: …" summary AND inline per-failure markers (`! <name> expected:` /
+# `! <name> got:`) — many .test files emit ONLY the latter (mirrors the .sh).
+# Union both sources + dedup so a run that prints only the markers still classifies.
 $faillist = (Get-Content $runlog | Select-String -Pattern '^Failures on these tests:\s*(.+)$' | Select-Object -Last 1)
+$failNames = @()
+if ($faillist) { $failNames += ($faillist.Matches[0].Groups[1].Value -split '\s+' | Where-Object { $_ }) }
+$failNames += (Get-Content $runlog |
+  Select-String -Pattern '^! ([A-Za-z0-9_.:-]+) (expected|got):' |
+  ForEach-Object { $_.Matches[0].Groups[1].Value })
+$failNames = @($failNames | Select-Object -Unique)
 $unitVerdict = ''; $unitFail = $false
 if (-not $summary) {
   $unitVerdict = "FAIL: fixture did not complete the suite (crash?) — see $runlog"; $unitFail = $true
@@ -453,7 +445,7 @@ if (-not $summary) {
   Get-Content $runlog -Tail 6 | ForEach-Object { Info "      $_" }
 } else {
   $nerr = [int]$summary.Matches[0].Groups[1].Value
-  $fails = if ($faillist) { ($faillist.Matches[0].Groups[1].Value -split '\s+' | Where-Object { $_ }) } else { @() }
+  $fails = $failNames
   $real = @(); $confound = @()
   foreach ($t in $fails) {
     $isc = $false
@@ -461,8 +453,8 @@ if (-not $summary) {
     if ($isc) { $confound += $t } else { $real += $t }
   }
   if ($nerr -gt 0 -and $fails.Count -eq 0) {
-    $unitVerdict = "FAIL: $nerr error(s) but no classifiable 'Failures on these tests:' list — see $runlog"; $unitFail = $true
-    Warn "[pe64] corpus FAIL — $($summary.Matches[0].Value) (unclassifiable)"
+    $unitVerdict = "FAIL: $nerr error(s) but no failure markers ('Failures on these tests:' / '! <name>') to classify — see $runlog"; $unitFail = $true
+    Warn "[pe64] corpus FAIL — $($summary.Matches[0].Value) (unclassifiable — no failure markers)"
   } elseif ($real.Count -eq 0) {
     $unitVerdict = "PASS ($($summary.Matches[0].Value)$(if ($confound.Count) { "; $($confound.Count) known confound(s): $($confound -join ' ')" }))"
     Pass "[pe64] corpus GREEN — $($summary.Matches[0].Value)$(if ($confound.Count) { "; all $($confound.Count) failure(s) are known non-DSS confounds: $($confound -join ' ')" })"
@@ -479,10 +471,7 @@ Info "compiler : $DssBin @ $dssHead"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
 Info "tier     : $Tier.test   outputs: $Work"
-Info "pe64 ($Spec): compiled$(if ($Shim) { ' [SHIMMED]' })   units: $unitVerdict"
-if ($Shim) {
-  Warn "This run used DSS_PE64_PENDING_FIXES_SHIM — the two pending compiler fixes (B1 `_declspec`, B2 `LONG volatile`) were SIMULATED. It is NOT a clean pass; land the compiler fixes and re-run without the shim."
-}
+Info "pe64 ($Spec): compiled   units: $unitVerdict"
 if ($unitFail) { Write-Host "`n [X] pe64 leg had genuine unit failures (non-confound) — the corpus is not green." -ForegroundColor Red; exit 1 }
-Pass "pe64 leg compiled the full-source testfixture + ran the $Tier unit corpus GREEN$(if ($Shim) { ' (SHIMMED — not a clean pass)' })"
+Pass "pe64 leg compiled the full-source testfixture + ran the $Tier unit corpus GREEN"
 exit 0

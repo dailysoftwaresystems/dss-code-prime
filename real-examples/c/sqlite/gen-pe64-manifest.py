@@ -47,6 +47,41 @@ def main(argv=None):
     includes = read_lines(args.includes)
     defines = [strip_d(d) for d in args.extra_define] + [strip_d(d) for d in read_lines(args.defines)]
 
+    # pe cross-compile auto-config. The recipe defines are captured from a LINUX
+    # `make -n`, so they carry that host's `configure`/zlib feature-probe results
+    # (HAVE_*/Z_HAVE_*) — facts about the build HOST, not the Windows TARGET.
+    # Feeding a foreign host's probe results to a `_WIN32` build is a cross-compile
+    # category error: SQLite/zlib must self-configure from the target's own
+    # predefined macros. So drop the host-probe defines (match ONLY a leading
+    # HAVE_/Z_HAVE_, never a substring — project feature flags like SQLITE_HAVE_ZLIB
+    # must survive) and let the target configure itself; then add SQLITE_OS_WIN=1
+    # as an explicit bridge for test helpers that probe it before sqliteInt.h. This
+    # generator is pe-only, so keying the rule on the pe target is inherent here.
+    #   _HAVE_SQLITE_CONFIG_H is dropped for the same reason: it makes sqliteInt.h
+    # `#include "config.h"` — the LINUX `configure`-generated header carrying the
+    # build host's HAVE_LOCALTIME_R etc. Inheriting it on a Windows TARGET is the
+    # same cross-compile category error (date.c then picks localtime_r over plain
+    # localtime). Dropping it makes sqlite self-configure its Windows build from
+    # _WIN32/SQLITE_OS_WIN (date.c falls to plain localtime → resolves via msvcrt).
+    import re
+    _host_probe = re.compile(r"^(HAVE_|Z_HAVE_)")
+    _config_h = "_HAVE_SQLITE_CONFIG_H"
+    _kept, _dropped = [], []
+    for _d in defines:
+        _name = _d.split("=", 1)[0]
+        (_dropped if (_host_probe.match(_name) or _name == _config_h) else _kept).append(_d)
+    defines = _kept
+    _added = []
+    if not any(_d.split("=", 1)[0] == "SQLITE_OS_WIN" for _d in defines):
+        defines.append("SQLITE_OS_WIN=1")
+        _added.append("SQLITE_OS_WIN")
+    _summary = "pe-config: dropped %d host-probe defines" % len(_dropped)
+    if _added:
+        _summary += ", added " + ", ".join(_added)
+    if _dropped:
+        _summary += "  [dropped: " + ", ".join(_d.split("=", 1)[0] for _d in _dropped) + "]"
+    print(_summary)
+
     if not sources:
         sys.stderr.write("gen-pe64-manifest.py: error: no TUs (empty %s)\n" % args.tus)
         return 1
