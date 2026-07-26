@@ -19,6 +19,12 @@ $BLOCK
   printf 'REAL=[%s] CONFOUND=[%s] SCOPED=[%s]\n' \"\${real[*]:-}\" \"\${confound[*]:-}\" \"\${scoped_excused[*]:-}\"
 }"
 
+# The `all` tier qualifies names with each suite's DECLARED -prefix; veryquick/quick/
+# full declare "" and are unqualified. These are real values from permutations.test:
+# the dotted default AND the `mmap` override "mm-", which is why the classifier reads
+# them as data instead of guessing `^<ident>\.`.
+declare -a TIER_PREFIXES=(no_mutex_try. memsubsys1. memsubsys2. mm-)
+
 CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$' '^recoverfault' 'emulated:^writecrash-')
 fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 
@@ -48,6 +54,42 @@ if [[ "$C" == *"CONFOUND=[writecrash-1.1.1"* ]]; then
 else
   echo "  FAIL the guard proves nothing — unscoped behaves the same as scoped"; fail=$((fail+1))
 fi
+
+echo "--- PERMUTATION-QUALIFIED names (the \`all\` tier) ---"
+# Real names taken verbatim from the first Linux `all` run's corpus.log.
+CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
+qual='memsubsys1.walsetlk-2.2.6 no_mutex_try.busy2-2.2.3 memsubsys2.recoverfault-1-oom-persistent.515 memsubsys1.zipfile-25.0 no_mutex_try.walsetlk_recover-1.2 memsubsys2.realbug-1.1'
+D=$(classify host "$qual"); echo "$D" | sed 's/^/      /'
+check "qualified walsetlk excused"    "memsubsys1.walsetlk-2.2.6"                 "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "qualified busy2 excused"       "no_mutex_try.busy2-2.2.3"                  "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "qualified recoverfault excused" "memsubsys2.recoverfault-1-oom-persistent.515" "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "qualified zipfile (anchored \$) excused" "memsubsys1.zipfile-25.0"          "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+# walsetlk_recover must NOT be swept in by ^walsetlk- : it is a DIFFERENT test with
+# no control yet, and silently excusing it would be the fault this all guards against.
+check "walsetlk_recover NOT excused"  "no_mutex_try.walsetlk_recover-1.2"         "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+check "a genuine failure stays REAL"  "memsubsys2.realbug-1.1"                    "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+
+# The `mmap` suite declares -prefix "mm-", NOT "mmap." — a dash, and not derivable
+# from the suite name. This is the shape the pe64 `all` run actually emits.
+G=$(classify host 'mm-zipfile-25.0 mm-walsetlk-2.1.3 mm-backup4-3.3')
+echo "$G" | sed 's/^/      /'
+check "mm- prefixed zipfile excused"  "mm-zipfile-25.0"  "$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "mm- prefixed walsetlk excused" "mm-walsetlk-2.1.3" "$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "mm- backup4 (no pattern) REAL" "mm-backup4-3.3"   "$(echo "$G" | sed 's/.*REAL=\[//;s/\].*//')"
+
+echo "--- RED-ON-DISABLE: with NO permutations known, qualified names must go unmatched ---"
+# This is the pre-fix behaviour: ^-anchored patterns cannot match a qualified name.
+TIER_PREFIXES=()
+E=$(classify host "$qual")
+if [[ "$E" == *"REAL=[memsubsys1.walsetlk-2.2.6"* ]]; then
+  echo "  ok   without TIER_PREFIXES the qualified confounds ARE misreported as genuine"
+  echo "       (so the strip is what fixes it, not something else)"
+  pass=$((pass+1))
+else
+  echo "  FAIL the guard proves nothing — qualified names classify the same either way"
+  echo "       got: $E"; fail=$((fail+1))
+fi
+TIER_PREFIXES=(no_mutex_try. memsubsys1. memsubsys2. mm-)
 
 echo
 echo "passed=$pass failed=$fail"

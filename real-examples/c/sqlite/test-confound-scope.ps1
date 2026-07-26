@@ -20,6 +20,10 @@ function Check($label, $cond) {
 }
 
 $failNames = @('writecrash-1.1.1','walsetlk-2.1.3','zipfile-25.0','sometest-9.9')
+# Real declared prefixes from permutations.test: the dotted default AND the `mmap`
+# override "mm-" (a DASH, not derivable from the suite name). pe64's `all` run emits
+# the mm- shape, which is why this driver needs the strip too.
+$TierPrefixes = @('no_mutex_try.','memsubsys1.','memsubsys2.','mm-')
 
 "--- native pe64 leg, scoped emulated pattern present ---"
 $Confounds = @('^walsetlk-','^zipfile-25\.0$','emulated:^writecrash-')
@@ -41,6 +45,21 @@ Check "and is NAMED as scope-excused"            ($scopedExcused -contains 'writ
 $Confounds = @('^writecrash-')
 Invoke-Expression $block
 Check "unscoped leaks in (prefix is what gated it)" ($confound -contains 'writecrash-1.1.1')
+
+'--- prefix-qualified names (pe64 all-tier emits the mm- shape) ---'
+$Confounds = @('^walsetlk-','^zipfile-25\.0$')
+$failNames = @('mm-zipfile-25.0','mm-walsetlk-2.1.3','mm-backup4-3.3')
+Invoke-Expression $block
+"      REAL=[$($real -join ' ')] CONFOUND=[$($confound -join ' ')]"
+Check "mm- zipfile excused"            ($confound -contains 'mm-zipfile-25.0')
+Check "mm- walsetlk excused"           ($confound -contains 'mm-walsetlk-2.1.3')
+Check "mm- backup4 (no pattern) REAL"  ($real -contains 'mm-backup4-3.3')
+
+"--- RED-ON-DISABLE: with no prefixes known, qualified names must go unmatched ---"
+$TierPrefixes = @()
+Invoke-Expression $block
+Check "without TierPrefixes they ARE misreported as genuine" ($real -contains 'mm-zipfile-25.0')
+$TierPrefixes = @('no_mutex_try.','memsubsys1.','memsubsys2.','mm-')
 
 ""
 "passed=$pass failed=$fail"

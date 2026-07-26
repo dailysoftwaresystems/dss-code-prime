@@ -649,6 +649,28 @@ function Get-TierPermutations($tierFile) {
   return $names
 }
 
+# The TEST-NAME PREFIX each suite stamps onto its test names, read as DATA out of
+# permutations.test — mirroring tier_prefixes() in build-and-test.sh. Necessary
+# because the prefix is NOT derivable from the suite name: permutations.test:39
+# defaults it to "<name>." but :220 declares `mmap -prefix "mm-"`, and
+# quick/full/threads declare "" (none). The pe64 `all` run emits exactly the
+# "mm-…" shape, so without this every ^-anchored confound pattern misses those
+# names and a documented confound is reported as a GENUINE failure
+# (D-SQLITE-CONFOUND-PERMUTATION-PREFIX). Longest-first so a longer prefix wins
+# over one that is merely its head.
+function Get-TierPrefixes($permutationsFile) {
+  $out = New-Object 'System.Collections.Generic.List[string]'
+  if (-not (Test-Path $permutationsFile)) { return $out }
+  foreach ($line in [System.IO.File]::ReadLines($permutationsFile)) {
+    $mn = [regex]::Match($line, 'test_suite\s+"([^"]*)"')
+    if (-not $mn.Success) { continue }
+    $mp = [regex]::Match($line, '-prefix\s+"([^"]*)"')
+    $p  = if ($mp.Success) { $mp.Groups[1].Value } else { $mn.Groups[1].Value + '.' }
+    if ($p -ne '' -and -not $out.Contains($p)) { $out.Add($p) }
+  }
+  return ($out | Sort-Object -Property Length -Descending)
+}
+
 # Single streaming pass over one segment log. (These logs reach 150 MB / 3.6M
 # lines — a per-pattern Get-Content sweep would cost minutes per pattern.)
 function Read-CorpusSegment($logPath) {
@@ -887,6 +909,7 @@ if ($TierExcludes.Count) {
 }
 $CorpusFiles = Get-CorpusFiles $StagedTestDir
 $TierPerms   = Get-TierPermutations $TestFile
+$TierPrefixes = Get-TierPrefixes (Join-Path $StagedTestDir 'permutations.test')
 $Ledger      = Join-Path $Work 'corpus-units.txt'
 
 # >>> dss:corpus-loop >>>
@@ -1100,12 +1123,19 @@ foreach ($t in $failNames) {
   # and SILENTLY excuse nothing while appearing configured
   # (D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY).
   $legMode = 'native'
+  # Strip the suite's declared test-name prefix before matching, so an ^-anchored
+  # pattern still recognises `mm-zipfile-25.0` in the `all` tier as the same
+  # confound it recognises as `zipfile-25.0` in `full`.
+  $tBare = $t
+  foreach ($pfx in $TierPrefixes) {
+    if ($t.StartsWith($pfx, [System.StringComparison]::Ordinal)) { $tBare = $t.Substring($pfx.Length); break }
+  }
   foreach ($p in $Confounds) {
     $pScope = ''; $pRx = $p
     if ($p -like 'native:*')        { $pScope = 'native';   $pRx = $p.Substring(7) }
     elseif ($p -like 'emulated:*')  { $pScope = 'emulated'; $pRx = $p.Substring(9) }
     if ($pScope -and $pScope -ne $legMode) { continue }
-    if ($t -match $pRx) { $isc = $true; if ($pScope) { $scopedExcused += $t }; break }
+    if ($t -match $pRx -or $tBare -match $pRx) { $isc = $true; if ($pScope) { $scopedExcused += $t }; break }
   }
   if ($isc) { $confound += $t } else { $real += $t }
 }

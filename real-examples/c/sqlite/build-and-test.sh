@@ -795,6 +795,32 @@ corpus_files() {               # corpus_files <testdir>
 }
 # The tier script's permutation sequence, in order, read as DATA from sqlite's own
 # `run_test_suite <name>` lines (all.test names 27; veryquick/quick/full name one).
+# The TEST-NAME PREFIX each permutation stamps onto its test names, read as DATA
+# out of sqlite's own permutations.test — the same discipline as the file/permutation
+# readers above, and necessary because the prefix is NOT derivable from the name:
+# permutations.test:39 defaults it to "<name>." but :220 declares `mmap -prefix "mm-"`,
+# and veryquick/quick/full/threads/valgrind declare `-prefix ""` (no prefix at all).
+# So `memsubsys1.walsetlk-2.2.6` and `mm-backup4-3.3` are BOTH qualified names, with
+# different separators, and neither can be recovered by guessing from the suite name.
+# Emits one non-empty prefix per line, longest first so that a longer prefix wins over
+# a shorter one that happens to be its head.
+tier_prefixes() {              # tier_prefixes <permutations.test>
+  LC_ALL=C awk '
+    /^[ \t]*test_suite[ \t]+"/ {
+      # name = the first quoted field after test_suite
+      line = $0
+      if (match(line, /test_suite[ \t]+"[^"]*"/)) {
+        nm = substr(line, RSTART, RLENGTH); sub(/^test_suite[ \t]+"/, "", nm); sub(/"$/, "", nm)
+        if (match(line, /-prefix[ \t]+"[^"]*"/)) {
+          p = substr(line, RSTART, RLENGTH); sub(/^-prefix[ \t]+"/, "", p); sub(/"$/, "", p)
+        } else {
+          p = nm "."          # permutations.test:39 — the documented default
+        }
+        if (p != "") print length(p) "\t" p
+      }
+    }' "$1" | LC_ALL=C sort -rn -k1,1 | cut -f2- | LC_ALL=C awk '!seen[$0]++'
+}
+
 tier_permutations() {          # tier_permutations <tierfile>
   LC_ALL=C awk 'match($0, /run_test_suite[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
       s = substr($0, RSTART, RLENGTH); sub(/^run_test_suite[ \t]+/, "", s); print s }' "$1"
@@ -1209,6 +1235,8 @@ for leg in "${LEG_ORDER[@]}"; do
   corpus_files "$TESTDIR_SRC" > "$scratch/files.txt"
   tier_permutations "$TEST_FILE" > "$scratch/perms.txt"
   declare -a TIER_PERMS=(); mapfile -t TIER_PERMS < "$scratch/perms.txt"
+  tier_prefixes "$TESTDIR_SRC/permutations.test" > "$scratch/prefixes.txt"
+  declare -a TIER_PREFIXES=(); mapfile -t TIER_PREFIXES < "$scratch/prefixes.txt"
 
   # >>> dss:corpus-loop >>>
   # Segment queue, one record per fixture invocation, fields separated by US
@@ -1442,6 +1470,25 @@ for leg in "${LEG_ORDER[@]}"; do
   declare -a real=() confound=() scoped_excused=()
   for t in $faillist; do
     is_c=0; by_scope=0
+    # In the `all` tier sqlite QUALIFIES every test name with its permutation
+    # (`memsubsys1.walsetlk-2.2.6`), while veryquick/quick/full report the bare name
+    # (`walsetlk-2.2.6`). Every confound pattern is ^-anchored, so against a
+    # qualified name it matches NOTHING and a long-documented confound is reported
+    # as a GENUINE failure. That is the mirror of a silent excusal — it indicts a
+    # benign test loudly instead of excusing a real one quietly — and it is just as
+    # wrong about where the compiler stands. Measured on the first Linux `all` run:
+    # 30 of 37 distinct failures were prefixed (D-SQLITE-CONFOUND-PERMUTATION-PREFIX).
+    # The prefix is stripped ONLY when it is a prefix sqlite ITSELF DECLARES, read by
+    # tier_prefixes() from permutations.test's own `-prefix` values — never guessed
+    # from the suite name, because it is NOT derivable from it: the default is
+    # "<name>." (:39) but `mmap` declares "mm-" (:220) and quick/full/threads declare
+    # "" (none at all). Guessing `^<ident>\.` would have silently missed every
+    # `mm-…` name — the very ones the pe64 `all` run produces. TIER_PREFIXES is sorted
+    # longest-first so a longer prefix wins over one that is its head.
+    t_bare="$t"
+    for _pfx in ${TIER_PREFIXES[@]+"${TIER_PREFIXES[@]}"}; do
+      [[ "$t" == "$_pfx"* ]] && { t_bare="${t#"$_pfx"}"; break; }
+    done
     for p in "${CONFOUND_PATTERNS[@]}"; do
       p_scope=''; p_rx="$p"
       case "$p" in
@@ -1450,7 +1497,10 @@ for leg in "${LEG_ORDER[@]}"; do
       esac
       # A scoped pattern is INERT on any other mode — it must not excuse there.
       [[ -n "$p_scope" && "$p_scope" != "$leg_mode" ]] && continue
-      [[ "$t" =~ $p_rx ]] && { is_c=1; [[ -n "$p_scope" ]] && by_scope=1; break; }
+      # Match the name as reported AND with its permutation qualifier removed: the
+      # confound is a property of the TEST, and running it under a permutation does
+      # not change which upstream behaviour it is sensitive to.
+      [[ "$t" =~ $p_rx || "$t_bare" =~ $p_rx ]] && { is_c=1; [[ -n "$p_scope" ]] && by_scope=1; break; }
     done
     if [[ "$is_c" == 1 ]]; then
       confound+=("$t")
@@ -1540,7 +1590,7 @@ for leg in "${LEG_ORDER[@]}"; do
   LEG_ABORTS["$leg"]="${ABORTS[*]-}"; LEG_NOTREACHED["$leg"]="$(printf '%s\n' ${NOT_REACHED[@]+"${NOT_REACHED[@]}"})"
   LEG_HYGIENE["$leg"]="$(printf '%s\n' ${HYGIENE[@]+"${HYGIENE[@]}"})"
   # <<< dss:corpus-loop <<<
-  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
