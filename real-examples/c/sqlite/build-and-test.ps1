@@ -148,8 +148,19 @@ $Tier         = if ($env:DSS_TIER) { $env:DSS_TIER } else { 'veryquick' }
 $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # DSS_CONFOUNDS: space-separated .NET-regex patterns for KNOWN non-DSS unit
 # failures (a failing test matching any is not counted against green). Same set
-# as the .sh: WAL set-lock wall-clock timing, a zipfile error-text env diff,
-# the recover-fault OOM-oracle class.
+# as the .sh: WAL set-lock wall-clock timing, an UPSTREAM zipfile test-isolation
+# leak, the recover-fault OOM-oracle class.
+# zipfile-25.0 — MECHANISM PROVEN 2026-07-26 (the old "error-text env diff" note
+# was WRONG): symlink.test:163 `file mkdir x` is never cleaned up and symlink
+# sorts before zipfile, so a DIRECTORY named `x` is present in the shared testdir
+# when zipfile-25.0 asserts that `zipfile('x')` fails with "cannot open file: x".
+# fopen() on a directory SUCCEEDS, so it fails in fread() instead. Proven by a
+# 4-case probe in ONE process varying only the filesystem. Compiler-independent.
+# See D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK.
+# ★ ASYMMETRY, DELIBERATELY NOT "FIXED": the .sh also carries `^date-2\.4c$` and
+# this list does not. Adding it here would suppress a failure that has never been
+# observed on pe64 — a confound must be EARNED per platform, not copied across.
+# Tracked by D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
 $Confounds    = if ($env:DSS_CONFOUNDS) { $env:DSS_CONFOUNDS -split '\s+' } `
                 else { @('^walsetlk-', '^walsetlk\.', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the

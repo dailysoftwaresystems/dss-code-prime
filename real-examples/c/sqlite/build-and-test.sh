@@ -99,7 +99,17 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # DSS_CONFOUNDS: ERE patterns (space/newline-separated) for KNOWN non-DSS unit
 # failures — a failing test matching any is not counted against green. Defaults
 # to the documented set (WAL set-lock wall-clock timing on a fast/uncontended box;
-# a zipfile error-message-text env diff; the recover-fault OOM-oracle class).
+# a zipfile UPSTREAM TEST-ISOLATION LEAK; the recover-fault OOM-oracle class).
+# (zipfile-25.0 — MECHANISM PROVEN 2026-07-26, superseding the earlier and WRONG
+# "error-message-text env diff" description. symlink.test:163 does `file mkdir x`
+# and never removes it; symlink sorts BEFORE zipfile, so by the time zipfile.test
+# runs in the SHARED testdir a DIRECTORY named `x` exists. zipfile-25.0 asserts
+# `zipfile('x')` fails with "cannot open file: x" — but on Linux fopen() on a
+# directory SUCCEEDS, so it fails later in fread() instead. A 4-case probe in ONE
+# process, varying only the filesystem, gives: x absent -> "cannot open file: x"
+# (expected); x = empty file -> success; x = DIRECTORY -> "error in fread()", the
+# corpus string byte-for-byte. One binary, three outcomes => cannot be codegen.
+# See D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK.)
 # (date-2.4c is gcc-EXONERATED — a GCC-built testfixture fails it identically
 # [expected NULL, got a date], so it is a sqlite date-format/version/env diff, not
 # a DSS miscompile. NOTE: fpconv1-2.0 is DELIBERATELY NOT a confound — a debug DSS
