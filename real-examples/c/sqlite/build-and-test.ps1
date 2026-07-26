@@ -643,7 +643,7 @@ function Get-TierPermutations($tierFile) {
 function Read-CorpusSegment($logPath) {
   $r = @{
     Summary = ''; Tests = 0; Errors = 0; FailNames = @{}; Completed = New-Object 'System.Collections.Generic.List[string]'
-    LastTest = ''; Permutation = ''; GaveUp = $false
+    LastTest = ''; Permutation = ''; GaveUp = $false; OkLines = 0; FailMarkers = 0
   }
   $reSummary = [regex]'(\d+) errors? out of (\d+) tests'
   $reTime    = [regex]'^Time: (\S+) \d+ ms$'
@@ -655,12 +655,22 @@ function Read-CorpusSegment($logPath) {
   $rePerm    = [regex]'^"?(?:run_test_suite|run_tests)\s+([A-Za-z_][A-Za-z0-9_]*)'
   foreach ($line in [System.IO.File]::ReadLines($logPath)) {
     if ($line.Length -eq 0) { continue }
+    # Per-test tally. An ABORTED segment never prints a summary, so these counts are
+    # the ONLY record of the work it did — see the derivation note at the union.
+    if ($line.EndsWith(' Ok', [System.StringComparison]::Ordinal)) { $r.OkLines++ }
     $c = $line[0]
     if ($c -eq 'T') { $m = $reTime.Match($line);  if ($m.Success) { $r.Completed.Add($m.Groups[1].Value); continue } }
     if ($c -eq '!') {
       $m = $reFails.Match($line)
       if ($m.Success) { foreach ($n in ($m.Groups[1].Value -split '\s+')) { if ($n) { $r.FailNames[$n] = $true } }; continue }
-      $m = $reBang.Match($line); if ($m.Success) { $r.FailNames[$m.Groups[1].Value] = $true; continue }
+      $m = $reBang.Match($line)
+      if ($m.Success) {
+        $r.FailNames[$m.Groups[1].Value] = $true
+        # one `expected:` per FAILED test (`got:` is its partner line) — the failure
+        # tally that pairs with OkLines to reconstitute sqlite's own count.
+        if ($m.Groups[2].Value -eq 'expected') { $r.FailMarkers++ }
+        continue
+      }
     }
     if ($c -eq '*' -and $line.StartsWith('*** Giving up')) { $r.GaveUp = $true; continue }
     $m = $reSummary.Match($line)
@@ -1018,13 +1028,56 @@ while ($si -lt $segments.Count) {
 }
 
 # ── union the segments + classify ────────────────────────────────────────────
-$totalTests = 0; $totalErrors = 0; $filesDone = 0
-$failNames = @()
-foreach ($r in $results) { $totalTests += $r.Tests; $totalErrors += $r.Errors; $filesDone += $r.Completed.Count; $failNames += $r.FailNames.Keys }
+# TWO SOURCES, COUNTED SEPARATELY AND NAMED. A segment that ABORTED prints no
+# summary line — but it is not an empty segment: the real `all` run's two aborted
+# segments between them executed 4.1M passing tests and one genuine failure
+# (mm-backup4-3.3). Summing only the summary lines under-reported that run by ~98%
+# and would have hidden any regression inside those segments from the totals.
+#
+# DERIVATION for an aborted segment, from its per-test lines:
+#     tests  = (lines ending " Ok") + (`! <name> expected:` lines) + 1
+#     errors = (`! <name> expected:` lines)
+# The +1 is STRUCTURAL, not a fudge: finalize_testing reports `[incr_ntest]`
+# (tester.tcl ~1273), and incr_ntest INCREMENTS THEN RETURNS, so sqlite's own figure
+# is always one more than the tests actually run. Every do_test increments that
+# counter and prints exactly one of the two line kinds above.
+# CALIBRATED: exact (delta 0) against all four real logs that DO carry a summary —
+# 46860, 25452, 1 from the `all` run's resumed segments, and 59055 from an unrelated
+# 1000-failure run that also hit `*** Giving up`. It is re-checked EVERY run below,
+# so it can never quietly drift out of agreement with sqlite's arithmetic.
+$sumTests = 0; $sumErrors = 0; $nSummarised = 0
+$derTests = 0; $derErrors = 0; $nDerived = 0
+$filesDone = 0; $failNames = @(); $calibration = @()
+foreach ($r in $results) {
+  $filesDone += $r.Completed.Count
+  $failNames += $r.FailNames.Keys        # names ALWAYS flow, summary or not
+  $r.DerivedTests  = $r.OkLines + $r.FailMarkers + 1
+  $r.DerivedErrors = $r.FailMarkers
+  if ($r.Summary) {
+    $sumTests += $r.Tests; $sumErrors += $r.Errors; $nSummarised++
+    # self-calibration: on a segment where sqlite DID report, the derivation must
+    # agree. A mismatch means the derived figures for aborted segments are off by a
+    # comparable margin, and that gets said out loud rather than assumed away.
+    if ($r.DerivedTests -ne $r.Tests) { $calibration += "$($r.Label): sqlite says $($r.Tests) tests, the per-test derivation says $($r.DerivedTests) (delta $($r.DerivedTests - $r.Tests))" }
+  } else {
+    $derTests += $r.DerivedTests; $derErrors += $r.DerivedErrors; $nDerived++
+  }
+}
 $failNames = @($failNames | Select-Object -Unique)
+$totalTests = $sumTests + $derTests
+$totalErrors = $sumErrors + $derErrors
+function Format-Count($n) { return ([long]$n).ToString('#,##0', [System.Globalization.CultureInfo]::InvariantCulture) }
 # For a single clean segment the summary text is the fixture's own, byte for byte.
 $summaryText = if ($results.Count -eq 1 -and $results[0].Summary) { $results[0].Summary }
-               else { "$totalErrors errors out of $totalTests tests (union of $($results.Count) segment(s))" }
+               else { "$totalErrors errors out of $(Format-Count $totalTests) tests (union of $($results.Count) segment(s))" }
+# Where the union came from — stated so nobody has to reverse-engineer it.
+$derivationText = ''
+if ($nDerived -gt 0) {
+  $derivationText = "$nSummarised segment summary/summaries: $(Format-Count $sumTests) test(s), $sumErrors error(s) · $nDerived ABORTED segment(s): $(Format-Count $derTests) test(s), $derErrors error(s) counted from per-test lines (' Ok' + '! <name> expected:' + 1 — an aborted segment prints no summary)"
+  if ($calibration.Count) {
+    $derivationText += "  [!! the derivation DISAGREES with sqlite on $($calibration.Count) segment(s) that did report — treat the aborted-segment figures as APPROXIMATE: $($calibration -join '; ')]"
+  }
+}
 $real = @(); $confound = @()
 foreach ($t in $failNames) {
   $isc = $false
@@ -1034,12 +1087,22 @@ foreach ($t in $failNames) {
 # Per-unit ledger — every file that reached a verdict, every abort, every gap.
 $led = New-Object 'System.Collections.Generic.List[string]'
 $led.Add("sqlite unit ledger — tier '$Tier', $($results.Count) segment(s), $resumes resume(s)")
+$led.Add("union: $summaryText")
+if ($derivationText) { $led.Add("   derived from: $derivationText") }
 foreach ($r in $results) {
   $led.Add("")
   $led.Add("== segment: $($r.Label)   rc=$($r.Rc)   $(if ($r.Summary) { $r.Summary } else { 'ABORTED (no summary line)' })")
   $led.Add("   log: $($r.Log)")
+  # counts + WHERE THEY CAME FROM, per segment
+  if ($r.Summary) {
+    $led.Add("   tests: $(Format-Count $r.Tests) / errors: $($r.Errors)   [source: sqlite's own summary line; per-test derivation independently gives $(Format-Count $r.DerivedTests)]")
+  } else {
+    $led.Add("   tests: $(Format-Count $r.DerivedTests) / errors: $($r.DerivedErrors)   [source: DERIVED from per-test lines — $(Format-Count $r.OkLines) ' Ok' + $($r.FailMarkers) '! expected:' + 1; this segment aborted and printed no summary]")
+  }
   $led.Add("   files completed ($($r.Completed.Count)): $($r.Completed -join ' ')")
+  if ($r.FailNames.Count) { $led.Add("   failing test(s) seen here ($($r.FailNames.Count)): $(($r.FailNames.Keys | Sort-Object) -join ' ')") }
 }
+if ($calibration.Count) { $led.Add(""); $led.Add("== derivation calibration MISMATCH =="); foreach ($c in $calibration) { $led.Add("   $c") } }
 if ($aborts.Count)     { $led.Add(""); $led.Add("== aborts =="); foreach ($a in $aborts) { $led.Add("   segment $($a.Segment): permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })' after test '$($a.LastTest)' ($(if ($a.KillReason) { "KILLED: $($a.KillReason)" } else { "rc=$($a.Rc)" })) -> $($a.Log)") } }
 if ($notReached.Count) { $led.Add(""); $led.Add("== NOT REACHED (no verdict) =="); foreach ($n in $notReached) { $led.Add("   $n") } }
 if ($hygiene.Count)    { $led.Add(""); $led.Add("== process hygiene =="); foreach ($h in $hygiene) { $led.Add("   $h") } }
@@ -1052,11 +1115,13 @@ if ($aborts.Count) {
   # makes the abort disappear, and a run with aborts is NEVER green.
   $where = @(); foreach ($a in $aborts) { $where += "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })" }
   $unitVerdict = "FAIL: $($aborts.Count) fixture ABORT(s) [$($where -join ' ')]; recovered by $resumes resume(s); union: $summaryText"
+  if ($derivationText) { $unitVerdict += " [$derivationText]" }
   if ($real.Count)      { $unitVerdict += "; $($real.Count) genuine unit failure(s): $($real -join ' ')" }
   if ($notReached.Count) { $unitVerdict += "; $($notReached.Count) unit group(s) NOT REACHED — see $Ledger" }
   $unitFail = $true
   Warn "[pe64] corpus FAIL — $($aborts.Count) abort(s): $($where -join ' ')"
   Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed"
+  if ($derivationText) { Info "        derived from: $derivationText" }
   if ($real.Count) { Info "      $($real.Count) GENUINE DSS failure(s): $($real -join ' ')" }
   foreach ($n in $notReached) { Warn "      NOT REACHED: $n" }
   Info "      per-unit ledger: $Ledger"
@@ -1106,6 +1171,7 @@ Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (ope
 # this block byte-identical to what it always was.
 if ($results.Count -gt 1 -or $aborts.Count -or $notReached.Count -or $hygiene.Count) {
   Info "segments : $($results.Count) ($resumes resume(s) of max $MaxResumes)   $filesDone test file(s) completed   ledger: $Ledger"
+  if ($derivationText) { Info "counts   : $derivationText" }
   foreach ($a in $aborts) { Info "aborted  : permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })'$(if ($a.KillReason) { " [KILLED: $($a.KillReason)]" }) — its remaining cases did NOT run  ($($a.Log))" }
   foreach ($n in $notReached) { Info "NOT RUN  : $n" }
   foreach ($h in $hygiene)    { Info "hygiene  : $h" }

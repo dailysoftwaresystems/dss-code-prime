@@ -790,6 +790,9 @@ tier_permutations() {          # tier_permutations <tierfile>
 #   T <name>  the last test emitted      G         `*** Giving up` (--maxerror cap)
 #   N <n>     completed file count       D <file>  the LAST completed file
 #   E <n>     errors      C <n>          tests     (parsed out of the summary line)
+#   K <n>     lines ending " Ok"         Q <n>     `! <name> expected:` lines
+# K and Q are the per-test tally: for a segment that ABORTED they are the ONLY
+# record of the work it did (no summary line exists) — see the union's derivation.
 # S is the WHOLE line ("0 errors out of 9 tests on <host> …"), which is what this
 # harness has always printed — E/C carry the numbers so nothing has to re-parse it.
 # NOTE the leading '!' on the canonical failure list: finalize_testing emits
@@ -797,11 +800,22 @@ tier_permutations() {          # tier_permutations <tierfile>
 # silently never matches.
 parse_segment() {              # parse_segment <log> <out-facts>
   LC_ALL=C awk '
+    # Strip a trailing CR first. A segment log can be CRLF (a fixture running on
+    # Windows), and a POSIX awk keeps that CR — so `$4=="ms"` and `/ Ok$/` would
+    # both silently match NOTHING and every count would come back zero. MSYS awk
+    # strips it and hides the problem, which is precisely how this stayed invisible.
+    { sub(/\r$/, "") }
     /^Time: / { if (NF==4 && $4=="ms") { print "F\t" $2; nf++; lastdone=$2; next } }
     /^\*\*\* Giving up/ { gaveup=1; next }
     /^!?Failures on these tests:/ {
       line=$0; sub(/^!?Failures on these tests:[ \t]*/, "", line);
       n=split(line, a, /[ \t]+/); for (i=1;i<=n;i++) if (a[i]!="") print "X\t" a[i]; next }
+    / Ok$/                     { ok++ }
+    # one `expected:` per FAILED test (`got:` is its partner line) — the failure
+    # tally that pairs with `ok` to reconstitute the count sqlite itself reports,
+    # for a segment that aborted before printing a summary.
+    # (NB no apostrophes in this block: it lives inside a single-quoted awk program.)
+    /^! [^ ]+ expected:/       { fx++ }
     /^! [^ ]+ (expected|got):/ { print "X\t" $2; next }
     match($0, /[0-9]+ errors? out of [0-9]+ tests/) {
       summary=$0; split(substr($0, RSTART, RLENGTH), q, / /); nerr=q[1]; ntest=q[5]; next }
@@ -816,7 +830,8 @@ parse_segment() {              # parse_segment <log> <out-facts>
           if (perm!="")    print "P\t" perm
           if (lasttest!="")print "T\t" lasttest
           if (gaveup)      print "G\t1"
-          print "N\t" nf+0; print "D\t" lastdone }
+          print "N\t" nf+0; print "D\t" lastdone
+          print "K\t" ok+0; print "Q\t" fx+0 }
   ' "$1" > "$2"
 }
 fact() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$2"; }
@@ -845,6 +860,12 @@ resolve_abort_file() {         # resolve_abort_file <lasttest> <corpus-list-file
 # Every corpus basename byte-wise AFTER <boundary> — the SQLITE_TEST_PATTERN_LIST
 # superset sqlite intersects with the permutation's own -files.
 files_after() { LC_ALL=C awk -v b="$1" '$0 > b' "$2"; }
+# thousands separators, locale-free (a 4.2M headline is unreadable without them)
+group_digits() {
+  LC_ALL=C awk -v n="$1" 'BEGIN{ s=sprintf("%d", n); out=""
+    while (length(s) > 3) { out = "," substr(s, length(s)-2) out; s = substr(s, 1, length(s)-3) }
+    print s out }'
+}
 str_gt()      { [[ "$(LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{print (a>b) ? 1 : 0}')" == 1 ]]; }
 
 # ── process hygiene ──────────────────────────────────────────────────────────
@@ -1181,7 +1202,8 @@ for leg in "${LEG_ORDER[@]}"; do
   # spliced in by an abort.
   US=$'\x1f'
   SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}$TEST_FILE${US}")
-  declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=()
+  declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() SEG_COUNTS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=() CALIBRATION=()
+  sum_tests=0; sum_errors=0; n_summarised=0; der_tests=0; der_errors=0; n_derived=0
   # Carry Step 7's pre-flight kills into this leg's hygiene record, then sweep again:
   # a leftover fixture holds file handles (the abort class this engine exists for IS
   # a leaked handle) and can make this run fail for a reason it did not cause.
@@ -1230,13 +1252,26 @@ for leg in "${LEG_ORDER[@]}"; do
     s_sum="$(fact S "$facts_f")"; s_perm_log="$(fact P "$facts_f")"
     s_last="$(fact T "$facts_f")"; s_done="$(fact D "$facts_f")"
     s_nf="$(fact N "$facts_f")";   s_gaveup="$(fact G "$facts_f")"
+    s_ok="$(fact K "$facts_f")";   s_fx="$(fact Q "$facts_f")"
     files_done=$((files_done + s_nf))
+    # failing NAMES always flow into the classifier, summary or not (VERIFIED on the
+    # real `all` run: mm-backup4-3.3 came from an ABORTED segment and was still
+    # reported as a genuine failure — it was only the COUNTS that dropped it).
     all_fails="$all_fails $(facts X "$facts_f" | tr '\n' ' ')"
+    seg_derived_tests=$((s_ok + s_fx + 1))
     seg_i=$((seg_i + 1))
     if [[ -n "$s_sum" ]]; then
       seg_summary="$s_sum"
-      total_errors=$((total_errors + $(fact E "$facts_f")))
-      total_tests=$((total_tests + $(fact C "$facts_f")))
+      seg_e="$(fact E "$facts_f")"; seg_c="$(fact C "$facts_f")"
+      sum_errors=$((sum_errors + seg_e)); sum_tests=$((sum_tests + seg_c)); n_summarised=$((n_summarised + 1))
+      SEG_COUNTS+=("tests: $(group_digits "$seg_c") / errors: $seg_e   [source: sqlite's own summary line; per-test derivation independently gives $(group_digits "$seg_derived_tests")]")
+      # self-calibration: where sqlite DID report, the derivation must agree. A
+      # mismatch means the aborted-segment figures are off by a comparable margin,
+      # and that is said out loud rather than assumed away.
+      [[ "$seg_derived_tests" -eq "$seg_c" ]] \
+        || CALIBRATION+=("$s_label: sqlite says $seg_c tests, the per-test derivation says $seg_derived_tests (delta $((seg_derived_tests - seg_c)))")
+      total_errors=$((total_errors + seg_e))
+      total_tests=$((total_tests + seg_c))
       # A completed segment can still have stopped EARLY: `*** Giving up...` is
       # tester.tcl hitting --maxerror (default 1000) and finalising. It DOES print a
       # summary, so it would otherwise read as a full run. Say so instead.
@@ -1248,6 +1283,13 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
 
     # ── ABORT ────────────────────────────────────────────────────────────────
+    # An aborted segment is NOT an empty segment. It printed no summary, so its work
+    # is counted from its per-test lines (see the derivation note at the union) —
+    # otherwise the totals silently omit everything it did, and a regression inside
+    # it never reaches the headline at all.
+    der_tests=$((der_tests + seg_derived_tests)); der_errors=$((der_errors + s_fx)); n_derived=$((n_derived + 1))
+    total_tests=$((total_tests + seg_derived_tests)); total_errors=$((total_errors + s_fx))
+    SEG_COUNTS+=("tests: $(group_digits "$seg_derived_tests") / errors: $s_fx   [source: DERIVED from per-test lines — $(group_digits "$s_ok") ' Ok' + $s_fx '! expected:' + 1; this segment aborted and printed no summary]")
     perm="$s_perm_log"
     [[ -n "$perm" ]] || perm="$s_perm"
     [[ -n "$perm" || ${#TIER_PERMS[@]} -ne 1 ]] || perm="${TIER_PERMS[0]}"
@@ -1343,9 +1385,31 @@ for leg in "${LEG_ORDER[@]}"; do
   # ── union the segments + classify ──────────────────────────────────────────
   nseg="${#SEG_LOGS[@]}"
   faillist="$(printf '%s\n' $all_fails | LC_ALL=C sort -u | tr '\n' ' ')"
+  # TWO SOURCES, COUNTED SEPARATELY AND NAMED. A segment that ABORTED prints no
+  # summary line — but it is not an empty segment: the real `all` run's two aborted
+  # segments between them ran 4.1M passing tests and one genuine failure. Summing
+  # only the summary lines under-reported that run by ~98% and would have hidden a
+  # regression inside those segments from the totals entirely.
+  #
+  # DERIVATION for an aborted segment, from its per-test lines:
+  #     tests  = (lines ending " Ok") + (`! <name> expected:` lines) + 1
+  #     errors = (`! <name> expected:` lines)
+  # The +1 is STRUCTURAL, not a fudge: finalize_testing reports `[incr_ntest]`
+  # (tester.tcl ~1273) and incr_ntest INCREMENTS THEN RETURNS, so sqlite's own figure
+  # is always one more than the tests actually run. Every do_test increments that
+  # counter and prints exactly one of the two line kinds above.
+  # CALIBRATED: exact (delta 0) against all four real logs that DO carry a summary,
+  # and re-checked EVERY run above, so it cannot quietly drift from sqlite's own
+  # arithmetic without saying so.
   # For a single clean segment the summary text is the fixture's own, byte for byte.
-  union_summary="$total_errors errors out of $total_tests tests (union of $nseg segment(s))"
+  union_summary="$total_errors errors out of $(group_digits "$total_tests") tests (union of $nseg segment(s))"
   if [[ $nseg -eq 1 ]]; then summary="$seg_summary"; else summary="$union_summary"; fi
+  derivation=""
+  if [[ "$n_derived" -gt 0 ]]; then
+    derivation="$n_summarised segment summary/summaries: $(group_digits "$sum_tests") test(s), $sum_errors error(s) · $n_derived ABORTED segment(s): $(group_digits "$der_tests") test(s), $der_errors error(s) counted from per-test lines (' Ok' + '! <name> expected:' + 1 — an aborted segment prints no summary)"
+    [[ ${#CALIBRATION[@]} -eq 0 ]] \
+      || derivation="$derivation  [!! the derivation DISAGREES with sqlite on ${#CALIBRATION[@]} segment(s) that did report — treat the aborted-segment figures as APPROXIMATE: ${CALIBRATION[*]}]"
+  fi
   declare -a real=() confound=()
   for t in $faillist; do
     is_c=0
@@ -1354,12 +1418,18 @@ for leg in "${LEG_ORDER[@]}"; do
   done
   # Per-unit ledger — every file that reached a verdict, every abort, every gap.
   { printf "sqlite unit ledger — leg '%s', tier '%s', %s segment(s), %s resume(s)\n" "$leg" "$DSS_TIER" "$nseg" "$resumes"
+    printf 'union: %s\n' "$summary"
+    [[ -z "$derivation" ]] || printf '   derived from: %s\n' "$derivation"
     for ((k = 0; k < nseg; k++)); do
       k_sum="$(fact S "$scratch/facts.$k")"
       printf '\n== segment: %s   rc=%s   %s\n   log: %s\n' \
         "${SEG_LABELS[$k]}" "${SEG_RCS[$k]}" "${k_sum:-ABORTED (no summary line)}" "${SEG_LOGS[$k]}"
+      printf '   %s\n' "${SEG_COUNTS[$k]}"
       printf '   files completed (%s): %s\n' "$(fact N "$scratch/facts.$k")" "$(facts F "$scratch/facts.$k" | tr '\n' ' ')"
+      k_fails="$(facts X "$scratch/facts.$k" | LC_ALL=C sort -u | tr '\n' ' ')"
+      [[ -z "${k_fails// /}" ]] || printf '   failing test(s) seen here: %s\n' "$k_fails"
     done
+    [[ ${#CALIBRATION[@]} -eq 0 ]] || { printf '\n== derivation calibration MISMATCH ==\n'; printf '   %s\n' "${CALIBRATION[@]}"; }
     [[ ${#ABORT_ROWS[@]} -eq 0 ]]  || { printf '\n== aborts ==\n'; printf '   %s\n' "${ABORT_ROWS[@]}"; }
     [[ ${#NOT_REACHED[@]} -eq 0 ]] || { printf '\n== NOT REACHED (no verdict) ==\n'; printf '   %s\n' "${NOT_REACHED[@]}"; }
     [[ ${#HYGIENE[@]} -eq 0 ]]     || { printf '\n== process hygiene ==\n'; printf '   %s\n' "${HYGIENE[@]}"; }
@@ -1370,11 +1440,13 @@ for leg in "${LEG_ORDER[@]}"; do
     # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
     # makes the abort disappear, and a run with aborts is NEVER green.
     v="FAIL:${#ABORTS[@]} fixture ABORT(s) [${ABORTS[*]}]; recovered by $resumes resume(s); union: $union_summary"
+    [[ -z "$derivation" ]] || v="$v [$derivation]"
     [[ ${#real[@]} -eq 0 ]] || v="$v; ${#real[@]} genuine unit failure(s): ${real[*]}"
     [[ ${#NOT_REACHED[@]} -eq 0 ]] || v="$v; ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger"
     UNIT_VERDICT["$leg"]="$v"; UNIT_FAILS=$((UNIT_FAILS + 1))
     warn "[$leg] corpus FAIL — ${#ABORTS[@]} abort(s): ${ABORTS[*]}"
     info "      union across $nseg segment(s): $union_summary; $files_done test file(s) completed"
+    [[ -z "$derivation" ]] || info "        derived from: $derivation"
     [[ ${#real[@]} -eq 0 ]] || info "      ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
     for n in ${NOT_REACHED[@]+"${NOT_REACHED[@]}"}; do warn "      NOT REACHED: $n"; done
     info "      per-unit ledger: $ledger"
@@ -1417,7 +1489,7 @@ for leg in "${LEG_ORDER[@]}"; do
   LEG_ABORTS["$leg"]="${ABORTS[*]-}"; LEG_NOTREACHED["$leg"]="$(printf '%s\n' ${NOT_REACHED[@]+"${NOT_REACHED[@]}"})"
   LEG_HYGIENE["$leg"]="$(printf '%s\n' ${HYGIENE[@]+"${HYGIENE[@]}"})"
   # <<< dss:corpus-loop <<<
-  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE SEG_LOGS SEG_LABELS SEG_RCS TIER_PERMS
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
