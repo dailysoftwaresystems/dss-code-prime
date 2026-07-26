@@ -200,6 +200,42 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 
 ---
 
+## C.-1 THE BAR APPLIES TO THE OPERATOR, NOT ONLY THE CODE
+
+The bar in §A governs what gets committed. This section governs **what gets said** — because
+a confident wrong claim is acted on, and costs more than an admitted unknown. Added
+2026-07-26 after a session where the analysis held and the discipline did not, and where
+**three of the operator's errors were caught by delegated agents rather than by the
+operator**.
+
+1. **Label every factual claim MEASURED / DOCUMENTED / INFERRED.** Never let an inferred
+   claim wear the voice of a measured one. "I verified X" and "X is documented to be true"
+   and "X follows from Y" are three different statements with three different failure modes.
+2. **Never state what a loader/parser/config accepts, rejects, or defaults to without
+   reading it.** "The sibling family does X" is a hypothesis. (Real case: `.format.json`
+   was asserted twice to enforce a closed root-key set. It does not — unknown keys are
+   silently ignored, so a typo'd capability presents as "unsupported".)
+3. **Re-validate after EVERY edit, not once per file.** JSON parse, `bash -n`, parse-check.
+   The *second* edit is the one that breaks it. (Real case: a validated `stdio.json` was
+   edited again and shipped with unescaped quotes, breaking every `#include <stdio.h>`.)
+4. **Never read state a background job is writing.** A racing read is not evidence.
+   Snapshot, or wait for the job.
+5. **Capture exit codes DIRECTLY, never after a pipe.** Use `${PIPESTATUS[0]}` or capture
+   then filter. Use **heredocs** for anything containing quotes — commit messages, JSON,
+   prose — never `-m "…"`.
+6. **Before ANY comparison/experiment: list the variables and state which are controlled.**
+   If a default differs between arms (stack reserve, CRT, optimisation, arch, toolchain),
+   the experiment is VOID until matched. Put this in the delegation brief so the agent can
+   catch the operator. (Real case: a native-vs-DSS control specified as-built would have
+   concluded "DSS frames are the bug" — MinGW reserves 2 MB, DSS 1 MB.)
+7. **A hypothesis written into an anchor is a LABELLED SUSPECT** until a test kills or
+   confirms it — and when it dies, the refutation stays in the row so it cannot be
+   re-proposed.
+8. **When a delegated agent contradicts the operator, that is the system working.** Verify
+   its claim, then update. Never defend the original because the operator wrote it.
+9. **Prefer fixing the CLASS over the instance.** Excluding the failing case or patching
+   around it treats the symptom; the next instance will be a different case.
+
 ## C. The cycle — ten steps (+ design-review gate at 3.5 · self-audit gate at 8.5)
 
 ### Step C.0 — DELEGATION IS THE DEFAULT (read before every step below)
