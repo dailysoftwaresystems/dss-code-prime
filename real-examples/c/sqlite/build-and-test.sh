@@ -122,7 +122,14 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # the output sqlite's crash harness compares — PROVEN by a gcc-built aarch64
 # abort() emitting that exact string, no DSS involved. The native host leg passes
 # all 988 writecrash assertions, so this must NEVER be excused there.
-DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ emulated:^writecrash-}"
+# ^walsetlk_recover- is a SEPARATE pattern on purpose: `^walsetlk-` must NOT sweep
+# it in by family resemblance (different test FILE), so it is excused only by its
+# own row, earned by its own control. EVIDENCE: the GCC-built full-source reference
+# testfixture fails it IDENTICALLY — 6 runs each, same machine, same sqlite tree,
+# both linking the same libtcl8.6.so: gcc 4 pass / 2 fail (tm -35334590, -35331430),
+# dss 3 pass / 3 fail (tm -35335818, +36338628, -35333129). Same intermittency, same
+# ~35.3 s magnitude, both signs. See D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED.
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^walsetlk_recover- ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ emulated:^writecrash-}"
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
@@ -533,13 +540,25 @@ fi
 BLD="$SQLITE_DIR/bld-dss"
 mkdir -p "$BLD"
 ( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null )
-# Build the reference fixture BEST-EFFORT: it generates every derived .c
+# Build the reference fixture. It generates every derived .c
 # (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a, which the DSS
-# TU set needs. A link-stage miss (e.g. a Tcl lib quirk) is tolerated — we only
-# harvest the byproducts + the recipe, not gcc's binary.
+# TU set needs — AND, when it links, it is the ORACLE that decides whether a corpus
+# failure is ours or upstream's. A link miss stays tolerated (the byproducts are
+# still harvested), but the log is KEPT, not sent to /dev/null: it was discarded for
+# a long time, which is why nobody noticed the build had started succeeding — and a
+# missing oracle is what stalled the walsetlk_recover attribution
+# (D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE).
 info "building the reference testfixture (generates derived sources + libsqlite3.a)"
-( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$JOBS" >/dev/null 2>&1 ) || \
+REF_BUILD_LOG="$BLD/reference-build.log"
+if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$JOBS" ) > "$REF_BUILD_LOG" 2>&1; then
+  REF_FIXTURE="$BLD/testfixture"
+  info "reference gcc testfixture built -> $REF_FIXTURE  (usable as an ATTRIBUTION ORACLE)"
+else
+  REF_FIXTURE=""
   warn "reference gcc testfixture did not fully link (tolerated — harvesting generated sources + recipe)"
+  warn "      log kept: $REF_BUILD_LOG — READ IT. A working reference is what lets a corpus"
+  warn "      failure be ATTRIBUTED instead of argued about; its absence stalled walsetlk_recover."
+fi
 # Emit the recipe: with testfixture removed but its prereqs built, `make -n` prints
 # the single testfixture cc/link command (the source of TUs + defines + -I dirs).
 rm -f "$BLD/testfixture"

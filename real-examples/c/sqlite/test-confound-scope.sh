@@ -64,9 +64,19 @@ check "qualified walsetlk excused"    "memsubsys1.walsetlk-2.2.6"               
 check "qualified busy2 excused"       "no_mutex_try.busy2-2.2.3"                  "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
 check "qualified recoverfault excused" "memsubsys2.recoverfault-1-oom-persistent.515" "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
 check "qualified zipfile (anchored \$) excused" "memsubsys1.zipfile-25.0"          "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-# walsetlk_recover must NOT be swept in by ^walsetlk- : it is a DIFFERENT test with
-# no control yet, and silently excusing it would be the fault this all guards against.
-check "walsetlk_recover NOT excused"  "no_mutex_try.walsetlk_recover-1.2"         "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+# walsetlk_recover must NOT be swept in by ^walsetlk- on family resemblance. It is a
+# DIFFERENT test FILE and it earned its own confound row with its own control (a
+# GCC-built reference fails it identically). Keeping this guard means the shipped
+# suppression is the explicit ^walsetlk_recover- row, never an accident of ^walsetlk-.
+check "walsetlk_recover NOT excused by ^walsetlk-" "no_mutex_try.walsetlk_recover-1.2" "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+
+# ...and WITH its own row it IS excused, so the shipped default list classifies it.
+CONFOUND_PATTERNS=('^walsetlk-' '^walsetlk_recover-' '^recoverfault')
+W=$(classify host 'no_mutex_try.walsetlk_recover-1.2 walsetlk_recover-1.3.(36244809) memsubsys2.realbug-1.1')
+check "walsetlk_recover excused by its OWN row" "walsetlk_recover-1.2" "$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "the (n)-suffixed form too"               "walsetlk_recover-1.3" "$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+check "an unrelated failure still REAL"         "memsubsys2.realbug-1.1" "$(echo "$W" | sed 's/.*REAL=\[//;s/\].*//')"
+CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
 check "a genuine failure stays REAL"  "memsubsys2.realbug-1.1"                    "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
 
 # The `mmap` suite declares -prefix "mm-", NOT "mmap." — a dash, and not derivable

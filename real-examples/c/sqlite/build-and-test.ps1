@@ -162,7 +162,7 @@ $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # observed on pe64 — a confound must be EARNED per platform, not copied across.
 # Tracked by D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
 $Confounds    = if ($env:DSS_CONFOUNDS) { $env:DSS_CONFOUNDS -split '\s+' } `
-                else { @('^walsetlk-', '^walsetlk\.', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
+                else { @('^walsetlk-', '^walsetlk\.', '^walsetlk_recover-', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
