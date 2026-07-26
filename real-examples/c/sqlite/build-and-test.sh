@@ -116,7 +116,13 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # fixture + a GCC fixture both pass it while a release DSS fixture fails all 500k
 # values, so it is a GENUINE release-optimizer fp miscompile [D-OPT-SQLITE-FPCONV1-
 # RELEASE-FP-MISCOMPILE] the harness MUST flag red until fixed.)
-DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$}"
+# A pattern may be SCOPED by execution mode: `emulated:<re>` / `native:<re>`; bare
+# means every leg. `emulated:^writecrash-` is excused ONLY on a leg that needs a
+# runner (qemu), because the emulator injects "qemu: uncaught target signal 6" into
+# the output sqlite's crash harness compares — PROVEN by a gcc-built aarch64
+# abort() emitting that exact string, no DSS involved. The native host leg passes
+# all 988 writecrash assertions, so this must NEVER be excused there.
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ emulated:^writecrash-}"
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
@@ -1420,12 +1426,47 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ ${#CALIBRATION[@]} -eq 0 ]] \
       || derivation="$derivation  [!! the derivation DISAGREES with sqlite on ${#CALIBRATION[@]} segment(s) that did report — treat the aborted-segment figures as APPROXIMATE: ${CALIBRATION[*]}]"
   fi
-  declare -a real=() confound=()
+  # A confound may be SCOPED to an execution mode: `native:<re>` or `emulated:<re>`
+  # (bare `<re>` = every leg). The mode is derived from whether the leg needs a
+  # runner prefix to execute its binaries — a per-leg TARGET fact, never a host or
+  # arch identity test, so a future emulated target inherits this for free.
+  # WHY SCOPES EXIST: `writecrash-` fails ONLY under qemu, because the emulator
+  # writes "qemu: uncaught target signal 6" into the child's captured output that
+  # sqlite's crash harness compares (D-SQLITE-ARM64-WRITECRASH-QEMU-ABORT-ARTIFACT,
+  # proven with a gcc-built aarch64 abort()). The native host leg passes all 988 of
+  # those assertions, so a BARE `^writecrash-` would suppress a future genuine host
+  # regression. An unscoped confound is exactly the silent-classification fault
+  # refused for date-2.4c (D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY).
+  local leg_mode='native'
+  [[ -n "${LEG_PREFIX[$leg]:-}" ]] && leg_mode='emulated'
+  declare -a real=() confound=() scoped_excused=()
   for t in $faillist; do
-    is_c=0
-    for p in "${CONFOUND_PATTERNS[@]}"; do [[ "$t" =~ $p ]] && { is_c=1; break; }; done
-    if [[ "$is_c" == 1 ]]; then confound+=("$t"); else real+=("$t"); fi
+    is_c=0; by_scope=0
+    for p in "${CONFOUND_PATTERNS[@]}"; do
+      p_scope=''; p_rx="$p"
+      case "$p" in
+        native:*)   p_scope='native';   p_rx="${p#native:}"   ;;
+        emulated:*) p_scope='emulated'; p_rx="${p#emulated:}" ;;
+      esac
+      # A scoped pattern is INERT on any other mode — it must not excuse there.
+      [[ -n "$p_scope" && "$p_scope" != "$leg_mode" ]] && continue
+      [[ "$t" =~ $p_rx ]] && { is_c=1; [[ -n "$p_scope" ]] && by_scope=1; break; }
+    done
+    if [[ "$is_c" == 1 ]]; then
+      confound+=("$t")
+      # Named separately in the verdict: an excusal that depends on HOW the leg runs
+      # is a coverage statement, not a clean pass. Silence about it would be a
+      # harness bug.
+      [[ "$by_scope" == 1 ]] && scoped_excused+=("$t")
+    else
+      real+=("$t")
+    fi
   done
+  if [[ ${#scoped_excused[@]} -gt 0 ]]; then
+    warn "[$leg] ${#scoped_excused[@]} failure(s) excused ONLY because this leg runs '$leg_mode': ${scoped_excused[*]}"
+    warn "      these are NOT evidence of correctness on a native run of this target — and a crash-simulation"
+    warn "      abort can TRUNCATE the rest of its .test file, so coverage there is partial."
+  fi
   # Per-unit ledger — every file that reached a verdict, every abort, every gap.
   { printf "sqlite unit ledger — leg '%s', tier '%s', %s segment(s), %s resume(s)\n" "$leg" "$DSS_TIER" "$nseg" "$resumes"
     printf 'union: %s\n' "$summary"

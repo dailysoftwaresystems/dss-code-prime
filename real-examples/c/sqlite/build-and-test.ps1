@@ -1089,11 +1089,28 @@ if ($nDerived -gt 0) {
     $derivationText += "  [!! the derivation DISAGREES with sqlite on $($calibration.Count) segment(s) that did report — treat the aborted-segment figures as APPROXIMATE: $($calibration -join '; ')]"
   }
 }
-$real = @(); $confound = @()
+$real = @(); $confound = @(); $scopedExcused = @()
 foreach ($t in $failNames) {
   $isc = $false
-  foreach ($p in $Confounds) { if ($t -match $p) { $isc = $true; break } }
+  # Scoped confounds, mirroring build-and-test.sh: `native:<re>` / `emulated:<re>`
+  # (bare = every leg). This driver has only the NATIVE pe64 leg — it runs its
+  # binaries directly, with no runner prefix — so an `emulated:` pattern must never
+  # excuse anything here. Parsed rather than ignored: without this, a scoped pattern
+  # would be treated as the literal regex "emulated:^writecrash-", match nothing,
+  # and SILENTLY excuse nothing while appearing configured
+  # (D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY).
+  $legMode = 'native'
+  foreach ($p in $Confounds) {
+    $pScope = ''; $pRx = $p
+    if ($p -like 'native:*')        { $pScope = 'native';   $pRx = $p.Substring(7) }
+    elseif ($p -like 'emulated:*')  { $pScope = 'emulated'; $pRx = $p.Substring(9) }
+    if ($pScope -and $pScope -ne $legMode) { continue }
+    if ($t -match $pRx) { $isc = $true; if ($pScope) { $scopedExcused += $t }; break }
+  }
   if ($isc) { $confound += $t } else { $real += $t }
+}
+if ($scopedExcused.Count) {
+  Warn "[pe64] $($scopedExcused.Count) failure(s) excused ONLY because this leg runs '$legMode': $($scopedExcused -join ' ')"
 }
 # Per-unit ledger — every file that reached a verdict, every abort, every gap.
 $led = New-Object 'System.Collections.Generic.List[string]'
