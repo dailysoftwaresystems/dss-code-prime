@@ -58,7 +58,8 @@
 #
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
-#                      DSS_MAX_RESUMES  ARM64_LIBDIR
+#                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
+#                      ARM64_LIBDIR
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -129,6 +130,24 @@ DSS_TIER_EXCLUDES="${DSS_TIER_EXCLUDES:-}"
 # fixture after an abort. Exceeded → the harness STOPS and says so; it never
 # loops, and never masks a fixture that aborts on everything.
 DSS_MAX_RESUMES="${DSS_MAX_RESUMES:-10}"
+# DSS_SEGMENT_STALL: seconds a segment may produce NO log output before the harness
+# declares it HUNG, kills it, and resumes past it. A stall bound (not a wall-clock
+# bound) is the right shape here: the tiers differ by orders of magnitude — `all`
+# runs ~2.5 h — but output is continuous within any of them, so a silent fixture is
+# the signal. MEASURED headroom: the slowest single test FILE in a real `all` run is
+# sort4.test at 306 s, and the fixture prints a line per TEST, not per file, so real
+# output gaps are far shorter still. 1800 s is ~6x the slowest file.
+DSS_SEGMENT_STALL="${DSS_SEGMENT_STALL:-1800}"
+# DSS_SEGMENT_TIMEOUT: optional ABSOLUTE per-segment wall-clock cap in seconds.
+# 0 = disabled (the default) — the stall bound above is the one that generalises;
+# an absolute cap has to be re-tuned for every tier.
+DSS_SEGMENT_TIMEOUT="${DSS_SEGMENT_TIMEOUT:-0}"
+# DSS_KILL_SETTLE: seconds to wait, after killing a hung segment, for the OS to
+# actually release its file handles before the next segment starts. MEASURED: with
+# no settle the next segment dies at tester.tcl's startup `reset_db` with
+# `error deleting "test.db": permission denied` — the harness manufacturing its own
+# next failure out of the previous kill.
+DSS_KILL_SETTLE="${DSS_KILL_SETTLE:-20}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 HOST_OS=""
@@ -277,6 +296,54 @@ else
   clone_or_update "$DSS_REPO_URL" "$SRC_DIR" ""
 fi
 pass "dss-code-prime ready"
+
+# ── Step 2b — take the RUN LOCK on the output tree ───────────────────────────
+# MEASURED FAILURE (2026-07-26, on the pe64 twin of this harness) this exists to
+# prevent: two harness invocations shared one output tree. Invocation B deleted and
+# re-staged the .test corpus invocation A's fixture was still sourcing files from,
+# mid-run, and B then died trying to delete a testfixture binary A was still
+# EXECUTING. The evidence was unambiguous: A's run dir and its process both dated
+# 09:49:23, and A's corpus log was still growing (79 MB) at 11:01. So the harness
+# must be single-instance per output tree — and silently corrupting a live 2.5 h
+# run is the worse half of that bug.
+#
+# The lock is LIVENESS-BASED, so a crashed run never wedges the next one: it records
+# the owning PID + that process's start marker, and a later invocation steals it
+# (and SAYS so) when the owner is gone. Correctness never depends on a release.
+# >>> dss:run-lock >>>
+mkdir -p "$OUT_DIR"
+LOCK_DIR="$OUT_DIR/.harness-lock"
+LOCK_FILE="$LOCK_DIR/owner.txt"
+LOCK_STOLEN=""
+proc_start_marker() {          # a PID's start time — the PID-reuse guard
+  ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true
+}
+self_marker="$(proc_start_marker $$)"
+for _try in 1 2; do
+  # `mkdir` is the portable atomic test-and-set; -p would defeat it.
+  if mkdir "$LOCK_DIR" 2>/dev/null; then break; fi
+  owner_pid=""; owner_mark=""
+  if [[ -f "$LOCK_FILE" ]]; then
+    owner_pid="$(sed -n '1p' "$LOCK_FILE" 2>/dev/null || true)"
+    owner_mark="$(sed -n '2p' "$LOCK_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null \
+     && [[ "$(proc_start_marker "$owner_pid")" == "$owner_mark" ]]; then
+    die "another dss sqlite harness run is ALREADY ACTIVE on this output tree.
+      output tree : $OUT_DIR
+      owner PID   : $owner_pid  (still running)
+      Two invocations here corrupt each other: one re-stages the .test corpus the
+      other run's fixture is sourcing from, and neither can replace a testfixture
+      binary that is still executing. Wait for it, or set OUT_DIR elsewhere.
+      If you are certain that PID is dead, remove: $LOCK_DIR"
+  fi
+  LOCK_STOLEN="${owner_pid:-an unreadable lock}"
+  rm -rf "$LOCK_DIR"
+done
+printf '%s\n%s\n%s\n' "$$" "$self_marker" "$(date -Is 2>/dev/null || date)" > "$LOCK_FILE"
+[[ -z "$LOCK_STOLEN" ]] || warn "took over a STALE run lock left by PID $LOCK_STOLEN (that run died without releasing it) — reported in the verdict."
+info "run lock: $LOCK_DIR (pid $$)"
+# <<< dss:run-lock <<<
 
 # ── Step 3 — sqlite ──────────────────────────────────────────────────────────
 step "3/9  Fetch sqlite/sqlite -> $SQLITE_DIR (default branch)"
@@ -749,20 +816,144 @@ resolve_abort_file() {         # resolve_abort_file <lasttest> <corpus-list-file
 # superset sqlite intersects with the permutation's own -files.
 files_after() { LC_ALL=C awk -v b="$1" '$0 > b' "$2"; }
 str_gt()      { [[ "$(LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{print (a>b) ? 1 : 0}')" == 1 ]]; }
-# <<< dss:corpus-engine <<<
-declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
-# per-leg resume-engine bookkeeping, surfaced in Step 9
-declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=()
-UNIT_FAILS=0
-run_leg() {                    # run_leg <leg> <bin> <args...>
+
+# ── process hygiene ──────────────────────────────────────────────────────────
+# Scoped to OUR EXACT fixture binary path — never to the image name. A developer's
+# own testfixture, or one from a different checkout, is never touched. This is only
+# safe because the run lock guarantees we are the sole invocation on this output
+# tree: any process still running THIS path is, by construction, a leftover of a run
+# that is already over. Matching on the full argv covers the cross legs too, where
+# the fixture is an argument of qemu-aarch64 rather than the image itself.
+# `ps -eo pid=,args=` is POSIX and works on Linux/WSL/macOS — the hosts this script
+# targets. If it ever does NOT, leftover detection is UNAVAILABLE, and that has to be
+# LOUD and on the record: silently finding nothing is the exact defect class this
+# whole layer exists to remove. Probed once.
+PS_ENUM_OK=""
+ps_enum_available() {
+  if [[ -z "$PS_ENUM_OK" ]]; then
+    if LC_ALL=C ps -eo pid=,args= >/dev/null 2>&1; then PS_ENUM_OK=yes; else
+      PS_ENUM_OK=no
+      # >&2 is load-bearing: this probe runs inside our_fixture_pids, whose STDOUT is
+      # consumed as a PID list. A warning on stdout would be parsed as PIDs to kill.
+      warn "this host's ps(1) cannot enumerate processes (\`ps -eo pid=,args=\` failed):" >&2
+      warn "  LEFTOVER-FIXTURE DETECTION IS UNAVAILABLE for this run — a stray fixture from a" >&2
+      warn "  dead run will not be found or killed. Reported in the verdict, never assumed clean." >&2
+    fi
+  fi
+  [[ "$PS_ENUM_OK" == yes ]]
+}
+our_fixture_pids() {           # our_fixture_pids <fixture-abs-path>
+  [[ -n "${1:-}" ]] || return 0
+  ps_enum_available || return 0
+  # The path goes through the ENVIRONMENT, never `awk -v`. With -v the path is in
+  # awk's OWN argv, so the concurrently-running `ps` snapshot contains it and the
+  # matcher reports its own helper as a leftover fixture — a self-match that had
+  # this function "find" a process it then tried to kill. (MEASURED.)
+  LC_ALL=C ps -eo pid=,args= 2>/dev/null \
+    | DSS_WANT="$1" DSS_SELF="$$" LC_ALL=C awk '
+        BEGIN { want=ENVIRON["DSS_WANT"]; self=ENVIRON["DSS_SELF"] }
+        { pid=$1; sub(/^[ \t]*[0-9]+[ \t]+/, ""); if (pid != self && index($0, want)) print pid }' || true
+}
+# Kill every leftover of OUR fixture and echo one report line per kill (never
+# silent — a killed process is a fact the verdict has to carry).
+stop_our_fixtures() {          # stop_our_fixtures <fixture-abs-path> <why>
+  local p
+  for p in $(our_fixture_pids "${1:-}"); do
+    # This function KILLS. Never act on a token that is not a plain PID: a stray
+    # line on the enumerator's stdout must not become a kill target.
+    [[ "$p" =~ ^[0-9]+$ ]] || { printf '%s — REFUSED to kill non-numeric target %q (enumerator emitted junk)\n' "$2" "$p"; continue; }
+    kill -TERM "$p" 2>/dev/null || true
+    local n=0
+    while kill -0 "$p" 2>/dev/null && [[ $n -lt 15 ]]; do sleep 1; n=$((n + 1)); done
+    if kill -0 "$p" 2>/dev/null; then
+      kill -KILL "$p" 2>/dev/null || true
+      printf '%s — killed (SIGKILL) pid %s\n' "$2" "$p"
+    else
+      printf '%s — killed pid %s\n' "$2" "$p"
+    fi
+  done
+}
+
+# Run ONE fixture segment: stdin at EOF, stdout+stderr merged to <log>, killed if it
+# stalls (no log growth for DSS_SEGMENT_STALL s) or exceeds an absolute cap. Sets
+# SEG_RC and SEG_KILL_REASON.
+#
+# stdin is </dev/null deliberately. It is NOT the fix for anything observed — the
+# "aborted fixture drops into the Tcl REPL and blocks on stdin" theory was TESTED
+# and REFUTED: tclsqlite.c's TCLSH_MAIN evaluates its mainloop script, takes the
+# `source $argv0` branch whenever $argv is non-empty, and on error prints errorInfo
+# and `return 1`; the `while {![eof stdin]}` REPL is reachable only with NO script
+# argument. Measured: with stdin an open pipe that is never written and never
+# closed, an aborted fixture still exits rc=1 in 8.8 s. Closing stdin is kept as
+# cheap hardening (tester.tcl's own `--pause` does read stdin) — not as a cure.
+# The per-leg launcher. `exec` is load-bearing, not a micro-optimisation: run_leg is
+# always the last command of run_fixture_segment's background subshell, so exec makes
+# the FIXTURE (or qemu) that subshell's OWN process. Without it the fixture is a
+# GRANDCHILD and the timeout's `kill $child` reaps only the shell — leaving the hung
+# fixture alive, holding its file handles, and defeating the point of the timeout.
+# It lives inside this region precisely because that contract is load-bearing here.
+run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES this shell
   local leg="$1" bin="$2"; shift 2
   local pfx="${LEG_PREFIX[$leg]}"
   if [[ -z "$pfx" ]]; then
-    "$bin" "$@" 2>&1
+    exec "$bin" "$@" 2>&1
   else
-    QEMU_LD_PREFIX="$QEMU_SYSROOT" LD_LIBRARY_PATH="$ARM64_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$pfx" "$bin" "$@" 2>&1
+    export QEMU_LD_PREFIX="$QEMU_SYSROOT" LD_LIBRARY_PATH="$ARM64_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    exec "$pfx" "$bin" "$@" 2>&1
   fi
 }
+
+run_fixture_segment() {        # run_fixture_segment <leg> <bin> <log> <args...>
+  local leg="$1" bin="$2" log="$3"; shift 3
+  SEG_RC=0; SEG_KILL_REASON=""
+  # `trap - ERR; set +e` inside the subshell is load-bearing. The old form was a
+  # `|| segrc=$?` list, which suppresses errexit and the ERR trap; a BACKGROUND job
+  # does not, so this subshell would inherit them (set -E) and the harness-level
+  # `die` would fire on the fixture's own non-zero exit — writing a bogus
+  # " [X] ERROR: failed at line …" INTO the segment log (stderr is redirected there)
+  # and masking the real exit status. A failing test is data here, not an error.
+  ( trap - ERR; set +e; cd "$rundir" && run_leg "$leg" "$bin" "$@" ) > "$log" 2>&1 < /dev/null &
+  local child=$!
+  local last_len=-1 last_grow t0
+  t0="$(date +%s)"; local last_grow_t="$t0"
+  while kill -0 "$child" 2>/dev/null; do
+    sleep 5
+    kill -0 "$child" 2>/dev/null || break
+    local len now
+    len="$(wc -c < "$log" 2>/dev/null || echo "$last_len")"
+    now="$(date +%s)"
+    if [[ "$len" != "$last_len" ]]; then last_len="$len"; last_grow_t="$now"
+    elif [[ "$DSS_SEGMENT_STALL" -gt 0 && $((now - last_grow_t)) -ge "$DSS_SEGMENT_STALL" ]]; then
+      SEG_KILL_REASON="produced no output for ${DSS_SEGMENT_STALL}s (DSS_SEGMENT_STALL)"; break
+    fi
+    if [[ "$DSS_SEGMENT_TIMEOUT" -gt 0 && $((now - t0)) -ge "$DSS_SEGMENT_TIMEOUT" ]]; then
+      SEG_KILL_REASON="exceeded the absolute cap of ${DSS_SEGMENT_TIMEOUT}s (DSS_SEGMENT_TIMEOUT)"; break
+    fi
+  done
+  if [[ -n "$SEG_KILL_REASON" ]]; then
+    kill -TERM "$child" 2>/dev/null || true; sleep 2
+    kill -KILL "$child" 2>/dev/null || true
+    # Sweep by path as well: on a host where `exec` cannot replace the shell with a
+    # native binary, the fixture is a grandchild the child-kill never reaches.
+    stop_our_fixtures "$bin" "segment timeout" >/dev/null || true
+    # SETTLE. MEASURED: without this the very next segment dies at tester.tcl's
+    # startup `reset_db` with `error deleting "test.db": permission denied` — the
+    # killed fixture's handle is still open, so the harness manufactures its own
+    # next failure and burns the resume budget on it. Bounded, and only on this path.
+    local s=0
+    while [[ $s -lt $DSS_KILL_SETTLE ]]; do
+      [[ -n "$(our_fixture_pids "$bin")" ]] || break
+      sleep 1; s=$((s + 1))
+    done
+    sleep 2
+  fi
+  wait "$child" 2>/dev/null || SEG_RC=$?
+}
+# <<< dss:corpus-engine <<<
+declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
+# per-leg resume-engine bookkeeping, surfaced in Step 9
+declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=() LEG_HYGIENE=()
+UNIT_FAILS=0
 # tester.tcl's cmdlinearg(testdir) default: the fixture `file mkdir`s this subdir of
 # its CWD and cd's into it before any .test body runs, so a test's relative
 # `./libtestloadext.so` resolves HERE. The harness passes no --testdir override.
@@ -833,7 +1024,16 @@ for leg in "${LEG_ORDER[@]}"; do
   # spliced in by an abort.
   US=$'\x1f'
   SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}$TEST_FILE${US}")
-  declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=()
+  declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=()
+  # PRE-FLIGHT HYGIENE — a leftover fixture from a dead run holds file handles (the
+  # abort class this engine exists for IS a leaked handle) and can make this run
+  # fail for a reason this run did not cause. We hold the run lock, so anything
+  # still running OUR fixture path is a leftover.
+  while IFS= read -r k; do
+    [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
+  done < <(stop_our_fixtures "$bin" 'pre-flight')
+  [[ -z "$LOCK_STOLEN" ]] || HYGIENE+=("took over a STALE run lock left by PID $LOCK_STOLEN")
+  ps_enum_available || HYGIENE+=("leftover-fixture detection UNAVAILABLE on this host (ps(1) cannot enumerate) — a stray fixture would go unnoticed")
   seg_i=0; resumes=0; last_boundary=""; total_tests=0; total_errors=0; files_done=0
   seg_summary=""; all_fails=""
   while [[ $seg_i -lt ${#SEGQ[@]} ]]; do
@@ -850,11 +1050,18 @@ for leg in "${LEG_ORDER[@]}"; do
     # words, so a whitespace join is a valid list.
     if [[ -n "$s_patfile" ]]; then SQLITE_TEST_PATTERN_LIST="$(tr '\n' ' ' < "$s_patfile")"; export SQLITE_TEST_PATTERN_LIST
     else unset SQLITE_TEST_PATTERN_LIST; fi
-    # `|| segrc=$?` CAPTURES the fixture's exit status (it is not `|| true`, which
-    # would discard it) while keeping errexit/the ERR trap out of a test failure.
-    segrc=0
-    ( cd "$rundir" && run_leg "$leg" "$bin" "${seg_argv[@]}" ) > "$seglog" 2>&1 || segrc=$?
+    run_fixture_segment "$leg" "$bin" "$seglog" "${seg_argv[@]}"
+    segrc="$SEG_RC"
     unset SQLITE_TEST_PATTERN_LIST
+    if [[ -n "$SEG_KILL_REASON" ]]; then
+      warn "[$leg] segment $((seg_i + 1)) HUNG — killed: $SEG_KILL_REASON"
+      HYGIENE+=("segment $((seg_i + 1)) TIMED OUT and was killed — $SEG_KILL_REASON")
+    fi
+    # POST-SEGMENT HYGIENE — a segment must not carry its file handles into the
+    # next one, nor outlive the run.
+    while IFS= read -r k; do
+      [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
+    done < <(stop_our_fixtures "$bin" "after segment $((seg_i + 1))")
     SEG_LOGS+=("$seglog"); SEG_LABELS+=("$s_label"); SEG_RCS+=("$segrc")
     facts_f="$scratch/facts.$seg_i"
     parse_segment "$seglog" "$facts_f"
@@ -882,6 +1089,22 @@ for leg in "${LEG_ORDER[@]}"; do
     perm="$s_perm_log"
     [[ -n "$perm" ]] || perm="$s_perm"
     [[ -n "$perm" || ${#TIER_PERMS[@]} -ne 1 ]] || perm="${TIER_PERMS[0]}"
+    # A KILLED segment (stall/cap) has NO Tcl traceback at all — and that is
+    # precisely when resume matters most, so the traceback cannot be the only
+    # source. Fall back to the permutation PREFIX sqlite stamps on every test name
+    # (`<perm>.<test>`, run_tests -prefix), then — for an initial tier segment that
+    # never showed ANY later permutation's prefix — to the tier's first permutation
+    # (all.test's first suite, `full`, is the one declared with -prefix "").
+    perm_inferred=""
+    if [[ -z "$perm" && -n "$s_last" ]]; then
+      for p in ${TIER_PERMS[@]+"${TIER_PERMS[@]}"}; do
+        if [[ "$s_last" == "$p."* ]]; then perm="$p"; perm_inferred="from the test-name prefix"; break; fi
+      done
+    fi
+    if [[ -z "$perm" && -n "$s_last" && "$s_kind" == "tier" && -z "$s_perm" && ${#TIER_PERMS[@]} -gt 0 ]]; then
+      perm="${TIER_PERMS[0]}"
+      perm_inferred="INFERRED — no permutation prefix ever appeared, so the run never left '${TIER_PERMS[0]}', the tier's first suite"
+    fi
     abort_file="$(resolve_abort_file "$s_last" "$scratch/files.txt")"
     # The boundary must STRICTLY advance every resume, or an aborting file could be
     # re-entered forever. If the aborting file could not be named (or is not past
@@ -894,9 +1117,14 @@ for leg in "${LEG_ORDER[@]}"; do
       boundary="$(files_after "$last_boundary" "$scratch/files.txt" | head -1)"
     fi
     ABORTS+=("${perm:-?}/${abort_file:-?}")
-    ABORT_ROWS+=("segment $seg_i: permutation '${perm:-?}' file '${abort_file:-?}' after test '${s_last:-?}' (rc=$segrc) -> $seglog")
-    warn "[$leg] ABORT #${#ABORTS[@]} — segment $seg_i ('$s_label') exited rc=$segrc with NO summary line"
-    info "        permutation        : ${perm:-(UNDETERMINED)}"
+    if [[ -n "$SEG_KILL_REASON" ]]; then how="KILLED: $SEG_KILL_REASON"; else how="rc=$segrc"; fi
+    ABORT_ROWS+=("segment $seg_i: permutation '${perm:-?}' file '${abort_file:-?}' after test '${s_last:-?}' ($how) -> $seglog")
+    if [[ -n "$SEG_KILL_REASON" ]]; then
+      warn "[$leg] ABORT #${#ABORTS[@]} — segment $seg_i ('$s_label') was KILLED after it $SEG_KILL_REASON"
+    else
+      warn "[$leg] ABORT #${#ABORTS[@]} — segment $seg_i ('$s_label') exited rc=$segrc with NO summary line"
+    fi
+    info "        permutation        : ${perm:-(UNDETERMINED)}${perm_inferred:+   [$perm_inferred]}"
     info "        last file completed: ${s_done:-(none)}"
     info "        died inside file   : ${abort_file:-(unresolved)}   last test: ${s_last:-(none)}"
     # The unit that died NEVER goes unreported — named when we can name it,
@@ -972,6 +1200,7 @@ for leg in "${LEG_ORDER[@]}"; do
     done
     [[ ${#ABORT_ROWS[@]} -eq 0 ]]  || { printf '\n== aborts ==\n'; printf '   %s\n' "${ABORT_ROWS[@]}"; }
     [[ ${#NOT_REACHED[@]} -eq 0 ]] || { printf '\n== NOT REACHED (no verdict) ==\n'; printf '   %s\n' "${NOT_REACHED[@]}"; }
+    [[ ${#HYGIENE[@]} -eq 0 ]]     || { printf '\n== process hygiene ==\n'; printf '   %s\n' "${HYGIENE[@]}"; }
     [[ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]] || { printf '\n== EXCLUDED by operator (DSS_TIER_EXCLUDES -> QUICKTEST_OMIT) ==\n   %s\n' "${EXCLUDE_PATTERNS[*]}"; }
   } > "$ledger"
 
@@ -1009,6 +1238,12 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] corpus FAIL — $summary; ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
     [[ ${#confound[@]} -gt 0 ]] && info "      (+${#confound[@]} known confound(s) ignored: ${confound[*]})"
   fi
+  # A killed zombie / stolen stale lock is a fact about THIS run, not a footnote —
+  # it rides on the verdict even when the corpus itself came back clean.
+  if [[ ${#HYGIENE[@]} -gt 0 ]]; then
+    UNIT_VERDICT["$leg"]="${UNIT_VERDICT[$leg]}  [PROCESS HYGIENE: ${#HYGIENE[@]} event(s) — ${HYGIENE[*]}]"
+    for h in "${HYGIENE[@]}"; do warn "[$leg] HYGIENE: $h"; done
+  fi
   # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
   if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS[@]} -eq 0 ]]; then
     UNIT_VERDICT["$leg"]="${UNIT_VERDICT[$leg]}  [NOT FULL COVERAGE: ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger]"
@@ -1018,8 +1253,9 @@ for leg in "${LEG_ORDER[@]}"; do
   LEG_SEGMENTS["$leg"]="$nseg"; LEG_RESUMES["$leg"]="$resumes"
   LEG_FILESDONE["$leg"]="$files_done"; LEG_LEDGER["$leg"]="$ledger"
   LEG_ABORTS["$leg"]="${ABORTS[*]-}"; LEG_NOTREACHED["$leg"]="$(printf '%s\n' ${NOT_REACHED[@]+"${NOT_REACHED[@]}"})"
+  LEG_HYGIENE["$leg"]="$(printf '%s\n' ${HYGIENE[@]+"${HYGIENE[@]}"})"
   # <<< dss:corpus-loop <<<
-  unset real confound ABORTS ABORT_ROWS NOT_REACHED SEG_LOGS SEG_LABELS SEG_RCS TIER_PERMS
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE SEG_LOGS SEG_LABELS SEG_RCS TIER_PERMS
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
@@ -1038,13 +1274,14 @@ for leg in "${LEG_ORDER[@]}"; do
   if [[ "${COMPILE_OK[$leg]:-0}" == "1" ]]; then
     # Only printed when there is something to say: a clean single-segment run
     # leaves this block byte-identical to what it always was.
-    if [[ "${LEG_SEGMENTS[$leg]:-1}" -gt 1 || -n "${LEG_ABORTS[$leg]:-}" || -n "${LEG_NOTREACHED[$leg]:-}" ]]; then
+    if [[ "${LEG_SEGMENTS[$leg]:-1}" -gt 1 || -n "${LEG_ABORTS[$leg]:-}" || -n "${LEG_NOTREACHED[$leg]:-}" || -n "${LEG_HYGIENE[$leg]:-}" ]]; then
       printf '   %-6s segments : %s (%s resume(s) of max %s)   %s test file(s) completed   ledger: %s\n' \
         "$leg" "${LEG_SEGMENTS[$leg]}" "${LEG_RESUMES[$leg]}" "$DSS_MAX_RESUMES" "${LEG_FILESDONE[$leg]}" "${LEG_LEDGER[$leg]}"
       for a in ${LEG_ABORTS[$leg]:-}; do
         printf '   %-6s aborted  : %s — its remaining cases did NOT run\n' "$leg" "$a"
       done
       while IFS= read -r n; do [[ -z "$n" ]] || printf '   %-6s NOT RUN  : %s\n' "$leg" "$n"; done <<< "${LEG_NOTREACHED[$leg]:-}"
+      while IFS= read -r h; do [[ -z "$h" ]] || printf '   %-6s hygiene  : %s\n' "$leg" "$h"; done <<< "${LEG_HYGIENE[$leg]:-}"
     fi
     # $EXCL_NOTE rides along on EVERY verdict — pass and fail alike — so a GREEN
     # line can never be read as "the whole corpus ran".
@@ -1053,6 +1290,10 @@ for leg in "${LEG_ORDER[@]}"; do
     printf '   %-6s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
   fi
 done
+# Release the run lock. Correctness does NOT depend on this — the lock is
+# liveness-based, so a run that dies here just leaves one the next invocation steals
+# and reports. Releasing simply keeps that report quiet when it should be.
+rm -rf "$LOCK_DIR"
 if [[ "$COMPILE_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) failed to compile the testfixture — inspect the compile.log diagnostics.%s\n' "$C_RED" "$COMPILE_FAILS" "$C_RST"
   exit 1

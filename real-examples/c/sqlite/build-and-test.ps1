@@ -116,6 +116,7 @@
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
 #                      DSS_TIER  DSS_CONFIG  DSS_TEST_FILE  DSS_CONFOUNDS
 #                      DSS_TIER_EXCLUDES  DSS_MAX_RESUMES
+#                      DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
 #                      TCL_DLL  ZLIB_DLL  TCL_LIBRARY
 
 $ErrorActionPreference = 'Stop'
@@ -173,6 +174,24 @@ $TierExcludes = if ($null -ne $env:DSS_TIER_EXCLUDES) { @($env:DSS_TIER_EXCLUDES
 # after an abort. Exceeded → the harness STOPS and says so; it never loops, and it
 # never masks a fixture that aborts on everything.
 $MaxResumes   = if ($env:DSS_MAX_RESUMES) { [int]$env:DSS_MAX_RESUMES } else { 10 }
+# DSS_SEGMENT_STALL: seconds a segment may produce NO log output before the harness
+# declares it HUNG, kills it, and resumes past it. A stall bound (not a wall-clock
+# bound) is the right shape here: the tiers differ by orders of magnitude — `all`
+# runs ~2.5 h — but output is continuous within any of them, so a silent fixture is
+# the signal. MEASURED headroom: the slowest single test FILE in a real `all` run is
+# sort4.test at 306 s, and the fixture prints a line per TEST, not per file, so real
+# output gaps are far shorter still. 1800 s is ~6x the slowest file.
+$SegStall     = if ($env:DSS_SEGMENT_STALL) { [int]$env:DSS_SEGMENT_STALL } else { 1800 }
+# DSS_SEGMENT_TIMEOUT: optional ABSOLUTE per-segment wall-clock cap in seconds.
+# 0 = disabled (the default) — the stall bound above is the one that generalises;
+# an absolute cap has to be re-tuned for every tier.
+$SegCap       = if ($env:DSS_SEGMENT_TIMEOUT) { [int]$env:DSS_SEGMENT_TIMEOUT } else { 0 }
+# DSS_KILL_SETTLE: seconds to wait, after killing a hung segment, for the OS to
+# actually release its file handles before the next segment starts. MEASURED: with
+# no settle the next segment dies at tester.tcl's startup `reset_db` with
+# `error deleting "test.db": permission denied` — the harness manufacturing its own
+# next failure out of the previous kill.
+$KillSettle   = if ($env:DSS_KILL_SETTLE) { [int]$env:DSS_KILL_SETTLE } else { 20 }
 # pe64 resolve-library targets: DLLs with export tables (NOT import .libs).
 # git-for-Windows ships a full Tcl 8.6 + zlib runtime; override if you have a
 # dedicated Tcl dev kit (Magicsplat/ActiveTcl).
@@ -218,6 +237,70 @@ $dssHead = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
 $dssBranch = (& git -C $RepoRoot rev-parse --abbrev-ref HEAD 2>$null)
 Info "  at $dssHead on $dssBranch"
 Pass "dss-code-prime checkout ready"
+
+# ── Step 2b — take the RUN LOCK on the work tree ─────────────────────────────
+# MEASURED FAILURE (2026-07-26) this exists to prevent: two harness invocations
+# shared $Work. Invocation B's Step 3+4 deleted and re-staged $Stage — the test
+# corpus invocation A's fixture was still sourcing .test files from, mid-run — and
+# B's Step 7 then died with "Access to the path '…\testfixture.exe' is denied"
+# because A's fixture was still EXECUTING that binary. The evidence is unambiguous:
+# A's run/ dir and its process both dated 09:49:23, and A's corpus.log was still
+# growing (79 MB) at 11:01. So the harness must be single-instance per work tree,
+# and silently corrupting a live 2.5 h run is the worse half of that bug.
+#
+# The lock is LIVENESS-BASED, so a crashed run never wedges the next one: it records
+# the owning PID + that process's start time, and a later invocation steals it (and
+# SAYS so) when the owner is gone. Correctness never depends on a release.
+# >>> dss:run-lock >>>
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
+$LockDir  = Join-Path $Work '.harness-lock'
+$LockFile = Join-Path $LockDir 'owner.txt'
+$LockStolen = ''
+function Get-LockOwner {
+  if (-not (Test-Path $LockFile)) { return $null }
+  $t = (Get-Content -Raw -LiteralPath $LockFile -ErrorAction SilentlyContinue)
+  if (-not $t) { return $null }
+  $parts = $t.Trim() -split '\|'
+  if ($parts.Count -lt 2) { return $null }
+  return @{ Pid = [int]$parts[0]; Start = $parts[1]; Text = $t.Trim() }
+}
+function Test-LockOwnerAlive($owner) {
+  if (-not $owner) { return $false }
+  $p = Get-Process -Id $owner.Pid -ErrorAction SilentlyContinue
+  if (-not $p) { return $false }
+  # PID reuse guard: the live process must ALSO have the recorded start time.
+  try { return ($p.StartTime.Ticks.ToString() -eq $owner.Start) } catch { return $false }
+}
+$selfStart = (Get-Process -Id $PID).StartTime.Ticks.ToString()
+for ($try = 0; $try -lt 2; $try++) {
+  try { [void][System.IO.Directory]::CreateDirectory($Work) } catch {}
+  $created = $false
+  try { $null = New-Item -ItemType Directory -Path $LockDir -ErrorAction Stop; $created = $true } catch { $created = $false }
+  if (-not $created) {
+    $owner = Get-LockOwner
+    if (Test-LockOwnerAlive $owner) {
+      Die @"
+another dss sqlite harness run is ALREADY ACTIVE on this work tree.
+      work tree : $Work
+      owner PID : $($owner.Pid)  (still running)
+      Two invocations here corrupt each other: Step 3+4 re-stages the .test corpus the
+      other run's fixture is sourcing from, and Step 7 cannot delete a testfixture.exe
+      that is still executing. Wait for it, or point this run elsewhere by overriding
+      the work tree (this script derives it from the repo root).
+      If you are certain that PID is dead, remove: $LockDir
+"@
+    }
+    # stale (owner gone, or the PID was reused by something else) — steal + REPORT
+    $LockStolen = if ($owner) { "PID $($owner.Pid)" } else { 'an unreadable lock' }
+    Remove-Item -Recurse -Force $LockDir -ErrorAction SilentlyContinue
+    continue
+  }
+  break
+}
+Set-Content -LiteralPath $LockFile -Value "$PID|$selfStart|$(Get-Date -Format o)" -Encoding ascii
+if ($LockStolen) { Warn "took over a STALE run lock left by $LockStolen (that run died without releasing it) — reported in the verdict." }
+Info "run lock: $LockDir (pid $PID)"
+# <<< dss:run-lock <<<
 
 # ── Step 3+4 — derive the full-source recipe + stage to Windows (VIA WSL) ────
 Step '3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL)'
@@ -428,6 +511,12 @@ $genOut = & $python3.Source @genArgs 2>&1
 if ($LASTEXITCODE -ne 0) { Die "manifest generation failed:`n$($genOut -join "`n")" }
 Info "manifest -> $Manifest ($genOut)"
 
+# PRE-FLIGHT HYGIENE — the $OutDir wipe below cannot delete a testfixture.exe that
+# is still executing, and that is exactly how a leftover fixture turns into an
+# "Access to the path … is denied" at Step 7 that looks nothing like its cause.
+# We hold the run lock, so anything still running OUR fixture path is a leftover.
+$PreflightKills = Stop-OurFixtures (Join-Path $OutDir "$Fmt\testfixture.exe") 'pre-flight'
+foreach ($k in $PreflightKills) { Warn "[pe64] LEFTOVER FIXTURE: $k" }
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $log = Join-Path $Work 'compile.log'
@@ -604,6 +693,93 @@ function Get-FilesAfter($corpusFiles, $boundary) {
   foreach ($f in $corpusFiles) { if ([string]::CompareOrdinal($f, $boundary) -gt 0) { $out.Add($f) } }
   return $out
 }
+
+# ── process hygiene ──────────────────────────────────────────────────────────
+# Scoped to OUR EXACT fixture binary path — never to the image name. A developer's
+# own testfixture.exe, or one belonging to a different checkout, is never touched.
+# This is only safe because the run lock guarantees we are the sole invocation on
+# this work tree: any process still running THIS path is, by construction, a
+# leftover of a run that is already over.
+function Get-OurFixtureProcesses($fixturePath) {
+  $hits = New-Object 'System.Collections.Generic.List[object]'
+  if (-not $fixturePath) { return $hits }
+  $want = [System.IO.Path]::GetFullPath($fixturePath)
+  foreach ($p in (Get-Process -Name ([System.IO.Path]::GetFileNameWithoutExtension($fixturePath)) -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $p.Path } catch { $path = $null }   # access denied on foreign processes
+    if ($path -and ([System.IO.Path]::GetFullPath($path) -eq $want)) { $hits.Add($p) }
+  }
+  return $hits
+}
+# Kill every leftover of OUR fixture and return one report line per kill (never
+# silent — a killed process is a fact the verdict has to carry).
+function Stop-OurFixtures($fixturePath, $why) {
+  $killed = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($p in (Get-OurFixtureProcesses $fixturePath)) {
+    $desc = "pid $($p.Id) (started $($p.StartTime.ToString('s')))"
+    try { $p.Kill(); [void]$p.WaitForExit(15000); $killed.Add("$why — killed $desc") }
+    catch { $killed.Add("$why — FAILED to kill ${desc}: $($_.Exception.Message)") }
+  }
+  return $killed
+}
+
+# Run ONE fixture segment: stdin at EOF, stdout+stderr to $logPath, killed if it
+# stalls (no log growth for $stall s) or exceeds an absolute cap.
+#
+# stdin is closed deliberately. It is NOT the fix for anything observed — the
+# "aborted fixture drops into the Tcl REPL and blocks on stdin" theory was TESTED
+# and REFUTED: tclsqlite.c's TCLSH_MAIN evaluates its mainloop script, takes the
+# `source $argv0` branch whenever $argv is non-empty, and on error prints errorInfo
+# and `return 1`; the `while {![eof stdin]}` REPL is reachable only with NO script
+# argument. Measured: with stdin an open pipe that is never written and never
+# closed, an aborted fixture still exits rc=1 in 8.8 s. Closing stdin is kept as
+# cheap hardening (tester.tcl's own `--pause` does read stdin) — not as a cure.
+function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap) {
+  $emptyIn = Join-Path ([System.IO.Path]::GetDirectoryName($logPath)) '.stdin-eof'
+  Set-Content -LiteralPath $emptyIn -Value '' -NoNewline -Encoding ascii
+  $sp = @{
+    FilePath = $exe; ArgumentList = $argv; WorkingDirectory = $workdir
+    RedirectStandardOutput = $logPath; RedirectStandardError = $errPath
+    RedirectStandardInput = $emptyIn; NoNewWindow = $true; PassThru = $true
+  }
+  $p = Start-Process @sp
+  $t0 = Get-Date; $lastLen = -1L; $lastGrow = Get-Date; $killReason = ''
+  while (-not $p.HasExited) {
+    Start-Sleep -Seconds 5
+    if ($p.HasExited) { break }
+    $len = 0L
+    try { $len = (Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue).Length } catch { $len = $lastLen }
+    if ($len -ne $lastLen) { $lastLen = $len; $lastGrow = Get-Date }
+    elseif ($stall -gt 0 -and ((Get-Date) - $lastGrow).TotalSeconds -ge $stall) {
+      $killReason = "produced no output for $stall s (DSS_SEGMENT_STALL)"; break
+    }
+    if ($cap -gt 0 -and ((Get-Date) - $t0).TotalSeconds -ge $cap) {
+      $killReason = "exceeded the absolute cap of $cap s (DSS_SEGMENT_TIMEOUT)"; break
+    }
+  }
+  if ($killReason) {
+    try { $p.Kill($true) } catch { try { $p.Kill() } catch {} }   # $true = whole tree
+    [void]$p.WaitForExit(30000)
+    # SETTLE. MEASURED (on the .sh twin): without this the very next segment dies at
+    # tester.tcl's startup `reset_db` with `error deleting "test.db": permission
+    # denied` — the killed fixture's handle is still open, so the harness
+    # manufactures its own next failure and burns the resume budget on it. Bounded,
+    # and only on this path.
+    $s = 0
+    while ($s -lt $KillSettle -and (Get-OurFixtureProcesses $exe).Count -gt 0) { Start-Sleep -Seconds 1; $s++ }
+    Start-Sleep -Seconds 2
+  }
+  $p.WaitForExit()
+  # stderr is appended to the segment log: the Tcl traceback the parser reads is
+  # written there, and it is emitted once, at the very end — the same place it sits
+  # in a merged stream. A clean segment writes nothing to stderr, so its log is
+  # unchanged from what this harness has always produced.
+  if ((Test-Path $errPath) -and (Get-Item $errPath).Length -gt 0) {
+    Add-Content -LiteralPath $logPath -Value (Get-Content -Raw -LiteralPath $errPath)
+  }
+  Remove-Item -LiteralPath $emptyIn -ErrorAction SilentlyContinue
+  return @{ Rc = $p.ExitCode; KillReason = $killReason; Seconds = ((Get-Date) - $t0).TotalSeconds }
+}
 # <<< dss:corpus-engine <<<
 
 # ── Step 8 — run the .test UNIT CORPUS through the fixture ────────────────────
@@ -637,6 +813,9 @@ $segments   = @(@{ Kind = 'tier'; Args = @($TestFile); Patterns = @(); Label = "
 $results    = @()          # one Read-CorpusSegment record per segment actually run
 $aborts     = @()          # one record per abort — these NEVER disappear from the verdict
 $notReached = @()          # units we can prove were never given a chance
+$hygiene    = @()          # leftover/killed fixture processes — never silent
+foreach ($k in $PreflightKills) { $hygiene += $k }
+if ($LockStolen) { $hygiene += "took over a STALE run lock left by $LockStolen" }
 $resumes    = 0
 $lastBoundary = ''
 $oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
@@ -649,23 +828,28 @@ while ($si -lt $segments.Count) {
   else {
     Info "[pe64] segment $($si + 1): $($seg.Label)$(if ($seg.Patterns.Count) { "  (SQLITE_TEST_PATTERN_LIST: $($seg.Patterns.Count) candidate file(s))" })"
   }
-  Push-Location $rundir
   try {
     $env:PATH = $runEnvPath; if (Test-Path $TclLibrary) { $env:TCL_LIBRARY = $TclLibrary }
     if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
     # SQLITE_TEST_PATTERN_LIST is a Tcl LIST of globs; corpus basenames are
     # bare words, so a space join is a valid list.
     if ($seg.Patterns.Count) { $env:SQLITE_TEST_PATTERN_LIST = ($seg.Patterns -join ' ') } else { $env:SQLITE_TEST_PATTERN_LIST = $null }
-    $segArgs = @($seg.Args)
-    & $fixture @segArgs *>&1 | Tee-Object -FilePath $log | Out-Null
-    $segRc = $LASTEXITCODE
+    $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap
+    $segRc = $run.Rc
   } finally {
     $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
-    Pop-Location
+  }
+  if ($run.KillReason) { Warn "[pe64] segment $($si + 1) HUNG — killed: $($run.KillReason)"; $hygiene += "segment $($si + 1) TIMED OUT and was killed — $($run.KillReason)" }
+  # POST-SEGMENT HYGIENE — a segment that spawned or left a fixture behind must not
+  # carry its file handles into the next one (the abort class this engine exists for
+  # is a leaked handle), nor outlive the run.
+  foreach ($k in (Stop-OurFixtures $fixture "after segment $($si + 1)")) {
+    Warn "[pe64] LEFTOVER FIXTURE: $k"; $hygiene += $k
   }
   $res = Read-CorpusSegment $log
   $res.Log = $log; $res.Rc = $segRc; $res.Label = $seg.Label; $res.Kind = $seg.Kind
+  $res.KillReason = $run.KillReason
   $results += $res
   $si++
   if ($res.Summary) {
@@ -685,6 +869,22 @@ while ($si -lt $segments.Count) {
   $perm     = $res.Permutation
   if (-not $perm -and $seg.Perm) { $perm = $seg.Perm }
   if (-not $perm -and $TierPerms.Count -eq 1) { $perm = $TierPerms[0] }
+  # A KILLED segment (stall/cap) has NO Tcl traceback at all — and that is precisely
+  # when resume matters most, so the traceback cannot be the only source. Fall back
+  # to the permutation PREFIX sqlite stamps on every test name (`<perm>.<test>`,
+  # run_tests -prefix), then — for an initial tier segment that never showed ANY
+  # later permutation's prefix — to the tier's first permutation (all.test's first
+  # suite, `full`, is the one declared with -prefix "").
+  $permInferred = ''
+  if (-not $perm -and $res.LastTest) {
+    foreach ($p in $TierPerms) {
+      if ($res.LastTest.StartsWith("$p.", [System.StringComparison]::Ordinal)) { $perm = $p; $permInferred = 'from the test-name prefix'; break }
+    }
+  }
+  if (-not $perm -and $res.LastTest -and $seg.Kind -eq 'tier' -and -not $seg.Perm -and $TierPerms.Count -gt 0) {
+    $perm = $TierPerms[0]
+    $permInferred = "INFERRED — no permutation prefix ever appeared, so the run never left '$($TierPerms[0])', the tier's first suite"
+  }
   $abortFile = Resolve-AbortFile $res.LastTest $CorpusFiles
   # The boundary must STRICTLY advance every resume, or an aborting file could be
   # re-entered forever. If the aborting file could not be named (or is not past the
@@ -701,9 +901,11 @@ while ($si -lt $segments.Count) {
   $aborts += @{
     Segment = $si; Perm = $perm; File = $abortFile; LastDone = $lastDone
     LastTest = $res.LastTest; Rc = $segRc; Log = $log; Boundary = $boundary
+    KillReason = $run.KillReason
   }
-  Warn "[pe64] ABORT #$($aborts.Count) — segment $si ('$($seg.Label)') exited rc=$segRc with NO summary line"
-  Info  "        permutation        : $(if ($perm) { $perm } else { '(UNDETERMINED)' })"
+  $how = if ($run.KillReason) { "was KILLED after it $($run.KillReason)" } else { "exited rc=$segRc with NO summary line" }
+  Warn "[pe64] ABORT #$($aborts.Count) — segment $si ('$($seg.Label)') $how"
+  Info  "        permutation        : $(if ($perm) { $perm } else { '(UNDETERMINED)' })$(if ($permInferred) { "   [$permInferred]" })"
   Info  "        last file completed: $(if ($lastDone) { $lastDone } else { '(none)' })"
   Info  "        died inside file   : $(if ($abortFile) { $abortFile } else { '(unresolved)' })   last test: $(if ($res.LastTest) { $res.LastTest } else { '(none)' })"
   # The unit that died NEVER goes unreported — named when we can name it, described
@@ -774,8 +976,9 @@ foreach ($r in $results) {
   $led.Add("   log: $($r.Log)")
   $led.Add("   files completed ($($r.Completed.Count)): $($r.Completed -join ' ')")
 }
-if ($aborts.Count)     { $led.Add(""); $led.Add("== aborts =="); foreach ($a in $aborts) { $led.Add("   segment $($a.Segment): permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })' after test '$($a.LastTest)' (rc=$($a.Rc)) -> $($a.Log)") } }
+if ($aborts.Count)     { $led.Add(""); $led.Add("== aborts =="); foreach ($a in $aborts) { $led.Add("   segment $($a.Segment): permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })' after test '$($a.LastTest)' ($(if ($a.KillReason) { "KILLED: $($a.KillReason)" } else { "rc=$($a.Rc)" })) -> $($a.Log)") } }
 if ($notReached.Count) { $led.Add(""); $led.Add("== NOT REACHED (no verdict) =="); foreach ($n in $notReached) { $led.Add("   $n") } }
+if ($hygiene.Count)    { $led.Add(""); $led.Add("== process hygiene =="); foreach ($h in $hygiene) { $led.Add("   $h") } }
 if ($TierExcludes.Count) { $led.Add(""); $led.Add("== EXCLUDED by operator (DSS_TIER_EXCLUDES -> QUICKTEST_OMIT) =="); $led.Add("   $($TierExcludes -join ' ')") }
 Set-Content -LiteralPath $Ledger -Value $led
 
@@ -808,6 +1011,12 @@ if ($aborts.Count) {
   Warn "[pe64] corpus FAIL — $summaryText; $($real.Count) GENUINE DSS failure(s): $($real -join ' ')"
   if ($confound.Count) { Info "      (+$($confound.Count) known confound(s) ignored: $($confound -join ' '))" }
 }
+# A killed zombie / stolen stale lock is a fact about THIS run, not a footnote — it
+# rides on the verdict even when the corpus itself came back clean.
+if ($hygiene.Count) {
+  $unitVerdict += "  [PROCESS HYGIENE: $($hygiene.Count) event(s) — $($hygiene -join '; ')]"
+  foreach ($h in $hygiene) { Warn "[pe64] HYGIENE: $h" }
+}
 # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
 if ($notReached.Count -and -not $aborts.Count) {
   $unitVerdict += "  [NOT FULL COVERAGE: $($notReached.Count) unit group(s) NOT REACHED — see $Ledger]"
@@ -831,12 +1040,17 @@ Info "tier     : $Tier.test   outputs: $Work"
 Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every `$allquicktests-derived permutation, still run under 'full')" } else { '(none — the full tier ran)' })"
 # Only printed when there is something to say: a clean single-segment run leaves
 # this block byte-identical to what it always was.
-if ($results.Count -gt 1 -or $aborts.Count -or $notReached.Count) {
+if ($results.Count -gt 1 -or $aborts.Count -or $notReached.Count -or $hygiene.Count) {
   Info "segments : $($results.Count) ($resumes resume(s) of max $MaxResumes)   $filesDone test file(s) completed   ledger: $Ledger"
-  foreach ($a in $aborts) { Info "aborted  : permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })' — its remaining cases did NOT run  ($($a.Log))" }
+  foreach ($a in $aborts) { Info "aborted  : permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })'$(if ($a.KillReason) { " [KILLED: $($a.KillReason)]" }) — its remaining cases did NOT run  ($($a.Log))" }
   foreach ($n in $notReached) { Info "NOT RUN  : $n" }
+  foreach ($h in $hygiene)    { Info "hygiene  : $h" }
 }
 Info "pe64 ($Spec): compiled   units: $unitVerdict"
+# Release the run lock. Correctness does NOT depend on this — the lock is
+# liveness-based, so a run that dies here just leaves one the next invocation
+# steals and reports. Releasing simply keeps that report quiet when it should be.
+Remove-Item -Recurse -Force $LockDir -ErrorAction SilentlyContinue
 if ($unitFail) { Write-Host "`n [X] pe64 leg had genuine unit failures (non-confound) — the corpus is not green." -ForegroundColor Red; exit 1 }
 Pass "pe64 leg compiled the full-source testfixture + ran the $Tier unit corpus GREEN"
 exit 0
