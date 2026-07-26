@@ -36,6 +36,9 @@
 #      (DSS_TIER: veryquick[default] | quick | full | all), parse
 #      "N errors out of M tests", classify failures against the documented
 #      non-DSS confounds. GREEN = every failure is a known confound.
+#      DSS_TIER_EXCLUDES drops known-upstream-broken .test FILES from the tier
+#      through sqlite's own QUICKTEST_OMIT hook — a documented coverage reduction
+#      that is reported in the verdict, never a way to silence an aborted run.
 #   9. summarise + exit non-zero on any genuine failure / compile miss / crash.
 #
 # DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
@@ -108,7 +111,7 @@
 #
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
 #                      DSS_TIER  DSS_CONFIG  DSS_TEST_FILE  DSS_CONFOUNDS
-#                      TCL_DLL  ZLIB_DLL  TCL_LIBRARY
+#                      DSS_TIER_EXCLUDES  TCL_DLL  ZLIB_DLL  TCL_LIBRARY
 
 $ErrorActionPreference = 'Stop'
 
@@ -139,6 +142,42 @@ $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # the recover-fault OOM-oracle class.
 $Confounds    = if ($env:DSS_CONFOUNDS) { $env:DSS_CONFOUNDS -split '\s+' } `
                 else { @('^walsetlk-', '^walsetlk\.', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
+# DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
+# tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
+# read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
+# matched against each test file's tail name and subtracted from `$allquicktests`,
+# the set every permutation in all.test is derived from EXCEPT `full` (which uses
+# `$alltests`). So an excluded file still runs ONCE, under `full`, and is dropped
+# from the derived permutations. MEASURED effect of the default below: -1 file from
+# quick / inmemory_journal / memsubsys1 / memsubsys2 / no_mutex_try, 0 from full,
+# 0 from veryquick / journaltest / prepare / mmap (which never listed it) — an
+# exact, verifiable subtraction, no collateral.
+#
+# THIS IS A COVERAGE REDUCTION AND IS REPORTED AS ONE: the patterns are echoed
+# before the run, carried into $unitVerdict, and printed in Step 9, so no result
+# can be read as "the whole corpus ran". It does NOT silence an abort — a run that
+# still fails to produce a summary line is still FAIL.
+#
+# DEFAULT — `all` tier only, swarmvtabfault.test:
+#   [D-SQLITE-PE64-ALL-TIER-OOM-FILE-HANDLE-LEAK] under the `inmemory_journal`
+#   permutation this file ABORTS the entire fixture at
+#   `swarmvtabfault-1.1-oom-persistent.143` with `error deleting "test.db2":
+#   permission denied` (after ~3.58M passing tests and ZERO wrong answers). It is
+#   an UPSTREAM sqlite-on-Windows defect, not a DSS one — a native gcc-built
+#   testfixture driven through the same tier fails at the SAME test, same
+#   iteration, with a byte-identical traceback and identical OOM fault schedules.
+#   Root cause: ext/misc/unionvtab.c ignores sqlite3_close()'s return at three
+#   sites (~470 unionCloseSources, ~488 unionDisconnect, ~688 unionOpenDatabase),
+#   each followed by `pSrc->db = 0`; sqlite3_close() returns SQLITE_BUSY and leaves
+#   the handle OPEN when statements are unfinalized — exactly the state an
+#   OOM-aborted teardown leaves — so the connection becomes unreachable and Windows
+#   then refuses to delete the file. Linux unlink() succeeds on open files, which
+#   is why upstream CI never sees it.
+#   The abort kills every permutation AFTER inmemory_journal (~7 of 26), so without
+#   this exclusion the `all` tier reports nothing at all about them.
+$TierExcludes = if ($null -ne $env:DSS_TIER_EXCLUDES) { @($env:DSS_TIER_EXCLUDES -split '\s+' | Where-Object { $_ }) } `
+                elseif ($Tier -eq 'all') { @('^swarmvtabfault\.test$') } `
+                else { @() }
 # pe64 resolve-library targets: DLLs with export tables (NOT import .libs).
 # git-for-Windows ships a full Tcl 8.6 + zlib runtime; override if you have a
 # dedicated Tcl dev kit (Magicsplat/ActiveTcl).
@@ -421,13 +460,26 @@ $runEnvPath = (Split-Path $TclDll) + ';' + (Split-Path $ZlibDll) + ';' + $env:PA
 $rundir = Join-Path $Work 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
 New-Item -ItemType Directory -Force -Path $rundir | Out-Null
 $runlog = Join-Path $Work 'corpus.log'
+# Tier exclusions — announced BEFORE the run so the reduction is on the record even
+# if the fixture never reaches a summary (see $TierExcludes above).
+if ($TierExcludes.Count) {
+  Warn "[pe64] tier EXCLUSIONS active — this run is NOT full-corpus coverage"
+  Info "      QUICKTEST_OMIT=$($TierExcludes -join ',')  (sqlite's own hook, test/permutations.test)"
+  Info "      drops these file(s) from every `$allquicktests-derived permutation (still run under 'full'):"
+  Info "        $($TierExcludes -join ' ')  -- D-SQLITE-PE64-ALL-TIER-OOM-FILE-HANDLE-LEAK (upstream ext/misc/unionvtab.c handle leak)"
+}
 Info "[pe64] running $Tier.test via $([System.IO.Path]::GetFileName($fixture)) …"
-$oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
+$oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY; $oldOmit = $env:QUICKTEST_OMIT
 Push-Location $rundir
 try {
   $env:PATH = $runEnvPath; if (Test-Path $TclLibrary) { $env:TCL_LIBRARY = $TclLibrary }
+  if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
   & $fixture $TestFile *>&1 | Tee-Object -FilePath $runlog | Out-Null
-} finally { $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib; Pop-Location }
+} finally {
+  $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib
+  if ($null -eq $oldOmit) { Remove-Item Env:QUICKTEST_OMIT -ErrorAction SilentlyContinue } else { $env:QUICKTEST_OMIT = $oldOmit }
+  Pop-Location
+}
 
 $summary  = (Get-Content $runlog | Select-String -Pattern '(\d+) errors? out of (\d+) tests' | Select-Object -Last 1)
 # The testfixture reports failures two ways: the canonical "Failures on these
@@ -467,6 +519,12 @@ if (-not $summary) {
     if ($confound.Count) { Info "      (+$($confound.Count) known confound(s) ignored: $($confound -join ' '))" }
   }
 }
+# The exclusion rides along on EVERY verdict — pass and fail alike — so a GREEN
+# line can never be read as "the whole corpus ran".
+if ($TierExcludes.Count) {
+  $unitVerdict += "  [NOT FULL COVERAGE: $($TierExcludes.Count) file pattern(s) EXCLUDED from the $Tier tier via QUICKTEST_OMIT -- $($TierExcludes -join ' ') -- D-SQLITE-PE64-ALL-TIER-OOM-FILE-HANDLE-LEAK]"
+  Warn "[pe64] the verdict above covers a REDUCED corpus: $($TierExcludes -join ' ') excluded from every `$allquicktests-derived permutation."
+}
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
 Step '9/9  Results'
@@ -474,6 +532,7 @@ Info "compiler : $DssBin @ $dssHead"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
 Info "tier     : $Tier.test   outputs: $Work"
+Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (QUICKTEST_OMIT; dropped from every `$allquicktests-derived permutation, still run under 'full')" } else { '(none — the full tier ran)' })"
 Info "pe64 ($Spec): compiled   units: $unitVerdict"
 if ($unitFail) { Write-Host "`n [X] pe64 leg had genuine unit failures (non-confound) — the corpus is not green." -ForegroundColor Red; exit 1 }
 Pass "pe64 leg compiled the full-source testfixture + ran the $Tier unit corpus GREEN"

@@ -52,7 +52,8 @@
 # line) + the emitted binary, never `$?` (probe a6b65f8b).
 #
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
-#                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  ARM64_LIBDIR
+#                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
+#                      ARM64_LIBDIR
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -100,6 +101,24 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # values, so it is a GENUINE release-optimizer fp miscompile [D-OPT-SQLITE-FPCONV1-
 # RELEASE-FP-MISCOMPILE] the harness MUST flag red until fixed.)
 DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$}"
+# DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
+# tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
+# read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
+# matched against each test file's tail name and subtracted from `$allquicktests`,
+# the set every permutation in all.test is derived from EXCEPT `full` (which uses
+# `$alltests`, so an excluded file still runs ONCE there). A confound EXPLAINS a
+# failing test; an exclusion REMOVES a file from the run — a real coverage
+# reduction, so it is echoed before the run and appended to every leg's verdict in
+# Step 9. It is never a way to make an aborted run look green: a leg with no
+# summary line is still FAIL.
+#
+# DEFAULT EMPTY on these legs, deliberately. The one file the pe64 harness excludes
+# by default (swarmvtabfault.test, [D-SQLITE-PE64-ALL-TIER-OOM-FILE-HANDLE-LEAK] —
+# ext/misc/unionvtab.c ignores sqlite3_close()'s SQLITE_BUSY return and leaks the
+# connection, so Windows refuses to delete test.db2) is broken ONLY on Windows:
+# POSIX unlink() succeeds on an open file, so the leaked handle is invisible here
+# and `all` runs the file green. Excluding it here would forfeit real coverage.
+DSS_TIER_EXCLUDES="${DSS_TIER_EXCLUDES:-}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 HOST_OS=""
@@ -564,6 +583,18 @@ step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failur
 TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
 [[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
 read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
+# Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
+# reduction is on the record even if a leg never reaches a summary line, and
+# carried into every leg's Step-9 verdict via $EXCL_NOTE.
+read -r -a EXCLUDE_PATTERNS <<< "$DSS_TIER_EXCLUDES"
+EXCL_NOTE=""
+if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
+  QUICKTEST_OMIT="$(IFS=,; printf '%s' "${EXCLUDE_PATTERNS[*]}")"; export QUICKTEST_OMIT
+  EXCL_NOTE="  [NOT FULL COVERAGE: ${#EXCLUDE_PATTERNS[@]} file pattern(s) EXCLUDED from the $DSS_TIER tier via QUICKTEST_OMIT -- ${EXCLUDE_PATTERNS[*]}]"
+  warn "tier EXCLUSIONS active — this is NOT full-corpus coverage"
+  info "      QUICKTEST_OMIT=$QUICKTEST_OMIT  (sqlite's own hook, test/permutations.test)"
+  info "      drops these file(s) from every \$allquicktests-derived permutation (still run under 'full'): ${EXCLUDE_PATTERNS[*]}"
+fi
 declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
 UNIT_FAILS=0
 run_leg() {                    # run_leg <leg> <bin> <args...>
@@ -681,10 +712,17 @@ printf '   compiler : %s @ %s\n' "$DSS_BIN" "$(git -C "$SRC_DIR" rev-parse --sho
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
+if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
+  printf '   excluded : %s   (QUICKTEST_OMIT; dropped from every $allquicktests-derived permutation, still run under '\''full'\'')\n' "${EXCLUDE_PATTERNS[*]}"
+else
+  printf '   excluded : (none — the full tier ran)\n'
+fi
 for leg in "${LEG_ORDER[@]}"; do
   spec="${LEG_SPEC[$leg]}"
   if [[ "${COMPILE_OK[$leg]:-0}" == "1" ]]; then
-    printf '   %-6s (%s): %scompiled%s   units: %s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}"
+    # $EXCL_NOTE rides along on EVERY verdict — pass and fail alike — so a GREEN
+    # line can never be read as "the whole corpus ran".
+    printf '   %-6s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
   else
     printf '   %-6s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
   fi
