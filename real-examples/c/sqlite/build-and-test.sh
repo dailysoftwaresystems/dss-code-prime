@@ -205,6 +205,133 @@ if [[ -n "${DSS_LEGS:-}" ]]; then
   LEG_ORDER=("${_filtered[@]}")
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED-CLONE READER/WRITER LOCK
+# ─────────────────────────────────────────────────────────────────────────────
+# The output-tree lock (Step 2b) is not enough, because the two drivers SHARE one
+# sqlite checkout and consume it differently:
+#   · build-and-test.sh  runs the .test corpus DIRECTLY out of the clone, for the
+#     whole run — measured: a qemu-aarch64 fixture 2 h 14 m into full.test with
+#     /home/rafael/src/sqlite/test/full.test open.
+#   · build-and-test.ps1 fetch/checkout/pull --rebases that same clone during
+#     staging, then copies it to a Windows stage.
+# Their OUTPUT trees differ, so both output locks are free and nothing stops the
+# .ps1 from rewriting .test files under the live arm64 fixture — silently, which is
+# the same failure class as the one the output lock already closes.
+#
+# MODEL — reader/writer, because the access patterns genuinely differ:
+#   WRITE  short, mutating: the .ps1's whole staging step; the .sh's Steps 3-7
+#          (clone_or_update pulls, configure/make generate sources, Step 6 writes
+#          $BLD/zinc INSIDE the clone).
+#   READ   long, read-only: the .sh's Step 8 corpus run (hours). The .sh takes the
+#          write lock first and DOWNGRADES to a read marker before Step 8, so the
+#          hours-long window blocks a mutator without blocking another reader.
+#
+# A live holder FAILS LOUD; it does not block. Deliberate: these runs are unattended
+# for hours, and silently waiting 2.5 h is a worse outcome than a refusal that names
+# the holder and its age. Staleness is liveness-based (PID + start marker), so a
+# crashed run never wedges the next one — its lock is stolen and the theft REPORTED.
+#
+# The lock state lives OUTSIDE the clone (never write into a checkout the harness
+# also pulls), keyed on the clone's real path so both drivers derive the same key.
+#
+# >>> dss:clone-lock >>>  (self-contained on purpose: build-and-test.ps1 EXTRACTS
+# this region by these sentinels and injects it into its WSL staging script, so both
+# drivers run literally the same lock code and cannot drift. Use only printf/exit
+# here — the .sh's step/info/warn/die helpers do not exist in that context.)
+DSS_CLONE_LOCK_DIR=""; DSS_CLONE_ROLE=""; DSS_CLONE_NOTES=""
+dss_clone_lock_key() {         # dss_clone_lock_key <clone-path>
+  local p; p="$(cd "$1" 2>/dev/null && pwd -P)" || p="$1"
+  printf '%s/dss-code-prime/clone-locks/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" \
+    "$(printf '%s' "$p" | tr -c 'A-Za-z0-9._-' '_')"
+}
+dss_proc_marker() { ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true; }
+dss_holder_alive() {           # dss_holder_alive <owner-file>
+  [[ -f "$1" ]] || return 1
+  local pid mark
+  pid="$(sed -n '1p' "$1" 2>/dev/null || true)"
+  mark="$(sed -n '2p' "$1" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && [[ "$(dss_proc_marker "$pid")" == "$mark" ]]
+}
+dss_holder_desc() {            # dss_holder_desc <owner-file>  — names it AND its age
+  local pid since what now age
+  pid="$(sed -n '1p' "$1" 2>/dev/null || true)"
+  since="$(sed -n '3p' "$1" 2>/dev/null || true)"
+  what="$(sed -n '4p' "$1" 2>/dev/null || true)"
+  now="$(date +%s)"
+  case "$since" in ''|*[!0-9]*) since="$now" ;; esac   # a corrupt marker must not abort the run
+  age=$(( now - since ))
+  printf 'pid %s — %s — holding for %dh%02dm' "${pid:-?}" "${what:-unknown}" "$((age / 3600))" "$(((age % 3600) / 60))"
+}
+dss_write_owner() {            # dss_write_owner <what> <owner-file>
+  printf '%s\n%s\n%s\n%s\n' "$$" "$(dss_proc_marker $$)" "$(date +%s)" "$1" > "$2"
+}
+dss_clone_lock_fail() {        # dss_clone_lock_fail <headline> <clone> <holder-desc>
+  printf 'DSS-CLONE-LOCK-BLOCKED\n' >&2
+  printf '\n [X] ERROR: %s\n' "$1" >&2
+  printf '      clone  : %s\n' "$2" >&2
+  printf '      held by: %s\n' "$3" >&2
+  printf '      Both drivers share this checkout: build-and-test.sh runs the .test corpus\n' >&2
+  printf '      DIRECTLY out of it for its whole run, while build-and-test.ps1 fetch/pull/\n' >&2
+  printf '      checkouts it during staging. Running both at once rewrites .test files under\n' >&2
+  printf '      a live fixture — silently, and the corrupted run still reports a verdict.\n' >&2
+  printf '      Wait for the holder above, or point this run at a different checkout:\n' >&2
+  printf '        .sh   SQLITE_DIR=/path/to/another/sqlite\n' >&2
+  printf '        .ps1  $env:SQLITE_WSL_DIR=/path/to/another/sqlite\n' >&2
+  exit 3
+}
+dss_clone_lock_write() {       # dss_clone_lock_write <clone-path> <what>
+  local ld w r live="" tries=0
+  ld="$(dss_clone_lock_key "$1")"; w="$ld/w.lock"
+  mkdir -p "$ld/readers"
+  while ! mkdir "$w" 2>/dev/null; do
+    dss_holder_alive "$w/owner" && \
+      dss_clone_lock_fail "another dss harness run is MUTATING this sqlite clone" "$1" "$(dss_holder_desc "$w/owner")"
+    DSS_CLONE_NOTES="${DSS_CLONE_NOTES}stole a STALE clone WRITE lock (its holder is gone); "
+    rm -rf "$w"
+    tries=$((tries + 1))
+    [[ $tries -lt 3 ]] || dss_clone_lock_fail "could not take the clone write lock after 3 attempts" "$1" "see $w"
+  done
+  dss_write_owner "$2" "$w/owner"
+  # drain readers: a long corpus run holds the clone read-only for hours
+  for r in "$ld/readers"/*.reader; do
+    [[ -e "$r" ]] || continue
+    if dss_holder_alive "$r"; then live="$live$(dss_holder_desc "$r"); "
+    else DSS_CLONE_NOTES="${DSS_CLONE_NOTES}removed a STALE clone READ marker (${r##*/}); "; rm -f "$r"; fi
+  done
+  if [[ -n "$live" ]]; then
+    rm -rf "$w"
+    dss_clone_lock_fail "this sqlite clone is being READ by a corpus run in progress" "$1" "$live"
+  fi
+  DSS_CLONE_LOCK_DIR="$ld"; DSS_CLONE_ROLE=write
+}
+dss_clone_lock_read() {        # dss_clone_lock_read <clone-path> <what>  (may downgrade)
+  local ld w; ld="$(dss_clone_lock_key "$1")"; w="$ld/w.lock"
+  mkdir -p "$ld/readers"
+  if [[ "$DSS_CLONE_ROLE" != write ]]; then
+    dss_holder_alive "$w/owner" && \
+      dss_clone_lock_fail "another dss harness run is MUTATING this sqlite clone" "$1" "$(dss_holder_desc "$w/owner")"
+    [[ ! -d "$w" ]] || { DSS_CLONE_NOTES="${DSS_CLONE_NOTES}stole a STALE clone WRITE lock (its holder is gone); "; rm -rf "$w"; }
+  fi
+  dss_write_owner "$2" "$ld/readers/$$.reader"
+  if [[ "$DSS_CLONE_ROLE" == write ]]; then
+    rm -rf "$w"                                  # downgrade: marker first, then release
+  elif dss_holder_alive "$w/owner"; then         # a writer won the race — back out
+    rm -f "$ld/readers/$$.reader"
+    dss_clone_lock_fail "a mutating run took this sqlite clone first" "$1" "$(dss_holder_desc "$w/owner")"
+  fi
+  DSS_CLONE_LOCK_DIR="$ld"; DSS_CLONE_ROLE=read
+}
+dss_clone_lock_release() {
+  [[ -n "$DSS_CLONE_LOCK_DIR" ]] || return 0
+  case "$DSS_CLONE_ROLE" in
+    write) rm -rf "$DSS_CLONE_LOCK_DIR/w.lock" ;;
+    read)  rm -f  "$DSS_CLONE_LOCK_DIR/readers/$$.reader" ;;
+  esac
+  DSS_CLONE_ROLE=""
+}
+# <<< dss:clone-lock <<<
+
 # ── logging / fail-loud ──────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   C_RST=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_BLU=$'\033[34;1m'
@@ -347,6 +474,12 @@ info "run lock: $LOCK_DIR (pid $$)"
 
 # ── Step 3 — sqlite ──────────────────────────────────────────────────────────
 step "3/9  Fetch sqlite/sqlite -> $SQLITE_DIR (default branch)"
+# Take the clone WRITE lock before the first thing that mutates it (the pull), and
+# release it however this script ends. Steps 3-7 all mutate: clone_or_update pulls,
+# configure/make generate sources, Step 6 writes $BLD/zinc inside the checkout.
+trap dss_clone_lock_release EXIT
+dss_clone_lock_write "$SQLITE_DIR" "$(basename "$0") staging/build — tier $DSS_TIER, legs ${LEG_ORDER[*]}"
+info "clone lock: WRITE on $SQLITE_DIR  ($DSS_CLONE_LOCK_DIR)"
 clone_or_update "$SQLITE_REPO_URL" "$SQLITE_DIR" ""
 [[ -f "$SQLITE_DIR/test/$DSS_TIER.test" || -n "${DSS_TEST_FILE:-}" ]] || \
   die "tier '$DSS_TIER' has no $SQLITE_DIR/test/$DSS_TIER.test (expected veryquick|quick|full|all)."
@@ -657,6 +790,11 @@ done
 
 # ── Step 8 — run the .test UNIT CORPUS through each leg's fixture ─────────────
 step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failures"
+# DOWNGRADE the clone lock: everything from here is READ-ONLY on the checkout (the
+# fixture sources .test files straight out of it) but it lasts for HOURS. A read
+# marker blocks a mutating run without blocking a second corpus run.
+dss_clone_lock_read "$SQLITE_DIR" "$(basename "$0") corpus run — tier $DSS_TIER, legs ${LEG_ORDER[*]}"
+info "clone lock: downgraded to READ for the corpus run ($DSS_CLONE_LOCK_DIR)"
 TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
 [[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
 # The corpus directory the tier script lives in — where permutations.test and the
@@ -1033,6 +1171,7 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
   done < <(stop_our_fixtures "$bin" 'pre-flight')
   [[ -z "$LOCK_STOLEN" ]] || HYGIENE+=("took over a STALE run lock left by PID $LOCK_STOLEN")
+  [[ -z "${DSS_CLONE_NOTES:-}" ]] || HYGIENE+=("shared-clone lock: ${DSS_CLONE_NOTES%%; }")
   ps_enum_available || HYGIENE+=("leftover-fixture detection UNAVAILABLE on this host (ps(1) cannot enumerate) — a stray fixture would go unnoticed")
   seg_i=0; resumes=0; last_boundary=""; total_tests=0; total_errors=0; files_done=0
   seg_summary=""; all_fails=""

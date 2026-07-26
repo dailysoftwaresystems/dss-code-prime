@@ -120,6 +120,10 @@
 #                      TCL_DLL  ZLIB_DLL  TCL_LIBRARY
 
 $ErrorActionPreference = 'Stop'
+# WSL emits UTF-8. Without this, every non-ASCII character in a message coming back
+# from the Linux side (the shared-clone lock's operator guidance, for one) is decoded
+# with the OEM code page and reaches the console as `?`.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 # ── logging / fail-loud (mirrors the .sh's step/info/pass/warn/die) ──────────
 function Step($m) { Write-Host "`n== $m ==" -ForegroundColor Blue }
@@ -305,7 +309,9 @@ Info "run lock: $LockDir (pid $PID)"
 # ── Step 3+4 — derive the full-source recipe + stage to Windows (VIA WSL) ────
 Step '3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL)'
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+# NOTE the stage is NOT wiped here. The wipe happens inside the WSL script BELOW,
+# after the shared-clone lock is held — otherwise a run that is about to be refused
+# has already destroyed its own staged corpus on the way to the refusal.
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 $StageWsl = ToWslPath $Stage
 # The WSL derivation reproduces the .sh's Step-4 recipe logic (make -n
@@ -317,6 +323,7 @@ $StageWsl = ToWslPath $Stage
 # (via `wslpath -m`, the forward-slash Windows form the manifest wants).
 $deriveScript = @'
 set -Eeuo pipefail
+__CLONE_LOCK_REGION__
 for t in git gcc make ar tclsh; do
   command -v "$t" >/dev/null 2>&1 || {
     echo "MISSING tool: $t — install the recipe toolchain, e.g.:" >&2
@@ -325,6 +332,17 @@ for t in git gcc make ar tclsh; do
 done
 DIR="__SQLITE_WSL_DIR__"
 STAGE="__STAGE_WSL__"
+# ── SHARED-CLONE WRITE LOCK ─────────────────────────────────────────────────
+# THIS is the mutating window: the fetch/checkout/pull below rewrites the very
+# .test files a build-and-test.sh corpus run sources LIVE out of this same clone
+# for hours. Held only for staging — once the tree is copied to $STAGE the .ps1
+# touches the clone no more, so the lock is released when this script ends.
+trap dss_clone_lock_release EXIT
+dss_clone_lock_write "$DIR" "build-and-test.ps1 pe64 staging (fetch/pull + stage copy)"
+echo "CLONE-LOCK=WRITE $DSS_CLONE_LOCK_DIR"
+# Only now is anything destroyed: a run that gets refused above still has its
+# previous stage intact.
+rm -rf "$STAGE"; mkdir -p "$STAGE"
 # clone-or-update sqlite (external dependency — DOES pull)
 if [ -d "$DIR/.git" ]; then
   git -C "$DIR" fetch --all --prune --quiet || true
@@ -434,15 +452,49 @@ echo "RECIPE-TUS=$(wc -l < "$STAGE/tus.txt")"
 echo "RECIPE-DEFS=$(wc -l < "$STAGE/defines.txt")"
 echo "RECIPE-INCS=$(wc -l < "$STAGE/includes.txt")"
 echo "SQLITE-HEAD=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null)"
+echo "CLONE-LOCK-NOTES=$DSS_CLONE_NOTES"
 '@
-$deriveScript = $deriveScript.Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageWsl) -replace "`r`n", "`n"
+# The shared-clone lock is EXTRACTED from build-and-test.sh rather than copied, so
+# the two drivers run literally the same lock code against the same key and cannot
+# drift apart. Both see this clone as the same WSL path, so the keys agree.
+$shHarness = Join-Path $PSScriptRoot 'build-and-test.sh'
+if (-not (Test-Path $shHarness)) { Die "build-and-test.sh not found next to this script ($shHarness) — it is the single source of the shared-clone lock." }
+$shLines = [System.IO.File]::ReadAllLines($shHarness)
+$lockStart = -1; $lockEnd = -1
+for ($i = 0; $i -lt $shLines.Count; $i++) {
+  if ($lockStart -lt 0 -and $shLines[$i] -match '>>> dss:clone-lock >>>') { $lockStart = $i }
+  elseif ($lockStart -ge 0 -and $shLines[$i] -match '<<< dss:clone-lock <<<') { $lockEnd = $i; break }
+}
+if ($lockStart -lt 0 -or $lockEnd -lt 0) { Die "could not find the 'dss:clone-lock' region in $shHarness (start=$lockStart end=$lockEnd) — the shared-clone lock cannot be injected, and running without it lets this staging step rewrite .test files under a live corpus run." }
+$cloneLockRegion = ($shLines[($lockStart + 1)..($lockEnd - 1)]) -join "`n"
+$deriveScript = $deriveScript.Replace('__CLONE_LOCK_REGION__', $cloneLockRegion).Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageWsl) -replace "`r`n", "`n"
 $tmpSh = Join-Path $Work 'derive.sh'
-Set-Content -LiteralPath $tmpSh -Value $deriveScript -NoNewline -Encoding ascii
-$deriveOut = & wsl.exe bash -l (ToWslPath $tmpSh) 2>&1
-if ($LASTEXITCODE -ne 0) { Die "WSL recipe derivation failed:`n$($deriveOut -join "`n")" }
+# UTF-8 WITHOUT a BOM. `-Encoding ascii` (what this used to be) replaces every
+# non-ASCII character with `?` — which silently mangled the injected shared-clone
+# lock's operator-facing message. A BOM, meanwhile, would break bash on line 1.
+[System.IO.File]::WriteAllText($tmpSh, $deriveScript, (New-Object System.Text.UTF8Encoding($false)))
+# Merge stderr into stdout INSIDE bash, not with PowerShell's `2>&1`. PowerShell wraps
+# a native command's stderr in ErrorRecords, and an EMPTY stderr line then stringifies
+# to "System.Management.Automation.RemoteException" while non-ASCII bypasses the
+# console encoding and arrives as `?` — mangling exactly the operator-facing text the
+# shared-clone lock prints. On stdout it is plain UTF-8 and survives intact.
+$deriveOut = @(& wsl.exe bash -l -c "bash '$(ToWslPath $tmpSh)' 2>&1")
+if ($LASTEXITCODE -ne 0) {
+  if (($deriveOut -join "`n") -match 'DSS-CLONE-LOCK-BLOCKED') {
+    Die "the shared sqlite clone is LOCKED by another dss harness run:`n$(($deriveOut | Where-Object { $_ -notmatch 'DSS-CLONE-LOCK-BLOCKED' -and $_.Trim() }) -join "`n")"
+  }
+  Die "WSL recipe derivation failed:`n$($deriveOut -join "`n")"
+}
 function Marker($k) { ($deriveOut | Select-String -Pattern "^$k=(.+)$" | Select-Object -Last 1).Matches[0].Groups[1].Value }
 $nTus = Marker 'RECIPE-TUS'; $nDefs = Marker 'RECIPE-DEFS'; $nIncs = Marker 'RECIPE-INCS'
 $sqliteHead = Marker 'SQLITE-HEAD'
+# stale clone locks stolen during staging ride into the verdict like any other
+# hygiene event — a theft is never silent.
+$CloneLockNotes = @()
+$m = ($deriveOut | Select-String -Pattern '^CLONE-LOCK-NOTES=(.+)$' | Select-Object -Last 1)
+if ($m) { $CloneLockNotes += "shared-clone lock: $($m.Matches[0].Groups[1].Value.TrimEnd('; ',' '))" }
+foreach ($n in $CloneLockNotes) { Warn $n }
+Info "clone lock: WRITE taken + released for the staging window (the .ps1 touches the clone only here)"
 if (-not (Test-Path "$Stage\tus.txt")) { Die "recipe derivation produced no tus.txt:`n$($deriveOut -join "`n")" }
 Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
@@ -816,6 +868,7 @@ $notReached = @()          # units we can prove were never given a chance
 $hygiene    = @()          # leftover/killed fixture processes — never silent
 foreach ($k in $PreflightKills) { $hygiene += $k }
 if ($LockStolen) { $hygiene += "took over a STALE run lock left by $LockStolen" }
+foreach ($n in $CloneLockNotes) { $hygiene += $n }
 $resumes    = 0
 $lastBoundary = ''
 $oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
