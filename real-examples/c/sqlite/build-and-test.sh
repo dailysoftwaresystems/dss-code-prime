@@ -44,8 +44,13 @@
 #      documented non-DSS confounds (WAL set-lock wall-clock timing, an env
 #      error-message text diff, the OOM-oracle recover faults). GREEN = every
 #      failure is a known confound (0 genuine DSS miscompiles).
+#      The corpus runs the ORIGINAL, 100% sqlite suite: nothing is omitted by
+#      default. A fixture ABORT does not end the leg — it is detected, reported,
+#      and RESUMED past through sqlite's own `--start=` / SQLITE_TEST_PATTERN_LIST
+#      hooks so every remaining unit still reaches a verdict, while the abort
+#      itself stays on the record as a failure (see "THE CORPUS RESUME ENGINE").
 #   9. summarise + exit non-zero if any leg has a GENUINE (non-confound) unit
-#      failure, a compile miss, or a fixture crash.
+#      failure, a compile miss, a fixture abort, or a unit that never ran.
 #
 # DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
 # fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
@@ -53,7 +58,7 @@
 #
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
-#                      ARM64_LIBDIR
+#                      DSS_MAX_RESUMES  ARM64_LIBDIR
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -109,16 +114,21 @@ DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^busy2- ^zipfile-25\.0$ ^
 # `$alltests`, so an excluded file still runs ONCE there). A confound EXPLAINS a
 # failing test; an exclusion REMOVES a file from the run — a real coverage
 # reduction, so it is echoed before the run and appended to every leg's verdict in
-# Step 9. It is never a way to make an aborted run look green: a leg with no
-# summary line is still FAIL.
+# Step 9.
 #
-# DEFAULT EMPTY on these legs, deliberately. The one file the pe64 harness excludes
-# by default (swarmvtabfault.test, [D-SQLITE-PE64-ALL-TIER-OOM-FILE-HANDLE-LEAK] —
-# ext/misc/unionvtab.c ignores sqlite3_close()'s SQLITE_BUSY return and leaks the
-# connection, so Windows refuses to delete test.db2) is broken ONLY on Windows:
-# POSIX unlink() succeeds on an open file, so the leaked handle is invisible here
-# and `all` runs the file green. Excluding it here would forfeit real coverage.
+# ★★ DEFAULT EMPTY — ALWAYS, ON EVERY TIER AND EVERY LEG. The requirement is that
+# the ORIGINAL, 100% sqlite test suite runs, unmodified and with nothing omitted.
+# The mechanism survives only as an operator escape hatch. An excluded file is NOT
+# how the harness survives an aborting unit — that is the RESUME ENGINE's job
+# (Step 8): an abort is detected, reported, and resumed past via sqlite's own
+# `--start=` / SQLITE_TEST_PATTERN_LIST hooks, so every remaining unit still
+# reaches a verdict while the abort itself stays on the record as a FAILURE.
+# Excluding a file deletes coverage; resuming preserves it.
 DSS_TIER_EXCLUDES="${DSS_TIER_EXCLUDES:-}"
+# DSS_MAX_RESUMES: hard bound on how many times Step 8 may re-invoke a leg's
+# fixture after an abort. Exceeded → the harness STOPS and says so; it never
+# loops, and never masks a fixture that aborts on everything.
+DSS_MAX_RESUMES="${DSS_MAX_RESUMES:-10}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 HOST_OS=""
@@ -582,6 +592,9 @@ done
 step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failures"
 TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
 [[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
+# The corpus directory the tier script lives in — where permutations.test and the
+# ~1.3k .test units are. READ-ONLY to this harness: nothing is ever written here.
+TESTDIR_SRC="$(cd "$(dirname "$TEST_FILE")" && pwd)"
 read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
 # Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
 # reduction is on the record even if a leg never reaches a summary line, and
@@ -595,7 +608,151 @@ if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
   info "      QUICKTEST_OMIT=$QUICKTEST_OMIT  (sqlite's own hook, test/permutations.test)"
   info "      drops these file(s) from every \$allquicktests-derived permutation (still run under 'full'): ${EXCLUDE_PATTERNS[*]}"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE CORPUS RESUME ENGINE — an abort is a RECOVERABLE, REPORTED outcome
+# ─────────────────────────────────────────────────────────────────────────────
+# The harness exists so that EVERY sqlite unit reaches a verdict. Before this
+# engine, a fixture that ABORTED mid-suite (a Tcl `error` out of a test body, a
+# hard crash) produced one line — "fixture did not complete the suite (crash?)" —
+# and every test FILE behind the abort point was silently never run. One bad unit
+# cost the other thousand.
+#
+# DETECT  a segment aborted iff its log has no "N errors out of M tests" summary
+#         line. That is the STRUCTURAL fact; the engine is never keyed on a test
+#         name or iteration index (an OOM-injection abort point is a function of
+#         process-global allocation history and moves between runs).
+# LOCATE  from the log: the last COMPLETED file ("Time: <file> N ms"), the
+#         permutation ("run_tests <name>" / "run_test_suite <name>" in the Tcl
+#         traceback, or the tier's sole suite), and the ABORTING file (resolved
+#         from the last emitted test name against the real corpus file list —
+#         the traceback's own `(file "…")` frame is NOT usable: Tcl truncates it
+#         to ~200 chars, so a long path degrades it to `…/test/sw...`).
+# RESUME  in a NEW PROCESS (required, not merely convenient: a leaked handle is
+#         held for the life of the fixture process), using SQLITE'S OWN upstream
+#         hooks — no hand-rolled Tcl runner, and NOTHING is ever written into the
+#         sqlite clone (the .sh runs the corpus straight out of it):
+#           · SQLITE_TEST_PATTERN_LIST (permutations.test ~1175) — a glob list
+#             intersected with the permutation's own -files, so passing "every
+#             corpus basename after the abort point" selects exactly the
+#             permutation's remaining files without the harness ever needing to
+#             know that file set.
+#           · --start=<permutation>: (tester.tcl ~444 / slave_test_file ~2395) —
+#             re-runs THE ORIGINAL tier script, skipping every permutation before
+#             the named one, so every `ifcapable`/platform guard in all.test is
+#             evaluated by sqlite exactly as in a normal run.
+# BOUND   $DSS_MAX_RESUMES. The resume boundary is forced to advance every time,
+#         so an aborting file can never be re-entered.
+# REPORT  the UNION across segments — total tests, total errors, EVERY abort with
+#         its permutation + file, the resume count, and every unit NOT reached.
+#         An abort is itself a FAILURE line: resuming never makes it disappear,
+#         and a run with aborts is NEVER green.
+#
+# GRANULARITY (stated because it is a real, reported loss): resume restarts at the
+# next FILE. The remainder of the aborting file — the fault-injection iterations
+# after the one that died — is NOT run, and is reported as such per abort. sqlite
+# exposes no finer restart point than (permutation, file).
+#
+# >>> dss:corpus-engine >>>  (region mirrored in build-and-test.ps1; the verifier
+# extracts it from this file by these sentinels, so keep them on their own lines)
+
+# sqlite's own $alltests: every `.test` basename in the corpus dir MINUS the driver
+# scripts it excludes by name (all.test / permutations.test / …), byte-sorted — the
+# same order run_tests uses (`lsort $options(-files)`, default -ascii). The
+# exclusion list is read as DATA out of permutations.test's own
+# `set alltests [test_set $alltests -exclude { … }]` block, never hard-coded; a
+# parse miss only widens the list, and the list is used as a SUPERSET filter, so
+# the worst case is a wasted resume stepping over a non-unit.
+corpus_files() {               # corpus_files <testdir>
+  # NOTE two statements deliberately: bash expands ALL words of a `local` command
+  # before it performs any of its assignments, so `local d="$1" skip="$d/…"` reads
+  # an unset `d` (fatal under `set -u`).
+  local d="$1" f
+  local skip="$d/permutations.test"
+  { for f in "$d"/*.test; do [[ -e "$f" ]] || continue; printf '%s\n' "${f##*/}"; done; } \
+  | LC_ALL=C awk -v skipfile="$skip" '
+      BEGIN {
+        while ((getline line < skipfile) > 0) {
+          if (!inb) { if (line ~ /^[ \t]*set[ \t]+alltests[ \t]+\[test_set[ \t]+\$alltests[ \t]+-exclude[ \t]*\{/) inb=1; continue }
+          n=split(line, w, /[ \t{}\]]+/); for (i=1;i<=n;i++) if (w[i] ~ /\.test$/) skip[w[i]]=1
+          if (line ~ /\}[ \t]*\]/) break
+        } }
+      !($0 in skip)' \
+  | LC_ALL=C sort
+}
+# The tier script's permutation sequence, in order, read as DATA from sqlite's own
+# `run_test_suite <name>` lines (all.test names 27; veryquick/quick/full name one).
+tier_permutations() {          # tier_permutations <tierfile>
+  LC_ALL=C awk 'match($0, /run_test_suite[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
+      s = substr($0, RSTART, RLENGTH); sub(/^run_test_suite[ \t]+/, "", s); print s }' "$1"
+}
+# ONE streaming pass over a segment log -> a small tab-separated fact file.
+# (These logs reach 150 MB / 3.6M lines; a grep per pattern costs minutes each.)
+#   F <file>  a completed test FILE      S <text>  the summary LINE, verbatim
+#   X <name>  a failing test name        P <name>  the permutation in the traceback
+#   T <name>  the last test emitted      G         `*** Giving up` (--maxerror cap)
+#   N <n>     completed file count       D <file>  the LAST completed file
+#   E <n>     errors      C <n>          tests     (parsed out of the summary line)
+# S is the WHOLE line ("0 errors out of 9 tests on <host> …"), which is what this
+# harness has always printed — E/C carry the numbers so nothing has to re-parse it.
+# NOTE the leading '!' on the canonical failure list: finalize_testing emits
+# `!Failures on these tests: …` (tester.tcl ~1304), which a `^Failures` pattern
+# silently never matches.
+parse_segment() {              # parse_segment <log> <out-facts>
+  LC_ALL=C awk '
+    /^Time: / { if (NF==4 && $4=="ms") { print "F\t" $2; nf++; lastdone=$2; next } }
+    /^\*\*\* Giving up/ { gaveup=1; next }
+    /^!?Failures on these tests:/ {
+      line=$0; sub(/^!?Failures on these tests:[ \t]*/, "", line);
+      n=split(line, a, /[ \t]+/); for (i=1;i<=n;i++) if (a[i]!="") print "X\t" a[i]; next }
+    /^! [^ ]+ (expected|got):/ { print "X\t" $2; next }
+    match($0, /[0-9]+ errors? out of [0-9]+ tests/) {
+      summary=$0; split(substr($0, RSTART, RLENGTH), q, / /); nerr=q[1]; ntest=q[5]; next }
+    # A traceback frame is quoted, and the closing quote can abut the name
+    # (`"run_test_suite inmemory_journal"`) — take the name by MATCH, never by
+    # whitespace split, or the permutation carries a trailing `"`.
+    { line=$0; sub(/^[ \t]*"?/, "", line);
+      if (match(line, /^(run_test_suite|run_tests)[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^[A-Za-z_]+[ \t]+/, "", s); perm=s; next } }
+    /^[^ \t]+\.\.\./ { split($0, c, /\.\.\./); lasttest=c[1] }
+    END { if (summary!="") { print "S\t" summary; print "E\t" nerr+0; print "C\t" ntest+0 }
+          if (perm!="")    print "P\t" perm
+          if (lasttest!="")print "T\t" lasttest
+          if (gaveup)      print "G\t1"
+          print "N\t" nf+0; print "D\t" lastdone }
+  ' "$1" > "$2"
+}
+fact() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$2"; }
+facts() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{print $2}' "$2"; }
+# Which corpus FILE was the fixture inside when it died? The last test it emitted
+# names it: pick the corpus stem occurring RIGHTMOST in that test name on delimiter
+# boundaries (rightmost, then longest). `inmemory_journal.swarmvtabfault-1.1-oom-
+# persistent.143` -> swarmvtabfault.test (not swarmvtab.test: the 'f' after it is
+# not a delimiter; not the leading permutation token: it is left of it).
+resolve_abort_file() {         # resolve_abort_file <lasttest> <corpus-list-file>
+  [[ -n "$1" ]] || return 0
+  LC_ALL=C awk -v name="$1" '
+    { f=$0; stem=f; sub(/\.test$/,"",stem); L=length(stem)
+      off=0; s=name; best=0
+      while (1) {
+        p=index(s, stem); if (p==0) break
+        idx=off+p
+        before=(idx==1) ? "." : substr(name, idx-1, 1)
+        after =(idx+L>length(name)) ? "." : substr(name, idx+L, 1)
+        if ((before=="."||before=="-") && (after=="."||after=="-")) best=idx
+        off=idx; s=substr(name, idx+1)
+      }
+      if (best>0 && (best>bi || (best==bi && L>bl))) { bi=best; bl=L; bf=f } }
+    END { if (bf!="") print bf }' "$2"
+}
+# Every corpus basename byte-wise AFTER <boundary> — the SQLITE_TEST_PATTERN_LIST
+# superset sqlite intersects with the permutation's own -files.
+files_after() { LC_ALL=C awk -v b="$1" '$0 > b' "$2"; }
+str_gt()      { [[ "$(LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{print (a>b) ? 1 : 0}')" == 1 ]]; }
+# <<< dss:corpus-engine <<<
 declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
+# per-leg resume-engine bookkeeping, surfaced in Step 9
+declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=()
 UNIT_FAILS=0
 run_leg() {                    # run_leg <leg> <bin> <args...>
   local leg="$1" bin="$2"; shift 2
@@ -659,37 +816,186 @@ for leg in "${LEG_ORDER[@]}"; do
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
   stage_loadext_extension "$leg" "$rundir"
   runlog="$OUT_DIR/$leg/corpus.log"
-  info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
-  ( cd "$rundir" && run_leg "$leg" "$bin" "$TEST_FILE" ) > "$runlog" 2>&1 || true
-  # summary "N errors out of M tests"; the failing test names come from BOTH the
-  # canonical "Failures on these tests: …" summary AND the per-failure markers the
-  # fixture prints inline (`! <name> expected:` / `! <name> got:`). Many
-  # testfixture builds emit ONLY the inline markers and NOT the summary line, so
-  # relying on the summary alone leaves failures UNCLASSIFIED — a false RED here,
-  # and a latent false GREEN if a future edit treats empty as clean. Union + dedup.
-  summary="$(grep -E '[0-9]+ errors? out of [0-9]+ tests' "$runlog" | tail -1 || true)"
-  faillist="$(sed -n 's/^Failures on these tests:[[:space:]]*//p' "$runlog" | tail -1 || true)"
-  faillist="$faillist $(grep -oE '^! [A-Za-z0-9_.:-]+ (expected|got):' "$runlog" 2>/dev/null | sed -E 's/^! ([A-Za-z0-9_.:-]+) .*/\1/')"
-  faillist="$(printf '%s\n' $faillist | sort -u | tr '\n' ' ')"
-  if [[ -z "$summary" ]]; then
-    UNIT_VERDICT["$leg"]="FAIL:fixture did not complete the suite (crash?) — see $runlog"
-    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
-    tail -4 "$runlog" 2>/dev/null | sed 's/^/      /'; continue
-  fi
-  nerr="$(printf '%s' "$summary" | grep -oE '^[0-9]+' || echo 0)"
+  ledger="$OUT_DIR/$leg/corpus-units.txt"
+  # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the
+  # corpus straight out of it, and a stray file there breaks the next `git pull
+  # --rebase` and poisons the .ps1's staged copy of the same tree).
+  scratch="$OUT_DIR/$leg/.corpus"; rm -rf "$scratch"; mkdir -p "$scratch"
+  corpus_files "$TESTDIR_SRC" > "$scratch/files.txt"
+  tier_permutations "$TEST_FILE" > "$scratch/perms.txt"
+  declare -a TIER_PERMS=(); mapfile -t TIER_PERMS < "$scratch/perms.txt"
+
+  # >>> dss:corpus-loop >>>
+  # Segment queue, one record per fixture invocation, fields separated by US
+  # (\x1f):  kind | perm | label | patternfile | arg1 | arg2
+  # Segment 0 is EXACTLY today's invocation (`fixture <tier>.test`) so a run with
+  # no abort is bit-for-bit the run it always was; resume segments are only ever
+  # spliced in by an abort.
+  US=$'\x1f'
+  SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}$TEST_FILE${US}")
+  declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=()
+  seg_i=0; resumes=0; last_boundary=""; total_tests=0; total_errors=0; files_done=0
+  seg_summary=""; all_fails=""
+  while [[ $seg_i -lt ${#SEGQ[@]} ]]; do
+    IFS="$US" read -r s_kind s_perm s_label s_patfile s_arg1 s_arg2 <<< "${SEGQ[$seg_i]}"
+    if [[ $seg_i -eq 0 ]]; then
+      seglog="$runlog"
+      info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
+    else
+      seglog="$OUT_DIR/$leg/corpus.resume$seg_i.log"
+      info "[$leg] segment $((seg_i + 1)): $s_label$( [[ -n "$s_patfile" ]] && printf '  (SQLITE_TEST_PATTERN_LIST: %s candidate file(s))' "$(wc -l < "$s_patfile")" )"
+    fi
+    declare -a seg_argv=("$s_arg1"); [[ -n "$s_arg2" ]] && seg_argv+=("$s_arg2")
+    # SQLITE_TEST_PATTERN_LIST is a Tcl LIST of globs; corpus basenames are bare
+    # words, so a whitespace join is a valid list.
+    if [[ -n "$s_patfile" ]]; then SQLITE_TEST_PATTERN_LIST="$(tr '\n' ' ' < "$s_patfile")"; export SQLITE_TEST_PATTERN_LIST
+    else unset SQLITE_TEST_PATTERN_LIST; fi
+    # `|| segrc=$?` CAPTURES the fixture's exit status (it is not `|| true`, which
+    # would discard it) while keeping errexit/the ERR trap out of a test failure.
+    segrc=0
+    ( cd "$rundir" && run_leg "$leg" "$bin" "${seg_argv[@]}" ) > "$seglog" 2>&1 || segrc=$?
+    unset SQLITE_TEST_PATTERN_LIST
+    SEG_LOGS+=("$seglog"); SEG_LABELS+=("$s_label"); SEG_RCS+=("$segrc")
+    facts_f="$scratch/facts.$seg_i"
+    parse_segment "$seglog" "$facts_f"
+    s_sum="$(fact S "$facts_f")"; s_perm_log="$(fact P "$facts_f")"
+    s_last="$(fact T "$facts_f")"; s_done="$(fact D "$facts_f")"
+    s_nf="$(fact N "$facts_f")";   s_gaveup="$(fact G "$facts_f")"
+    files_done=$((files_done + s_nf))
+    all_fails="$all_fails $(facts X "$facts_f" | tr '\n' ' ')"
+    seg_i=$((seg_i + 1))
+    if [[ -n "$s_sum" ]]; then
+      seg_summary="$s_sum"
+      total_errors=$((total_errors + $(fact E "$facts_f")))
+      total_tests=$((total_tests + $(fact C "$facts_f")))
+      # A completed segment can still have stopped EARLY: `*** Giving up...` is
+      # tester.tcl hitting --maxerror (default 1000) and finalising. It DOES print a
+      # summary, so it would otherwise read as a full run. Say so instead.
+      if [[ -n "$s_gaveup" ]]; then
+        warn "[$leg] segment $seg_i stopped EARLY at the --maxerror cap ('*** Giving up...') — this is NOT full coverage"
+        NOT_REACHED+=("every file after ${s_done:-(none)} in '$s_label' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)")
+      fi
+      continue
+    fi
+
+    # ── ABORT ────────────────────────────────────────────────────────────────
+    perm="$s_perm_log"
+    [[ -n "$perm" ]] || perm="$s_perm"
+    [[ -n "$perm" || ${#TIER_PERMS[@]} -ne 1 ]] || perm="${TIER_PERMS[0]}"
+    abort_file="$(resolve_abort_file "$s_last" "$scratch/files.txt")"
+    # The boundary must STRICTLY advance every resume, or an aborting file could be
+    # re-entered forever. If the aborting file could not be named (or is not past
+    # the last completed one), fall back to the last completed file, then force the
+    # boundary one corpus entry forward.
+    boundary="$abort_file"; forced=0
+    if [[ -z "$boundary" ]] || ! str_gt "$boundary" "$s_done"; then boundary="$s_done"; fi
+    if ! str_gt "$boundary" "$last_boundary"; then
+      forced=1
+      boundary="$(files_after "$last_boundary" "$scratch/files.txt" | head -1)"
+    fi
+    ABORTS+=("${perm:-?}/${abort_file:-?}")
+    ABORT_ROWS+=("segment $seg_i: permutation '${perm:-?}' file '${abort_file:-?}' after test '${s_last:-?}' (rc=$segrc) -> $seglog")
+    warn "[$leg] ABORT #${#ABORTS[@]} — segment $seg_i ('$s_label') exited rc=$segrc with NO summary line"
+    info "        permutation        : ${perm:-(UNDETERMINED)}"
+    info "        last file completed: ${s_done:-(none)}"
+    info "        died inside file   : ${abort_file:-(unresolved)}   last test: ${s_last:-(none)}"
+    # The unit that died NEVER goes unreported — named when we can name it,
+    # described by what we do know when we cannot. Silence about a unit is the defect.
+    if [[ -n "$abort_file" ]]; then
+      NOT_REACHED+=("the REMAINDER of $abort_file under permutation '${perm:-?}' (aborted at ${s_last:-?})")
+    else
+      if [[ "$forced" == 1 ]]; then
+        what="the resume boundary was FORCED to ${boundary:-the end of the corpus}, so that one file may have been skipped without a verdict"
+      else
+        what="the next segment resumes from ${boundary:-the end of the corpus} and will RE-ATTEMPT it"
+      fi
+      NOT_REACHED+=("the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}); $what")
+    fi
+    tail -6 "$seglog" 2>/dev/null | sed 's/^/      /'
+
+    if [[ -z "$boundary" ]]; then
+      warn "[$leg] the abort is at the END of the corpus file list — nothing left to resume."; continue
+    fi
+    if [[ -z "$perm" ]]; then
+      warn "[$leg] CANNOT RESUME — the aborting permutation could not be determined from the log."
+      NOT_REACHED+=("every unit after $boundary — no resume was possible (permutation undetermined; see $seglog)"); continue
+    fi
+    perm_idx=-1
+    for ((k = 0; k < ${#TIER_PERMS[@]}; k++)); do [[ "${TIER_PERMS[$k]}" == "$perm" ]] && { perm_idx=$k; break; }; done
+    if [[ $resumes -ge $DSS_MAX_RESUMES ]]; then
+      warn "[$leg] RESUME BUDGET EXHAUSTED ($DSS_MAX_RESUMES) — stopping. Raise DSS_MAX_RESUMES to go further."
+      rest=""
+      [[ $perm_idx -ge 0 && $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]] && rest=" and every permutation after '$perm' (${TIER_PERMS[*]:$((perm_idx + 1))})"
+      NOT_REACHED+=("every unit after $boundary in '$perm'$rest — resume budget ($DSS_MAX_RESUMES) exhausted"); continue
+    fi
+    # (a) the rest of the aborting permutation, via sqlite's own file-selection hook.
+    resumes=$((resumes + 1)); last_boundary="$boundary"
+    patfile="$scratch/after.$resumes"
+    files_after "$boundary" "$scratch/files.txt" > "$patfile"
+    info "        -> resume $resumes/$DSS_MAX_RESUMES: permutations.test $perm, corpus files after $boundary"
+    declare -a TAIL_SEGS=("perm${US}${perm}${US}permutations.test $perm (after $boundary)${US}${patfile}${US}${TESTDIR_SRC}/permutations.test${US}${perm}")
+    # (b) the tier continued from the NEXT permutation — the ORIGINAL tier script,
+    # so every ifcapable/platform guard is evaluated by sqlite exactly as always.
+    if [[ "$s_kind" != "perm" ]]; then
+      if [[ $perm_idx -lt 0 ]]; then
+        warn "[$leg] permutation '$perm' is not named by ${TEST_FILE##*/} — cannot continue the tier past it."
+        NOT_REACHED+=("every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries")
+      elif [[ $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]]; then
+        nextperm="${TIER_PERMS[$((perm_idx + 1))]}"
+        TAIL_SEGS+=("tier${US}${nextperm}${US}${TEST_FILE##*/} --start=${nextperm}:${US}${US}${TEST_FILE}${US}--start=${nextperm}:")
+        info "        -> then: ${TEST_FILE##*/} --start=${nextperm}:  (permutations $nextperm..${TIER_PERMS[-1]})"
+      fi
+    fi
+    SEGQ=("${SEGQ[@]:0:$seg_i}" "${TAIL_SEGS[@]}" "${SEGQ[@]:$seg_i}")
+    unset TAIL_SEGS
+  done
+
+  # ── union the segments + classify ──────────────────────────────────────────
+  nseg="${#SEG_LOGS[@]}"
+  faillist="$(printf '%s\n' $all_fails | LC_ALL=C sort -u | tr '\n' ' ')"
+  # For a single clean segment the summary text is the fixture's own, byte for byte.
+  union_summary="$total_errors errors out of $total_tests tests (union of $nseg segment(s))"
+  if [[ $nseg -eq 1 ]]; then summary="$seg_summary"; else summary="$union_summary"; fi
   declare -a real=() confound=()
   for t in $faillist; do
     is_c=0
     for p in "${CONFOUND_PATTERNS[@]}"; do [[ "$t" =~ $p ]] && { is_c=1; break; }; done
     if [[ "$is_c" == 1 ]]; then confound+=("$t"); else real+=("$t"); fi
   done
-  # conservative: if the summary reports errors but the fixture printed no
-  # classifiable failure list, treat the run as RED (unclassified).
-  if [[ "$nerr" -gt 0 && -z "$faillist" ]]; then
-    UNIT_VERDICT["$leg"]="FAIL:$nerr error(s) but no failure markers ('Failures on these tests:' / '! <name>') to classify — see $runlog"
-    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — $summary (unclassifiable — no failure markers)"; continue
-  fi
-  if [[ ${#real[@]} -eq 0 ]]; then
+  # Per-unit ledger — every file that reached a verdict, every abort, every gap.
+  { printf "sqlite unit ledger — leg '%s', tier '%s', %s segment(s), %s resume(s)\n" "$leg" "$DSS_TIER" "$nseg" "$resumes"
+    for ((k = 0; k < nseg; k++)); do
+      k_sum="$(fact S "$scratch/facts.$k")"
+      printf '\n== segment: %s   rc=%s   %s\n   log: %s\n' \
+        "${SEG_LABELS[$k]}" "${SEG_RCS[$k]}" "${k_sum:-ABORTED (no summary line)}" "${SEG_LOGS[$k]}"
+      printf '   files completed (%s): %s\n' "$(fact N "$scratch/facts.$k")" "$(facts F "$scratch/facts.$k" | tr '\n' ' ')"
+    done
+    [[ ${#ABORT_ROWS[@]} -eq 0 ]]  || { printf '\n== aborts ==\n'; printf '   %s\n' "${ABORT_ROWS[@]}"; }
+    [[ ${#NOT_REACHED[@]} -eq 0 ]] || { printf '\n== NOT REACHED (no verdict) ==\n'; printf '   %s\n' "${NOT_REACHED[@]}"; }
+    [[ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]] || { printf '\n== EXCLUDED by operator (DSS_TIER_EXCLUDES -> QUICKTEST_OMIT) ==\n   %s\n' "${EXCLUDE_PATTERNS[*]}"; }
+  } > "$ledger"
+
+  if [[ ${#ABORTS[@]} -gt 0 ]]; then
+    # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
+    # makes the abort disappear, and a run with aborts is NEVER green.
+    v="FAIL:${#ABORTS[@]} fixture ABORT(s) [${ABORTS[*]}]; recovered by $resumes resume(s); union: $union_summary"
+    [[ ${#real[@]} -eq 0 ]] || v="$v; ${#real[@]} genuine unit failure(s): ${real[*]}"
+    [[ ${#NOT_REACHED[@]} -eq 0 ]] || v="$v; ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger"
+    UNIT_VERDICT["$leg"]="$v"; UNIT_FAILS=$((UNIT_FAILS + 1))
+    warn "[$leg] corpus FAIL — ${#ABORTS[@]} abort(s): ${ABORTS[*]}"
+    info "      union across $nseg segment(s): $union_summary; $files_done test file(s) completed"
+    [[ ${#real[@]} -eq 0 ]] || info "      ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
+    for n in ${NOT_REACHED[@]+"${NOT_REACHED[@]}"}; do warn "      NOT REACHED: $n"; done
+    info "      per-unit ledger: $ledger"
+  elif [[ -z "$summary" ]]; then
+    UNIT_VERDICT["$leg"]="FAIL:fixture did not complete the suite (crash?) — see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
+    tail -4 "$runlog" 2>/dev/null | sed 's/^/      /'
+  elif [[ "$total_errors" -gt 0 && -z "${faillist// /}" ]]; then
+    # conservative: errors reported but no classifiable failure list -> RED.
+    UNIT_VERDICT["$leg"]="FAIL:$total_errors error(s) but no failure markers ('Failures on these tests:' / '! <name>') to classify — see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — $summary (unclassifiable — no failure markers)"
+  elif [[ ${#real[@]} -eq 0 ]]; then
     if [[ ${#confound[@]} -eq 0 ]]; then
       UNIT_VERDICT["$leg"]="PASS ($summary)"
       pass "[$leg] corpus GREEN — $summary"
@@ -703,7 +1009,17 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] corpus FAIL — $summary; ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
     [[ ${#confound[@]} -gt 0 ]] && info "      (+${#confound[@]} known confound(s) ignored: ${confound[*]})"
   fi
-  unset real confound
+  # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
+  if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS[@]} -eq 0 ]]; then
+    UNIT_VERDICT["$leg"]="${UNIT_VERDICT[$leg]}  [NOT FULL COVERAGE: ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger]"
+    UNIT_FAILS=$((UNIT_FAILS + 1))
+    for n in "${NOT_REACHED[@]}"; do warn "[$leg] NOT REACHED: $n"; done
+  fi
+  LEG_SEGMENTS["$leg"]="$nseg"; LEG_RESUMES["$leg"]="$resumes"
+  LEG_FILESDONE["$leg"]="$files_done"; LEG_LEDGER["$leg"]="$ledger"
+  LEG_ABORTS["$leg"]="${ABORTS[*]-}"; LEG_NOTREACHED["$leg"]="$(printf '%s\n' ${NOT_REACHED[@]+"${NOT_REACHED[@]}"})"
+  # <<< dss:corpus-loop <<<
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED SEG_LOGS SEG_LABELS SEG_RCS TIER_PERMS
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
@@ -713,13 +1029,23 @@ printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git -C "$SQLITE_DIR" rev-parse
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
 if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
-  printf '   excluded : %s   (QUICKTEST_OMIT; dropped from every $allquicktests-derived permutation, still run under '\''full'\'')\n' "${EXCLUDE_PATTERNS[*]}"
+  printf '   excluded : %s   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every $allquicktests-derived permutation, still run under '\''full'\'')\n' "${EXCLUDE_PATTERNS[*]}"
 else
   printf '   excluded : (none — the full tier ran)\n'
 fi
 for leg in "${LEG_ORDER[@]}"; do
   spec="${LEG_SPEC[$leg]}"
   if [[ "${COMPILE_OK[$leg]:-0}" == "1" ]]; then
+    # Only printed when there is something to say: a clean single-segment run
+    # leaves this block byte-identical to what it always was.
+    if [[ "${LEG_SEGMENTS[$leg]:-1}" -gt 1 || -n "${LEG_ABORTS[$leg]:-}" || -n "${LEG_NOTREACHED[$leg]:-}" ]]; then
+      printf '   %-6s segments : %s (%s resume(s) of max %s)   %s test file(s) completed   ledger: %s\n' \
+        "$leg" "${LEG_SEGMENTS[$leg]}" "${LEG_RESUMES[$leg]}" "$DSS_MAX_RESUMES" "${LEG_FILESDONE[$leg]}" "${LEG_LEDGER[$leg]}"
+      for a in ${LEG_ABORTS[$leg]:-}; do
+        printf '   %-6s aborted  : %s — its remaining cases did NOT run\n' "$leg" "$a"
+      done
+      while IFS= read -r n; do [[ -z "$n" ]] || printf '   %-6s NOT RUN  : %s\n' "$leg" "$n"; done <<< "${LEG_NOTREACHED[$leg]:-}"
+    fi
     # $EXCL_NOTE rides along on EVERY verdict — pass and fail alike — so a GREEN
     # line can never be read as "the whole corpus ran".
     printf '   %-6s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
