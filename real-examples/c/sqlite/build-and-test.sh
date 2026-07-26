@@ -36,7 +36,9 @@
 #      sqlite+tcl8.6+zlib include dirs / the recipe defines / the leg's
 #      libtcl8.6.so + libz.so.1 (resolveLibraries); the build routes the binary
 #      to <out>/<leg>/<formatName>/testfixture.
-#   8. run SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
+#   8. stage each leg's run dir — including the `libtestloadext.so` extension the
+#      loadext corpus dlopen()s, compiled by THE LEG'S TARGET compiler — then run
+#      SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
 #      runnable leg (DSS_TIER: veryquick[default] | quick | full | all), parse
 #      "N errors out of M tests", and classify each failing test against the
 #      documented non-DSS confounds (WAL set-lock wall-clock timing, an env
@@ -123,20 +125,27 @@ host_target_spec() {
   esac
 }
 
-# ── LEGS: label -> "spec|runner-prefix|libsrc" ───────────────────────────────
+# ── LEGS: label -> "spec|runner-prefix|libsrc|cc|cc-pkg" ─────────────────────
 # The "host" leg is always the native target (runs directly). On a Linux x86_64
 # host the "arm64" cross leg is added: elf64-aarch64 compiled here + RUN under
 # user-mode qemu-aarch64 (QEMU_LD_PREFIX → the aarch64 sysroot; LD_LIBRARY_PATH →
 # the staged arm64 tcl/zlib). libsrc selects which tcl/zlib libraries the leg's
-# fixture links + runs against ("host" | "arm64").
+# fixture links + runs against ("host" | "arm64"). cc is the leg's TARGET C
+# compiler — a per-leg target fact exactly like the runner prefix and libsrc, used
+# to build the corpus's dlopen()ed helper extension FOR THE LEG (step 8); cc-pkg is
+# the apt package providing it (empty = already ensured by step 1).
 QEMU_SYSROOT="${QEMU_SYSROOT:-/usr/aarch64-linux-gnu}"
-declare -A LEG_SPEC=() LEG_PREFIX=() LEG_LIBSRC=()
+declare -A LEG_SPEC=() LEG_PREFIX=() LEG_LIBSRC=() LEG_CC=() LEG_CC_PKG=()
 declare -a LEG_ORDER=()
-add_leg() { LEG_ORDER+=("$1"); LEG_SPEC["$1"]="$2"; LEG_PREFIX["$1"]="$3"; LEG_LIBSRC["$1"]="$4"; }
+add_leg() {                    # add_leg <label> <spec> <runner-prefix> <libsrc> <cc> [<cc-apt-pkg>]
+  LEG_ORDER+=("$1"); LEG_SPEC["$1"]="$2"; LEG_PREFIX["$1"]="$3"; LEG_LIBSRC["$1"]="$4"
+  LEG_CC["$1"]="$5"; LEG_CC_PKG["$1"]="${6:-}"
+}
 _hspec="$(host_target_spec)"
-[[ -n "$_hspec" ]] && add_leg "host" "$_hspec" "" "host"
+[[ -n "$_hspec" ]] && add_leg "host" "$_hspec" "" "host" "${CC:-cc}"
 if [[ "$HOST_OS" == "linux" && "$HOST_ARCH" == "x86_64" ]]; then
-  add_leg "arm64" "arm64:elf64-aarch64-linux-exec" "qemu-aarch64" "arm64"
+  add_leg "arm64" "arm64:elf64-aarch64-linux-exec" "qemu-aarch64" "arm64" \
+          "aarch64-linux-gnu-gcc" "gcc-aarch64-linux-gnu"
 fi
 # DSS_LEGS: comma-separated filter (e.g. DSS_LEGS=host) for fast iteration.
 if [[ -n "${DSS_LEGS:-}" ]]; then
@@ -566,11 +575,58 @@ run_leg() {                    # run_leg <leg> <bin> <args...>
     QEMU_LD_PREFIX="$QEMU_SYSROOT" LD_LIBRARY_PATH="$ARM64_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$pfx" "$bin" "$@" 2>&1
   fi
 }
+# tester.tcl's cmdlinearg(testdir) default: the fixture `file mkdir`s this subdir of
+# its CWD and cd's into it before any .test body runs, so a test's relative
+# `./libtestloadext.so` resolves HERE. The harness passes no --testdir override.
+SQLITE_TESTDIR_SUBDIR="testdir"
+# How a shared object is produced — decided by the leg's TARGET object format, never
+# by the host's.
+leg_shared_flags() { case "${LEG_SPEC[$1]##*:}" in macho64-*) printf '%s' '-dynamiclib';; *) printf '%s' '-shared -fPIC';; esac; }
+# [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO] Stage the helper shared object the
+# loadext corpus dlopen()s, built for THE LEG'S TARGET.
+#
+# sqlite's test/loadext.test builds this helper itself, from src/test_loadext.c with
+# a HARDCODED `gcc`, but only `if {![file exists $testextension]}`. On a cross leg
+# that self-build is silently WRONG: qemu-aarch64 passes the guest's `exec gcc`
+# through to the HOST kernel, so the aarch64 fixture is handed a HOST x86-64 shared
+# object. Every dlopen() then fails, the extension never registers half(), and all
+# 16 loadext-* rows report `[1 {no such function: half}]` — a harness artefact that
+# reads exactly like a genuine DSS miscompile. Pre-staging a target-correct helper
+# makes `[file exists …]` true, so loadext.test never shells out to the wrong
+# compiler. Include dirs come from the sqlite TREE ($SQLITE_DIR/src for
+# sqlite3ext.h, $BLD for the generated sqlite3.h) — loadext.test's own `-I. -I..`
+# find neither from the run dir and silently fall through to a SYSTEM sqlite3.h of
+# an unrelated version.
+#
+# FAIL-LOUD: an unobtainable leg compiler DIES. Falling back to the host compiler is
+# precisely the defect above, and it would be invisible in the results.
+stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>
+  local leg="$1" rundir="$2"
+  local cc="${LEG_CC[$leg]}" pkg="${LEG_CC_PKG[$leg]:-}"
+  local src="$SQLITE_DIR/src/test_loadext.c"
+  local dst="$rundir/$SQLITE_TESTDIR_SUBDIR/libtestloadext.so"
+  [[ -f "$src" ]] || die "[$leg] sqlite extension source not found: $src"
+  if ! command -v "$cc" >/dev/null 2>&1 && [[ -n "$pkg" ]]; then
+    warn "[$leg] target C compiler '$cc' not found — installing $pkg"
+    pkg_install "$pkg"
+    hash -r
+  fi
+  command -v "$cc" >/dev/null 2>&1 || die \
+"[$leg] target C compiler '$cc' not found${pkg:+ (apt: $pkg)} — it builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s.
+      NOT falling back to the host compiler: sqlite's loadext.test would then build a HOST-arch extension the $leg fixture cannot load, and every
+      loadext-* test would false-red as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]."
+  mkdir -p "$(dirname "$dst")"
+  # leg_shared_flags is a deliberate word-split flag list.
+  "$cc" $(leg_shared_flags "$leg") -I"$SQLITE_DIR/src" -I"$BLD" -o "$dst" "$src" \
+    || die "[$leg] could not build the loadext helper extension: $cc $(leg_shared_flags "$leg") -o $dst $src"
+  info "[$leg] loadext helper -> $dst (built by $cc)"
+}
 for leg in "${LEG_ORDER[@]}"; do
   if [[ "${COMPILE_OK[$leg]:-0}" != "1" ]]; then
     UNIT_VERDICT["$leg"]="skipped (compile failed)"; warn "[$leg] corpus skipped — step 7 did not compile the fixture"; continue
   fi
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
+  stage_loadext_extension "$leg" "$rundir"
   runlog="$OUT_DIR/$leg/corpus.log"
   info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
   ( cd "$rundir" && run_leg "$leg" "$bin" "$TEST_FILE" ) > "$runlog" 2>&1 || true
