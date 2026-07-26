@@ -706,114 +706,6 @@ leg_z_lib()   { case "${LEG_LIBSRC[$1]}" in arm64) find_first_in "$ARM64_LIBDIR"
 find_first_in() { local d="$1"; shift; local n; for n in "$@"; do [[ -e "$d/$n" ]] && { printf '%s' "$d/$n"; return; }; done; }
 pass "headers + libraries ready for: ${LEG_ORDER[*]}"
 
-# ── Step 7 — build the full-source testfixture with dss-code-prime, per leg ──
-step "7/9  Build the full-source testfixture (dss-code-prime --project), per leg"
-declare -A FIXTURE=()          # leg -> binary path (on success)
-declare -A COMPILE_OK=()
-COMPILE_FAILS=0
-# the per-leg manifest is emitted as clean JSON by python3 (a harness dep now).
-ensure_cmd python3 python3
-# The leg-INDEPENDENT include-dir set: the sqlite recipe dirs + the staged
-# third-party tcl8.6/zlib headers + the build tree ($BLD, which resolves the
-# recipe's relative `-I.`). These dirs, the TU list (${TUS[@]}) and the recipe
-# defines (${RECIPE_DEFS[@]}, already `-D`-stripped) are the SAME inputs the
-# per-file CLI fed; here they populate a `.dss-project.json` manifest instead.
-declare -a INC_DIRS=()
-for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"); done
-
-# generate_manifest <spec> <tcl-lib> <z-lib> <out-manifest> — write a project
-# manifest reproducing the recipe: language c-subset, profile cli, ONE target
-# (the leg's <targetName>:<formatName> spec), artifactName testfixture, the full
-# TU set as ABSOLUTE `sources`, the `includes` dirs, the `defines` (a leading
-# `-D` stripped defensively; an empty SQLITE_PRIVATE= value preserved), and the
-# leg's (tcl, z) libraries as `resolveLibraries`. The arrays reach python3 via
-# the ENVIRONMENT (newline-joined) — never argv — so 185 paths can't overflow
-# ARG_MAX or trip quoting. Echoes the array counts for the build log.
-generate_manifest() {
-  local spec="$1" tcl_lib="$2" z_lib="$3" out="$4"
-  MANIFEST_SPEC="$spec" MANIFEST_TCL="$tcl_lib" MANIFEST_Z="$z_lib" \
-  MANIFEST_TUS="$(printf '%s\n' "${TUS[@]}")" \
-  MANIFEST_INCS="$(printf '%s\n' "${INC_DIRS[@]}")" \
-  MANIFEST_DEFS="$(printf '%s\n' "${RECIPE_DEFS[@]}")" \
-  python3 - "$out" <<'PY'
-import json, os, sys
-out = sys.argv[1]
-def lines(name):
-    return [x for x in os.environ.get(name, "").splitlines() if x]
-def strip_d(d):
-    return d[2:] if d.startswith("-D") else d   # RECIPE_DEFS is pre-stripped; defensive
-manifest = {
-    "language":         "c-subset",
-    "artifactProfile":  "cli",
-    "targets":          [os.environ["MANIFEST_SPEC"]],
-    "artifactName":     "testfixture",
-    "sources":          lines("MANIFEST_TUS"),
-    "includes":         lines("MANIFEST_INCS"),
-    "defines":          [strip_d(d) for d in lines("MANIFEST_DEFS")],
-    "resolveLibraries": [os.environ["MANIFEST_TCL"], os.environ["MANIFEST_Z"]],
-}
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
-    f.write("\n")
-print("sources=%d includes=%d defines=%d" % (
-    len(manifest["sources"]), len(manifest["includes"]), len(manifest["defines"])))
-PY
-}
-compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
-for leg in "${LEG_ORDER[@]}"; do
-  spec="${LEG_SPEC[$leg]}"; fmt="${spec##*:}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
-  manifest="$outd/$leg.dss-project.json"
-  mkdir -p "$outd"
-  tcl_lib="$(leg_tcl_lib "$leg")"; z_lib="$(leg_z_lib "$leg")"
-  [[ -n "$tcl_lib" && -n "$z_lib" ]] || die "[$leg] could not resolve tcl/zlib libraries."
-  info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "$tcl_lib"), $(basename "$z_lib"))"
-  counts="$(generate_manifest "$spec" "$tcl_lib" "$z_lib" "$manifest")" \
-    || die "[$leg] manifest generation failed (python3) — see above."
-  info "[$leg] manifest → $manifest ($counts)"
-  # A project build routes each target to <output>/<formatName>/<artifactName>.
-  # dss-code-prime returns EXIT 0 even on fatal errors → judge from `error[` + the binary.
-  "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
-  bin="$outd/$fmt/testfixture"
-  if grep -qE 'error\[' "$log" || [[ ! -x "$bin" ]]; then
-    COMPILE_FAILS=$((COMPILE_FAILS + 1))
-    if grep -qE 'error\[' "$log"; then
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
-      { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
-    else
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
-    fi
-  else
-    FIXTURE["$leg"]="$bin"; COMPILE_OK["$leg"]=1
-    pass "[$leg] testfixture -> $bin$(compile_time_suffix "$log")"
-  fi
-done
-
-# ── Step 8 — run the .test UNIT CORPUS through each leg's fixture ─────────────
-step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failures"
-# DOWNGRADE the clone lock: everything from here is READ-ONLY on the checkout (the
-# fixture sources .test files straight out of it) but it lasts for HOURS. A read
-# marker blocks a mutating run without blocking a second corpus run.
-dss_clone_lock_read "$SQLITE_DIR" "$(basename "$0") corpus run — tier $DSS_TIER, legs ${LEG_ORDER[*]}"
-info "clone lock: downgraded to READ for the corpus run ($DSS_CLONE_LOCK_DIR)"
-TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
-[[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
-# The corpus directory the tier script lives in — where permutations.test and the
-# ~1.3k .test units are. READ-ONLY to this harness: nothing is ever written here.
-TESTDIR_SRC="$(cd "$(dirname "$TEST_FILE")" && pwd)"
-read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
-# Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
-# reduction is on the record even if a leg never reaches a summary line, and
-# carried into every leg's Step-9 verdict via $EXCL_NOTE.
-read -r -a EXCLUDE_PATTERNS <<< "$DSS_TIER_EXCLUDES"
-EXCL_NOTE=""
-if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
-  QUICKTEST_OMIT="$(IFS=,; printf '%s' "${EXCLUDE_PATTERNS[*]}")"; export QUICKTEST_OMIT
-  EXCL_NOTE="  [NOT FULL COVERAGE: ${#EXCLUDE_PATTERNS[@]} file pattern(s) EXCLUDED from the $DSS_TIER tier via QUICKTEST_OMIT -- ${EXCLUDE_PATTERNS[*]}]"
-  warn "tier EXCLUSIONS active — this is NOT full-corpus coverage"
-  info "      QUICKTEST_OMIT=$QUICKTEST_OMIT  (sqlite's own hook, test/permutations.test)"
-  info "      drops these file(s) from every \$allquicktests-derived permutation (still run under 'full'): ${EXCLUDE_PATTERNS[*]}"
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
 # THE CORPUS RESUME ENGINE — an abort is a RECOVERABLE, REPORTED outcome
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,6 +980,133 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <log> <args...>
   wait "$child" 2>/dev/null || SEG_RC=$?
 }
 # <<< dss:corpus-engine <<<
+
+# ── Step 7 — build the full-source testfixture with dss-code-prime, per leg ──
+step "7/9  Build the full-source testfixture (dss-code-prime --project), per leg"
+declare -A FIXTURE=()          # leg -> binary path (on success)
+declare -A COMPILE_OK=()
+COMPILE_FAILS=0
+# the per-leg manifest is emitted as clean JSON by python3 (a harness dep now).
+ensure_cmd python3 python3
+# The leg-INDEPENDENT include-dir set: the sqlite recipe dirs + the staged
+# third-party tcl8.6/zlib headers + the build tree ($BLD, which resolves the
+# recipe's relative `-I.`). These dirs, the TU list (${TUS[@]}) and the recipe
+# defines (${RECIPE_DEFS[@]}, already `-D`-stripped) are the SAME inputs the
+# per-file CLI fed; here they populate a `.dss-project.json` manifest instead.
+declare -a INC_DIRS=()
+for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"); done
+
+# generate_manifest <spec> <tcl-lib> <z-lib> <out-manifest> — write a project
+# manifest reproducing the recipe: language c-subset, profile cli, ONE target
+# (the leg's <targetName>:<formatName> spec), artifactName testfixture, the full
+# TU set as ABSOLUTE `sources`, the `includes` dirs, the `defines` (a leading
+# `-D` stripped defensively; an empty SQLITE_PRIVATE= value preserved), and the
+# leg's (tcl, z) libraries as `resolveLibraries`. The arrays reach python3 via
+# the ENVIRONMENT (newline-joined) — never argv — so 185 paths can't overflow
+# ARG_MAX or trip quoting. Echoes the array counts for the build log.
+generate_manifest() {
+  local spec="$1" tcl_lib="$2" z_lib="$3" out="$4"
+  MANIFEST_SPEC="$spec" MANIFEST_TCL="$tcl_lib" MANIFEST_Z="$z_lib" \
+  MANIFEST_TUS="$(printf '%s\n' "${TUS[@]}")" \
+  MANIFEST_INCS="$(printf '%s\n' "${INC_DIRS[@]}")" \
+  MANIFEST_DEFS="$(printf '%s\n' "${RECIPE_DEFS[@]}")" \
+  python3 - "$out" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+def lines(name):
+    return [x for x in os.environ.get(name, "").splitlines() if x]
+def strip_d(d):
+    return d[2:] if d.startswith("-D") else d   # RECIPE_DEFS is pre-stripped; defensive
+manifest = {
+    "language":         "c-subset",
+    "artifactProfile":  "cli",
+    "targets":          [os.environ["MANIFEST_SPEC"]],
+    "artifactName":     "testfixture",
+    "sources":          lines("MANIFEST_TUS"),
+    "includes":         lines("MANIFEST_INCS"),
+    "defines":          [strip_d(d) for d in lines("MANIFEST_DEFS")],
+    "resolveLibraries": [os.environ["MANIFEST_TCL"], os.environ["MANIFEST_Z"]],
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+print("sources=%d includes=%d defines=%d" % (
+    len(manifest["sources"]), len(manifest["includes"]), len(manifest["defines"])))
+PY
+}
+compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
+declare -a PREFLIGHT_KILLS=()
+for leg in "${LEG_ORDER[@]}"; do
+  spec="${LEG_SPEC[$leg]}"; fmt="${spec##*:}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
+  manifest="$outd/$leg.dss-project.json"
+  mkdir -p "$outd"
+  # >>> dss:preflight >>>
+  # PRE-FLIGHT HYGIENE — FIRST thing this leg does, mirroring the .ps1. The hazard
+  # differs by platform but is the same shape: the compiler below WRITES this leg's
+  # testfixture, and on POSIX writing an executable that a leftover process is still
+  # running fails with ETXTBSY ("Text file busy"), while on Windows the equivalent
+  # output wipe fails with "access denied". We hold the run lock, so anything still
+  # running THIS leg's fixture path is a leftover by construction.
+  # Command substitution, NOT `done < <(...)`. A process substitution runs in a
+  # SUBSHELL, so a failure inside it (or a `die`) exits only that subshell and the
+  # harness sails on with the sweep silently not done — MEASURED while verifying
+  # this very step. `$(...)` propagates the status, so a broken sweep is loud.
+  preflight_out="$(stop_our_fixtures "$outd/$fmt/testfixture" 'pre-flight')" \
+    || die "[$leg] the pre-flight fixture sweep FAILED — refusing to build over a possibly-running fixture."
+  while IFS= read -r k; do
+    [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; PREFLIGHT_KILLS+=("$k"); }
+  done <<< "$preflight_out"
+  # <<< dss:preflight <<<
+  tcl_lib="$(leg_tcl_lib "$leg")"; z_lib="$(leg_z_lib "$leg")"
+  [[ -n "$tcl_lib" && -n "$z_lib" ]] || die "[$leg] could not resolve tcl/zlib libraries."
+  info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "$tcl_lib"), $(basename "$z_lib"))"
+  counts="$(generate_manifest "$spec" "$tcl_lib" "$z_lib" "$manifest")" \
+    || die "[$leg] manifest generation failed (python3) — see above."
+  info "[$leg] manifest → $manifest ($counts)"
+  # A project build routes each target to <output>/<formatName>/<artifactName>.
+  # dss-code-prime returns EXIT 0 even on fatal errors → judge from `error[` + the binary.
+  "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
+  bin="$outd/$fmt/testfixture"
+  if grep -qE 'error\[' "$log" || [[ ! -x "$bin" ]]; then
+    COMPILE_FAILS=$((COMPILE_FAILS + 1))
+    if grep -qE 'error\[' "$log"; then
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
+      { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+    else
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
+    fi
+  else
+    FIXTURE["$leg"]="$bin"; COMPILE_OK["$leg"]=1
+    pass "[$leg] testfixture -> $bin$(compile_time_suffix "$log")"
+  fi
+done
+
+# ── Step 8 — run the .test UNIT CORPUS through each leg's fixture ─────────────
+step "8/9  Run SQLite unit corpus ($DSS_TIER.test) on each leg + classify failures"
+# DOWNGRADE the clone lock: everything from here is READ-ONLY on the checkout (the
+# fixture sources .test files straight out of it) but it lasts for HOURS. A read
+# marker blocks a mutating run without blocking a second corpus run.
+dss_clone_lock_read "$SQLITE_DIR" "$(basename "$0") corpus run — tier $DSS_TIER, legs ${LEG_ORDER[*]}"
+info "clone lock: downgraded to READ for the corpus run ($DSS_CLONE_LOCK_DIR)"
+TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
+[[ -f "$TEST_FILE" ]] || die "test file not found: $TEST_FILE"
+# The corpus directory the tier script lives in — where permutations.test and the
+# ~1.3k .test units are. READ-ONLY to this harness: nothing is ever written here.
+TESTDIR_SRC="$(cd "$(dirname "$TEST_FILE")" && pwd)"
+read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
+# Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
+# reduction is on the record even if a leg never reaches a summary line, and
+# carried into every leg's Step-9 verdict via $EXCL_NOTE.
+read -r -a EXCLUDE_PATTERNS <<< "$DSS_TIER_EXCLUDES"
+EXCL_NOTE=""
+if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
+  QUICKTEST_OMIT="$(IFS=,; printf '%s' "${EXCLUDE_PATTERNS[*]}")"; export QUICKTEST_OMIT
+  EXCL_NOTE="  [NOT FULL COVERAGE: ${#EXCLUDE_PATTERNS[@]} file pattern(s) EXCLUDED from the $DSS_TIER tier via QUICKTEST_OMIT -- ${EXCLUDE_PATTERNS[*]}]"
+  warn "tier EXCLUSIONS active — this is NOT full-corpus coverage"
+  info "      QUICKTEST_OMIT=$QUICKTEST_OMIT  (sqlite's own hook, test/permutations.test)"
+  info "      drops these file(s) from every \$allquicktests-derived permutation (still run under 'full'): ${EXCLUDE_PATTERNS[*]}"
+fi
+
 declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
 # per-leg resume-engine bookkeeping, surfaced in Step 9
 declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=() LEG_HYGIENE=()
@@ -1163,13 +1182,15 @@ for leg in "${LEG_ORDER[@]}"; do
   US=$'\x1f'
   SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}$TEST_FILE${US}")
   declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=()
-  # PRE-FLIGHT HYGIENE — a leftover fixture from a dead run holds file handles (the
-  # abort class this engine exists for IS a leaked handle) and can make this run
-  # fail for a reason this run did not cause. We hold the run lock, so anything
-  # still running OUR fixture path is a leftover.
+  # Carry Step 7's pre-flight kills into this leg's hygiene record, then sweep again:
+  # a leftover fixture holds file handles (the abort class this engine exists for IS
+  # a leaked handle) and can make this run fail for a reason it did not cause.
+  for k in ${PREFLIGHT_KILLS[@]+"${PREFLIGHT_KILLS[@]}"}; do HYGIENE+=("$k"); done
+  sweep_out="$(stop_our_fixtures "$bin" 'pre-corpus')" \
+    || die "[$leg] the pre-corpus fixture sweep FAILED — refusing to start the corpus with a possible leftover holding handles."
   while IFS= read -r k; do
     [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
-  done < <(stop_our_fixtures "$bin" 'pre-flight')
+  done <<< "$sweep_out"
   [[ -z "$LOCK_STOLEN" ]] || HYGIENE+=("took over a STALE run lock left by PID $LOCK_STOLEN")
   [[ -z "${DSS_CLONE_NOTES:-}" ]] || HYGIENE+=("shared-clone lock: ${DSS_CLONE_NOTES%%; }")
   ps_enum_available || HYGIENE+=("leftover-fixture detection UNAVAILABLE on this host (ps(1) cannot enumerate) — a stray fixture would go unnoticed")
@@ -1198,9 +1219,11 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     # POST-SEGMENT HYGIENE — a segment must not carry its file handles into the
     # next one, nor outlive the run.
+    post_out="$(stop_our_fixtures "$bin" "after segment $((seg_i + 1))")" \
+      || die "[$leg] the post-segment fixture sweep FAILED — a leftover could poison the next segment."
     while IFS= read -r k; do
       [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
-    done < <(stop_our_fixtures "$bin" "after segment $((seg_i + 1))")
+    done <<< "$post_out"
     SEG_LOGS+=("$seglog"); SEG_LABELS+=("$s_label"); SEG_RCS+=("$segrc")
     facts_f="$scratch/facts.$seg_i"
     parse_segment "$seglog" "$facts_f"

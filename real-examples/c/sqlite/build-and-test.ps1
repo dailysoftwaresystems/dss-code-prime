@@ -546,45 +546,6 @@ Info "zlib: $ZlibDll"
 if (-not (Test-Path $TclLibrary)) { Warn "Tcl script library not at $TclLibrary — the corpus RUN needs it (set \$env:TCL_LIBRARY)." }
 Pass "pe64 resolve-library DLLs ready"
 
-# ── Step 7 — generate the manifest + build the testfixture (dss --project) ───
-Step "7/9  Build the full-source testfixture (dss-code-prime --project, $Config)"
-$extraDefineArgs = @()
-$genArgs = @(
-  $GenPy,
-  '--tus',      (Join-Path $Stage 'tus.txt'),
-  '--includes', (Join-Path $Stage 'includes.txt'),
-  '--defines',  (Join-Path $Stage 'defines.txt'),
-  '--target',   $Spec,
-  '--resolve-library', $TclDll,
-  '--resolve-library', $ZlibDll,
-  '--artifact-name', 'testfixture'
-) + $extraDefineArgs + @('--output', $Manifest)
-$genOut = & $python3.Source @genArgs 2>&1
-if ($LASTEXITCODE -ne 0) { Die "manifest generation failed:`n$($genOut -join "`n")" }
-Info "manifest -> $Manifest ($genOut)"
-
-# PRE-FLIGHT HYGIENE — the $OutDir wipe below cannot delete a testfixture.exe that
-# is still executing, and that is exactly how a leftover fixture turns into an
-# "Access to the path … is denied" at Step 7 that looks nothing like its cause.
-# We hold the run lock, so anything still running OUR fixture path is a leftover.
-$PreflightKills = Stop-OurFixtures (Join-Path $OutDir "$Fmt\testfixture.exe") 'pre-flight'
-foreach ($k in $PreflightKills) { Warn "[pe64] LEFTOVER FIXTURE: $k" }
-if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$log = Join-Path $Work 'compile.log'
-# dss-code-prime returns exit 0 even on FATAL errors → judge from `error[` + the binary.
-& $DssBin --project $Manifest --config="$Config" --output $OutDir --time *>&1 |
-  Tee-Object -FilePath $log | Out-Null
-$errCount = (Select-String -Path $log -Pattern 'error\[' -AllMatches).Count
-$fixture  = Join-Path $OutDir "$Fmt\testfixture.exe"
-$ctime = (Get-Content $log | Select-String -Pattern 'compile time (\S+)' | Select-Object -Last 1)
-$ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
-if ($errCount -gt 0 -or -not (Test-Path $fixture)) {
-  Get-Content $log | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-  Die "pe64 build FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture.exe. See $log"
-}
-Pass "testfixture -> $fixture$ctimeSuffix"
-
 # ─────────────────────────────────────────────────────────────────────────────
 # THE CORPUS RESUME ENGINE — an abort is a RECOVERABLE, REPORTED outcome
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,6 +794,56 @@ function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap)
   return @{ Rc = $p.ExitCode; KillReason = $killReason; Seconds = ((Get-Date) - $t0).TotalSeconds }
 }
 # <<< dss:corpus-engine <<<
+
+# ── Step 7 — generate the manifest + build the testfixture (dss --project) ───
+Step "7/9  Build the full-source testfixture (dss-code-prime --project, $Config)"
+# >>> dss:preflight >>>
+# PRE-FLIGHT HYGIENE — FIRST thing in Step 7, before anything is generated or
+# deleted. The $OutDir wipe further down cannot remove a testfixture.exe that is
+# still executing, and that is exactly how a leftover fixture from a dead run turns
+# into "Access to the path … is denied" — an error that looks nothing like its
+# cause. We hold the run lock, so anything still running OUR fixture path is a
+# leftover by construction.
+#
+# NOTE the helper functions this calls are defined ABOVE, in the dss:corpus-engine
+# region hoisted before this step. PowerShell binds function names in EXECUTION
+# order, so a helper defined later in the file simply does not exist here — that is
+# a real, measured failure ("The term 'Stop-OurFixtures' is not recognized"), not a
+# style point. Keep the region above this line.
+$PreflightKills = Stop-OurFixtures (Join-Path $OutDir "$Fmt\testfixture.exe") 'pre-flight'
+foreach ($k in $PreflightKills) { Warn "[pe64] LEFTOVER FIXTURE: $k" }
+# <<< dss:preflight <<<
+$extraDefineArgs = @()
+$genArgs = @(
+  $GenPy,
+  '--tus',      (Join-Path $Stage 'tus.txt'),
+  '--includes', (Join-Path $Stage 'includes.txt'),
+  '--defines',  (Join-Path $Stage 'defines.txt'),
+  '--target',   $Spec,
+  '--resolve-library', $TclDll,
+  '--resolve-library', $ZlibDll,
+  '--artifact-name', 'testfixture'
+) + $extraDefineArgs + @('--output', $Manifest)
+$genOut = & $python3.Source @genArgs 2>&1
+if ($LASTEXITCODE -ne 0) { Die "manifest generation failed:`n$($genOut -join "`n")" }
+Info "manifest -> $Manifest ($genOut)"
+
+if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$log = Join-Path $Work 'compile.log'
+# dss-code-prime returns exit 0 even on FATAL errors → judge from `error[` + the binary.
+& $DssBin --project $Manifest --config="$Config" --output $OutDir --time *>&1 |
+  Tee-Object -FilePath $log | Out-Null
+$errCount = (Select-String -Path $log -Pattern 'error\[' -AllMatches).Count
+$fixture  = Join-Path $OutDir "$Fmt\testfixture.exe"
+$ctime = (Get-Content $log | Select-String -Pattern 'compile time (\S+)' | Select-Object -Last 1)
+$ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
+if ($errCount -gt 0 -or -not (Test-Path $fixture)) {
+  Get-Content $log | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
+  Die "pe64 build FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture.exe. See $log"
+}
+Pass "testfixture -> $fixture$ctimeSuffix"
+
 
 # ── Step 8 — run the .test UNIT CORPUS through the fixture ────────────────────
 Step "8/9  Run SQLite unit corpus ($Tier.test) + classify failures"
