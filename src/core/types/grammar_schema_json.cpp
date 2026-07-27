@@ -4184,6 +4184,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // absent leaves it empty, so a `#line` hits the generic
             // unsupported-directive fail-loud (the embed/pragma opt-in model).
             readOptWord("lineDirective",          cfg.lineDirective);
+            // D-CPP-ERROR-WARNING (`#error` C23 6.10.5 / `#warning` C23 6.10.6):
+            // the DIAGNOSTIC directive words. OPTIONAL — absent leaves each empty
+            // so the line hits the generic unsupported-directive fail-loud (the
+            // embed/pragma/line opt-in model). Independent of one another: a
+            // language may declare `#error` without `#warning` (pre-C23 C did
+            // exactly that), so no cross-field self-consistency rule applies.
+            readOptWord("errorDirective",         cfg.errorDirective);
+            readOptWord("warningDirective",       cfg.warningDirective);
             readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like

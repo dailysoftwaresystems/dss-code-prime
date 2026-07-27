@@ -73,6 +73,32 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
            "would let the member fold its size to 0 (the incomplete composite has "
            "no layout), a silent wrong-bytes layout. Named pin (ListSelfConsistent "
            "would still pass if this member were dropped from the table).";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::P_PreprocessorErrorDirective))
+        << "TF-C70 D-CPP-ERROR-WARNING (C23 6.10.5): `#error` is the author's "
+           "OWN declaration that this configuration must not be built. It is "
+           "reached only when its conditional group is live, so suppressing it "
+           "would compile exactly the configuration the source says is invalid "
+           "— and silently, since nothing downstream re-reports it. Named pin "
+           "(ListSelfConsistent would still pass if this member were dropped "
+           "from the table).";
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::P_PreprocessorWarningDirective))
+        << "TF-C70 (C23 6.10.6): `#warning` is advisory and translation "
+           "continues, so it MUST stay suppressable — the opposite of its "
+           "`#error` sibling. Pinning the asymmetry keeps a future 'both "
+           "preprocessor directive codes belong in the table' edit honest.";
+    // The WARNING code is deliberately NOT in the closed table, so
+    // `ListSelfConsistent`'s "no member names Unknown" sweep never reaches it —
+    // and `diagnosticCodeName`'s switch has no `default:`, so a MISSING case
+    // falls through to the "Unknown" sentinel silently rather than failing to
+    // compile. (The ERROR code is covered for free by that sweep, via the
+    // table.) This is the only pin on the warning code's name.
+    EXPECT_NE(
+        std::string{
+            diagnosticCodeName(DiagnosticCode::P_PreprocessorWarningDirective)},
+        "Unknown")
+        << "P_PreprocessorWarningDirective has no `diagnosticCodeName` case — "
+           "the code would render as the Unknown sentinel in every diagnostic, "
+           "--suppress name, and log line";
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
         << "None must never be a member (guards the array-size-bumped-without-"
            "adding-the-entry bug at runtime too)";

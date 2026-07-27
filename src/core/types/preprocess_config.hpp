@@ -356,6 +356,36 @@ struct DSS_EXPORT PreprocessConfig {
     // opt-in model). The engine matches THIS string, never a hard-coded "line".
     std::string lineDirective;     // "line"
 
+    // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5 / `#warning`; C23 6.10.6): the
+    // DIAGNOSTIC directive words, matched by lexeme TEXT against the token after
+    // `#` (like define/undef/include/line -- `error`/`warning` lex as plain
+    // Identifiers, NOT grammar keywords). A REACHED `#error` emits
+    // `P_PreprocessorErrorDirective` at Error severity (C23 6.10.5p1: a
+    // constraint -- the implementation shall diagnose and the translation unit
+    // is invalid); a reached `#warning` emits `P_PreprocessorWarningDirective` at
+    // Warning severity and translation CONTINUES. Both messages carry the
+    // directive's `pp-tokens` VERBATIM -- the operand is never macro-expanded
+    // (gcc/clang agree; the text is prose, not a macro invocation site) and is
+    // OPTIONAL (`pp-tokens_opt`), so a bare `#error` is well-formed and still
+    // fires.
+    //
+    // OPTIONAL -- empty means the language declares NO such directive, so the
+    // line falls through to the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`; the `pragmaDirective`/`embedDirective`/
+    // `lineDirective` opt-in model). The engine matches THESE strings, never a
+    // hard-coded "error"/"warning" -- rebinding the word in the config rebinds
+    // the feature, and stripping the field restores the fail-loud fallback.
+    //
+    // ★ Both are dispatched BELOW `handleDirective`'s `if (!stackActive())`
+    // dead-branch gate -- the `#pragma`/`#embed`/`#line` parity -- so an `#error`
+    // inside a NOT-TAKEN `#if` branch is entirely SILENT (C 6.10p1: a skipped
+    // group is parsed only far enough to track nesting). That is load-bearing,
+    // not cosmetic: the Apple SDK headers guard unsupported configurations with
+    // an `#error` inside branches a supported target skips, so a recognise-on-lex
+    // implementation could not compile a single macOS translation unit.
+    std::string errorDirective;    // "error"
+    std::string warningDirective;  // "warning"
+
     // FC17.9(h) (`__has_embed`; C23 6.10.1): the `__has_embed` OPERATOR keyword,
     // valid only inside a `#if`/`#elif` operand. `__has_embed("resource")` tests
     // whether the resource a `#embed` of the same form would read exists, yielding

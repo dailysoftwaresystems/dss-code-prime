@@ -8,7 +8,7 @@ namespace dss {
 namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
-// / L / R / A) + numeric value within each phase for at-a-glance
+// / L / R / A / S / P) + numeric value within each phase for at-a-glance
 // audit. The linear scan via `std::ranges::find` is O(N) over the
 // table — still faster than hash lookup at this size + needs no
 // static-init dance.
@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 127> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 128> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -585,6 +585,27 @@ constexpr std::array<DiagnosticCode, 127> kUnsuppressableCodes{{
     // (hasErrors() is untouched by a warning). Forcing any of them
     // unsuppressable would make `--suppress` unable to silence exactly the
     // class of diagnostic the standard defines as ignorable.
+
+    // P_* preprocessor band — the AUTHORED ABORT (D-CPP-ERROR-WARNING, C23
+    // 6.10.5). This is the FIRST P_* member of the table, and the break in the
+    // D_/F_/H_/I_/K_/L_/R_/A_/S_ family pattern is deliberate, not a stray: every
+    // other entry above is a MACHINE-detected invariant (the compiler found
+    // something it must not ship), whereas a reached `#error` is the SOURCE
+    // AUTHOR's own abort — a constraint they wrote precisely because the
+    // configuration being built is one their code cannot correctly build.
+    // Suppressing it hides no compiler opinion; it silently BUILDS the
+    // configuration the header author declared invalid, and since this reject is
+    // the only thing failing that build, it would do so GREEN — the exact
+    // ship-a-broken-artifact-green surface this closed table exists to forbid.
+    // Membership is cheap on real code because the emit site is REACHABILITY-
+    // gated (below the preprocessor's dead-branch gate): an `#error` inside a
+    // not-taken `#if` branch — the shape that dominates SDK headers — never
+    // emits at all, so it is never suppressed either.
+    // P_PreprocessorWarningDirective (C23 6.10.6) is deliberately NOT a member:
+    // translation continues, no wrong bytes ship, no build failure is hidden, and
+    // `--suppress` must stay able to silence exactly that advisory class — the
+    // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
+    DiagnosticCode::P_PreprocessorErrorDirective,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

@@ -43,11 +43,16 @@ namespace {
 
 constexpr int kMaxIncludeDepth = 64;
 
+// D-CPP-ERROR-WARNING: `sev` is a TRAILING DEFAULTED parameter so every existing
+// call site stays byte-identical and keeps its Error severity. Only `#warning`
+// (C23 6.10.6 -- translation CONTINUES, so it must never bump `errorCount()`)
+// passes anything else; a preprocessor diagnostic is otherwise always an Error.
 void emitPP(DiagnosticReporter& rep, DiagnosticCode code, BufferId buffer,
-            SourceSpan span, std::string actual) {
+            SourceSpan span, std::string actual,
+            DiagnosticSeverity sev = DiagnosticSeverity::Error) {
     ParseDiagnostic d;
     d.code     = code;
-    d.severity = DiagnosticSeverity::Error;
+    d.severity = sev;
     d.buffer   = buffer;
     d.span     = span;
     d.actual   = std::move(actual);
@@ -1128,8 +1133,31 @@ struct SynthBuilder {
             return e;
         };
 
+        // ★ A `#` is a DIRECTIVE INTRO only when it is FIRST on its line
+        // (C 6.10p1). The authoritative `MacroExpander` loop has always
+        // enforced this (`isHash(in[i]) && firstOnLine(in, i)`); this pre-scan
+        // did NOT, so ANY `#` anywhere — in ordinary program text, not just in
+        // a directive payload — was read as a directive of its own. The
+        // unhandled-directive line skip below fixed the PAYLOAD half of that;
+        // this fixes the other half, which the skip cannot reach because the
+        // stray `#` is not on a directive line at all. WITNESS (bare `#` in
+        // ORDINARY TEXT, inside a dead group):
+        //     #if 0
+        //     x # endif y          <- the prose `#endif` POPS the frame
+        //     #include "missing.h" <- now looks live -> eagerly resolved
+        //     #endif
+        // produced a spurious `P0016` on a header the authoritative pass never
+        // looks at. Mirrors `firstOnLine` exactly, over the pre-scan's own
+        // token wrapper (`toks[p].tok`).
+        auto sbFirstOnLine = [&](std::size_t idx) {
+            for (std::size_t p = idx; p-- > 0;) {
+                if (isNewline(toks[p].tok)) return true;
+                if (!isTrivia(toks[p].tok)) return false;
+            }
+            return true;   // start of buffer
+        };
         for (std::size_t i = 0; i < toks.size(); ++i) {
-            if (!isHash(toks[i].tok)) continue;
+            if (!isHash(toks[i].tok) || !sbFirstOnLine(i)) continue;
             std::size_t j = i + 1;
             while (j < toks.size() && isTrivia(toks[j].tok)) ++j;
             if (j >= toks.size()) break;
@@ -1282,7 +1310,50 @@ struct SynthBuilder {
                 continue;
             }
 
-            if (dirWord != cfg().includeDirective) continue;
+            // ── D-CPP-ERROR-WARNING (F2): skip a DIAGNOSTIC directive's line. Its
+            // operand is PROSE, and prose routinely contains the very words this
+            // pre-scan hunts for — `#error you must #define FOO first`, `#error see
+            // #include "config.h"`. Two pre-scan properties make that dangerous:
+            // the fall-through below does NOT skip the rest of the line (so the
+            // loop keeps stepping token-by-token INTO the message), and this
+            // loop's hash test (`isHash`, above) has NO `firstOnLine` guard —
+            // unlike the authoritative `MacroExpander` loop — so an embedded `#`
+            // inside the prose is read as a directive of its own. The first shape
+            // would harvest a phantom macro into `localMacros`; the second would
+            // reach the include arm and eagerly resolve/splice a header the
+            // program never asked for. Skipping the line is what EVERY other
+            // directive this pre-scan recognises already does, and for the same
+            // reason (see the conditional and define/undef arms above).
+            //
+            // Deliberately NOT gated on `sbStackActive`, unlike the define/undef
+            // arms: those MUTATE `localMacros`, so they must only run on a live
+            // branch. This one mutates nothing — it only advances `i` past bytes
+            // that are not include/define syntax in either case — so skipping is
+            // correct live OR dead. (The DIAGNOSTIC itself is not emitted here at
+            // all; the authoritative `MacroExpander` pass owns that, below its
+            // dead-branch gate.)
+            //
+            // ★ STATED AS THE GENERAL INVARIANT, not a per-directive list
+            // (D-PP-PRESCAN-UNHANDLED-DIRECTIVE-LINE-SKIP). Everything this
+            // pre-scan actually PROCESSES has already been dispatched above:
+            // the `#if`-family, `#define`, `#undef`. So by this point `dirWord`
+            // is either `include` (handled just below) or a directive this pass
+            // does not interpret at all — `#error`/`#warning`, `#pragma`,
+            // `#line`, `#embed`, or a word no config declares. For EVERY one of
+            // those the rest of the line is opaque payload, never include or
+            // define syntax, so stepping into it token-by-token can only
+            // misfire. Enumerating the words was the original shape and it
+            // aged badly: `#error`/`#warning` were added here only after the
+            // TF-C70 repro showed a prose `#define` being harvested and a prose
+            // `#include` being eagerly resolved (with the spliced-out include
+            // even corrupting the emitted message) — while `#pragma`/`#line`
+            // silently kept the same exposure. Skipping the line for ANY
+            // unhandled directive closes the class once, and closes it for
+            // directives not yet invented.
+            if (dirWord != cfg().includeDirective) {
+                i = sbLineEndTok(i) - 1;   // ++i lands just past the line
+                continue;
+            }
             std::size_t k = j + 1;
             while (k < toks.size() && isTrivia(toks[k].tok)) ++k;
             if (k >= toks.size()) continue;
@@ -1980,6 +2051,101 @@ private:
         }
         return synth_->slice(t.span);
     }
+    // D-CPP-ERROR-WARNING (C23 6.10.5 / 6.10.6): the VERBATIM `pp-tokens` operand
+    // of a diagnostic directive, as source bytes. `p` is the index just past the
+    // directive WORD; `end` is `lineEnd`'s one-past-the-newline.
+    //
+    // NOT macro-expanded, deliberately (gcc and clang agree): 6.10.5 asks only for
+    // a message "that includes the specified sequence of preprocessing tokens",
+    // and the operand is PROSE. Expanding it would rewrite the author's sentence
+    // and could even trip the function-like-macro arity machinery on an ordinary
+    // English parenthesis.
+    //
+    // An EMPTY operand is LEGAL, not malformed: the grammar is
+    // `# error pp-tokens_opt`, so a bare `#error` still fires. This returns "" and
+    // the caller must NOT bolt on a malformed-operand check.
+    //
+    // TRAILING-TRIVIA POLICY: the span is clipped to the first and LAST non-trivia
+    // token, so trailing whitespace and a trailing comment are EXCLUDED. That is
+    // the standard-correct reading rather than a nicety -- a comment becomes one
+    // space in translation phase 3, BEFORE phase-4 directive execution, so it is
+    // never one of the `pp-tokens` the message must include (`#error nope // TODO`
+    // must not report "nope // TODO"). Between those two anchors the slice stays
+    // BYTE-VERBATIM, so an INTERIOR comment (`#error a /* x */ b`) does survive:
+    // keeping the author's exact spelling and spacing is worth more to the reader
+    // than re-spelling the token sequence, and interior comments in a diagnostic
+    // message are vanishingly rare.
+    //
+    // Slices `synth_` DIRECTLY rather than going through `text()`: `text()` takes a
+    // `Token const&`, not a span. Its `productText_` branch is UNREACHABLE here
+    // anyway -- a `#`/`##` product token can only be born inside a macro
+    // replacement list, and a macro expansion can never produce a directive
+    // (C 6.10.3p11: a `#` arising from expansion is not a directive), so every
+    // token on a directive line is an ORIGINAL one whose span precedes `prefixLen_`.
+    [[nodiscard]] std::string_view directiveOperandText(
+        std::vector<Token> const& in, std::size_t p, std::size_t end) const {
+        std::size_t const first = skipTrivia(in, p);
+        if (first >= end || isNewline(in[first])) return {};
+        std::size_t last = end;   // one past the newline that ends the line
+        while (last > first
+               && (isNewline(in[last - 1]) || isTrivia(in[last - 1]))) {
+            --last;
+        }
+        if (last <= first) return {};   // defensive: `first` is already non-trivia
+        SourceSpan const joined =
+            SourceSpan::join(in[first].span, in[last - 1].span);
+        // ★ CLOSING STRING DELIMITER: re-consume it if it physically follows.
+        // The tokenizer splits a literal into a StringStart token holding ONLY
+        // the opening quote plus a COALESCED BODY token covering the raw bytes
+        // BETWEEN the quotes — the closing quote belongs to NO token's span (see
+        // the quote-include path above, which solves this identically at its
+        // `spliced[dirEnd] == dquote` step). So joining first..last stops one
+        // byte short whenever the operand ENDS in a literal, and only then:
+        // `#warning "abc" tail` is already correct because the join ends on
+        // `tail`. That made the bug invisible to every bare-prose test — and
+        // `#warning "Unsupported compiler detected"` (sys/cdefs.h:81, the exact
+        // shape that motivated this feature) is the broken form, so C23
+        // 6.10.5p1/6.10.6's "include the pp-tokens" was being violated on the
+        // one case that matters most.
+        //
+        // ★ `>` IS INCLUDED, and it is not hypothetical: when the word
+        // `include` appears earlier on the line it arms the tokenizer's
+        // header-context, so `#error please include <stdio.h>` lexes as
+        // HeaderStart + a coalesced HeaderPath with the SAME token-less close —
+        // and reported `<stdio.h` until this byte was added. Same shortfall,
+        // third delimiter.
+        //
+        // Guarded on the byte ACTUALLY being one of the three, so it can never
+        // over-consume. A closing delimiter that DOES belong to a token (an
+        // ordinary `>` operator, e.g. `#error a > b`) leaves `joined.end()`
+        // pointing past it at trivia, so the guard declines. It is also
+        // idempotent-safe against a future tokenizer that covers the closer
+        // itself: `last` is by construction the last NON-TRIVIA token, so every
+        // byte between `joined.end()` and the newline is trivia, and trivia
+        // never begins with one of these — the guard would simply stop firing.
+        //
+        // NOT a correctness guard for UNTERMINATED literals: `#error abc"` runs
+        // the literal to EOF and the tokenizer already fails loud with
+        // `P_UnterminatedString` (P0010, "EOF inside lexer mode 'string'").
+        // This only shapes the message text in a program that is being
+        // rejected anyway.
+        //
+        // The one-byte shortfall this compensates for is the CONSUMER-side
+        // symptom of a tokenizer-wide behaviour — the closer belongs to no
+        // token at all — tracked as D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN.
+        // Two other consumers compensate or suffer identically (the
+        // quote-include path just below, and `tree_builder`'s span join, whose
+        // short spans give `S0003` a caret one byte narrow). When that anchor
+        // closes, DELETE this block rather than leaving a third copy.
+        ByteOffset endWithDelim = joined.end();
+        std::string_view const tail =
+            synth_->slice(endWithDelim, endWithDelim + 1);
+        if (tail.size() == 1
+            && (tail[0] == '"' || tail[0] == '\'' || tail[0] == '>')) {
+            ++endWithDelim;
+        }
+        return synth_->slice(SourceSpan::of(joined.start(), endWithDelim));
+    }
     bool isHash(Token const& t) const {
         return hashKind_.valid() && t.schemaKind == hashKind_;
     }
@@ -2160,6 +2326,53 @@ private:
             // #define/#include/#pragma/#embed parity). The line's tokens are NOT
             // forwarded into `body`: a directive is not program text.
             handleLine(in, p + 1, end);
+        } else if (!cfg().errorDirective.empty()
+                   && word == cfg().errorDirective) {
+            // D-CPP-ERROR-WARNING, C23 6.10.5 (`#error`). 6.10.5p1 is a
+            // CONSTRAINT: the implementation shall produce a diagnostic message
+            // that includes the specified `pp-tokens`. Error severity; the code is
+            // in the unsuppressable closed table (an authored abort must not be
+            // silenceable into building the very configuration the author declared
+            // invalid).
+            //
+            // ★ ANTI-INSTRUCTION — DO NOT move this arm (or its `#warning` twin)
+            // up into the UNCONDITIONAL conditional-dispatch block above (the
+            // `#if`/`#ifdef`/.../`#endif` chain). That block deliberately runs in
+            // DEAD branches to keep `condStack_` balanced; an `#error` handled
+            // there would fire on every LEXED `#error`, including the ones the
+            // Apple SDK headers put inside unsupported-configuration branches that
+            // a supported target skips — i.e. every macOS compile would break.
+            // Sitting HERE, below `if (!stackActive()) return end;`, makes a
+            // dead-branch `#error` structurally incapable of firing: reachability,
+            // not recognition (C 6.10p1; the #define/#include/#pragma/#embed/#line
+            // parity).
+            //
+            // The operand is VERBATIM + optional (see `directiveOperandText`) and a
+            // bare `#error` is well-formed, so there is deliberately NO
+            // malformed-operand check. The `"#error: "` prefix is a fixed
+            // presentation LABEL naming the C directive class — the MATCH above is
+            // on `cfg().errorDirective`, never on a hard-coded spelling, so a
+            // config that rebinds the word still routes here (and a config that
+            // drops it falls through to the P0015 fail-loud below). The line's
+            // tokens are NOT forwarded into `body`: a directive is not program text.
+            emitPP(rep_, DiagnosticCode::P_PreprocessorErrorDirective,
+                   synth_->id(), in[p].span,
+                   std::string{"#error: "}
+                       + std::string{directiveOperandText(in, p + 1, end)});
+        } else if (!cfg().warningDirective.empty()
+                   && word == cfg().warningDirective) {
+            // D-CPP-ERROR-WARNING, C23 6.10.6 (`#warning`) — the `#error` twin at
+            // Warning severity: 6.10.6 standardises the long-standing gcc/clang
+            // extension, and translation CONTINUES, so this must never bump
+            // `errorCount()` (hence the explicit severity argument; every other
+            // `emitPP` here defaults to Error). Suppressible by design, unlike its
+            // `#error` sibling. Same reachability gate, same verbatim-optional
+            // operand, same no-tokens-into-`body` rule as above.
+            emitPP(rep_, DiagnosticCode::P_PreprocessorWarningDirective,
+                   synth_->id(), in[p].span,
+                   std::string{"#warning: "}
+                       + std::string{directiveOperandText(in, p + 1, end)},
+                   DiagnosticSeverity::Warning);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
                    synth_->id(), in[p].span,

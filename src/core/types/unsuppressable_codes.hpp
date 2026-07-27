@@ -70,6 +70,25 @@ namespace dss {
 //     A_LirToMirSizeMismatch, A_NoMatchingEncodingVariant,
 //     A_RoundTripMismatch, A_NoEncodingDeclared,
 //     A_NoEncodingShapeWalker.
+//   - AUTHORED ABORT (D-CPP-ERROR-WARNING) — the first and only P_*
+//     member, and a DELIBERATE break in the D_/F_/H_/I_/K_/L_/R_/A_/S_
+//     family pattern above, so it is spelled out rather than left to
+//     look like a stray: P_PreprocessorErrorDirective. Every other
+//     entry in this table is a MACHINE-detected invariant (the
+//     compiler found something it must not ship). A reached `#error`
+//     (C23 6.10.5) is the opposite direction — the SOURCE AUTHOR's own
+//     abort, written precisely because the configuration being built
+//     is one their code cannot correctly build. Suppressing it hides
+//     no compiler opinion; it silently BUILDS the configuration the
+//     header author declared invalid, and since the reject is the only
+//     thing failing that build, it would do so GREEN. (It fires only
+//     when conditional inclusion REACHES the directive — an `#error`
+//     in a not-taken branch never emits, so membership costs nothing
+//     on the skipped-guard shape that dominates real headers.) Its
+//     twin P_PreprocessorWarningDirective (C23 6.10.6) is deliberately
+//     NOT a member: translation continues, no wrong bytes ship, and
+//     `--suppress` must stay able to silence exactly that advisory
+//     class — the S_DeprecatedSymbolUsed / S_UnknownAttribute posture.
 //
 // Adding a code here is a commitment: this code's emission MUST be visible
 // to the build pipeline regardless of any --suppress policy. New entries

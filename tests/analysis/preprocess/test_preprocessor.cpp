@@ -18,9 +18,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -5445,3 +5447,731 @@ TEST(Preprocessor, ArityMismatchDropsMalformedCallKeepsTrailingTokens) {
         EXPECT_NE(l, ")") << "the malformed call's `)` leaked";
     }
 }
+
+// ============================================================================
+// TF-C70 (D-CPP-ERROR-WARNING) -- C23 6.10.5 `#error` / 6.10.6 `#warning`.
+//
+// The load-bearing property is TWO-DIRECTIONAL, and the SILENT half is the one
+// that carries the weight. C 6.10p1 EXECUTES a directive only when its
+// enclosing conditional group is live, so an `#error` in a NOT-TAKEN branch
+// must produce NO diagnostic at all. Every macOS SDK header depends on exactly
+// that: `sys/cdefs.h` and friends park `#error`s inside unsupported-
+// configuration branches that a supported target skips. A suite that asserted
+// only "a reached `#error` diagnoses" would be fully satisfied by an
+// implementation that fires on every LEXED `#error` -- i.e. one that cannot
+// preprocess a single system header. So the silence tests below are paired
+// with positive twins (an implementation that NEVER fires cannot pass either),
+// and each test names the concrete engine edit that turns THAT test red.
+//
+// The engine seam, for the red-on-disable notes: `MacroExpander::
+// handleDirective` (src/analysis/preprocess/preprocessor.cpp) dispatches the
+// `#if`-family UNCONDITIONALLY (they must keep `condStack_` balanced inside a
+// dead group), then hits `if (!stackActive()) return end;` -- and only BELOW
+// that gate live the `#error`/`#warning` arms. Reachability, not recognition.
+// ============================================================================
+namespace {
+
+// The FIRST diagnostic carrying `code` (nullptr if none). `firstMessageWithCode`
+// above yields only the text; `#warning`'s entire contract is its SEVERITY, so
+// these tests need the diagnostic itself.
+[[nodiscard]] ParseDiagnostic const* firstDiagWithCode(PreprocessResult const& r,
+                                                       DiagnosticCode code) {
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) return &d;
+    }
+    return nullptr;
+}
+
+// Rebind ONE `"<key>": "<word>"` string field of the shipped c-subset config to
+// `newWord` and reload. Unlike handing `reboundCSubset` a literal key-value
+// spelling, this LOCATES the value (key -> `:` -> the quoted value), so the
+// rebind survives any re-alignment of the config's columns. A missing key is an
+// ADD_FAILURE, never a silent no-op: a rebind whose `from` stopped matching
+// would otherwise re-run the BASELINE schema and pass VACUOUSLY -- the exact
+// failure mode that makes a config-driven test worthless.
+[[nodiscard]] std::shared_ptr<GrammarSchema const>
+reboundPreprocessWord(std::string const& key, std::string const& newWord,
+                      std::string const& label) {
+    std::string const text = loadShippedCSubsetText();
+    if (text.empty()) {
+        ADD_FAILURE() << "could not locate shipped c-subset config";
+        return nullptr;
+    }
+    std::string const quotedKey = "\"" + key + "\"";
+    auto const keyPos = text.find(quotedKey);
+    if (keyPos == std::string::npos) {
+        ADD_FAILURE() << "shipped c-subset config declares no " << quotedKey;
+        return nullptr;
+    }
+    auto const colon = text.find(':', keyPos + quotedKey.size());
+    auto const openQ = (colon == std::string::npos)
+                           ? std::string::npos
+                           : text.find('"', colon + 1);
+    auto const closeQ = (openQ == std::string::npos)
+                            ? std::string::npos
+                            : text.find('"', openQ + 1);
+    if (closeQ == std::string::npos) {
+        ADD_FAILURE() << quotedKey << " is not a `\"key\": \"value\"` pair";
+        return nullptr;
+    }
+    return reboundCSubset(text.substr(keyPos, closeQ + 1 - keyPos),
+                          quotedKey + ": \"" + newWord + "\"", label);
+}
+
+// `lexs` is EXACTLY the five lexemes of `int x=1;` -- the whole program once the
+// directive lines are gone. Pins consumption as well as (non-)diagnosis: a
+// directive whose `#`/word leaked into the parser stream fails here even when
+// the diagnostic assertions pass.
+[[nodiscard]] ::testing::AssertionResult isIntXAssignOne(
+    std::vector<std::string> const& lexs) {
+    static char const* const kWant[] = {"int", "x", "=", "1", ";"};
+    if (lexs.size() != 5) {
+        return ::testing::AssertionFailure()
+               << "expected exactly 5 lexemes (`int x = 1 ;`), got "
+               << lexs.size();
+    }
+    for (std::size_t i = 0; i < 5; ++i) {
+        if (lexs[i] != kWant[i]) {
+            return ::testing::AssertionFailure()
+                   << "lexeme " << i << ": expected '" << kWant[i] << "', got '"
+                   << lexs[i] << "'";
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+} // namespace
+
+// ── SILENCE (the load-bearing half) ─────────────────────────────────────────
+
+// (1) `#if 0` elides its group, so the `#error` inside is never EXECUTED
+// (C 6.10p1) -- no diagnostic of any kind, and the surviving program is exactly
+// `int x = 1 ;`.
+// RED-ON-DISABLE: move the `#error` arm out of the `else if` chain in
+// `handleDirective` and up into the UNCONDITIONAL `#if`-family dispatch above
+// `if (!stackActive()) return end;` -- the directive is then diagnosed on
+// RECOGNITION rather than reachability and this test reds on every assertion.
+TEST(Preprocessor, TfC70ErrorDirectiveInIfZeroIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 0\n#error must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "an `#error` in a NOT-TAKEN `#if 0` group must never fire -- every "
+           "macOS SDK header parks `#error`s in branches a supported target "
+           "skips";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "nor may it be downgraded into a warning: a skipped group produces "
+           "NO diagnostic";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a dead-branch `#error` must be completely silent (got "
+        << r.diagnostics->all().size() << " diagnostics)";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// (2) The `#ifdef` path is a SEPARATE evaluator arm from `#if` (`SbIfKind::
+// Ifdef` reads definedness DIRECTLY; `#if 0` runs the ICE expression
+// evaluator), so the silence contract is pinned once per arm. An undefined
+// macro name leaves the group dead.
+// RED-ON-DISABLE: same edit as (1) (hoisting the arm above the `stackActive()`
+// gate); additionally red if `sbHandleIf`'s `Ifdef` branch ever pushed an
+// ACTIVE frame for an undefined name.
+TEST(Preprocessor, TfC70ErrorDirectiveInIfdefUndefinedMacroIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef DSS_NEVER_DEFINED\n#error must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "`#ifdef <undefined>` is a dead group -- its `#error` is not "
+           "executed (the `#ifdef` evaluator arm, distinct from `#if 0`)";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// (3) The NOT-TAKEN `#else` arm: the group's `#if 1` already took, so the
+// `#else` body never executes. Distinct frame state from (1)/(2) -- here the
+// frame was pushed ACTIVE and is later turned off by `sbHandleElse`, so this
+// pins the `#else` transition rather than the open.
+// RED-ON-DISABLE: same hoist as (1); also red if `sbHandleElse` stopped
+// clearing `thisBranchActive` once `anyBranchTaken`.
+TEST(Preprocessor, TfC70ErrorDirectiveInNotTakenElseIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 1\nint x;\n#else\n#error dead else\n#endif\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "the `#else` arm of an already-taken group is dead -- its `#error` "
+           "must not fire";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    ASSERT_EQ(lexs.size(), 3u) << "only the taken arm `int x ;` survives";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "x");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// (4) ★ NESTED: an `#if 1` whose own controlling expression is TRUE, sitting
+// inside a dead `#if 0`. Liveness is a property of the WHOLE frame chain, not
+// of the innermost directive -- the shape that appears in real headers as a
+// feature test nested under a platform guard.
+// RED-ON-DISABLE: the (1) hoist reds this too. The nesting-specific pin is the
+// CONJUNCTION of two engine facts, and the test reds if BOTH are undone:
+// `sbHandleIf` pushing `thisBranchActive = enclosing && cond`
+// (preprocessor.cpp:287) AND `sbStackActive` walking every frame
+// (preprocessor.cpp:204-209). Undoing either ALONE leaves the composite
+// predicate correct -- they are observationally equivalent by construction,
+// which is why no test can separate them; what this test pins is that at least
+// one of the two survives, i.e. that a live-looking inner group inside a dead
+// outer group stays dead. No other test in this file exercises the nested
+// shape.
+TEST(Preprocessor, TfC70ErrorDirectiveNestedInDeadOuterBranchStaysSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n#if 1\n#error inner live but outer dead\n#endif\n#endif\n"
+        "int x=1;\n",
+        r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "the inner `#if 1` is nested inside a dead `#if 0`: liveness is the "
+           "conjunction over EVERY open frame, so the `#error` is not executed";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// ── POSITIVE TWINS (so a never-fires implementation cannot pass) ────────────
+
+// (5) A REACHED `#error` fails loud, at Error severity, and its message carries
+// the author's `pp-tokens` verbatim (C 6.10.5p1 makes including them a
+// CONSTRAINT, not a nicety). The directive line itself is consumed -- a
+// directive is not program text.
+// RED-ON-DISABLE: delete the `else if (... word == cfg().errorDirective)` arm
+// in `handleDirective` -- the line falls through to the generic
+// `P_PreprocessorUnsupported` (P0015) fail-loud, whose message is "unsupported
+// preprocessor directive ...: error" and carries none of the user's text.
+TEST(Preprocessor, TfC70ErrorDirectiveReachedFailsLoudWithUserText) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#error unsupported configuration for this target\n"
+                  "int x=1;\n",
+                  r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "a REACHED `#error` must fail loud";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "it must route to the `#error` arm, not the generic "
+           "unsupported-directive fail-loud";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#error` is fatal: translation does not continue (C 6.10.5)";
+    auto const* d =
+        firstDiagWithCode(r, DiagnosticCode::P_PreprocessorErrorDirective);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Error)
+        << "`#error` is an ERROR, not a warning";
+    EXPECT_NE(d->actual.find("unsupported configuration"), std::string::npos)
+        << "the message must INCLUDE the author's pp-tokens (C 6.10.5p1); got: "
+        << d->actual;
+    EXPECT_TRUE(isIntXAssignOne(lexs))
+        << "the `#error` line is consumed, never forwarded to the parser";
+}
+
+// (6) The positive twin of (4): two LIVE frames. Proves the liveness walk does
+// not spuriously report a nested group dead -- the direction that would make
+// `#error` unreachable-by-construction and silently satisfy every silence test
+// above.
+// RED-ON-DISABLE: make `sbStackActive` return false for any non-empty stack
+// (the over-conservative mirror of the (1) hoist) -- (1)-(4) stay green and
+// ONLY this test reds.
+TEST(Preprocessor, TfC70ErrorDirectiveLiveInNestedTakenBranchStillFires) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#if 1\n#if 1\n#error live through two frames\n#endif\n#endif\n"
+        "int x=1;\n",
+        r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "both enclosing frames are TAKEN, so the `#error` IS executed";
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// ── SEMANTICS ───────────────────────────────────────────────────────────────
+
+// (7) C23 6.10.5 spells the directive `# error pp-tokens_opt` -- the operand is
+// OPTIONAL, so a BARE `#error` is well-formed and still fires, with empty user
+// text. It must NOT be reported as a malformed directive
+// (`P_PreprocessorDirective`, P0013).
+// RED-ON-DISABLE: add an "operand required" check to the `#error` arm (the
+// obvious-looking `if (operand.empty()) emit(P_PreprocessorDirective)`), which
+// is what the `pp-tokens_opt` grammar forbids -- the code assertion reds.
+TEST(Preprocessor, TfC70ErrorDirectiveWithNoOperandStillFires) {
+    PreprocessResult r;
+    (void)ppLexemes("#error\nint x=1;\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "`# error pp-tokens_opt`: a bare `#error` is well-formed and fires";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "an absent operand is NOT a malformed directive (C23 6.10.5's "
+           "`pp-tokens_opt`)";
+    EXPECT_EQ(firstMessageWithCode(
+                  r, DiagnosticCode::P_PreprocessorErrorDirective),
+              "#error: ")
+        << "the message is the fixed label plus EMPTY user text";
+}
+
+// (8) The operand is NOT macro-expanded. C 6.10.5 requires the message to
+// include "the specified pp-tokens" -- the tokens as WRITTEN. A directive line
+// is never run through the expander (C 6.10.3p11), so `X` stays `X`.
+// RED-ON-DISABLE: expand the operand before building the message (route it
+// through the macro pass instead of `directiveOperandText`'s verbatim slice) --
+// the message becomes "#error: 1 is bad" and both assertions red.
+TEST(Preprocessor, TfC70ErrorDirectiveOperandIsNotMacroExpanded) {
+    PreprocessResult r;
+    (void)ppLexemes("#define X 1\n#error X is bad\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective));
+    std::string const msg = firstMessageWithCode(
+        r, DiagnosticCode::P_PreprocessorErrorDirective);
+    EXPECT_NE(msg.find("X is bad"), std::string::npos)
+        << "the pp-tokens are reported AS WRITTEN; got: " << msg;
+    EXPECT_EQ(msg.find("1 is bad"), std::string::npos)
+        << "the operand must NOT be macro-expanded; got: " << msg;
+}
+
+// OPERAND FORMS the bare-prose tests above do NOT reach. C23 6.10.5p1/6.10.6
+// require the pp-tokens VERBATIM, and the tokenizer makes a trailing STRING
+// LITERAL a special case: it splits a literal into a StringStart token holding
+// only the opening quote plus a coalesced BODY token covering the bytes BETWEEN
+// the quotes, so the CLOSING quote belongs to no token's span and a naive
+// first..last span join stops one byte short.
+//
+// ★ WHY THIS TEST EXISTS AT ALL: every other TfC70 operand test uses bare prose,
+// and bare prose is exactly the form that does NOT expose the bug — as does
+// `"abc" tail`, because there the join ends on `tail`. The suite was green over
+// that subset while `#warning "Unsupported compiler detected"` — sys/cdefs.h:81,
+// the literal shape that motivated this whole feature — silently reported a
+// truncated `"Unsupported compiler detected` with no closing quote. A
+// multi-FORM contract needs a test per form, not per site.
+//
+// RED-ON-DISABLE: delete the closing-delimiter re-consume in
+// `directiveOperandText` (the `tail[0] == '"'` guard) -> (A) and (B) red.
+// The negative cases (C)/(D) guard the OTHER direction: the re-consume must be
+// byte-guarded so it can never swallow a character that is not a delimiter.
+TEST(Preprocessor, TfC70OperandKeepsClosingStringDelimiter) {
+    auto msgOf = [](char const* src) {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        return firstMessageWithCode(
+            r, DiagnosticCode::P_PreprocessorWarningDirective);
+    };
+    // (A) THE sys/cdefs.h:81 SHAPE — operand is a lone string literal.
+    EXPECT_NE(msgOf("#warning \"Unsupported compiler detected\"\n")
+                  .find("\"Unsupported compiler detected\""),
+              std::string::npos)
+        << "the closing quote is part of the pp-tokens and must be reported";
+    // (B) char-literal twin: the same span shortfall applies to `'`.
+    EXPECT_NE(msgOf("#warning 'q'\n").find("'q'"), std::string::npos);
+    // (C) ANGLE delimiter — the THIRD form, and not hypothetical: the word
+    // `include` earlier on the line arms the tokenizer's header-context, so the
+    // path lexes as HeaderStart + coalesced HeaderPath with the same token-less
+    // close. Reported `<stdio.h` before `>` was added to the guard.
+    EXPECT_NE(msgOf("#warning please include <stdio.h>\n").find("<stdio.h>"),
+              std::string::npos)
+        << "the header-path close `>` is part of the pp-tokens too";
+    // (D) NEGATIVE: a delimiter that DOES belong to a token must not be
+    // doubled. `a > b` ends on `b`, so the guard has nothing to extend.
+    {
+        std::string const m = msgOf("#warning use a > b\n");
+        EXPECT_NE(m.find("use a > b"), std::string::npos) << m;
+        EXPECT_EQ(m.find("b>"), std::string::npos)
+            << "the re-consume must not append a phantom byte; got: " << m;
+    }
+    // (E) NEGATIVE: an UNTERMINATED literal. The guard must not double the
+    // quote. NOTE this program is rejected anyway — the tokenizer fails loud
+    // with P0010 `EOF inside lexer mode 'string'` — so this pins message shape
+    // only, not acceptance. (An earlier comment here claimed the stray quote
+    // "ends on a StringStart whose own span covers it"; that was wrong, and
+    // measuring it is what corrected the record.)
+    {
+        std::string const m = msgOf("#warning abc\"\n");
+        EXPECT_EQ(m.find("abc\"\""), std::string::npos)
+            << "the delimiter re-consume must not double up; got: " << m;
+    }
+    // (D) NEGATIVE: the trailing-trivia policy still wins — a trailing comment
+    // is one space in phase 3, long before phase-4 directive execution, so it
+    // is never part of the pp-tokens.
+    {
+        std::string const m = msgOf("#warning nope // TODO\n");
+        EXPECT_NE(m.find("nope"), std::string::npos) << m;
+        EXPECT_EQ(m.find("TODO"), std::string::npos)
+            << "a trailing comment is not part of the pp-tokens; got: " << m;
+    }
+}
+
+// ── ★ CONFIG-DRIVEN: REBIND, not merely strip ───────────────────────────────
+
+// (9) The directive WORD comes from `preprocess.errorDirective`, never a
+// hard-coded "error". Rebound off "error" -> "errr": `#error` becomes an
+// UNKNOWN directive (P0015) and `#errr` drives the `#error` handler. Follows
+// FC179EmbedDirectiveIsConfigDrivenNotHardcoded.
+// ★ A strip-only test (asserting `#error` fails loud once the field is empty)
+// would be INADEQUATE: an implementation that consults the config solely for
+// the `.empty()` guard while MATCHING a hard-coded "error" literal passes it.
+// Only the rebind's second half -- `#errr` DRIVING the handler -- excludes that.
+// RED-ON-DISABLE: replace `word == cfg().errorDirective` with `word == "error"`
+// in `handleDirective`. The rebind is then ignored: `#error` still fires
+// P001E (first sub-case reds) and `#errr` reaches the generic fail-loud
+// (second sub-case reds).
+TEST(Preprocessor, TfC70ErrorDirectiveIsConfigDrivenNotHardcoded) {
+    auto schema =
+        reboundPreprocessWord("errorDirective", "errr", "<rebound-error>");
+    ASSERT_TRUE(schema != nullptr);
+    ASSERT_EQ(schema->preprocess().errorDirective, "errr")
+        << "the rebound schema must carry the NEW directive word";
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString("#error x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with the word rebound, `#error` is an unknown directive (P0015)";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "a hard-coded \"error\" literal would still fire P001E here";
+    }
+    {
+        auto buf = SourceBuffer::fromString("#errr x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "the rebound `#errr` word now drives the `#error` handler";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported));
+    }
+}
+
+// (10) The `#warning` twin of (9), with the same reasoning: rebound off
+// "warning" -> "warnn", `#warning` is unknown (P0015) and `#warnn` drives the
+// warning handler.
+// RED-ON-DISABLE: replace `word == cfg().warningDirective` with
+// `word == "warning"`.
+TEST(Preprocessor, TfC70WarningDirectiveIsConfigDrivenNotHardcoded) {
+    auto schema =
+        reboundPreprocessWord("warningDirective", "warnn", "<rebound-warning>");
+    ASSERT_TRUE(schema != nullptr);
+    ASSERT_EQ(schema->preprocess().warningDirective, "warnn");
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString("#warning x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with the word rebound, `#warning` is an unknown directive";
+        EXPECT_FALSE(
+            hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "a hard-coded \"warning\" literal would still fire P001F here";
+    }
+    {
+        auto buf = SourceBuffer::fromString("#warnn x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(
+            hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "the rebound `#warnn` word now drives the `#warning` handler";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported));
+    }
+}
+
+// ── `#warning` (the half that unblocks sys/cdefs.h) ─────────────────────────
+
+// (11) ★ A reached `#warning` is NON-FATAL: it is reported, carries the user's
+// text, and translation CONTINUES (C23 6.10.6) -- `hasErrors()` stays FALSE and
+// the program still reaches the parser intact. This is the whole point of the
+// directive: `sys/cdefs.h` emits `#warning`s on paths a build must survive.
+// RED-ON-DISABLE: drop the explicit `DiagnosticSeverity::Warning` argument from
+// the `#warning` `emitPP` call (every other `emitPP` in the file DEFAULTS to
+// Error) -- `hasErrors()` flips true and the severity assertion reds.
+TEST(Preprocessor, TfC70WarningDirectiveReachedIsNonFatal) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#warning deprecated path\nint x=1;\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "a REACHED `#warning` must be reported";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "`#warning` must NOT bump errorCount -- translation continues "
+           "(C23 6.10.6); a fatal `#warning` breaks every build that uses one";
+    auto const* d =
+        firstDiagWithCode(r, DiagnosticCode::P_PreprocessorWarningDirective);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Warning);
+    EXPECT_NE(d->actual.find("deprecated path"), std::string::npos)
+        << "the message must include the author's pp-tokens; got: " << d->actual;
+    EXPECT_TRUE(isIntXAssignOne(lexs))
+        << "translation continues: the whole program still reaches the parser";
+}
+
+// (12) The `#warning` silence twin. Note `hasErrors()` is false either way for
+// a warning, so the load-bearing assertions here are the CODE's absence and the
+// empty diagnostic list -- not the error flag.
+// RED-ON-DISABLE: hoist the `#warning` arm above `if (!stackActive()) return
+// end;` (or handle it in the unconditional `#if`-family block) -- the dead
+// group's `#warning` then fires and both assertions red.
+TEST(Preprocessor, TfC70WarningDirectiveInDeadBranchIsSilent) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#if 0\n#warning must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "a `#warning` in a NOT-TAKEN group is not executed (C 6.10p1)";
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a dead-branch `#warning` must be completely silent (got "
+        << r.diagnostics->all().size() << " diagnostics)";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// ── PRE-SCAN PROSE GUARD ────────────────────────────────────────────────────
+
+// (13) The `#error`/`#warning` MESSAGE BODY is prose, never directives. This is
+// a real seam, not a hypothetical: `SynthBuilder`'s include pre-scan
+// (preprocessor.cpp ~:1136) scans for the intro token with NO `firstOnLine`
+// guard -- unlike the authoritative `MacroExpander` loop -- so any `#` EMBEDDED
+// in the prose is read as a directive of its own unless the whole line is
+// skipped. The consequences are one-sided and LOUD-but-WRONG: a phantom macro
+// harvested into `localMacros` flips a later guard, and the include arm then
+// eagerly resolves a header the program never asked for (P0016 on a file the
+// authoritative pass never looks at).
+//
+// ★ RED-ON-DISABLE — HONEST STATEMENT, corrected after measurement. The
+// pre-scan now carries TWO guards that each independently prevent this shape:
+// (1) `sbFirstOnLine` on the hash test (a `#` is a directive intro only when
+// FIRST on its line, C 6.10p1), and (2) the unhandled-directive line skip.
+// MEASURED: disabling EITHER one alone leaves this test GREEN — they overlap
+// here, so this test does NOT pin either individually and it is honest to say
+// so rather than claim a red-on-disable it does not have. It reds only when
+// BOTH are removed. The guard that IS uniquely pinned by a single test is
+// `sbFirstOnLine`, by `TfC70StrayHashInOrdinaryTextIsNotADirective` below —
+// a stray `#` in ORDINARY TEXT, which the line skip structurally cannot cover
+// because there is no directive word to match. NOTE the skip is deliberately
+// stated as the GENERAL invariant
+// (any directive this pre-scan does not itself process gets its line skipped,
+// D-PP-PRESCAN-UNHANDLED-DIRECTIVE-LINE-SKIP), NOT as an
+// `errorDirective`/`warningDirective` special case: an enumerated list left
+// `#pragma`/`#line`/`#embed` carrying the identical exposure. So this test
+// guards the whole class, and the sub-cases below are merely the two shapes
+// that were empirically reproduced. Each sub-case reds:
+//   (A) the prose `#define POISON` is harvested (the define arm is live here),
+//       `#if defined(POISON)` folds TRUE in the pre-scan only, and
+//       `#include "missing.h"` is resolved -> P0016;
+//   (B) the prose `#endif` POPS the dead frame in the pre-scan (the conditional
+//       arm runs UNCONDITIONALLY, by design, to keep nesting balanced), so the
+//       following dead `#include "missing.h"` becomes "confident-live" and is
+//       resolved -> P0016;
+//   (C) the `#warning` twin of (A) -- pins that the skip covers BOTH words, not
+//       just `#error`.
+// The skip must NOT be gated on `sbStackActive`: sub-case (B) is a DEAD group.
+TEST(Preprocessor, TfC70ErrorMessageBodyIsNotScannedAsDirectives) {
+    // (A) LIVE `#error`, prose containing a `#define`.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#error do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "non-vacuous: the `#error` itself IS reached and fires";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#define POISON` must not be harvested by the "
+               "pre-scan -- doing so flips `#if defined(POISON)` and resolves "
+               "an include the authoritative pass never executes";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (B) DEAD `#error`, prose containing an `#endif` (the conditional arms run
+    // unconditionally, so this shape corrupts the frame stack without the skip).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "#error remove this #endif marker\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` must not pop the pre-scan's conditional "
+               "frame -- doing so makes the DEAD include look live and "
+               "resolves a header that does not exist";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "the whole group is dead: nothing at all is reported (got "
+            << r.diagnostics->all().size() << ")";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (C) LIVE `#warning`, prose containing a `#define` -- the skip covers both
+    // directive words. Here the fixed engine reports NOTHING fatal, so the
+    // error flag itself is a red-on-disable witness.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#warning do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "non-vacuous: the `#warning` itself IS reached and reported";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the `#warning` prose must be skipped by the pre-scan too";
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a `#warning` alone is non-fatal; a spurious P0016 from the "
+               "prose would make this compile fail";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+}
+
+// ★ THE `sbFirstOnLine` PIN — the one guard no other test isolates.
+// C 6.10p1: a `#` introduces a directive only when it is FIRST on its line.
+// The authoritative `MacroExpander` loop always enforced that; the include
+// PRE-SCAN did not, so a `#` ANYWHERE — in ordinary program text, not merely in
+// a directive payload — was read as a directive of its own. The
+// unhandled-directive line skip cannot reach this shape: there is no directive
+// word on the line to match, so the skip never fires. That makes this the ONLY
+// discriminating witness between the two overlapping guards.
+//
+// RED-ON-DISABLE (DEMONSTRATED): drop `|| !sbFirstOnLine(i)` from the pre-scan's
+// hash test and this test fails — with the line skip still fully in place.
+// Before the guard, the prose `#endif` POPPED the pre-scan's conditional frame
+// (the conditional arms run UNCONDITIONALLY, by design, to keep nesting
+// balanced), so the DEAD `#include` below it looked live and was eagerly
+// resolved: a hard `P0016` on a header the authoritative pass never looks at.
+TEST(Preprocessor, TfC70StrayHashInOrdinaryTextIsNotADirective) {
+    // A bare `#` mid-line in ORDINARY TEXT, inside a dead group.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "x # endif y\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` that is not first on its line is NOT a directive: the "
+               "prose `#endif` must not pop the pre-scan's frame and make the "
+               "dead include look live";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // The same stray `#` in a LIVE region must also stay inert for the
+    // pre-scan (it is ordinary text; the parser may reject it later, but the
+    // pre-scan must not resolve an include off it).
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#define GUARD 1\n"
+                        "a # include \"missing.h\" b\n"
+                        "int x=1;\n",
+                        r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a mid-line `# include` is ordinary text, not a directive -- "
+               "the pre-scan must not resolve it";
+    }
+}
+
+// The SAME class, for the two OTHER directive words whose payload the pre-scan
+// does not interpret: `#pragma` and `#line`
+// (D-PP-PRESCAN-UNHANDLED-DIRECTIVE-LINE-SKIP).
+//
+// WHY THIS TEST EXISTS SEPARATELY FROM THE `#error`/`#warning` ONE ABOVE. The
+// first cut of the fix ENUMERATED `errorDirective`/`warningDirective`, which
+// was correct-but-incomplete: `#pragma`/`#line`/`#embed` kept the identical
+// exposure, and the suite was green over that SUBSET. The fix is now the
+// general invariant — "any directive this pre-scan does not itself process
+// gets its line skipped" — but an invariant stated only in a comment decays.
+// These cases pin the OTHER forms so a future narrowing back to an enumerated
+// list cannot pass. `#pragma` is the realistic one: C 6.10.6 makes its payload
+// implementation-defined token soup, and the authoritative pass consumes-and-
+// drops it, so a bare `#` in a payload is entirely plausible.
+//
+// ★ RED-ON-DISABLE — CORRECTED AFTER MEASUREMENT, and the correction matters.
+// An earlier version of this comment claimed each sub-case reds when the
+// unhandled-directive line skip is collapsed to a bare `continue`. That WAS
+// true when the skip was the only guard; it is FALSE now. `sbFirstOnLine` was
+// added to the pre-scan's hash test afterwards, and every payload `#` here is
+// BY DEFINITION not first on its line — so `sbFirstOnLine` alone keeps (A)-(D)
+// green and the line skip has NO single-test pin at all. These sub-cases pin
+// the PAIR, exactly like their `#error`/`#warning` sibling above; they red only
+// when BOTH guards are removed.
+//
+// The skip is deliberately KEPT despite being behaviourally subsumed: it states
+// the intent locally ("this pass does not interpret that payload") and it
+// advances `i` past the whole line instead of stepping token-by-token. But it
+// is defence-in-depth plus a small win, NOT the load-bearing guard — do not
+// claim a red-on-disable for it, and do not let its presence excuse weakening
+// `sbFirstOnLine`, which IS uniquely pinned (by
+// `TfC70StrayHashInOrdinaryTextIsNotADirective`).
+// ★ A first attempt at (C) used `#line 7 "x #define POISON"` and did NOT red —
+// the `#define` sat inside a STRING LITERAL and lexes as one token, so the
+// pre-scan never saw a `#`. The bare-`#` form below is the one that bites;
+// keep it that way or this sub-case silently stops testing anything.
+TEST(Preprocessor, TfC70PragmaAndLinePayloadsAreNotScannedAsDirectives) {
+    // (A) `#pragma` payload carrying a prose `#define`.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma GCC poison do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` inside a `#pragma` payload must not be read as a "
+               "directive: harvesting the prose `#define POISON` flips "
+               "`#if defined(POISON)` in the PRE-SCAN ONLY and resolves an "
+               "include the authoritative pass never executes";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (B) `#pragma` payload carrying a prose `#endif`, inside a DEAD group that
+    // guards an include. Worse than (A): the conditional arms run
+    // UNCONDITIONALLY (by design, to keep nesting balanced), so a prose
+    // `#endif` POPS the frame and makes the dead include look live.
+    {
+        PreprocessResult r;
+        // ★ BARE prose, NOT `/* ... */`. An earlier version wrapped the stray
+        // `#endif` in a block comment and was INERT: comment bodies are
+        // trivia-kind tokens, so the pre-scan never sees the `#` at all and the
+        // sub-case passed with or without the guard. Exactly the trap this
+        // file documents for the string-literal attempt a few tests below —
+        // keep the payload bare or this stops testing anything.
+        auto lexs = ppLexemes("#if 0\n"
+                              "#pragma once stray #endif marker\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` must not pop the pre-scan's conditional "
+               "frame";
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "the whole group is dead: nothing at all is reported (got "
+            << r.diagnostics->all().size() << ")";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (C) `#line` payload carrying a prose `#define`. Malformed as C, but the
+    // pre-scan must be robust to it — it runs BEFORE any directive is
+    // validated, so it cannot assume well-formedness.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#line 7 #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` inside a `#line` payload must not be read as a directive";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (D) `#line` payload carrying a prose `#endif`, in a dead group.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "#line 7 #endif\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` in a `#line` payload must not pop the "
+               "pre-scan's conditional frame";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+}
+

@@ -47,6 +47,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_PreprocessorPredefinedMacro: return "P_PreprocessorPredefinedMacro";
         case DiagnosticCode::P_PreprocessorHasInclude:   return "P_PreprocessorHasInclude";
         case DiagnosticCode::P_PreprocessorEmbed:        return "P_PreprocessorEmbed";
+        case DiagnosticCode::P_PreprocessorErrorDirective:
+            return "P_PreprocessorErrorDirective";
+        case DiagnosticCode::P_PreprocessorWarningDirective:
+            return "P_PreprocessorWarningDirective";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

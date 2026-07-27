@@ -101,6 +101,38 @@ enum class DiagnosticCode : std::uint16_t {
     // every non-bare-quote-filename shape emits THIS code -- never a silent drop
     // and never a silent partial embed.
     P_PreprocessorEmbed           = 0x001D,
+    // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5): the translation unit contains
+    // an `#error` directive that the conditional-inclusion state REACHED. C23
+    // 6.10.5p1 makes this a CONSTRAINT: the implementation shall produce a
+    // diagnostic message that includes the directive's `pp-tokens` (which are
+    // NOT macro-expanded -- gcc/clang agree, and the operand is deliberately
+    // prose). Severity Error (unlike its `#warning` twin) and a member of the
+    // unsuppressable closed table: an `#error` is the header author's authored
+    // ABORT, so silencing it silently builds the configuration they declared
+    // invalid. The operand is OPTIONAL (`pp-tokens_opt`): a bare `#error` is
+    // well-formed and still fires.
+    //
+    // ★ REACHABILITY INVARIANT (the whole feature): C 6.10p1 -- a group skipped
+    // by conditional inclusion is parsed ONLY far enough to track nesting, so an
+    // `#error` inside a NOT-TAKEN branch must be entirely SILENT. This is not a
+    // nicety: the Apple SDK headers use `#error` as the unsupported-config guard
+    // INSIDE branches that a supported target skips, so an implementation firing
+    // on every LEXED `#error` cannot compile a single macOS translation unit.
+    // The emit site is therefore placed BELOW `handleDirective`'s
+    // `if (!stackActive()) return end;` gate -- structurally incapable of firing
+    // in a dead branch -- exactly like the `#pragma`/`#embed`/`#line` arms.
+    P_PreprocessorErrorDirective  = 0x001E,
+    // D-CPP-ERROR-WARNING (`#warning`; C23 6.10.6): the reached-directive twin of
+    // `P_PreprocessorErrorDirective`, at Warning severity. C23 6.10.6p1 (the
+    // long-standing gcc/clang extension standardised by C23): the implementation
+    // produces a diagnostic including the directive's `pp-tokens` and translation
+    // CONTINUES -- so this must never bump `errorCount()`. Deliberately NOT in the
+    // unsuppressable closed table (its `#error` sibling is): a warning ships no
+    // wrong bytes and hides no build failure, so `--suppress` must be able to
+    // silence exactly this advisory class (the S_DeprecatedSymbolUsed posture).
+    // The SAME reachability invariant applies verbatim -- a `#warning` in an
+    // elided branch is silent.
+    P_PreprocessorWarningDirective = 0x001F,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
