@@ -1,29 +1,55 @@
 #!/usr/bin/env bash
-# Verifies the SCOPED-CONFOUND classifier by EXTRACTING the block from the shipped
+# Verifies the confound classifier by EXTRACTING the block from the shipped
 # build-and-test.sh and running it — not by re-implementing it here. A copy would
 # stay green if the shipped logic broke, which is the inert-test trap.
+#
+# ★★ SCOPE + SHELL-OPTION FIDELITY — why this runs the block the awkward way.
+# An earlier version ran the extracted block INSIDE a function (`classify() { ... }`)
+# under default shell options. Both differed from production, and BOTH mattered:
+#   * the shipped block runs at TOP LEVEL (the nearest function closes well above it),
+#     so a `local` there is a fatal "can only be used in a function" — yet it is
+#     perfectly legal inside the test's own wrapper;
+#   * the driver runs `set -Eeuo pipefail` + an ERR trap (build-and-test.sh:64,369),
+#     so that failure ABORTS the run — while under default options it is a mere line
+#     on stderr and execution continues.
+# With either difference present this test stayed GREEN while the real harness died at
+# the classification step, AFTER a completed 13-hour arm64 corpus run. So the block is
+# now executed in a temp script, at top level, under the driver's exact options.
 set -uo pipefail
 SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-and-test.sh"
 
-BLOCK=$(sed -n '/^  local leg_mode=/,/^  fi$/p' "$SH")
+# Match with OR without a `local` prefix ON PURPOSE: if someone reintroduces `local`,
+# the block must still be EXTRACTED so it fails at RUNTIME for the real reason.
+# Anchoring only on the correct form would fail with "could not extract", which proves
+# nothing about scope.
+BLOCK=$(sed -n "/^  \(local \)\?leg_mode='native'/,/^  fi$/p" "$SH")
 if [ -z "$BLOCK" ]; then echo "FATAL: could not extract the classifier block"; exit 1; fi
 echo "extracted $(printf '%s\n' "$BLOCK" | wc -l) lines from the shipped script"
 
-warn() { echo "      WARN: $*"; }
+TMPRUN=$(mktemp /tmp/confscope_XXXXXX.sh)
+trap 'rm -f "$TMPRUN"' EXIT
+
 declare -A LEG_PREFIX=( [host]="" [arm64]="qemu-aarch64" )
-
-# The extracted text uses `local`, so it must run inside a function — same as in
-# the real script.
-eval "classify() { local leg=\"\$1\"; local faillist=\"\$2\"
-$BLOCK
-  printf 'REAL=[%s] CONFOUND=[%s] SCOPED=[%s]\n' \"\${real[*]:-}\" \"\${confound[*]:-}\" \"\${scoped_excused[*]:-}\"
-}"
-
-# The `all` tier qualifies names with each suite's DECLARED -prefix; veryquick/quick/
-# full declare "" and are unqualified. These are real values from permutations.test:
-# the dotted default AND the `mmap` override "mm-", which is why the classifier reads
-# them as data instead of guessing `^<ident>\.`.
+# Real declared prefixes from permutations.test: the dotted default AND the `mmap`
+# override "mm-" (a DASH, not derivable from the suite name).
 declare -a TIER_PREFIXES=(no_mutex_try. memsubsys1. memsubsys2. mm-)
+
+classify() {
+  {
+    echo 'set -Eeuo pipefail'          # the driver's own options (build-and-test.sh:64)
+    echo 'warn() { echo "      WARN: $*"; }'
+    printf 'leg=%q\n' "$1"
+    printf 'faillist=%q\n' "$2"
+    declare -p LEG_PREFIX
+    declare -p TIER_PREFIXES
+    declare -p CONFOUND_PATTERNS
+    printf '%s\n' "$BLOCK"
+    cat <<'TAIL'
+printf 'REAL=[%s] CONFOUND=[%s] SCOPED=[%s]\n' "${real[*]:-}" "${confound[*]:-}" "${scoped_excused[*]:-}"
+TAIL
+  } > "$TMPRUN"
+  bash "$TMPRUN"                       # top level, driver options — same as production
+}
 
 CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$' '^recoverfault' 'emulated:^writecrash-')
 fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
@@ -56,44 +82,46 @@ else
 fi
 
 echo "--- PERMUTATION-QUALIFIED names (the \`all\` tier) ---"
-# Real names taken verbatim from the first Linux `all` run's corpus.log.
 CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
 qual='memsubsys1.walsetlk-2.2.6 no_mutex_try.busy2-2.2.3 memsubsys2.recoverfault-1-oom-persistent.515 memsubsys1.zipfile-25.0 no_mutex_try.walsetlk_recover-1.2 memsubsys2.realbug-1.1'
 D=$(classify host "$qual"); echo "$D" | sed 's/^/      /'
-check "qualified walsetlk excused"    "memsubsys1.walsetlk-2.2.6"                 "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "qualified busy2 excused"       "no_mutex_try.busy2-2.2.3"                  "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "qualified recoverfault excused" "memsubsys2.recoverfault-1-oom-persistent.515" "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "qualified zipfile (anchored \$) excused" "memsubsys1.zipfile-25.0"          "$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-# walsetlk_recover must NOT be swept in by ^walsetlk- on family resemblance. It is a
-# DIFFERENT test FILE and it earned its own confound row with its own control (a
+dconf="$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+dreal="$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+check "qualified walsetlk excused"             "memsubsys1.walsetlk-2.2.6"                    "$dconf"
+check "qualified busy2 excused"                "no_mutex_try.busy2-2.2.3"                     "$dconf"
+check "qualified recoverfault excused"         "memsubsys2.recoverfault-1-oom-persistent.515" "$dconf"
+check "qualified zipfile (anchored \$) excused" "memsubsys1.zipfile-25.0"                     "$dconf"
+# walsetlk_recover must NOT be swept in by ^walsetlk- on family resemblance: it is a
+# DIFFERENT test FILE that earned its own confound row with its own control (a
 # GCC-built reference fails it identically). Keeping this guard means the shipped
 # suppression is the explicit ^walsetlk_recover- row, never an accident of ^walsetlk-.
-check "walsetlk_recover NOT excused by ^walsetlk-" "no_mutex_try.walsetlk_recover-1.2" "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+check "walsetlk_recover NOT excused by ^walsetlk-" "no_mutex_try.walsetlk_recover-1.2"        "$dreal"
+check "a genuine failure stays REAL"           "memsubsys2.realbug-1.1"                       "$dreal"
 
-# ...and WITH its own row it IS excused, so the shipped default list classifies it.
+echo "--- walsetlk_recover WITH its own row ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^walsetlk_recover-' '^recoverfault')
 W=$(classify host 'no_mutex_try.walsetlk_recover-1.2 walsetlk_recover-1.3.(36244809) memsubsys2.realbug-1.1')
-check "walsetlk_recover excused by its OWN row" "walsetlk_recover-1.2" "$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "the (n)-suffixed form too"               "walsetlk_recover-1.3" "$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "an unrelated failure still REAL"         "memsubsys2.realbug-1.1" "$(echo "$W" | sed 's/.*REAL=\[//;s/\].*//')"
-CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
-check "a genuine failure stays REAL"  "memsubsys2.realbug-1.1"                    "$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
+wconf="$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+wreal="$(echo "$W" | sed 's/.*REAL=\[//;s/\].*//')"
+check "excused by its OWN row"        "walsetlk_recover-1.2"    "$wconf"
+check "the (n)-suffixed form too"     "walsetlk_recover-1.3"    "$wconf"
+check "an unrelated failure REAL"     "memsubsys2.realbug-1.1"  "$wreal"
 
-# The `mmap` suite declares -prefix "mm-", NOT "mmap." — a dash, and not derivable
-# from the suite name. This is the shape the pe64 `all` run actually emits.
+echo "--- mm- prefixed names (what the pe64 all tier emits) ---"
+CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$')
 G=$(classify host 'mm-zipfile-25.0 mm-walsetlk-2.1.3 mm-backup4-3.3')
-echo "$G" | sed 's/^/      /'
-check "mm- prefixed zipfile excused"  "mm-zipfile-25.0"  "$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "mm- prefixed walsetlk excused" "mm-walsetlk-2.1.3" "$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
-check "mm- backup4 (no pattern) REAL" "mm-backup4-3.3"   "$(echo "$G" | sed 's/.*REAL=\[//;s/\].*//')"
+gconf="$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
+greal="$(echo "$G" | sed 's/.*REAL=\[//;s/\].*//')"
+check "mm- zipfile excused"            "mm-zipfile-25.0"   "$gconf"
+check "mm- walsetlk excused"           "mm-walsetlk-2.1.3" "$gconf"
+check "mm- backup4 (no pattern) REAL"  "mm-backup4-3.3"    "$greal"
 
-echo "--- RED-ON-DISABLE: with NO permutations known, qualified names must go unmatched ---"
-# This is the pre-fix behaviour: ^-anchored patterns cannot match a qualified name.
+echo "--- RED-ON-DISABLE: with NO prefixes known, qualified names go unmatched ---"
+CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
 TIER_PREFIXES=()
 E=$(classify host "$qual")
 if [[ "$E" == *"REAL=[memsubsys1.walsetlk-2.2.6"* ]]; then
   echo "  ok   without TIER_PREFIXES the qualified confounds ARE misreported as genuine"
-  echo "       (so the strip is what fixes it, not something else)"
   pass=$((pass+1))
 else
   echo "  FAIL the guard proves nothing — qualified names classify the same either way"

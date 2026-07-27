@@ -1484,7 +1484,11 @@ for leg in "${LEG_ORDER[@]}"; do
   # those assertions, so a BARE `^writecrash-` would suppress a future genuine host
   # regression. An unscoped confound is exactly the silent-classification fault
   # refused for date-2.4c (D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY).
-  local leg_mode='native'
+  # NOT `local`: this block runs at TOP LEVEL (the nearest function,
+  # stage_loadext_extension, closes at ~1241), so `local` is a fatal
+  # "can only be used in a function" — it aborted a completed 13 h arm64 run at the
+  # classification step, AFTER the whole corpus had been executed.
+  leg_mode='native'
   [[ -n "${LEG_PREFIX[$leg]:-}" ]] && leg_mode='emulated'
   declare -a real=() confound=() scoped_excused=()
   for t in $faillist; do
