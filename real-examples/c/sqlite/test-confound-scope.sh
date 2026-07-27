@@ -15,6 +15,24 @@
 # With either difference present this test stayed GREEN while the real harness died at
 # the classification step, AFTER a completed 13-hour arm64 corpus run. So the block is
 # now executed in a temp script, at top level, under the driver's exact options.
+# ── bash 4+ required (`declare -A`) — macOS ships 3.2 ────────────────────────
+# D-HARNESS-SELFTEST-BSD-SED-PORTABILITY. This guard is NOT redundant with the
+# driver's: this file is also run STANDALONE (by hand, by CI, by a future ctest
+# row), and under bash 3.2 it died at the first `declare -A` having run ZERO
+# assertions — while still exiting 0. A guard that reports success having proven
+# nothing is worse than one that fails, so refuse rather than under-report.
+# Mirrors build-and-test.sh:67 verbatim; on Linux the version check passes and
+# the loop is never entered.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  for _newer_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+    if [ -n "$_newer_bash" ] && [ -x "$_newer_bash" ] && "$_newer_bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      exec "$_newer_bash" "$0" "$@"
+    fi
+  done
+  echo "ERROR: this self-test needs bash 4+ (found ${BASH_VERSION:-unknown}); on macOS run: brew install bash" >&2
+  exit 1
+fi
+
 set -uo pipefail
 SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-and-test.sh"
 
@@ -22,11 +40,28 @@ SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-and-test.sh"
 # the block must still be EXTRACTED so it fails at RUNTIME for the real reason.
 # Anchoring only on the correct form would fail with "could not extract", which proves
 # nothing about scope.
-BLOCK=$(sed -n "/^  \(local \)\?leg_mode='native'/,/^  fi$/p" "$SH")
+#
+# ★ POSIX BRE ONLY — `\(local \)*`, never `\(local \)\?`
+# (D-HARNESS-SELFTEST-BSD-SED-PORTABILITY). `\?` is a GNU sed EXTENSION: BSD/macOS
+# sed treats it literally, so the address never matched, the block extracted as
+# EMPTY, and the driver's own self-test failed with "could not extract" — which
+# refused to start the run on macOS, the one host the self-test exists to protect
+# (the first run on a NEW HOST is the one you least want to lose). `\(...\)` and
+# `*` are both core POSIX BRE and behave identically on BSD and GNU sed, so this
+# form needs no `-E` and has no dialect dependency. MEASURED on both: BSD sed
+# extracts 0 lines with `\?` vs 52 with `*`; GNU sed extracts 52 either way (so
+# the Linux/Windows legs are byte-unchanged). `*` also still matches the
+# `local`-prefixed form, preserving the deliberate red-on-disable above.
+BLOCK=$(sed -n "/^  \(local \)*leg_mode='native'/,/^  fi$/p" "$SH")
 if [ -z "$BLOCK" ]; then echo "FATAL: could not extract the classifier block"; exit 1; fi
 echo "extracted $(printf '%s\n' "$BLOCK" | wc -l) lines from the shipped script"
 
-TMPRUN=$(mktemp /tmp/confscope_XXXXXX.sh)
+# Trailing X's ONLY — BSD/macOS mktemp substitutes X's only at the END of the
+# template, so `..._XXXXXX.sh` was returned VERBATIM (a fixed, shared path: two
+# concurrent runs would clobber each other, and the failure messages named the
+# literal template). The suffix bought nothing — the file is executed via
+# "$BASH", not by extension. Portable to GNU coreutils mktemp unchanged.
+TMPRUN=$(mktemp /tmp/confscope_XXXXXX)
 trap 'rm -f "$TMPRUN"' EXIT
 
 declare -A LEG_PREFIX=( [host]="" [arm64]="qemu-aarch64" )
@@ -48,7 +83,12 @@ classify() {
 printf 'REAL=[%s] CONFOUND=[%s] SCOPED=[%s]\n' "${real[*]:-}" "${confound[*]:-}" "${scoped_excused[*]:-}"
 TAIL
   } > "$TMPRUN"
-  bash "$TMPRUN"                       # top level, driver options — same as production
+  # "$BASH", never a bare `bash` — see the header guard. The emitted script
+  # replays `declare -p` output for an ASSOCIATIVE array, which bash 3.2 cannot
+  # parse (it evaluates `[host]` arithmetically → "host: unbound variable" under
+  # set -u). PATH `bash` is 3.2 on macOS, so a bare `bash` here failed all 20
+  # assertions on a correct classifier. Same interpreter on Linux, no change.
+  "$BASH" "$TMPRUN"                    # top level, driver options — same as production
 }
 
 CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$' '^recoverfault' 'emulated:^writecrash-')

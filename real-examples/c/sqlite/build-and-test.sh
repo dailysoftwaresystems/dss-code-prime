@@ -24,17 +24,19 @@
 #      DSS compiles the WHOLE source set (it cannot consume gcc's libsqlite3.a),
 #      so the core sources inside that .a are recovered via `ar t`.
 #   5. build dss-code-prime              (its default CMake-4 Release build)
-#   6. stage the third-party HEADERS DSS parses agnostically (real tcl8.6 + zlib,
-#      NO descriptor — D-FFI-SHIPPED-LIBS-OS-ONLY) and obtain the per-leg LIBS the
-#      fixture links + runs against (host libtcl/libz; arm64 via ports .deb extract)
+#   6. stage the third-party HEADERS DSS parses agnostically (the host's REAL tcl
+#      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
+#      LIBS-OS-ONLY) and obtain the per-leg LIBS the fixture links + runs against
+#      (host libtcl/libz; arm64 via ports .deb extract)
 #   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
 #      from a generated `.dss-project.json` manifest (dss --project mode):
 #        - host  → the native ELF/Mach-O target (runs directly)
 #        - arm64 → elf64-aarch64 (Linux x86_64 host only; runs under qemu-aarch64)
 #      each leg's manifest declares c-subset / cli / the leg's
 #      <targetName>:<formatName> target / the ~185 TUs (absolute `sources`) / the
-#      sqlite+tcl8.6+zlib include dirs / the recipe defines / the leg's
-#      libtcl8.6.so + libz.so.1 (resolveLibraries); the build routes the binary
+#      sqlite+tcl+zlib include dirs / the recipe defines / the leg's host libtcl +
+#      libz (resolveLibraries — the arm64 cross leg keeps its own fixed
+#      libtcl8.6.so.0 + libz.so.1 from the ports .deb); the build routes the binary
 #      to <out>/<leg>/<formatName>/testfixture.
 #   8. stage each leg's run dir — including the `libtestloadext.so` extension the
 #      loadext corpus dlopen()s, compiled by THE LEG'S TARGET compiler — then run
@@ -59,7 +61,7 @@
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
-#                      ARM64_LIBDIR
+#                      ARM64_LIBDIR  DSS_TCL_VERSION
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -85,6 +87,17 @@ OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 LANGUAGE="c-subset"
 MIN_CMAKE_MAJOR=4
+# DSS_TCL_VERSION: OPTIONAL pin for the Tcl the fixture is staged against (e.g.
+# "8.6", "9.0"). UNSET — the default — means VERSION-AGNOSTIC: Step 6 discovers
+# whatever Tcl the host actually has, from that installation's OWN tclConfig.sh.
+# Nothing pins a Tcl version any more: commit 355572d (Cycle TF-C65,
+# D-FFI-SHIPPED-LIBS-OS-ONLY) deleted every THIRD-PARTY shipped-lib descriptor, so
+# DSS carries no tcl.json that could disagree with the host — it PARSES whatever
+# tcl.h Step 6 stages — and sqlite supports Tcl 9 natively (`#if
+# TCL_MAJOR_VERSION==9` in src/tclsqlite.c). Set this only to exercise one
+# specific Tcl ABI; a pin that is not installed FAILS LOUD in Step 6 rather than
+# silently falling back to another version (which would link and then misbehave).
+DSS_TCL_VERSION="${DSS_TCL_VERSION:-}"
 # DSS_TIER: which unit-corpus tier to run — veryquick (default, ~331k tests, ~6min
 # native) | quick | full | all. Bigger tiers take far longer (all.test under qemu is
 # hours). DSS_TEST_FILE overrides with a single .test path (fast plumbing check).
@@ -439,7 +452,16 @@ elif [[ ! -f "$_selftest" ]]; then
       you the entire run. Restore the file, or set DSS_SKIP_SELFTEST=1 knowing that
       a classifier fault will surface only after the corpus has finished."
 else
-  if _st_out="$(bash "$_selftest" 2>&1)"; then
+  # ★ "$BASH", never a bare `bash` (D-HARNESS-SELFTEST-BSD-SED-PORTABILITY).
+  # A bare `bash` is resolved through PATH, which on macOS is /bin/bash 3.2 —
+  # NOT the bash 4+ this driver just re-exec'd itself into (line 67). The
+  # self-test needs 4+ (`declare -A`), so under 3.2 it died at its first
+  # associative array having run ZERO assertions — and still exited 0, so this
+  # guard reported "OK" while proving nothing (an INERT guard, worse than a
+  # failing one). "$BASH" is the absolute path of the interpreter actually
+  # running, so the self-test always gets the same validated shell. Correct on
+  # Linux too, where it simply resolves to the same bash that is already running.
+  if _st_out="$("$BASH" "$_selftest" 2>&1)"; then
     info "driver self-test: OK ($(printf '%s\n' "$_st_out" | sed -n 's/^passed=\([0-9]*\).*/\1/p') assertions)"
   else
     printf '%s\n' "$_st_out" | sed 's/^/      /' >&2
@@ -548,13 +570,184 @@ clone_or_update "$SQLITE_REPO_URL" "$SQLITE_DIR" ""
   die "tier '$DSS_TIER' has no $SQLITE_DIR/test/$DSS_TIER.test (expected veryquick|quick|full|all)."
 pass "sqlite ready"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED THIRD-PARTY DISCOVERY (roots + the Tcl inventory)
+# ─────────────────────────────────────────────────────────────────────────────
+# This block sits ABOVE Step 4 on purpose. It used to live inside Step 6, but the
+# INTERPRETER is part of the Tcl choice, not a separate decision: sqlite's
+# `configure`, `make -n` and mksqlite3c.tcl all run under the `tclsh` Step 4 puts
+# on PATH, and the recipe they emit bakes THAT Tcl's `-I` dirs in. Selecting the
+# headers/library in Step 6 from a different Tcl than Step 4's interpreter builds
+# the fixture against two Tcls at once. So Step 4 and Step 6 now share ONE
+# inventory and ONE selector.
+#
+# Portable multi-root find. A hardcoded start-dir list mixes Linux + macOS paths
+# (e.g. `/opt/homebrew/*`, `/usr/lib64`); `find` EXITS NON-ZERO on a start dir
+# that does not exist on this host, which under `set -Eeuo pipefail` would abort
+# the whole harness. Restrict the search to the roots that EXIST (a genuinely
+# absent header/lib is still caught by the explicit `… || die` checks later).
+# Usage: find_in <dir>... -- <find-expr>...   (stderr suppressed).
+find_in() {
+  local -a roots=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do [[ -d "$1" ]] && roots+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && shift
+  [[ ${#roots[@]} -gt 0 ]] || return 0
+  find "${roots[@]}" "$@" 2>/dev/null
+}
+# macOS keeps NONE of this material where Linux does, so the root lists below get
+# two macOS-only sources APPENDED. Both are pure additions: `xcrun` and `brew` do
+# not exist on Linux, so the helpers print nothing there, and `find_in` then drops
+# the empty candidate — every root list stays byte-identical to its pre-macOS form
+# on a Linux host, and the legacy roots keep their original PRECEDENCE by staying
+# first.
+#   · the Xcode SDK. macOS has NO /usr/include AT ALL; the system C headers —
+#     zlib.h/zconf.h among them — live under `xcrun --show-sdk-path`/usr/include.
+#     Only the SDK's INCLUDE dir is taken: its lib/ holds `.tbd` TEXT stubs, not
+#     Mach-O, and a .tbd handed to DSS as a --resolve-library cannot be read.
+#   · KEG-ONLY Homebrew prefixes. A keg-only formula is deliberately NOT symlinked
+#     into /opt/homebrew/{include,lib,bin}, so it is invisible to the plain roots —
+#     tcl-tk (9.x), tcl-tk@8 (8.6) and zlib are all keg-only. `brew --prefix <f>`
+#     prints the WOULD-BE prefix even when <f> is not installed, which is exactly
+#     why these are only CANDIDATE roots that find_in must still filter.
+brew_prefix() { command -v brew  >/dev/null 2>&1 && brew --prefix "$1" 2>/dev/null || true; }
+sdk_prefix()  { command -v xcrun >/dev/null 2>&1 && xcrun --show-sdk-path 2>/dev/null || true; }
+declare -a EXTRA_INC_ROOTS=() EXTRA_LIB_ROOTS=() EXTRA_BIN_ROOTS=()
+if [[ "$HOST_OS" == "macos" ]]; then
+  for _f in zlib tcl-tk tcl-tk@8; do
+    _p="$(brew_prefix "$_f")"
+    [[ -n "$_p" ]] && { EXTRA_INC_ROOTS+=("$_p/include"); EXTRA_LIB_ROOTS+=("$_p/lib"); EXTRA_BIN_ROOTS+=("$_p/bin"); }
+  done
+  _sdk="$(sdk_prefix)"
+  [[ -n "$_sdk" ]] && EXTRA_INC_ROOTS+=("$_sdk/usr/include")
+fi
+# `${arr[@]:-}` — an EMPTY array must expand to one empty string, not trip `set -u`
+# (bash ≤4.3 treats a bare `${arr[@]}` on an empty array as unbound). find_in drops
+# the empty element like any other non-directory. On Linux all three ARE empty.
+declare -a INC_ROOTS=(/usr/include /usr/local/include /opt/homebrew/include "${EXTRA_INC_ROOTS[@]:-}")
+declare -a LIB_ROOTS=(/usr/lib /lib /usr/local/lib /opt/homebrew/lib             "${EXTRA_LIB_ROOTS[@]:-}")
+declare -a CFG_ROOTS=(/usr/lib /usr/lib64 /usr/local/lib /opt/homebrew/lib       "${EXTRA_LIB_ROOTS[@]:-}")
+
+# ── the Tcl inventory, VERSION-AGNOSTIC, straight from tclConfig.sh ──────────
+# The harness used to hardcode 8.6 everywhere. That was a harness-only fiction:
+# TF-C65 (commit 355572d, D-FFI-SHIPPED-LIBS-OS-ONLY) deleted every third-party
+# shipped-lib descriptor, so DSS holds no tcl.json to disagree with the host and
+# simply PARSES the tcl.h Step 6 stages; and sqlite supports Tcl 9 natively. The
+# pin bought nothing and hard-failed any host whose Tcl is 9.x (Homebrew's
+# `tcl-tk` is 9.0 today). tclConfig.sh is Tcl's OWN authoritative, version-neutral
+# description of an installation — TCL_VERSION, TCL_INCLUDE_SPEC (`-I<headerdir>`),
+# TCL_LIB_FILE (the runtime library's file NAME) and TCL_EXEC_PREFIX (where its
+# bin/ is) — so interpreter, header dir AND library are all DERIVED from it rather
+# than guessed from hardcoded names.
+# Emits "<version> <path>" per installation, `sort -u`'d so the candidate set (and
+# therefore the pick) is deterministic instead of filesystem-order-dependent.
+tcl_configs() {
+  local cfg ver
+  while IFS= read -r cfg; do
+    ver="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_VERSION:-}" )" || ver=""
+    [[ -n "$ver" ]] && printf '%s %s\n' "$ver" "$cfg"
+  done < <(find_in "${CFG_ROOTS[@]}" -- -name tclConfig.sh | sort -u)
+  return 0
+}
+tcl_cfg_for() {                 # tcl_cfg_for <version> -> its tclConfig.sh (or "")
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ "${line%% *}" == "$1" ]] && { printf '%s' "${line#* }"; return; }
+  done <<< "$TCL_CFGS"
+  return 0
+}
+tclsh_version() { echo 'puts $tcl_version' | tclsh 2>/dev/null || true; }
+# The `#define TCL_VERSION "x.y"` a HEADER declares. POSIX BRE only (`\(…\)` and
+# `[[:space:]][[:space:]]*` — never GNU `\+`), and it tolerates Tcl 9's indented
+# `#   define` as well as 8.6's `#define`. Verified byte-identical under BSD
+# /usr/bin/sed and GNU gsed.
+tcl_h_version() {               # tcl_h_version <path/to/tcl.h> -> "8.6" | "9.0" | ""
+  sed -n 's/^#[[:space:]]*define[[:space:]][[:space:]]*TCL_VERSION[[:space:]][[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$1" 2>/dev/null | sed -n '1p'
+}
+TCL_CFGS="$(tcl_configs)"
+
 # ── Step 4 — configure + derive the full-source testfixture recipe ───────────
 step "4/9  Derive the full-source testfixture recipe (make -n testfixture)"
 # mksqlite3c.tcl + the fixture link need tclsh 8.6+ and the Tcl dev files
 # (tclConfig.sh — configure detects Tcl through it). apt: tcl (8.6+) + tcl-dev.
+# An interpreter REPORTING <version>, most-authoritative candidate first: the bin/
+# of the very installation whose tclConfig.sh declares that version (same tree as
+# its headers + library), then a version-suffixed `tclshN.M` on PATH (the Debian
+# shape), then each keg bin/ (the Homebrew shape), then the plain PATH `tclsh`.
+# Every candidate is CONFIRMED by asking it `puts $tcl_version` — a file NAME is
+# not proof of a version, and picking on the name is how a 9.0 interpreter ends up
+# generating sources for an 8.6 build.
+tclsh_bin_for() {               # tclsh_bin_for <version> -> path (or "")
+  local want="$1" cfg="" pfx="" c v r
+  local -a cands=()
+  cfg="$(tcl_cfg_for "$want")"
+  if [[ -n "$cfg" ]]; then
+    pfx="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_EXEC_PREFIX:-}" )" || pfx=""
+    [[ -n "$pfx" ]] && cands+=("$pfx/bin/tclsh$want" "$pfx/bin/tclsh")
+    # …and the keg layout, where tclConfig.sh sits in <prefix>/lib beside bin/.
+    cands+=("$(dirname "$(dirname "$cfg")")/bin/tclsh$want" "$(dirname "$(dirname "$cfg")")/bin/tclsh")
+  fi
+  cands+=("$(command -v "tclsh$want" 2>/dev/null || true)")
+  for r in "${EXTRA_BIN_ROOTS[@]:-}"; do
+    [[ -n "$r" ]] && cands+=("$r/tclsh$want" "$r/tclsh")
+  done
+  cands+=("$(command -v tclsh 2>/dev/null || true)")
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    v="$(echo 'puts $tcl_version' | "$c" 2>/dev/null || true)"
+    [[ "$v" == "$want" ]] && { printf '%s' "$c"; return; }
+  done
+  return 0
+}
+# Put the pinned interpreter on PATH under the PLAIN name. Prepending the found
+# binary's own directory is NOT enough: that directory's `tclsh` may be a
+# different version (Debian's alternatives symlink; a prefix holding both), and
+# everything downstream invokes the unversioned name. A one-line exec shim in the
+# harness's OWN output tree makes `tclsh` resolve to the pinned interpreter on any
+# layout, touching neither the host nor the sqlite clone. `exec "<abs path>"`
+# keeps argv[0] absolute, so Tcl still finds its own init.tcl next to the REAL
+# installation rather than beside the shim.
+tcl_pin_path() {                # tcl_pin_path <interpreter>
+  local bin="$1" dir="$OUT_DIR/tcl-pin"
+  mkdir -p "$dir"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$bin" > "$dir/tclsh"
+  chmod +x "$dir/tclsh"
+  export PATH="$dir:$PATH"
+  hash -r
+}
+TCL_PIN_SH=""; TCL_PIN_CFG=""
 ensure_tclsh() {
   local ver=""
   command -v tclsh >/dev/null 2>&1 && ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
+  # ── PINNED (DSS_TCL_VERSION set): the interpreter is PART of the pin ───────
+  # Not "≥ 8.6" — EXACTLY the pinned version. `configure`, `make -n` and
+  # mksqlite3c.tcl all run under this tclsh and bake ITS `-I` dirs into the
+  # recipe, so continuing on a different Tcl would silently stage the fixture
+  # against two of them. Nothing is installed on this path: an absent pin is an
+  # operator decision to make, so it FAILS LOUD naming everything searched.
+  if [[ -n "$DSS_TCL_VERSION" ]]; then
+    TCL_PIN_CFG="$(tcl_cfg_for "$DSS_TCL_VERSION")"
+    if [[ "$ver" != "$DSS_TCL_VERSION" ]]; then
+      TCL_PIN_SH="$(tclsh_bin_for "$DSS_TCL_VERSION")"
+      [[ -n "$TCL_PIN_SH" ]] || die "DSS_TCL_VERSION=$DSS_TCL_VERSION is pinned, but NO tclsh reporting $DSS_TCL_VERSION was found.
+      tclsh on PATH  : $(command -v tclsh 2>/dev/null || echo none) (reports ${ver:-none})
+      tclConfig.sh   : $(printf '%s' "${TCL_CFGS:-<none>}" | tr '\n' ';')
+      searched       : each config's TCL_EXEC_PREFIX/bin + <prefix>/bin, 'tclsh$DSS_TCL_VERSION' on
+                       PATH, ${EXTRA_BIN_ROOTS[*]:-<no keg bin roots>}, then PATH 'tclsh'
+      Install it (apt: tcl$DSS_TCL_VERSION — brew: 'tcl-tk@8' for 8.6 / 'tcl-tk' for 9.x, both
+      KEG-ONLY), or unset DSS_TCL_VERSION. NOT continuing on a different Tcl: sqlite's configure,
+      make -n and mksqlite3c.tcl all run under this interpreter and bake ITS -I dirs into the
+      recipe, so a mismatched tclsh silently builds the fixture against two different Tcls."
+      tcl_pin_path "$TCL_PIN_SH"
+      ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
+    else
+      TCL_PIN_SH="$(command -v tclsh)"
+    fi
+    [[ "$ver" == "$DSS_TCL_VERSION" ]] || die "tclsh is STILL $ver after pinning to $DSS_TCL_VERSION (shim: $OUT_DIR/tcl-pin) — refusing to continue."
+    info "tclsh $ver ($(command -v tclsh)) — PINNED by DSS_TCL_VERSION"
+    return
+  fi
+  # ── UNPINNED: the original ≥ 8.6 floor, unchanged ─────────────────────────
   if [[ -z "$ver" ]] || ! awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}"; then
     [[ -n "$ver" ]] && info "tclsh ${ver} is < 8.6 — installing a newer tcl"
     pkg_install tcl tcl-tk
@@ -573,13 +766,63 @@ ensure_tclsh
 # Tcl dev files (headers + tclConfig.sh) — configure needs them to emit the recipe.
 if [[ "$HOST_OS" == "macos" ]]; then
   pkg_install tcl tcl-tk
+  # zlib too — parity with the Linux branch below, and NOT optional here. macOS
+  # ships NO libz a program can OPEN: /usr/lib/libz.1.dylib exists only inside the
+  # dyld shared cache, /usr/lib/libz.1.2.12.dylib is a dangling symlink to it, and
+  # the SDK carries .tbd TEXT stubs. Step 6 must hand DSS a REAL library binary to
+  # read (--resolve-library), so Homebrew's zlib is a hard prerequisite; it is
+  # keg-only, which is why Step 6 searches `brew --prefix zlib` explicitly.
+  pkg_install zlib1g-dev zlib
 else
   command -v dpkg >/dev/null 2>&1 && dpkg -s tcl-dev >/dev/null 2>&1 || pkg_install tcl-dev tcl-tk
   command -v dpkg >/dev/null 2>&1 && dpkg -s zlib1g-dev >/dev/null 2>&1 || pkg_install zlib1g-dev zlib
 fi
 BLD="$SQLITE_DIR/bld-dss"
 mkdir -p "$BLD"
-( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null )
+# Carry the pin INTO sqlite's own Tcl detection. Without this, `configure` picks a
+# Tcl by its own search and can write a DIFFERENT version's `-I` into the Makefile
+# — which `make -n` then hands us as SQLITE_INCS, and those dirs come FIRST in the
+# Step-7 include list, so they would silently WIN over the Tcl Step 6 staged.
+# sqlite's autosetup exposes exactly the two knobs needed (autosetup/
+# sqlite-config.tcl: `with-tcl:DIR` = the directory holding tclConfig.sh,
+# `with-tclsh:PATH` = the interpreter used for tclConfig detection AND all
+# TCL-based code generation, which trumps --with-tcl). Passing both states the
+# same installation twice, deliberately: whichever one autosetup honours, it is
+# the pinned one. The Step-6 recipe coherence check is the backstop if it is not.
+# UNPINNED — the default, and every Linux run today — takes the `else` branch,
+# which is byte-identical to what this line always was.
+declare -a CONFIGURE_ARGS=()
+if [[ -n "$DSS_TCL_VERSION" ]]; then
+  [[ -n "$TCL_PIN_SH"  ]] && CONFIGURE_ARGS+=("--with-tclsh=$TCL_PIN_SH")
+  [[ -n "$TCL_PIN_CFG" ]] && CONFIGURE_ARGS+=("--with-tcl=$(dirname "$TCL_PIN_CFG")")
+  info "configure: pinning sqlite's Tcl detection — ${CONFIGURE_ARGS[*]:-<none resolvable>}"
+fi
+# $BLD is REUSED between runs, and re-running configure rewrites the Makefile but
+# NOT the object timestamps — `make` cannot see that a header PATH changed. So a
+# tclsqlite.o built under a previous run's Tcl survives and gets linked against
+# THIS run's libtcl: a silently mis-built REFERENCE fixture, i.e. a corrupt
+# attribution oracle (the one thing worse than no oracle). Stamp the Tcl identity
+# and refuse to build on top of a different one. A MISSING stamp means "no
+# information" and never fires, so every existing tree — every Linux tree today —
+# is untouched until the Tcl actually changes under it. The harness does NOT wipe
+# it itself: $BLD lives inside the sqlite clone, which this driver never destroys.
+TCL_STAMP="$BLD/.dss-tcl-identity"
+TCL_STAMP_NOW="tclsh=$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true) configure=${CONFIGURE_ARGS[*]:-<default>}"
+if [[ -f "$TCL_STAMP" && "$(cat "$TCL_STAMP" 2>/dev/null || true)" != "$TCL_STAMP_NOW" ]]; then
+  die "the Tcl behind $BLD CHANGED since it was built.
+      was: $(cat "$TCL_STAMP" 2>/dev/null || true)
+      now: $TCL_STAMP_NOW
+      Re-running configure rewrites the Makefile but not the .o timestamps, so a stale tclsqlite.o
+      compiled against the PREVIOUS Tcl's headers would link against this run's libtcl and quietly
+      corrupt the reference (gcc) fixture — the ORACLE the whole failure-attribution story rests on.
+      Rebuild the tree from scratch:  rm -rf '$BLD'   then re-run."
+fi
+if [[ ${#CONFIGURE_ARGS[@]} -gt 0 ]]; then
+  ( cd "$BLD" && "$SQLITE_DIR/configure" "${CONFIGURE_ARGS[@]}" >/dev/null )
+else
+  ( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null )
+fi
+printf '%s\n' "$TCL_STAMP_NOW" > "$TCL_STAMP"
 # Build the reference fixture. It generates every derived .c
 # (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a, which the DSS
 # TU set needs — AND, when it links, it is the ORACLE that decides whether a corpus
@@ -607,7 +850,16 @@ mkdir -p "$OUT_DIR"
 ( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
 # `make -n testfixture` is essentially ONE cc command (the fixture link); join its
 # backslash-continuations, then extract each token-type from the whole blob.
-BLOB="$(sed ':a;N;$!ba;s/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
+# ★ ONE `-e` PER LABEL — never `sed ':a;N;$!ba;…'`
+# (D-HARNESS-SELFTEST-BSD-SED-PORTABILITY). GNU sed lets a `:label` be
+# terminated by `;`, BSD/macOS sed does NOT: it swallows the rest of the script
+# as part of the LABEL NAME and dies `unused label 'a;N;$!ba;…'`, emitting only
+# the first line — so the backslash-continuation join SILENTLY DID NOT HAPPEN
+# and $BLOB was whatever sed managed before erroring. Splitting the script into
+# separate -e arguments makes the label end at the argument boundary, which is
+# the portable form: MEASURED byte-identical output (8093 B on this recipe) from
+# BSD sed and GNU sed, and identical to what the Linux legs were already getting.
+BLOB="$(sed -e ':a' -e 'N;$!ba' -e 's/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
 # defines: -DNAME[=VALUE]  →  DSS `--define NAME[=VALUE]` (strip make's literal "" so
 # SQLITE_PRIVATE="" becomes an EMPTY value, and drop bare shell quoting).
 mapfile -t RECIPE_DEFS < <(printf '%s\n' "$BLOB" | grep -oE '\-D[A-Za-z0-9_]+(=[^ ]*)?' | sed 's/^-D//; s/"//g' | sort -u)
@@ -688,50 +940,188 @@ pass "dss-code-prime built: $DSS_BIN"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
-# Headers are leg-INDEPENDENT: DSS parses the host tcl8.6/zlib headers agnostically
-# (ABI is irrelevant at parse). tcl8.6 headers sit in a private subdir (safe on -I);
-# zlib.h sits directly in /usr/include (would shadow the OS descriptors) → stage a
-# private copy of just zlib.h + zconf.h.
+# Headers are leg-INDEPENDENT: DSS parses the host tcl/zlib headers agnostically
+# (ABI is irrelevant at parse). The tcl headers sit in a per-version private subdir
+# (safe on -I); zlib.h sits directly in a system include dir (would shadow the OS
+# descriptors) → stage a private copy of just zlib.h + zconf.h.
 THIRD_PARTY_INCS=()
-# Portable multi-root find. A hardcoded start-dir list mixes Linux + macOS paths
-# (e.g. `/opt/homebrew/*`, `/usr/lib64`); `find` EXITS NON-ZERO on a start dir
-# that does not exist on this host, which under `set -Eeuo pipefail` would abort
-# the whole harness. Restrict the search to the roots that EXIST (a genuinely
-# absent header/lib is still caught by the explicit `… || die` checks below).
-# Usage: find_in <dir>... -- <find-expr>...   (stderr suppressed).
-find_in() {
-  local -a roots=()
-  while [[ $# -gt 0 && "$1" != "--" ]]; do [[ -d "$1" ]] && roots+=("$1"); shift; done
-  [[ "${1:-}" == "--" ]] && shift
-  [[ ${#roots[@]} -gt 0 ]] || return 0
-  find "${roots[@]}" "$@" 2>/dev/null
-}
-tcl_header_dir() {
-  local d=""
-  local cfg; cfg="$(find_in /usr/lib /usr/lib64 /usr/local/lib /opt/homebrew/lib -- -name tclConfig.sh | head -1)"
-  [[ -n "$cfg" ]] && d="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_INCLUDE_SPEC#-I}" )"
-  [[ -n "$d" && -f "$d/tcl.h" ]] || d="$(dirname "$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -name tcl.h -path '*tcl8*' | head -1)")"
-  [[ -f "$d/tcl.h" ]] || d="$(dirname "$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -name tcl.h | head -1)")"
+# find_in / the *_ROOTS lists / tcl_configs / tcl_cfg_for all live in the SHARED
+# THIRD-PARTY DISCOVERY block above Step 4 — Step 4's `ensure_tclsh` needs the very
+# same inventory to honour DSS_TCL_VERSION, and one selector shared by both steps
+# is what keeps the INTERPRETER, the headers and the library a single Tcl.
+# RE-TAKE the inventory here: Step 4 may have installed a Tcl since it was first
+# computed (the unpinned path runs `pkg_install tcl tcl-tk`).
+TCL_CFGS="$(tcl_configs)"
+# Pick ONE installation, deterministically:
+#   1. DSS_TCL_VERSION set → EXACTLY that TCL_VERSION, or DIE. A pin that silently
+#      fell back to another ABI would be worse than no pin at all.
+#   2. otherwise → the installation matching the `tclsh` ensure_tclsh validated
+#      onto PATH. That interpreter is the one sqlite's configure and mksqlite3c.tcl
+#      ALREADY ran under (Step 4), so matching it keeps generator, headers and
+#      runtime library one single Tcl.
+#   3. otherwise → the highest version present. `sort -t. -k1,1nr -k2,2nr` (numeric
+#      major, then minor) — NOT `sort -V`, which is a GNU extension absent from
+#      POSIX and unreliable under a BSD userland.
+TCL_VER=""; TCL_CFG=""; TCLSH_VER="$(tclsh_version)"
+if [[ -n "$DSS_TCL_VERSION" ]]; then
+  TCL_VER="$DSS_TCL_VERSION"; TCL_CFG="$(tcl_cfg_for "$TCL_VER")"
+  [[ -n "$TCL_CFG" ]] || die "DSS_TCL_VERSION=$TCL_VER is pinned, but no Tcl $TCL_VER is installed.
+      tclConfig.sh found: $(printf '%s' "${TCL_CFGS:-<none>}" | tr '\n' ';')
+      roots searched   : ${CFG_ROOTS[*]}
+      Install it (apt: tcl${TCL_VER}-dev — brew: 'tcl-tk' for 9.x, 'tcl-tk@8' for 8.6; both are
+      KEG-ONLY, which is why their own prefixes are searched), or unset DSS_TCL_VERSION to take
+      whatever Tcl this host has."
+  info "tcl: PINNED to $TCL_VER by DSS_TCL_VERSION"
+else
+  [[ -n "$TCLSH_VER" ]] && TCL_CFG="$(tcl_cfg_for "$TCLSH_VER")"
+  if [[ -n "$TCL_CFG" ]]; then
+    TCL_VER="$TCLSH_VER"
+  elif [[ -n "$TCL_CFGS" ]]; then
+    _hi="$(printf '%s\n' "$TCL_CFGS" | sort -t. -k1,1nr -k2,2nr | sed -n '1p')"
+    TCL_VER="${_hi%% *}"; TCL_CFG="${_hi#* }"
+    warn "no tclConfig.sh matches the tclsh on PATH (${TCLSH_VER:-none}) — falling back to the highest installed Tcl ($TCL_VER)."
+  fi
+fi
+# Interpreter-vs-staging agreement. WITH a pin this is an ASSERTION, not advice:
+# Step 4's ensure_tclsh already put a tclsh of exactly $DSS_TCL_VERSION on PATH and
+# died if it could not, so a disagreement here means something regressed between
+# the two steps — fatal. WITHOUT a pin it is a genuine host inconsistency the
+# operator may not care about (nothing forced the interpreter), so it stays a warn
+# that names the remedy.
+if [[ -n "$TCL_VER" && -n "$TCLSH_VER" && "$TCL_VER" != "$TCLSH_VER" ]]; then
+  if [[ -n "$DSS_TCL_VERSION" ]]; then
+    die "PINNED Tcl skew after Step 4: staging $TCL_VER but tclsh on PATH reports $TCLSH_VER
+      (pin=$DSS_TCL_VERSION, interpreter=$(command -v tclsh)). ensure_tclsh guarantees these agree,
+      so this is a harness regression, not a host problem. Refusing to build against two Tcls."
+  fi
+  warn "tcl SKEW: staging headers+library for $TCL_VER while tclsh on PATH is $TCLSH_VER — the sources
+      Step 4 generated came from the latter. Set DSS_TCL_VERSION=$TCL_VER to pin BOTH end-to-end."
+fi
+# The chosen Tcl's header dir: TCL_INCLUDE_SPEC out of ITS OWN tclConfig.sh (the
+# authoritative answer — it names the private per-version subdir). Two weaker
+# fallbacks cover an installation whose config is missing or omits the spec: a
+# tcl.h under a version-named directory, then any tcl.h at all. The version glob
+# replaces the old hardcoded `*tcl8*`; on Debian, `*tcl8.6*` still selects
+# /usr/include/tcl8.6 exactly as before.
+tcl_header_dir() {              # tcl_header_dir <tclConfig.sh|""> <version|"">
+  local cfg="$1" ver="$2" d="" spec=""
+  if [[ -n "$cfg" ]]; then
+    spec="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_INCLUDE_SPEC:-}" )" || spec=""
+    d="${spec#-I}"
+  fi
+  [[ -n "$d" && -f "$d/tcl.h" ]] || d="$(dirname "$(find_in "${INC_ROOTS[@]}" -- -name tcl.h -path "*tcl${ver:-[0-9]}*" | sed -n '1p')")"
+  [[ -f "$d/tcl.h" ]] || d="$(dirname "$(find_in "${INC_ROOTS[@]}" -- -name tcl.h | sed -n '1p')")"
   printf '%s' "$d"
 }
-TCL_INC="$(tcl_header_dir)"
-[[ -f "$TCL_INC/tcl.h" ]] || die "tcl.h not found — install tcl-dev / tcl8.6-dev (or brew tcl-tk)."
+TCL_INC="$(tcl_header_dir "$TCL_CFG" "$TCL_VER")"
+[[ -f "$TCL_INC/tcl.h" ]] || die "tcl.h not found — install the Tcl DEV files (apt: tcl-dev / tcl8.6-dev; brew: tcl-tk).
+      roots searched: ${INC_ROOTS[*]}"
+# Cross-check the header we are about to stage against the installation we chose.
+# A tcl.h from one Tcl beside a libtcl from another COMPILES AND LINKS and then
+# misbehaves at run time — precisely the class this harness must never ship
+# silently.
+TCL_INC_VER="$(tcl_h_version "$TCL_INC/tcl.h")"
+[[ -z "$TCL_VER" || -z "$TCL_INC_VER" || "$TCL_VER" == "$TCL_INC_VER" ]] || \
+  die "Tcl staging is INCOHERENT: tclConfig.sh reports $TCL_VER ($TCL_CFG) but $TCL_INC/tcl.h reports $TCL_INC_VER.
+      A fixture built against one Tcl's headers and another's library links clean and then fails at
+      run time. Pin one with DSS_TCL_VERSION, or remove the stray installation."
+[[ -n "$TCL_VER" ]] || TCL_VER="$TCL_INC_VER"
+# RECIPE COHERENCE — the third and last place a Tcl can enter the build. The `-I`
+# dirs harvested from `make -n testfixture` (SQLITE_INCS, Step 4) carry whatever
+# Tcl `configure` detected. Step 7 puts those dirs BEFORE the staged
+# THIRD_PARTY_INCS in the include list, so a tcl.h sitting in one of them WINS
+# over everything decided above — silently compiling the fixture against a Tcl
+# whose library it never links. That is the exact failure DSS_TCL_VERSION exists
+# to prevent, so it is FATAL, not a warning. Only dirs that actually contain a
+# tcl.h are judged; an unreadable/version-less header is skipped rather than
+# guessed at.
+for _d in "${SQLITE_INCS[@]:-}"; do
+  [[ -n "$_d" && -f "$_d/tcl.h" ]] || continue
+  _rv="$(tcl_h_version "$_d/tcl.h")"
+  [[ -z "$_rv" || "$_rv" == "$TCL_VER" ]] || die "RECIPE/STAGING Tcl MISMATCH — the fixture would compile against TWO Tcls.
+      recipe -I dir : $_d  (tcl.h reports $_rv)
+      staged Tcl    : $TCL_VER  ($TCL_CFG)
+      The recipe dir comes FIRST in the Step-7 include list, so its headers would WIN over the
+      staged ones while the fixture links $TCL_VER's library.
+      'configure' chose that dir; it follows the tclsh on PATH ($(command -v tclsh), $TCLSH_VER).
+      Fix: run with DSS_TCL_VERSION=$_rv (stage what the recipe uses) or DSS_TCL_VERSION=$TCL_VER
+      (which also passes --with-tclsh/--with-tcl to configure so the recipe follows the pin), then
+      delete $BLD so configure re-runs."
+done
 ZINC="$BLD/zinc"; mkdir -p "$ZINC"
-ZH="$(find_in /usr/include /usr/local/include /opt/homebrew/include -- -maxdepth 3 -name zlib.h | head -1)"
-[[ -n "$ZH" ]] || die "zlib.h not found — install zlib1g-dev (or brew zlib)."
+ZH="$(find_in "${INC_ROOTS[@]}" -- -maxdepth 3 -name zlib.h | sed -n '1p')"
+[[ -n "$ZH" ]] || die "zlib.h not found — install zlib1g-dev (or 'brew install zlib').
+      roots searched: ${INC_ROOTS[*]}"
 cp -f "$ZH" "$ZINC/"
-for zc in "$(dirname "$ZH")/zconf.h" $(find_in /usr/include -- -maxdepth 3 -name zconf.h); do
+# zconf.h beside zlib.h first (they are a matched pair); the sweep is the fallback.
+# Deliberately unquoted — this word-splits the find results into loop items.
+for zc in "$(dirname "$ZH")/zconf.h" $(find_in "${INC_ROOTS[@]}" -- -maxdepth 3 -name zconf.h); do
   [[ -f "$zc" ]] && { cp -f "$zc" "$ZINC/"; break; }
 done
 THIRD_PARTY_INCS=("$TCL_INC" "$ZINC")
-info "tcl headers: $TCL_INC   zlib headers: $ZINC (staged)"
+info "tcl $TCL_VER headers: $TCL_INC   zlib headers: $ZINC (staged from $ZH)"
 
-# host libraries (the native leg links + runs against these)
-find_first() { local n; for n in "$@"; do local h; h="$(find_in /usr/lib /lib /usr/local/lib /opt/homebrew/lib -- -name "$n" | head -1)"; [[ -n "$h" ]] && { printf '%s' "$h"; return; }; done; }
-HOST_TCL_LIB="$(find_first 'libtcl8.6.so' 'libtcl8.6.so.0' 'libtcl8.6.dylib')"
-HOST_Z_LIB="$(find_first 'libz.so' 'libz.so.1' 'libz.dylib')"
-[[ -n "$HOST_TCL_LIB" ]] || die "host libtcl8.6 not found (install tcl-dev / brew tcl-tk)."
-[[ -n "$HOST_Z_LIB"   ]] || die "host libz not found (install zlib1g-dev / brew zlib)."
+# ── host libraries (the native leg links + runs against these) ───────────────
+# WHAT THESE ARE FOR — both flow through leg_tcl_lib/leg_z_lib into the per-leg
+# `.dss-project.json` "resolveLibraries" (Step 7), i.e. DSS `--resolve-library`.
+# DSS OPENS AND READS each one AT COMPILE TIME to harvest its export table (the
+# FF1 binary reader) and fails loud `F_FileOpenFailed` on a path it cannot open
+# (src/program/compile_pipeline.cpp:305). They are NOT `-l` flags for a system
+# linker and NOT the gcc reference link (that uses its own configure-derived
+# flags) — so each must be a REAL, READABLE library binary. The runtime dependency
+# the linker then records comes from the binary's OWN embedded identity (ELF
+# DT_SONAME / Mach-O LC_ID_DYLIB install name — D-FF1-READER-SONAME,
+# src/ffi/ingest.cpp:356), which is why a Homebrew dylib carrying an absolute
+# install name resolves at run time from wherever the keg lives.
+# WHY READABILITY IS TESTED, NOT MERE EXISTENCE — on macOS the only libz left in
+# /usr/lib is `libz.1.2.12.dylib`, a symlink to `libz.1.dylib`, which is not a file
+# at all: it exists solely inside the dyld shared cache. `find` prints that
+# dangling link happily and DSS then cannot open it, killing the build. `-f`/`-r`
+# FOLLOW symlinks, which is exactly the test wanted; `find -type f` would inspect
+# the LINK itself and still accept the dangling one. Checking every match (not just
+# `head -1`) is what lets a later, real candidate win — and it drops the old
+# `find | head -1` SIGPIPE exposure under `pipefail`.
+find_first() {                  # find_first <name>... -> first match that is a readable file
+  local n h
+  for n in "$@"; do
+    [[ -n "$n" ]] || continue
+    while IFS= read -r h; do
+      [[ -f "$h" && -r "$h" ]] && { printf '%s' "$h"; return; }
+    done < <(find_in "${LIB_ROOTS[@]}" -- -name "$n")
+  done
+  return 0
+}
+# Candidate library FILE NAMES for the chosen Tcl, from tclConfig.sh's TCL_LIB_FILE
+# (which is exactly that: `libtcl8.6.so` on Debian, `libtcl9.0.dylib` on Homebrew)
+# instead of a hardcoded list. `<file>.0` covers a host shipping only the versioned
+# ELF runtime object; the TCL_VERSION-derived triple covers a config that omits
+# TCL_LIB_FILE. On Debian the first candidate is `libtcl8.6.so` — the same name,
+# and the same file, the pre-macOS hardcoded list resolved to.
+tcl_lib_names() {
+  local f=""
+  if [[ -n "$TCL_CFG" ]]; then
+    f="$( . "$TCL_CFG" >/dev/null 2>&1; printf '%s' "${TCL_LIB_FILE:-}" )" || f=""
+  fi
+  [[ -n "$f" ]] && printf '%s\n%s.0\n' "$f" "$f"
+  [[ -n "$TCL_VER" ]] && printf 'libtcl%s.so\nlibtcl%s.so.0\nlibtcl%s.dylib\n' "$TCL_VER" "$TCL_VER" "$TCL_VER"
+  return 0
+}
+declare -a TCL_LIB_NAMES=(); mapfile -t TCL_LIB_NAMES < <(tcl_lib_names)
+HOST_TCL_LIB="$(find_first "${TCL_LIB_NAMES[@]:-}")"
+# zlib: the two Linux names FIRST (so a Linux host resolves exactly as before),
+# then the macOS ones. Homebrew's keg ships libz.<ver>.dylib plus libz.dylib and
+# libz.1.dylib symlinks onto it, all readable.
+HOST_Z_LIB="$(find_first 'libz.so' 'libz.so.1' 'libz.dylib' 'libz.1.dylib')"
+[[ -n "$HOST_TCL_LIB" ]] || die "host libtcl ${TCL_VER:-<version unknown>} not found — install the Tcl runtime + dev files
+      (apt: tcl-dev / tcl${TCL_VER}-dev; brew: 'tcl-tk' for 9.x or 'tcl-tk@8' for 8.6 — KEG-ONLY, so
+      its own prefix is searched). names tried: ${TCL_LIB_NAMES[*]:-<none>}
+      roots searched: ${LIB_ROOTS[*]}"
+[[ -n "$HOST_Z_LIB"   ]] || die "host libz not found — install zlib1g-dev (linux) / 'brew install zlib' (macOS).
+      macOS ships NO OPENABLE libz: /usr/lib/libz.1.dylib exists only inside the dyld shared cache,
+      /usr/lib/libz.1.2.12.dylib is a dangling symlink to it, and the SDK carries .tbd TEXT stubs —
+      none can be read, and DSS must read the export table (--resolve-library). Homebrew's keg-only
+      zlib provides a real dylib under \$(brew --prefix zlib)/lib.
+      roots searched: ${LIB_ROOTS[*]}"
 info "host libs: $HOST_TCL_LIB  +  $HOST_Z_LIB"
 
 # arm64 libraries (only if an arm64 leg is selected) — Ubuntu ports .deb extract,
@@ -1111,12 +1501,30 @@ COMPILE_FAILS=0
 # the per-leg manifest is emitted as clean JSON by python3 (a harness dep now).
 ensure_cmd python3 python3
 # The leg-INDEPENDENT include-dir set: the sqlite recipe dirs + the staged
-# third-party tcl8.6/zlib headers + the build tree ($BLD, which resolves the
+# third-party tcl/zlib headers (whatever Tcl Step 6 discovered — the harness pins
+# no version) + the build tree ($BLD, which resolves the
 # recipe's relative `-I.`). These dirs, the TU list (${TUS[@]}) and the recipe
 # defines (${RECIPE_DEFS[@]}, already `-D`-stripped) are the SAME inputs the
 # per-file CLI fed; here they populate a `.dss-project.json` manifest instead.
 declare -a INC_DIRS=()
 for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"); done
+# ★ macOS: the Xcode SDK include dir goes on the path LAST
+# (D-CSUBSET-DARWIN-PLATFORM-MACROS follow-on). Now that a macho target
+# predefines __APPLE__, the Darwin-guarded arms of sqlite compile for the first
+# time and reach genuinely Apple-only SDK headers — <TargetConditionals.h>,
+# <sys/sysctl.h>, <sys/param.h>, <sys/mount.h>, <sys/file.h>, <malloc/malloc.h>.
+# None ships a DSS descriptor, so `D-INCLUDE-ANGLE-SOURCE-FALLBACK` parses the
+# REAL SDK header — but only if its directory is on the include path. A native
+# clang gets this dir implicitly via -isysroot; DSS is told explicitly.
+# Ordered LAST so sqlite's own headers and the staged third-party dirs still win,
+# and because the angle resolver consults SHIPPED DESCRIPTORS FIRST, adding this
+# dir cannot shadow the OS descriptors (<stdio.h>/<unistd.h>/… keep resolving to
+# stdio.json/unistd.json; only descriptor-less Apple headers fall through to it).
+# Linux/Windows no-op: gated on HOST_OS, and `sdk_prefix` is empty without xcrun.
+if [[ "$HOST_OS" == "macos" ]]; then
+  _sdk_inc="$(sdk_prefix)"
+  [[ -n "$_sdk_inc" && -d "$_sdk_inc/usr/include" ]] && INC_DIRS+=("$_sdk_inc/usr/include")
+fi
 
 # generate_manifest <spec> <tcl-lib> <z-lib> <out-manifest> — write a project
 # manifest reproducing the recipe: language c-subset, profile cli, ONE target

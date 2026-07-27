@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -2365,10 +2366,11 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // macros remain: `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho
     // trampolines — <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
     // `__STDC_NO_VLA__` (a VLA-supporting impl must not define it).
-    EXPECT_EQ(pms.size(), 22u)
-        << "c-subset declares 11 un-gated + 11 pe-gated predefined macros (no macho-gated)";
+    EXPECT_EQ(pms.size(), 24u)
+        << "c-subset declares 11 un-gated + 11 pe-gated + 2 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
+    std::vector<std::string> machoGatedNames;
     for (auto const& pm : pms) {
         if (pm.availableObjectFormats.empty()) {
             ++ungated;
@@ -2377,11 +2379,28 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be gated to exactly one format";
             EXPECT_NE(pm.name, "__STDC_NO_THREADS__")
                 << "__STDC_NO_THREADS__ must be REMOVED (threads.h complete on all legs)";
-            ++peGated;
-            EXPECT_EQ(pm.availableObjectFormats.front(), "pe")
-                << pm.name << " should be pe-gated (Windows selection) — no macho-gated macro remains";
+            auto const& fmt = pm.availableObjectFormats.front();
+            if (fmt == "macho") {
+                machoGatedNames.push_back(pm.name);
+            } else {
+                ++peGated;
+                EXPECT_EQ(fmt, "pe")
+                    << pm.name << " should be pe-gated (Windows selection) or macho-gated "
+                                  "(Darwin selection) — no other format gate is declared";
+            }
         }
     }
+    // Darwin platform-selection macros (first macOS sqlite-corpus run, 2026-07-27,
+    // D-CSUBSET-DARWIN-PLATFORM-MACROS). EXACT SET, not a count: every portable C
+    // program branches on `__APPLE__`, and without it DSS silently compiled the
+    // `#else` (Linux) arm of sqlite's `src/test1.c` CPU-count code on a Darwin
+    // target — reaching `sysconf(_SC_NPROCESSORS_ONLN)` instead of the `sysctl`
+    // arm real Apple toolchains take. Mirrors the c95 `_WIN32`-for-pe precedent.
+    std::sort(machoGatedNames.begin(), machoGatedNames.end());
+    EXPECT_EQ(machoGatedNames, (std::vector<std::string>{"__APPLE__", "__MACH__"}))
+        << "macho targets must predefine exactly __APPLE__ and __MACH__ — the "
+           "platform-selection macros clang/gcc define on Darwin; dropping either "
+           "makes every `#ifdef __APPLE__` in portable C take the wrong branch";
     EXPECT_EQ(ungated, 11u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) are un-gated (every "

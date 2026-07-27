@@ -221,6 +221,24 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
     std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
     std::string const libArtifact = "dsslib.dll";
     std::string const exeArtifact = "decl.exe";
+// D-TEST-MACOS-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the
+// artifact, so the target must match the HOST. The original two-arm shape read
+// "Windows or else Linux", which silently handed macOS an elf64-x86_64 binary —
+// `posix_spawn` then failed rc=8 (ENOEXEC) and the suite could never be green on
+// a Mac. RETARGET rather than skip: the round-trip assertion stays LIVE on every
+// host (a GTEST_SKIP here would quietly stop testing --resolve-library on macOS,
+// which is exactly the coverage the first macOS run needed). Arch is selected
+// from the host too — Apple Silicon and Intel Macs both ship dylib+exec formats.
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+    std::string const libTarget   = "arm64:macho64-arm64-darwin-dylib";
+    std::string const execTarget  = "arm64:macho64-arm64-darwin-exec";
+#  else
+    std::string const libTarget   = "x86_64:macho64-x86_64-darwin-dylib";
+    std::string const execTarget  = "x86_64:macho64-x86_64-darwin-exec";
+#  endif
+    std::string const libArtifact = "dsslib.dylib";
+    std::string const exeArtifact = "decl";
 #else
     std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
     std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";
@@ -299,6 +317,24 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibr
     std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
     std::string const libArtifact = "dsslib.dll";
     std::string const exeArtifact = "decl.exe";
+// D-TEST-MACOS-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the
+// artifact, so the target must match the HOST. The original two-arm shape read
+// "Windows or else Linux", which silently handed macOS an elf64-x86_64 binary —
+// `posix_spawn` then failed rc=8 (ENOEXEC) and the suite could never be green on
+// a Mac. RETARGET rather than skip: the round-trip assertion stays LIVE on every
+// host (a GTEST_SKIP here would quietly stop testing --resolve-library on macOS,
+// which is exactly the coverage the first macOS run needed). Arch is selected
+// from the host too — Apple Silicon and Intel Macs both ship dylib+exec formats.
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+    std::string const libTarget   = "arm64:macho64-arm64-darwin-dylib";
+    std::string const execTarget  = "arm64:macho64-arm64-darwin-exec";
+#  else
+    std::string const libTarget   = "x86_64:macho64-x86_64-darwin-dylib";
+    std::string const execTarget  = "x86_64:macho64-x86_64-darwin-exec";
+#  endif
+    std::string const libArtifact = "dsslib.dylib";
+    std::string const exeArtifact = "decl";
 #else
     std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
     std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";

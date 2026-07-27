@@ -65,7 +65,7 @@
     { "name": "ferror",   "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "fflush",   "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "clearerr", "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> void", "kind": "function", "linkage": "external" },
-    { "name": "fileno",   "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
+    { "name": "fileno",   "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
     { "name": "remove",   "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
     { "name": "rename",   "signature": "fn(ptr<char>, ptr<char>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "perror",   "signature": "fn(ptr<char>) -> void",          "kind": "function", "linkage": "external" },
