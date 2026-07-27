@@ -146,12 +146,14 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"Alice"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
             rule:stringLitExpr
               tok:"'"
               tok:"alice@example.com"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
@@ -177,12 +179,14 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"Bob''s Tools"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
             rule:stringLitExpr
               tok:"'"
               tok:"bob@example.com"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
@@ -208,12 +212,14 @@ rule:root
             rule:uniStringLitExpr
               tok:"N'"
               tok:"héllo"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
             rule:uniStringLitExpr
               tok:"N'"
               tok:"h@example.com"
+              tok:"'"
         tok:","
         rule:expression
           rule:operand
@@ -247,6 +253,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"pending"
+              tok:"'"
       tok:")"
       tok:";"
   rule:statement
@@ -276,6 +283,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"shipped"
+              tok:"'"
       tok:")"
       tok:";"
   rule:statement
@@ -305,6 +313,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"pending"
+              tok:"'"
       tok:")"
       tok:";"
   rule:statement
@@ -469,6 +478,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"pending"
+              tok:"'"
       tok:";"
   rule:statement
     rule:selectStmt
@@ -691,6 +701,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"pending"
+              tok:"'"
       tok:";"
   rule:statement
     rule:selectStmt
@@ -803,6 +814,7 @@ rule:root
               rule:stringLitExpr
                 tok:"'"
                 tok:"shipped"
+                tok:"'"
       rule:whereClause
         tok:"WHERE"
         rule:expression
@@ -928,6 +940,7 @@ rule:root
             rule:stringLitExpr
               tok:"'"
               tok:"cancelled"
+              tok:"'"
       tok:";"
   rule:statement
     rule:deleteStmt

@@ -2260,6 +2260,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             std::optional<DefaultTokenSpec> defaultToken;
             if (modeObj.contains("defaultToken")) {
                 json const& dt = modeObj.at("defaultToken");
+                // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+                // Without it a mis-spelled knob (`closeTokn`, `coalese`) loads
+                // clean and does NOTHING — and it poisons the diagnostics of the
+                // checks below: the required-`closeToken` rule would report a
+                // "missing" field the author demonstrably DID write, sending them
+                // hunting in the wrong place. `$`-prefixed keys are the codebase-
+                // wide documentation convention (`$comment` / `$…Comment`), never
+                // a knob, so they are exempt.
+                if (dt.is_object()) {
+                    static constexpr std::array<std::string_view, 4>
+                        kDefaultTokenKeys{"kind", "flags", "coalesce", "closeToken"};
+                    for (auto it = dt.begin(); it != dt.end(); ++it) {
+                        if (!it.key().empty() && it.key().front() == '$') continue;
+                        bool known = false;
+                        for (auto const& k : kDefaultTokenKeys) {
+                            if (it.key() == k) { known = true; break; }
+                        }
+                        if (known) continue;
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/defaultToken/{}", modePath, it.key()),
+                                  std::format("unknown key '{}' in 'defaultToken' — "
+                                              "allowed keys are 'kind', 'flags', "
+                                              "'coalesce', 'closeToken' (typo "
+                                              "discriminator)", it.key()));
+                    }
+                }
                 if (!dt.is_object() || !dt.contains("kind") ||
                     !dt.at("kind").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
@@ -2291,6 +2317,76 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         } else {
                             spec.coalesce = dt.at("coalesce").get<bool>();
                         }
+                    }
+                    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. `closeToken` names the
+                    // token KIND the tokenizer stamps on the body's CLOSE delimiter
+                    // (`"` / `'` / `>`). Before it existed the coalesced path
+                    // advanced past the delimiter emitting nothing, so those bytes
+                    // belonged to no token's span — every span join downstream came
+                    // up one delimiter short, silently. The kind is config-supplied
+                    // so the engine never has to know that C spells its string
+                    // terminator `"`.
+                    if (dt.contains("closeToken")) {
+                        if (!dt.at("closeToken").is_string()
+                            || dt.at("closeToken").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      std::format("{}/defaultToken/closeToken", modePath),
+                                      "'defaultToken.closeToken' must be a non-empty "
+                                      "token-kind name string");
+                        } else {
+                            spec.closeToken = data.schemaTokens->intern(
+                                dt.at("closeToken").get<std::string>());
+                        }
+                    }
+                    // A coalesced body MUST name its closer. There is no defensible
+                    // default: falling back to `kind` re-creates the exact silent
+                    // corruption described below, and silently emitting no token
+                    // restores the defect. Reject the combination loudly rather than
+                    // pick a winner (the same posture the `popAtNewline` +
+                    // `defaultToken` conflict takes further down). Keyed on the key's
+                    // ABSENCE so a present-but-malformed `closeToken` reports only its
+                    // own type error instead of also being called missing.
+                    if (spec.coalesce && !dt.contains("closeToken")) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/defaultToken/closeToken", modePath),
+                                  "'defaultToken.coalesce' is true but no "
+                                  "'defaultToken.closeToken' was declared — a "
+                                  "coalesced body mode consumes its close delimiter, "
+                                  "so it must name the token kind that delimiter is "
+                                  "emitted as, or the delimiter's bytes land in no "
+                                  "token's span at all");
+                    }
+                    // The converse knob-that-lies: only the COALESCED tokenizer path
+                    // reads `closeToken`. A per-codepoint body mode already emits its
+                    // closer through the ordinary body path, so a `closeToken` there
+                    // would be config the engine silently never consults.
+                    if (!spec.coalesce && spec.closeToken.valid()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/defaultToken/closeToken", modePath),
+                                  "'defaultToken.closeToken' requires "
+                                  "'defaultToken.coalesce': true — only the coalesced "
+                                  "body path emits a separate close-delimiter token; "
+                                  "a per-codepoint mode would silently ignore it");
+                    }
+                    // The closer must NOT reuse the body's kind. Every consumer that
+                    // filters a literal's children BY KIND would then treat the
+                    // delimiter as body content: `decodeAdjacentStringBodies`
+                    // (string_literal_decode.hpp) would decode `"abc"` to `abc"` —
+                    // SILENTLY, because the semantic and HIR tiers both read the same
+                    // children and agree on the same wrong length, so no cross-tier
+                    // guard can fire. Loud rejection here is the only place the
+                    // mistake is still cheap.
+                    if (spec.closeToken.valid() && spec.closeToken == spec.kind) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/defaultToken/closeToken", modePath),
+                                  std::format("'defaultToken.closeToken' must differ "
+                                              "from 'defaultToken.kind' (both are "
+                                              "'{}') — a close delimiter sharing the "
+                                              "body's kind is indistinguishable from "
+                                              "body content to every by-kind child "
+                                              "filter, and would be decoded INTO the "
+                                              "literal's value",
+                                              dt.at("kind").get<std::string>()));
                     }
                     defaultToken = spec;
                 }
@@ -2404,6 +2500,53 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                           "token map active in this mode",
                           DiagnosticSeverity::Warning);
             }
+        }
+    }
+
+    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN, cross-mode consistency. Two
+    // coalesced modes MAY share a `defaultToken.kind` — tsql's `single-string`
+    // and `unicode-string` both emit `StringLiteral`, and only the OPENER
+    // distinguishes `'a'` from `N'a'` — but if they do they MUST agree on the
+    // closer.
+    //
+    // This is not tidiness: `closeTokenForCoalescedBody`
+    // (core/types/literal_close_token.hpp) is the consumer-side resolver, and it
+    // keys on the BODY kind because that is the only handle a consumer reliably
+    // has. Its lookup is a FIRST-MATCH scan over the mode list. If two modes
+    // shared a body kind and declared DIFFERENT closers, that scan would hand
+    // every consumer the first-declared mode's closer — for literals lexed by
+    // the second mode, silently the wrong kind, with no diagnostic anywhere and
+    // mode-declaration ORDER as the deciding factor. An invariant a first-match
+    // lookup DEPENDS on has to be enforced where it can still be enforced (load
+    // time), or the lookup is a silent-wrong-answer waiting for its second
+    // consumer — exactly the failure class this anchor exists to eliminate.
+    //
+    // Runs after the per-mode loop so every mode is parsed; scans `data.lexerModes`
+    // rather than the JSON so it sees the resolved, interned ids.
+    {
+        // body kind → (closer, name of the mode that first claimed it)
+        std::unordered_map<std::uint32_t, std::pair<SchemaTokenId, std::string>> seen;
+        for (auto const& mode : data.lexerModes) {
+            if (!mode.defaultToken || !mode.defaultToken->coalesce) continue;
+            if (!mode.defaultToken->kind.valid()) continue;
+            auto const [it, inserted] = seen.try_emplace(
+                mode.defaultToken->kind.v,
+                std::pair{mode.defaultToken->closeToken, mode.name});
+            if (inserted) continue;
+            if (it->second.first == mode.defaultToken->closeToken) continue;
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("/lexerModes/{}/defaultToken/closeToken", mode.name),
+                      std::format("coalesced modes '{}' and '{}' share the body kind "
+                                  "'{}' but declare different 'closeToken's ('{}' vs "
+                                  "'{}') — the body kind is how a consumer resolves "
+                                  "the closer, so two answers for one body kind means "
+                                  "the resolution silently depends on mode-declaration "
+                                  "order. Give the two modes the same closer, or give "
+                                  "them distinct body kinds",
+                                  it->second.second, mode.name,
+                                  data.schemaTokens->name(mode.defaultToken->kind),
+                                  data.schemaTokens->name(it->second.first),
+                                  data.schemaTokens->name(mode.defaultToken->closeToken)));
         }
     }
 
@@ -3110,6 +3253,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // synthetic-meaning drift guard accepts it.
                     if (mode.defaultToken && mode.defaultToken->coalesce) {
                         data.modeIntroducedKinds.insert(mode.defaultToken->kind);
+                        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the CLOSE-delimiter
+                        // kind is mode-introduced for the same reason, and recording
+                        // it is not optional — without this line the build HARD-
+                        // ABORTS on the first string literal. The delimiter's lexeme
+                        // (`"` / `'` / `>`) IS in the global table, but mapped to a
+                        // DIFFERENT kind (`StringStart`, an operator, …), so the
+                        // builder's `resolveMeaning` finds candidates that don't
+                        // contain the tokenizer's pre-resolved kind, takes Path B,
+                        // and calls `makeSyntheticMeaning` — whose drift guard
+                        // `tbFatal`s on any kind that is neither a body default, a
+                        // built-in literal, nor mode-introduced.
+                        //
+                        // It goes HERE and not in `bodyDefaultTokenKinds`: that set
+                        // is the OFF-grammar cursor-skip set, and the closer is very
+                        // much IN-grammar — a shape names it as a real slot, and
+                        // `validateBodyDefaultKindsOffGrammar` would reject that
+                        // shape reference outright if the kind were filed as a body
+                        // default.
+                        if (mode.defaultToken->closeToken.valid()) {
+                            data.modeIntroducedKinds.insert(
+                                mode.defaultToken->closeToken);
+                        }
                     }
                 }
                 // FF11: every kind declared in a per-mode `tokens` override

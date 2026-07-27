@@ -3,6 +3,7 @@
 #include "core/types/attribute_naming.hpp"   // stripDunder (shared with the packed scan)
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -174,6 +175,14 @@ public:
         // the honest behavior is a hard error, NOT a silent misevaluation.
         charOpenKind_ = schema_.hirLowering().charStartToken;
         charBodyKind_ = schema_.hirLowering().charBodyToken;
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closing `'` is a real token
+        // now, so the char arm must CONSUME it or `evaluate()`'s end-of-run check
+        // reports "trailing tokens after #if controlling expression" for the
+        // ordinary `#if 'A' == 65`. Its kind is resolved from the schema via the
+        // BODY kind (the mode that declares this coalesced body declares the
+        // closer) — never the spelling `"CharEnd"`. Invalid for a language whose
+        // char body mode declares no closer; the arm then consumes nothing extra.
+        charCloseKind_ = closeTokenForCoalescedBody(schema_, charBodyKind_);
     }
 
     // Evaluate the whole token run. nullopt on any fail-loud condition (already
@@ -216,6 +225,7 @@ private:
     SchemaTokenId                 stringOpenKind_{};
     SchemaTokenId                 charOpenKind_{};   // c12: `'` opener
     SchemaTokenId                 charBodyKind_{};   // c12: coalesced char body
+    SchemaTokenId                 charCloseKind_{};  // the `'` closer's own token
     std::size_t                   pos_ = 0;
     bool                          failed_ = false;
 
@@ -540,7 +550,9 @@ private:
 
         // c12: char constant `'A'` / `'\n'` / `'\301'`. It lexes as the OPENER
         // (`charOpenKind_` = `'`) followed by the COALESCED body token
-        // (`charBodyKind_`), the closing `'` already consumed on mode-pop. The body
+        // (`charBodyKind_`) and then the CLOSER (`charCloseKind_`) —
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN gave the closing `'` a token of
+        // its own, so this arm consumes THREE tokens, not two. The body
         // text is the raw bytes between the quotes (escapes unresolved); decode it
         // to a single byte via the SHARED `decodeCharLiteralBody` (the same decoder
         // char-literal lowering uses — so an escape means the same thing here). The
@@ -563,6 +575,17 @@ private:
                 return std::nullopt;
             }
             advance();   // consume the body
+            // Consume the closing `'` token. Guarded on the kind MATCHING rather
+            // than asserted: a language whose char body mode declares no closer
+            // leaves `charCloseKind_` invalid and consumes nothing (unchanged
+            // behaviour), and a genuinely unterminated `'a` never reaches here —
+            // the tokenizer already failed loud with P_UnterminatedString. A
+            // closer that is somehow absent still fails loud, one frame out, as
+            // `evaluate()`'s trailing-token check.
+            if (charCloseKind_.valid() && !atEnd()
+                && peek().schemaKind == charCloseKind_) {
+                advance();
+            }
             HirLiteralValue lv;
             lv.core  = TypeKind::I32;
             lv.value = static_cast<std::int64_t>(*cp);
@@ -724,6 +747,30 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         return j;
     };
 
+    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: `body` indexes a coalesced literal
+    // BODY token; return the index just past it AND past the CLOSE-delimiter
+    // token that now follows it. The closer is a SIGNIFICANT token (the
+    // tokenizer deliberately gives it no `EmptySpace` flag, so a shape can name
+    // the slot), which means every `body + 1` step in the operator arms below
+    // would otherwise land ON the closer instead of on the operator's `)`.
+    // For `__has_include` that is the LOUD "expected ')'"; for `__has_embed` it
+    // was SILENT — the closer counted as an unsupported PARAMETER and the
+    // operator answered NOT_FOUND(0), so a guarded `#embed` never ran.
+    // The closer KIND comes from the schema (keyed on the body token's own
+    // kind), never the spelling `"StringEnd"`. Tolerant when the language
+    // declares no closer: the index then simply steps past the body, which is
+    // the pre-closer behaviour.
+    auto skipBodyAndCloser = [&](std::size_t body) -> std::size_t {
+        SchemaTokenId const closeKind =
+            closeTokenForCoalescedBody(schema, operandTokens[body].schemaKind);
+        std::size_t n = body + 1;
+        if (closeKind.valid() && n < operandTokens.size()
+            && operandTokens[n].schemaKind == closeKind) {
+            ++n;
+        }
+        return n;
+    };
+
     bool rewriteFailed = false;
     // FC15c fail-loud helper for a malformed `__has_include` (positioned on the
     // operator token, a DISTINCT code -- never a generic ICE fallthrough).
@@ -802,12 +849,15 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 // opening `"`; the coalesced StringLiteral BODY is the next token
                 // and its raw text is the filename (escapes NOT decoded, like the
                 // include resolver). An empty body (`""`) leaves filename empty.
+                // The body is FOLLOWED by the literal's CLOSE-delimiter token
+                // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN); without stepping past
+                // it the `)` check below sees the `"` and fails "expected ')'".
                 std::size_t k = j + 1;
                 if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
                     && operandTokens[k].span.start()
                            == operandTokens[j].span.end()) {
                     filename = std::string{synth.slice(operandTokens[k].span)};
-                    ++k;
+                    k = skipBodyAndCloser(k);
                 }
                 j = k;
             } else {
@@ -889,13 +939,17 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 // QUOTE form `"r"`: the coalesced StringLiteral BODY is the
                 // adjacent next token; its raw text is the resource name (escapes
                 // NOT decoded, like the include/embed resolver). An empty body
-                // (`""`) leaves the name empty -> loud below.
+                // (`""`) leaves the name empty -> loud below. The body is then
+                // FOLLOWED by the literal's CLOSE-delimiter token
+                // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN) — stepping past it here
+                // is what keeps the parameter scan below from counting the `"` as
+                // a parameter and SILENTLY answering NOT_FOUND.
                 std::size_t k = j + 1;
                 if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
                     && operandTokens[k].span.start()
                            == operandTokens[j].span.end()) {
                     filename = std::string{synth.slice(operandTokens[k].span)};
-                    ++k;
+                    k = skipBodyAndCloser(k);
                 }
                 j = k;
             } else {

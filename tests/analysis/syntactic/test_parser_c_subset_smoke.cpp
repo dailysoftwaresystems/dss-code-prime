@@ -1975,6 +1975,24 @@ namespace {
     return n;
 }
 
+// The visible TOKEN children of `node` as a `/`-joined list of schema-token
+// KIND NAMES (e.g. `StringStart/StringLiteral/StringEnd`).
+//
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: added because a bare COUNT cannot tell
+// `opener+body+closer` from `opener+body+body`, and the difference between those
+// two is a silently corrupted string literal. Whenever a child count is pinned
+// below, the ROLES are pinned alongside it.
+[[nodiscard]] std::string visibleTokenChildKinds(Tree const& t, NodeId node) {
+    std::string out;
+    for (NodeId c : t.children(node)) {
+        if (isEmptySpace(t.flags(c))) continue;
+        if (t.kind(c) != NodeKind::Token) continue;
+        if (!out.empty()) out += '/';
+        out += t.schema().schemaTokens().name(t.tokenKind(c));
+    }
+    return out;
+}
+
 [[nodiscard]] Tree parseCSubset(std::string source) {
     auto h = loadAndTokenize(std::move(source));
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -1983,32 +2001,75 @@ namespace {
 
 } // namespace
 
-// Regression: a LONE string literal still produces EXACTLY two token children
-// (StringStart + StringLiteral) — the repeat fires zero times, byte-identical
-// to the pre-c20 single-pair rule. RED if the grammar change perturbed the
-// single-string shape.
-TEST(ParserCSubsetSmoke, SingleStringLiteralHasTwoChildren) {
+// ── Adjacent-string-concat SHAPE (D-CSUBSET-ADJACENT-STRING-CONCAT) ──────────
+//
+// ★ RENAMED — D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. These three tests were
+// `SingleStringLiteralHasTwoChildren` / `TwoAdjacentStringsHaveFourChildren` /
+// `ThreeAdjacentStringsHaveSixChildren`, i.e. their NAMES asserted 2/4/6. The
+// closing `"` is now its own `StringEnd` token, so each adjacent piece
+// contributes a TRIPLE and the counts are 3/6/9.
+//
+// They are not renamed to `…HasThreeChildren` — a literal count in a test name
+// is exactly what went stale here, and would go stale again. The names now
+// state the INVARIANT the grammar actually guarantees:
+//
+//     N adjacent string pieces  →  N token triples in ONE stringLiteralExpr
+//
+// and the per-piece width lives in `kTokensPerStringPiece` below, in ONE place,
+// so a future shape change is a one-line edit with a compile-time-visible
+// meaning rather than a hunt for magic numbers. A test named `HasTwoChildren`
+// that asserts 3 is a landmine; so is one named `HasThreeChildren` if the shape
+// moves again.
+//
+// The three children of each piece, in order:
+//     [0] opener  — StringStart (or a wide/UTF variant: L" u" U" u8")
+//     [1] body    — StringLiteral, the coalesced raw bytes BETWEEN delimiters
+//     [2] closer  — StringEnd, the closing `"`     ← NEW; had no token before
+//
+// The closer MUST be a kind distinct from the body: `decodeAdjacentStringBodies`
+// picks its segments by FILTERING children on the body kind, so a closer sharing
+// that kind would decode `"abc"` as `abc"`. That is why these tests now pin the
+// KIND SEQUENCE and not merely the count — a count of 3 is equally satisfied by
+// `opener/body/body`, which is the corrupt shape.
+
+// Each adjacent string piece contributes opener + body + closer.
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN took this from 2 to 3.
+constexpr std::size_t kTokensPerStringPiece = 3;
+
+// Regression: a LONE string literal produces EXACTLY one triple — the repeat
+// fires zero times. RED if the grammar change perturbed the single-string shape.
+TEST(ParserCSubsetSmoke, SingleStringLiteralHasOneTokenTriple) {
     Tree t = parseCSubset("int main() { \"x\"; }");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid()) << "a lone string must still form a stringLiteralExpr";
-    EXPECT_EQ(visibleTokenChildCount(t, sle), 2u)
-        << "lone string: StringStart + StringLiteral (repeat fires 0×)";
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 1 * kTokensPerStringPiece)
+        << "lone string: opener + body + closer (repeat fires 0×)";
+    EXPECT_EQ(visibleTokenChildKinds(t, sle), "StringStart/StringLiteral/StringEnd")
+        << "the closer must be StringEnd, NOT a second StringLiteral — a "
+           "body-kinded closer would make decodeAdjacentStringBodies read `x\"`";
 }
 
-// Two adjacent string literals concatenate into ONE stringLiteralExpr with
-// FOUR token children (StringStart StringLiteral StringStart StringLiteral) —
-// flat, no wrapper. This is the shape `decodeAdjacentStringBodies` walks.
-TEST(ParserCSubsetSmoke, TwoAdjacentStringsHaveFourChildren) {
+// Two adjacent string literals concatenate into ONE stringLiteralExpr with TWO
+// flat triples — no wrapper node. This is the shape `decodeAdjacentStringBodies`
+// walks.
+TEST(ParserCSubsetSmoke, TwoAdjacentStringsHaveTwoTokenTriples) {
     Tree t = parseCSubset("int main() { \"a\" \"b\"; }");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid());
-    EXPECT_EQ(visibleTokenChildCount(t, sle), 4u)
-        << "\"a\" \"b\" → 4 flat token children (the repeat fires once)";
-    // There must be exactly ONE stringLiteralExpr node — the second pair is
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 2 * kTokensPerStringPiece)
+        << "\"a\" \"b\" → 2 flat triples (the repeat fires once)";
+    // ★ The closer had to be added to the grammar's REPEAT body as well as its
+    // head. Omitting it there would not merely under-describe the tree — the
+    // repeat would fail to match at the second piece's closer and the two
+    // strings would stop concatenating. This kind sequence is what proves the
+    // repeat consumed a FULL triple.
+    EXPECT_EQ(visibleTokenChildKinds(t, sle),
+              "StringStart/StringLiteral/StringEnd/StringStart/StringLiteral/StringEnd");
+    // There must be exactly ONE stringLiteralExpr node — the second piece is
     // absorbed by the repeat, NOT a separate expression.
     std::size_t exprCount = 0;
     RuleId const rid = t.schema().rules().find("stringLiteralExpr");
@@ -2019,15 +2080,36 @@ TEST(ParserCSubsetSmoke, TwoAdjacentStringsHaveFourChildren) {
     EXPECT_EQ(exprCount, 1u) << "adjacent strings form ONE expression, not two";
 }
 
-// Three adjacent string literals → SIX token children (the repeat fires twice).
-TEST(ParserCSubsetSmoke, ThreeAdjacentStringsHaveSixChildren) {
+// Three adjacent string literals → THREE triples (the repeat fires twice).
+TEST(ParserCSubsetSmoke, ThreeAdjacentStringsHaveThreeTokenTriples) {
     Tree t = parseCSubset("int main() { \"a\" \"b\" \"c\"; }");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid());
-    EXPECT_EQ(visibleTokenChildCount(t, sle), 6u)
-        << "\"a\" \"b\" \"c\" → 6 flat token children (repeat fires twice)";
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 3 * kTokensPerStringPiece)
+        << "\"a\" \"b\" \"c\" → 3 flat triples (repeat fires twice)";
+    EXPECT_EQ(visibleTokenChildKinds(t, sle),
+              "StringStart/StringLiteral/StringEnd/"
+              "StringStart/StringLiteral/StringEnd/"
+              "StringStart/StringLiteral/StringEnd");
+}
+
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN, the CHAR form: `charLiteralExpr` went
+// from 2 children to 3 for the same reason. Pinned here because the char form
+// rides a DIFFERENT lexer mode and a DIFFERENT grammar rule from the string
+// form — nothing above would catch a char-closer regression.
+TEST(ParserCSubsetSmoke, CharLiteralHasOpenerBodyCloserChildren) {
+    Tree t = parseCSubset("int main() { 'c'; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const cle = findFirstNodeWithRule(t, "charLiteralExpr");
+    ASSERT_TRUE(cle.valid()) << "a char constant must form a charLiteralExpr";
+    EXPECT_EQ(visibleTokenChildCount(t, cle), 3u)
+        << "char constant: opener + body + closer";
+    EXPECT_EQ(visibleTokenChildKinds(t, cle), "CharStart/CharLiteral/CharEnd")
+        << "the char closer is CharEnd — a kind of its own, never the "
+           "CharLiteral body kind reused";
 }
 
 // ── FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): the attribute-declaration

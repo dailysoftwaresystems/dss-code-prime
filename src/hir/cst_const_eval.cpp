@@ -824,10 +824,21 @@ evalNode(NodeId                              expr,
     // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert('a'==97)`
     // gap): a NARROW character constant (`'a'`, `'\n'`, `'\xFF'`) in const-expr
     // position — C 6.4.4.4 makes it an integer constant expression. SHAPE-keyed,
-    // not rule-keyed (the [opener, body] pair is the tokenizer contract): exactly
-    // two visible tokens, the first the NARROW `charStartToken`, the second the
-    // `charBodyToken` — a shape the generic wrapper-peel below cannot descend
-    // (two tokens, zero internals ⇒ it would fail NotAConstantExpression).
+    // not rule-keyed: an all-token node carrying the NARROW `charStartToken`
+    // followed by the `charBodyToken` — a shape the generic wrapper-peel below
+    // cannot descend (all tokens, zero internals ⇒ it would fail
+    // NotAConstantExpression).
+    //
+    // ★ KIND-KEYED, NOT COUNT-KEYED (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): this
+    // used to require `kids.size() == 2` and index `kids[0]`/`kids[1]` directly.
+    // The closing `'` is a token of its own now, so the node has THREE children
+    // and the count test silently stopped matching — dropping every char constant
+    // to the wrapper-peel, which fails NotAConstantExpression and regresses
+    // `_Static_assert('a' == 97, "ok")`. Re-pinning the count at 3 would just
+    // re-arm the same trap for the next tokenizer shape change, so the scan looks
+    // for the OPENER and BODY kinds and is indifferent to what else the literal
+    // carries.
+    //
     // Gated on the body token being INTEGER-cored in this consumer's set (C's
     // `'x'` is int-typed via `literalTypes`; a language whose char constants are
     // not integers never folds them here). Decodes via the SHARED
@@ -840,21 +851,33 @@ evalNode(NodeId                              expr,
     // silently accept what the value tier fails loud on. It falls through to
     // the generic fail below (loud, as today).
     if (cfg.charStartToken.valid() && cfg.charBodyToken.valid()
-        && kids.size() == 2
-        && tree.kind(kids[0]) == NodeKind::Token
-        && tree.kind(kids[1]) == NodeKind::Token
-        && tree.tokenKind(kids[0]).v == cfg.charStartToken.v
-        && tree.tokenKind(kids[1]).v == cfg.charBodyToken.v
         && ctx.integerLiteralTokens.contains(cfg.charBodyToken.v)) {
-        auto const cp = decodeCharLiteralBody(tree.text(kids[1]));
-        if (!cp.has_value()) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        NodeId charBody{};
+        bool   sawOpener  = false;
+        bool   allTokens  = !kids.empty();
+        for (NodeId c : kids) {
+            if (tree.kind(c) != NodeKind::Token) { allTokens = false; break; }
+            SchemaTokenId const k = tree.tokenKind(c);
+            if (!sawOpener) {
+                // The NARROW opener must come FIRST — a wide/UTF opener leaves
+                // `sawOpener` false and the node never matches.
+                if (k.v != cfg.charStartToken.v) break;
+                sawOpener = true;
+                continue;
+            }
+            if (!charBody.valid() && k.v == cfg.charBodyToken.v) charBody = c;
         }
-        HirLiteralValue lv;
-        lv.core  = TypeKind::I32;  // C 6.4.4.4: a char constant has type `int`;
-                                   // consumers read `.value` (the leaf-arm note)
-        lv.value = static_cast<std::int64_t>(*cp);
-        return ok(std::move(lv));
+        if (allTokens && sawOpener && charBody.valid()) {
+            auto const cp = decodeCharLiteralBody(tree.text(charBody));
+            if (!cp.has_value()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            HirLiteralValue lv;
+            lv.core  = TypeKind::I32;  // C 6.4.4.4: a char constant has type
+                                       // `int`; consumers read `.value`
+            lv.value = static_cast<std::int64_t>(*cp);
+            return ok(std::move(lv));
+        }
     }
 
     // Wrapper rule: any internal node with exactly one meaningful child

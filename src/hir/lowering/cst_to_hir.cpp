@@ -14,6 +14,7 @@
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/bit_int_value.hpp"          // C4b: host bignum for wb/uwb literals
 #include "core/types/integer_literal_ladder.hpp" // FC3 c1: the C 6.4.4.1 ladder (shared with the semantic tier)
+#include "core/types/literal_close_token.hpp"    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closer kind, from the schema
 #include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -1248,10 +1249,48 @@ struct Lowerer {
         // works; an unknown composite fails loud with the composite key.
         SchemaTokenId const strStart = cfg.stringStartToken;
         SchemaTokenId const strBody  = cfg.stringBodyToken;
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: a string literal's CLOSING
+        // delimiter is a token of its own, so the argument `("hidden")` is FOUR
+        // tokens (`(`, opener, body, closer) + `)`, not three. This scan must know
+        // the third string piece exactly as it already knows the first two.
+        //
+        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c-subset
+        // `linkageSpecifierIgnoredKinds` rows that also list `StringEnd` are
+        // DEFENCE-IN-DEPTH, not the mechanism — keep them (they document the
+        // closer's structural role at the config surface, and they are what a
+        // language whose closer kind the engine cannot resolve would rely on),
+        // but do not mistake them for load-bearing.
+        //
+        // MEASURED, both directions, because an earlier version of this note
+        // over-claimed in both:
+        //   • Strip `StringEnd` from ALL THREE config rows and
+        //     `visibility("hid" "den")` still fails loud with the SAME
+        //     `H_UnknownLinkageSpecifier` adjacent-concat message. The
+        //     `kind == strClose` arm below already covers it, so config alone
+        //     was never the thing standing between here and the bug.
+        //   • With the closer ignored NOWHERE (this arm removed AND the config
+        //     rows stripped) the failure is CONFUSING BUT LOUD — never silent.
+        //     `visibility("hidden")` reports `'"' is not a recognized linkage
+        //     specifier` (the outer loop reaches the closer token and takes its
+        //     TEXT as a specifier name); `visibility("hid" "den")` reports three
+        //     errors — `'visibility:hid'`, `'":den'`, `'"'`. The
+        //     adjacent-concat wall does decline (k2 lands on the closer, which
+        //     is not another opener), so the key `visibility:hid` IS formed —
+        //     but that key is not a declared facet, so the strict lookup below
+        //     rejects it. No silent path exists here in any configuration.
+        // Keying it in the ENGINE is still right: it makes the consumer correct
+        // for every language config rather than per-language-correct, and it
+        // turns a confusing multi-error cascade into no error at all.
+        SchemaTokenId const strClose =
+            closeTokenForCoalescedBody(tree().schema(), strBody);
         auto const isIgnoredKind = [&](SchemaTokenId kind) {
             for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
                 if (k == kind) return true;
-            return false;
+            // The literal's closer is structural syntax of the string ARGUMENT,
+            // never a specifier name — skipped everywhere the ignored kinds are,
+            // including the two forward scans below, so the composite pairing and
+            // its adjacent-concat wall both see through it.
+            return strClose.valid() && kind == strClose;
         };
         for (std::size_t i = 0; i < toks.size(); ++i) {
             NodeId const n = toks[i];

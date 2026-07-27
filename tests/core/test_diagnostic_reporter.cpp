@@ -1,9 +1,19 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/source_buffer.hpp"
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the caret-width pin below drives a REAL
+// literal through the tokenizer + parser rather than a hand-built span. See the
+// comment on `CaretWidthOverRealStringLiteralCoversTheClosingQuote`.
+#include "analysis/syntactic/parser.hpp"
+#include "core/types/grammar_schema.hpp"
+#include "core/types/tree.hpp"
+#include "tokenizer/token_stream.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <string>
+#include <utility>
 
 using namespace dss;
 
@@ -309,6 +319,141 @@ TEST(ReporterFormat, MultiCharSpanProducesMultiCaretUnderline) {
     auto out = r.format(r.all()[0], bufs);
     EXPECT_NE(out.find("^^^"), std::string::npos)
         << "3-byte span must render `^^^` not a lone `^`";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN — CARET WIDTH FROM A **REAL** LITERAL.
+//
+// ★ WHY THIS TEST EXISTS, AND WHY IT IS NOT LIKE ITS NEIGHBOURS.
+// Every other caret test in this file builds its span BY HAND
+// (`makeDiag(..., 4, 7, ...)`) and therefore tests only the renderer's
+// span → `^^^` loop. That is precisely how the delimiter defect survived: the
+// renderer was always correct, and the span handed to it was one byte short.
+// A suite that only ever feeds synthetic spans cannot observe a bug in how real
+// spans are PRODUCED, no matter how many caret cases it enumerates.
+//
+// So this one takes the span from the REAL pipeline — tokenizer → parser → CST
+// node span — and pins the user-visible symptom the whole cycle exists to fix:
+//
+//     int x = "abc";
+//             ^^^^^     5 columns, the whole literal
+//             ^^^^      4 columns was the BUG (the closing `"` had no token,
+//                       so the node span that joins the children stopped short)
+//
+// The chain each assertion covers: the tokenizer emits a `StringEnd` token for
+// the closing quote → `tree_builder` joins its children's spans into the
+// `stringLiteralExpr` node span → that node span reaches a diagnostic → the
+// reporter underlines it. A regression ANYWHERE on that chain shortens the
+// caret, and only an end-to-end pin can see it.
+//
+// RED-ON-DISABLE: revert the closer emit and the underline becomes `^^^^`.
+TEST(ReporterFormat, CaretWidthOverRealStringLiteralCoversTheClosingQuote) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    // Offsets: `int x = "abc";`
+    //           0123456789...   → the literal is [8,13): `"`, `abc`, `"`.
+    const std::string source = "int x = \"abc\";\n";
+    auto src = SourceBuffer::fromString(source, "<inline>");
+
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
+    ASSERT_NE(t.root(), InvalidNode);
+
+    // Locate the `stringLiteralExpr` NODE — the span a real diagnostic over the
+    // literal would carry.
+    const auto ruleId = t.schema().rules().find("stringLiteralExpr");
+    ASSERT_TRUE(ruleId.valid());
+    NodeId sle{};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == ruleId.v) {
+            sle = id;
+            break;
+        }
+    }
+    ASSERT_TRUE(sle.valid()) << "`\"abc\"` must parse to a stringLiteralExpr";
+
+    // ★ THE PIN. The node's span must cover all FIVE bytes of `"abc"`, not the
+    // four it covered while the closing quote had no token to contribute one.
+    const SourceSpan span = t.span(sle);
+    EXPECT_EQ(span.start(),  8u);
+    EXPECT_EQ(span.end(),   13u) << "the node span must include the closing `\"`";
+    EXPECT_EQ(span.length(), 5u)
+        << "a 5-byte literal must have a 5-byte node span — 4 is the "
+           "D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN defect";
+    EXPECT_EQ(source.substr(span.start(), span.length()), "\"abc\"")
+        << "the span must slice back to the COMPLETE literal, delimiters "
+           "included — this is the source-extent round-trip the anchor is about";
+
+    // ...and that span must render a 5-wide caret.
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    bufs.add(src);
+    auto d = makeDiag(DiagnosticCode::P_UnexpectedToken,
+                      DiagnosticSeverity::Error,
+                      src->id(),
+                      span.start(), span.end(), "\"abc\"");
+    r.report(d);
+    auto const out = r.format(r.all()[0], bufs);
+    EXPECT_NE(out.find("^^^^^"), std::string::npos)
+        << "a diagnostic over `\"abc\"` must underline 5 columns; the witnessed "
+           "symptom of this defect was a 4-wide caret under a 5-byte literal";
+    EXPECT_EQ(out.find("^^^^^^"), std::string::npos)
+        << "...and exactly 5 — a 6-wide caret would mean the span overshot the "
+           "literal";
+}
+
+// Same pin for the CHAR form (multi-FORM discipline): `'c'` rides a different
+// lexer mode and a different grammar rule, so the string pin above does not
+// cover it. 3 bytes → 3 carets; the pre-fix defect would render 2.
+TEST(ReporterFormat, CaretWidthOverRealCharLiteralCoversTheClosingQuote) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    // Offsets: `int x = 'c';` → the literal is [8,11).
+    const std::string source = "int x = 'c';\n";
+    auto src = SourceBuffer::fromString(source, "<inline>");
+
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
+    ASSERT_NE(t.root(), InvalidNode);
+
+    const auto ruleId = t.schema().rules().find("charLiteralExpr");
+    ASSERT_TRUE(ruleId.valid());
+    NodeId cle{};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == ruleId.v) {
+            cle = id;
+            break;
+        }
+    }
+    ASSERT_TRUE(cle.valid()) << "`'c'` must parse to a charLiteralExpr";
+
+    const SourceSpan span = t.span(cle);
+    EXPECT_EQ(span.length(), 3u)
+        << "a 3-byte char constant must have a 3-byte node span";
+    EXPECT_EQ(source.substr(span.start(), span.length()), "'c'");
+
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    bufs.add(src);
+    auto d = makeDiag(DiagnosticCode::P_UnexpectedToken,
+                      DiagnosticSeverity::Error,
+                      src->id(),
+                      span.start(), span.end(), "'c'");
+    r.report(d);
+    auto const out = r.format(r.all()[0], bufs);
+    EXPECT_NE(out.find("^^^"), std::string::npos)
+        << "a diagnostic over `'c'` must underline all 3 columns";
+    EXPECT_EQ(out.find("^^^^"), std::string::npos) << "...and exactly 3";
 }
 
 // Empty-span (start == end) renders a single caret rather than zero.

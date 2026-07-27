@@ -2291,6 +2291,111 @@ TEST(HirLoweringCSubset, GnuUnknownAttributeFileScopeStillFailsLoud) {
         << "an unknown GNU attribute must keep the loud typo-protection gate";
 }
 
+// ── TfC71 (D-HIR-ADJACENT-CONCAT-WALL-UNTESTED): the linkage-specifier
+//    argument's ADJACENT-STRING-CONCAT wall ─────────────────────────────────
+
+namespace {
+// The `.actual` text of the FIRST diagnostic carrying `c` (empty if none). The
+// adjacent-concat wall and the generic unrecognized-key fall-through share ONE
+// DiagnosticCode (H_UnknownLinkageSpecifier), so a count alone cannot tell them
+// apart — these pins discriminate on the message.
+[[nodiscard]] std::string firstMessageFor(DiagnosticReporter const& r,
+                                          DiagnosticCode c) {
+    for (auto const& d : r.all()) if (d.code == c) return d.actual;
+    return {};
+}
+} // namespace
+
+// NEGATIVE — C 5.1.1.2 phase 6 makes `visibility("a" "b")` grammatically valid,
+// but the composite pairing decodes exactly ONE string body into the
+// `<identifier>:<decoded-body>` facet key. The wall fires H_UnknownLinkageSpecifier
+// EXACTLY ONCE rather than reading the first piece and walking on.
+//
+// ★ WHY THIS IS THE ANTI-SILENT-DROP GUARD. Without the wall the scan keeps only
+// the FIRST piece and DROPS the rest. That is a WRONG-ATTRIBUTE MISCOMPILE, not a
+// crash — the program still builds and still links, just with the linkage facet
+// the source did not ask for — therefore it is invisible unless something pins it.
+// MEASURED against a wall-relaxed build (`if (false && k2 < toks.size() && …)`),
+// the drop lands in two DIFFERENT ways, so both are witnessed here:
+//   (1) `"hid" "den"` → first piece forms the key `visibility:hid`, which is NOT
+//       in `linkageSpecifiers`, so a relaxed build still errors — but from the
+//       generic fall-through arm ("'visibility:hid' is not a recognized linkage
+//       specifier"). The COUNT is 1 either way, so a count-only assertion stays
+//       GREEN on a relaxed wall. The message is pinned for exactly that reason.
+//   (2) `"hidden" "x"` → first piece forms `visibility:hidden`, which DOES
+//       resolve. A relaxed build compiles this CLEAN (zero diagnostics) and
+//       stamps Hidden visibility while silently discarding `"x"`. THIS is the
+//       real miscompile, and this is the witness whose count flips 1 → 0.
+TEST(HirLoweringCSubset, AdjacentStringConcatInLinkageArgFailsLoud) {
+    {   // (1) neither piece alone is a known key — the wall must still be the
+        //     REPORTER, not the downstream unrecognized-key fall-through.
+        SemanticModel model = analyzeCSubset(
+            "__attribute__((visibility(\"hid\" \"den\"))) int f(int v) "
+            "{ return v + 1; }\n"
+            "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << "test setup: adjacent concat parses + analyzes cleanly; the "
+               "rejection is at lowering, not at parse/semantic";
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        (void)res;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+            << "the concat wall must fire exactly once — one attribute, one wall";
+        EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
+                      .find("adjacent string concatenation"),
+                  std::string::npos)
+            << "must be the WALL's diagnostic, not the generic unrecognized-key "
+               "fall-through on the silently-truncated key 'visibility:hid'";
+    }
+    {   // (2) the FIRST piece is a known key — relax the wall and this compiles
+        //     clean with `"x"` silently dropped. The miscompile witness.
+        SemanticModel model = analyzeCSubset(
+            "__attribute__((visibility(\"hidden\" \"x\"))) int f(int v) "
+            "{ return v + 1; }\n"
+            "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        (void)res;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+            << "a resolvable FIRST piece must not let the trailing piece be "
+               "silently dropped — that is the wrong-attribute miscompile";
+        EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
+                      .find("adjacent string concatenation"),
+                  std::string::npos);
+    }
+}
+
+// POSITIVE — the ORDINARY single-string form `visibility("hidden")` still takes
+// the normal composite-key path: ZERO H_UnknownLinkageSpecifier *and* the
+// `visibility:hidden` facet actually RESOLVES onto the lowered Function's
+// linkage side-table entry (Hidden visibility, binding untouched at Global).
+//
+// ★ WHY THE RESOLVED EFFECT IS ASSERTED, NOT MERELY THE ABSENCE OF A DIAGNOSTIC.
+// A negative-only pin is satisfied by an implementation that rejects everything —
+// and by one that accepts everything and honors nothing. This is the pin that
+// stops the wall from being TIGHTENED into rejecting (or quietly ignoring) the
+// single-string form that every real header actually uses: the wall's skip-ahead
+// must see PAST the ignored `StringEnd` closer and find NO second opener here.
+TEST(HirLoweringCSubset, SingleStringLinkageArgResolvesHiddenVisibility) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((visibility(\"hidden\"))) int f(int v) { return v + 1; }\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "the single-string form is ordinary legal C — the wall must not widen";
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "a NON-default visibility must be recorded (the side-table is sparse: "
+           "an absent entry means Global/Default — i.e. the facet was DROPPED)";
+    EXPECT_EQ(res->linkageMap.get(f).visibility, SymbolVisibility::Hidden);
+    EXPECT_EQ(res->linkageMap.get(f).binding, SymbolBinding::Global);
+}
+
 // (The `static __attribute__((deprecated))` no-clobber pin — the co-present
 // `static` keeping its INTERNAL binding — lives at the MIR tier where the
 // binding is observable: MirLoweringCSubsetLinkage

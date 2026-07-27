@@ -33,11 +33,13 @@
 
   "syncTokens": ["EndStatement"],
 
+  "$closingDelimiterTokenComment": "D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: every `coalesce: true` body mode declares `defaultToken.closeToken` — the token KIND emitted for the mode's CLOSING delimiter. Both T-SQL string bodies close on `'`, so both name `StringEnd` (they already SHARE the `StringLiteral` body kind; only the OPENER — StringStart vs UnicodeStringStart — distinguishes the narrow and N'' forms, and that is what stringLitExpr / uniStringLitExpr branch on). Previously the closing `'` was consumed with NO token at all, leaving a source byte of the literal with no node in the CST. The closer MUST be a kind DISTINCT from `defaultToken.kind` — the loader rejects `closeToken == kind` fail-loud — because `decodeAdjacentStringBodies` (core/types/string_literal_decode.hpp, the shared body-decode chokepoint) selects its segments by FILTERING a node's children on the body kind: reuse `StringLiteral` for the closer and it matches that filter as an extra segment, so `'abc'` decodes to `abc'` — one byte too long, SILENTLY. Nothing catches it: the semantic tier sizes the literal from that same decode and the HIR tier lowers the same bytes through the same chokepoint, so both tiers agree on the wrong length and every cross-tier guard passes. Consequence for the GRAMMAR: stringLitExpr and uniStringLitExpr each gained the trailing `StringEnd` leaf. `bracket-id` is deliberately UNTOUCHED: it is NOT coalesced (one off-grammar `BracketIdChar` per codepoint), so no `closeToken` is required and none is declared. Be exact about what that does NOT mean: the `]` is still a TOKEN. The per-codepoint path consumes the closing delimiter and emits it like any other body codepoint, carrying the BODY kind — MEASURED, `[col name]` lexes as ten tokens: `BracketIdStart` + eight `BracketIdChar`s + a ninth `BracketIdChar` for the `]` (TsqlBracketIdScansToClosingBracket, tests/tokenizer/test_tokenizer.cpp, which asserts every token after the opener is a `BracketIdChar`). A closer carrying the body kind is exactly the anti-pattern the coalesced path forbids; it is harmless HERE only because `BracketIdChar` is off-grammar `EmptySpace`-class trivia no kind-filtering decoder reads, and because `nameAtom` spells only the `BracketIdStart` opener while bracketInnerText reads the `[…]` bytes off that opener's source span — neither depends on the `]`'s kind. What `bracket-id` lacks is a DISTINCT closer KIND, not a closer token.",
+
   "lexerModes": {
     "main":            { "tokens": "default" },
     "bracket-id":      { "defaultToken": { "kind": "BracketIdChar" } },
-    "single-string":   { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
-    "unicode-string":  { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
+    "single-string":   { "defaultToken": { "kind": "StringLiteral", "coalesce": true, "closeToken": "StringEnd" } },
+    "unicode-string":  { "defaultToken": { "kind": "StringLiteral", "coalesce": true, "closeToken": "StringEnd" } },
     "line-comment":    {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -135,6 +137,8 @@
     { "word": "VARCHAR","kind": "VarcharKw" },
     { "word": "BIT",    "kind": "BitKw"    }
   ],
+
+  "$stringLitCloserComment": "[relocated from inside `shapes` — a $-key placed THERE is interned as a RULE NAME by the loader and fails C_UnknownShape; only rule BODIES and the TOP LEVEL accept $-doc-keys] D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: both string expressions gained the trailing `StringEnd` leaf (the closing `'`, now a real token — see $closingDelimiterTokenComment). 2 children → 3 for each. The OPENER still discriminates the two forms (StringStart vs UnicodeStringStart) and the body is still located by KIND (hirLowering.stringLiteral.bodyToken = StringLiteral), never by child index, so no consumer's addressing shifts. T-SQL has NO adjacent-string concatenation (`'a' 'b'` is not one literal here — the c-subset `stringLiteralExpr` repeat has no analogue), so there is exactly ONE closer per expression and no repeat body to keep in sync.",
 
   "shapes": {
     "root": { "sequence": [ { "repeat": "statement" } ] },
@@ -280,8 +284,8 @@
       ]
     },
 
-    "stringLitExpr":    { "sequence": [ "StringStart",        "StringLiteral" ] },
-    "uniStringLitExpr": { "sequence": [ "UnicodeStringStart", "StringLiteral" ] },
+    "stringLitExpr":    { "sequence": [ "StringStart",        "StringLiteral", "StringEnd" ] },
+    "uniStringLitExpr": { "sequence": [ "UnicodeStringStart", "StringLiteral", "StringEnd" ] },
 
     "nameOrCall": {
       "alt": [ "callExpr", "qualifiedName" ],

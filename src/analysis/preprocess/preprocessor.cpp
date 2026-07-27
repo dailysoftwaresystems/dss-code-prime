@@ -2,6 +2,7 @@
 
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/include_path_resolve.hpp"
+#include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -129,6 +130,42 @@ std::vector<PPToken> tokenizeToPP(
         out.push_back(PPToken{t, buffer->slice(t.span)});
     }
     return out;
+}
+
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the source end offset of the coalesced
+// literal whose BODY token is `toks[bodyIdx]` — i.e. the offset PAST its close
+// delimiter (`"` for a quote include, `>` for an angle one).
+//
+// LOAD-BEARING, and the reason this is NOT just `body.span.end()`: the include
+// arms feed this offset to `copiedUpTo`, the point at which verbatim source
+// copying RESUMES after a spliced-away `#include`. Stop one byte short and the
+// closing delimiter is left in the emitted text, where a stray `"` pairs with
+// the NEXT quote in the file and swallows everything between — a SILENT
+// miscompile with no diagnostic anywhere. The literal's BODY span deliberately
+// did not change when the closer got its own token, so this offset must be read
+// off the CLOSER token; the closer's KIND comes from the schema (keyed on the
+// body token's own kind), never from the `"`/`>` byte.
+//
+// Falls back to the body end when the language declares no closer for this body
+// mode, or when the expected closer is absent. Absent means the literal was
+// UNTERMINATED (the tokenizer emits the body, then the closer only if it saw
+// one) — in which case the body swallowed the rest of the file, every caller's
+// resolve step fails loud on the garbage filename, and the main macro pass
+// re-reports the tokenizer's P_UnterminatedString that this pre-scan's throwaway
+// reporter discarded. So the fallback never produces a silent splice.
+[[nodiscard]] ByteOffset literalEndPastCloser(GrammarSchema const&        schema,
+                                              std::vector<PPToken> const& toks,
+                                              std::size_t                 bodyIdx) {
+    const ByteOffset bodyEnd = toks[bodyIdx].tok.span.end();
+    const SchemaTokenId closeKind =
+        closeTokenForCoalescedBody(schema, toks[bodyIdx].tok.schemaKind);
+    const std::size_t closeIdx = bodyIdx + 1;
+    if (closeKind.valid() && closeIdx < toks.size()
+        && toks[closeIdx].tok.schemaKind == closeKind
+        && toks[closeIdx].tok.span.start() == bodyEnd) {
+        return toks[closeIdx].tok.span.end();
+    }
+    return bodyEnd;
 }
 
 } // namespace
@@ -754,19 +791,23 @@ struct SynthBuilder {
             //
             // ★ Do NOT join token TEXTS: a PPToken is not always a self-contained
             // spelling. The tokenizer emits a coalesced literal as an OPENER
-            // token plus a BODY token and then consumes the closing delimiter
-            // with NO token at all (tokenizer.cpp), so `'A'` is the two texts `'`
-            // and `A` — joining them (with or without a separator) LOSES the
-            // closer and yields `' A`, which re-lexes to an unterminated literal.
-            // `#define NL '\n'` guarding a conditional include is ordinary C and
-            // would hard-error. Slicing the source range keeps every byte,
-            // including delimiters the token stream does not carry.
+            // token, a BODY token, and a CLOSER token
+            // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN gave the closing delimiter a
+            // token of its own; it previously had none), so `'A'` is the three
+            // texts `'`, `A`, `'` — joining them with a separator re-lexes as
+            // something else (`' A '`), and joining them bare only happens to
+            // round-trip for literals. `#define NL '\n'` guarding a conditional
+            // include is ordinary C. Slicing the source range keeps every byte in
+            // its original spacing, which no token-text join can promise.
             //
             // The range runs from the first significant replacement token to the
             // END of the directive line (the newline's start, or the last token's
-            // end when the line is unterminated). Taking the whole tail also
-            // captures a trailing closer; any trailing comment re-lexes to trivia
-            // and is dropped by `sbMintProduct`.
+            // end when the line is unterminated). Taking the whole line tail is
+            // what makes this site IDEMPOTENT across the closer-token change: it
+            // already covered the closing delimiter's bytes when they belonged to
+            // no token, and covers them still now that they belong to one. Any
+            // trailing comment re-lexes to trivia and is dropped by
+            // `sbMintProduct`.
             std::size_t firstStart = 0;
             std::size_t lineEnd    = 0;
             bool        haveFirst  = false;
@@ -1034,8 +1075,13 @@ struct SynthBuilder {
 
     void build(std::shared_ptr<SourceBuffer> const& source,
                std::string& out, LineMap& map) {
-        const char dquote     = '"';
-        const char angleClose = '>';   // the `<h>` closer (source-fallback drop)
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the `"` / `>` byte constants that
+        // used to sit here are GONE. Both include arms below used to re-consume
+        // the closing delimiter BYTE because it belonged to no token; the closer
+        // is a real token now, so the directive's end offset is read from that
+        // token's span and the engine never names a delimiter byte. Strictly more
+        // agnostic — a language whose string/header closer is not `"`/`>` now
+        // splices correctly too.
         const char newline    = '\n';
         if (depth > kMaxIncludeDepth) {
             emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
@@ -1434,13 +1480,13 @@ struct SynthBuilder {
                 if (angleRes.kind == AngleIncludeKind::Source
                     && includeResolvable()) {
                     const ByteOffset dStart = toks[i].tok.span.start();
-                    // Directive end: past the angle body, consuming the '>' closer if
-                    // it physically follows (mirrors the quote arm's closing-quote
-                    // consume). `toks[aBody]` spans the header name; '>' is next.
-                    ByteOffset dirEnd = toks[aBody].tok.span.end();
-                    if (dirEnd < spliced.size() && spliced[dirEnd] == angleClose) {
-                        ++dirEnd;
-                    }
+                    // Directive end: PAST the angle body's `>` closer, read off the
+                    // closer's own token (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN).
+                    // `toks[aBody]` spans only the header name — its span stops
+                    // BEFORE the `>`, so cutting there would leave the delimiter in
+                    // the output. Mirrors the quote arm below.
+                    const ByteOffset dirEnd =
+                        literalEndPastCloser(*schema, toks, aBody);
                     std::error_code ec;
                     fs::path canon = fs::weakly_canonical(angleRes.path, ec);
                     if (ec) canon = angleRes.path;
@@ -1533,10 +1579,12 @@ struct SynthBuilder {
                 && !isNewline(toks[bodyIdx].tok)
                 && toks[bodyIdx].tok.span.start() == toks[k].tok.span.end()) {
                 filename = std::string{toks[bodyIdx].text};
-                dirEnd   = toks[bodyIdx].tok.span.end();
+                // PAST the closing quote, read off the closer's own token
+                // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN). The body's span still
+                // stops BEFORE the `"` — deliberately, so `filename` stays
+                // quote-free — so this must not cut at the body end.
+                dirEnd = literalEndPastCloser(*schema, toks, bodyIdx);
             }
-            // Consume the closing quote char if it physically follows.
-            if (dirEnd < spliced.size() && spliced[dirEnd] == dquote) ++dirEnd;
 
             auto resolved = resolveQuote(filename, includingDir);
             if (!resolved) {
@@ -2092,59 +2140,22 @@ private:
             --last;
         }
         if (last <= first) return {};   // defensive: `first` is already non-trivia
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN (CLOSED): the join is CORRECT BY
+        // CONSTRUCTION now, and the `"`/`'`/`>` byte re-consume that used to sit
+        // here is DELETED. `last - 1` is the last NON-TRIVIA token on the line, and
+        // a literal's close delimiter is a significant token of its own, so when
+        // the operand ends in a literal the join already ends PAST the delimiter.
+        // Previously the closer belonged to no token at all and
+        // `#warning "Unsupported compiler detected"` (sys/cdefs.h:81, the shape
+        // that motivated `#warning`) reported one byte short, violating C23
+        // 6.10.5p1/6.10.6's "include the pp-tokens" on the case that matters most;
+        // `#error please include <stdio.h>` lost its `>` the same way, because the
+        // word `include` arms the tokenizer's header-context. Both are now whole
+        // without the engine ever naming a delimiter byte — strictly more agnostic
+        // than the guard it replaces, which only knew C's three delimiters.
         SourceSpan const joined =
             SourceSpan::join(in[first].span, in[last - 1].span);
-        // ★ CLOSING STRING DELIMITER: re-consume it if it physically follows.
-        // The tokenizer splits a literal into a StringStart token holding ONLY
-        // the opening quote plus a COALESCED BODY token covering the raw bytes
-        // BETWEEN the quotes — the closing quote belongs to NO token's span (see
-        // the quote-include path above, which solves this identically at its
-        // `spliced[dirEnd] == dquote` step). So joining first..last stops one
-        // byte short whenever the operand ENDS in a literal, and only then:
-        // `#warning "abc" tail` is already correct because the join ends on
-        // `tail`. That made the bug invisible to every bare-prose test — and
-        // `#warning "Unsupported compiler detected"` (sys/cdefs.h:81, the exact
-        // shape that motivated this feature) is the broken form, so C23
-        // 6.10.5p1/6.10.6's "include the pp-tokens" was being violated on the
-        // one case that matters most.
-        //
-        // ★ `>` IS INCLUDED, and it is not hypothetical: when the word
-        // `include` appears earlier on the line it arms the tokenizer's
-        // header-context, so `#error please include <stdio.h>` lexes as
-        // HeaderStart + a coalesced HeaderPath with the SAME token-less close —
-        // and reported `<stdio.h` until this byte was added. Same shortfall,
-        // third delimiter.
-        //
-        // Guarded on the byte ACTUALLY being one of the three, so it can never
-        // over-consume. A closing delimiter that DOES belong to a token (an
-        // ordinary `>` operator, e.g. `#error a > b`) leaves `joined.end()`
-        // pointing past it at trivia, so the guard declines. It is also
-        // idempotent-safe against a future tokenizer that covers the closer
-        // itself: `last` is by construction the last NON-TRIVIA token, so every
-        // byte between `joined.end()` and the newline is trivia, and trivia
-        // never begins with one of these — the guard would simply stop firing.
-        //
-        // NOT a correctness guard for UNTERMINATED literals: `#error abc"` runs
-        // the literal to EOF and the tokenizer already fails loud with
-        // `P_UnterminatedString` (P0010, "EOF inside lexer mode 'string'").
-        // This only shapes the message text in a program that is being
-        // rejected anyway.
-        //
-        // The one-byte shortfall this compensates for is the CONSUMER-side
-        // symptom of a tokenizer-wide behaviour — the closer belongs to no
-        // token at all — tracked as D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN.
-        // Two other consumers compensate or suffer identically (the
-        // quote-include path just below, and `tree_builder`'s span join, whose
-        // short spans give `S0003` a caret one byte narrow). When that anchor
-        // closes, DELETE this block rather than leaving a third copy.
-        ByteOffset endWithDelim = joined.end();
-        std::string_view const tail =
-            synth_->slice(endWithDelim, endWithDelim + 1);
-        if (tail.size() == 1
-            && (tail[0] == '"' || tail[0] == '\'' || tail[0] == '>')) {
-            ++endWithDelim;
-        }
-        return synth_->slice(SourceSpan::of(joined.start(), endWithDelim));
+        return synth_->slice(joined);
     }
     bool isHash(Token const& t) const {
         return hashKind_.valid() && t.schemaKind == hashKind_;
@@ -2183,6 +2194,26 @@ private:
         while (p < in.size() && !isNewline(in[p])) ++p;
         if (p < in.size()) ++p;
         return p;
+    }
+    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: `bodyIdx` indexes a coalesced literal
+    // BODY token; return the index just past it AND past the CLOSE-delimiter token
+    // that now follows. Every directive handler that reads a quoted operand used
+    // to step `body + 1` straight onto whatever came next, because the closing
+    // delimiter belonged to no token; that step now lands ON the closer, which is
+    // a SIGNIFICANT token (deliberately un-flagged so a shape can name the slot)
+    // and therefore reads as trailing junk to the strict "nothing may follow"
+    // checks. The closer KIND is resolved from the schema through the body token's
+    // own kind — the engine never spells `"StringEnd"`. Tolerant of a language
+    // that declares no closer: the index then just steps past the body.
+    [[nodiscard]] std::size_t pastBodyAndCloser(std::vector<Token> const& in,
+                                                std::size_t bodyIdx) const {
+        const SchemaTokenId closeKind =
+            closeTokenForCoalescedBody(*schema_, in[bodyIdx].schemaKind);
+        std::size_t n = bodyIdx + 1;
+        if (closeKind.valid() && n < in.size() && in[n].schemaKind == closeKind) {
+            ++n;
+        }
+        return n;
     }
     std::size_t handleDirective(std::vector<Token> const& in, std::size_t start,
                                 std::vector<Token>& body) {
@@ -2655,16 +2686,17 @@ private:
         // The quote opener consumed only the opening `"`; the coalesced string
         // BODY is the ADJACENT next token, its raw text the filename (escapes NOT
         // decoded, like the include resolver). An empty body (`#embed ""`) leaves
-        // the filename empty -> loud below. The closing `"` byte is absorbed into
-        // the StringLiteral (coalesce:true) and produces NO token (the working
-        // `__has_include("h")` / SynthBuilder precedent), so it can't be mistaken
-        // for a trailing parameter.
+        // the filename empty -> loud below. The closing `"` is its OWN token
+        // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), so `after` must step past BOTH
+        // the body and the closer — otherwise the parameter wall right below sees
+        // the delimiter and reports `parameter '"' is not supported`, rejecting
+        // every well-formed `#embed "res.bin"`.
         std::string filename;
         std::size_t after = p + 1;   // token index just past the filename body
         if (after < end && !isTrivia(in[after]) && !isNewline(in[after])
             && in[after].span.start() == in[p].span.end()) {
             filename = std::string{text(in[after])};
-            ++after;
+            after    = pastBodyAndCloser(in, after);
         }
         if (filename.empty()) {
             emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
@@ -3001,19 +3033,24 @@ private:
         // OPTIONAL "file" operand (6.10.4p3): absent => presumed name UNCHANGED.
         std::size_t const q = skipTrivia(in, p + 1);
         if (q < end && !isNewline(in[q])) {
-            // A quoted operand is TWO tokens, exactly as `#include`/`#embed` see
+            // A quoted operand is THREE tokens, exactly as `#include`/`#embed` see
             // it: the OPENER (config kind `quoteIncludeToken`, which consumed only
-            // the `"`) followed by the coalesced BODY token whose text is the raw
-            // bytes between the quotes. Keying on the CONFIG kind + position keeps
-            // this agnostic — never a hard-coded `"` scan of one token's text.
+            // the `"`), the coalesced BODY token whose text is the raw bytes
+            // between the quotes, and the CLOSER
+            // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN). Keying on the CONFIG kinds +
+            // position keeps this agnostic — never a hard-coded `"` scan of one
+            // token's text.
             if (quoteIncludeKind_.valid() && in[q].schemaKind == quoteIncludeKind_
                 && q + 1 < end && !isNewline(in[q + 1])) {
                 rec.file    = std::string{text(in[q + 1])};
                 rec.hasFile = true;
                 // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
                 // ignoring tokens after the operand would let an unsupported
-                // form be half-honoured (`#line 5 "f" <anything>`).
-                std::size_t const t = skipTrivia(in, q + 2);
+                // form be half-honoured (`#line 5 "f" <anything>`). The scan
+                // starts past the CLOSER, not at `q + 2` — the closing `"` is a
+                // real token now and would otherwise BE the reported junk,
+                // rejecting every well-formed `#line 100 "f.c"`.
+                std::size_t const t = skipTrivia(in, pastBodyAndCloser(in, q + 1));
                 if (t < end && !isNewline(in[t])) {
                     emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
                            synth_->id(), in[t].span,
@@ -3453,10 +3490,12 @@ private:
     // (the chars of a string/char literal -- in valid C those characters appear
     // ONLY inside such a literal, so escaping every occurrence is exact). The
     // result is wrapped in `"..."`, appended to `productText_` (A2), and
-    // RE-TOKENIZED so the product is a real StringStart + StringLiteral pair
-    // (a single fabricated token would not satisfy the grammar's
-    // `stringLiteralExpr = StringStart StringLiteral`) whose spans point at the
-    // appended region. Each product token is stamped with `hs`.
+    // RE-TOKENIZED so the product is a real opener + body + CLOSER token run (a
+    // single fabricated token would not satisfy the grammar's `stringLiteralExpr`,
+    // which since D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN names all three slots)
+    // whose spans point at the appended region. `materializeSignificant` filters
+    // only trivia/newline/Eof, so the closer survives into the product. Each
+    // product token is stamped with `hs`.
     void stringizeArg(std::vector<ExpToken> const& raw, HideSet const& hs,
                       ByteOffset invOffset, std::vector<ExpToken>& out) {
         std::string inner = "\"";
@@ -3464,15 +3503,16 @@ private:
             // The raw operand's tokens are un-pre-expanded args from the CALL
             // site, so they are contiguous in the prefix buffer: one slice
             // recovers the exact source spelling (incl. interior string quotes
-            // and whitespace). The CLOSING delimiter of a string/char literal
-            // that ENDS the argument was consumed by the tokenizer (no token
-            // covers it), so extend the slice by one byte when it is a `"`/`'`.
+            // and whitespace).
+            //
+            // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN (CLOSED): the one-byte `"`/`'`
+            // re-consume that used to sit here is DELETED. A literal's close
+            // delimiter is its own token now, so when the argument ENDS in a
+            // literal `raw.back()` IS that closer and the slice already covers it.
+            // Keeping the byte probe would DOUBLE-count the delimiter and stringize
+            // `F("a")` as `"\"a\"\""`.
             const ByteOffset s = raw.front().tok.span.start();
-            ByteOffset e = raw.back().tok.span.end();
-            if (e < prefixLen_) {
-                const std::string_view tail = synth_->slice(e, e + 1);
-                if (tail.size() == 1 && (tail[0] == '"' || tail[0] == '\'')) ++e;
-            }
+            const ByteOffset e = raw.back().tok.span.end();
             appendStringized(synth_->slice(s, e), inner);
         }
         inner.push_back('"');

@@ -1657,34 +1657,59 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
 // FC15a (`#`/`##` operators -- C 6.10.3.2 stringize, 6.10.3.3 token-paste).
 //
 // A stringize product (`#x` -> `"..."`) is, by GRAMMAR REALITY, the string
-// literal's StringStart + StringLiteral pair (`stringLiteralExpr = StringStart
-// StringLiteral`), NOT a single fabricated token -- so `ppLexemes` yields TWO
-// entries for it: the opening `"` (StringStart) then the body (StringLiteral,
-// whose span excludes the consumed closing `"`). `reconstructStringLiteral`
-// joins them back into the full `"..."` for readable assertions. A paste product
-// (`a##b` -> `ab`) is exactly ONE token (F1) and yields ONE lexeme.
+// literal's token TRIPLE (`stringLiteralExpr = StringStart StringLiteral
+// StringEnd`), NOT a single fabricated token -- so `ppLexemes` yields THREE
+// entries for it: the opening `"` (StringStart), the body (StringLiteral, whose
+// span covers only the bytes BETWEEN the delimiters), and the closing `"`
+// (StringEnd). `reconstructStringLiteral` joins them back into the full `"..."`
+// for readable assertions. A paste product (`a##b` -> `ab`) is exactly ONE token
+// (F1) and yields ONE lexeme.
 // Every assertion is RED-ON-DISABLE: without the `#` handling `#x` emits the
 // literal `#` token (lexs[0]=="#" not "\""); without the `##` handling `a##b`
 // emits three tokens (`a`, `##`, `b`) instead of the single `ab`.
+//
+// ★ RENEGOTIATED -- D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. This block used to say
+// the pair was TWO entries and that the body's span "excludes the CONSUMED
+// closing `\"`". The closer is no longer consumed token-lessly; it is a
+// `StringEnd` token of its own, so every stringize/predefined-macro lexeme count
+// in this file went UP BY ONE PER STRING PRODUCT. The BODY lexeme is byte-for-
+// byte unchanged, which is why no `decodeStringLiteralBody` expectation moved.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Join a StringStart (`"`) + StringLiteral (body, no closing quote) pair from the
-// pp lexemes at index `i` back into the full source-form literal `"...body..."`.
+// Join the StringStart (`"`) + StringLiteral (body) + StringEnd (`"`) TRIPLE
+// starting at pp-lexeme index `i` back into the full source-form literal.
+//
+// ★ D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: this used to be
+//     `lexs[i] + lexs[i + 1] + "\""`
+// -- the trailing quote was a HAND-WRITTEN CONSTANT, because the closer had no
+// token to read it from. That made this helper one more instance of the
+// compensate-at-the-consumer pattern the anchor is about, and it also made the
+// assertions WEAKER than they looked: a corrupted or missing closer could never
+// fail them, since the closing quote came from this line rather than from the
+// token stream. It now READS the closer, so `reconstructStringLiteral` is a real
+// round-trip check on all three tokens.
 [[nodiscard]] std::string reconstructStringLiteral(
     std::vector<std::string> const& lexs, std::size_t i) {
-    if (i + 1 >= lexs.size()) return "<malformed-string-product>";
-    return lexs[i] + lexs[i + 1] + "\"";   // StringStart + body + implied close
+    if (i + 2 >= lexs.size()) return "<malformed-string-product>";
+    return lexs[i] + lexs[i + 1] + lexs[i + 2];   // opener + body + closer
 }
 
 TEST(Preprocessor, FC15aStringizeSimple) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define STR(x) #x\nSTR(hello)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    // The product `"hello"` is StringStart `"` + StringLiteral `hello`.
-    ASSERT_EQ(lexs.size(), 2u) << "expected the string-literal pair: \" hello";
+    // The product `"hello"` is StringStart `"` + StringLiteral `hello` +
+    // StringEnd `"`.
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `"` of the
+    // stringize product is now its own token. The stringize BODY is unchanged --
+    // what the `#` operator produces did not change, only how many tokens the
+    // literal is spelled with.
+    ASSERT_EQ(lexs.size(), 3u)
+        << "expected the string-literal triple: \" hello \"";
     EXPECT_EQ(lexs[0], "\"") << "stringize must produce a string-literal opener "
                                 "(red-on-disable: a literal `#` here)";
     EXPECT_EQ(lexs[1], "hello");
+    EXPECT_EQ(lexs[2], "\"") << "the closing `\"` is a token of its own";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"hello\"");
 }
 
@@ -1694,9 +1719,14 @@ TEST(Preprocessor, FC15aStringizeEscapes) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define STR(x) #x\nSTR(a \"b\\c\")\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the product's closing `"`
+    // is its own token. The ESCAPING under test is untouched -- note the body
+    // expectation below is byte-identical to before, which is the proof that
+    // giving the closer a token did not disturb the escape logic.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(lexs[0], "\"");
-    // Body (StringStart consumed the opening `"`, the close `"` is consumed):
+    // Body (StringStart is the opening `"`, StringEnd the closing one; the body
+    // token covers only what is BETWEEN them):
     //   a <space> \ " b \ \ c \ "   (the escaped inner text).
     EXPECT_EQ(lexs[1], "a \\\"b\\\\c\\\"")
         << "interior `\"` and `\\` of the string arg must be backslash-escaped";
@@ -1713,7 +1743,8 @@ TEST(Preprocessor, FC15aStringizeUsesUnexpandedArg) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define X hello\n#define STR(x) #x\nSTR(X)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + closer.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(lexs[1], "X")
         << "stringize uses the RAW arg `X`, not its expansion `hello`";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"X\"");
@@ -1778,7 +1809,8 @@ TEST(Preprocessor, FC15aStringizeVaArgs) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define S(...) #__VA_ARGS__\nS(a,b)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + closer.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a,b\"")
         << "#__VA_ARGS__ stringizes the raw comma-joined trailing args";
 }
@@ -1872,12 +1904,16 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
         r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "the directive `#define` must be consumed, not treated as a stringize";
-    // Output: "a" (StringStart+body)  then  int after ;
-    ASSERT_EQ(lexs.size(), 5u) << "expected: \" a int after ;";
+    // Output: "a" (StringStart + body + StringEnd)  then  int after ;
+    // ★ 5 -> 6 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): ONE extra lexeme, the
+    // stringize product's closing `"`. The trailing `int after ;` shifts by one
+    // index for the same reason -- the non-contamination property under test is
+    // unaffected, only the literal's spelling widened.
+    ASSERT_EQ(lexs.size(), 6u) << "expected: \" a \" int after ;";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a\"");
-    EXPECT_EQ(lexs[2], "int");
-    EXPECT_EQ(lexs[3], "after");
-    EXPECT_EQ(lexs[4], ";");
+    EXPECT_EQ(lexs[3], "int");
+    EXPECT_EQ(lexs[4], "after");
+    EXPECT_EQ(lexs[5], ";");
     // The directive-introducing `#` never leaked a stringize diagnostic.
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize));
 }
@@ -2148,13 +2184,19 @@ TEST(Preprocessor, FC15bStdcVersionInIfExpression) {
 // The `file` kind (C 6.10.8.1): `__FILE__` materializes the current source file
 // name as a C string literal. The buffer is named "main.c" by ppLexemes, so the
 // product decodes to "main.c". A string-literal product is a StringStart +
-// StringLiteral pair (like a stringize product), so we reconstruct it.
+// StringLiteral + StringEnd triple (like a stringize product), so we
+// reconstruct it.
 TEST(Preprocessor, FC15bFileResolvesToSourceName) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* f = __FILE__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    // const char * f = " main.c ;   -> the string product is lexs[5]+lexs[6].
-    ASSERT_EQ(lexs.size(), 8u) << "const char * f = <str-start> <str-body> ;";
+    // const char * f = " main.c " ;  -> the string product is lexs[5..7].
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the materialized literal
+    // now carries its closing `"` as a token. `__FILE__`'s VALUE is unchanged --
+    // the reconstruction below still reads "main.c", which is what this test is
+    // actually about.
+    ASSERT_EQ(lexs.size(), 9u)
+        << "const char * f = <str-start> <str-body> <str-end> ;";
     EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
         << "__FILE__ materializes the source file name as a string literal";
 }
@@ -2224,8 +2266,14 @@ TEST(Preprocessor, FC15bDateShapeOnly) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* d = __DATE__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `"` is a
+    // token. The BODY index (6) and the 11-char shape below are UNCHANGED --
+    // the closer was split off the body, not folded into it, so the decoded
+    // `"Mmm dd yyyy"` is still exactly 11 chars. If it ever reads 12, the
+    // delimiter leaked into the body.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(lexs[5], "\"") << "__DATE__ is a string-literal product";
+    EXPECT_EQ(lexs[7], "\"") << "...terminated by its own closer token";
     auto decoded = decodeStringLiteralBody(lexs[6]);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), 11u)
@@ -2242,8 +2290,11 @@ TEST(Preprocessor, FC15bTimeShapeOnly) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* t = __TIME__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), as for __DATE__. The
+    // 8-char decoded shape is unchanged; a 9 would mean the closer leaked in.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(lexs[5], "\"") << "__TIME__ is a string-literal product";
+    EXPECT_EQ(lexs[7], "\"") << "...terminated by its own closer token";
     auto decoded = decodeStringLiteralBody(lexs[6]);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), 8u)
@@ -2277,7 +2328,9 @@ TEST(Preprocessor, FC15bUndefOfPredefinedFailsLoud) {
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
         << "#undef of a predefined macro name must fail loud";
     // __FILE__ still materializes (the #undef was rejected, not applied).
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the materialized literal
+    // carries its closer token. The fail-loud property under test is unaffected.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
         << "the rejected #undef must NOT remove the predefined macro";
 }
@@ -3454,15 +3507,34 @@ TEST(Preprocessor, Tf60GateDefinedInParentSourceMakesChildIncludeLive) {
 }
 
 // TF-C60 code-audit BLOCKER 1: a macro whose replacement is a CHARACTER LITERAL
-// must survive into the pre-scan's guard evaluation. The tokenizer emits a
-// coalesced literal as OPENER + BODY and consumes the closing delimiter with NO
-// token, so building the stored replacement by joining token TEXTS loses the
-// closer (`'A'` → `' A`), which re-lexes to an unterminated literal → the guard
-// becomes unevaluable → the (d) arm turns it into a HARD ERROR on valid C.
+// must survive into the pre-scan's guard evaluation. The tokenizer USED TO emit
+// a coalesced literal as OPENER + BODY and consume the closing delimiter with NO
+// token, so building the stored replacement by joining token TEXTS lost the
+// closer (`'A'` → `' A`), which re-lexed to an unterminated literal → the guard
+// became unevaluable → the (d) arm turned it into a HARD ERROR on valid C.
+// (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN has since given the closer its own
+// `CharEnd` token. This test stayed GREEN through that change and is kept: it
+// pins the OBSERVABLE contract — a char-literal macro replacement survives
+// guard evaluation — which must hold regardless of how the replacement is
+// captured.)
 // `#define NEWLINE '\n'` guarding a conditional include is ordinary C.
-// RED-ON-DISABLE: revert `sbTrackDefine` to joining `toks[q].text` and this
-// errors (P_PreprocessorIncludeError) while every `#define GATE 1`-shaped test
-// stays green — the coverage hole the audit found.
+//
+// RED-ON-DISABLE, RE-AIMED AND MEASURED: replace `sbTrackDefine`'s source
+// SLICE with a WHITESPACE-SEPARATED join of `toks[q].text` and this errors
+// while every `#define GATE 1`-shaped test stays green — the coverage hole the
+// audit found. Verified: the stored replacement becomes `' \n '` (the
+// separators land INSIDE the literal), a multi-char char constant, so the guard
+// is unevaluable and the (d) arm hard-errors on valid C — `hasErrors()` true
+// and `inner.h` never splices.
+//
+// ★ The BARE join (`joined += toks[q].text`, the pre-TF-C60 shape the earlier
+// version of this note named) no longer reddens it — MEASURED GREEN. Now that
+// the closer carries its own `CharEnd` token, a bare join happens to
+// reassemble `'\n'` byte-for-byte. That is exactly why the instruction is
+// aimed at the SEPARATOR instead: it targets the property the slice actually
+// buys — every replacement byte in its ORIGINAL spacing — which no token-text
+// join can promise, rather than a token-count accident that the closer-token
+// work already changed once.
 TEST(Preprocessor, Tf60CharLiteralMacroReplacementSurvivesGuardEval) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path() / "dss_tf60_charlit";
@@ -4446,9 +4518,12 @@ TEST(Preprocessor, ProductSpansSurviveAcrossFlush) {
         r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
     // A stringize product is tokenized as a string-literal opener `"` + a BODY
-    // token (+ implied close) -- see reconstructStringLiteral above -- so we check
+    // token + a closing `"` -- see reconstructStringLiteral above -- so we check
     // the distinctive product BODIES (which slice from productText_; an invalid
     // multi-flush span would yield an empty/garbage lexeme, not the exact body).
+    // This test is count-free by construction, so D-TOK-CLOSING-DELIMITER-HAS-NO-
+    // TOKEN left it GREEN; only the wording above needed the correction (the
+    // close is no longer "implied", it is a real token).
     auto has = [&](std::string_view s) {
         for (auto const& l : lexs) if (l == s) return true;
         return false;
@@ -5733,11 +5808,11 @@ TEST(Preprocessor, TfC70ErrorDirectiveOperandIsNotMacroExpanded) {
 }
 
 // OPERAND FORMS the bare-prose tests above do NOT reach. C23 6.10.5p1/6.10.6
-// require the pp-tokens VERBATIM, and the tokenizer makes a trailing STRING
-// LITERAL a special case: it splits a literal into a StringStart token holding
-// only the opening quote plus a coalesced BODY token covering the bytes BETWEEN
-// the quotes, so the CLOSING quote belongs to no token's span and a naive
-// first..last span join stops one byte short.
+// require the pp-tokens VERBATIM, and a trailing LITERAL used to be a special
+// case: the tokenizer split a literal into a StringStart token holding only the
+// opening quote plus a coalesced BODY token covering the bytes BETWEEN the
+// quotes, so the CLOSING quote belonged to no token's span and a naive
+// first..last span join stopped one byte short.
 //
 // ★ WHY THIS TEST EXISTS AT ALL: every other TfC70 operand test uses bare prose,
 // and bare prose is exactly the form that does NOT expose the bug — as does
@@ -5747,10 +5822,33 @@ TEST(Preprocessor, TfC70ErrorDirectiveOperandIsNotMacroExpanded) {
 // truncated `"Unsupported compiler detected` with no closing quote. A
 // multi-FORM contract needs a test per form, not per site.
 //
-// RED-ON-DISABLE: delete the closing-delimiter re-consume in
-// `directiveOperandText` (the `tail[0] == '"'` guard) -> (A) and (B) red.
-// The negative cases (C)/(D) guard the OTHER direction: the re-consume must be
-// byte-guarded so it can never swallow a character that is not a delimiter.
+// ★ RENEGOTIATED — D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. This test stayed GREEN
+// across the anchor's fix, but its RED-ON-DISABLE instruction went stale and had
+// to be rewritten rather than left to rot. It used to read:
+//
+//     "delete the closing-delimiter re-consume in `directiveOperandText`
+//      (the `tail[0] == '\"'` guard) -> (A) and (B) red."
+//
+// That guard NO LONGER EXISTS. It was one of the four hand-compensations the
+// anchor catalogued, and closing the anchor at the ROOT deleted it: the closing
+// delimiter is now a token of its own, so `last - 1` (the line's last
+// non-trivia token) IS the closer and the span join reaches it BY CONSTRUCTION.
+// An instruction to disable deleted code cannot be followed, and a
+// RED-ON-DISABLE note that cannot be followed is worse than none — it reads as
+// verified when nothing is verifying it.
+//
+// WHAT THIS TEST GUARDS NOW: that the operand text still reaches the closing
+// delimiter, whatever mechanism supplies it. It is no longer a pin on a guard;
+// it is a pin on the OBSERVABLE CONTRACT (C23 6.10.5p1/6.10.6), which is the
+// more durable thing to assert and is why the test survived the mechanism
+// change unedited. RED-ON-DISABLE today: revert the tokenizer's closer emit —
+// the closer stops being a token, `last - 1` falls back to the body, and (A),
+// (B) and (C) all go red together. Note that is strictly BROADER coverage than
+// before: one revert now fails all three delimiter forms, where the old guard
+// had to be disabled per-byte.
+//
+// The negative cases (D)/(E) guard the OTHER direction — that nothing appends a
+// phantom byte past the operand — and (F) guards the trailing-trivia policy.
 TEST(Preprocessor, TfC70OperandKeepsClosingStringDelimiter) {
     auto msgOf = [](char const* src) {
         PreprocessResult r;
@@ -5767,31 +5865,39 @@ TEST(Preprocessor, TfC70OperandKeepsClosingStringDelimiter) {
     EXPECT_NE(msgOf("#warning 'q'\n").find("'q'"), std::string::npos);
     // (C) ANGLE delimiter — the THIRD form, and not hypothetical: the word
     // `include` earlier on the line arms the tokenizer's header-context, so the
-    // path lexes as HeaderStart + coalesced HeaderPath with the same token-less
-    // close. Reported `<stdio.h` before `>` was added to the guard.
+    // path lexes as HeaderStart + coalesced HeaderPath, which had the same
+    // token-less close. Reported `<stdio.h` before the fix; the `>` is now a
+    // `HeaderEnd` token and the span join reaches it like any other token.
     EXPECT_NE(msgOf("#warning please include <stdio.h>\n").find("<stdio.h>"),
               std::string::npos)
         << "the header-path close `>` is part of the pp-tokens too";
-    // (D) NEGATIVE: a delimiter that DOES belong to a token must not be
-    // doubled. `a > b` ends on `b`, so the guard has nothing to extend.
+    // (D) NEGATIVE: the span join must stop exactly at the last non-trivia
+    // token. `a > b` ends on `b`, and this `>` is an ordinary operator, not a
+    // header-path closer — nothing may append a phantom `>` past the operand.
+    // (This used to read "the guard has nothing to extend", naming the
+    // `tail[0] == '"'` re-consume in `directiveOperandText`. That guard is
+    // DELETED — see the RENEGOTIATED note above. The assertion is unchanged
+    // because it always pinned the OBSERVABLE, not the mechanism.)
     {
         std::string const m = msgOf("#warning use a > b\n");
         EXPECT_NE(m.find("use a > b"), std::string::npos) << m;
         EXPECT_EQ(m.find("b>"), std::string::npos)
-            << "the re-consume must not append a phantom byte; got: " << m;
+            << "nothing may append a phantom byte past the operand; got: " << m;
     }
-    // (E) NEGATIVE: an UNTERMINATED literal. The guard must not double the
-    // quote. NOTE this program is rejected anyway — the tokenizer fails loud
-    // with P0010 `EOF inside lexer mode 'string'` — so this pins message shape
-    // only, not acceptance. (An earlier comment here claimed the stray quote
-    // "ends on a StringStart whose own span covers it"; that was wrong, and
-    // measuring it is what corrected the record.)
+    // (E) NEGATIVE: an UNTERMINATED literal. The stray quote must be reported
+    // exactly once, never doubled. NOTE this program is rejected anyway — the
+    // tokenizer fails loud with P0010 `EOF inside lexer mode 'string'` — so this
+    // pins message shape only, not acceptance. (TWO earlier claims here have now
+    // been corrected by measurement: that the stray quote "ends on a StringStart
+    // whose own span covers it", and that a "delimiter re-consume" is what must
+    // not double it — that re-consume no longer exists. What survives both
+    // corrections is the observable: no doubled delimiter byte.)
     {
         std::string const m = msgOf("#warning abc\"\n");
         EXPECT_EQ(m.find("abc\"\""), std::string::npos)
-            << "the delimiter re-consume must not double up; got: " << m;
+            << "the closing delimiter must appear exactly once; got: " << m;
     }
-    // (D) NEGATIVE: the trailing-trivia policy still wins — a trailing comment
+    // (F) NEGATIVE: the trailing-trivia policy still wins — a trailing comment
     // is one space in phase 3, long before phase-4 directive execution, so it
     // is never part of the pp-tokens.
     {
