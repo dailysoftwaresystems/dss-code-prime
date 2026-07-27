@@ -229,6 +229,32 @@ function ToWslPath($p) {
 }
 
 # ── Step 1 — host is Windows + WSL + online ──────────────────────────────────
+# ── Step 0 — SELF-TEST the driver's own late-stage logic ─────────────────────
+# >>> dss:selftest >>>
+# Mirrors build-and-test.sh. The classifier runs at the very END of a run, so a
+# defect there is invisible until the build and the whole corpus have already been
+# paid for — a top-level `local` in the .sh classifier aborted a COMPLETED 13-hour
+# arm64 run at exactly that point (D-HARNESS-TEST-SCOPE-FIDELITY). Syntax checks
+# cannot catch that class; only executing the code can.
+# So the driver REFUSES TO START if its own end-of-run logic is broken. This reuses
+# test-confound-scope.ps1, which EXTRACTS the shipped classifier and runs it — no
+# duplicated logic to drift. Set DSS_SKIP_SELFTEST=1 to bypass (not recommended).
+$selfTest = Join-Path $PSScriptRoot 'test-confound-scope.ps1'
+if ($env:DSS_SKIP_SELFTEST -eq '1') {
+  Warn 'driver self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run.'
+} elseif (-not (Test-Path $selfTest)) {
+  Die "driver self-test missing: $selfTest`n      This guard is what stops a defect in the END-OF-RUN classifier from costing you the entire run."
+} else {
+  $stOut = & pwsh -NoProfile -File $selfTest 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    $stOut | ForEach-Object { "      $_" } | Write-Host
+    Die "DRIVER SELF-TEST FAILED — refusing to start.`n      The end-of-run classifier is broken, so this run would execute the whole corpus (hours) and then abort while classifying."
+  }
+  $n = ($stOut | Select-String -Pattern '^passed=(\d+)').Matches.Groups[1].Value
+  Info "driver self-test: OK ($n assertions)"
+}
+# <<< dss:selftest <<<
+
 Step '1/9  Host check (Windows + WSL, online)'
 if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) {
   Die "this harness targets Windows (the pe64 leg); use build-and-test.sh on Linux/WSL/macOS."

@@ -411,6 +411,46 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
   info "  at $(git -C "$dir" rev-parse --short HEAD) on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
 }
 
+# ── Step 0 — SELF-TEST the driver's own late-stage logic ─────────────────────
+# >>> dss:selftest >>>
+# WHY THIS EXISTS, AND WHY IT RUNS BEFORE ANYTHING EXPENSIVE.
+# The classifier runs at the very END of a run — after the build and after hours
+# of corpus. A defect there is invisible until everything else has already been
+# paid for. That is not hypothetical: a top-level `local` in the classifier aborted
+# a COMPLETED 13-hour arm64 run at the classification step, with the whole corpus
+# already executed (D-HARNESS-TEST-SCOPE-FIDELITY). `bash -n` cannot catch it —
+# a top-level `local` is syntactically valid and only fails at runtime.
+#
+# So the driver now REFUSES TO START if its own end-of-run logic is broken. The
+# check reuses test-confound-scope.sh, which EXTRACTS the shipped classifier and
+# executes it at top level under these same shell options — no duplicated logic to
+# drift, and it is already demonstrated red-on-disable. Cost: well under a second.
+#
+# This matters most on a NEW HOST (macOS, a fresh Linux box), where the first run
+# is the one you least want to lose. A portability defect in the late-stage code
+# surfaces here, in seconds, instead of after a multi-hour corpus.
+# Set DSS_SKIP_SELFTEST=1 to bypass (not recommended; say why in the log).
+_selftest="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-confound-scope.sh"
+if [[ "${DSS_SKIP_SELFTEST:-0}" == "1" ]]; then
+  warn "driver self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
+elif [[ ! -f "$_selftest" ]]; then
+  die "driver self-test missing: $_selftest
+      This guard is what stops a defect in the END-OF-RUN classifier from costing
+      you the entire run. Restore the file, or set DSS_SKIP_SELFTEST=1 knowing that
+      a classifier fault will surface only after the corpus has finished."
+else
+  if _st_out="$(bash "$_selftest" 2>&1)"; then
+    info "driver self-test: OK ($(printf '%s\n' "$_st_out" | sed -n 's/^passed=\([0-9]*\).*/\1/p') assertions)"
+  else
+    printf '%s\n' "$_st_out" | sed 's/^/      /' >&2
+    die "DRIVER SELF-TEST FAILED — refusing to start.
+      The end-of-run classifier is broken, so this run would execute the whole corpus
+      (hours) and then abort while classifying. Fix the driver first; the output above
+      names the failing assertion."
+  fi
+fi
+# <<< dss:selftest <<<
+
 # ── Step 1 — host supported + online ─────────────────────────────────────────
 step "1/9  Host check (Linux / WSL / macOS, online)"
 [[ -n "$HOST_OS"   ]] || die "unsupported host OS — uname -s = '$(uname -s)' (need Linux/WSL or macOS/Darwin)."
