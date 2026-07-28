@@ -11247,3 +11247,159 @@ TEST(SemanticAnalyzerCSubset, CompositeMisspelledAlignedStillFailsLoud) {
         EXPECT_NE(d.actual.find("alinged"), std::string::npos) << d.actual;
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C77 — D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS, the SEMANTIC tier.
+// The linkage-tier pins live in tests/hir/test_hir_lowering_c_subset.cpp; these
+// cover the ATTRIBUTE-SEMANTICS sink (alignment) and the BLOCK-SCOPE twin of the
+// new mid-position slot.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ★★ MODE 2 AT BLOCK SCOPE — the `varDecl` sibling, and the reason it was
+// included rather than cut.
+//
+// MEASURED at the pre-change HEAD: `int __attribute__((aligned(16))) x = 1;`
+// inside a function body was a hard P0009, while the byte-identical file-scope
+// spelling was about to become legal. One attribute must not mean two different
+// things depending on SCOPE, so `declAttrRun` joined BOTH branches of `varDecl`
+// in the same commit as `topLevelDecl`.
+//
+// ★ ASSERTS THE APPLIED ALIGNMENT (32 — a genuine OVER-alignment for `int`,
+// natural 4), not that it compiled. A slot that parses and drops the value emits
+// NOTHING, so only the stored number can catch it.
+//
+// RED-ON-DISABLE: drop `declarationAttrSlotRules` from the varDecl row → the
+// declaration still parses and this reads no value at all. Remove `declAttrRun`
+// from the varDecl branches → P0009, and the ASSERT_NE on the record fires first.
+TEST(SemanticAnalyzerCSubset, MidPositionAlignedAppliesAtBlockScope) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int __attribute__((aligned(32))) x = 1; return x; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr) << "the block-scope mid-position form must PARSE";
+    ASSERT_TRUE(x->explicitAlignment.has_value())
+        << "the mid-position `aligned(32)` on a LOCAL must reach the same "
+           "attribute-semantics sink the file-scope spelling reaches";
+    EXPECT_EQ(*x->explicitAlignment, 32u);
+}
+
+// The block-scope MID position and the block-scope LEADING position must agree,
+// on the same program. This is the scope-level twin of the file-scope symmetry
+// pin in the HIR suite: an attribute that means one thing before the type and
+// another after it is the exact defect class this cycle closes.
+TEST(SemanticAnalyzerCSubset, BlockScopeMidAndLeadingAlignedAgree) {
+    for (char const* decl : {
+             "__attribute__((aligned(32))) int x = 1;",     // leading
+             "int __attribute__((aligned(32))) x = 1;"}) {  // mid (TF-C77)
+        auto cu = buildShippedUnit("c-subset", {
+            std::string("int main(void){ ") + decl + " return x; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        SymbolRecord const* x = findSym(model, "x");
+        ASSERT_NE(x, nullptr) << decl;
+        ASSERT_TRUE(x->explicitAlignment.has_value()) << decl;
+        EXPECT_EQ(*x->explicitAlignment, 32u) << decl;
+    }
+}
+
+// MODE 2 anti-hijack at BLOCK scope: `declAttrRun` is a sibling of `declHead`,
+// never a child, so an attribute identifier that also names a real type must not
+// be resolved as the declaration's type. `long` vs `int` makes the hijack
+// OBSERVABLE as a size — a check that `x` is merely "some integer" would pass
+// through the very hijack this guards.
+TEST(SemanticAnalyzerCSubset, BlockScopeMidPositionDoesNotHijackTheHeadType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef long aligned;\n"
+        "int main(void){ int __attribute__((aligned(4))) x = 1; "
+        "return (int)sizeof(x); }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->explicitAlignment.has_value())
+        << "a typedef named `aligned` must not stop the attribute being honored";
+    EXPECT_EQ(*x->explicitAlignment, 4u);
+}
+
+// ★★ MODE 1, THE NORETURN SINK — the pin that proves the after-keyword position
+// is REACHED by the semantic specifier scan, not merely parsed.
+//
+// `specifierPrefixNamesNoreturn` walks the row's `specifierPrefixChild`. Mode 1
+// works only because `externSpecifiers` IS that prefix and is MANDATORY (it owns
+// the `extern` keyword), so it is always the first visible child and always
+// returned. This test is what makes that "zero new wiring" claim VERIFIED rather
+// than asserted — the Tcl `TCL_NORETURN` shape must MEAN noreturn, not just parse.
+//
+// ★ ASSERTS THE APPLIED BIT. The end-to-end consequence is witnessed separately
+// and more strongly at the HIR verifier: MEASURED, `int pick(int c){ if (c)
+// return 1; die(2); }` compiles with exit 0 when `die` is declared
+// `extern __attribute__((__noreturn__)) void die(int);` and fails
+// `H0003 non-void function may fall through without returning a value` when the
+// attribute is removed — so the flag really does terminate the path.
+//
+// RED-ON-DISABLE: remove `attrSpec` from `externSpecifiers` → P0009 (the shape
+// stops parsing). Remove `noreturn` from `semantics.noreturnAttributeNames` →
+// this parses clean and the bit reads false, silently.
+TEST(SemanticAnalyzerCSubset, ExternHeadNoreturnAttributeIsApplied) {
+    auto model = analyzeShipped("c-subset", {
+        "extern __attribute__((__noreturn__)) void die(int);\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
+        << "an attribute written AFTER the `extern` keyword must reach the "
+           "noreturn scan — the dunder spelling `__noreturn__` normalizes to "
+           "`noreturn`, exactly as it does in the leading position";
+}
+
+// ★★ A DEFECT THIS CYCLE FOUND AND DELIBERATELY DID NOT FIX — RECORDED HERE SO
+// IT IS GREPPABLE INSTEAD OF INVISIBLE.
+//
+// This started life as a symmetry pin ("the after-keyword and after-declarator
+// positions must agree on `noreturn`") and it FAILED — which is the useful
+// outcome. MEASURED: the AFTER-DECLARATOR spelling does NOT reach the noreturn
+// sink at all. End to end, on the identical program:
+//
+//   extern __attribute__((__noreturn__)) void die(int);   (mode 1, NEW)  exit 0
+//   extern void die(int) __attribute__((__noreturn__));   (trailing)     H0003
+//       "non-void function may fall through without returning a value"
+//
+// CAUSE: `specifierPrefixNamesNoreturn` scans the row's `specifierPrefixChild`
+// ONLY. Mode 1 works because `externSpecifiers` IS that prefix. TF-C73 made the
+// after-declarator run a LINKAGE scan root but never a NORETURN one, so the
+// trailing spelling is parsed, linkage-folded, and its noreturn meaning dropped.
+//
+// WHY IT IS NOT FIXED HERE: it is PRE-EXISTING (nothing in TF-C77 touches that
+// scan or that run), it is a SAFE MISS rather than a miscompile — dropping the
+// flag can only produce a SPURIOUS diagnostic, never wrong code, which is the
+// posture `specifierPrefixNamesNoreturn`'s own comment states — and closing it
+// means deciding whether a per-DECLARATOR trailing run may confer a
+// DECLARATION-level property, which is a different anchor's question.
+//
+// ★ THE EXPECT_FALSE BELOW ASSERTS A BUG, NOT A DESIRED PROPERTY. When the
+// trailing position is wired to the noreturn scan, this test WILL fail — that is
+// the point. Flip it to EXPECT_TRUE then, and fold both arms back into one
+// symmetry loop. Do NOT "fix" it by deleting the assertion.
+TEST(SemanticAnalyzerCSubset, ExternTrailingNoreturnIsNotYetHonoredKnownGap) {
+    auto head = analyzeShipped("c-subset", {
+        "extern __attribute__((__noreturn__)) void die(int);\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(head.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(head, "die"))
+        << "mode 1 (after-keyword) IS honored — this half is the new behavior";
+
+    auto trail = analyzeShipped("c-subset", {
+        "extern void die(int) __attribute__((__noreturn__));\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(trail.hasErrors())
+        << "the trailing form still PARSES and links cleanly — the gap is the "
+           "dropped semantic fact, not a rejection";
+    EXPECT_FALSE(survivingFnIsNoreturn(trail, "die"))
+        << "KNOWN GAP (see banner): if this now reads TRUE the trailing position "
+           "has been wired to the noreturn scan — flip this to EXPECT_TRUE and "
+           "restore the symmetry loop";
+}

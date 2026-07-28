@@ -1228,7 +1228,39 @@ struct Lowerer {
     // wins" — the trailing attribute overrides a conflicting leading one, exactly
     // as reading the declaration left-to-right implies.
 
-    // The declaration-level (shared) scan root: the specifier prefix, if any.
+    // The declaration-level (shared) scan roots: the specifier prefix, plus every
+    // declaration-level attribute SLOT the row declares.
+    //
+    // ★ TF-C77 (D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS) — THE SLOT ROOTS.
+    // Until this change the function returned the specifier prefix ALONE, so an
+    // attribute sitting in a declaration-level slot OUTSIDE that prefix was
+    // invisible to `linkageFrom`. That was harmless while the only rows declaring
+    // `declarationAttrSlotRules` had no `linkageSpecifiers` facet at all (they
+    // early-return below), but it is exactly the SILENT DROP the new mid-position
+    // slot would otherwise be: `int __attribute__((weak)) gv;` parses clean and
+    // loses its weak binding at link time with no diagnostic anywhere, and an
+    // unknown name in that position is swallowed too — `topLevelDecl` does not set
+    // `unknownStrictAttributeIsError`, so the GNU form's loudness there comes
+    // ENTIRELY from this tier's H_UnknownLinkageSpecifier gate.
+    //
+    // WHAT IT CONSUMES: the row's CONFIG-DECLARED `declarationAttrSlotRules` list
+    // and nothing else — the same list the semantic attribute scan already selects
+    // by. No rule name, attribute name, arch or format is compared to a string
+    // literal here; a language with no such slots gets an empty list and the loop
+    // does nothing. The match is on DIRECT VISIBLE children by rule id, mirroring
+    // `scanAttributeSemantics`'s slot loop, so a run nested deeper (inside a
+    // declarator) is deliberately NOT promoted to declaration-level linkage.
+    //
+    // ORDER IS LOAD-BEARING, same as for the trailing roots: the prefix root goes
+    // FIRST and the slots follow in `visibleChildren` (source) order, so the
+    // flattened token list stays source-ordered and last-wins keeps meaning "the
+    // later spelling wins".
+    //
+    // INERT FOR EVERY PRE-EXISTING SLOT ROW, verified row by row rather than
+    // assumed: `typedefDecl`, `structSpec`, `unionSpec`, `structField` and
+    // `unionField` are the only shipped rows declaring `declarationAttrSlotRules`
+    // today, and NONE of them declares `linkageSpecifiers` — so each takes the
+    // early return above the loop and never reaches it.
     [[nodiscard]] std::vector<NodeId>
     linkagePrefixRoots(NodeId node, DeclarationRule const& decl) {
         std::vector<NodeId> roots;
@@ -1237,6 +1269,13 @@ struct Lowerer {
         if (decl.linkageSpecifiers.empty()) return roots;
         if (NodeId const pfx = specifierPrefixChild(tree(), node, decl); pfx.valid())
             roots.push_back(pfx);
+        if (decl.declarationAttrSlotRules.empty()) return roots;
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (RuleId sr : decl.declarationAttrSlotRules) {
+                if (tree().rule(c).v == sr.v) { roots.push_back(c); break; }
+            }
+        }
         return roots;
     }
 

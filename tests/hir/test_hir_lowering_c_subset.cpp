@@ -6985,3 +6985,408 @@ TEST(HirLoweringCSubset, StaticAssertFloatConditionFailsAsNonConstant) {
         "int main(void){ return 0; }\n");
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C77 — D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS, modes 1 and 2.
+//
+// TWO new attribute POSITIONS opened this cycle, each previously a hard P0009:
+//   mode 1  AFTER the `extern` keyword   `extern __attribute__((weak)) int wk;`
+//   mode 2  BETWEEN the type head and the declarator list — the `declAttrRun`
+//           slot — `static int SQLITE_NOINLINE f(…)` / `int __attribute__((weak)) gv;`
+//
+// EVERY pin below asserts an APPLIED FACT (a binding, a visibility, an
+// alignment, a resolved sibling-CU value) or an exact diagnostic SET. That is
+// forced, not stylistic: the failure mode of a dropped attribute is SILENCE, so
+// a "compiles clean" or bare-count pin reads green through the exact regression
+// it exists to catch.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── MODE 1 ──────────────────────────────────────────────────────────────────
+
+// MODE 1, the `weak` binding. `externSpecifiers` gained `attrSpec`, and because
+// that wrapper IS the row's `specifierPrefix` the attribute reaches `linkageFrom`
+// with ZERO new wiring. This pin is what proves the "zero wiring" claim is real
+// rather than assumed.
+//
+// ★ ASSERTS THE APPLIED BINDING. A count pin would pass if the attribute were
+// parsed and silently dropped — which is precisely what the position did before
+// the grammar landed, one tier earlier, as P0009.
+//
+// RED-ON-DISABLE (MEASURED): remove `attrSpec` from `externSpecifiers`'s repeat
+// alt → P0009 'expected Identifier, VoidKeyword, … — got __attribute__' and the
+// model never reaches lowering. Drop the `weak` key from the externDecl row's
+// `linkageSpecifiers` → H_UnknownLinkageSpecifier. Move `weak` into that row's
+// ignored NAMES instead → zero diagnostics and `wkBinding` silently reads
+// Global, which is the wrong-way "fix" this assertion exists to catch.
+TEST(HirLoweringCSubset, ExternHeadAttributeWeakApplies) {
+    SemanticModel model = analyzeCSubset(
+        "extern __attribute__((weak)) int wk;\n"
+        "int main(void){ return wk; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(declaredBinding(*res, model, "wk"), SymbolBinding::Weak)
+        << "an attribute AFTER the `extern` keyword must bind exactly as the "
+           "same attribute after the declarator does";
+}
+
+// MODE 1, the COMPOSITE `visibility("hidden")` key. Separate from the `weak` pin
+// because it exercises a different machine: the `<identifier>:<string-body>`
+// pairing, which requires the attribute's string argument to survive the scan as
+// a token rather than being skipped wholesale.
+TEST(HirLoweringCSubset, ExternHeadAttributeVisibilityHiddenApplies) {
+    SemanticModel model = analyzeCSubset(
+        "extern __attribute__((visibility(\"hidden\"))) int ev;\n"
+        "int ev = 7;\n"
+        "int main(void){ return ev; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "the composite `visibility:hidden` key must resolve from the "
+           "after-keyword position — a bare `visibility` would fail loud";
+}
+
+// MODE 1 × THREAD-STORAGE, BOTH ORDERS. `externSpecifiers`'s slot is a REPEAT
+// over an alt, so `extern _Thread_local __attribute__((…)) int` and
+// `extern __attribute__((…)) _Thread_local int` are both legal orderings and
+// must agree. An order-sensitive fold is a real hazard here — the linkage merge
+// is last-wins — so the two orders are pinned against EACH OTHER, not merely
+// each against "compiles".
+TEST(HirLoweringCSubset, ExternHeadAttributeAndThreadLocalAgreeInBothOrders) {
+    for (char const* decl : {
+             "extern _Thread_local __attribute__((weak)) int tv;\n",
+             "extern __attribute__((weak)) _Thread_local int tv;\n"}) {
+        std::string const full = std::string(decl)
+                               + "int main(void){ return tv; }\n";
+        SemanticModel model = analyzeCSubset(full);
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << decl;
+        EXPECT_EQ(declaredBinding(*res, model, "tv"), SymbolBinding::Weak)
+            << decl << " — the attribute must bind identically whichever side of "
+                       "the thread-storage keyword it is written on";
+    }
+}
+
+// MODE 1, MULTI-CLAUSE. `__attribute__((__nothrow__, __leaf__))` is glibc's
+// `__THROW`; the clause comma is a DIRECT child of `attrSpec` and so is NOT
+// covered by the attribute-ARGUMENT token flag. This pin asserts the exact
+// diagnostic SET is EMPTY for the whole declaration, which is the only way to
+// distinguish "resolved" from "one of the six tokens quietly matched something".
+TEST(HirLoweringCSubset, ExternHeadMultiClauseAttributeResolvesClean) {
+    SemanticModel model = analyzeCSubset(
+        "extern __attribute__((__nothrow__, __leaf__)) int gg(void);\n"
+        "int gg(void){ return 10; }\n"
+        "int main(void){ return gg(); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(declaredBinding(*res, model, "gg"), SymbolBinding::Global)
+        << "an ABI-neutral hint run must leave the binding untouched — a fold "
+           "that clobbered it to a default would read as a silent relinking";
+}
+
+// MODE 1, THE UNKNOWN-NAME GATE. The diagnostic SET must be exactly
+// {H_UnknownLinkageSpecifier} — not "at least one error", which would also be
+// satisfied by a parse failure and would therefore keep passing if the grammar
+// were reverted.
+TEST(HirLoweringCSubset, ExternHeadUnknownAttributeIsExactlyTheLinkageDiagnostic) {
+    SemanticModel model = analyzeCSubset(
+        "extern __attribute__((frobnicate_xyz)) int uz;\n"
+        "int uz = 1;\n"
+        "int main(void){ return uz; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the shape must PARSE — the rejection belongs to the linkage tier, "
+           "so a parse error here would mean this pin is guarding the wrong thing";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "an unrecognized GNU name in the newly-honored after-keyword position "
+           "must fail LOUD — silence here is the whole bug class this cycle "
+           "exists to close";
+    std::size_t others = 0;
+    for (auto const& d : r.all())
+        if (d.code != DiagnosticCode::H_UnknownLinkageSpecifier
+            && d.severity == DiagnosticSeverity::Error) ++others;
+    EXPECT_EQ(others, 0u) << "the SET must be exactly {H_UnknownLinkageSpecifier}";
+}
+
+// ── MODE 2 ──────────────────────────────────────────────────────────────────
+
+// ★★ MODE 2, THE LOAD-BEARING PIN — AND THE H2 HALFWAY-STATE DEMONSTRATION.
+//
+// The grammar alone makes `int __attribute__((weak)) gv = 3;` PARSE. Only the
+// `linkagePrefixRoots` extension — pushing every `declarationAttrSlotRules`
+// child as a scan root — makes the binding APPLY. With the grammar and the
+// config key but WITHOUT that engine change, this program compiles perfectly
+// cleanly, emits ZERO diagnostics, and links `gv` as a plain strong global: a
+// silent wrong-linkage miscompile.
+//
+// RED-ON-DISABLE (H2, MEASURED): revert `linkagePrefixRoots` to returning only
+// `specifierPrefixChild` → this EXPECT flips Weak → Global with ZERO
+// diagnostics of any code anywhere in the program. That is the halfway state,
+// and it is why the grammar and the engine change are ONE unit.
+TEST(HirLoweringCSubset, MidPositionAttributeWeakApplies) {
+    SemanticModel model = analyzeCSubset(
+        "int __attribute__((weak)) gv = 3;\n"
+        "int main(void){ return gv; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(declaredBinding(*res, model, "gv"), SymbolBinding::Weak)
+        << "the mid-position attribute must BIND, not merely parse — without the "
+           "linkagePrefixRoots slot roots this reads Global, silently";
+}
+
+// MODE 2 IS A DECLARATION-LEVEL SLOT, NOT A PER-DECLARATOR ONE — the exact
+// OPPOSITE of the after-declarator run, and the distinction is C semantics, not
+// a convention. `int __attribute__((weak)) a = 1, b = 2;` writes the attribute
+// in the DECL-SPECIFIER region, so it applies to EVERY declarator.
+//
+// GROUND TRUTH IS REAL CLANG, not DSS agreeing with itself: MEASURED with
+// `clang -c` + `nm -m`, that exact line emits BOTH `_ma` and `_mb` as
+// "weak external". Contrast `int a __attribute__((weak)) = 1, b = 2;` — the
+// trailing form — where only `a` is weak (pinned by
+// `AfterDeclaratorAttributeIsPerDeclaratorNotPerDeclaration` above). Two
+// positions, two different scopes of application, both correct; this pin exists
+// so a future refactor cannot collapse them into one rule.
+TEST(HirLoweringCSubset, MidPositionAttributeAppliesToEveryDeclarator) {
+    SemanticModel model = analyzeCSubset(
+        "int __attribute__((weak)) ma = 1, mb = 2;\n"
+        "int main(void){ return ma + mb; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(declaredBinding(*res, model, "ma"), SymbolBinding::Weak);
+    EXPECT_EQ(declaredBinding(*res, model, "mb"), SymbolBinding::Weak)
+        << "a DECL-SPECIFIER-position attribute applies to the whole "
+           "declaration — clang emits both as `weak external` (MEASURED)";
+}
+
+// MODE 2 ON A FUNCTION DEFINITION — the literal sqlite shape
+// (`static T SQLITE_NOINLINE f(…) { … }`) and the one that moves the
+// `kindByChild` index. `declaratorList` 1 → 2 and `childPath` [2,0] → [3,0]
+// had to move with the grammar; this pin is what fails if either is left behind.
+//
+// RED-ON-DISABLE (H3, MEASURED): leave `kindByChild.childPath` at [2,0] → the
+// tail is never recognized as a `block`, the definition is not lowered as a
+// Function, and this ASSERT on the Function's presence fails.
+TEST(HirLoweringCSubset, MidPositionAttributeOnFunctionDefinitionLowersAsFunction) {
+    SemanticModel model = analyzeCSubset(
+        "static int __attribute__((cold)) sf(int x){ return x + 1; }\n"
+        "int main(void){ return sf(41); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0;
+    bool sawSf = false;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Function) continue;
+        ++fns;
+        auto const* rec = model.recordFor(res->hir.functionSymbol(d));
+        if (rec != nullptr && rec->name == "sf") sawSf = true;
+    }
+    EXPECT_TRUE(sawSf)
+        << "the decorated DEFINITION must lower as a Function with a body — if "
+           "kindByChild still points at [2,0] it is mis-lowered as a variable";
+    EXPECT_EQ(fns, 2u) << "exactly `sf` and `main`";
+    EXPECT_EQ(declaredBinding(*res, model, "sf"), SymbolBinding::Local)
+        << "the co-present `static` must still bind internal — an attribute in "
+           "the new slot must not clobber the specifier prefix's binding";
+}
+
+// MODE 2 ON A PROTOTYPE (no body) — the same position, the other tail arm. Kept
+// separate from the definition pin because the two take different lowering
+// paths and an asymmetric break would otherwise hide.
+TEST(HirLoweringCSubset, MidPositionAttributeOnPrototypeApplies) {
+    SemanticModel model = analyzeCSubset(
+        "int __attribute__((weak)) wp(void);\n"
+        "int wp(void){ return 42; }\n"
+        "int main(void){ return wp(); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+}
+
+// ★ MODE 2, THE ALIGNMENT SINK — AND THE H1 HALFWAY-STATE DEMONSTRATION.
+//
+// `declarationAttrSlotRules` is what routes the slot to `scanAttributeSemantics`.
+// With the grammar but WITHOUT that key the declaration parses perfectly and the
+// alignment is SILENTLY GONE — no diagnostic, no wrong number to notice, just an
+// under-aligned object.
+//
+// 32 is a genuine OVER-alignment for `int` (natural 4), so the value is
+// load-bearing: a sink that fell back to natural alignment reads 4 or 0.
+//
+// RED-ON-DISABLE (H1, MEASURED): drop `declarationAttrSlotRules` from the
+// topLevelDecl row → the program still compiles clean with ZERO diagnostics and
+// this EXPECT reads 0 instead of 32.
+TEST(HirLoweringCSubset, MidPositionAlignedApplies) {
+    SemanticModel model = analyzeCSubset(
+        "int __attribute__((aligned(32))) av = 20;\n"
+        "int main(void){ return av; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(globalAlignment(*res, model, "av"), 32u)
+        << "the mid-position `aligned(32)` must APPLY — a dropped alignment "
+           "emits nothing at all, so only the applied value can catch it";
+}
+
+// MODE 2 × the LEADING position: the SAME attribute must mean the SAME thing in
+// both, on the same program. An asymmetry here is the bug class TF-C73 named
+// (an attribute that means two different things depending on where it sits), so
+// the two arms are pinned against each other rather than each against a constant.
+TEST(HirLoweringCSubset, MidPositionAlignedAgreesWithTheLeadingPosition) {
+    for (char const* decl : {
+             "__attribute__((aligned(32))) int av = 20;\n",     // leading
+             "int __attribute__((aligned(32))) av = 20;\n"}) {  // mid (TF-C77)
+        std::string const full = std::string(decl)
+                               + "int main(void){ return av; }\n";
+        SemanticModel model = analyzeCSubset(full);
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl;
+        EXPECT_EQ(globalAlignment(*res, model, "av"), 32u) << decl;
+    }
+}
+
+// MODE 2, THE STATIC/WEAK CONFLICT. `static int __attribute__((weak)) x;` asks
+// for internal AND weak binding at once. It must be REFUSED, and the fact that
+// it can be refused at all is itself evidence: the prefix root and the slot root
+// are folded in the SAME `linkageFrom` pass, so the conflict is visible. Two
+// independent folds could not see it and would silently last-wins one of them.
+TEST(HirLoweringCSubset, MidPositionWeakConflictsWithStaticLoudly) {
+    SemanticModel model = analyzeCSubset(
+        "static int __attribute__((weak)) sx = 1;\n"
+        "int main(void){ return sx; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "the conflicting binding must be reported, never silently resolved "
+           "by whichever root happened to be folded last";
+}
+
+// MODE 2, THE UNKNOWN-NAME GATE at file scope. Exact diagnostic SET.
+TEST(HirLoweringCSubset, MidPositionUnknownAttributeIsExactlyTheLinkageDiagnostic) {
+    SemanticModel model = analyzeCSubset(
+        "int __attribute__((frobnicate_xyz)) uz = 1;\n"
+        "int main(void){ return uz; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the shape must PARSE — the rejection belongs to the linkage tier";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "without the linkagePrefixRoots slot roots this reads 0 — the "
+           "unknown name is swallowed along with the weak binding";
+    std::size_t others = 0;
+    for (auto const& d : r.all())
+        if (d.code != DiagnosticCode::H_UnknownLinkageSpecifier
+            && d.severity == DiagnosticSeverity::Error) ++others;
+    EXPECT_EQ(others, 0u) << "the SET must be exactly {H_UnknownLinkageSpecifier}";
+}
+
+// ★★ MODE 2, THE TYPE-HIJACK ANTI-PIN — the reason `declAttrRun` is a SIBLING of
+// the head and never a child of it.
+//
+// `resolveTypeNodeImpl` is first-child-that-resolves-wins and its token arm
+// resolves ANY identifier through the scope chain. Had the run been nested
+// inside `topLevelHead`, the attribute identifier `weak` — which this program
+// deliberately also makes a real typedef name — would be tried as a TYPE and
+// `gv` would silently resolve to it. Since `typedef int weak;` and the real type
+// are both `int` here, the hijack would be invisible to a type check alone —
+// so this pin asserts BOTH halves: `gv` is still `int` (4 bytes) AND still weak.
+// A hijack that also dropped the binding, or a binding that survived a hijacked
+// type, each fails exactly one half.
+TEST(HirLoweringCSubset, MidPositionAttributeDoesNotHijackTheHeadType) {
+    SemanticModel model = analyzeCSubset(
+        "typedef int weak;\n"
+        "int __attribute__((weak)) gv = 3;\n"
+        "int main(void){ return gv + (int)sizeof(gv); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(declaredBinding(*res, model, "gv"), SymbolBinding::Weak)
+        << "a typedef named `weak` must not stop the attribute from binding";
+    bool sawGv = false;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Global) continue;
+        auto const* rec = model.recordFor(res->hir.globalSymbol(d));
+        if (rec == nullptr || rec->name != "gv") continue;
+        sawGv = true;
+    }
+    EXPECT_TRUE(sawGv) << "`gv` must lower as a Global, not be swallowed";
+}
+
+// ★ MODE 2, THE INDEX NON-REGRESSION — the DECLARATOR-LESS form.
+//
+// `struct P { int x; };` has NO `initDeclaratorList`, so its post-strip role
+// children are [topLevelHead, declAttrRun, topLevelDeclTail] — one SHORTER than
+// the decorated case. This is exactly where an index that moved by hand rather
+// than by construction goes wrong, so the TU carries a no-declarator type
+// declaration AND a function definition AND a plain global together: all three
+// index shapes in one lowering.
+//
+// RED-ON-DISABLE (H3, MEASURED): leave `declaratorList` at 1 → the row addresses
+// the (empty) `declAttrRun` as its declarator list and the global is lost.
+TEST(HirLoweringCSubset, DeclaratorLessDeclarationKeepsTheRowIndicesStable) {
+    SemanticModel model = analyzeCSubset(
+        "struct P { int x; };\n"
+        "int plain = 1;\n"
+        "int helper(int a){ return a + 1; }\n"
+        "int main(void){ struct P p; p.x = 40; return helper(p.x) + plain; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0, globals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function) ++fns;
+        if (res->hir.kind(d) == HirKind::Global)   ++globals;
+    }
+    EXPECT_EQ(fns, 2u)
+        << "`helper` and `main` must both lower as Functions — a stale "
+           "kindByChild path mis-reads a definition as a variable";
+    EXPECT_EQ(globals, 1u)
+        << "`plain` must lower as exactly one Global — a stale declaratorList "
+           "index reads the empty declAttrRun and loses it";
+}
+
+// ── TRAILING-POSITION NON-REGRESSION ────────────────────────────────────────
+//
+// The glibc idiom in the AFTER-DECLARATOR position, unchanged by this cycle.
+// It shares `externDecl` with mode 1's new head slot, and the two runs are now
+// folded into ONE `linkageFrom` pass, so a mistake in the new roots would show
+// up here as a spurious diagnostic on code that has worked for two cycles.
+TEST(HirLoweringCSubset, TrailingAttributeRunStillResolvesAfterTheHeadSlotOpened) {
+    SemanticModel model = analyzeCSubset(
+        "extern int gg(void) __attribute__((__nothrow__));\n"
+        "int gg(void){ return 42; }\n"
+        "int main(void){ return gg(); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+}

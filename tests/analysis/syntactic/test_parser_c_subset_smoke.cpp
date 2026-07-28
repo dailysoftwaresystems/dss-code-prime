@@ -1149,12 +1149,21 @@ TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
     // FC4 c1: the specifier/declarator split — the array suffix now lives
     // INSIDE the directDeclarator (C 6.7.6), and the `;` is the
     // topLevelDeclTail's EndStatement arm (vs `{` = function definition).
+    // ★ TF-C77: the EMPTY `declAttrRun` between the head and the declarator list
+    // is present ON PURPOSE and this golden asserts it. `declAttrRun` is a named
+    // rule over a lone `{repeat}`, so its node is emitted even when the source
+    // carries no attribute — that is precisely what keeps the topLevelDecl row's
+    // `declaratorList: 2` / `kindByChild [3,0]` indices CONSTANT instead of
+    // shifting with the number of attributes written. If a future change makes
+    // the run conditional, this line disappears and every declaration in the TU
+    // is mis-indexed — so the empty node belongs in the golden, not out of it.
     constexpr std::string_view kExpected =
         "rule:topLevel\n"
         "  rule:topLevelDecl\n"
         "    rule:topLevelHead\n"
         "      rule:typeSpecifierSeq\n"
         "        tok:\"int\"\n"
+        "    rule:declAttrRun\n"
         "    rule:initDeclaratorList\n"
         "      rule:initDeclarator\n"
         "        rule:declarator\n"
@@ -1205,12 +1214,19 @@ TEST(ParserCSubsetSmoke, InnerArrayDeclParses) {
     // FC4 c1: the local declaration statement is `varDecl` — keyword-led
     // head (kwDeclHead) + initDeclaratorList; the array suffix lives
     // INSIDE the directDeclarator (C 6.7.6).
+    // ★ TF-C77: the EMPTY `declAttrRun` after the head is asserted DELIBERATELY —
+    // the block-scope twin of the topLevelDecl golden above. The node is emitted
+    // whether or not an attribute is written, which is what keeps this row's
+    // `declaratorList: 2` constant; and it must appear in the `kwDeclHead` branch
+    // as well as the specifier-led one, because ONE attribute must not mean two
+    // different things depending on which branch of `varDecl` matched.
     constexpr std::string_view kExpected =
         "rule:varDecl\n"
         "  rule:kwDeclHead\n"
         "    rule:typeSpecifierForDecl\n"
         "      rule:typeSpecifierSeq\n"
         "        tok:\"int\"\n"
+        "  rule:declAttrRun\n"
         "  rule:initDeclaratorList\n"
         "    rule:initDeclarator\n"
         "      rule:declarator\n"
@@ -2756,4 +2772,114 @@ TEST(ParserCSubsetSmoke, TagReferenceKeepsItsShapeWithTheLeadSlot) {
     EXPECT_EQ(visibleChildRoles(t, spec),
               "tok:StructKeyword/rule:compositeAttrLead/tok:Identifier")
         << "a bare tag reference: lead slot present-and-empty, tag still at 2";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C77 — D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS, the PARSE tier.
+// One test per FORM. The APPLIED-FACT pins live in the HIR and semantic suites;
+// these guard the shapes themselves and — just as importantly — the shapes that
+// must STAY loud.
+// ════════════════════════════════════════════════════════════════════════════
+
+// MODE 1: the attribute rides INSIDE `externSpecifiers`, after the keyword.
+TEST(ParserCSubsetSmoke, ExternHeadAttributeParses) {
+    for (char const* src : {
+             "extern __attribute__((__noreturn__)) void die(int);",
+             "extern __attribute__((weak)) int wk;",
+             "extern __attribute__((visibility(\"hidden\"))) int ev;",
+             "extern __attribute__((__nothrow__, __leaf__)) int gg(void);",
+             "extern _Thread_local __attribute__((weak)) int t1;",
+             "extern __attribute__((weak)) _Thread_local int t2;",
+             "extern __attribute__((weak)) int wfun(void) { return 1; }"}) {
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto result = std::move(p).parse();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
+    }
+}
+
+// MODE 2: the `declAttrRun` slot, every shape that can occupy it.
+TEST(ParserCSubsetSmoke, MidPositionAttributeParses) {
+    for (char const* src : {
+             "int __attribute__((weak)) gv;",
+             "int __attribute__((weak)) gv = 3;",
+             "int __attribute__((weak)) a = 1, b = 2;",
+             "int __attribute__((aligned(32))) av = 20;",
+             "static int __attribute__((cold)) sf(int x){ return x + 1; }",
+             "int __attribute__((weak)) wp(void);",
+             "int main(void){ int __attribute__((aligned(16))) x = 1; return x; }",
+             "int main(void){ struct S { int a; } __attribute__((packed)) s; "
+             "return s.a; }"}) {
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto result = std::move(p).parse();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
+    }
+}
+
+// ★★ THE `stdAttr` EXCLUSION — AND IT IS THE MOST IMPORTANT TEST IN THIS BLOCK,
+// because it is the one that can go green the WRONG way.
+//
+// Adding `stdAttr` to either new slot would be a one-word config edit and would
+// make both of these compile. It must NOT: MEASURED with
+// `/usr/bin/clang -std=c23 -fsyntax-only`, real clang REJECTS both —
+//   `extern [[deprecated]] int dg;`
+//       error: an attribute list cannot appear here
+//   `int [[deprecated]] gv;`
+//       error: 'deprecated' attribute cannot be applied to types
+// (after a type-specifier a `[[…]]` appertains to the TYPE, not the declaration).
+// DSS accepting C that no toolchain accepts is a defect in the permissive
+// direction, and the permissive direction is the one nobody notices.
+//
+// RED-ON-DISABLE: add `stdAttr` beside `attrSpec` in `declAttrRun` or in
+// `externSpecifiers`'s repeat alt → the corresponding line parses clean and this
+// test fails. That is the demonstration; keep it.
+TEST(ParserCSubsetSmoke, StdAttrStaysRejectedInBothNewSlots) {
+    for (char const* src : {
+             "extern [[deprecated]] int dg;",   // mode 1 slot
+             "int [[deprecated]] gv;"}) {       // mode 2 slot
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto result = std::move(p).parse();
+        EXPECT_TRUE(result.tree.diagnostics().hasErrors())
+            << src << " — real clang rejects this; admitting `stdAttr` into the "
+                      "new slots would make DSS accept C no toolchain does";
+    }
+}
+
+// ★ THE ANTI-HIJACK PIN. `declAttrRun` is a SIBLING of the head, never a child.
+// Nested inside the head, `resolveTypeNodeImpl`'s first-child-that-resolves-wins
+// token arm would try the attribute identifier as a TYPE — and here `aligned` and
+// `weak` are deliberately made real typedef names, so a hijack would bind the
+// wrong type SILENTLY. `long` vs `int` makes the difference observable as a size.
+// (The applied-type half is asserted in the semantic + HIR suites; this arm pins
+// that the shape parses at all with the collision present, which is the parse
+// tier's share of the guard.)
+TEST(ParserCSubsetSmoke, MidPositionAttributeNameCollidingWithATypedefParses) {
+    for (char const* src : {
+             "typedef long weak;\nint __attribute__((weak)) gv = 3;",
+             "typedef long aligned;\nint __attribute__((aligned(4))) av = 3;",
+             "typedef long aligned;\nint main(void){ "
+             "int __attribute__((aligned(4))) x = 1; return x; }"}) {
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto result = std::move(p).parse();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
+    }
+}
+
+// ★ THE ORDER WALL. An attribute BEFORE `extern` is deliberately NOT admitted:
+// it would put AttributeKeyword into FIRST(externDecl), colliding with
+// `topLevelDecl`'s `{optional declSpecifiers}` at `/shapes/topLevel`. MEASURED
+// with a throwaway patched config tree, that collision is caught at LOAD time —
+// `error[C_AmbiguousAlternatives] at /shapes/topLevel` + `D_SchemaLoadFailed`,
+// exit 1 — so the wall is real and loud rather than a silent mis-parse. The form
+// is carved into its own anchor; until then it must stay a clean parse error.
+TEST(ParserCSubsetSmoke, AttributeBeforeExternKeywordStaysRejected) {
+    auto h = loadAndTokenize("__attribute__((weak)) extern int g;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    EXPECT_TRUE(result.tree.diagnostics().hasErrors())
+        << "an attribute before `extern` must stay LOUD — FIRST(externDecl) has "
+           "to remain {ExternKeyword} or the schema fails to load at all";
 }
