@@ -414,26 +414,22 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
     stack.pop_back();
 }
 
-// C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE / FINDING-B): the SINGLE
-// per-object-format availability predicate for a config PREDEFINED macro. A
-// macro with a non-empty `availableObjectFormats` set is available ONLY when the
-// active object format is in that set; an EMPTY set means EVERY format; absent an
-// active format only a universal (empty-set) macro is available. Shared by the
-// include-gating pre-scan's definedness oracle (`sbNameDefined`), the value-seed
-// prefix builder (`preprocess`), the `MacroExpander` `predefined_` seed, AND the
-// function-like "<built-in>" prologue filter -- so all four apply ONE filter and
-// can NEVER drift. A divergence between the pre-scan's seed and the authoritative
-// `predefined_` set would be a silent P0016 seam (the pre-scan resolving a
-// value-gated include the authoritative pass reads dead), so this MUST stay the
-// one definition.
-[[nodiscard]] bool predefinedMacroAvailableOnActiveFormat(
-    std::vector<std::string> const&        availableObjectFormats,
-    std::optional<ObjectFormatKind> const& activeFormat) {
-    if (availableObjectFormats.empty()) return true;
-    if (!activeFormat.has_value()) return false;
-    return ffi::objectFormatInAvailabilitySet(availableObjectFormats,
-                                              *activeFormat);
-}
+// C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE / FINDING-B) → TF-C74.
+//
+// The per-object-format availability predicate for a config PREDEFINED macro
+// USED TO LIVE HERE, as a shared helper the four predefine seed sites each
+// called: the include-gating pre-scan's definedness oracle (`sbNameDefined`),
+// the value-seed prefix builder, the `MacroExpander` `predefined_` seed, and
+// the function-like "<built-in>" prologue. It is now DELETED. Four call sites
+// of one predicate is one careless edit away from three call sites and a
+// fourth that forgot, and a divergence between the pre-scan's seed and the
+// authoritative `predefined_` set is a SILENT P0016 seam (the pre-scan
+// resolving a value-gated include the authoritative pass reads dead).
+//
+// The filter now runs EXACTLY ONCE, inside `mergePredefinedMacros` (bottom of
+// this file), whose `effective` output is already format-resolved; all four
+// sites iterate that ONE list. There is deliberately no named predicate left
+// for a fifth site to call — the filter is structurally unrepeatable.
 
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
@@ -478,6 +474,14 @@ struct SynthBuilder {
     // `<command-line>`/`<built-in>` prologues the authoritative pass sees, so the
     // pre-scan is more-live only IN LOCKSTEP (P0016 stays closed).
     std::string const& preScanDefinePrefix;
+    // TF-C74: the EFFECTIVE predefined-macro list — language ⊕ target, already
+    // format-resolved by `mergePredefinedMacros`. Shared by const-ref across
+    // every child builder (like `preScanDefinePrefix`), so the whole include
+    // tree's definedness oracle reads the SAME list the authoritative
+    // `MacroExpander` seeds from. Replaces the old
+    // `schema->preprocess().predefinedMacros` read + a locally re-applied
+    // format filter: seed site #1 of four.
+    std::span<PredefinedMacroDef const> effectivePredefines;
     // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: sink for every system-descriptor PARENT
     // this builder (and its recursive children) SPLICES for an angle `#include <h>`
     // (or the quote->angle fallback), paired with the SYNTH-BUFFER byte offset of
@@ -557,13 +561,14 @@ struct SynthBuilder {
         // handler), so the separate C19 `seededDefines` NAME set is gone. KEEP the
         // predefined arm: a FUNCTION-like predefine (EXCLUDED from the value prefix
         // per FINDING-A) must still report DEFINED here for `#if defined(NAME)` /
-        // `#ifdef NAME`. The predefined filter is the SHARED helper (FINDING-B) so
-        // it can never drift from the value prefix's predefined subset.
+        // `#ifdef NAME`. TF-C74: the arm walks the pre-filtered EFFECTIVE list
+        // (language ⊕ target), so mere PRESENCE means available — no local filter
+        // to drift from the value prefix's predefined subset, and a per-arch
+        // target predefine (`__aarch64__`) gates a quote-`#include` exactly as a
+        // language one does.
         if (localMacros.find(std::string{n}) != localMacros.end()) return true;
-        for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
-            if (pm.name != n) continue;
-            return predefinedMacroAvailableOnActiveFormat(
-                pm.availableObjectFormats, activeFormat);
+        for (PredefinedMacroDef const& pm : effectivePredefines) {
+            if (pm.name == n) return true;
         }
         return false;
     }
@@ -1508,8 +1513,8 @@ struct SynthBuilder {
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
                                        rep, depth + 1, includeStack, fatal,
-                                       preScanDefinePrefix, resolvedDescriptorsOut,
-                                       localMacros};
+                                       preScanDefinePrefix, effectivePredefines,
+                                       resolvedDescriptorsOut, localMacros};
                     child.build(headerBuf, out, map);
                     includeStack.pop_back();
                     out.push_back(newline);
@@ -1670,7 +1675,8 @@ struct SynthBuilder {
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
                                depth + 1, includeStack, fatal, preScanDefinePrefix,
-                               resolvedDescriptorsOut, localMacros};
+                               effectivePredefines, resolvedDescriptorsOut,
+                               localMacros};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -1801,7 +1807,12 @@ public:
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
                   std::optional<ObjectFormatKind> activeFormat = {},
-                  fs::path includingDir = {})
+                  fs::path includingDir = {},
+                  // TF-C74: the EFFECTIVE predefined list (language ⊕ target,
+                  // already format-resolved). Defaults to {} so the ~dozen
+                  // test/helper constructions compile unchanged; `preprocess()`
+                  // always passes the merged list.
+                  std::span<PredefinedMacroDef const> effectivePredefines = {})
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
@@ -1812,21 +1823,13 @@ public:
         // macro but IS a predefined name materializes its configured value (see
         // `expand`). EMPTY when the language declares none (toy / tsql), so the
         // engine is a strict identity pass for `__LINE__` &c.
-        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
-            // Per-format availability filter (mirrors the shipped-header gate):
-            // a macro with a non-empty `availableObjectFormats` is seeded ONLY
-            // when the active object format is in its set. EMPTY ⇒ every format.
-            // A nullopt activeFormat_ (no target selected) seeds the macro
-            // UNCONDITIONALLY only when the filter is empty; a format-restricted
-            // macro stays unseeded absent a format (it is meaningless without
-            // one). This lets `_WIN32` be predefined for the pe target ONLY.
-            // FINDING-B (C21): the SHARED per-format filter, so this authoritative
-            // `predefined_` seed can never drift from the pre-scan's value prefix +
-            // sbNameDefined.
-            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
-                                                        activeFormat_)) {
-                continue;
-            }
+        // TF-C74: iterate the EFFECTIVE list (language ⊕ target), whose entries
+        // are ALREADY format-resolved by `mergePredefinedMacros` — the per-format
+        // availability filter that used to be re-applied here (and at the three
+        // other seed sites) now runs exactly once, so this authoritative
+        // `predefined_` seed CANNOT drift from the pre-scan's value prefix +
+        // sbNameDefined. Presence in the list IS availability.
+        for (PredefinedMacroDef const& pm : effectivePredefines) {
             // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
             // NOT seeded here — it lowers to a `#define name(params) value`
             // line in the "<built-in>" prologue (see `preprocess()`), making it
@@ -1841,8 +1844,13 @@ public:
         // `"Mmm dd yyyy"` with a SPACE-padded day (e.g. `"Jun  4 2026"`);
         // `__TIME__` is `"hh:mm:ss"`. Computed only when at least one date/time
         // macro is declared (no `std::time` call for a language that needs none).
+        // TF-C74: scan the EFFECTIVE list too, not `cfg().predefinedMacros` — a
+        // target-declared date/time macro (or a format-gated language one that
+        // the filter just dropped) must drive this decision from the SAME list
+        // `predefined_` was seeded from, or the expander would look up a
+        // date/time spelling it never computed.
         bool needDate = false, needTime = false;
-        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+        for (PredefinedMacroDef const& pm : effectivePredefines) {
             if (pm.kind == PredefinedMacroKind::Date) needDate = true;
             if (pm.kind == PredefinedMacroKind::Time) needTime = true;
         }
@@ -4145,13 +4153,80 @@ std::optional<std::string> embedResourceSizeError(std::size_t byteCount) {
           "~2 tokens/byte and would exhaust memory (see D-PP-EMBED-STREAMING)";
 }
 
+// ── TF-C74: the ONE merge of the language and target predefine lists ──────
+//
+// See `preprocessor.hpp` for the contract. The two invariants worth restating
+// where the code is:
+//
+//   • the collision scan runs BEFORE the format filter. A language `_WIN32`
+//     gated `["pe"]` and a target `_WIN32` ungated are a collision on EVERY
+//     leg, including elf/macho where the language entry is filtered out — the
+//     fault is that two configs claim the same NAME, and if it only surfaced
+//     on the pe leg a maintainer could ship the conflict and never see it.
+//
+//   • the format filter runs exactly ONCE, right here. `effective` is the only
+//     predefine list that leaves this function, and every seed site consumes
+//     it verbatim.
+//
+// NOTE (agnosticism): nothing in this function knows any macro's name or any
+// architecture's name. It compares config-supplied strings to each other and
+// never to a literal.
+MergedPredefinedMacros mergePredefinedMacros(
+    std::span<PredefinedMacroDef const> languageMacros,
+    std::span<PredefinedMacroDef const> targetMacros,
+    std::optional<ObjectFormatKind>     activeFormat) {
+    MergedPredefinedMacros out;
+
+    // The per-format availability predicate, in its ONE surviving location.
+    // Local to this function on purpose: no seed site can call it.
+    auto const availableHere = [&](PredefinedMacroDef const& pm) {
+        if (pm.availableObjectFormats.empty()) return true;   // every format
+        if (!activeFormat.has_value()) return false;          // no target ⇒ only universal
+        return ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
+                                                  *activeFormat);
+    };
+
+    // (a) COLLISION SCAN — pre-filter, so gating cannot hide a conflict.
+    for (PredefinedMacroDef const& tgt : targetMacros) {
+        for (PredefinedMacroDef const& lang : languageMacros) {
+            if (lang.name != tgt.name) continue;
+            out.conflicts.push_back(std::format(
+                "predefined macro '{}' is declared by BOTH the language config "
+                "(/preprocess/predefinedMacros) and the target config "
+                "(/predefinedMacros) — neither declaration may silently win; "
+                "remove one, or rename it so the two configs own distinct "
+                "names",
+                tgt.name));
+            break;
+        }
+    }
+    // Within-list duplicates are rejected at LOAD (`parsePredefinedMacroArray`),
+    // so a name can appear at most once per side and the scan above is
+    // sufficient. Returning early keeps `effective` empty — there is no
+    // partially-merged state a caller could mistake for usable.
+    if (!out.conflicts.empty()) return out;
+
+    // (b)+(c) FILTER ONCE, stable order: language entries first, then target.
+    out.effective.reserve(languageMacros.size() + targetMacros.size());
+    for (PredefinedMacroDef const& pm : languageMacros) {
+        if (availableHere(pm)) out.effective.push_back(pm);
+    }
+    for (PredefinedMacroDef const& pm : targetMacros) {
+        if (availableHere(pm)) out.effective.push_back(pm);
+    }
+    // (d) an empty `targetMacros` leaves exactly the format-filtered
+    // language-only list the pre-TF-C74 engine built at each seed site.
+    return out;
+}
+
 PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
     std::span<fs::path const>            systemDirs,
     std::optional<ObjectFormatKind>      activeFormat,
-    std::span<std::string const>         userDefines) {
+    std::span<std::string const>         userDefines,
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -4160,6 +4235,27 @@ PreprocessResult preprocess(
 
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>();
+
+    // TF-C74: merge the LANGUAGE and TARGET predefined-macro lists ONCE, here,
+    // and apply the per-format filter ONCE while doing it. Every one of the
+    // four downstream seed sites reads `merged.effective` and nothing else —
+    // that is what makes the pre-scan/authoritative agreement structural rather
+    // than a convention four sites have to keep.
+    MergedPredefinedMacros const merged = mergePredefinedMacros(
+        schema->preprocess().predefinedMacros, targetPredefinedMacros,
+        activeFormat);
+    if (!merged.conflicts.empty()) {
+        // A name owned by BOTH configs. Neither may silently win, so the pass
+        // does not run at all: `fatal` stops the caller from treating the
+        // (empty) token stream as a successful preprocess.
+        for (std::string const& msg : merged.conflicts) {
+            emitPP(*result.diagnostics,
+                   DiagnosticCode::C_ConflictingPredefinedMacro,
+                   mainSource->id(), SourceSpan::empty(ByteOffset{0}), msg);
+        }
+        result.fatal = true;
+        return result;
+    }
 
     std::string synthText;
 
@@ -4181,14 +4277,12 @@ PreprocessResult preprocess(
     // synth stream is byte-identical to the pre-c105 shape.
     {
         std::string builtinText;
-        for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+        // TF-C74: the EFFECTIVE list (seed site #3 of four) — already
+        // format-resolved, so no filter is re-applied here. A TARGET-declared
+        // function-like predefine lowers to a "<built-in>" `#define` exactly
+        // like a language-declared one.
+        for (PredefinedMacroDef const& pm : merged.effective) {
             if (!pm.isFunctionLike) continue;
-            // FINDING-B (C21): the SHARED per-format filter (same as the pre-scan
-            // value prefix / sbNameDefined / the predefined_ seed).
-            if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
-                                                        activeFormat)) {
-                continue;
-            }
             builtinText += "#define ";
             builtinText += pm.name;
             builtinText += '(';
@@ -4264,12 +4358,12 @@ PreprocessResult preprocess(
         preScanDefinePrefix += val;
         preScanDefinePrefix += '\n';
     }
-    for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+    // TF-C74: the EFFECTIVE list (seed site #4 of four) — already
+    // format-resolved, so no filter is re-applied. This is what makes a
+    // per-architecture predefine usable as a VALUE guard on a quote-`#include`
+    // (`#if __aarch64__` … `#include "x"`), not merely as a definedness test.
+    for (PredefinedMacroDef const& pm : merged.effective) {
         if (pm.isFunctionLike) continue;   // FINDING-A: never value-seed a call macro
-        if (!predefinedMacroAvailableOnActiveFormat(pm.availableObjectFormats,
-                                                    activeFormat)) {
-            continue;
-        }
         preScanDefinePrefix += "#define ";
         preScanDefinePrefix += pm.name;
         preScanDefinePrefix += ' ';
@@ -4297,7 +4391,8 @@ PreprocessResult preprocess(
     std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          *result.diagnostics, 0, includeStack, result.fatal,
-                         preScanDefinePrefix, resolvedParents, preScanMacros};
+                         preScanDefinePrefix, merged.effective,
+                         resolvedParents, preScanMacros};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
@@ -4351,7 +4446,8 @@ PreprocessResult preprocess(
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
                            includeDirs,   systemDirs,   activeFormat,
-                           fs::path{mainSource->name()}.parent_path()};
+                           fs::path{mainSource->name()}.parent_path(),
+                           merged.effective};
     std::vector<Token> finalTokens;
     {
         // D-PERF-1 sub-timing: the macro pass (table build + stream expansion +

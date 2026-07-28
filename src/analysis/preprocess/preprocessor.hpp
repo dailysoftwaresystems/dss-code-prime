@@ -208,6 +208,51 @@ struct DSS_EXPORT PreprocessResult {
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
 };
 
+// ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the effective list ──────
+//
+// The ONE effective-predefined-macro list.
+//
+// Predefined macros come from TWO independent config families: the LANGUAGE
+// (`preprocess.predefinedMacros` in `<lang>.lang.json` — `__LINE__`, `_WIN32`,
+// …) and the TARGET (`predefinedMacros` in `<arch>.target.json` — the
+// per-architecture identity macros `__aarch64__`, `__x86_64__`, …). They are
+// paired only at COMPILE time, when a (language, target) pair actually exists,
+// so this is where the merge — and the collision check — must live.
+struct DSS_EXPORT MergedPredefinedMacros {
+    // The effective list: language entries FIRST, then target entries, each in
+    // declaration order, with the per-entry `availableObjectFormats` filter
+    // ALREADY APPLIED. This is the single list every seed site iterates, which
+    // is why the filter is applied exactly ONCE, here — the four seed sites can
+    // no longer each apply their own copy and drift.
+    std::vector<PredefinedMacroDef> effective;
+    // One message per colliding NAME, each naming BOTH declaring config paths.
+    // NON-EMPTY ⇒ the merge FAILED: `effective` is not usable and the caller
+    // must emit `C_ConflictingPredefinedMacro` and abort the pass. There is no
+    // "merge anyway" mode — a silent last-writer-wins in either direction is
+    // the exact wrong-value miscompile this check exists to prevent.
+    std::vector<std::string> conflicts;
+};
+
+// Merge the language and target predefined-macro lists for `activeFormat`.
+//
+// Properties (each pinned by a test):
+//  (a) a NAME present in BOTH lists is a conflict, compared BEFORE the format
+//      filter — so a `["pe"]`-gated language `_WIN32` still collides with an
+//      ungated target `_WIN32`. Gating is about which formats SEE a macro, not
+//      about who OWNS the name; deferring the check until after the filter
+//      would let a collision hide on every leg but one.
+//  (b) the per-format filter is applied ONCE, here. (An entry with an EMPTY
+//      `availableObjectFormats` is available on every format; a non-empty set
+//      restricts it to those formats; absent an active format only a
+//      universal entry survives.)
+//  (c) order is stable: language entries first, then target entries.
+//  (d) an EMPTY `targetMacros` yields exactly the language-only list the
+//      pre-TF-C74 engine computed — the no-regression invariant.
+[[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
+    std::span<PredefinedMacroDef const> languageMacros,
+    std::span<PredefinedMacroDef const> targetMacros,
+    std::optional<ObjectFormatKind>     activeFormat);
+
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
 // `schema->preprocess().enabled` is true (the caller gates on it; calling
 // with a disabled schema is a usage error and fatal-asserted). `includeDirs`
@@ -240,13 +285,21 @@ struct DSS_EXPORT PreprocessResult {
 // #undef-ability (a -D macro is an ordinary macro). Function-like predefined
 // macros (PredefinedMacroDef.isFunctionLike) ride the same mechanism via a
 // "<built-in>" prologue. Defaults to {} — every existing caller unchanged.
+// TF-C74: `targetPredefinedMacros` is the ACTIVE TARGET's `predefinedMacros`
+// list (`TargetSchema::predefinedMacros()`) — the per-architecture identity
+// macros. Merged with the language's ONCE at entry (`mergePredefinedMacros`),
+// producing the single effective list all four seed sites then iterate. A name
+// declared by BOTH families is FATAL (`C_ConflictingPredefinedMacro`), never
+// silently resolved. Defaults to {} ⇒ output byte-identical to pre-TF-C74, so
+// every existing caller compiles and behaves unchanged.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
-    std::span<std::string const>         userDefines  = {});
+    std::span<std::string const>         userDefines  = {},
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros = {});
 
 // FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
 // check for the cycle-1 `#embed` splice. The splice materializes the resource as

@@ -40,12 +40,14 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -203,6 +205,42 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     return "target spec '" + spec + "' failed to parse.";
 }
 
+// ── TF-C74 (D-PROGRAM-UNKNOWN-OBJECT-FORMAT-SILENT): ONE wording per half ──
+//
+// The two halves of a `--target <targetName>:<formatName>` spec are now
+// checked in TWO places — the pre-flight in `runCusToTargets` (which must
+// reject before the CU build) and `compileOneTarget` (the authoritative site,
+// which still checks because it is reachable on its own terms). Hoisting the
+// CHECK must not fork the MESSAGE, and the only way that survives the next
+// edit is for both sites to call the same emitter.
+//
+// Each emits TWO diagnostics and both are load-bearing: the config loader's
+// own reason (`C_InvalidTargetName` / `C_InvalidFormatName`) says WHAT it
+// could not find and is forwarded verbatim rather than swallowed; the driver's
+// `D_SchemaLoadFailed` says what that means for this build and where to look.
+// Neither is a duplicate of the other, so neither is dropped.
+void emitTargetSchemaLoadFailed(DiagnosticReporter&               rep,
+                                std::span<ConfigDiagnostic const> why,
+                                std::string const&                targetName) {
+    forwardConfigDiagnostics(why, rep);
+    emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+               "target schema '" + targetName
+               + "' could not be loaded — check that "
+                 "src/dss-config/targets/" + targetName
+               + ".target.json exists and parses cleanly.");
+}
+
+void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
+                                      std::span<ConfigDiagnostic const> why,
+                                      std::string const&                formatName) {
+    forwardConfigDiagnostics(why, rep);
+    emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+               "object-format schema '" + formatName
+               + "' could not be loaded — check that "
+                 "src/dss-config/object-formats/" + formatName
+               + ".format.json exists and parses cleanly.");
+}
+
 // D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pool
 // (only consulted when NO executor is injected). Never more workers than there
 // are CUs — extra workers would just block on the empty job queue. An explicit
@@ -276,22 +314,14 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     auto targetR = TargetSchema::loadShipped(parsed->targetName);
     if (!targetR.has_value()) {
-        forwardConfigDiagnostics(targetR.error(), reporter);
-        emitDriver(reporter, DiagnosticCode::D_SchemaLoadFailed,
-                   "target schema '" + parsed->targetName
-                   + "' could not be loaded — check that "
-                     "src/dss-config/targets/" + parsed->targetName
-                   + ".target.json exists and parses cleanly.");
+        emitTargetSchemaLoadFailed(reporter, targetR.error(),
+                                   parsed->targetName);
         return false;
     }
     auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
     if (!formatR.has_value()) {
-        forwardConfigDiagnostics(formatR.error(), reporter);
-        emitDriver(reporter, DiagnosticCode::D_SchemaLoadFailed,
-                   "object-format schema '" + parsed->formatName
-                   + "' could not be loaded — check that "
-                     "src/dss-config/object-formats/" + parsed->formatName
-                   + ".format.json exists and parses cleanly.");
+        emitObjectFormatSchemaLoadFailed(reporter, formatR.error(),
+                                         parsed->formatName);
         return false;
     }
 
@@ -909,16 +939,42 @@ std::optional<ObjectFormatKind> formatKindOfSpec(std::string const& spec) {
     return (*formatR)->kind();
 }
 
+// ── TF-C74: what identifies ONE front-end build ───────────────────────────
+//
+// The front-end is built once per DISTINCT key and CACHED. Before TF-C74 the
+// key was the OBJECT FORMAT ALONE, which was correct only while the
+// preprocessed text depended on nothing else per-target. It now depends on the
+// TARGET's `predefinedMacros` too, and `arm64:elf64-aarch64-linux-exec` and
+// `x86_64:elf64-x86_64-linux-exec` share one object format — so a format-only
+// key would hand the second target the FIRST target's preprocessed text, with
+// the first target's architecture macros baked in. That is a silent
+// miscompile, strictly worse than a loud `#error`, so widening the key is a
+// REQUIRED CORRECTNESS CHANGE, not an optimization.
+//
+// `targetName` is a CACHE KEY and nothing else — it is compared only against
+// other target names, NEVER against a literal. Empty when the language has no
+// preprocess pass, so such a build still collapses to ONE CU for all targets.
+struct CuBuildKey {
+    std::string                     targetName;
+    std::optional<ObjectFormatKind> format;
+    [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
+        if (targetName != o.targetName) return targetName < o.targetName;
+        return format < o.format;
+    }
+};
+
 // Build N CUs' front-end (via `buildCus`), then compile them to each target — the
 // linker MERGES the N CUs into ONE image per target (LK11). Shared by
 // `compileFiles` (one CU5 multi-file CU → 1-element vector) and `compileUnits` (N
 // single-file CUs); the only difference is the `buildCus` closure each passes.
-// c9: `buildCus(kind)` is invoked ONCE PER DISTINCT object-format-kind among the
-// targets (the front-end's `__has_include` depends on the active format), so the
-// CU is rebuilt only when the format actually changes the preprocessed source; the
-// common single-kind case builds exactly once. Returns 0 on success, 1 on any error.
+// c9: `buildCus(key, …)` is invoked ONCE PER DISTINCT `CuBuildKey` among the
+// targets (the front-end's `__has_include` depends on the active format, and —
+// TF-C74 — its predefined macros depend on the target), so the CU is rebuilt only
+// when the key actually changes the preprocessed source; the common single-target
+// case builds exactly once. Returns 0 on success, 1 on any error.
 int runCusToTargets(
-    std::function<std::vector<CompilationUnit>(std::optional<ObjectFormatKind>)> buildCus,
+    std::function<std::vector<CompilationUnit>(
+        CuBuildKey const&, std::span<PredefinedMacroDef const>)> buildCus,
     GrammarSchema const&                        grammar,
     std::string const&                          sourceStem,
     std::vector<std::string> const&             targets,
@@ -943,21 +999,192 @@ int runCusToTargets(
     // gates them. Passed PER TARGET, not resolved once: two targets of one
     // build can differ in whether their format can carry the request.
     ImageRequest const&                         imageRequest) {
-    // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
-    // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
-    // every format (activeFormat is inert) → a single nullopt-keyed build, no
-    // waste. The COMMON case — one target, or every target sharing one kind — is
-    // exactly ONE build, as before c9.
     bool const ppEnabled = grammar.preprocess().enabled;
-    std::map<std::optional<ObjectFormatKind>, std::vector<CompilationUnit>> cuByKey;
-    std::vector<std::optional<ObjectFormatKind>> keyPerTarget;
+
+    // ── TF-C74 (a): resolve every target — and every object format — BEFORE
+    //    the CU build ───────────────────────────────────────────────────────
+    //
+    // The CU build now needs each target's `predefinedMacros`, so target
+    // schemas must be resolved FIRST. This also repairs a LATENT ordering
+    // defect: the CU build used to run before any target schema loaded, and
+    // the `if (rep.hasErrors()) return 1;` below aborts before
+    // `compileOneTarget` ever emits the authoritative `D_SchemaLoadFailed` —
+    // so a bad `--target` surfaced as whatever the front-end happened to
+    // produce (on the sqlite corpus: a cascade of `#error architecture not
+    // supported`) instead of saying the target was wrong. Emitting here means
+    // a bad target spec is now diagnosed as a bad target spec.
+    //
+    // A target whose spec is malformed or whose schema won't load is FATAL
+    // here; the pre-TF-C74 fallback (group it under the nullopt key and let
+    // `compileOneTarget` re-diagnose it) can no longer work, because we would
+    // have no predefine list to build its CU with — and silently building it
+    // with SOME OTHER target's macros is exactly the miscompile this change
+    // exists to prevent.
+    //
+    // ── TF-C74 (D-PROGRAM-UNKNOWN-OBJECT-FORMAT-SILENT): the FORMAT half ──
+    //
+    // The OBJECT FORMAT is resolved here for the same reason the target is,
+    // and it is the same defect: the front-end's output depends on the ACTIVE
+    // FORMAT (format-gated predefines, `__has_include` of a format-gated
+    // shipped header, the per-format descriptor availability set), so an
+    // unknown format used to build a CU with NO format at all — every gated
+    // arm vanished, the source's own fail-loud `#else` fired, and the run
+    // returned at the drain below with a pile of header errors and NOT ONE
+    // WORD about the format. MEASURED before this change on a two-line arch
+    // ladder: `--target arm64:macho64-arm64-darwn-exec` (one letter dropped)
+    // produced exactly one diagnostic, `P_PreprocessorErrorDirective`, and
+    // zero mention of `macho64-arm64-darwn-exec`.
+    //
+    // The format check keys on the FORMAT NAME and nothing else: the
+    // target-name dedupe below cannot be allowed to gate it, because one
+    // target may appear with several formats (`x86_64:elf…` + `x86_64:pe…`)
+    // and a format validated behind a target-keyed skip would be silently
+    // unchecked after the first — the very failure mode being closed. (It
+    // was written ahead of a target-name dedupe `continue`; that `continue`
+    // is now a memoized lookup for the pair check's sake — see below — but
+    // the reason this check owns its own key is unchanged.) Its
+    // `formatChecked` set keeps the diagnostic one-per-distinct-format-name.
+    //
+    // The format schema is retained only FOR THE DURATION OF THIS PASS (the
+    // PAIR check below needs it next to its target), and then dropped: this
+    // pass owns rejection, not caching. `compileOneTarget` remains the
+    // authoritative consumer and still loads its own, so nothing downstream
+    // depends on a copy kept alive here.
+    //
+    // ── TF-C74 (D-PROGRAM-TARGET-FORMAT-PAIR-VALIDATED-LATE): the PAIR ────
+    //
+    // FACET 3 of the same ordering defect, and the one the other two could
+    // not see: a spec's two halves can each be individually VALID while
+    // their COMBINATION is nonsense. `arm64:elf64-x86_64-linux-exec` names a
+    // real target AND a real object format, so both checks above PASS — and
+    // only `crossValidateTargetFormat` rejects it. That call still lives in
+    // `compileOneTarget`, i.e. downstream of the CU build and behind the same
+    // drain, so on a source whose headers cascade the run
+    // ended with ONLY the header `#error`. MEASURED before this change, on
+    // the arch ladder used by the witness: `--target
+    // arm64:elf64-x86_64-linux-exec` produced exactly ONE diagnostic,
+    // `P_PreprocessorErrorDirective`, and not one word about the mismatch —
+    // while the SAME spec over a header-less source printed the full
+    // `D_TargetMachineCodeMismatch`. The diagnostic was never missing, only
+    // unreachable.
+    //
+    // The CALL is hoisted, never the MESSAGE: `crossValidateTargetFormat` is
+    // already the one emitter, so both sites say the identical thing by
+    // construction — the same rule the two half-checks bought with their
+    // shared `emit*SchemaLoadFailed` helpers. `compileOneTarget` keeps its
+    // call: it is a [[nodiscard]] helper that must stay correct when invoked
+    // directly, and with all three facets now pre-flighted its copy is
+    // DEFENSE IN DEPTH rather than a live path — which is exactly why it must
+    // share the emitter instead of restating the message.
+    //
+    // ★ THE DE-DUPLICATION KEY IS THE ORDERED PAIR, and it cannot be either
+    // half. This check's verdict is a RELATION over both names, so a key that
+    // drops one half silently skips distinct pairs that happen to share the
+    // other: keyed on the TARGET, `arm64:elf64-aarch64-linux-exec` (good) +
+    // `arm64:elf64-x86_64-linux-exec` (bad) validates only the first; keyed on
+    // the FORMAT, `arm64:elf64-aarch64-linux-exec` (good) +
+    // `x86_64:elf64-aarch64-linux-exec` (bad) likewise. Both are the very
+    // silent skip being closed, and both are MEASURED red-on-disable in
+    // `TFC74PairCheckDedupeKeyIsTheOrderedPair` — each wrong key reds exactly
+    // the leg aimed at it. That is also why the target-name dedupe below is
+    // now a MEMOIZED LOOKUP instead of an early `continue`: the pair check has
+    // to run for every spec, and a `continue` keyed on one half would have
+    // re-introduced the bug one level up.
+    std::map<std::string, std::shared_ptr<TargetSchema const>> targetByName;
+    std::unordered_set<std::string>                            formatChecked;
+    std::unordered_map<std::string,
+                       std::shared_ptr<ObjectFormatSchema const>> formatByName;
+    std::set<std::pair<std::string, std::string>>              pairChecked;
+    for (auto const& spec : targets) {
+        auto parsed = TargetSpec::parse(spec);
+        if (!parsed) {
+            emitDriver(rep, DiagnosticCode::D_InvalidTargetSpec,
+                       targetSpecErrorMessage(spec, parsed.error()));
+            continue;
+        }
+        if (formatChecked.insert(parsed->formatName).second) {
+            auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
+            if (!formatR.has_value()) {
+                emitObjectFormatSchemaLoadFailed(rep, formatR.error(),
+                                                 parsed->formatName);
+                // No `continue`: a spec can be wrong in BOTH halves, and the
+                // operator deserves both names in one run rather than one
+                // recompile per typo. The drain below aborts either way.
+            } else {
+                formatByName.emplace(parsed->formatName, *formatR);
+            }
+        }
+        // Load each distinct target ONCE, memoized. (Was `if
+        // (targetByName.count(...)) continue;` — see the pair-key note above
+        // for why the `continue` had to go.) A failed load is still fatal for
+        // THIS spec: with no target schema there is no pair to validate, and
+        // the reason is already on the reporter.
+        auto targetIt = targetByName.find(parsed->targetName);
+        if (targetIt == targetByName.end()) {
+            auto targetR = TargetSchema::loadShipped(parsed->targetName);
+            if (!targetR.has_value()) {
+                emitTargetSchemaLoadFailed(rep, targetR.error(),
+                                           parsed->targetName);
+                continue;
+            }
+            targetIt = targetByName.emplace(parsed->targetName, *targetR).first;
+        }
+        auto const formatIt = formatByName.find(parsed->formatName);
+        if (formatIt != formatByName.end()
+            && pairChecked.emplace(parsed->targetName,
+                                   parsed->formatName).second) {
+            // Unlike the two half-checks, the pair message names the target
+            // and the two machine codes but NOT the format — so on a
+            // multi-target build it cannot say by itself WHICH spec was
+            // rejected. Route it through the same `[target=<spec>]` stamp the
+            // per-target loop uses, so hoisting the call costs the operator
+            // nothing the downstream path carried. Scratch config mirrors
+            // that loop's: `rep`'s POLICY axes, cap/dedup relaxed because
+            // those are enforced once at `rep` during the merge.
+            auto pairCfg = rep.config();
+            pairCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+            pairCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+            pairCfg.dedupWindow    = 0;
+            DiagnosticReporter pairScratch{pairCfg};
+            // Verdict discarded deliberately: no `continue`, for the same
+            // reason the format half has none — a spec wrong in more than one
+            // way must report every reason in ONE run. The drain aborts.
+            (void)crossValidateTargetFormat(*targetIt->second,
+                                            *formatIt->second, pairScratch);
+            mergeWithTargetContext(pairScratch, spec, rep);
+        }
+    }
+    if (rep.hasErrors()) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
+    // c9 + TF-C74 (b): build the front-end ONCE PER DISTINCT `CuBuildKey`. A
+    // language WITHOUT a preprocess pass produces identical CUs for every
+    // target (both `activeFormat` and the target predefines are inert) → the
+    // key is {"" , nullopt} for every target → a single build, no waste. The
+    // COMMON case — ONE target — is exactly one build, as before c9. What
+    // CHANGES vs c9: two targets of DIFFERENT architecture sharing one object
+    // format (arm64:elf… + x86_64:elf…) now build TWICE, because their
+    // architecture predefines differ and reusing one CU for both would splice
+    // the wrong architecture's macros into the second image.
+    std::map<CuBuildKey, std::vector<CompilationUnit>> cuByKey;
+    std::vector<CuBuildKey> keyPerTarget;
     keyPerTarget.reserve(targets.size());
     for (auto const& spec : targets) {
-        std::optional<ObjectFormatKind> const key =
-            ppEnabled ? formatKindOfSpec(spec) : std::nullopt;
+        CuBuildKey key;
+        std::span<PredefinedMacroDef const> targetPredefines;
+        if (ppEnabled) {
+            key.format = formatKindOfSpec(spec);
+            // The spec parsed cleanly above (we returned otherwise), so this
+            // lookup always resolves.
+            auto const parsed = TargetSpec::parse(spec);
+            key.targetName    = parsed->targetName;
+            targetPredefines  = targetByName.at(key.targetName)->predefinedMacros();
+        }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
-            cuByKey.emplace(key, buildCus(key));
+            cuByKey.emplace(key, buildCus(key, targetPredefines));
         }
     }
 
@@ -1556,13 +1783,17 @@ int Program::compileFiles(
     // `kind` is nullopt for a non-preprocess language / undeterminable spec
     // (pure-existence, unchanged). The build still runs on the 64 MiB worker stack
     // (D-PARSE-DEEP-FRONTEND-STACK).
-    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+    auto buildCus = [&](CuBuildKey const&                   key,
+                        std::span<PredefinedMacroDef const> targetPredefines)
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
-                if (kind) builder.setActiveFormat(*kind);
+                if (key.format) builder.setActiveFormat(*key.format);
+                // TF-C74: the active target's per-architecture identity macros.
+                builder.setTargetPredefinedMacros(
+                    {targetPredefines.begin(), targetPredefines.end()});
                 builder.setUserDefines(userDefines());  // c105: --define
                 applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                 for (auto const& path : sourceFiles) {
@@ -1638,7 +1869,8 @@ int Program::compileUnits(
     // c9 (Phase-2): build N single-file CUs once per distinct object-format-kind
     // (the closure `runCusToTargets` invokes), so `__has_include` is per-target
     // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
-    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+    auto buildCus = [&](CuBuildKey const&                   key,
+                        std::span<PredefinedMacroDef const> targetPredefines)
         -> std::vector<CompilationUnit> {
         std::vector<CompilationUnit> cus;
         cus.reserve(sourceFiles.size());
@@ -1650,7 +1882,10 @@ int Program::compileUnits(
                 substrate::kDeepRecursionStackBytes, [&] {
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
-                    if (kind) builder.setActiveFormat(*kind);
+                    if (key.format) builder.setActiveFormat(*key.format);
+                    // TF-C74: the active target's per-architecture identity macros.
+                    builder.setTargetPredefinedMacros(
+                        {targetPredefines.begin(), targetPredefines.end()});
                     builder.setUserDefines(userDefines());  // c105: --define
                     applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                     builder.addFile(fs::path{path});

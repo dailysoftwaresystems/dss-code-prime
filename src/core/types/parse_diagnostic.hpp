@@ -264,6 +264,23 @@ enum class DiagnosticCode : std::uint16_t {
     // unknown TOKEN-name field still routes to `C_UnknownToken`, a missing
     // required string to `C_MissingField`.
     C_InvalidPreprocess           = 0xC037,
+    // TF-C74: ONE predefined-macro name declared by BOTH the language config
+    // (`preprocess.predefinedMacros` in `<lang>.lang.json`) AND the target
+    // config (`predefinedMacros` in `<arch>.target.json`). Neither declaration
+    // may silently win: the language's `_WIN32` and a target's `_WIN32` are two
+    // different authors' intentions, and picking either one quietly is a
+    // wrong-value miscompile with no diagnostic. Detected when the two lists
+    // are MERGED (at preprocess time — the pairing does not exist earlier),
+    // BEFORE the per-format filter, so a `["pe"]`-gated language entry still
+    // collides with an ungated target entry of the same name (the collision is
+    // about the NAME being owned twice, not about which formats happen to see
+    // it). The message names BOTH declaring config paths.
+    //
+    // Distinct from `C_InvalidPreprocess` (scoped to the language `preprocess`
+    // block — this fault belongs to neither block alone) and from
+    // `C_ConflictingField` (single-document semantics — this is a
+    // CROSS-document conflict between two independently valid configs).
+    C_ConflictingPredefinedMacro  = 0xC038,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer

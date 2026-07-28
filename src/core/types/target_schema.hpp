@@ -2587,6 +2587,26 @@ struct DSS_EXPORT TargetSchemaData {
     // char→int promotion's SExt-vs-ZExt decision) via `MirLoweringConfig`.
     bool charIsUnsigned = false;
 
+    // TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the target's
+    // PER-ARCHITECTURE IDENTITY predefined macros
+    // (`"predefinedMacros"` — the same entry grammar as the language's
+    // `preprocess.predefinedMacros`, parsed by the SHARED
+    // `parsePredefinedMacroArray`). This lives on the TARGET, not the
+    // language, because it is per-CPU-architecture semantics — exactly like
+    // `charIsUnsigned` / `aggregateLayout` / `tls` above. The alternative
+    // (a language-side arch filter) would force `c-subset.lang.json` to
+    // enumerate CPU architectures: a layering inversion.
+    //
+    // Merged with the language list at preprocess time
+    // (`mergePredefinedMacros`), which is where a name declared by BOTH
+    // sides fails LOUD — there is no last-writer-wins in either direction.
+    // OPTIONAL; absent ⇒ empty ⇒ the preprocessor's effective list is
+    // byte-identical to the language-only list (the no-regression
+    // invariant). Per-entry `availableObjectFormats` still applies, which is
+    // how the Apple-only `__arm64__`/`__arm64` spellings stay macho-gated
+    // while `__aarch64__` is universal.
+    std::vector<PredefinedMacroDef> predefinedMacros;
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
     // a target without it (arm64 until TLS C2) cannot lay out a TLS
@@ -2850,6 +2870,19 @@ public:
     // ZExt (unsigned) vs SExt (signed) with NO arch identity branch.
     [[nodiscard]] bool charIsUnsigned() const noexcept {
         return d_.charIsUnsigned;
+    }
+
+    // ── Per-architecture identity predefined macros (TF-C74) ──────
+    // The target's `predefinedMacros` rows, in declaration order and
+    // UNFILTERED (the per-entry `availableObjectFormats` filter is
+    // applied ONCE downstream, in `mergePredefinedMacros`, alongside
+    // the language's — one filter, so the four preprocessor seed
+    // sites can never disagree). EMPTY for a target that declares
+    // none ⇒ the preprocessor's effective list is byte-identical to
+    // the language-only list.
+    [[nodiscard]] std::span<PredefinedMacroDef const>
+    predefinedMacros() const noexcept {
+        return d_.predefinedMacros;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────

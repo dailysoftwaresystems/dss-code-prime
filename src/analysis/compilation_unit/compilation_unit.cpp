@@ -240,7 +240,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         std::optional<substrate::PhaseTimers::Scope> phase;
         phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
-                                         activeFormat_, userDefines_);
+                                         activeFormat_, userDefines_,
+                                         targetPredefinedMacros_);
         phase.reset();
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
@@ -435,6 +436,14 @@ void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
         cuFatal("UnitBuilder::setUserDefines called after finish()");
     }
     userDefines_ = std::move(defines);
+}
+
+void UnitBuilder::setTargetPredefinedMacros(
+    std::vector<PredefinedMacroDef> macros) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setTargetPredefinedMacros called after finish()");
+    }
+    targetPredefinedMacros_ = std::move(macros);
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,

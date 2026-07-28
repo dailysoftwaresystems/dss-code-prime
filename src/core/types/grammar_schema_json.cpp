@@ -10,7 +10,9 @@
 #include "core/types/tree_node.hpp"
 #include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
 #include "core/types/attribute_naming.hpp"     // stripDunder — the ONE dunder normalizer, shared with the semantic attribute scans (TF-C73 drift cross-check)
+#include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74: shared with the target loader)
 #include "core/types/data_model.hpp"           // dataModelFromName (FC3 c1 coreByDataModel keys)
+#include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
@@ -36,76 +38,15 @@ namespace {
 
 using json = nlohmann::json;
 
-// ── the `$` documentation-key convention ──────────────────────────────────
+// ── closed-key vocabulary + the `$` documentation-key convention ──────────
 //
-// A key whose name starts with `$` (`$comment`, `$…Comment`) is PROSE, never
-// config: the codebase-wide way to explain a block inside the JSON that
-// declares it. Every closed-key vocabulary in this loader must skip such keys,
-// and so must every place that reads an object's keys AS IDENTIFIERS — most
-// sharply the `shapes` map, where a `$`-prefixed sibling of the rule names was
-// read as a SHAPE DEFINITION and its prose value as a rule REFERENCE, failing
-// the whole load with the paragraph echoed back as if it were a rule name.
-//
-// ★ ONE predicate, not a ninth copy of the same expression. The convention had
-// been open-coded identically at seven sites; a convention spelled out N times
-// is a convention that holds only where someone remembered it, and the shapes
-// map is the site where it was forgotten. Every site now calls this, so
-// "documentation key" has exactly one definition to read and to change.
-[[nodiscard]] constexpr bool isDocumentationKey(std::string_view key) {
-    return !key.empty() && key.front() == '$';
-}
-
-// ── the closed-key-vocabulary well-formedness check ───────────────────────
-//
-// Every `kSomethingKeys` table in this loader is a `std::array<string_view, N>`
-// whose N is written BY HAND next to the initializer list — and the compiler
-// does NOT check that the two agree in the dangerous direction.
-// `std::array<std::string_view, 57>` with 56 initializers is perfectly legal:
-// it value-initializes the tail, so element 56 becomes the EMPTY string_view
-// and the typo discriminator silently starts whitelisting a key of `""`.
-// (MEASURED on `kSemanticsKeys`: bumping 56→57 alone compiles clean, and a
-// `semantics` key of `""` then loads without a diagnostic.) A DUPLICATE entry
-// is silent in a mirror-image way — it inflates the count, so a key that is
-// actually missing looks accounted for by the number.
-//
-// ★ ONE helper, not a copy of the loop per table. The check had been written
-// once, for `kDeclarationRowKeys`, and the three sibling tables — including the
-// 56-entry `kSemanticsKeys`, the largest and most edit-prone of them — went
-// unguarded; a guard that must be remembered per table is a guard that holds
-// only where someone remembered it. Every closed-key table now calls this, at
-// compile time, so the next person to add a key cannot get the number wrong
-// without the build saying so.
-template <std::size_t N>
-[[nodiscard]] constexpr bool isWellFormedKeyVocabulary(
-    std::array<std::string_view, N> const& keys) {
-    for (std::size_t a = 0; a < N; ++a) {
-        if (keys[a].empty()) return false;             // under-filled ⇒ tail is ""
-        for (std::size_t b = a + 1; b < N; ++b)
-            if (keys[a] == keys[b]) return false;      // duplicate ⇒ count lies
-    }
-    return true;
-}
-// The same check for a name→value vocabulary (a verb table). The under-fill
-// hazard is WORSE here: the value half zero-initializes too, so the phantom
-// `""` verb silently maps to whatever enumerator happens to be 0.
-template <typename T, std::size_t N>
-[[nodiscard]] constexpr bool isWellFormedKeyVocabulary(
-    std::array<std::pair<std::string_view, T>, N> const& rows) {
-    for (std::size_t a = 0; a < N; ++a) {
-        if (rows[a].first.empty()) return false;
-        for (std::size_t b = a + 1; b < N; ++b)
-            if (rows[a].first == rows[b].first) return false;
-    }
-    return true;
-}
-// The one message every closed-key table shares, so the diagnosis reads the
-// same wherever the build breaks.
-#define DSS_CHECK_KEY_VOCABULARY(table)                                        \
-    static_assert(isWellFormedKeyVocabulary(table),                            \
-                  #table ": the declared std::array size must equal the "      \
-                  "initializer count (an under-filled array zero-fills and "   \
-                  "would whitelist the empty key) and every entry must be "    \
-                  "unique")
+// EXTRACTED (TF-C74) to `core/types/config_key_vocabulary.hpp` —
+// `isDocumentationKey`, `isWellFormedKeyVocabulary` and
+// `DSS_CHECK_KEY_VOCABULARY` are now SHARED with the target-schema loader,
+// which gained its own closed root-key vocabulary in the same cycle. The
+// rationale (an under-filled `std::array` whitelisting the empty key; a
+// `$comment` read as a rule name) lives with the definitions there. Every
+// use below is unqualified and resolves to `dss::detail::…`.
 
 // ── ScopeKind name lookup ─────────────────────────────────────────────────
 constexpr std::pair<std::string_view, ScopeKind> kBuiltinScopes[] = {
@@ -4256,209 +4197,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "/preprocess/predefinedMacros",
                               "'preprocess.predefinedMacros' must be an array");
                 } else {
-                    for (std::size_t mi = 0; mi < pms.size(); ++mi) {
-                        const auto mpath =
-                            std::format("/preprocess/predefinedMacros/{}", mi);
-                        json const& e = pms[mi];
-                        if (!e.is_object()) {
-                            coll.emit(DiagnosticCode::C_InvalidPreprocess, mpath,
-                                      "a 'predefinedMacros' entry must be an "
-                                      "object");
-                            continue;
-                        }
-                        PredefinedMacroDef pm;
-                        // `name` -- REQUIRED, non-empty string.
-                        if (!e.contains("name")) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      mpath + "/name",
-                                      "a 'predefinedMacros' entry requires 'name'");
-                            continue;
-                        }
-                        if (!e.at("name").is_string()) {
-                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                      mpath + "/name",
-                                      "'predefinedMacros.name' must be a string");
-                            continue;
-                        }
-                        pm.name = e.at("name").get<std::string>();
-                        if (pm.name.empty()) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      mpath + "/name",
-                                      "'predefinedMacros.name' must be non-empty");
-                            continue;
-                        }
-                        // `kind` -- REQUIRED, one of the CLOSED verb set.
-                        if (!e.contains("kind")) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      mpath + "/kind",
-                                      "a 'predefinedMacros' entry requires 'kind'");
-                            continue;
-                        }
-                        if (!e.at("kind").is_string()) {
-                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                      mpath + "/kind",
-                                      "'predefinedMacros.kind' must be a string");
-                            continue;
-                        }
-                        const std::string kind = e.at("kind").get<std::string>();
-                        bool isConstant = false;
-                        if (kind == "line") {
-                            pm.kind = PredefinedMacroKind::Line;
-                        } else if (kind == "file") {
-                            pm.kind = PredefinedMacroKind::File;
-                        } else if (kind == "constant") {
-                            pm.kind = PredefinedMacroKind::Constant;
-                            isConstant = true;
-                        } else if (kind == "date") {
-                            pm.kind = PredefinedMacroKind::Date;
-                        } else if (kind == "time") {
-                            pm.kind = PredefinedMacroKind::Time;
-                        } else {
-                            coll.emit(
-                                DiagnosticCode::C_InvalidPreprocess,
-                                mpath + "/kind",
-                                std::format("unknown predefined-macro kind '{}' "
-                                            "(expected line/file/constant/date/"
-                                            "time)",
-                                            kind));
-                            continue;
-                        }
-                        // `value` -- REQUIRED iff kind==constant; the static
-                        // replacement spelling. Ignored for the derived kinds.
-                        if (isConstant) {
-                            if (!e.contains("value")) {
-                                coll.emit(DiagnosticCode::C_MissingField,
-                                          mpath + "/value",
-                                          "a 'constant' predefinedMacros entry "
-                                          "requires 'value'");
-                                continue;
-                            }
-                            if (!e.at("value").is_string()) {
-                                coll.emit(
-                                    DiagnosticCode::C_InvalidPreprocess,
-                                    mpath + "/value",
-                                    "'predefinedMacros.value' must be a string");
-                                continue;
-                            }
-                            pm.value = e.at("value").get<std::string>();
-                        }
-                        // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL `params`
-                        // — a FUNCTION-LIKE predefine (e.g. the MSVC-profile
-                        // `__declspec(x)` → empty erase). Constant-kind only
-                        // (the derived kinds are inherently object-like). Each
-                        // param must be a non-empty unique string (C 6.10.3p6
-                        // duplicate-param parity with the directive handler,
-                        // enforced HERE so a config typo fails at load).
-                        if (e.contains("params")) {
-                            if (!isConstant) {
-                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                          mpath + "/params",
-                                          "'params' is valid only on a 'constant' "
-                                          "predefinedMacros entry");
-                                continue;
-                            }
-                            json const& prs = e.at("params");
-                            if (!prs.is_array()) {
-                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                          mpath + "/params",
-                                          "'predefinedMacros.params' must be an "
-                                          "array of parameter-name strings");
-                                continue;
-                            }
-                            bool prOk = true;
-                            for (std::size_t pi = 0; pi < prs.size(); ++pi) {
-                                if (!prs[pi].is_string()
-                                    || prs[pi].get<std::string>().empty()) {
-                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                              mpath + "/params",
-                                              "each 'params' entry must be a "
-                                              "non-empty string");
-                                    prOk = false;
-                                    break;
-                                }
-                                std::string p = prs[pi].get<std::string>();
-                                // c105 audit L2: each param must BE an
-                                // identifier ([A-Za-z_][A-Za-z0-9_]*) — a
-                                // config `"a b"` would otherwise emit a
-                                // malformed prologue #define that fails only
-                                // at first preprocess, not at load.
-                                bool idOk = !(p[0] >= '0' && p[0] <= '9');
-                                for (char const c : p) {
-                                    if (!((c >= 'A' && c <= 'Z')
-                                          || (c >= 'a' && c <= 'z')
-                                          || (c >= '0' && c <= '9')
-                                          || c == '_')) {
-                                        idOk = false;
-                                        break;
-                                    }
-                                }
-                                if (!idOk) {
-                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                              mpath + "/params",
-                                              std::format("macro parameter '{}' "
-                                                          "is not an identifier",
-                                                          p));
-                                    prOk = false;
-                                    break;
-                                }
-                                if (std::find(pm.params.begin(), pm.params.end(),
-                                              p) != pm.params.end()) {
-                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                              mpath + "/params",
-                                              std::format("duplicate macro "
-                                                          "parameter '{}'", p));
-                                    prOk = false;
-                                    break;
-                                }
-                                pm.params.push_back(std::move(p));
-                            }
-                            if (!prOk) continue;
-                            pm.isFunctionLike = true;
-                        }
-                        // OPTIONAL `availableObjectFormats` — a per-format
-                        // availability filter (mirrors the shipped-lib
-                        // descriptor field). Absent ⇒ available on every format.
-                        // Present: an array of object-format NAMES; each must be
-                        // a known name ("pe"/"elf"/"macho") or fail LOUD (never a
-                        // silent typo). Lets `_WIN32` be predefined pe-only.
-                        if (e.contains("availableObjectFormats")) {
-                            json const& afs = e.at("availableObjectFormats");
-                            if (!afs.is_array()) {
-                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                          mpath + "/availableObjectFormats",
-                                          "'predefinedMacros.availableObjectFormats'"
-                                          " must be an array of object-format names,"
-                                          " e.g. [\"pe\"]");
-                                continue;
-                            }
-                            bool afOk = true;
-                            for (std::size_t ai = 0; ai < afs.size(); ++ai) {
-                                json const& av = afs[ai];
-                                if (!av.is_string()) {
-                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                              mpath + "/availableObjectFormats",
-                                              "'availableObjectFormats' entries must "
-                                              "be strings");
-                                    afOk = false;
-                                    break;
-                                }
-                                std::string fmt = av.get<std::string>();
-                                if (!objectFormatKindFromName(fmt).has_value()) {
-                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
-                                              mpath + "/availableObjectFormats",
-                                              std::format("unknown object-format name"
-                                                          " '{}' (expected "
-                                                          "\"pe\"/\"elf\"/\"macho\")",
-                                                          fmt));
-                                    afOk = false;
-                                    break;
-                                }
-                                pm.availableObjectFormats.push_back(std::move(fmt));
-                            }
-                            if (!afOk) continue;
-                        }
-                        cfg.predefinedMacros.push_back(std::move(pm));
-                    }
+                    // TF-C74: the per-entry grammar is the SHARED parser
+                    // (`predefined_macro_json.hpp`) — the same one the TARGET
+                    // loader calls for its per-architecture identity macros, so
+                    // the two families can never drift on the closed `kind`
+                    // verb set, the Constant⇒`value` rule, the function-like
+                    // `params` checks, or `availableObjectFormats` validation.
+                    detail::parsePredefinedMacroArray(
+                        pms, "/preprocess/predefinedMacros",
+                        DiagnosticCode::C_InvalidPreprocess, coll,
+                        cfg.predefinedMacros);
                 }
             }
 

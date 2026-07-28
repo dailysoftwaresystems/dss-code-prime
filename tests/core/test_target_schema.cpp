@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <gtest/gtest.h>
 #include <set>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // Negative-path tests for the `TargetSchema` JSON loader. Mirrors the
 // shape of `test_grammar_schema.cpp` since the two loaders are parallel
@@ -1706,4 +1708,200 @@ TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
     ASSERT_FALSE(bad.has_value())
         << "an argVrs naming a GPR (non-VR) register must fail loud";
     EXPECT_TRUE(anyHasCode(bad.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C74 — per-ARCHITECTURE identity predefined macros (`predefinedMacros`)
+// + the target family's closed root-key vocabulary.
+//
+// The macros that tell the preprocessor which CPU it is compiling for live on
+// the TARGET, next to the other per-target language-affecting semantics
+// (`charIsUnsigned`, `aggregateLayout`, `tls`, `callingConventions`) — putting
+// them on the language would force `c-subset.lang.json` to enumerate CPU
+// architectures. Entry grammar is the SHARED parser the language loader uses.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// One shipped predefine row, flattened for exact-set comparison. Comparing the
+// WHOLE row (name + kind + value + format gate) in ORDER is the point: a count
+// would pass if `__arm64__` silently lost its ["macho"] gate and started
+// leaking an Apple-only spelling onto the ELF leg.
+struct PredefineRow {
+    std::string_view              name;
+    ::dss::PredefinedMacroKind    kind;
+    std::string_view              value;
+    std::vector<std::string_view> formats;   // empty ⇒ ungated (every format)
+
+    bool operator==(PredefineRow const&) const = default;
+};
+
+[[nodiscard]] std::vector<PredefineRow> rowsOf(::dss::TargetSchema const& t) {
+    std::vector<PredefineRow> out;
+    for (auto const& pm : t.predefinedMacros()) {
+        PredefineRow r{pm.name, pm.kind, pm.value, {}};
+        for (auto const& f : pm.availableObjectFormats) r.formats.push_back(f);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+}  // namespace
+
+// EXACT SET, in declaration order — names, kinds, values AND format gates.
+//
+// MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`:
+//   arm64-apple-darwin  defines __aarch64__ __ARM_ARCH_ISA_A64 __arm64__ __arm64
+//   aarch64-linux-gnu   defines __aarch64__ __ARM_ARCH_ISA_A64   (NO __arm64*)
+// So `__arm64__`/`__arm64` are APPLE-ONLY and MUST carry ["macho"]. Shipping
+// them ungated leaks an Apple spelling onto ELF; shipping only `__aarch64__`
+// clears nothing on macOS, whose SDK arch ladders gate on `__arm64__`.
+// RED-ON-DISABLE: drop the gate from arm64.target.json and the format-set
+// comparison fails.
+TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
+    auto r = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(r.has_value());
+    using K = ::dss::PredefinedMacroKind;
+    EXPECT_EQ(rowsOf(**r),
+              (std::vector<PredefineRow>{
+                  {"__aarch64__",        K::Constant, "1", {}},
+                  {"__ARM_ARCH_ISA_A64", K::Constant, "1", {}},
+                  {"__arm64__",          K::Constant, "1", {"macho"}},
+                  {"__arm64",            K::Constant, "1", {"macho"}},
+              }))
+        << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated "
+           "and the two APPLE-ONLY spellings gated to macho";
+}
+
+// The x86_64 twin: MEASURED identical on x86_64-linux-gnu, x86_64-apple-darwin
+// AND x86_64-pc-windows-msvc, so all four spellings are UNGATED. This test
+// pinning EMPTY format sets is what keeps someone from "symmetrically" adding
+// a gate here by analogy with arm64 — the asymmetry is a real toolchain fact.
+TEST(TargetSchema, TFC74X86_64PredefinedMacrosExactSet) {
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    using K = ::dss::PredefinedMacroKind;
+    EXPECT_EQ(rowsOf(**r),
+              (std::vector<PredefineRow>{
+                  {"__x86_64__", K::Constant, "1", {}},
+                  {"__x86_64",   K::Constant, "1", {}},
+                  {"__amd64__",  K::Constant, "1", {}},
+                  {"__amd64",    K::Constant, "1", {}},
+              }))
+        << "x86_64 predefines all four spellings UNGATED (measured present on "
+           "linux, darwin and windows-msvc alike)";
+}
+
+// A target declaring NO `predefinedMacros` is legal and yields an EMPTY span —
+// the no-regression path (the preprocessor's effective list is then exactly the
+// language's).
+TEST(TargetSchema, TFC74PredefinedMacrosOptional) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->predefinedMacros().empty());
+}
+
+// ── the entry grammar, inherited from the SHARED parser ──────────────────
+// Each of these would have to be re-implemented (and could drift) had the
+// target loader copied the language loader's parser instead of calling it.
+
+TEST(TargetSchema, TFC74PredefinedMacroUnknownKindRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "the `kind` verb set is CLOSED — a typo must never load as some "
+           "default kind";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, TFC74PredefinedMacroConstantRequiresValue) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a constant predefine with no `value` would expand to nothing — "
+           "that must be a load error, not an empty macro";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(TargetSchema, TFC74PredefinedMacroBadObjectFormatRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                 "availableObjectFormats":["machoo"]}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an unknown object-format name is a typo that would make the macro "
+           "dead on EVERY target — it must fail loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1"},
+                                {"name":"__X__","kind":"constant","value":"2"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "two entries for one name would make the effective value depend on "
+           "which preprocessor seed site iterated last — fail loud instead";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ── the closed root-key vocabulary (TF-C74) ──────────────────────────────
+//
+// ★ This is the pin that makes the whole feature HONEST. Before TF-C74 the
+// target loader read every root key through a bare `doc.contains(…)` and
+// ignored unknowns, so a misspelled `"predefindMacros"` would have loaded
+// perfectly clean and the entire per-architecture-identity feature would have
+// silently no-op'd — a knob that lies. RED-ON-DISABLE: delete the
+// `kTargetDocumentKeys` loop in target_schema_json.cpp and this test fails
+// while every other test in this file still passes.
+TEST(TargetSchema, TFC74UnknownRootKeyRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefindMacros":[{"name":"__X__","kind":"constant","value":"1"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled root key must be REJECTED — silently ignoring it "
+           "makes every optional key a knob that can lie";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// The `$`-prefix documentation carve-out is MANDATORY, not decorative: both
+// shipped target files use `$comment` / `$…Comment` heavily, so without it the
+// closed vocabulary above would reject every shipped target on first load.
+TEST(TargetSchema, TFC74DollarPrefixedRootKeysStillAccepted) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "$comment":"prose, not config",
+            "$predefinedMacrosComment":"why these spellings are gated",
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "`$`-prefixed keys are the codebase-wide documentation convention "
+           "and must survive the typo discriminator";
+}
+
+// Both SHIPPED targets must load clean under the closed vocabulary — the
+// regression this catches is adding a root key to a .target.json without
+// adding it to `kTargetDocumentKeys` (or vice versa).
+TEST(TargetSchema, TFC74ShippedTargetsSatisfyClosedRootKeyVocabulary) {
+    for (char const* name : {"arm64", "x86_64"}) {
+        auto r = TargetSchema::loadShipped(name);
+        EXPECT_TRUE(r.has_value())
+            << name << ".target.json must load clean under the closed "
+                       "root-key vocabulary";
+    }
 }

@@ -3,10 +3,13 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <format>
@@ -673,6 +676,49 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
 
+    // ── closed root-key vocabulary (TF-C74) ───────────────────────────────
+    //
+    // The TARGET loader had NO closed root-key vocabulary: every root key was
+    // read through a bare `doc.contains(…)` and an unknown key was silently
+    // ignored. MEASURED consequence for THIS cycle: a misspelled
+    // `"predefindMacros"` would have loaded perfectly clean and the whole
+    // per-architecture-identity feature would have silently no-op'd — the new
+    // key would have been a knob that LIES. The language family closed this in
+    // TF-C72 (`kDocumentKeys`); the target family closes it here, with the same
+    // helper (`DSS_CHECK_KEY_VOCABULARY`) and the same `C_MalformedJson` code.
+    //
+    // The `$`-prefix carve-out is MANDATORY, not decorative: both shipped
+    // target files use `$comment` / `$…Comment` heavily (MEASURED: 12 such
+    // keys in arm64.target.json, 10 in x86_64.target.json), so without it the
+    // guard would reject every shipped target on its first load.
+    //
+    // Every name here is a key the loader genuinely reads.
+    static constexpr std::array<std::string_view, 14> kTargetDocumentKeys{
+        // identity + loader gates
+        "dssTargetVersion", "target",
+        // per-target LANGUAGE-affecting semantics
+        "charIsUnsigned", "predefinedMacros", "aggregateLayout", "tls",
+        // machine description
+        "opcodes", "registers", "registerClassOps", "relocations",
+        "condCodeEncoding",
+        // ABI / softcall surface
+        "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
+        "callingConventions"};
+    DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (detail::isDocumentationKey(it.key())) continue;
+        bool known = false;
+        for (auto const& k : kTargetDocumentKeys) {
+            if (it.key() == k) { known = true; break; }
+        }
+        if (!known) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/{}", it.key()),
+                      std::format("unknown top-level key '{}' (typo "
+                                  "discriminator)", it.key()));
+        }
+    }
+
     // ── dssTargetVersion ──
     if (!doc.contains("dssTargetVersion")
      || !doc.at("dssTargetVersion").is_number_integer()) {
@@ -1112,6 +1158,34 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "'charIsUnsigned' must be a boolean");
         } else {
             data.charIsUnsigned = doc.at("charIsUnsigned").get<bool>();
+        }
+    }
+
+    // ── predefinedMacros (TF-C74 — per-architecture identity macros) ──
+    // The macros that identify this CPU ARCHITECTURE to the preprocessor
+    // (`__aarch64__`, `__x86_64__`, …). Declared HERE, next to the other
+    // per-target language-affecting semantics (`charIsUnsigned` above,
+    // `aggregateLayout`, `tls`, `callingConventions`) — never on the
+    // language, which must not enumerate CPU architectures.
+    //
+    // The per-entry grammar is the SHARED parser the language loader uses
+    // (`parsePredefinedMacroArray`), so the closed `kind` verb set, the
+    // Constant⇒`value` rule, the function-like `params` checks and the
+    // `availableObjectFormats` validation are inherited rather than
+    // re-implemented. OPTIONAL; absent ⇒ no target predefines ⇒ the
+    // preprocessor's effective list is byte-identical to today's.
+    // Malformed entries emit `C_MalformedJson` (this family's code for a
+    // structurally-wrong value, as `charIsUnsigned`/`tls` above do);
+    // MISSING required fields emit the universal `C_MissingField`.
+    if (doc.contains("predefinedMacros")) {
+        json const& pms = doc.at("predefinedMacros");
+        if (!pms.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/predefinedMacros",
+                      "'predefinedMacros' must be an array");
+        } else {
+            detail::parsePredefinedMacroArray(
+                pms, "/predefinedMacros", DiagnosticCode::C_MalformedJson,
+                coll, data.predefinedMacros);
         }
     }
 

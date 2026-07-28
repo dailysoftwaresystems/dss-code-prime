@@ -19,6 +19,7 @@ add_library(core OBJECT
     types/glob_match.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    types/predefined_macro_json.cpp
     types/target_schema.cpp
     types/target_schema_json.cpp
     types/lexer_mode.cpp

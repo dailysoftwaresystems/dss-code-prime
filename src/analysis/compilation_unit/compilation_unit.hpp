@@ -267,6 +267,18 @@ public:
     // block. Aborts if called after finish().
     void setUserDefines(std::vector<std::string> defines);
 
+    // TF-C74: declare the active TARGET's per-architecture identity predefined
+    // macros (`TargetSchema::predefinedMacros()`), merged with the language's
+    // by the preprocessor. UNSET (the default) ⇒ empty ⇒ the effective list is
+    // the language's alone, byte-identical to pre-TF-C74 — which is the state
+    // the LSP and the FFI header parser deliberately stay in (see their call
+    // sites). Because it changes the preprocessed token stream exactly as
+    // `setActiveFormat` does, the driver builds the CU ONCE PER (target,
+    // object-format) pair, not once per object-format. Owned BY VALUE: the
+    // `TargetSchema` the rows came from must not have to outlive the builder.
+    // Aborts if called after finish().
+    void setTargetPredefinedMacros(std::vector<PredefinedMacroDef> macros);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -336,6 +348,7 @@ private:
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
+    std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

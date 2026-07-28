@@ -13,6 +13,7 @@
 #include "core/types/object_format_kind.hpp"   // c105: per-format prologue tests
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -2417,10 +2419,17 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 11 pe-gated = 22: the pe-gated set is the c95
     // Windows selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
     // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec) + the legacy
-    // single-underscore `_declspec` alias (B1, D-SQLITE-PE64-TESTFIXTURE-FRONTEND). NO macho-gated
-    // macros remain: `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho
-    // trampolines — <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
+    // single-underscore `_declspec` alias (B1, D-SQLITE-PE64-TESTFIXTURE-FRONTEND) + 2
+    // macho-gated (the Darwin platform-selection pair pinned as an EXACT SET below)
+    // = 24. `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho trampolines —
+    // <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
     // `__STDC_NO_VLA__` (a VLA-supporting impl must not define it).
+    //
+    // TF-C74 SCOPE NOTE: the per-ARCHITECTURE identity macros (`__aarch64__`,
+    // `__x86_64__`, …) are deliberately ABSENT from this list — they live on the
+    // TARGET config, not the language, and are merged in at preprocess time. That
+    // is why this count did not move in TF-C74. The effective language ⊕ target
+    // sets are pinned by `TFC74EffectiveArchPredefinesForShippedTargets`.
     EXPECT_EQ(pms.size(), 24u)
         << "c-subset declares 11 un-gated + 11 pe-gated + 2 macho-gated predefined macros";
     std::size_t ungated = 0;
@@ -6281,3 +6290,434 @@ TEST(Preprocessor, TfC70PragmaAndLinePayloadsAreNotScannedAsDirectives) {
     }
 }
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C74 — PER-ARCHITECTURE identity predefined macros from the TARGET config.
+//
+// Predefines now come from TWO config families: the LANGUAGE
+// (`preprocess.predefinedMacros`) and the TARGET (`predefinedMacros` in
+// `<arch>.target.json`). They are merged ONCE, at `preprocess()` entry, by
+// `mergePredefinedMacros` — which is also the ONE place the per-format
+// availability filter now runs. All FOUR predefine seed sites then iterate that
+// single effective list, so the include-gating pre-scan and the authoritative
+// MacroExpander can no longer disagree (a divergence there is a silent P0016
+// seam: the pre-scan resolving a gated `#include` the real pass reads dead).
+//
+// ★ The four seed sites are pinned INDIVIDUALLY below. A naive implementation
+// wires only the MacroExpander (#2), and a test suite that only checked
+// `#if defined(X)` would pass on it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Build a target-side predefine row without going through a .target.json — so
+// these tests pin the ENGINE contract, not the shipped config's current
+// contents (which `test_target_schema.cpp` pins separately).
+[[nodiscard]] PredefinedMacroDef targetMacro(
+    std::string name, std::string value,
+    std::vector<std::string> formats = {}) {
+    PredefinedMacroDef pm;
+    pm.name                   = std::move(name);
+    pm.kind                   = PredefinedMacroKind::Constant;
+    pm.value                  = std::move(value);
+    pm.availableObjectFormats = std::move(formats);
+    return pm;
+}
+
+// `ppLexemes`, but with an active object format + a TARGET predefine list.
+[[nodiscard]] std::vector<std::string> ppLexemesForTarget(
+    std::string text, std::optional<ObjectFormatKind> fmt,
+    std::span<PredefinedMacroDef const> targetMacros, PreprocessResult& out,
+    std::span<std::filesystem::path const> includeDirs = {}) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::string> noDefines;
+    out = preprocess(buf, schema, includeDirs, {}, fmt, noDefines, targetMacros);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+
+}  // namespace
+
+// ── SEED SITE #2: the authoritative MacroExpander `predefined_` map ───────
+// Ordinary expansion of a target predefine in normal code. This is the site a
+// naive implementation wires FIRST (and often only).
+// RED-ON-DISABLE: revert the `merged.effective` loop in the MacroExpander ctor
+// to `cfg().predefinedMacros` and the token comes back as the identifier.
+TEST(Preprocessor, TFC74TargetPredefineExpandsSeedSiteExpander) {
+    std::vector<PredefinedMacroDef> tms{targetMacro("__ARCHPROBE__", "7")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("int x = __ARCHPROBE__;\n",
+                                   ObjectFormatKind::Elf, tms, r);
+    // EXACT surviving token stream, not a count: `7` must have REPLACED the
+    // identifier, not been appended alongside it.
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "7", ";"}));
+}
+
+// ── SEED SITE #1: the include-gating pre-scan's definedness oracle ────────
+// A `#ifdef`-gated QUOTE-include whose gate is a FUNCTION-LIKE target
+// predefine. The pre-scan decides whether to SPLICE the header long before the
+// MacroExpander runs, so it needs its own view of the predefines
+// (`SynthBuilder::sbNameDefined`).
+//
+// ★ The gate MUST be function-like to ISOLATE this seed site. MEASURED while
+// verifying red-on-disable: with an OBJECT-like gate, reverting `sbNameDefined`
+// alone leaves the test GREEN — the pre-scan VALUE prefix (seed site #4) also
+// materializes object-like predefines into `localMacros`, which `sbNameDefined`
+// consults first, so the two sites mask each other. Function-like predefines
+// are EXCLUDED from the value prefix (FINDING-A: value-seeding a call macro
+// would make a bare `#if NAME` fold more-live in the pre-scan than in the
+// authoritative pass — a P0016 re-open), so ONLY the predefined arm of
+// `sbNameDefined` can report this one DEFINED.
+//
+// RED-ON-DISABLE (VERIFIED): revert `sbNameDefined`'s loop to
+// `schema->preprocess().predefinedMacros` — the header is not spliced and
+// `MARKER_FROM_HEADER` never appears.
+TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tfc74_prescan_ifdef";
+    fs::create_directories(dir);
+    {
+        std::ofstream h(dir / "arch_gated.h");
+        h << "int MARKER_FROM_HEADER = 1;\n";
+    }
+    std::vector<fs::path> const dirs{dir};
+
+    PredefinedMacroDef fn;
+    fn.name           = "__ARCHFNPROBE__";
+    fn.kind           = PredefinedMacroKind::Constant;
+    fn.value          = "";
+    fn.params         = {"x"};
+    fn.isFunctionLike = true;
+    std::vector<PredefinedMacroDef> tms{fn};
+
+    static constexpr char const* kSrc = "#ifdef __ARCHFNPROBE__\n"
+                                        "#include \"arch_gated.h\"\n"
+                                        "#endif\n";
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget(kSrc, ObjectFormatKind::Elf, tms, r, dirs);
+    EXPECT_NE(std::find(lexs.begin(), lexs.end(), "MARKER_FROM_HEADER"),
+              lexs.end())
+        << "an `#ifdef`-gated quote-#include must SPLICE when the gate is a "
+           "FUNCTION-LIKE TARGET predefine — the pre-scan's definedness oracle "
+           "is a seed site the value prefix cannot cover";
+
+    // Mirror: with NO target list the same source must NOT splice — proving the
+    // splice above came from the target predefine and not from something else.
+    PreprocessResult r2;
+    auto lexs2 = ppLexemesForTarget(kSrc, ObjectFormatKind::Elf, {}, r2, dirs);
+    EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_FROM_HEADER"),
+              lexs2.end());
+    fs::remove_all(dir);
+}
+
+// ── SEED SITE #4: the pre-scan's VALUE prefix ─────────────────────────────
+// A `#if <macro> == N`-gated QUOTE-include. Definedness is not enough here: the
+// pre-scan must know the macro's VALUE. A `#ifdef`-only test would pass with
+// site #4 unwired (the value would fold to 0 and the include would be skipped).
+// RED-ON-DISABLE: revert the `preScanDefinePrefix` loop to
+// `schema->preprocess().predefinedMacros` — the gate folds 0 and the header is
+// silently dropped.
+TEST(Preprocessor, TFC74TargetPredefineValueGatesIncludeSeedSitePreScanValue) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tfc74_prescan_value";
+    fs::create_directories(dir);
+    {
+        std::ofstream h(dir / "value_gated.h");
+        h << "int MARKER_VALUE_GATED = 1;\n";
+    }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> tms{targetMacro("__ARCHPROBE__", "7")};
+
+    // TRUE arm: value 7 == 7 ⇒ splice.
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("#if __ARCHPROBE__ == 7\n"
+                                   "#include \"value_gated.h\"\n"
+                                   "#endif\n",
+                                   ObjectFormatKind::Elf, tms, r, dirs);
+    EXPECT_NE(std::find(lexs.begin(), lexs.end(), "MARKER_VALUE_GATED"),
+              lexs.end())
+        << "a VALUE-gated quote-#include must see the target predefine's VALUE, "
+           "not merely its definedness";
+
+    // FALSE arm: same macro, wrong value ⇒ no splice. This is what proves the
+    // value actually arrived (a definedness-only seed would make BOTH arms
+    // behave the same way).
+    PreprocessResult r2;
+    auto lexs2 = ppLexemesForTarget("#if __ARCHPROBE__ == 8\n"
+                                    "#include \"value_gated.h\"\n"
+                                    "#endif\n",
+                                    ObjectFormatKind::Elf, tms, r2, dirs);
+    EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_VALUE_GATED"),
+              lexs2.end());
+    fs::remove_all(dir);
+}
+
+// ── SEED SITE #3: the "<built-in>" prologue (FUNCTION-LIKE predefines) ────
+// A function-like target predefine is NOT seeded into `predefined_`; it lowers
+// to a `#define name(params) value` line in the synthetic "<built-in>"
+// prologue. RED-ON-DISABLE: revert the builtin-prologue loop to
+// `schema->preprocess().predefinedMacros` and `__ARCHATTR__(x)` survives
+// unexpanded, breaking the exact token comparison.
+TEST(Preprocessor, TFC74FunctionLikeTargetPredefineSeedSiteBuiltinPrologue) {
+    PredefinedMacroDef fn;
+    fn.name           = "__ARCHATTR__";
+    fn.kind           = PredefinedMacroKind::Constant;
+    fn.value          = "";              // erase the call entirely
+    fn.params         = {"x"};
+    fn.isFunctionLike = true;
+    std::vector<PredefinedMacroDef> tms{fn};
+
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("__ARCHATTR__(unused) int x = 1;\n",
+                                   ObjectFormatKind::Elf, tms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "1", ";"}))
+        << "a FUNCTION-LIKE target predefine must reach the \"<built-in>\" "
+           "prologue and erase its call";
+}
+
+// ── the per-format filter, on TARGET entries, in BOTH directions ──────────
+// This is what keeps the Apple-only `__arm64__` spelling off the ELF leg.
+TEST(Preprocessor, TFC74TargetPredefineHonoursAvailableObjectFormats) {
+    std::vector<PredefinedMacroDef> tms{
+        targetMacro("__APPLEONLYPROBE__", "1", {"macho"})};
+
+    // macho ⇒ DEFINED and expanded.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       ObjectFormatKind::MachO, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "1", ";"}));
+    }
+    // elf ⇒ UNDEFINED: the identifier survives verbatim (leaking the Apple
+    // spelling onto ELF is the exact defect the gate exists to prevent).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       ObjectFormatKind::Elf, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=",
+                                                  "__APPLEONLYPROBE__", ";"}));
+    }
+    // nullopt (no target selected) ⇒ UNDEFINED: a format-restricted macro is
+    // meaningless without a format.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       std::nullopt, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=",
+                                                  "__APPLEONLYPROBE__", ";"}));
+    }
+}
+
+// ── the COLLISION policy ──────────────────────────────────────────────────
+// A name owned by BOTH config families is FATAL. Neither may silently win:
+// picking either quietly is a wrong-value miscompile with no diagnostic.
+TEST(Preprocessor, TFC74CollidingPredefineFailsLoudNamingBothPaths) {
+    auto schema = cSubset();
+    // `__LINE__` is declared by the shipped c-subset language config.
+    std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+
+    EXPECT_TRUE(r.fatal)
+        << "a language/target predefine collision must abort the pass, not "
+           "silently resolve to one side";
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+
+    // The message must name BOTH declaring config paths — a diagnostic that
+    // says only "conflict" leaves the maintainer to guess which file to edit.
+    bool named = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+        named = d.actual.find("/preprocess/predefinedMacros") != std::string::npos
+             && d.actual.find("/predefinedMacros") != std::string::npos
+             && d.actual.find("__LINE__") != std::string::npos;
+        if (named) break;
+    }
+    EXPECT_TRUE(named)
+        << "the collision message must name the macro AND both declaring "
+           "config paths";
+}
+
+// ★ The collision scan runs BEFORE the format filter. `_WIN32` is declared
+// pe-GATED by the shipped c-subset language config, so on an ELF target the
+// language entry is filtered OUT — yet an ungated TARGET `_WIN32` must STILL
+// collide. Otherwise a maintainer could ship the conflict and only ever see it
+// on the one leg where both entries survive the filter.
+// RED-ON-DISABLE: move the collision scan in `mergePredefinedMacros` below the
+// filter loops and this test goes green-but-wrong.
+TEST(Preprocessor, TFC74CollisionDetectedBeforeFormatFilter) {
+    auto schema = cSubset();
+    std::vector<PredefinedMacroDef> tms{targetMacro("_WIN32", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    // ELF: the language's pe-gated `_WIN32` would NOT survive the filter.
+    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+    EXPECT_TRUE(r.fatal);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro))
+        << "a pe-GATED language `_WIN32` must still collide with an UNGATED "
+           "target `_WIN32` on an ELF build — gating decides which formats SEE "
+           "a macro, not who OWNS the name";
+}
+
+// ── the NO-REGRESSION invariant: empty target span == legacy ──────────────
+// An empty target list must produce a token stream BYTE-IDENTICAL to the
+// pre-TF-C74 engine, on every format. This is the guarantee that lets the
+// feature ship without re-verifying every existing preprocessor test.
+TEST(Preprocessor, TFC74EmptyTargetSpanIsByteIdenticalToLegacy) {
+    // Source that touches predefines the shipped language config gates
+    // differently per format (`_WIN32` is pe-only, `__APPLE__` macho-only) plus
+    // an ungated one, so a filter regression on ANY leg would show up.
+    static constexpr char const* kSrc =
+        "#ifdef _WIN32\nint w = 1;\n#endif\n"
+        "#ifdef __APPLE__\nint a = 1;\n#endif\n"
+        "long v = __STDC_VERSION__;\n";
+
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{}}) {
+        auto schema = cSubset();
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+
+        // LEGACY shape: the 6-arg overload, exactly as every pre-TF-C74 caller
+        // spells it (the target-predefine parameter defaulted away).
+        auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult legacy =
+            preprocess(legacyBuf, schema, noDirs, {}, fmt, noDefines);
+
+        // NEW shape: explicitly empty target span.
+        auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
+        std::vector<PredefinedMacroDef> none;
+        PreprocessResult withEmpty =
+            preprocess(newBuf, schema, noDirs, {}, fmt, noDefines, none);
+
+        ASSERT_FALSE(legacy.fatal);
+        ASSERT_FALSE(withEmpty.fatal);
+        // Compare the SYNTH TEXT byte-for-byte, not just the token count — the
+        // prologues and the pre-scan value prefix are text, and a regression
+        // there would be invisible to a token-count comparison.
+        EXPECT_EQ(legacy.synthBuffer->text(), withEmpty.synthBuffer->text())
+            << "an empty target span must leave the synthesized text "
+               "byte-identical to the legacy call shape";
+        ASSERT_EQ(legacy.tokens.size(), withEmpty.tokens.size());
+        for (std::size_t i = 0; i < legacy.tokens.size(); ++i) {
+            EXPECT_EQ(legacy.tokens[i].span, withEmpty.tokens[i].span);
+            EXPECT_EQ(legacy.tokens[i].coreKind, withEmpty.tokens[i].coreKind);
+        }
+    }
+}
+
+// ── `mergePredefinedMacros` unit contract ────────────────────────────────
+// Order is language-first-then-target, and stable within each side. The seed
+// sites depend on this: the "<built-in>" prologue and the pre-scan value prefix
+// are `#define` STREAMS, so order is observable behaviour, not an accident.
+TEST(Preprocessor, TFC74MergeOrderIsLanguageThenTargetStable) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("L1", "1"),
+                                         targetMacro("L2", "2")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("T1", "3"),
+                                        targetMacro("T2", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::Elf);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"L1", "L2", "T1", "T2"}));
+}
+
+// The filter is applied ONCE, here — so `effective` contains ONLY entries
+// available on the active format, from BOTH sides.
+TEST(Preprocessor, TFC74MergeAppliesFormatFilterOnceToBothSides) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("LPE", "1", {"pe"}),
+                                         targetMacro("LANY", "2")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("TMACHO", "3", {"macho"}),
+                                        targetMacro("TANY", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::MachO);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"LANY", "TMACHO", "TANY"}))
+        << "the pe-gated language entry must be filtered out and the "
+           "macho-gated target entry kept — one filter, both sides";
+}
+
+// A conflict leaves `effective` EMPTY — there is no partially-merged state a
+// caller could mistake for usable.
+TEST(Preprocessor, TFC74MergeConflictYieldsNoUsableList) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("DUP", "1")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("DUP", "2")};
+    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::Elf);
+    EXPECT_EQ(merged.conflicts.size(), 1u);
+    EXPECT_TRUE(merged.effective.empty());
+}
+
+// ── shipped-config sibling pins: language ⊕ arm64 and language ⊕ x86_64 ───
+// The EFFECTIVE arch-identity set a real macho/elf build sees. EXACT SETS, not
+// counts — the whole point of the cycle is which SPELLINGS reach the source.
+TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+
+    auto namesOfTargetHalf = [](MergedPredefinedMacros const& m,
+                                std::size_t langCount) {
+        std::vector<std::string> out;
+        for (std::size_t i = langCount; i < m.effective.size(); ++i) {
+            out.push_back(m.effective[i].name);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto langSurviving = [&](std::optional<ObjectFormatKind> fmt) {
+        return mergePredefinedMacros((*c)->preprocess().predefinedMacros, {}, fmt)
+            .effective.size();
+    };
+
+    // arm64 on MACHO: all four spellings, including the Apple-only pair.
+    {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*arm)->predefinedMacros(),
+                                       ObjectFormatKind::MachO);
+        ASSERT_TRUE(m.conflicts.empty())
+            << "the shipped language and arm64 configs must not collide";
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::MachO)),
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__",
+                                            "__arm64", "__arm64__"}));
+    }
+    // arm64 on ELF: the Apple-only pair is GONE.
+    {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*arm)->predefinedMacros(),
+                                       ObjectFormatKind::Elf);
+        ASSERT_TRUE(m.conflicts.empty());
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__"}))
+            << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto ELF";
+    }
+    // x86_64: the same four spellings on every format.
+    for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
+                                 ObjectFormatKind::Pe}) {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*x86)->predefinedMacros(), fmt);
+        ASSERT_TRUE(m.conflicts.empty())
+            << "the shipped language and x86_64 configs must not collide";
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(fmt)),
+                  (std::vector<std::string>{"__amd64", "__amd64__", "__x86_64",
+                                            "__x86_64__"}));
+    }
+}

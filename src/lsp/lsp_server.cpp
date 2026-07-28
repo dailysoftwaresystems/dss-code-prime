@@ -421,6 +421,13 @@ void LspServer::enqueueParse_(std::string uri) {
         // analysis. The CU must outlive the SemanticModel (its side-tables
         // hold raw Tree*), so we wrap it in a shared_ptr and hand it to
         // analyze(), which keeps its own shared_ptr inside the model.
+        // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — the LSP has no
+        // active target (it also sets no `setActiveFormat`), so the effective
+        // predefined-macro list is the LANGUAGE's alone, exactly as before this
+        // cycle. An editor session is not a compile: picking a target here would
+        // make `#ifdef __aarch64__` resolve differently in the editor than in
+        // the build, which is worse than resolving neither arm. Trigger to
+        // revisit: the day the LSP learns the workspace's active target.
         dss::UnitBuilder builder{snap.schema};
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(
