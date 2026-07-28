@@ -2527,13 +2527,31 @@ struct DSS_EXPORT TargetSchemaData {
     // `declared == false` → `wideFloatSoftcall()` returns nullptr → the
     // F128 engine verb falls through to the fail-loud encoded-width gate
     // (this ABSENCE, not a target/format check, is what gates the softcall
-    // path). `wideFloatSoftcallLibraryByFormat` maps an object-format key
-    // ("elf") → the DT_NEEDED library the minted extern imports bind to
+    // path). `wideFloatSoftcallLibraryByFormat` maps an object FORMAT KIND
+    // (Elf) → the DT_NEEDED library the minted extern imports bind to
     // ("libgcc_s.so.1"); the LIR lowerer resolves the ACTIVE format's entry
     // and threads it in (nullopt = the format declares none → the softcall
     // fails loud rather than mint an unbound extern).
+    //
+    // ★ KEYED ON THE ENUM, NOT ON A STRING — the `charIsUnsignedByFormat`
+    // reshape, applied here. This map USED to be an
+    // `unordered_map<std::string,std::string>` filled from arbitrary JSON keys,
+    // so a misspelled `"elff"` (or a mis-cased `"ELF"`) STORED cleanly, the
+    // accessor's raw-string lookup missed, and the F128 softcall path reported
+    // "this format declares no softcall library" — a config typo degrading
+    // long-double arithmetic with no diagnostic pointing at the config. An
+    // `ObjectFormatKind`-indexed array makes that state UNREPRESENTABLE: there
+    // is no slot for a name that is not in `kObjectFormatKindTable`, so the
+    // loader MUST resolve every key through `objectFormatKindFromName` (and
+    // reject the `unknown` sentinel) before it can store anything at all.
+    //
+    // An EMPTY slot means "this format declares no softcall library". The
+    // loader rejects an empty library STRING for exactly that reason — an
+    // empty value would be indistinguishable from an absent key, which is the
+    // same silent-fallback shape one layer down.
     std::array<WideFloatSoftcall, kWideFloatOpCount> wideFloatSoftcalls{};
-    std::unordered_map<std::string, std::string> wideFloatSoftcallLibraryByFormat;
+    std::array<std::string, kObjectFormatKindCount>
+        wideFloatSoftcallLibraryByFormat{};
 
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
@@ -2826,15 +2844,20 @@ public:
         auto const& row = d_.wideFloatSoftcalls[idx];
         return row.declared ? &row : nullptr;
     }
-    // The DT_NEEDED library the minted F128-softcall externs bind to, for
-    // the object format named `formatKey` ("elf"), or empty when the format
-    // declares none. Resolved once per compilation (the LIR lowerer captures
-    // it), so the `std::string` key temporary is not a hot-path cost.
+    // The DT_NEEDED library the minted F128-softcall externs bind to, for the
+    // object format `format`, or empty when the format declares none.
+    //
+    // Takes the KIND, never a name string: both call sites (program.cpp's merge
+    // path and compile_pipeline.cpp's single-CU path) already hold an
+    // `ObjectFormatKind` and used to stringify it just to feed a string lookup
+    // that could silently miss. The round trip is gone — an unresolvable name
+    // can no longer reach this function, because the loader could not have
+    // stored one.
     [[nodiscard]] std::string_view
-    wideFloatSoftcallLibrary(std::string_view formatKey) const {
-        auto it = d_.wideFloatSoftcallLibraryByFormat.find(std::string(formatKey));
-        if (it == d_.wideFloatSoftcallLibraryByFormat.end()) return {};
-        return it->second;
+    wideFloatSoftcallLibrary(ObjectFormatKind format) const noexcept {
+        auto const idx = static_cast<std::size_t>(format);
+        if (idx >= d_.wideFloatSoftcallLibraryByFormat.size()) return {};
+        return d_.wideFloatSoftcallLibraryByFormat[idx];
     }
 
     // ── Calling conventions (cycle 2b) ──────────────────────────

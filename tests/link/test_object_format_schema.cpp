@@ -308,10 +308,17 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
 }
 
 TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
-    // `Unknown` round-trips through the EnumNameTable, so a JSON file
-    // could in principle declare `"kind": "unknown"`. The validate
-    // pass rejects this — `Unknown` is the invalid sentinel, not a
-    // real format declaration.
+    // ★ `Unknown` round-trips through the EnumNameTable — the sentinel SPELLS
+    // CORRECTLY, so `objectFormatKindFromName("unknown")` SUCCEEDS and the
+    // loader's name check cannot catch it. `kind` is the load-bearing
+    // dispatcher (the cross-kind identity-block guard, the elf/pe/macho/image
+    // block readers, FFI C-mangling, the linker's walker selection,
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`), so a sentinel kind
+    // would match NOTHING everywhere at once and take a default arm silently.
+    //
+    // Asserts the CODE and the MESSAGE, not merely "the load failed" — this
+    // fixture is one dataModel typo away from going green for an unrelated
+    // reason, and a bare ASSERT_FALSE could never tell the difference.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
@@ -319,6 +326,43 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
       "relocations":[]
     })");
     ASSERT_FALSE(r.has_value());
+    bool sawSentinelDiag = false;
+    for (auto const& d : r.error()) {
+        if (d.path == "/format/kind"
+            && d.code == dss::DiagnosticCode::C_MalformedJson
+            && d.message.find("sentinel") != std::string::npos) {
+            sawSentinelDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawSentinelDiag)
+        << "the rejection must come from the kind check and NAME the sentinel";
+}
+
+// ★ ONE DEFECT, ONE DIAGNOSTIC. The sentinel is rejected at the load site and
+// the parse STOPS there, so the cross-kind identity-block guard never runs
+// against it. Without the early return, `kind: unknown` alongside an `elf`
+// block also emits "identity block 'elf' is only meaningful when
+// format.kind == 'elf' … fix the block name or the format.kind" — advice that
+// points at the BLOCK when the single actual defect is the kind, and that would
+// have a reader renaming perfectly good blocks.
+//
+// RED-ON-DISABLE: drop the `isSelectableObjectFormatKind` early-return in
+// `object_format_schema_json.cpp` and the identity-block diagnostic appears
+// (validate() still fails the load, so a bare ASSERT_FALSE would NOT red —
+// which is exactly why this asserts on message content).
+TEST(ObjectFormatSchemaLoader, SentinelKindDoesNotCascadeIntoIdentityBlockNoise) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"x","kind":"unknown"},
+      "elf": {"machine": 183, "type": "exec"},
+      "relocations":[]
+    })");
+    ASSERT_FALSE(r.has_value());
+    for (auto const& d : r.error()) {
+        EXPECT_EQ(d.message.find("identity block"), std::string::npos)
+            << "a sentinel kind must not spawn per-block advice: " << d.message;
+    }
 }
 
 TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {

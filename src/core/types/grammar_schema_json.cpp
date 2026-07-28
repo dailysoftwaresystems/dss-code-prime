@@ -9982,8 +9982,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         auto const kindPath = std::format(
                             "/semantics/externLibraryByFormat/{}",
                             formatName);
-                        if (!objectFormatKindFromName(
-                                formatName).has_value()) {
+                        auto const fmtKind =
+                            objectFormatKindFromName(formatName);
+                        if (!fmtKind.has_value()) {
                             coll.emit(
                                 DiagnosticCode::C_InvalidSemantics,
                                 kindPath,
@@ -9994,6 +9995,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     "'pe', 'macho', 'wasm', "
                                     "'spirv')",
                                     formatName));
+                            continue;
+                        }
+                        // The `unknown` sentinel SPELLS correctly, so the
+                        // lookup above accepts it. An entry stored under it
+                        // would be keyed to a format no image can ever have,
+                        // so the extern would fall through to the
+                        // "no externLibraryByFormat entry for this format"
+                        // diagnostic — a config that declares the library and
+                        // is told the library is undeclared.
+                        if (!isSelectableObjectFormatKind(*fmtKind)) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      kindPath,
+                                      std::string{
+                                          kObjectFormatKindSentinelRejection});
                             continue;
                         }
                         if (!val.is_string()) {
@@ -11080,6 +11095,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                                   "'{}' (expected e.g. "
                                                                   "'elf', 'pe', 'macho')",
                                                                   fkey));
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        // The `unknown` sentinel spells correctly and this
+                                        // map is ALREADY keyed on ObjectFormatKind, so it
+                                        // would store a live `Unknown` row. That is worse
+                                        // than a dead entry: `resolveElementCore` takes an
+                                        // `optional<ObjectFormatKind>`, so a caller holding
+                                        // a default-constructed kind (== Unknown, not
+                                        // nullopt) would MATCH the row and silently take a
+                                        // wchar_t width nothing intended.
+                                        if (!isSelectableObjectFormatKind(*fmt)) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      std::string{
+                                                          kObjectFormatKindSentinelRejection});
                                             formatMapOk = false;
                                             continue;
                                         }

@@ -171,11 +171,23 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                     break;
                 }
                 std::string fmt = av.get<std::string>();
-                if (!objectFormatKindFromName(fmt).has_value()) {
+                auto const fmtKind = objectFormatKindFromName(fmt);
+                if (!fmtKind.has_value()) {
                     coll.emit(entryCode, mpath + "/availableObjectFormats",
                               std::format("unknown object-format name '{}' "
                                           "(expected \"pe\"/\"elf\"/\"macho\")",
                                           fmt));
+                    afOk = false;
+                    break;
+                }
+                // The `unknown` sentinel spells correctly, so the name lookup
+                // accepts it — and the filter then matches no real format, so
+                // the macro is silently predefined NOWHERE. A macro listed as
+                // available that never gets predefined is the same silent
+                // no-op a typo'd name would produce; both fail loud here.
+                if (!isSelectableObjectFormatKind(*fmtKind)) {
+                    coll.emit(entryCode, mpath + "/availableObjectFormats",
+                              std::string{kObjectFormatKindSentinelRejection});
                     afOk = false;
                     break;
                 }

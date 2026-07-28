@@ -892,8 +892,8 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // scope) — exactly where externCallDispatch is pre-resolved from the
     // format. Empty = the format declares none (nullopt → F128 softcall fails
     // loud).
-    std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary(
-        objectFormatKindName((*formatR)->kind()));
+    std::string_view const wfLib =
+        (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
     std::optional<std::string> wideFloatSoftcallLibrary =
         wfLib.empty() ? std::nullopt
                       : std::optional<std::string>(std::string(wfLib));

@@ -1854,6 +1854,9 @@ TEST(TargetSchema, TFC74PredefinedMacroBadObjectFormatRejected) {
            "dead on EVERY target — it must fail loud";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
+// (The SENTINEL variant of this typo test lives with the other TF-C76 sentinel
+// pins at the end of this file — it needs the `anyMentions` helper declared
+// there.)
 
 TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     auto r = TargetSchema::loadFromText(
@@ -2226,4 +2229,202 @@ TEST(TargetSchema, TFC75DollarPrefixedInnerKeysAccepted) {
         << "`$`-prefixed keys are the codebase-wide documentation convention";
     EXPECT_FALSE((*r)->charIsUnsigned(ObjectFormatKind::MachO));
     EXPECT_TRUE((*r)->charIsUnsigned(ObjectFormatKind::Elf));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// `wideFloatSoftcallLibraryByFormat` — THE HOLE THE TF-C75 TESTS NAMED
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// TF-C75's `TFC75UnknownObjectFormatKeyRejectedAndNamed` above opens with "★ THE
+// HOLE THE PRECEDENT LEFT OPEN" and points AT THIS KEY: it accepted ARBITRARY
+// string keys, so `"elff"` / `"ELF"` stored cleanly, the accessor's raw-string
+// lookup missed, and the F128 softcall path reported that the format declares no
+// softcall library. Long-double arithmetic degraded on a PURE TYPO with no
+// diagnostic naming the config.
+//
+// The fix is the SAME reshape TF-C75 used, not merely the same validation: the
+// map is now an `ObjectFormatKind`-INDEXED ARRAY, so an unresolvable key has no
+// slot to be stored in. Invalid state unrepresentable, not just rejected — which
+// is why the accessor now takes the KIND and the raw-string lookup is gone.
+//
+// A minimal target whose `wideFloatSoftcallLibraryByFormat` is exactly `body`,
+// spliced verbatim so a test can probe a MALFORMED shape, not just a bad value.
+namespace {
+[[nodiscard]] std::string targetWithSoftcallLibrary(std::string_view body) {
+    return std::string{
+               R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+               R"("opcodes":[{"mnemonic":"invalid","result":"none"}],)"
+               R"("wideFloatSoftcallLibraryByFormat":)"}
+           + std::string{body} + "}";
+}
+}  // namespace
+
+// ★ THE TYPO CASE. Mirrors TFC75UnknownObjectFormatKeyRejectedAndNamed exactly:
+// rejected AND named. Both spellings a human actually produces are covered — a
+// slip (`elff`) and a case error (`ELF`) — because the old string map treated
+// both as "no entry for elf" and said nothing.
+//
+// RED-ON-DISABLE: drop the `objectFormatKindFromName` check in the loader and
+// the load succeeds, leaving `wideFloatSoftcallLibrary(Elf)` empty.
+TEST(TargetSchema, TFC76SoftcallLibraryUnknownFormatKeyRejectedAndNamed) {
+    for (auto const* bad : {"elff", "ELF", "Mach-O"}) {
+        auto const body =
+            std::string{R"({")"} + bad + R"(":"libgcc_s.so.1"})";
+        auto r = TargetSchema::loadFromText(targetWithSoftcallLibrary(body),
+                                            "<inline>");
+        ASSERT_FALSE(r.has_value())
+            << "a typo'd/mis-cased format key must fail loud — silently "
+               "ignoring it leaves the F128 softcall path with no runtime "
+               "library and no diagnostic pointing at the config: " << bad;
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson))
+            << bad;
+        EXPECT_TRUE(anyMentions(r.error(), bad))
+            << "the diagnostic must NAME the offending key: " << bad;
+    }
+}
+
+// ★ A DIFFERENT SPECIES FROM A TYPO — the sentinel SPELLS CORRECTLY, so
+// `objectFormatKindFromName("unknown")` SUCCEEDS and the name check above waves
+// it through. Only an explicit selectability check stops it. The
+// `bitFieldStrategy` "none" discipline, and TF-C75's sibling assertion.
+TEST(TargetSchema, TFC76SoftcallLibrarySentinelFormatKeyRejected) {
+    auto r = TargetSchema::loadFromText(
+        targetWithSoftcallLibrary(R"({"unknown":"libgcc_s.so.1"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "'unknown' is the invalid sentinel, not a selectable format — a "
+           "library declared under it could never resolve for any real image";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    EXPECT_TRUE(anyMentions(r.error(), "sentinel"))
+        << "the diagnostic must say WHY 'unknown' is refused — it spells "
+           "correctly, so 'unrecognized name' would be a confusing lie";
+}
+
+// An EMPTY library string is the same silent fallback one layer down: the
+// accessor cannot distinguish it from an absent key, so a file that plainly
+// declares a library would resolve to "this format declares none".
+TEST(TargetSchema, TFC76SoftcallLibraryEmptyValueRejected) {
+    auto r = TargetSchema::loadFromText(
+        targetWithSoftcallLibrary(R"({"elf":""})"), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an empty library value is indistinguishable from declaring none";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    EXPECT_TRUE(anyMentions(r.error(), "non-empty"));
+}
+
+// Shape errors on both halves stay loud.
+TEST(TargetSchema, TFC76SoftcallLibraryMalformedShapesRejected) {
+    for (char const* body : {R"({"elf":5})", R"({"elf":null})",
+                             R"({"elf":["libgcc_s.so.1"]})",
+                             R"("libgcc_s.so.1")", "[]", "true"}) {
+        auto r = TargetSchema::loadFromText(targetWithSoftcallLibrary(body),
+                                            "<inline>");
+        EXPECT_FALSE(r.has_value())
+            << "malformed wideFloatSoftcallLibraryByFormat must fail loud: "
+            << body;
+    }
+}
+
+// The `$`-documentation carve-out reaches inside this map too (the shipped
+// arm64 file documents this key at length right next to it).
+TEST(TargetSchema, TFC76SoftcallLibraryDollarPrefixedKeysAccepted) {
+    auto r = TargetSchema::loadFromText(
+        targetWithSoftcallLibrary(
+            R"({"$elfComment":"libgcc holds the __addtf3 family",
+                "elf":"libgcc_s.so.1"})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "`$`-prefixed keys are the codebase-wide documentation convention";
+    EXPECT_EQ((*r)->wideFloatSoftcallLibrary(ObjectFormatKind::Elf),
+              "libgcc_s.so.1");
+}
+
+// ★ SHIPPED BEHAVIOUR IS UNCHANGED, AS AN EXACT TABLE — not a spot check.
+// `arm64.target.json` declares `{"elf": "libgcc_s.so.1"}` and nothing else; the
+// whole resolved row is compared so a reshape that quietly moved the value to a
+// different kind, or leaked it to every kind, cannot pass. x86_64 declares the
+// key not at all and must resolve empty everywhere.
+//
+// RED-ON-DISABLE: index the array by anything other than the resolved kind and
+// the elf cell moves; return the first non-empty slot instead of the indexed one
+// and every arm64 cell fills.
+TEST(TargetSchema, TFC76ShippedSoftcallLibraryMatrixIsExact) {
+    // Rows are compared as printable "target/format => library" strings so a
+    // failure NAMES the drifted cell instead of dumping struct bytes. Note the
+    // accessor returns a `string_view` into the schema, so each cell is copied
+    // to a `std::string` before the schema goes out of scope.
+    struct Cell { std::string_view target, format; };
+    constexpr Cell kCells[] = {
+        {"arm64",  "elf"}, {"arm64",  "pe"}, {"arm64",  "macho"},
+        {"arm64",  "wasm"}, {"arm64", "spirv"},
+        {"x86_64", "elf"}, {"x86_64", "pe"}, {"x86_64", "macho"},
+        {"x86_64", "wasm"}, {"x86_64", "spirv"},
+    };
+    std::vector<std::string> const expected{
+        // arm64: ONLY elf. The f64-axis formats (pe/macho-arm64) collapse long
+        // double to double and never reach the softcall path.
+        "arm64/elf => libgcc_s.so.1",
+        "arm64/pe => ",
+        "arm64/macho => ",
+        "arm64/wasm => ",
+        "arm64/spirv => ",
+        // x86_64 declares no key at all (it uses the inline x87 sequence).
+        "x86_64/elf => ",
+        "x86_64/pe => ",
+        "x86_64/macho => ",
+        "x86_64/wasm => ",
+        "x86_64/spirv => ",
+    };
+
+    std::vector<std::string> actual;
+    for (auto const& cell : kCells) {
+        auto t = TargetSchema::loadShipped(std::string{cell.target});
+        ASSERT_TRUE(t.has_value()) << cell.target;
+        auto const kind = ::dss::objectFormatKindFromName(cell.format);
+        ASSERT_TRUE(kind.has_value()) << cell.format;
+        actual.push_back(
+            std::string{cell.target} + "/" + std::string{cell.format} + " => "
+            + std::string{(*t)->wideFloatSoftcallLibrary(*kind)});
+    }
+    EXPECT_EQ(actual, expected)
+        << "the shipped softcall-library matrix changed — this reshape must be "
+           "byte-for-byte behaviour-preserving for shipped config";
+}
+
+// ★ THE SENTINEL VARIANT of `TFC74PredefinedMacroBadObjectFormatRejected`
+// (which probes the typo `"machoo"`). "machoo" fails the name lookup;
+// "unknown" PASSES it — it is a row in the table — and then narrows
+// availability to a format no image can have, so the macro is silently
+// predefined NOWHERE. That is exactly the dead-on-every-target outcome the
+// typo check exists to prevent, reached by a correctly-spelled word.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `predefined_macro_json.cpp` and this load succeeds.
+TEST(TargetSchema, TFC76PredefinedMacroSentinelObjectFormatRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                 "availableObjectFormats":["unknown"]}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "'unknown' spells correctly, so only an explicit selectability check "
+           "stops it from making the macro dead on every target";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    EXPECT_TRUE(anyMentions(r.error(), "sentinel"))
+        << "the diagnostic must say WHY 'unknown' is refused";
+}
+
+// The sentinel slot must stay empty even though the array physically HAS one
+// (it is indexed by ordinal, and Unknown == 0). Nothing can write it, so
+// nothing can read a library out of it.
+TEST(TargetSchema, TFC76SoftcallLibrarySentinelSlotAlwaysEmpty) {
+    for (auto const* name : {"arm64", "x86_64"}) {
+        auto t = TargetSchema::loadShipped(name);
+        ASSERT_TRUE(t.has_value()) << name;
+        EXPECT_TRUE(
+            (*t)->wideFloatSoftcallLibrary(ObjectFormatKind::Unknown).empty())
+            << "the Unknown slot is unwritable by the loader, so it must never "
+               "resolve to a library: " << name;
+    }
 }

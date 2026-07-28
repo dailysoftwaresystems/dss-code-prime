@@ -1431,7 +1431,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // in scope here — no new CuMirModule field needed). Empty = the format
     // declares none (nullopt → an F128 softcall fails loud).
     std::string_view const wfLib =
-        cuMir.target->wideFloatSoftcallLibrary(objectFormatKindName(fmtKind));
+        cuMir.target->wideFloatSoftcallLibrary(fmtKind);
     std::optional<std::string> wideFloatSoftcallLibrary =
         wfLib.empty() ? std::nullopt
                       : std::optional<std::string>(std::string(wfLib));

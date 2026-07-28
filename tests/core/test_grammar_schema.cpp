@@ -3907,6 +3907,37 @@ TEST(GrammarSchema, SemanticsExternLibraryByFormatUnknownKeyReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ★ A DIFFERENT SPECIES FROM THE "pee" TYPO ABOVE. `unknown` is a real row in
+// `kObjectFormatKindTable`, so `objectFormatKindFromName("unknown")` SUCCEEDS
+// and the name check one test up waves it straight through. The entry then sits
+// in the map keyed to a format no emitted image can ever have — so every extern
+// falls through to `F_FfiNoImportLibraryForFormat`, i.e. a config that DOES
+// declare the library is told the library is undeclared.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `grammar_schema_json.cpp`'s externLibraryByFormat loop and this load succeeds.
+TEST(GrammarSchema, SemanticsExternLibraryByFormatSentinelKeyReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "unknown": "msvcrt.dll" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "'unknown' is the invalid sentinel — it SPELLS correctly, so only an "
+           "explicit selectability check can stop it";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    EXPECT_TRUE(std::ranges::any_of(r.error(), [](auto const& d) {
+        return d.message.find("sentinel") != std::string::npos;
+    })) << "the diagnostic must say WHY 'unknown' is refused — 'unrecognized "
+           "name' would be a confusing lie for a correctly-spelled row:\n"
+        << errorDiags(r.error());
+}
+
 TEST(GrammarSchema, SemanticsExternLibraryByFormatNonStringValueReportsInvalid) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
@@ -5354,6 +5385,38 @@ TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
     ASSERT_FALSE(result.has_value())
         << "an unknown object-format key must fail the load, not silently ignore";
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// ★ THE SENTINEL VARIANT of the test above, and the WORST of the family. This
+// map is ALREADY keyed on `ObjectFormatKind`, so `"unknown"` does not merely sit
+// dead — it stores a LIVE `ObjectFormatKind::Unknown` row. `resolveElementCore`
+// takes an `optional<ObjectFormatKind>`, so any caller holding a
+// default-constructed kind (== Unknown, NOT nullopt) MATCHES that row and takes
+// a wchar_t element width nothing intended. A dead entry is a silent no-op; this
+// one is a silent WRONG ANSWER.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
+// `elementCoreByFormat` loop and the mutated config loads clean.
+TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos)
+        << "elementCoreByFormat pe-key not found in shipped config";
+    text.replace(pos, needle.size(),
+                 "\"elementCoreByFormat\": { \"unknown\": \"U16\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "the 'unknown' sentinel must fail the load — it resolves through the "
+           "name table, so it would be STORED as a live per-format override";
+    EXPECT_TRUE(hasDiagCode(result.error(),
+                            DiagnosticCode::C_InvalidHirLowering));
+    EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
+        return d.message.find("sentinel") != std::string::npos;
+    })) << errorDiags(result.error());
 }
 
 TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {

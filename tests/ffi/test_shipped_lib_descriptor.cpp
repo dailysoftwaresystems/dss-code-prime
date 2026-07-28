@@ -54,6 +54,19 @@ namespace {
     return p;
 }
 
+// True iff SOME reported diagnostic's text contains `needle`. The descriptor
+// reader packs its whole message into `ParseDiagnostic::actual` (see
+// `emitMalformed` → `dss::report`). Used by the sentinel pins below: they all
+// share ONE code (`F_ShippedLibDescriptorMalformed`), so `hasErrors()` alone
+// cannot tell the intended rejection from an unrelated one in the same fixture.
+[[nodiscard]] bool anyDiagMentions(DiagnosticReporter const& rep,
+                                   std::string_view needle) {
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
 // ── Happy path: structural FnSig inspection ──────────────────────────────────
 
 TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
@@ -317,6 +330,34 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideUnknownFormatFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());   // unknown format key → whole read fails
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE SENTINEL VARIANT of the test above. "bogus" fails the name lookup;
+// "unknown" PASSES it — it is a row in `kObjectFormatKindTable` — and the
+// library then resolves for no real format, so the symbol reaches the link with
+// no import library. Same outcome as the typo, reached by a correctly-spelled
+// word, which is why only an explicit selectability check can catch it.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `decodeLibraryMap` and the read succeeds with a dead `unknown` entry.
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinel_sym_lib.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "unknown": "x.dll" } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"))
+        << "the diagnostic must say WHY 'unknown' is refused — 'unknown "
+           "object-format key' would be a confusing lie for a name that IS in "
+           "the table";
 }
 
 // A per-symbol `library` VALUE that is not a string fails loud (mirrors the
@@ -1395,6 +1436,35 @@ TEST(ShippedLibDescriptor, StructVariantUnknownFormatValueFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ★ THE SENTINEL VARIANT of the test above, and by that test's OWN stated
+// rationale: `"unknown"` would never match either, so the struct variant would
+// silently vanish on every target — identical consequence, but it survives the
+// name lookup because it IS a table row.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
+// `when.format` decode and this read succeeds with a variant that never fires.
+TEST(ShippedLibDescriptor, StructVariantSentinelFormatValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinelfmt.json", R"JSON({
+        "header": "bf.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "x86_64", "format": "unknown" },
+                  "fields": [ { "name": "x", "type": "i32" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"));
+}
+
 // BACK-COMPAT (gate 8; closure gate 8). An existing flat-`fields` struct decodes
 // BYTE-IDENTICALLY whether activeTarget is nullopt (direct-API/LSP/test) or set (a
 // real per-target compile) — the flat path never consults the selector, so the
@@ -1523,6 +1593,28 @@ TEST(ShippedLibDescriptor, AvailabilityUnknownFormatFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE SENTINEL VARIANT of the test above. "bogus" fails the name lookup;
+// "unknown" passes it and then narrows availability to a format no image can
+// have — the header goes silently unavailable EVERYWHERE, which is the first
+// failure mode that test names.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `decodeShippedAvailability` and "unknown" decodes as a live format.
+TEST(ShippedLibDescriptor, AvailabilitySentinelFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinelav.json", R"JSON({
+        "header": "h.h", "availableObjectFormats": ["elf", "unknown"],
+        "typedefs": [ { "name": "t", "type": "i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"));
 }
 
 // readShippedLibAvailability: interner-FREE (the front-end gate's path — neither

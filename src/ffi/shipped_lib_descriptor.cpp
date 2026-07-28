@@ -326,11 +326,22 @@ matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
         // The format VALUE is matched against the CLOSED object-format vocabulary
         // (a typo'd "elff" would otherwise silently never match → the entry
         // vanishes on every target).
-        if (!objectFormatKindFromName(wantFormat).has_value()) {
+        auto const wantKind = objectFormatKindFromName(wantFormat);
+        if (!wantKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
                                         + ": 'format' has unknown object-format name '"
                                         + wantFormat
                                         + "' (expected \"pe\"/\"elf\"/\"macho\")");
+            return WhenMatch::Error;
+        }
+        // ...and the `unknown` SENTINEL has the identical consequence by the
+        // rationale one line up: it spells correctly, so the lookup accepts it,
+        // and then it matches no real active format — the entry vanishes on
+        // every target, exactly as the typo would. Same defect, same verdict.
+        if (!isSelectableObjectFormatKind(*wantKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
+                                        + ": 'format' names the invalid sentinel — "
+                                        + std::string{kObjectFormatKindSentinelRejection});
             return WhenMatch::Error;
         }
         if (!activeFormat.has_value() || activeFormatName != wantFormat) matches = false;
@@ -578,10 +589,21 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             continue;
         }
         std::string fmt = v.get<std::string>();
-        if (!objectFormatKindFromName(fmt).has_value()) {
+        auto const fmtKind = objectFormatKindFromName(fmt);
+        if (!fmtKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
                                         + "': 'availableObjectFormats' has unknown object-format "
                                           "name '" + fmt + "' (expected \"pe\"/\"elf\"/\"macho\")");
+            continue;
+        }
+        // The `unknown` sentinel spells correctly, so it survives the lookup and
+        // then narrows availability to a format no image can have — the library
+        // becomes silently unavailable everywhere, which is what a typo does too.
+        if (!isSelectableObjectFormatKind(*fmtKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                        + "': 'availableObjectFormats' names the invalid "
+                                          "sentinel — "
+                                        + std::string{kObjectFormatKindSentinelRejection});
             continue;
         }
         out.push_back(std::move(fmt));
@@ -613,11 +635,22 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         return false;
     }
     for (auto const& kv : node.items()) {
-        if (!objectFormatKindFromName(kv.key()).has_value()) {
+        auto const keyKind = objectFormatKindFromName(kv.key());
+        if (!keyKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
                 + "' has unknown object-format key '" + kv.key()
                 + "' (expected one of the object-format names, e.g. "
                   "\"pe\"/\"elf\"/\"macho\")");
+            continue;
+        }
+        // The `unknown` sentinel spells correctly ("pee" does not), so only an
+        // explicit check stops it. A library stored under it resolves for no
+        // real format — the symbol reaches the link with no import library,
+        // which is precisely what this closed vocabulary exists to prevent.
+        if (!isSelectableObjectFormatKind(*keyKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "' names the invalid sentinel — "
+                + std::string{kObjectFormatKindSentinelRejection});
             continue;
         }
         if (!kv.value().is_string()) {

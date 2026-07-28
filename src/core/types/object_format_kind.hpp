@@ -73,6 +73,29 @@ objectFormatKindFromName(std::string_view s) noexcept {
     return kObjectFormatKindTable.fromName(s);
 }
 
+// ★ THE SENTINEL SPELLS CORRECTLY. `Unknown` carries the name "unknown" in the
+// table above, so `objectFormatKindFromName("unknown")` SUCCEEDS. A config site
+// that validates a format name ONLY through that function therefore accepts the
+// project's universal invalid sentinel as if it named a real format — and every
+// downstream per-kind dispatch then matches NOTHING and silently takes a default
+// arm. That is a DIFFERENT species from a typo hole (`"elff"` fails the name
+// lookup and is caught): the sentinel passes the lookup and dies later, quietly.
+//
+// So EVERY config surface that resolves a declared object-format NAME must ALSO
+// ask `isSelectableObjectFormatKind` and reject the sentinel explicitly — the
+// `bitFieldStrategy` "none" discipline (object_format_schema_json.cpp), applied
+// to this vocabulary. `kObjectFormatKindSentinelRejection` is the shared wording
+// so the diagnostics cannot drift site to site; each site supplies its own
+// diagnostic CODE and JSON path.
+[[nodiscard]] constexpr bool
+isSelectableObjectFormatKind(ObjectFormatKind k) noexcept {
+    return k != ObjectFormatKind::Unknown;
+}
+
+inline constexpr std::string_view kObjectFormatKindSentinelRejection =
+    "'unknown' is the invalid sentinel, not a selectable object format — it "
+    "names no real format, so a declaration under it could never fire";
+
 // The number of `ObjectFormatKind` enumerators INCLUDING the `Unknown`
 // sentinel — i.e. one past the largest ordinal, so an
 // `std::array<T, kObjectFormatKindCount>` indexed by

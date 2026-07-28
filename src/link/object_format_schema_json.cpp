@@ -188,6 +188,30 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                   "expected 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
         return std::unexpected(std::move(coll).release());
     }
+    // ★ The `unknown` SENTINEL passes the name lookup above (it is a row in
+    // `kObjectFormatKindTable`), so it must be rejected on its own. `kind` is
+    // THE load-bearing dispatcher of this whole file — the cross-kind
+    // identity-block guard below, the elf/pe/macho/image block readers, FFI
+    // C-mangling, the linker's walker selection and `TargetSchema::
+    // charIsUnsigned(ObjectFormatKind)` all switch on it — so a sentinel kind
+    // matches nothing everywhere at once.
+    //
+    // `ObjectFormatData::validate()` ALSO rejects `Unknown`, and that arm
+    // stays: it is the guard for a HAND-BUILT `ObjectFormatData` that never
+    // set the field (the zero default IS the sentinel), which no JSON path can
+    // reach. This check is the JSON-path one, and it EARLY-RETURNS on purpose.
+    // Continuing the parse under a sentinel kind would run the cross-kind guard
+    // against it and emit one spurious "identity block 'elf' is only meaningful
+    // when format.kind == 'elf'" per declared block — diagnostics that point at
+    // the BLOCKS and advise renaming them, when the single actual defect is the
+    // kind. Stopping here leaves exactly one diagnostic, naming the sentinel.
+    if (!isSelectableObjectFormatKind(*kindOpt)) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
+                  std::string{kObjectFormatKindSentinelRejection}
+                      + " — declare one of 'elf' / 'pe' / 'macho' / 'wasm' / "
+                        "'spirv'");
+        return std::unexpected(std::move(coll).release());
+    }
     data.kind = *kindOpt;
 
     // Cross-format identity-block validation (test-analyzer Gap 6

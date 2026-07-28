@@ -1183,9 +1183,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // precedent does NOT do this (it stores arbitrary strings), and inheriting
     // that hole here would be fatal: `"machO"` would silently mean NO ENTRY →
     // silent fallback to the default → the exact miscompile this cycle closes.
-    // The sentinel spelling `"unknown"` is likewise rejected (the
-    // `bitFieldStrategy` "none" discipline) — it names no real format, so an
-    // override under it could never fire.
+    // The sentinel spelling `"unknown"` is likewise rejected — it SPELLS
+    // correctly, so the name lookup succeeds, but it selects no real format
+    // (the shared `kObjectFormatKindSentinelRejection` discipline, identical
+    // to `wideFloatSoftcallLibraryByFormat` below).
     if (doc.contains("charIsUnsigned")) {
         auto const& cu = doc.at("charIsUnsigned");
         if (!cu.is_object()) {
@@ -1261,11 +1262,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                           "in place.", it.key()));
                             continue;
                         }
-                        if (*kind == ObjectFormatKind::Unknown) {
+                        if (!isSelectableObjectFormatKind(*kind)) {
                             coll.emit(DiagnosticCode::C_MalformedJson, path,
-                                      "'unknown' is the invalid sentinel, not "
-                                      "a selectable object format — an "
-                                      "override under it could never fire");
+                                      std::string{
+                                          kObjectFormatKindSentinelRejection});
                             continue;
                         }
                         if (!it.value().is_boolean()) {
@@ -1855,26 +1855,77 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     // ── wideFloatSoftcallLibraryByFormat (LD-2 — optional) ─────────
-    // Flat object-format-key → DT_NEEDED library string (e.g.
+    // Object-format-kind key → DT_NEEDED library string (e.g.
     // {"elf":"libgcc_s.so.1"}). The LIR lowerer resolves the ACTIVE format's
-    // entry and binds each minted softcall extern to it. Mirrors the
-    // condCodeEncoding object-of-scalars shape (arbitrary keys here).
+    // entry and binds each minted softcall extern to it.
+    //
+    // ★ EVERY KEY IS VALIDATED through `objectFormatKindFromName`, and the
+    // parsed value is stored under the resolved KIND (an
+    // `ObjectFormatKind`-indexed array), not under the raw string. This key
+    // used to accept ARBITRARY strings — it was the precedent the
+    // `charIsUnsigned.byObjectFormat` reshape deliberately did NOT follow, and
+    // it left exactly the hole that reshape exists to delete: a misspelled
+    // `"elff"` / a mis-cased `"ELF"` loaded perfectly clean, the accessor's
+    // lookup missed, and the F128 softcall path reported that the format
+    // declares no softcall library. Long-double arithmetic degraded or failed
+    // on a PURE TYPO, with no diagnostic naming the config.
+    //
+    // Three rejections, each closing one way the old shape could lie:
+    //   * an unrecognized name — the typo case, and the diagnostic NAMES it;
+    //   * the `unknown` sentinel — it SPELLS correctly so the name lookup
+    //     succeeds, but it selects no real format (the shared
+    //     `kObjectFormatKindSentinelRejection` discipline);
+    //   * an EMPTY library string — indistinguishable at the accessor from an
+    //     absent key, i.e. the same silent fallback one layer down.
     if (doc.contains("wideFloatSoftcallLibraryByFormat")) {
         auto const& lib = doc.at("wideFloatSoftcallLibraryByFormat");
         if (!lib.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/wideFloatSoftcallLibraryByFormat",
-                      "must be an object mapping object-format key → library string");
+                      "must be an object mapping object-format kind name "
+                      "('elf' / 'pe' / 'macho' / 'wasm' / 'spirv') → library "
+                      "string");
         } else {
             for (auto it = lib.begin(); it != lib.end(); ++it) {
-                if (!it.value().is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/wideFloatSoftcallLibraryByFormat/{}", it.key()),
-                              "library value must be a string");
+                if (detail::isDocumentationKey(it.key())) continue;
+                auto const path = std::format(
+                    "/wideFloatSoftcallLibraryByFormat/{}", it.key());
+                auto const kind = objectFormatKindFromName(it.key());
+                if (!kind.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is not a recognized object-format kind "
+                                  "(expected one of 'elf' / 'pe' / 'macho' / "
+                                  "'wasm' / 'spirv'). An unrecognized name "
+                                  "would declare a softcall library that never "
+                                  "resolves, silently leaving the F128 softcall "
+                                  "path with no runtime library.", it.key()));
                     continue;
                 }
-                data.wideFloatSoftcallLibraryByFormat.emplace(
-                    it.key(), it.value().get<std::string>());
+                if (!isSelectableObjectFormatKind(*kind)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::string{kObjectFormatKindSentinelRejection});
+                    continue;
+                }
+                if (!it.value().is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "library value must be a string (the DT_NEEDED "
+                              "library the minted softcall externs bind to)");
+                    continue;
+                }
+                auto value = it.value().get<std::string>();
+                if (value.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "library value must be non-empty — an empty "
+                              "string is indistinguishable from declaring no "
+                              "library at all, so it would read as a silent "
+                              "'this format has none' instead of the "
+                              "declaration it looks like. Omit the key "
+                              "instead.");
+                    continue;
+                }
+                data.wideFloatSoftcallLibraryByFormat[
+                    static_cast<std::size_t>(*kind)] = std::move(value);
             }
         }
     }
