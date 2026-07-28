@@ -5,6 +5,7 @@
 #include "core/types/aggregate_layout.hpp"  // FC6: AggregateLayoutParams
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (extracted; breaks the leaf-enum cycle)
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
+#include "core/types/object_format_kind.hpp"  // ObjectFormatKind (charIsUnsigned's per-format axis)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
 
@@ -2577,15 +2578,44 @@ struct DSS_EXPORT TargetSchemaData {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
 
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): whether bare `char`
-    // (the distinct `TypeKind::Char`, NOT `signed char`/`unsigned char`) is an
-    // UNSIGNED type on this target. Config-driven, NOT an arch identity branch:
-    // the AArch64 ABI mandates unsigned bare `char`, while x86_64/pe64 use
-    // signed — so `arm64.target.json` declares `"charIsUnsigned": true` and the
-    // x86_64 descriptor omits it. Default false = signed (the C-common default
-    // that keeps x86_64/pe64 byte-identical). Consumed by HIR→MIR lowering (the
-    // char→int promotion's SExt-vs-ZExt decision) via `MirLoweringConfig`.
-    bool charIsUnsigned = false;
+    // ── Bare-`char` signedness — THE SINGLE SOURCE OF TRUTH ──────────────
+    // (TF-C56 D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET,
+    //  TF-C75 D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+    //
+    // Whether bare `char` (the distinct `TypeKind::Char`, NOT `signed char` /
+    // `unsigned char`) is an UNSIGNED type. C 6.2.5p15 leaves this
+    // IMPLEMENTATION-DEFINED, and the implementation that decides is the
+    // (processor × PLATFORM) pair, not either alone: the SAME AArch64 CPU is
+    // UNSIGNED under GNU/Linux AAPCS64 and SIGNED under Apple's Darwin ABI.
+    //
+    // ★ THE WHOLE FACT LIVES HERE, IN ONE KEY. `charIsUnsignedDefault` is the
+    // processor's answer; `charIsUnsignedByFormat[kind]` overrides it for the
+    // object formats whose PLATFORM fixes the answer for every CPU it serves
+    // (Darwin/macho and Windows/pe both chose SIGNED). It is NOT split across
+    // the target and the format schemas: `elf` serves both aarch64 (unsigned)
+    // and x86_64 (signed), so a flat value on the FORMAT would be a lie on one
+    // of them, and making it honest would force all 24 `.format.json` files to
+    // enumerate CPU architectures — a layering inversion. The processor half
+    // and the platform half are both per-processor knowledge, so they belong
+    // in the per-processor file.
+    //
+    // `charIsUnsignedByFormatDeclared[kind]` is the presence bit — the
+    // `condCodeDeclared` discipline. It exists because `false` (signed) is a
+    // MEANINGFUL override value: without it, "this format declares signed"
+    // would be indistinguishable from "this format says nothing", and the
+    // macho/pe rows (which declare exactly `false`) would silently vanish.
+    //
+    // Indexed by `static_cast<std::size_t>(ObjectFormatKind)`; the array size
+    // is derived from the enum's own name table (`kObjectFormatKindCount`), so
+    // a new format kind cannot leave the table one slot short.
+    //
+    // Consumed through ONE accessor, `charIsUnsigned(ObjectFormatKind)`, whose
+    // result is threaded into `MirLoweringConfig.charIsUnsigned` — sole reader
+    // `isSignedIntKind(Char)`, the single SExt-vs-ZExt decision on the char→int
+    // promotion. No arch, format, or platform NAME is ever compared.
+    bool charIsUnsignedDefault = false;
+    std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormat{};
+    std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormatDeclared{};
 
     // TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the target's
     // PER-ARCHITECTURE IDENTITY predefined macros
@@ -2863,13 +2893,32 @@ public:
         return d_.aggregateLayoutLoaded;
     }
 
-    // ── Bare-char signedness (TF-C56, D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) ──
-    // True iff bare `char` is an UNSIGNED type on this target (the AArch64 ABI
-    // rule), false = signed (x86_64/pe64; the default). Threaded into
-    // `MirLoweringConfig.charIsUnsigned` so the char→int promotion picks
-    // ZExt (unsigned) vs SExt (signed) with NO arch identity branch.
-    [[nodiscard]] bool charIsUnsigned() const noexcept {
-        return d_.charIsUnsigned;
+    // ── Bare-char signedness (TF-C56 + TF-C75) ────────────────────────────
+    // THE one resolution point for "is bare `char` unsigned here". True ⇒ the
+    // char→int promotion zero-extends; false ⇒ it sign-extends.
+    //
+    // ★ The OBJECT FORMAT is a REQUIRED argument, and there is deliberately NO
+    // zero-argument overload. Bare-`char` signedness is a (processor ×
+    // PLATFORM) fact, so a no-arg accessor could only return the processor
+    // half — and a caller that forgot the format would silently get arm64's
+    // `true` on Darwin, which is precisely the zero-vs-sign-extend miscompile
+    // this shape exists to make unrepresentable. Requiring the argument moves
+    // that error from "silently wrong output" to "does not compile".
+    //
+    // Resolution: the format's declared override if this target declared one
+    // for that kind, else the target's own default. Both halves come from the
+    // ONE `charIsUnsigned` key in the `.target.json`; no format schema
+    // contributes. Selects on the enum ordinal only — never a format, arch, or
+    // platform NAME.
+    [[nodiscard]] bool charIsUnsigned(ObjectFormatKind format) const noexcept {
+        auto const idx = static_cast<std::size_t>(format);
+        // Bounds-check a corrupt/out-of-enum cast rather than index out of
+        // range; an unrepresentable kind reads as "no override declared".
+        if (idx < d_.charIsUnsignedByFormatDeclared.size()
+            && d_.charIsUnsignedByFormatDeclared[idx]) {
+            return d_.charIsUnsignedByFormat[idx];
+        }
+        return d_.charIsUnsignedDefault;
     }
 
     // ── Per-architecture identity predefined macros (TF-C74) ──────

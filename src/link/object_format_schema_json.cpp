@@ -4,11 +4,13 @@
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
+#include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -43,6 +45,77 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
         return std::unexpected(std::move(coll).release());
+    }
+
+    // ── closed root-key vocabulary ────────────────────────────────────────
+    //
+    // ★ THE LAST UNGUARDED LOADER FAMILY, and the highest-stakes of the three.
+    // The language loader closed its root keys in TF-C72 and the TARGET loader
+    // in TF-C74; the FORMAT loader still read every root key through a bare
+    // `doc.contains(…)` and IGNORED unknowns. That matters more here than
+    // anywhere else because format keys carry SILENT-MISCOMPILE semantics:
+    // `dataModel`, `bitFieldStrategy`, `longDoubleFormat`, `externCallDispatch`,
+    // `dataImportBinding`, `tlsAccess`, `stackReserveControl`. A typo'd
+    // `"bitFieldStrateg"` in any of the shipped `.format.json` files loads
+    // perfectly clean, is never read, and the engine silently falls back to the
+    // TARGET's strategy: a wrong-LAYOUT miscompile with no diagnostic. Same
+    // helper, same `C_MalformedJson` code and same message wording as the
+    // target loader — three loaders behaving identically is the point.
+    //
+    // ★ `charSignedness` is DELIBERATELY ABSENT from this vocabulary, and its
+    // absence is load-bearing rather than an oversight. Bare-`char` signedness
+    // is declared ENTIRELY on the TARGET (`charIsUnsigned`, which carries its
+    // own per-object-format overrides); a format file that re-declares it here
+    // would be a SECOND source of truth that nothing reads, so this guard
+    // rejects it by name rather than letting it sit inert.
+    //
+    // The `$`-prefix carve-out is MANDATORY, not decorative: the shipped format
+    // files use `$comment` / `$…Comment` heavily (MEASURED: 20 distinct
+    // `$`-prefixed root keys across the 24 shipped files, `$comment` in all 24),
+    // so without it this guard would reject every shipped format on first load.
+    //
+    // ★ Every name here is a key the loader GENUINELY READS — derived by
+    // walking this function's own `doc.contains(…)` / `doc.at(…)` sites, NOT
+    // copied from a shipped file's key set (that would bake in whatever one
+    // file happens to contain and start failing legitimate keys only other
+    // files use). `relocations` is read indirectly, through the shared
+    // `loadRelocationTable(doc, …)` substrate below. RE-DERIVED (not
+    // decremented) after `charSignedness` was removed: 25 keys appear in a
+    // direct `doc.contains(…)`/`doc.at(…)`, plus `relocations` through the
+    // shared substrate, = 26. VERIFIED against the union of non-`$` root keys
+    // across all 24 shipped files (also 26): the two sets are identical — no
+    // key is read-but-never-declared, and none is declared-but-never-read.
+    static constexpr std::array<std::string_view, 26> kFormatDocumentKeys{
+        // identity + loader gates
+        "dssObjectFormatVersion", "format",
+        // C-family ABI axes (every one a silent-miscompile risk if it typos)
+        "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        // output packaging + artifact vocabulary
+        "container", "artifactProfiles",
+        // program-entry cluster
+        "entryPoint", "entryCallingConvention", "processExit", "processArgs",
+        // import / link contract
+        "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        "tlsAccess", "librarySynthesis",
+        // stack-reserve capability + its remedy axis
+        "stackReserveControl", "stackReserveUnsupportedReason",
+        // section / relocation description
+        "sections", "relocations", "supportedDataSections",
+        // per-kind identity blocks (cross-kind-guarded above)
+        "elf", "pe", "optionalHeader", "macho", "image"};
+    DSS_CHECK_KEY_VOCABULARY(kFormatDocumentKeys);
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (detail::isDocumentationKey(it.key())) continue;
+        bool known = false;
+        for (auto const& k : kFormatDocumentKeys) {
+            if (it.key() == k) { known = true; break; }
+        }
+        if (!known) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/{}", it.key()),
+                      std::format("unknown top-level key '{}' (typo "
+                                  "discriminator)", it.key()));
+        }
     }
 
     // dssObjectFormatVersion — same per-schema-file version contract

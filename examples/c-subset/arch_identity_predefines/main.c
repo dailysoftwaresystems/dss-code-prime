@@ -38,13 +38,33 @@
  * expected.json, so the three routes are told apart by the RUNNER and not only
  * by arithmetic that happens to agree.
  *
- * ★ DELIBERATELY NOT USED as the runtime arch cross-check: bare-`char`
- * signedness. `arm64.target.json` declares `charIsUnsigned: true` for BOTH
- * arm64 platforms, but clang defines `__CHAR_UNSIGNED__` only for
- * aarch64-linux-gnu — NOT for arm64-apple-darwin (MEASURED 2026-07-28).
- * Building the exit code on it would bake that known divergence into a green
- * test AND would make the clang ground-truth build disagree with DSS on this
- * very host. The identity-macro VALUES carry the arithmetic instead.
+ * ★ DELIBERATELY NOT USED as the runtime ARCHITECTURE cross-check: bare-`char`
+ * signedness. THE CONSTRAINT STANDS; ITS REASON HAS CHANGED. The reason used to
+ * be that DSS was WRONG on the macho leg — bare `char` resolved to UNSIGNED on
+ * both arm64 platforms, so building the exit code on `char` signedness would
+ * have baked a known divergence into a green test. TF-C75 fixed that: signedness
+ * is now resolved per (architecture × object-format) pair, so DSS and clang
+ * agree on every shipped leg (MEASURED 2026-07-28: clang defines
+ * `__CHAR_UNSIGNED__` only for aarch64-linux-gnu, NOT for arm64-apple-darwin /
+ * x86_64-linux / x86_64-windows-msvc, and DSS matches that on all four shipped
+ * legs).
+ *
+ * The constraint survives its original reason because of a SECOND, permanent
+ * one: bare-`char` signedness is not an ARCHITECTURE fact at all. It is
+ * (architecture × PLATFORM) — one CPU legitimately answers differently on two
+ * platforms, as arm64-linux (unsigned) and arm64-darwin (signed) do. So an
+ * example that used it to identify a CPU would be asserting something untrue,
+ * and would break the moment a new platform is added for an existing CPU
+ * (windows-arm64 being the obvious next one). The identity-macro VALUES carry
+ * the arithmetic here instead, and they are per-CPU facts by construction.
+ *
+ * The ONE sanctioned use of `char` signedness in a corpus exit code is
+ * examples/c-subset/char_signedness_macro_coherence, which cross-checks the two
+ * DECLARATIONS of that single fact (the `__CHAR_UNSIGNED__` macro row against
+ * the emitted SExt/ZExt codegen) rather than using it to identify a machine.
+ * That is a self-consistency check, not an architecture check, and it is the
+ * only way to catch drift between those two declarations. Do not spread the
+ * dependency beyond it.
  */
 
 #include <stdio.h>   /* `puts` — the shipped descriptor, resolved per format */

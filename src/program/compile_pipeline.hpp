@@ -101,6 +101,20 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
 effectiveLongDoubleFormat(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;
 
+// ★ NO `effectiveCharIsUnsigned` HERE — and its absence is the design, not an
+// omission (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, TF-C75). The two resolvers
+// above exist because their axes have contributions from BOTH schemas that must
+// be reconciled. Bare-`char` signedness has exactly ONE contributor: the TARGET
+// declares the whole (processor × platform) fact in its single `charIsUnsigned`
+// key (`{"default": …, "byObjectFormat": {…}}`), and resolution is
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)` — a method on the owner, with
+// the format KIND as a REQUIRED argument so no caller can silently take the
+// processor half alone. A wrapper here would be a second place the fact is
+// "about", which is precisely the duplication this reshape removed. The result
+// still lands in `MirLoweringConfig.charIsUnsigned`, whose sole reader is
+// `isSignedIntKind(TypeKind::Char)` — the single SExt-vs-ZExt decision for the
+// char→int promotion.
+
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
 // tier succeeded AND `writeImage` committed bytes to disk.

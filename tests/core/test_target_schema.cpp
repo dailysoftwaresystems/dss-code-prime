@@ -1768,9 +1768,19 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   {"__ARM_ARCH_ISA_A64", K::Constant, "1", {}},
                   {"__arm64__",          K::Constant, "1", {"macho"}},
                   {"__arm64",            K::Constant, "1", {"macho"}},
+                  // TF-C75: NOT an identity spelling — the PREPROCESSOR face of
+                  // this file's `charIsUnsigned` key, gated to exactly the leg
+                  // where that key's `default` (true) is the effective answer.
+                  // The macho/pe `byObjectFormat` overrides make bare `char`
+                  // SIGNED there, so the macro must NOT appear on those legs.
+                  // MEASURED 2026-07-28, `/usr/bin/clang -dM -E`: defined for
+                  // aarch64-linux-gnu only.
+                  {"__CHAR_UNSIGNED__",  K::Constant, "1", {"elf"}},
               }))
-        << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated "
-           "and the two APPLE-ONLY spellings gated to macho";
+        << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated, "
+           "the two APPLE-ONLY spellings gated to macho, and __CHAR_UNSIGNED__ "
+           "gated to elf — the one row whose gate is an ABI property rather "
+           "than a vendor spelling";
 }
 
 // The x86_64 twin: MEASURED identical on x86_64-linux-gnu, x86_64-apple-darwin
@@ -1904,4 +1914,316 @@ TEST(TargetSchema, TFC74ShippedTargetsSatisfyClosedRootKeyVocabulary) {
             << name << ".target.json must load clean under the closed "
                        "root-key vocabulary";
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C75 (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM) — bare-`char` signedness, the
+// SINGLE SOURCE OF TRUTH.
+//
+// The whole (processor × platform) fact lives in ONE key on the TARGET:
+//
+//     "charIsUnsigned": { "default": true,
+//                         "byObjectFormat": { "macho": false, "pe": false } }
+//
+// It was briefly split across the target (a bare bool) and every `.format.json`
+// (a `charSignedness` tri-state) — two places, reconciled by a free function.
+// The collapse to one place is what these tests pin: the shape, its fail-loud
+// rejections, the resolution, and the shipped declarations themselves.
+//
+// WHY IT CANNOT LIVE ON THE FORMAT INSTEAD: `elf` serves BOTH aarch64
+// (unsigned) and x86_64 (signed), so a flat value there is a lie on one of
+// them. WHY IT CANNOT BE A BARE BOOL HERE: `true` alone asserts one answer for
+// every platform this processor serves, and that assertion was the miscompile
+// (correct for aarch64-linux, silently wrong for arm64-darwin).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using ::dss::ObjectFormatKind;
+
+// A minimal target whose `charIsUnsigned` key is exactly `body` (spliced in
+// verbatim, so a test can probe a MALFORMED shape and not just a wrong value).
+[[nodiscard]] std::string targetWithCharIsUnsigned(std::string_view body) {
+    return std::string{
+               R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+               R"("opcodes":[{"mnemonic":"invalid","result":"none"}],)"
+               R"("charIsUnsigned":)"}
+           + std::string{body} + "}";
+}
+
+// True iff SOME diagnostic mentions `needle` (message or path). A rejection
+// that does not NAME the offending key sends the reader back to eyeballing the
+// file by hand.
+[[nodiscard]] bool anyMentions(auto const& diags, std::string_view needle) {
+    return std::ranges::any_of(diags, [needle](auto const& d) {
+        return d.message.find(needle) != std::string::npos
+            || d.path.find(needle)    != std::string::npos;
+    });
+}
+
+// Every ObjectFormatKind an emitted image can actually have, so a "resolves for
+// EVERY format" assertion cannot quietly skip one.
+constexpr ObjectFormatKind kRealFormatKinds[] = {
+    ObjectFormatKind::Elf,  ObjectFormatKind::Pe,   ObjectFormatKind::MachO,
+    ObjectFormatKind::Wasm, ObjectFormatKind::Spirv};
+
+}  // namespace
+
+// ── the SHIPPED matrix, EXACT SET (not a count, not a spot check) ───────────
+//
+// ★ THE anti-drift pin. Every (shipped target × every format kind) pair, whole
+// map, one comparison. A count would stay green if `macho` and `elf` silently
+// traded values; a spot check on arm64×macho would stay green if the `pe`
+// forward guard were dropped. The resolved truth table is the deliverable, so
+// the resolved truth table is what is compared.
+//
+// RED-ON-DISABLE: delete either `byObjectFormat` row from arm64.target.json, or
+// make `charIsUnsigned(kind)` ignore its argument, and this fails naming the
+// exact pair.
+TEST(TargetSchema, TFC75ShippedCharSignednessMatrixIsExact) {
+    struct Row {
+        std::string_view target;
+        std::string_view format;
+        bool             charIsUnsigned;
+        bool operator==(Row const&) const = default;
+    };
+    // MEASURED 2026-07-28 with /usr/bin/clang (Apple clang 21.0.0) via
+    // `clang -dM -E` (__CHAR_UNSIGNED__), `_Static_assert((char)-1 < 0)` and
+    // ldrsb-vs-ldrb codegen: aarch64-linux is the ONLY unsigned leg.
+    std::vector<Row> const expected{
+        // arm64: the SAME processor, OPPOSITE answers, decided by the platform.
+        {"arm64",  "elf",   true },  // AAPCS64 base standard — unsigned
+        {"arm64",  "pe",    false},  // forward guard: no pe64-arm64 format file
+                                     // exists yet; if one lands while PE is
+                                     // silent, Windows-ARM64 silently inherits
+                                     // the bug this anchor was opened for
+        {"arm64",  "macho", false},  // Apple's platform ABI — signed
+        {"arm64",  "wasm",  true },  // no override ⇒ the processor default
+        {"arm64",  "spirv", true },
+        // x86_64: signed on every platform it serves, so it declares NO key at
+        // all and every row falls to the absent-key default.
+        {"x86_64", "elf",   false},
+        {"x86_64", "pe",    false},
+        {"x86_64", "macho", false},
+        {"x86_64", "wasm",  false},
+        {"x86_64", "spirv", false},
+    };
+
+    std::vector<Row> actual;
+    for (auto const& row : expected) {
+        auto t = TargetSchema::loadShipped(std::string{row.target});
+        ASSERT_TRUE(t.has_value()) << row.target;
+        auto const kind = ::dss::objectFormatKindFromName(row.format);
+        ASSERT_TRUE(kind.has_value()) << row.format;
+        actual.push_back(Row{row.target, row.format,
+                             (*t)->charIsUnsigned(*kind)});
+    }
+    EXPECT_EQ(actual, expected)
+        << "the shipped bare-`char` signedness matrix drifted — arm64 must be "
+           "UNSIGNED on elf and SIGNED on macho/pe, x86_64 SIGNED everywhere";
+}
+
+// ── the accessor's own quadrants, on hand-built schemas ─────────────────────
+//
+// The shipped matrix above cannot reach two of these: no shipped target
+// overrides a `false` default UP to unsigned, and none declares the object form
+// without a `byObjectFormat`. An inverted comparison inside the accessor would
+// survive a shipped-only test, because both branches produce a valid-looking
+// answer.
+TEST(TargetSchema, TFC75OverrideBeatsDefaultInBothDirections) {
+    // default UNSIGNED, macho overrides DOWN to signed (the shipped shape).
+    auto down = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":true,"byObjectFormat":{"macho":false}})"),
+        "<inline>");
+    ASSERT_TRUE(down.has_value());
+    EXPECT_FALSE((*down)->charIsUnsigned(ObjectFormatKind::MachO))
+        << "a declared override must beat the default";
+    EXPECT_TRUE((*down)->charIsUnsigned(ObjectFormatKind::Elf))
+        << "a format with no override must take the default";
+
+    // default SIGNED, macho overrides UP to unsigned — the OTHER direction,
+    // which an inverted `if` would keep passing without.
+    auto up = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":false,"byObjectFormat":{"macho":true}})"),
+        "<inline>");
+    ASSERT_TRUE(up.has_value());
+    EXPECT_TRUE((*up)->charIsUnsigned(ObjectFormatKind::MachO))
+        << "the override must win when it flips signed→unsigned too, not only "
+           "unsigned→signed";
+    EXPECT_FALSE((*up)->charIsUnsigned(ObjectFormatKind::Elf));
+}
+
+// ★ An override of `false` must be DISTINGUISHABLE from no override at all.
+// This is the whole reason the storage carries a presence bit rather than a
+// bare bool: the shipped macho/pe rows declare exactly `false`, so if "declared
+// false" collapsed into "undeclared" those rows would silently vanish and arm64
+// would zero-extend on Darwin again.
+TEST(TargetSchema, TFC75FalseOverrideIsDistinguishableFromNoOverride) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":true,"byObjectFormat":{"macho":false}})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE((*r)->charIsUnsigned(ObjectFormatKind::MachO));
+    for (auto const kind : kRealFormatKinds) {
+        if (kind == ObjectFormatKind::MachO) continue;
+        EXPECT_TRUE((*r)->charIsUnsigned(kind))
+            << "only the DECLARED format may be overridden — "
+            << ::dss::objectFormatKindName(kind) << " must keep the default";
+    }
+}
+
+// `byObjectFormat` is optional: an object with only `default` states a uniform
+// answer, and must resolve to it for EVERY format kind.
+TEST(TargetSchema, TFC75DefaultOnlyObjectAppliesToEveryFormat) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(R"({"default":true})"), "<inline>");
+    ASSERT_TRUE(r.has_value());
+    for (auto const kind : kRealFormatKinds) {
+        EXPECT_TRUE((*r)->charIsUnsigned(kind))
+            << ::dss::objectFormatKindName(kind);
+    }
+}
+
+// The key is OPTIONAL as a whole — absent ⇒ signed on every format. This is the
+// x86_64 path and it must stay byte-identical to pre-TF-C75 behaviour.
+TEST(TargetSchema, TFC75AbsentKeyMeansSignedOnEveryFormat) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    for (auto const kind : kRealFormatKinds) {
+        EXPECT_FALSE((*r)->charIsUnsigned(kind))
+            << "a target that declares nothing must be SIGNED everywhere — the "
+               "C-common default x86_64.target.json relies on: "
+            << ::dss::objectFormatKindName(kind);
+    }
+}
+
+// ── loader fail-loud ────────────────────────────────────────────────────────
+
+// ★ THE HOLE THE PRECEDENT LEFT OPEN, closed here. `wideFloatSoftcallLibrary-
+// ByFormat` accepts ARBITRARY string keys, so on that key `"machO"` silently
+// means NO ENTRY. Inherited here it would mean: no override → silent fallback
+// to the arm64 default → bare `char` zero-extends on Darwin, with no
+// diagnostic. Exactly the miscompile this cycle exists to fix.
+TEST(TargetSchema, TFC75UnknownObjectFormatKeyRejectedAndNamed) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":true,"byObjectFormat":{"machO":false}})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a mis-cased/typo'd format name must fail loud — silently ignoring "
+           "it re-creates the exact silent miscompile this key was reshaped to "
+           "eliminate";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    EXPECT_TRUE(anyMentions(r.error(), "machO"))
+        << "the diagnostic must NAME the offending key";
+}
+
+// The `unknown` sentinel names no real format, so an override under it could
+// never fire — the `bitFieldStrategy` "none" discipline.
+TEST(TargetSchema, TFC75UnknownSentinelFormatKeyRejected) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":true,"byObjectFormat":{"unknown":false}})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "'unknown' is the invalid sentinel, not a selectable format";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ A BARE BOOLEAN IS REJECTED, ON PURPOSE. It is the pre-TF-C75 shape and it
+// READS as "char is unsigned on this target, full stop" — the false sentence
+// this reshape deleted. Accepting it as a shorthand would let that sentence
+// back into a config file, and the resulting silent-fallback-to-default is
+// indistinguishable at the call site from a correct uniform answer.
+TEST(TargetSchema, TFC75BareBooleanShapeRejected) {
+    for (char const* legacy : {"true", "false"}) {
+        auto r = TargetSchema::loadFromText(
+            targetWithCharIsUnsigned(legacy), "<inline>");
+        ASSERT_FALSE(r.has_value())
+            << "the legacy bare-bool shape must fail loud, never be silently "
+               "re-interpreted as a uniform default: " << legacy;
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    }
+}
+
+// Any other non-object scalar likewise — a string `"unsigned"` is the shape of
+// the REMOVED format-side key and must not be quietly accepted here.
+TEST(TargetSchema, TFC75NonObjectShapesRejected) {
+    for (char const* body : {R"("unsigned")", "1", "null", "[]"}) {
+        auto r = TargetSchema::loadFromText(
+            targetWithCharIsUnsigned(body), "<inline>");
+        EXPECT_FALSE(r.has_value())
+            << "non-object charIsUnsigned must fail loud: " << body;
+    }
+}
+
+// `default` is REQUIRED inside the object. Without it, every format with no
+// override would resolve to an implicit `false` that no file states — a silent
+// fallback on the one axis whose two answers are opposite high-bit extensions.
+TEST(TargetSchema, TFC75MissingDefaultRejected) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(R"({"byObjectFormat":{"macho":false}})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an object with no 'default' leaves un-overridden formats resolving "
+           "to a signedness nothing declares";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// The inner keys are a CLOSED vocabulary: a misspelled `"defualt"` would
+// otherwise read as "no default declared" AND drop the value silently.
+TEST(TargetSchema, TFC75UnknownInnerKeyRejectedAndNamed) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(R"({"default":true,"byObjectFormt":{}})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled inner key must be REJECTED — ignoring it makes the "
+           "override map a knob that can lie";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    EXPECT_TRUE(anyMentions(r.error(), "byObjectFormt"))
+        << "the diagnostic must NAME the offending key";
+}
+
+// Malformed value types on both halves.
+TEST(TargetSchema, TFC75NonBooleanValuesRejected) {
+    auto badDefault = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(R"({"default":"true"})"), "<inline>");
+    EXPECT_FALSE(badDefault.has_value())
+        << "'default' must be a boolean — a string 'true' is a typo, not a yes";
+
+    auto badOverride = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"default":true,"byObjectFormat":{"macho":"signed"}})"),
+        "<inline>");
+    EXPECT_FALSE(badOverride.has_value())
+        << "an override must be a boolean — 'signed' is the spelling of the "
+           "REMOVED format-side key and must not be accepted here";
+
+    auto badMap = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(R"({"default":true,"byObjectFormat":true})"),
+        "<inline>");
+    EXPECT_FALSE(badMap.has_value())
+        << "'byObjectFormat' must be an object";
+}
+
+// The `$`-documentation carve-out must reach INSIDE the block too — the shipped
+// arm64 file explains this key at length, and prose must never be mistaken for
+// a format name.
+TEST(TargetSchema, TFC75DollarPrefixedInnerKeysAccepted) {
+    auto r = TargetSchema::loadFromText(
+        targetWithCharIsUnsigned(
+            R"({"$comment":"why Darwin differs","default":true,
+                "byObjectFormat":{"$machoComment":"Apple chose signed",
+                                  "macho":false}})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "`$`-prefixed keys are the codebase-wide documentation convention";
+    EXPECT_FALSE((*r)->charIsUnsigned(ObjectFormatKind::MachO));
+    EXPECT_TRUE((*r)->charIsUnsigned(ObjectFormatKind::Elf));
 }

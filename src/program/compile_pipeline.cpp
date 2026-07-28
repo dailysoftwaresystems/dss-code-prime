@@ -82,6 +82,18 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     return format.longDoubleFormat();
 }
 
+// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-
+// PLATFORM) ──────────────────────────────────────────────────────────────
+// There is deliberately no third member of the `effective*` family for
+// bare-`char` signedness. This family exists because those axes have
+// contributions from BOTH schemas that must be RECONCILED — a genuine
+// two-sided negotiation. Char signedness has exactly ONE contributor: the
+// target declares the whole (processor × platform) fact in its single
+// `charIsUnsigned` key. An `effectiveCharIsUnsigned(target, format)` wrapper
+// would advertise a negotiation that no longer happens, and would be a second
+// place the fact is "about" — the exact duplication this reshape removed.
+// The call site asks the owner directly: `target.charIsUnsigned(format.kind())`.
+
 namespace {
 
 // Snapshot-vs-current `errorCount` gate. Each tier shares `reporter`,
@@ -578,11 +590,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the active
-    // target's bare-`char` signedness (AArch64 = unsigned; x86_64/pe64 = signed)
-    // so HIR→MIR picks ZExt vs SExt for the char→int promotion — a config bool,
-    // never an arch identity branch. Absent key ⇒ false = signed.
-    mirCfg.charIsUnsigned        = target.charIsUnsigned();
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+    // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
+    // so HIR→MIR picks ZExt vs SExt for the char→int promotion. The axis is
+    // (processor × PLATFORM), not per-processor — the same arm64 CPU is
+    // UNSIGNED under GNU/Linux and SIGNED under Darwin — and the TARGET
+    // declares BOTH halves in its one `charIsUnsigned` key, so this asks the
+    // one owner and passes it the active format KIND. No format schema
+    // contributes; no arch or platform name is compared.
+    mirCfg.charIsUnsigned        = target.charIsUnsigned(format.kind());
     // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
     // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
     // merge maps MIR symbols to names through `model.recordFor`, so a

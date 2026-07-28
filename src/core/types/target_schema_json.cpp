@@ -1145,19 +1145,142 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // diagnostic if a target is asked to lay out an aggregate without declaring
     // its params — a silent wrong-layout is thereby still impossible.
 
-    // ── charIsUnsigned (TF-C56, D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) ──
-    // Whether bare `char` is UNSIGNED on this target (`"charIsUnsigned": true`).
-    // OPTIONAL scalar bool; ABSENT ⇒ false = signed (the x86_64/pe64 default,
-    // the C-common choice). arm64 declares true (the AArch64 ABI rule). A
-    // present value MUST be a boolean (a malformed value fails loud rather than
-    // silently picking a signedness — the two produce opposite high-bit
-    // extensions, a silent-miscompile axis).
+    // ── charIsUnsigned (TF-C56 D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET
+    //     + TF-C75 D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM) ────────────────
+    //
+    // THE SINGLE SOURCE OF TRUTH for bare-`char` signedness — the whole
+    // (processor × platform) fact in ONE key on the ONE file that owns it:
+    //
+    //     "charIsUnsigned": {
+    //       "default": true,
+    //       "byObjectFormat": { "macho": false, "pe": false }
+    //     }
+    //
+    // `default` is the PROCESSOR's answer; `byObjectFormat` overrides it for
+    // the platforms that fix the answer for every CPU they serve (Darwin and
+    // Windows both chose SIGNED). OPTIONAL as a whole; ABSENT ⇒ default false
+    // = signed everywhere, which is the C-common answer and is CORRECT on
+    // every format x86_64 serves (x86_64.target.json therefore omits the key,
+    // exactly as before this cycle).
+    //
+    // ★ WHEN PRESENT THE KEY MUST BE THE OBJECT FORM — a bare boolean is
+    // REJECTED, not accepted as a shorthand. This is deliberate and is the
+    // point of the reshape: `"charIsUnsigned": true` READS as "char is
+    // unsigned on this target, full stop", and that sentence is exactly the
+    // falsehood TF-C75 exists to delete (it was true for aarch64-linux and
+    // silently wrong for arm64-darwin). `{"default": true}` reads as "unsigned
+    // unless a format says otherwise", which is what the value actually means.
+    // Accepting both shapes would also leave the bare-bool form with ZERO
+    // shipped users — accepted config surface nothing exercises.
+    //
+    // ★ `default` is REQUIRED inside the object. An object carrying only
+    // `byObjectFormat` would leave every unlisted format resolving to an
+    // implicit `false` that no file states — a silent fallback on the one axis
+    // whose two answers are opposite high-bit extensions.
+    //
+    // ★ EVERY `byObjectFormat` KEY IS VALIDATED through
+    // `objectFormatKindFromName`. The nearby `wideFloatSoftcallLibraryByFormat`
+    // precedent does NOT do this (it stores arbitrary strings), and inheriting
+    // that hole here would be fatal: `"machO"` would silently mean NO ENTRY →
+    // silent fallback to the default → the exact miscompile this cycle closes.
+    // The sentinel spelling `"unknown"` is likewise rejected (the
+    // `bitFieldStrategy` "none" discipline) — it names no real format, so an
+    // override under it could never fire.
     if (doc.contains("charIsUnsigned")) {
-        if (!doc.at("charIsUnsigned").is_boolean()) {
+        auto const& cu = doc.at("charIsUnsigned");
+        if (!cu.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, "/charIsUnsigned",
-                      "'charIsUnsigned' must be a boolean");
+                      "'charIsUnsigned' must be an OBJECT — "
+                      R"({"default": <bool>, "byObjectFormat": {"macho": <bool>, …}}. )"
+                      "A bare boolean is rejected on purpose: it asserts one "
+                      "signedness for every platform this processor serves, "
+                      "which is the claim that made bare `char` sign-extend "
+                      "wrongly on Apple arm64. Write {\"default\": <bool>} if "
+                      "the answer really is uniform.");
         } else {
-            data.charIsUnsigned = doc.at("charIsUnsigned").get<bool>();
+            // Closed inner-key vocabulary: a misspelled `"defualt"` would
+            // otherwise leave the required-key check firing on a file that
+            // plainly meant to declare one, or (worse, once `default` is
+            // present) silently drop a `"byObjectFormt"` override map.
+            static constexpr std::array<std::string_view, 2>
+                kCharIsUnsignedKeys{"default", "byObjectFormat"};
+            DSS_CHECK_KEY_VOCABULARY(kCharIsUnsignedKeys);
+            for (auto it = cu.begin(); it != cu.end(); ++it) {
+                if (detail::isDocumentationKey(it.key())) continue;
+                bool known = false;
+                for (auto const& k : kCharIsUnsignedKeys) {
+                    if (it.key() == k) { known = true; break; }
+                }
+                if (!known) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/charIsUnsigned/{}", it.key()),
+                              std::format("unknown key '{}' in 'charIsUnsigned' "
+                                          "(expected 'default' / "
+                                          "'byObjectFormat')", it.key()));
+                }
+            }
+
+            if (!cu.contains("default")) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/charIsUnsigned/default",
+                          "'charIsUnsigned' must state its 'default' — the "
+                          "processor's answer for every object format that "
+                          "declares no override. Omitting it would leave those "
+                          "formats resolving to a signedness no file states.");
+            } else if (!cu.at("default").is_boolean()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/charIsUnsigned/default",
+                          "'default' must be a boolean (true = bare `char` is "
+                          "UNSIGNED)");
+            } else {
+                data.charIsUnsignedDefault = cu.at("default").get<bool>();
+            }
+
+            if (cu.contains("byObjectFormat")) {
+                auto const& byFmt = cu.at("byObjectFormat");
+                if (!byFmt.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/charIsUnsigned/byObjectFormat",
+                              "'byObjectFormat' must be an object mapping "
+                              "object-format kind names to booleans");
+                } else {
+                    for (auto it = byFmt.begin(); it != byFmt.end(); ++it) {
+                        if (detail::isDocumentationKey(it.key())) continue;
+                        auto const path = std::format(
+                            "/charIsUnsigned/byObjectFormat/{}", it.key());
+                        auto const kind = objectFormatKindFromName(it.key());
+                        if (!kind.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format(
+                                          "'{}' is not a recognized "
+                                          "object-format kind (expected one of "
+                                          "'elf' / 'pe' / 'macho' / 'wasm' / "
+                                          "'spirv'). An unrecognized name would "
+                                          "declare an override that never "
+                                          "fires, silently leaving the default "
+                                          "in place.", it.key()));
+                            continue;
+                        }
+                        if (*kind == ObjectFormatKind::Unknown) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      "'unknown' is the invalid sentinel, not "
+                                      "a selectable object format — an "
+                                      "override under it could never fire");
+                            continue;
+                        }
+                        if (!it.value().is_boolean()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      "override must be a boolean (true = bare "
+                                      "`char` is UNSIGNED on this format)");
+                            continue;
+                        }
+                        auto const idx = static_cast<std::size_t>(*kind);
+                        data.charIsUnsignedByFormat[idx] =
+                            it.value().get<bool>();
+                        data.charIsUnsignedByFormatDeclared[idx] = true;
+                    }
+                }
+            }
         }
     }
 

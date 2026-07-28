@@ -53,6 +53,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -2894,4 +2895,92 @@ TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
     EXPECT_FALSE(fs::exists(scratch.path() / "target"))
         << "a multi-target build rejected at the pre-flight must not have "
            "compiled ANY target — no output tree should exist";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C75 (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM) — the END-TO-END chain the
+// production wiring actually walks: a SHIPPED `.format.json` → its declared
+// `kind` → `TargetSchema::charIsUnsigned(kind)`.
+//
+// The unit-level quadrants live in tests/core/test_target_schema.cpp (hand-
+// built schemas, both override directions, every fail-loud shape). What is
+// pinned HERE is the part those cannot reach: that the SHIPPED format files
+// carry the kinds this resolution depends on, and that the ONE production call
+// site — `mirCfg.charIsUnsigned = target.charIsUnsigned(format.kind())` in
+// compile_pipeline.cpp — therefore resolves the real platform matrix.
+//
+// A resolver correct on hand-built schemas and wrong on the shipped ones is
+// still a miscompile, and the shipped chain has an extra failure mode all its
+// own: a format file whose `kind` drifted would silently pick up the WRONG
+// override row while every unit test stayed green.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★ `arm64` × `macho64-arm64-darwin-exec` is THE row: the arm64 processor's
+// default says UNSIGNED, Apple's platform ABI says SIGNED, and the target's own
+// `byObjectFormat` override is what has to win. It was the shipped miscompile
+// before this arc.
+//
+// RED-ON-DISABLE (both verified against the final build):
+//   (1) delete the `"macho": false` row from arm64.target.json → that row
+//       resolves true (unsigned) and this fails;
+//   (2) make `TargetSchema::charIsUnsigned(kind)` ignore its argument and
+//       return the default → the same row fails, and so do the codegen matrix
+//       in tests/mir and the exact-set matrix in tests/core.
+TEST(Program_CharSignedness, ShippedFormatKindsResolveThePlatformMatrix) {
+    struct Row {
+        std::string_view target;
+        std::string_view format;
+        bool             unsignedChar;
+        std::string_view why;
+        bool operator==(Row const&) const = default;
+    };
+    std::vector<Row> const expected{
+        {"arm64", "macho64-arm64-darwin-exec", false,
+         "Apple arm64: the target's macho override makes bare `char` SIGNED, "
+         "beating its own unsigned default"},
+        {"arm64", "macho64-arm64-darwin-dylib", false,
+         "the override is per FORMAT KIND, so every macho artifact profile "
+         "inherits it — not just the one exec file"},
+        {"arm64", "elf64-aarch64-linux-exec", true,
+         "Linux arm64: no override for elf, so AAPCS64's unsigned default "
+         "stands — CORRECT, never flip this"},
+        {"arm64", "elf64-aarch64-linux-pie", true,
+         "same, across artifact profiles"},
+        {"x86_64", "pe64-x86_64-windows-exec", false,
+         "Windows x86_64: signed (x86_64 declares no key at all)"},
+        {"x86_64", "macho64-x86_64-darwin-exec", false,
+         "Darwin x86_64: signed"},
+        {"x86_64", "elf64-x86_64-linux-exec", false,
+         "Linux x86_64: signed"},
+    };
+
+    std::vector<Row> actual;
+    for (auto const& row : expected) {
+        auto t = TargetSchema::loadShipped(std::string{row.target});
+        auto f = ObjectFormatSchema::loadShipped(std::string{row.format});
+        ASSERT_TRUE(t.has_value()) << row.target;
+        ASSERT_TRUE(f.has_value()) << row.format;
+        actual.push_back(Row{row.target, row.format,
+                             (*t)->charIsUnsigned((*f)->kind()), row.why});
+    }
+    EXPECT_EQ(actual, expected)
+        << "the shipped (target × format) bare-`char` matrix drifted";
+}
+
+// The two arm64 legs must DISAGREE. Stated as its own assertion because it is
+// the fact a single per-processor boolean could not hold, and because a
+// resolution that collapsed to "always the default" or "always the override"
+// would satisfy plenty of individual rows above while failing this.
+TEST(Program_CharSignedness, TheTwoArm64LegsDisagreeByPlatform) {
+    auto t     = TargetSchema::loadShipped("arm64");
+    auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    auto elf   = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(t.has_value());
+    ASSERT_TRUE(macho.has_value());
+    ASSERT_TRUE(elf.has_value());
+    EXPECT_NE((*t)->charIsUnsigned((*macho)->kind()),
+              (*t)->charIsUnsigned((*elf)->kind()))
+        << "ONE processor, TWO platforms, OPPOSITE answers — if these ever "
+           "agree, the format half of the resolution has stopped being read "
+           "and bare `char` is being mis-extended on one of the two legs";
 }

@@ -22,6 +22,7 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
 #include "core/types/target_schema.hpp"
+#include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
 
 #include <gtest/gtest.h>
@@ -61,7 +62,18 @@ struct Lowered {
                                    // not spell `long double` at all; the f64 axis
                                    // is the pe64 / apple-arm64 shape where `long
                                    // double` and `double` share ONE core.
-                                   LongDoubleFormat ldf = LongDoubleFormat::None) {
+                                   LongDoubleFormat ldf = LongDoubleFormat::None,
+                                   // D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM: the
+                                   // active OBJECT FORMAT, by shipped name.
+                                   // Bare-`char` signedness is a (processor ×
+                                   // PLATFORM) property — the same arm64 CPU is
+                                   // SIGNED under Darwin and UNSIGNED under
+                                   // GNU/Linux — so a target name alone cannot
+                                   // express the arm64×macho arm at all. EMPTY
+                                   // (the default) ⇒ no format in play and the
+                                   // TARGET's value stands, byte-identically
+                                   // what every pre-existing fixture here got.
+                                   std::string formatName = {}) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -99,11 +111,32 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): thread the target's
-        // bare-`char` signedness exactly as compile_pipeline.cpp does, so an
-        // arm64 target lowers the char→int promotion as ZExt (unsigned) and
-        // x86_64 as SExt (signed). Absent key ⇒ false = signed.
-        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned();
+        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+        // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char`
+        // signedness exactly as compile_pipeline.cpp does, so the char→int
+        // promotion lowers as SExt (signed) or ZExt (unsigned). ★ Routed
+        // through the REAL production accessor and fed the SHIPPED format's own
+        // declared kind — not a re-implementation of the rule and not a
+        // hand-picked kind. That is what keeps the arm64×macho pin non-vacuous:
+        // if the resolution stopped honouring the format the pin goes red,
+        // where a hand-computed expectation here would happily agree with a
+        // broken engine.
+        //
+        // EMPTY `formatName` ⇒ ELF, the format every pre-existing fixture in
+        // this file was implicitly written against. It is spelled out rather
+        // than left to a no-arg accessor BECAUSE there is no no-arg accessor:
+        // the object format is a required argument precisely so a caller cannot
+        // silently take the processor half alone.
+        auto formatKind = ObjectFormatKind::Elf;
+        if (!formatName.empty()) {
+            auto f = ObjectFormatSchema::loadShipped(formatName);
+            if (!f) {
+                ADD_FAILURE() << "loadShipped(format) failed: " << formatName;
+                std::abort();
+            }
+            formatKind = (*f)->kind();
+        }
+        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned(formatKind);
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
@@ -996,6 +1029,76 @@ TEST(MirLoweringCSubset, BareCharToIntPromotionIsTargetSignednessAware) {
             << "arm64: bare char is UNSIGNED — the char→int promotion must ZExt";
         EXPECT_EQ(sexts.size(), 0u)
             << "arm64: no SExt — char is unsigned here (the TF-C56 fix)";
+    }
+}
+
+// D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM: the (processor × PLATFORM) matrix that
+// the per-processor test above CANNOT express. Same one-line program, same one
+// decision site (`isSignedIntKind(Char)` → `mapCast(Char, I32)`), now resolved
+// through the real `TargetSchema::charIsUnsigned(ObjectFormatKind)` fed the
+// shipped format's own declared kind.
+//
+// ★ THE arm64×macho ROW IS THE WHOLE POINT, and it was RED before this arc's
+// fix. `arm64.target.json` declared one flat `charIsUnsigned: true`, so every
+// arm64 leg — including Darwin — zero-extended, while clang SIGN-extends on
+// Apple arm64. MEASURED 2026-07-28 (Darwin 25.5.0 arm64, Apple clang 21.0.0,
+// /usr/bin/clang), three ways: `clang -dM -E` defines __CHAR_UNSIGNED__ for
+// aarch64-linux-gnu and NOT for arm64-apple-darwin; `_Static_assert((char)-1 <
+// 0)` passes on arm64-apple-darwin and fails on aarch64-linux-gnu; codegen is
+// `ldrsb` vs `ldrb`. The two arm64 rows below DISAGREE on purpose — that
+// disagreement is the fact a per-CPU boolean cannot hold, and the reason the
+// target's one key carries `byObjectFormat` overrides.
+//
+// RED-ON-DISABLE (two independent observables, both verified against the FINAL
+// build):
+//   (1) drop the `"macho": false` row from arm64.target.json's `charIsUnsigned`
+//       → the arm64×macho row falls back to `default: true` and emits ZExt,
+//       failing this test (the exact-set matrix in tests/core fails too);
+//   (2) make `charIsUnsigned(kind)` ignore its argument and return the default
+//       → the same row goes red, and the two arm64 rows stop disagreeing.
+TEST(MirLoweringCSubset, BareCharSignednessIsResolvedPerTargetAndFormat) {
+    constexpr char kSrc[] = "int f(char c) { return c; }";
+
+    struct Row {
+        char const* target;
+        char const* cc;
+        char const* format;
+        bool        expectSExt;   // true ⇒ signed char ⇒ SExt; false ⇒ ZExt
+        char const* why;
+    };
+    for (Row const row : {
+             // x86_64 is SIGNED on every platform it serves — the format's
+             // declaration (macho/pe) and the target default (elf) agree, so all
+             // three rows must be byte-identical to the pre-cycle behaviour.
+             Row{"x86_64", "sysv_amd64", "elf64-x86_64-linux-exec",   true,
+                 "x86_64/elf: signed — x86_64 declares no charIsUnsigned key "
+                 "at all, so every format takes the absent-key default"},
+             Row{"x86_64", "sysv_amd64", "macho64-x86_64-darwin-exec", true,
+                 "x86_64/macho: signed, same default"},
+             Row{"x86_64", "ms_x64",     "pe64-x86_64-windows-exec",   true,
+                 "x86_64/pe: signed, same default"},
+             // arm64 is where the platform axis bites: the SAME processor,
+             // OPPOSITE answers, decided by the platform.
+             Row{"arm64",  "aapcs64",    "elf64-aarch64-linux-exec",   false,
+                 "arm64/elf: no override for elf, so the AAPCS64 processor "
+                 "default (unsigned) governs — this row is CORRECT as-is and "
+                 "must never be flipped"},
+             Row{"arm64",  "aapcs64",    "macho64-arm64-darwin-exec",  true,
+                 "arm64/macho: Apple's platform ABI chose SIGNED, so the "
+                 "target's `byObjectFormat: {macho: false}` override must beat "
+                 "its own unsigned default — the miscompile this anchor was "
+                 "opened for"},
+         }) {
+        auto L = lowerCSubset(kSrc, row.target, row.cc, DataModel::Lp64,
+                              LongDoubleFormat::None, row.format);
+        ASSERT_TRUE(L.mir.ok)
+            << row.why << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(sexts.size(), row.expectSExt ? 1u : 0u) << row.why;
+        EXPECT_EQ(zexts.size(), row.expectSExt ? 0u : 1u) << row.why;
     }
 }
 

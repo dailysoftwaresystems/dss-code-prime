@@ -92,14 +92,19 @@ struct DSS_EXPORT MirLoweringConfig {
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
 
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): whether bare `char`
-    // (`TypeKind::Char`, NOT `signed char`/`unsigned char`) is UNSIGNED on the
-    // active target, threaded from `TargetSchema::charIsUnsigned()`. The AArch64
-    // ABI mandates unsigned bare `char`; x86_64/pe64 use signed. Read ONLY by
-    // `isSignedIntKind(Char)` — the one target-aware char-signedness predicate
-    // that drives the char→int promotion's SExt (signed) vs ZExt (unsigned)
-    // in `mapCast`. Default false = signed (x86_64/pe64 stay byte-identical).
-    // NO arch identity branch anywhere — the decision is this config bool.
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+    // CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
+    // `signed char`/`unsigned char`) is UNSIGNED for this compilation. ALREADY
+    // RESOLVED when it arrives here — the driver threads in
+    // `TargetSchema::charIsUnsigned(format.kind())`, which folds the target's
+    // per-processor default together with its per-object-format overrides. The
+    // axis is (processor × PLATFORM), not per-processor: the same AArch64 CPU
+    // is UNSIGNED under GNU/Linux AAPCS64 and SIGNED under Apple's Darwin ABI.
+    // Read ONLY by `isSignedIntKind(Char)` — the one char-signedness predicate,
+    // driving the char→int promotion's SExt (signed) vs ZExt (unsigned) in
+    // `mapCast`. Default false = signed (x86_64/pe64 stay byte-identical).
+    // NO arch, format or platform identity branch anywhere — the decision is
+    // this already-resolved config bool.
     bool                  charIsUnsigned = false;
 
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate

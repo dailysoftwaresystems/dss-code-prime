@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1637,4 +1638,147 @@ TEST(StackReserveControl, NonObjectBlockRejected) {
                      DiagnosticCode::C_MalformedJson,
                      "a scalar in place of the block must fail loud rather "
                      "than be read as a bare byte count");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The FORMAT loader's closed root-key vocabulary (the last of the three loader
+// families to be closed; the language family closed in TF-C72, the target
+// family in TF-C74) — plus the pin that keeps bare-`char` signedness OUT of
+// this schema for good (TF-C75, D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM).
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+[[nodiscard]] bool anyHasMalformedJson(
+    std::vector<ConfigDiagnostic> const& diags) {
+    for (auto const& d : diags) {
+        if (d.code == DiagnosticCode::C_MalformedJson) return true;
+    }
+    return false;
+}
+
+// True iff SOME diagnostic message mentions `needle`. Used to pin that the typo
+// discriminator NAMES the offending key — a rejection that does not say which
+// key is wrong sends the reader back to diffing 24 files by hand.
+[[nodiscard]] bool anyMessageMentions(
+    std::vector<ConfigDiagnostic> const& diags, std::string_view needle) {
+    for (auto const& d : diags) {
+        if (d.message.find(needle) != std::string::npos) return true;
+        if (d.path.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// kElfMinimal with one extra root key spliced in.
+[[nodiscard]] std::string withRootKey(std::string_view keyAndValue) {
+    std::string json{kElfMinimal};
+    json.insert(json.rfind('}'), std::string{","} + std::string{keyAndValue});
+    return json;
+}
+
+}  // namespace
+
+// ★ THE ANTI-RESURRECTION PIN (TF-C75). Bare-`char` signedness briefly lived
+// HERE as a `charSignedness` tri-state, in parallel with the target's own
+// `charIsUnsigned` — two sources of truth for one fact, reconciled by a free
+// function. It was collapsed onto the TARGET, which now declares the whole
+// (processor × platform) fact in one key.
+//
+// The format side had to go rather than the target side: `elf` serves BOTH
+// aarch64 (unsigned) and x86_64 (signed), so any flat value here is a lie on
+// one of them, and making it honest would force all 24 format files to
+// enumerate CPU architectures — a layering inversion.
+//
+// This test is what stops it coming back QUIETLY. Without the closed
+// vocabulary, a re-added `"charSignedness": "signed"` would load perfectly
+// clean, be read by nothing, and sit in the tree looking authoritative while
+// the real answer came from somewhere else entirely. RED-ON-DISABLE: put
+// `charSignedness` back into `kFormatDocumentKeys` and this fails.
+TEST(FormatRootKeyVocabulary, CharSignednessIsRejectedOnAFormatSchema) {
+    auto r = ObjectFormatSchema::loadFromText(
+        withRootKey(R"("charSignedness":"signed")"));
+    ASSERT_FALSE(r.has_value())
+        << "bare-`char` signedness is declared ENTIRELY on the target "
+           "(`charIsUnsigned`), so a format schema re-declaring it must be "
+           "REJECTED — a second source of truth that nothing reads is worse "
+           "than none";
+    EXPECT_TRUE(anyHasMalformedJson(r.error()));
+    EXPECT_TRUE(anyMessageMentions(r.error(), "charSignedness"))
+        << "the diagnostic must NAME the offending key";
+}
+
+// ★ This is the pin that makes every OTHER format key honest, and the format
+// family is the highest-stakes of the three: its keys carry SILENT-MISCOMPILE
+// semantics. Before TF-C75 the loader read every root key through a bare
+// `doc.contains(…)` and ignored unknowns, so a typo'd `"bitFieldStrateg"` would
+// have loaded perfectly clean, never been read, and the engine would have
+// silently fallen back to the TARGET's bit-field strategy — a wrong-LAYOUT
+// miscompile with no diagnostic.
+//
+// RED-ON-DISABLE: delete the `kFormatDocumentKeys` loop in
+// object_format_schema_json.cpp and this test fails while the rest of the file
+// still passes.
+TEST(FormatRootKeyVocabulary, UnknownRootKeyRejectedAndNamed) {
+    auto r = ObjectFormatSchema::loadFromText(
+        withRootKey(R"("dataModle":"LP64")"));
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled root key must be REJECTED — silently ignoring it makes "
+           "every optional format key a knob that can lie";
+    EXPECT_TRUE(anyHasMalformedJson(r.error()));
+    EXPECT_TRUE(anyMessageMentions(r.error(), "dataModle"))
+        << "the diagnostic must NAME the offending key";
+}
+
+// The same guard over a sibling key whose silent no-op is a wrong-LAYOUT
+// miscompile rather than a wrong-value one — the class the vocabulary protects
+// is the whole key set, not just any one member.
+TEST(FormatRootKeyVocabulary, MisspelledBitFieldStrategyRejected) {
+    auto r = ObjectFormatSchema::loadFromText(
+        withRootKey(R"("bitFieldStrateg":"gnu_packed")"));
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd bitFieldStrategy would silently fall back to the TARGET's "
+           "strategy — a wrong-layout miscompile with no diagnostic";
+    EXPECT_TRUE(anyHasMalformedJson(r.error()));
+}
+
+// The `$`-prefix documentation carve-out is MANDATORY, not decorative: the
+// shipped format files use `$comment` / `$…Comment` heavily (MEASURED: 20
+// distinct `$`-prefixed root keys across the 24 shipped files, `$comment` in
+// all 24), so without it this guard would reject every shipped format.
+TEST(FormatRootKeyVocabulary, DollarPrefixedRootKeysStillAccepted) {
+    auto r = ObjectFormatSchema::loadFromText(
+        withRootKey(R"("$comment":"prose, not config",
+                       "$dataModelComment":"why LP64 here")"));
+    ASSERT_TRUE(r.has_value())
+        << "`$`-prefixed keys are the codebase-wide documentation convention "
+           "and must survive the typo discriminator";
+}
+
+// EVERY shipped format must load clean under the closed vocabulary — all 24,
+// not a sample. This is exactly the multi-site class where a green subset hides
+// the miss: the regression it catches is adding a root key to a `.format.json`
+// without adding it to `kFormatDocumentKeys`, or vice versa.
+TEST(FormatRootKeyVocabulary, AllShippedFormatsLoadCleanUnderClosedVocabulary) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed — a sample "
+                  "is exactly how a multi-site miss stays green");
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        EXPECT_TRUE(r.has_value())
+            << name << ".format.json must load clean under the closed "
+                       "root-key vocabulary";
+    }
 }

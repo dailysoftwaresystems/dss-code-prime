@@ -805,6 +805,18 @@ struct DSS_EXPORT ObjectFormatData {
     // NO target-side fallback field — the axis is format-only.
     LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
 
+    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-
+    // PLATFORM) ─────────────────────────────────────────────────────────
+    // The axis is (processor × platform), and it is declared ENTIRELY on the
+    // TARGET — one key, `charIsUnsigned`, carrying its own per-object-format
+    // overrides (`{"default": …, "byObjectFormat": {…}}`), resolved by
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`. A format-side field
+    // was tried and removed: `elf` serves BOTH aarch64 (unsigned) and x86_64
+    // (signed), so any flat value here is a lie on one of them, and making it
+    // honest would force all 24 format files to enumerate CPU architectures —
+    // a layering inversion. Do not re-add a `charSignedness` key here; the
+    // closed root-key vocabulary in the loader will reject it.
+
     // Relocations row — same shape as `TargetSchema::relocations[]`
     // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;

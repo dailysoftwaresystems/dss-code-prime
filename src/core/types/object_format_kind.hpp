@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -71,6 +72,32 @@ objectFormatKindName(ObjectFormatKind k) noexcept {
 objectFormatKindFromName(std::string_view s) noexcept {
     return kObjectFormatKindTable.fromName(s);
 }
+
+// The number of `ObjectFormatKind` enumerators INCLUDING the `Unknown`
+// sentinel — i.e. one past the largest ordinal, so an
+// `std::array<T, kObjectFormatKindCount>` indexed by
+// `static_cast<std::size_t>(kind)` is always in range. Derived from the name
+// table rather than written as a literal, so adding an enumerator cannot leave
+// a per-kind array one slot short (which would silently truncate the new kind
+// to whatever the bounds check does). Consumed by `TargetSchema`'s per-format
+// `charIsUnsigned` override table.
+inline constexpr std::size_t kObjectFormatKindCount =
+    kObjectFormatKindTable.rows.size();
+
+// The derivation above is only a SAFE array size while every enumerator's
+// ordinal is < the row count (the ordinals are dense from 0 today). A future
+// sparse enumerator would make `array[ordinal]` an out-of-range index that no
+// runtime bounds check on the array's own `.size()` could catch — so the
+// density is asserted here, at the one place the count is derived.
+static_assert([] {
+    for (auto const& r : kObjectFormatKindTable.rows) {
+        if (static_cast<std::size_t>(r.first) >= kObjectFormatKindCount) {
+            return false;
+        }
+    }
+    return true;
+}(), "ObjectFormatKind ordinals must stay dense from 0 — a per-kind array "
+     "sized by the name-table row count would otherwise index out of range");
 
 // ── Extern-call dispatch model (D-FFI-EXTERN-CALL-DISPATCH) ────────
 //

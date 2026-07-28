@@ -6699,15 +6699,31 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
                   (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__",
                                             "__arm64", "__arm64__"}));
     }
-    // arm64 on ELF: the Apple-only pair is GONE.
+    // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
+    // APPEARS — the two gates point in OPPOSITE directions on the same target,
+    // which is the whole reason the gate is per-entry.
+    //
+    // ★ `__CHAR_UNSIGNED__` is not an identity spelling: it is the
+    // PREPROCESSOR-VISIBLE face of the target's `charIsUnsigned` key
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM), whose `default` is `true` and
+    // whose macho/pe overrides are `false`. So it must be defined on exactly
+    // the leg where the default is the effective answer. MEASURED 2026-07-28
+    // with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang
+    // 21.0.0): DEFINED for aarch64-linux-gnu; NOT defined for
+    // arm64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc.
     {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
                                        (*arm)->predefinedMacros(),
                                        ObjectFormatKind::Elf);
         ASSERT_TRUE(m.conflicts.empty());
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
-                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__"}))
-            << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto ELF";
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
+                                            "__CHAR_UNSIGNED__",
+                                            "__aarch64__"}))
+            << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
+               "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
+               "there — it is the preprocessor face of the target's "
+               "`charIsUnsigned` default, which macho/pe override to signed";
     }
     // x86_64: the same four spellings on every format.
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
