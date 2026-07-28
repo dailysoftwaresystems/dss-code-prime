@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -520,4 +521,84 @@ TEST(ReporterFormat, FormatAllSortsBySourceOrder) {
     ASSERT_NE(p7, std::string::npos);
     EXPECT_LT(p1, p4);
     EXPECT_LT(p4, p7);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TF-C80: past-end-of-buffer spans must never over-read or abort.
+//
+// The preprocessor deliberately mints macro-expansion PRODUCT tokens whose
+// spans start at `buf.text().size() + productOffset` — past end-of-buffer BY
+// CONSTRUCTION (preprocessor.cpp `sbTextOf` / `text(Token const&)` decode that
+// encoding). When such a token is the subject of a parse error, the span
+// reaches the renderer verbatim. The renderer's line-start walk had no upper
+// clamp, so it read `src[lineStart - 1]` past the buffer and then threw
+// `std::out_of_range: string_view::substr` — an UNCAUGHT exception, i.e.
+// SIGABRT with NO diagnostic at all, bypassing fail-loud discipline entirely.
+//
+// The abort was NON-DETERMINISTIC in the wild (~3/20) because it fired only
+// when a `'\n'` (0x0A) happened to sit in the recycled-heap window past the
+// buffer. These tests make that window DETERMINISTIC: build a string that
+// contains newlines, then shrink it WITHOUT releasing capacity, so the bytes
+// past `size()` are known to be `'\n'`-bearing. `fromString` MOVES the string,
+// so the buffer (and its trailing bytes) survive into the SourceBuffer.
+//
+// Red-on-disable (verified): removing the `std::min` clamp in `extractLine`
+// makes PastEndSpanWithNewlineInTrailingCapacity abort with
+// `libc++abi: terminating due to uncaught exception ... string_view::substr`.
+namespace {
+
+// A buffer whose bytes past `size()` deterministically contain '\n'.
+std::shared_ptr<SourceBuffer> bufferWithNewlinesPastEnd(std::string name) {
+    std::string text = "abc\ndef\nghi\njkl\n";   // 16 bytes, newline at [3],[7],[11],[15]
+    text.resize(4);                              // size()==4 ("abc\n"); capacity keeps [5..15]
+    return SourceBuffer::fromString(std::move(text), std::move(name));
+}
+
+} // namespace
+
+TEST(ReporterFormat, PastEndSpanWithNewlineInTrailingCapacity) {
+    // Span starts at 8 — four bytes past the 4-byte buffer, and the byte at
+    // index 7 in the surviving capacity is '\n'. Unclamped, the backward walk
+    // stops immediately at lineStart==8 > size()==4, and substr(8, 0) throws.
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    auto buf = bufferWithNewlinesPastEnd("<tfc80>");
+    ASSERT_EQ(buf->text().size(), 4u);
+    bufs.add(buf);
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                      buf->id(), 8, 9, "'product'"));
+
+    // The contract: renders, does not abort, and never escapes the buffer.
+    auto const out = r.format(r.all()[0], bufs);
+    EXPECT_NE(out.find("error[P0003]"), std::string::npos);
+    EXPECT_NE(out.find("<tfc80>"), std::string::npos);
+    // Past-end offsets clamp to the buffer, exactly as SourceBuffer::lineCol
+    // already did — so this renders the LAST line, never heap garbage.
+    EXPECT_EQ(out.find("def"), std::string::npos);
+    EXPECT_EQ(out.find("ghi"), std::string::npos);
+    EXPECT_EQ(out.find("jkl"), std::string::npos);
+}
+
+TEST(ReporterFormat, PastEndSpanRendersSameAsClampedSpan) {
+    // A span past EOF must render the same location as one clamped to size().
+    // Pins the clamp semantics, so a future "fix" that invents a bogus line
+    // number for product spans fails here rather than silently misreporting.
+    auto buf = SourceBuffer::fromString("int x = 1;\nint y = 2;\n", "<tfc80b>");
+    const auto n = static_cast<ByteOffset>(buf->text().size());
+
+    auto renderAt = [&](ByteOffset start) {
+        DiagnosticReporter r;
+        BufferRegistry bufs;
+        bufs.add(buf);
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          buf->id(), start, start + 1, "'x'"));
+        return r.format(r.all()[0], bufs);
+    };
+
+    auto const atEnd = renderAt(n);
+    for (ByteOffset over : {n + 1u, n + 7u, n + 64u, n + 4096u}) {
+        EXPECT_EQ(renderAt(over), atEnd)
+            << "past-end span " << over << " (buffer size " << n
+            << ") must clamp to end-of-buffer, not read past it";
+    }
 }
