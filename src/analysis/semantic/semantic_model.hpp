@@ -299,6 +299,33 @@ struct DSS_EXPORT SymbolRecord {
     // is propagated through every MirFunc copy/rebuild path rather than only the
     // lowering that mints it. Default false.
     bool            isNoInline = false;
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4): TRUE iff THIS
+    // declaration of a FUNCTION symbol spells the `inline` specifier WITHOUT
+    // `extern` — 6.7.4p7's exact clause, not merely "the word inline appears".
+    // Set at Pass-1.5 declarator resolution from `cfg.inlineKeywordToken` /
+    // `cfg.inlineExternSpecifierTokens` — never a hardcoded spelling — gated on
+    // the declared type being a FnSig (the `isNoInline` discipline); the
+    // non-function case is a 6.7.4p1 constraint violation reported loud as
+    // S_InlineNonFunction rather than recorded here.
+    //
+    // ★ **AND**-MERGED across a proto/definition pair by the post-1.5
+    // `mergedFnDecls` sweep — the one flag on this record that is not OR-merged,
+    // and the asymmetry is the C standard's, not a preference. 6.7.4p7 makes a
+    // definition an INLINE definition (providing NO external definition) only
+    // when ALL of the file-scope declarations spell inline-without-extern, so a
+    // single plain `int f(int);` beside `inline int f(int){…}` restores the
+    // external definition. OR-merging would decide the opposite on exactly the
+    // two commonest shapes (an inline prototype with a plain definition, and a
+    // plain prototype with an inline definition) — MEASURED, clang emits `T _f`
+    // for both.
+    //
+    // Read at CST→HIR: a file-scope function DEFINITION whose symbol carries
+    // this flag with a Global binding is lowered as an `ExternFunction`
+    // DECLARATION instead of a `Function`, so nothing is emitted for it and the
+    // reference resolves against a sibling CU (or fails loud K_SymbolUndefined).
+    // A `static inline` keeps its Local binding and IS emitted — 6.7.4p7
+    // constrains external linkage only. Default false.
+    bool            isInline = false;
     // FC17.9(c) (D-CSUBSET-SETJMP): TRUE iff this FUNCTION symbol "returns more than
     // once" (C11 7.13.1.1 — `setjmp`/`_setjmp`: a matching `longjmp` makes the setjmp
     // call appear to return a SECOND time). There is NO source syntax for it (unlike

@@ -1776,6 +1776,28 @@ struct DSS_EXPORT SemanticConfig {
     // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
     // {binding:local}), not this token.
     std::optional<SchemaTokenId> constexprKeywordToken;
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the C99 6.7.4 `inline`
+    // FUNCTION-specifier KEYWORD token. ONE kind carries every spelling the
+    // language declares for it (c-subset maps `inline`, `__inline` and
+    // `__inline__` to a single `InlineKeyword`) — MEASURED against clang, the
+    // spellings are exact synonyms, and the C99-vs-GNU89 divergence rides the
+    // language mode and the `gnu_inline` attribute rather than the spelling.
+    // Pass 1.5 scans a declaration's specifier prefix for it
+    // (`specifierPrefixHasInline`, the `specifierPrefixHasConstexpr` mirror)
+    // and marks the symbol `isInline`. Unset ⇒ the language has no `inline`
+    // surface (the scan never runs — toy/tsql). Source-AGNOSTIC: WHICH token is
+    // per-language config; the engine never hardcodes the spelling.
+    std::optional<SchemaTokenId> inlineKeywordToken;
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the tokens
+    // whose CO-PRESENCE in the same specifier prefix cancels the
+    // inline-definition reading. 6.7.4p7 makes a definition an INLINE
+    // definition (providing no external definition) only when every file-scope
+    // declaration of the function "include[s] the inline function specifier
+    // WITHOUT extern" — so `extern` beside `inline` means the opposite thing
+    // from `inline` alone. c-subset lists `ExternKeyword`. EMPTY ⇒ no
+    // cancellation (a language whose `inline` has no such interaction).
+    // Source-AGNOSTIC: WHICH kinds are per-language config.
+    std::vector<SchemaTokenId>   inlineExternSpecifierTokens;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): storage-class specifier TOKENS that may
     // NOT be combined with a thread-storage specifier in one declaration
     // (C11/C23 6.7.1p2 admits only `static`/`extern` beside `thread_local`;

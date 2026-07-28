@@ -4406,7 +4406,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // silently unhonored: the knob-that-lies class this discipline
             // exists to prevent. Listed in loader-read order so a new facet's
             // key lands next to the reader that consumes it.
-            static constexpr std::array<std::string_view, 56> kSemanticsKeys{
+            static constexpr std::array<std::string_view, 57> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -4418,7 +4418,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "assignments", "callRules", "casts",
                 // type-query operators + declaration specifiers
                 "sizeof", "alignof", "typeof", "bitInt", "alignas", "packed",
-                "noreturn", "constexpr", "threadLocal",
+                "noreturn", "constexpr", "inline", "threadLocal",
                 "predefinedFunctionNames",
                 // attribute surface (FC17)
                 "attributeSemantics", "nodiscard",
@@ -8840,6 +8840,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                   "unknown token kind '{}'", tn));
                         } else {
                             cfg.constexprKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                }
+            }
+
+            // ── inline function specifier (TF-C79, D-CSUBSET-INLINE-FUNCTION-SPECIFIER) ──
+            // `{ keywordToken, externSpecifierTokens? }` — the C99 6.7.4 `inline`
+            // FUNCTION specifier. `keywordToken` resolves exactly like
+            // constexpr's (REQUIRED string naming a declared token; unknown name
+            // → C_UnknownToken, missing/non-string → C_MissingField), so a typo
+            // can never silently disarm the emission decision that rides it.
+            // `externSpecifierTokens` is the OPTIONAL 6.7.4p7 "without extern"
+            // vocabulary — the kinds whose co-presence in the same specifier
+            // prefix cancels the inline-definition reading. An ABSENT block
+            // leaves the token unset ⇒ no surface. Nothing hardcodes "inline".
+            if (sem.contains("inline")) {
+                json const& il = sem.at("inline");
+                if (!il.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/inline",
+                              "'semantics.inline' must be an object "
+                              "{ keywordToken, externSpecifierTokens? }");
+                } else {
+                    if (!il.contains("keywordToken")
+                        || !il.at("keywordToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/inline/keywordToken",
+                                  "'keywordToken' is required and must be a string");
+                    } else {
+                        std::string const tn =
+                            il.at("keywordToken").get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/inline/keywordToken",
+                                      std::format("'inline.keywordToken' references "
+                                                  "unknown token kind '{}'", tn));
+                        } else {
+                            cfg.inlineKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                    if (il.contains("externSpecifierTokens")) {
+                        json const& ex = il.at("externSpecifierTokens");
+                        if (!ex.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/inline/externSpecifierTokens",
+                                      "'externSpecifierTokens' must be an array of "
+                                      "token-kind names");
+                        } else {
+                            for (auto const& entry : ex) {
+                                if (!entry.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              "/semantics/inline/externSpecifierTokens",
+                                              "each 'externSpecifierTokens' entry must "
+                                              "be a token-kind name string");
+                                    continue;
+                                }
+                                std::string const kn = entry.get<std::string>();
+                                if (!data.schemaTokens->contains(kn)) {
+                                    coll.emit(
+                                        DiagnosticCode::C_UnknownToken,
+                                        "/semantics/inline/externSpecifierTokens",
+                                        std::format(
+                                            "'inline.externSpecifierTokens' references "
+                                            "unknown token kind '{}'", kn));
+                                    continue;
+                                }
+                                cfg.inlineExternSpecifierTokens.push_back(
+                                    data.schemaTokens->find(kn));
+                            }
                         }
                     }
                 }

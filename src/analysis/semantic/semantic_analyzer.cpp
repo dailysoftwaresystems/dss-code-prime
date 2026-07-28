@@ -2910,6 +2910,48 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     return false;
 }
 
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): true iff a declaration's
+// specifier prefix carries the C99 6.7.4 `inline` KEYWORD *without* one of
+// `cfg.inlineExternSpecifierTokens`. The `specifierPrefixHasConstexpr` mirror,
+// keyword-form only — `inline` has no attribute spelling (GNU's `__inline` /
+// `__inline__` are additional KEYWORD spellings that share the one token kind,
+// not attribute names), so unlike `specifierPrefixNamesNoreturn` there is no
+// identifier arm and a name-matching pass would be dead code.
+//
+// ★ THE `extern` TEST IS PART OF THE PREDICATE, NOT A SEPARATE QUERY, because
+// 6.7.4p7 is phrased over "the inline function specifier without extern" — the
+// two tokens together mean the OPPOSITE of `inline` alone (an EXTERNAL
+// definition rather than an inline definition). Folding both into one scan is
+// what lets the caller AND-merge a single boolean across every declaration of
+// the function and land on the standard's rule exactly.
+//
+// Emits NOTHING: the 6.7.4p1 non-function constraint is reported by the caller,
+// which is the only site that knows the declared type.
+[[nodiscard]] bool
+specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
+                         NodeId declNode, DeclarationRule const& decl) {
+    if (!cfg.inlineKeywordToken.has_value()
+        || !cfg.inlineKeywordToken->valid()) {
+        return false;
+    }
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return false;
+    bool sawInline = false;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        SchemaTokenId const kind = tree.tokenKind(c);
+        if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; continue; }
+        for (SchemaTokenId ex : cfg.inlineExternSpecifierTokens)
+            if (kind == ex) return false;
+    }
+    return sawInline;
+}
+
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
 // declaration's specifier prefix. Keyed on the SAME per-row `linkageSpecifiers`
 // facet CST→HIR's `linkageFrom` folds (token SOURCE TEXT → effect), so the
@@ -6310,6 +6352,12 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // on a non-function object is inert — a named safe-miss deferral).
                     bool const declHasNoreturn =
                         specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4):
+                    // does this declaration's specifier prefix spell `inline`
+                    // WITHOUT `extern`? Computed ONCE per declaration (the
+                    // `declHasNoreturn` shape); STORED per-declarator below.
+                    bool const declHasInline =
+                        specifierPrefixHasInline(cfg, tree, node, decl);
                     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the standard-
                     // attribute effects from this declaration's specifier
                     // prefix ONCE (like `declAlignasSpec`/`declHasNoreturn`);
@@ -6620,6 +6668,37 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // survivor by the post-1.5 sweep so a call sees the flag.
                         if (isFnSig && declHasNoreturn)
                             s.symbols.at(sym).isNoreturn = true;
+                        // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99
+                        // 6.7.4): record the inline-without-extern reading on a
+                        // FUNCTION symbol; AND-merged across the proto/def pair
+                        // by the post-1.5 sweep and read at CST→HIR to decide
+                        // whether this definition provides an EXTERNAL
+                        // definition at all (6.7.4p7).
+                        //
+                        // ★ THE NON-FUNCTION CASE IS LOUD, NOT INERT — the one
+                        // place this departs from `declHasNoreturn` right above.
+                        // 6.7.4p1 confines the specifier to "the declaration of
+                        // a function", and unlike a stray `_Noreturn` (whose
+                        // loss is a safe miss) a dropped `inline` here would be
+                        // a specifier the compiler parsed and then honored
+                        // nowhere. `isFunctionForm` keeps a declarator whose
+                        // TYPE failed to resolve from producing a second,
+                        // misleading diagnostic on top of its own.
+                        if (isFnSig && declHasInline) {
+                            s.symbols.at(sym).isInline = true;
+                        } else if (declHasInline && declTy.valid()
+                                   && !isFunctionForm) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_InlineNonFunction;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode.valid() ? nameNode
+                                                                    : node);
+                            d.actual   =
+                                "'inline' on a declaration that does not declare "
+                                "a function (C99 6.7.4p1)";
+                            s.reporter.report(std::move(d));
+                        }
                         // ★ TF-C73 ROOT (b) — DECLARATOR-DEPTH ATTRIBUTES.
                         // `scanAttributeSemantics` used to run from ONE root (the
                         // specifier prefix), so an attribute written after the
@@ -12317,6 +12396,31 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                              || s.symbols.at(absorbed).isNoInline;
                 s.symbols.at(survivor).isNoInline = ni;
                 s.symbols.at(absorbed).isNoInline = ni;
+            }
+            // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the
+            // inline-definition reading merges with **AND**, not OR — the one
+            // flag in this sweep that does, and the asymmetry is the standard's.
+            // 6.7.4p7 makes a definition an INLINE definition (providing NO
+            // external definition) only "if all of the file scope declarations
+            // for [the] function in a translation unit include the inline
+            // function specifier without extern". So a single plain declaration
+            // anywhere in the TU RESTORES the external definition, and ANDing is
+            // literally that quantifier. OR here would invert the result on the
+            // two commonest real shapes — MEASURED with clang, both
+            // `inline int p(int); int p(int){…}` and
+            // `int p(int); inline int p(int){…}` emit `T _p`, which an OR-merge
+            // would suppress.
+            //
+            // Pairwise ANDing composes transitively across N declarations: with
+            // pairs (def,p1) then (def,p2) the survivor ends at p1 && p2 && def,
+            // which is the quantifier over all three. Writing the result back to
+            // the absorbed record too keeps either merge ORDER equivalent, as
+            // the OR-merges above do.
+            {
+                bool const inl = s.symbols.at(survivor).isInline
+                              && s.symbols.at(absorbed).isInline;
+                s.symbols.at(survivor).isInline = inl;
+                s.symbols.at(absorbed).isInline = inl;
             }
             // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): OR-merge deprecated /
             // nodiscard across the proto/def pair, the isNoreturn precedent —

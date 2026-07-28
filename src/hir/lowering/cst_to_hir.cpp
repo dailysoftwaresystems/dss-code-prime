@@ -8792,6 +8792,65 @@ struct Lowerer {
     // empty — the declarator-mode convention: params live in the declarator's fn
     // suffix, the matched block IS the body). Degrades to an Error node when the
     // semantic tier already rejected the declarator (no named declarator).
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): a file-scope
+    // function DEFINITION every one of whose declarations spelled `inline`
+    // without `extern` is an INLINE DEFINITION — it "does not provide an
+    // external definition for the function", so this translation unit emits NO
+    // body for it and the call resolves against some other TU's external
+    // definition. Returns true (with `outNode` set to the replacement HIR node,
+    // or invalid when the language synthesizes nothing) when it CLAIMED the
+    // declaration; false leaves the ordinary definition path untouched.
+    //
+    // ★ THE SUPPRESSION AND THE REPLACEMENT ARE ONE DECISION, deliberately in
+    // one function. Suppressing the body without leaving a declaration behind
+    // makes a sibling CU's definition win SILENTLY — same program, different
+    // bytes, no diagnostic — which is the sharpest failure this feature can
+    // have. Emitting the `ExternFunction` in the same breath keeps the outcome
+    // observable: it resolves against a sibling CU (the LK11 merge strips the
+    // import and calls direct) or fails LOUD K_SymbolUndefined naming the
+    // symbol, exactly as a bare prototype does.
+    //
+    // ★ ONLY A `Global` BINDING IS CLAIMED. 6.7.4p7 constrains functions with
+    // EXTERNAL linkage; a `static inline` has internal linkage (6.7.4p6 admits
+    // any internal-linkage function as inline) and MUST still be emitted, as
+    // must a `weak` one — MEASURED, clang emits `t _p` for `static inline`.
+    [[nodiscard]] bool
+    lowerInlineDefinitionAsDeclaration(NodeId node, DeclarationRule const& decl,
+                                       DeclaratorConfig const& dc,
+                                       LinkageAttr linkAttr,
+                                       HirNodeId& outNode) {
+        outNode = HirNodeId{};
+        if (linkAttr.binding != SymbolBinding::Global) return false;
+        auto vis = declRoleChildren(tree(), node, decl);
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        if (!carrier.has_value() || *carrier >= vis.size()) return false;
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        NodeId fnName{};
+        for (NodeId d : declarators) {
+            fnName = declaratorNameNode(tree(), d, dc);
+            if (fnName.valid()) break;
+        }
+        if (!fnName.valid()) return false;
+        SymbolId const sym = model.symbolAt(fnName);
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr || !rec->isInline || !rec->type.valid()) return false;
+        if (!decl.prototypeSynthesizesExtern) return true;
+        HirNodeId const ef =
+            track(builder.makeExternFunction(rec->type, sym.v, {}), node);
+        auto const* shipped = model.suppressedShippedSymbolFor(rec->name);
+        externDecls.push_back(HirExternRecord{
+            ef, rec->name,
+            shipped != nullptr ? shipped->library
+                               : std::unordered_map<std::string, std::string>{},
+            /*noLibraryBinding=*/shipped == nullptr,
+            shipped != nullptr ? shipped->version : std::string{}});
+        outNode = ef;
+        return true;
+    }
+
     [[nodiscard]] HirNodeId
     lowerDeclaratorModeFunction(NodeId node, DeclarationRule const& decl,
                                 DeclaratorConfig const& dc, NodeId discNode,
@@ -8908,10 +8967,19 @@ struct Lowerer {
             // is unambiguous here. (A trailing attribute on a DEFINITION is
             // rejected upstream today; wiring it anyway means this path needs no
             // revisit when that gap closes.)
-            out.push_back(lowerDeclaratorModeFunction(
-                node, decl, dc, discNode,
+            LinkageAttr const fnLink =
                 declaratorLinkage(prefixLink, decl,
-                                  declarators.empty() ? NodeId{} : declarators[0])));
+                                  declarators.empty() ? NodeId{} : declarators[0]);
+            // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
+            // definition provides no external definition — lower it as a
+            // DECLARATION and emit no body.
+            if (HirNodeId ef; lowerInlineDefinitionAsDeclaration(
+                                  node, decl, dc, fnLink, ef)) {
+                if (ef.valid()) out.push_back(ef);
+                return;
+            }
+            out.push_back(
+                lowerDeclaratorModeFunction(node, decl, dc, discNode, fnLink));
             return;
         }
 

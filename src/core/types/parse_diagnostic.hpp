@@ -985,6 +985,18 @@ enum class DiagnosticCode : std::uint16_t {
     // scalar store). Renders error[S0058].
     S_BitfieldMutationUnsupportedBase = 0xE058,
 
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the `inline` function
+    // specifier appears on a declaration whose declared type is NOT a function
+    // (C99 6.7.4p1 — "shall be used only in the declaration of a function").
+    // Loud rather than inert BECAUSE the specifier has a real sink: on a
+    // function it decides whether the definition is emitted at all (6.7.4p7),
+    // so accepting it on an object would be a specifier the compiler parsed and
+    // then honored nowhere — D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP at the
+    // declaration tier. Reported by the semantic tier (the only place that
+    // knows the declared type), never by the linkage scan, which sees the
+    // keyword but not the type. Renders error[S0059].
+    S_InlineNonFunction = 0xE059,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

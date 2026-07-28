@@ -6038,6 +6038,150 @@ TEST(SemanticAnalyzerCSubset, NoreturnProtoMergesIntoDefinition) {
         << "the _Noreturn on the proto must OR-merge into the surviving definition";
 }
 
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the surviving Function symbol
+// named `name` carries the C99 6.7.4p7 inline-definition reading. The
+// `survivingFnIsNoreturn` mirror — the `!isAbsorbedProto` filter isolates the
+// single callable record CST→HIR consults when it decides whether to emit a
+// body at all.
+[[nodiscard]] inline bool
+survivingFnIsInline(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            return r.isInline;
+        }
+    }
+    return false;
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the C99 6.7.4p7 truth table at
+// the APPLIED-FACT tier — one case per DECLARATION SHAPE, each asserting the
+// bit CST→HIR actually reads rather than "the file compiled".
+//
+// ★ EVERY EXPECTATION BELOW IS GROUND TRUTH FROM A REAL TOOLCHAIN, not from
+// reading the standard. Each row was MEASURED with
+// `/usr/bin/clang -std=c99 -O0 -c <case>.c` followed by `nm`: an inline
+// definition shows `_p` UNDEFINED, an external definition shows `T _p`, and an
+// internal one shows `t _p`. `isInline == true` is exactly the `U _p` column.
+//
+// ★★ ROWS (c) AND (d) ARE THE AND-MERGE PINS, and they are why this table
+// exists as a table. 6.7.4p7 quantifies over ALL file-scope declarations —
+// "if ALL of the file scope declarations ... include the inline function
+// specifier without extern" — so the proto/def merge is an AND. Every other
+// flag on SymbolRecord merges with OR, and an OR here would invert BOTH of
+// these rows while leaving (a), (b) and (g) green: the two commonest real
+// shapes would silently stop being emitted. Row (e) is the same quantifier
+// reached through `extern` instead of through a missing `inline`, and row (f)
+// pins the scanner's own without-extern clause.
+TEST(SemanticAnalyzerCSubset, InlineDefinitionFollowsC99Quantifier) {
+    // (a) the lone inline definition — no other declaration to cancel it.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "a lone `inline` definition IS an inline definition (clang: U _p)";
+    }
+    // (b) every declaration inline — the quantifier still holds.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "all-inline declarations keep the inline definition (clang: U _p)";
+    }
+    // (c) ★ inline PROTOTYPE + plain definition — the quantifier fails.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x);\n"
+                                     "int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "one plain declaration restores the external definition "
+               "(clang: T _p) — an OR-merge would wrongly report true here";
+    }
+    // (d) ★ plain prototype + inline definition — the same, other order.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "declaration ORDER must not change the quantifier (clang: T _p)";
+    }
+    // (e) ★ an `extern` declaration cancels it — the silent-halfway-state pin.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"extern int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "a co-present extern declaration promotes the definition "
+               "(clang: T _p) — losing this is the one SILENT failure mode";
+    }
+    // (f) ★ `extern inline` on the definition itself — 6.7.4p7's exemption,
+    // caught by the scanner's own without-extern clause rather than by a merge.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"extern inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "`extern inline` DOES provide the external definition "
+               "(clang: T _p)";
+    }
+    // (g) `static inline` — the flag is set; internal linkage is what keeps the
+    // body emitted (6.7.4p6), and that gate lives at the HIR binding check, not
+    // here. Pinning true rather than false keeps the two concerns separable.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"static inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "static inline records the specifier; the Local binding is what "
+               "keeps it emitted (clang: t _p)";
+    }
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): `inline`, `__inline` and
+// `__inline__` are ONE token kind and therefore one meaning.
+//
+// The synonym claim is not a style assertion — it is the reason the keyword
+// table maps three words to a single kind instead of forking a GNU dialect.
+// MEASURED: `/usr/bin/clang -std=c99 -O0 -c` gives `__inline int p(int){…}` the
+// same `U _p` symbol state as the C99 spelling. RED-ON-DISABLE: give `__inline`
+// its own kind and it stops reaching `semantics.inline.keywordToken`, so these
+// two flip to false while the `inline` row above stays green — exactly the
+// silent split the single kind exists to prevent.
+TEST(SemanticAnalyzerCSubset, InlineGnuSpellingsAreSynonyms) {
+    for (std::string_view spelling : {"__inline", "__inline__"}) {
+        auto model = analyzeShipped(
+            "c-subset", {std::string(spelling) + " int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors()) << spelling;
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << spelling << " must mean exactly what `inline` means";
+    }
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): C99 6.7.4p1 confines the
+// specifier to "the declaration of a function", so `inline` on an OBJECT is a
+// constraint violation and must be LOUD.
+//
+// ★ WHY LOUD RATHER THAN INERT, unlike a stray `_Noreturn`. On a function this
+// specifier decides whether the definition is emitted at all; silently ignoring
+// it on a non-function would be a specifier the compiler parsed and honored
+// nowhere — D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP at the declaration tier.
+// The LINKAGE tier cannot raise it (it sees the keyword but not the declared
+// type), which is why the keyword is ignored-by-kind there and reported here.
+TEST(SemanticAnalyzerCSubset, InlineOnNonFunctionIsLoud) {
+    auto model = analyzeShipped("c-subset", {"inline int gv = 5;\n"});
+    EXPECT_TRUE(model.hasErrors())
+        << "`inline` on an object must not be silently ignored";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineNonFunction), 1u);
+}
+
 // (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
 // `"noreturn": true` (the abort/exit shape) threads onto the injected
 // SymbolRecord's isNoreturn — a shipped extern has no user prototype to carry
