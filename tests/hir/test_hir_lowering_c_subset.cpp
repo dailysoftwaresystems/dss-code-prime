@@ -516,29 +516,58 @@ TEST(HirLoweringCSubset, FormFeedAndVerticalTabAreWhitespace) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
+// TF-C73 UPDATED THIS TEST'S SUBJECT, deliberately. It used to include
+// `int v __attribute__((aligned(4))) = 20;` and assert the whole program lowered
+// CLEAN — which was only true because the after-declarator position was
+// parse-and-IGNORE, i.e. the alignment was being silently dropped. `aligned` is
+// an ABI FACT and now has a real sink, so "lowers with zero diagnostics" is no
+// longer a meaningful thing to assert about it — the interesting question became
+// WHAT ALIGNMENT WAS APPLIED, which this test cannot see. It therefore moved to
+// the applied-value pin `AfterDeclaratorAlignedAppliesLikeTheLeadingPosition`
+// below (and to the runtime witness `examples/c-subset/gnu_aligned_attribute/`).
+// The ABI-NEUTRAL hints this test exists to cover — multi-clause, nested-paren,
+// number args — are unaffected and stay green, which is the point: the split is
+// between "hint with no sink, safely ignorable" (here) and "ABI fact with a
+// sink, assert the VALUE" (there). Do not merge them back: a clean-lowering
+// assertion is exactly the witness that cannot detect a dropped alignment.
 TEST(HirLoweringCSubset, GnuAttributeAfterDeclaratorLowersClean) {
     SemanticModel model = analyzeCSubset(
         "int add(int a, int b) __attribute__((__nothrow__, __leaf__));\n"
         "int add(int a, int b) { return a + b; }\n"
         "int deref(const int *p) __attribute__((__nonnull__((1))));\n"
         "int deref(const int *p) { return *p; }\n"
-        "int v __attribute__((aligned(4))) = 20;\n"
-        "int main(void){ int t=22; return add(v, t); }\n");
+        // `format(printf, 1, 2)` on a REAL format function: position 1 is the
+        // `const char *` and position 2 the first variadic. The obvious-looking
+        // `int firstv(int n, ...)` is a HARD clang ERROR ("format argument not a
+        // string type") — it shipped in the corpus example for a whole cycle
+        // before TF-C73 caught it, so it is spelled correctly here on purpose.
+        "int logfmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));\n"
+        "int logfmt(const char *fmt, ...) { return fmt[0] - '%'; }\n"
+        "int v __attribute__((__unused__)) = 20;\n"
+        "int main(void){ int t=22; return add(v, t) + logfmt(\"%d\", 7); }\n");
     ASSERT_FALSE(model.hasErrors())
         << "after-declarator GNU attributes with multi-clause / nested / number "
            "args must parse and lower as parse-and-ignore hints";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "every attribute here is an ABI-neutral hint with no DSS sink — the "
+           "now-scanned trailing position must ignore names AND arguments alike";
     // The `= 20` initializer must still be found (not shadowed by the
     // after-declarator attribute): `v` lowers to a Global WITH an initializer.
     std::size_t globalsWithInit = 0;
     for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
         if (res->hir.kind(d) == HirKind::Global) ++globalsWithInit;
     EXPECT_GE(globalsWithInit, 1u)
-        << "`int v __attribute__((aligned(4))) = 20;` must still lower to a "
+        << "`int v __attribute__((__unused__)) = 20;` must still lower to a "
            "Global — the attribute must not be mistaken for the initializer";
 }
+
+// (The positional-symmetry pin that explains WHY `aligned` left this test —
+// `AfterDeclaratorAlignedAppliesLikeTheLeadingPosition` — lives with the rest of
+// the TF-C73 battery further down, where the shared `globalAlignment` helper it
+// asserts the applied value through is already in scope.)
 
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
@@ -2417,6 +2446,700 @@ TEST(HirLoweringCSubset, FallthroughStatementLowersToSkip) {
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+}
+
+// ── TF-C73 (D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP +
+//    D-CSUBSET-GNU-ATTRIBUTE's pinned after-declarator follow-up) ──────────────────────
+//
+// Two defects, ONE fix, because they are one unit: seeding `linkageFrom` with
+// the after-declarator roots (defect 2) makes the arg tokens of a real-header
+// prototype (`… __attribute__((format(printf,1,2)))`) reachable by the specifier
+// scan for the first time, so shipping defect 2 WITHOUT the arg-token flag
+// (defect 1) would convert a silent drop into a wall of spurious errors on every
+// glibc/tcl header. Neither half is separately shippable.
+
+namespace {
+// TF-C73: the APPLIED explicit alignment, in bytes, of the module-level Global
+// named `want` — 0 when that declaration carries NO entry in the alignment
+// side-table.
+//
+// ★ 0 IS AN UNAMBIGUOUS "NOTHING WAS APPLIED", not a plausible answer that could
+// mask a bug. The side-table is SPARSE and `AlignmentAttr.alignmentBytes` is
+// never 0 by construction (an absent override is the ABSENCE of an entry, never
+// a zero value — see hir/attributes/alignment_attr.hpp), so this helper's 0
+// means exactly "the declaration was lowered with no explicit alignment", which
+// is the silent under-alignment the `aligned` sink exists to prevent and the one
+// failure a diagnostic-count pin cannot see.
+[[nodiscard]] std::uint32_t globalAlignment(CstToHirResult const& res,
+                                            SemanticModel const& model,
+                                            char const* want) {
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        if (res.hir.kind(d) != HirKind::Global) continue;
+        auto const* rec = model.recordFor(res.hir.globalSymbol(d));
+        if (rec == nullptr || rec->name != want) continue;
+        if (auto const* a = res.alignmentMap.tryGet(d)) return a->alignmentBytes;
+    }
+    return 0u;
+}
+} // namespace
+
+// DEFECT 1 — a LEADING attribute's ARGUMENTS are no longer read as linkage
+// specifier names.
+//
+// ★ THE TWO CASES ASSERT DIFFERENT THINGS ON PURPOSE, and the difference is the
+// point. Both prove the ARG tokens are gone as SPECIFIER NAMES; they differ on
+// what happens to the argument afterwards:
+//   • `format` has no DSS model, so it is in `linkageSpecifierIgnoredNames` and
+//     the whole declaration is clean — count 0 AND an empty message (the message
+//     is asserted because a count alone cannot tell "no diagnostic" from "a
+//     different diagnostic that happens to total zero here").
+//   • `aligned` DOES have a DSS model, so its argument is not merely ignored —
+//     it is CONSUMED. The arm below asserts the APPLIED ALIGNMENT (16), which is
+//     strictly stronger than either a count-1 or a count-0 pin: it fails if the
+//     arg comes back as a specifier name (count 2), it fails if `aligned` were
+//     "fixed" by ignoring the name (count 0, alignment 0), and it fails if the
+//     argument were parsed but decoded wrong (count 0, alignment ≠ 16). Only an
+//     applied-value assertion covers that third case at all.
+//
+// ★ WHAT THIS PIN USED TO SAY, AND WHY IT CHANGED. Until TF-C73 both arms
+// asserted `aligned` was LOUD — "exactly one diagnostic, and it names
+// `aligned`" — with a banner forbidding anyone to quiet it by adding `aligned`
+// to `linkageSpecifierIgnoredNames`. That prohibition was never about the noise;
+// it was about the SINK. DSS sourced alignment only from `alignasSpec`, so
+// ignoring the name would have compiled `__attribute__((aligned(16))) int v;`
+// clean with the alignment GONE — a silently under-aligned object, a miscompile.
+// The banner's own escape clause was "the ignore entry belongs in the same
+// commit as a real `aligned` sink, never before it". THAT SINK LANDED in TF-C73
+// (`AttributeEffect::Align` → the clause argument is const-evaluated into
+// `SymbolRecord.explicitAlignment`, the SAME sink and the same validation path
+// `alignas` uses), so the condition the prohibition was waiting on is met and
+// the expectation is inverted rather than deleted. What guards the behavior now
+// is NOT a diagnostic count — it is the applied `AlignmentAttr` asserted below,
+// plus the runtime address check in `examples/c-subset/gnu_aligned_attribute/`.
+// A count pin here would now be DEAD: the regression it must catch (a dropped or
+// mis-decoded alignment) emits nothing to count.
+//
+// RED-ON-DISABLE — two independent disables, both recorded with how they were
+// measured, because they fail this pin in two DIFFERENT ways:
+//   • drop the `fromAttrArg[i]` guard in `linkageFrom` → the argument tokens are
+//     read as specifier names again. MEASURED on the pre-sink tree (where the
+//     `aligned` clause name was still loud, so its baseline was 1 rather than
+//     today's 0): aligned(16) 1 → 2 ("'16' is not a recognized linkage
+//     specifier"); format(printf,1,2) 0 → 3 ('printf', '1', '2' — the commas are
+//     covered by the `Comma` ignoredKind, so they stay silent). The `format`
+//     half is untouched by the sink and still reads exactly as measured; the
+//     `aligned` half now starts from 0, so it would go 0 → 1.
+//   • MEASURED THIS CYCLE, through a config tree patched under `DSS_CONFIG_ROOT`
+//     (the live checkout was never modified): demote the `aligned` row in
+//     `semantics.attributeSemantics.effects` from `"effect": "align"` to
+//     `"effect": "none"` → the alignment assertion goes 16 → 0 while the
+//     diagnostic count STAYS 0. That silence IS the argument for asserting a
+//     value here: the regression is completely invisible to a count. Deleting
+//     the row outright measures the same 16 → 0 at this position (it also makes
+//     `aligned` unknown vocabulary, which fails loud S0031 at the typedef and
+//     member positions — shapes this pin does not exercise).
+TEST(HirLoweringCSubset, LeadingAttributeArgumentsAreNotLinkageSpecifiers) {
+    {   // an ABI-AFFECTING name is HONORED: the clause is clean AND its ARGUMENT
+        // is applied — the argument is consumed, not merely silenced
+        SemanticModel model = analyzeCSubset(
+            "__attribute__((aligned(16))) int v;\nint main(void){ return v; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "`aligned` has a real sink now, so neither the clause NAME nor "
+               "its argument `16` may reach the linkage-specifier fall-through";
+        EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                  std::string{})
+            << "asserted beside the count so a future generic fall-through that "
+               "re-uses this code cannot hide behind a zero total";
+        // THE APPLIED FACT — the half a count can never carry. Silence alone is
+        // satisfied by an `aligned` that is ignored by name, which is exactly
+        // the under-aligned-object outcome the old loud pin was protecting
+        // against; only the 16 distinguishes honored from quietly discarded.
+        EXPECT_EQ(globalAlignment(*res, model, "v"), 16u)
+            << "the LEADING `aligned(16)` must be APPLIED to `v`: 0 means the "
+               "clause was silently dropped (an under-aligned object, the "
+               "miscompile the pre-sink loud behavior existed to prevent), and "
+               "any other value means the argument was decoded wrong";
+    }
+    {   // a hint attribute with a multi-arg list is clean end-to-end
+        SemanticModel model = analyzeCSubset(
+            "__attribute__((format(printf,1,2))) int h(const char*, ...);\n"
+            "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "`format` is ignored by name and printf/1/2 are argument tokens";
+        EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                  std::string{})
+            << "asserted beside the count so a future generic fall-through that "
+               "re-uses this code cannot hide behind a zero total";
+    }
+}
+
+// ★★ DEFECT 1's ANTI-OVER-SKIP PIN — the single most important test here.
+//
+// The obvious implementation of "ignore attribute arguments" is to add the arg
+// rule to `linkageSpecifierIgnoredRules` and skip the subtree WHOLESALE. That is
+// REFUTED, and this is the witness: the composite key `<ident>:<string-body>` is
+// assembled by a FORWARD SCAN over the flattened token list, and the string lives
+// INSIDE the argument group. Remove those tokens and the pairing has nothing left
+// to pair with, so the bare `visibility` misses the strict map.
+//
+// RED-ON-DISABLE (observed, by patching the shipped config's topLevelDecl row to
+// `"linkageSpecifierIgnoredRules": ["stdAttr", "alignasSpec", "attrArgs"]`):
+//   error[H000C] 'visibility' is not a recognized linkage specifier
+// — i.e. this test's count goes 0 → 1 and the Hidden visibility disappears.
+// The failure is LOUD rather than silent, which is exactly what makes the WRONG
+// fix cheap to detect and the RIGHT fix easy to under-test: a pin that only
+// counted diagnostics on `format(...)` would stay green through that regression.
+TEST(HirLoweringCSubset, AttrArgFlagDoesNotBreakCompositeVisibilityKey) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((visibility(\"hidden\"))) int g;\n"
+        "int main(void){ return g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "the arg-token flag must MARK the string, never REMOVE it";
+    // The applied fact, not merely the absence of a diagnostic: a wholesale skip
+    // also produces "no visibility recorded", and only this half distinguishes
+    // "resolved to Hidden" from "quietly resolved to nothing".
+    bool sawHidden = false;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (!res->linkageMap.has(d)) continue;
+        if (res->linkageMap.get(d).visibility == SymbolVisibility::Hidden)
+            sawHidden = true;
+    }
+    EXPECT_TRUE(sawHidden)
+        << "the composite key `visibility:hidden` must still RESOLVE — an absent "
+           "entry means the facet was dropped, which is the wholesale-skip bug";
+}
+
+// DEFECT 2 — an AFTER-DECLARATOR attribute now reaches the linkage fold.
+//
+// ★ THIS ASSERTS THE APPLIED FACT, NOT A DIAGNOSTIC COUNT, and that is
+// deliberate: the bug was SILENT. Measured at the pre-change HEAD,
+// `int f(void) __attribute__((weak));` compiled with ZERO diagnostics and simply
+// lost the weak binding — the attribute run was consumed by the init-detection
+// skip and `linkageFrom` never saw it. A count-based pin would have been dead on
+// arrival because the broken behavior emits nothing to count.
+//
+// ★ THE WITNESS IS AN OBJECT DEFINITION, NOT A FUNCTION PROTOTYPE, and the reason
+// is worth stating so nobody "improves" it back. A function's after-declarator
+// attribute can only sit on a PROTOTYPE (`int f(void) __attribute__((weak)) {…}`
+// is rejected upstream — S_TypeMismatch/S0018, a separate semantic-tier gap), and
+// a weak prototype correctly DECLINES `prototypeSynthesizesExtern`, so it emits NO
+// HIR node at all and therefore has no linkage entry to assert on. An object
+// declaration IS its own definition, so the fold is observable exactly where the
+// attribute sits — no cross-declaration merge in the way.
+//
+// RED-ON-DISABLE (observed): make `declaratorAttrRoots` (cst_to_hir.cpp) return
+// an empty vector — deleting its after-declarator collection loop, so
+// `declaratorLinkage` hands back the `linkagePrefixRoots` fold untouched → both
+// `sawWeak` and `sawHidden` go true → false, i.e. straight back to the silent
+// drop. (The two shipped root builders are `linkagePrefixRoots` and
+// `declaratorAttrRoots`; there has never been a `linkageScanRoots`.)
+TEST(HirLoweringCSubset, AfterDeclaratorAttributeReachesLinkage) {
+    SemanticModel model = analyzeCSubset(
+        "int gv __attribute__((weak)) = 5;\n"
+        "int gh __attribute__((visibility(\"hidden\"))) = 7;\n"
+        "int main(void){ return gv + gh - 12; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`weak` / `visibility` are DECLARED linkage specifiers — they must "
+           "resolve from the trailing position, not fail";
+    bool sawWeak = false, sawHidden = false;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (!res->linkageMap.has(d)) continue;
+        LinkageAttr const a = res->linkageMap.get(d);
+        if (a.binding == SymbolBinding::Weak)            sawWeak = true;
+        if (a.visibility == SymbolVisibility::Hidden)    sawHidden = true;
+    }
+    EXPECT_TRUE(sawWeak)
+        << "the after-declarator `__attribute__((weak))` must produce a WEAK "
+           "binding — the linkage side-table is sparse, so no entry at all is "
+           "precisely the silent drop this fixes";
+    // The COMPOSITE key resolving from a trailing root proves the two halves of
+    // this cycle compose: the arg-token flag keeps the string visible to the
+    // forward scan (defect 1) *and* the trailing subtree is now scanned at all
+    // (defect 2). Either half missing and this assertion fails.
+    EXPECT_TRUE(sawHidden)
+        << "`visibility(\"hidden\")` must resolve its composite key from the "
+           "AFTER-DECLARATOR position exactly as it does from the leading one";
+}
+
+// DEFECT 2's fail-loud half: an UNKNOWN attribute in the after-declarator
+// position must now be as loud as the same attribute in the leading position.
+// Measured at the pre-change HEAD this compiled SILENTLY CLEAN.
+//
+// ★ THE MESSAGE TEXT IS ASSERTED, NOT THE COUNT. `linkageFrom` has THREE
+// producers of H_UnknownLinkageSpecifier (the unrecognized-key fall-through, the
+// adjacent-string-concat wall, and the leading-`packed` guard), so "count == 1"
+// does not identify WHICH one fired — a future change that made this shape trip
+// the concat wall instead would keep a count pin green while reporting nonsense.
+//
+// RED-ON-DISABLE (observed): make `declaratorAttrRoots` (cst_to_hir.cpp) return
+// an empty vector, so only the `linkagePrefixRoots` fold survives → the message
+// goes from the text below to EMPTY (count 1 → 0), i.e. straight back to silent
+// acceptance. (The two shipped root builders are `linkagePrefixRoots` and
+// `declaratorAttrRoots`; there has never been a `linkageScanRoots`.)
+TEST(HirLoweringCSubset, AfterDeclaratorUnknownAttributeFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) __attribute__((frobnicate));\n"
+        "int f(void){ return 1; }\n"
+        "int main(void){ return f() - 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+              "'frobnicate' is not a recognized linkage specifier")
+        << "an unknown attribute AFTER the declarator must fail loud with the "
+           "unrecognized-key message — an empty string here means the trailing "
+           "position went back to parse-and-ignore";
+}
+
+// TF-C73 — the after-declarator attribute is PER-DECLARATOR, not per-declaration.
+//
+// C attaches an after-declarator attribute to the ONE declarator it follows, so
+// `int a __attribute__((weak)) = 3, b = 4;` weakens `a` and leaves `b` alone.
+// The first cut of this feature folded the trailing run at DECLARATION level and
+// pushed `a`'s binding onto `b` too — an over-application: still a wrong answer,
+// even though it was less wrong than the silent drop that preceded it.
+//
+// ★ GROUND TRUTH IS REAL CLANG, not my reading of the standard. The same program
+// built with `clang -Wall -Wextra` (zero warnings) gives, via `nm -m`:
+//     __DATA,__data  weak external  _a
+//     __DATA,__data  external       _b
+// so "a weak, b default" is the answer a real toolchain produces.
+//
+// ★ ASSERTS APPLIED linkageMap FACTS, not diagnostic counts — the failure mode is
+// a WRONG APPLIED VALUE (`b` silently weak), and the broken version emits no
+// diagnostic at all, so a count pin would be dead on arrival.
+//
+// RED-ON-DISABLE (observed): make the globals arm of `lowerTopLevelInto` record
+// one declaration-level attr again (fold the trailing run into the shared base
+// and drop the `origins` mapping) → `b` comes back Weak and this test fails on
+// the `bWeak` assertion.
+TEST(HirLoweringCSubset, AfterDeclaratorAttributeIsPerDeclaratorNotPerDeclaration) {
+    SemanticModel model = analyzeCSubset(
+        "int a __attribute__((weak)) = 3, b = 4;\n"
+        "int main(void){ return a + b - 7; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    bool sawA = false, sawB = false, aWeak = false, bWeak = false;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Global) continue;
+        auto const* rec = model.recordFor(res->hir.globalSymbol(d));
+        if (rec == nullptr) continue;
+        // The side-table is SPARSE: no entry means Global/Default binding, which
+        // is exactly what `b` must have.
+        bool const weak = res->linkageMap.has(d)
+                       && res->linkageMap.get(d).binding == SymbolBinding::Weak;
+        if (rec->name == "a") { sawA = true; aWeak = weak; }
+        if (rec->name == "b") { sawB = true; bWeak = weak; }
+    }
+    ASSERT_TRUE(sawA) << "test setup: `a` must lower to a Global";
+    ASSERT_TRUE(sawB) << "test setup: `b` must lower to a Global";
+    EXPECT_TRUE(aWeak)
+        << "`a` carries the __attribute__((weak)) — it must be WEAK";
+    EXPECT_FALSE(bWeak)
+        << "`b` carries NO attribute — a sibling declarator's weak binding must "
+           "not leak onto it (clang emits `b` as a plain external symbol)";
+}
+
+// TF-C73 — the POSITIONAL SYMMETRY pin, and the reason
+// `GnuAttributeAfterDeclaratorLowersClean` above no longer carries an `aligned`.
+//
+// `aligned` is ABI-AFFECTING, and before this cycle the two positions gave two
+// DIFFERENT answers for the same attribute on the same program: the LEADING
+// position failed it loud (no sink existed, and going quiet would have produced
+// an under-aligned object), while the TRAILING position silently ACCEPTED it and
+// dropped the alignment. That asymmetry IS the bug — an attribute must not mean
+// two different things depending on which side of the declarator it sits.
+//
+// ★ THE SYMMETRY IS UNCHANGED; THE SHARED ANSWER IS. This pin was written when
+// the only honest shared answer was "loud in BOTH positions", carrying a banner
+// that forbade quieting it by adding `aligned` to `linkageSpecifierIgnoredNames`
+// — because that would have made BOTH positions silently drop the alignment, a
+// miscompile strictly worse than the noise. That banner named its own expiry:
+// "the ignore entry belongs in the same commit as a real `aligned` sink, never
+// before it". THE SINK LANDED in TF-C73 (`AttributeEffect::Align` — the clause
+// argument is const-evaluated into `SymbolRecord.explicitAlignment`, the same
+// sink and same validation path `alignas` already used), so the shared answer is
+// now "APPLIED, identically, in BOTH positions". Same intent, inverted
+// expectation — the test was not deleted, because the asymmetry it guards can
+// regress in either direction.
+//
+// ★ ASSERTS THE APPLIED ALIGNMENT, NOT A DIAGNOSTIC COUNT, and that is now
+// forced rather than stylistic. With a sink present, BOTH the correct behavior
+// and the regression are silent: an `aligned` that is dropped, ignored by name,
+// or decoded to the wrong number all emit ZERO diagnostics, so a count pin would
+// be dead on arrival — it would read 0 in every one of those cases and stay
+// green through the exact miscompile this exists to prevent. 32 is a genuine
+// OVER-alignment for `int` (natural 4), so the value is load-bearing: a sink
+// that silently fell back to natural alignment reads 4 or 0, never 32.
+//
+// WHAT GUARDS THIS NOW: the applied `AlignmentAttr` below (both positions), and
+// the runtime address check in `examples/c-subset/gnu_aligned_attribute/`, which
+// re-witnesses the same two positions as a masked ADDRESS in a running program
+// on every target — including the shipped `release` pipeline, so an optimizer
+// that re-laid-out the globals would be caught too.
+//
+// RED-ON-DISABLE (MEASURED THIS CYCLE, through a config tree patched under
+// `DSS_CONFIG_ROOT` — the live checkout was never modified): demote the
+// `aligned` row in `semantics.attributeSemantics.effects` from
+// `"effect": "align"` to `"effect": "none"` → BOTH loop arms fail with the
+// alignment 32 → 0, symmetrically, and with ZERO diagnostics of any code.
+// Deleting the row outright measures the same 32 → 0 at both positions. The
+// runtime witness `examples/c-subset/gnu_aligned_attribute/` catches that same
+// demotion as `baseline exit-code mismatch (expected=42; OS=1)` — the program
+// still compiles and links and simply returns the wrong number.
+//
+// The ASYMMETRIC regression (one position honoring, the other dropping) is what
+// this pin's two-arm shape exists to catch: it reports the failing `decl` string,
+// so a per-position break names itself instead of collapsing into one failure.
+TEST(HirLoweringCSubset, AfterDeclaratorAlignedAppliesLikeTheLeadingPosition) {
+    for (char const* decl : {
+             "__attribute__((aligned(32))) int v = 20;\n",     // leading
+             "int v __attribute__((aligned(32))) = 20;\n"}) {  // trailing
+        std::string const full = std::string(decl) + "int main(void){ return v; }\n";
+        SemanticModel model = analyzeCSubset(full);
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << decl << " — `aligned` has a sink, so the clause must resolve "
+                       "cleanly in BOTH positions and its argument `32` must not "
+                       "be read as a linkage specifier name";
+        EXPECT_EQ(globalAlignment(*res, model, "v"), 32u)
+            << decl << " — the SAME attribute must APPLY the SAME alignment from "
+                       "either side of the declarator; 0 means this position "
+                       "silently dropped it (the original asymmetry, back), and "
+                       "4 means it fell back to the natural alignment";
+    }
+}
+
+// The newly-ignored ABI-NEUTRAL hint names, in the real spellings glibc / tcl.h /
+// the Apple SDK actually use: dunder forms, a multi-clause comma run, nested
+// double-paren args, and a keyword-argument `availability`. Every one must lower
+// with ZERO H_UnknownLinkageSpecifier.
+//
+// This is the pin that covers BOTH new config rows at once — the `Comma`
+// ignoredKind (the clause separator is a DIRECT child of `attrSpec`, so the arg
+// flag does not reach it) and the added names.
+//
+// ★★ EVERY DECLARATION BELOW IS VALID C THAT REAL CLANG ACCEPTS, verified with
+// `clang -fsyntax-only -Wall -Wextra`: zero errors, zero warnings on each. This
+// matters because an attribute asserted on a shape clang REJECTS would make the
+// pin claim DSS handles real C while actually witnessing the opposite. The first
+// draft of this test got exactly that wrong in four rows and is recorded here so
+// the shapes are not "simplified" back:
+//   * `malloc` / `alloc_size(N)` require a POINTER return    (else -Wignored-attributes)
+//   * `__nonnull__((1))` requires a POINTER PARAMETER at 1   (else a hard error:
+//     "'__nonnull__' attribute parameter 1 is out of bounds" on `int q(void)`)
+//   * `cold` and `hot` are MUTUALLY EXCLUSIVE — `((cold, hot))` is a hard error
+//     ("'hot' and 'cold' attributes are not compatible"), so they get one row each
+//   * `sentinel` requires a VARIADIC function            (else -Wignored-attributes)
+//
+// ★ `access(read_only, N)` is deliberately ABSENT even though it IS in the ignore
+// list. It is a GCC-only attribute — clang answers `-Wunknown-attributes`, and no
+// real GCC is available on this machine to witness it — so there is no shape that
+// can be validated here. Its ignore-list entry stays justified by the GCC-
+// flattened glibc headers DSS actually meets it in; it simply has no clang-clean
+// witness, and a witness clang flags is worse than none.
+//
+// RED-ON-DISABLE (observed): remove `"Comma"` from the topLevelDecl
+// `linkageSpecifierIgnoredKinds` → the multi-clause row fails with
+// "',' is not a recognized linkage specifier". Remove a NAME (e.g. `pure`) →
+// that row fails with "'pure' is not a recognized linkage specifier".
+TEST(HirLoweringCSubset, AbiNeutralHintAttributeNamesLowerClean) {
+    for (char const* decl : {
+             "__attribute__((pure)) int q(void);",
+             "__attribute__((__nothrow__, __leaf__)) int q(void);",
+             "__attribute__((malloc)) void *q(unsigned long n);",
+             "__attribute__((alloc_size(1))) void *q(unsigned long n);",
+             "__attribute__((__nonnull__((1)))) int q(const int *p);",
+             "__attribute__((cold)) int q(void);",
+             "__attribute__((hot)) int q(void);",
+             "__attribute__((sentinel)) void q(const char *first, ...);",
+             "__attribute__((availability(macos,introduced=10.12))) int q(void);"}) {
+        std::string const src = std::string(decl) + "\nint main(void){ return 0; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << decl << " — an ABI-neutral hint with no DSS sink must be ignored, "
+                       "name and arguments alike";
+        EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                  std::string{}) << decl;
+    }
+}
+
+namespace {
+// The declared binding for the module decl whose bound symbol is `name`, read
+// from the SPARSE linkage side-table: absent ⇒ the implicit `Global` state (that
+// is exactly what `recordLinkage` means by storing nothing), so this reports the
+// APPLIED binding for every node, annotated or not. `std::nullopt` means no such
+// module decl exists at all — a distinct answer from "exists with Global
+// binding", and telling those two apart is the whole point at a synthesis gate.
+[[nodiscard]] std::optional<SymbolBinding>
+declaredBinding(CstToHirResult const& res, SemanticModel const& model,
+                std::string_view name) {
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        SymbolId sym{};
+        switch (res.hir.kind(d)) {
+            case HirKind::Global:         sym = res.hir.globalSymbol(d);         break;
+            case HirKind::Function:       sym = res.hir.functionSymbol(d);       break;
+            case HirKind::ExternGlobal:   sym = res.hir.externGlobalSymbol(d);   break;
+            case HirKind::ExternFunction: sym = res.hir.externFunctionSymbol(d); break;
+            default: continue;
+        }
+        auto const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+        if (rec == nullptr || rec->name != name) continue;
+        return res.linkageMap.has(d) ? res.linkageMap.get(d).binding
+                                     : SymbolBinding::Global;
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+// ★★ TF-C73 REGRESSION PIN — THE LITERAL glibc IDIOM ON AN `extern`.
+//
+// TF-C73 made the after-declarator attribute run a linkage SCAN ROOT for every
+// declarator-mode row. `externDecl` is one, and it carried only
+// `{_Thread_local, thread_local}` + an `ExternKeyword` ignore — no
+// `AttributeKeyword`, no parens, no `Comma`, no ignored names — so every raw
+// token of a trailing run hit the strict lookup.
+//
+// MEASURED, before the config row grew its vocabulary: the first line below
+// produced EIGHT H_UnknownLinkageSpecifier errors and NO object —
+// `'__attribute__'`, `'('`, `'('`, `'__nothrow__'`, `','`, `'__leaf__'`, `')'`,
+// `')'`. That is the expansion of glibc's `__THROW`, so it is on essentially
+// every function declaration in a real libc header.
+//
+// GROUND TRUTH IS REAL CLANG: this exact program under
+// `clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)` gives
+// ZERO errors and ZERO warnings, and this compiler accepted it before TF-C73.
+//
+// ★ ASSERTS THE APPLIED BINDING, not "no diagnostics". A count pin would be
+// satisfied by a row that went quiet the WRONG way — adding `weak` to
+// `linkageSpecifierIgnoredNames` would silence all eight errors and silently
+// drop `ea`'s weak binding, which is the same silent-wrong-linkage bug wearing a
+// green test. Only the applied `Weak` on `ea` — beside the applied `Global` on
+// its sibling `eb`, which shares the declaration and carries no attribute —
+// distinguishes "resolved" from "quietly ignored".
+//
+// RED-ON-DISABLE (observed): strip the `externDecl` row in c-subset.lang.json
+// back to `"linkageSpecifierIgnoredKinds": ["ExternKeyword"]` with no
+// `linkageSpecifierIgnoredNames` → the `gg` line fails with
+// "'__attribute__' is not a recognized linkage specifier" (8 errors) and both
+// EXPECTs on `gg` fail. Drop ONLY the `weak` key from that row's
+// `linkageSpecifiers` → `ea` fails with "'weak' is not a recognized linkage
+// specifier"; move `weak` into that row's ignored NAMES instead → the errors
+// vanish and `eaBinding` silently reads Global, which is the assertion below
+// that catches the wrong-way fix.
+TEST(HirLoweringCSubset, ExternDeclGlibcAttributeRunResolvesAndApplies) {
+    SemanticModel model = analyzeCSubset(
+        "extern int gg(void) __attribute__((__nothrow__, __leaf__));\n"
+        "extern int ea __attribute__((weak)), eb;\n"
+        "int main(void){ return gg() + ea + eb; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+              std::string{})
+        << "the glibc `__THROW` expansion must resolve on an extern declaration "
+           "— any message here means a token of the attribute run reached the "
+           "strict lookup";
+
+    // The hint-decorated extern still LOWERS — `gg` must exist as an import, not
+    // be dropped along with the diagnostics.
+    EXPECT_EQ(declaredBinding(*res, model, "gg"),
+              std::optional{SymbolBinding::Global})
+        << "`extern int gg(void) __attribute__((__nothrow__, __leaf__));` must "
+           "lower to an ordinary external import — nullopt means the whole "
+           "declaration was lost, not merely mis-annotated";
+    EXPECT_EQ(declaredBinding(*res, model, "ea"),
+              std::optional{SymbolBinding::Weak})
+        << "`extern int ea __attribute__((weak))` must APPLY the weak binding "
+           "(clang emits `_ea` as `undefined weak external`) — Global here means "
+           "the row went quiet by ignoring `weak` instead of honoring it";
+    EXPECT_EQ(declaredBinding(*res, model, "eb"),
+              std::optional{SymbolBinding::Global})
+        << "`eb` shares the declaration but carries NO attribute — its sibling's "
+           "weak binding must not leak onto it";
+}
+
+// ★★ TF-C73 REGRESSION PIN — A WEAK PROTOTYPE STILL SYNTHESIZES ITS EXTERN.
+//
+// The HIR-tier half of `examples/c-subset/weak_proto_crosscu/`, which is the
+// real two-TU link-and-run witness. This half exists because the runtime witness
+// can only say "the program failed to build"; this one names WHY, at the exact
+// node the gate decides.
+//
+// The `prototypeSynthesizesExtern` gate asked `binding == Global`, on the stated
+// grounds that "a `static` (Local) or weak proto must never bind another TU's
+// public symbol (C 6.2.2p3)". That is correct for `static` and FACTUALLY WRONG
+// for `weak`: C 6.2.2 has no `weak` at all — it is a GNU attribute that changes
+// LINKER RESOLUTION, not a linkage class, and a weak DECLARATION still has
+// external linkage. GROUND TRUTH, real clang, two TUs: links and exits 42.
+//
+// ★ ASSERTS THE APPLIED SYNTHESIS, not a diagnostic count. The broken gate
+// emitted NOTHING at this tier — it simply declined to create the node, and the
+// program died much later at HIR→MIR with H0009 "Ref to unbound symbol". So the
+// fact to pin is that the ExternFunction EXISTS (`declaredBinding` returns a
+// value rather than `nullopt`) and that it carries the WEAK binding it was
+// declared with — a node that existed but had lost its weakness would be the
+// other half of the same bug.
+//
+// ★ BOTH SPELLINGS. The trailing one regressed in TF-C73; the LEADING one
+// reached the same gate through the specifier prefix and was broken identically
+// since the gate was written (MEASURED at the pre-TF-C73 HEAD: the leading
+// spelling failed H0009 there while the trailing one ran to 42). One gate, two
+// spellings — pinning only the regressed spelling leaves the older half open.
+//
+// RED-ON-DISABLE (observed): restore the gate to
+// `protoLinkage().binding == SymbolBinding::Global` → BOTH `declaredBinding`
+// calls return `std::nullopt` (no ExternFunction node is created at all) and
+// both EXPECTs fail.
+TEST(HirLoweringCSubset, WeakPrototypeSynthesizesExternInBothPositions) {
+    SemanticModel model = analyzeCSubset(
+        "int wtrail(int) __attribute__((weak));\n"
+        "__attribute__((weak)) int wlead(int);\n"
+        "int main(void){ return wtrail(30) + wlead(1); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(declaredBinding(*res, model, "wtrail"),
+              std::optional{SymbolBinding::Weak})
+        << "the TRAILING `__attribute__((weak))` proto must still synthesize its "
+           "extern (nullopt = no node, so nothing for a sibling TU's definition "
+           "to bind to) AND keep the weak binding it declared";
+    EXPECT_EQ(declaredBinding(*res, model, "wlead"),
+              std::optional{SymbolBinding::Weak})
+        << "the LEADING `__attribute__((weak))` proto must behave identically — "
+           "the fix is to the RULE, not to one spelling of it";
+}
+
+// ★★ TF-C73 REGRESSION PIN — `static` + `weak` IS A CONFLICT, NOT LAST-WINS.
+//
+// MEASURED, before the fix, on `static int x __attribute__((weak)) = 7;`:
+// the ELF object carried `V x` — a WEAK GLOBAL under its own unmangled name,
+// escaping the TU — where the same declaration without the attribute emits
+// `d sym_N`, a TU-local. ZERO diagnostics, exit code 0. Silent wrong linkage:
+// the program links against a different definition than the source asked for.
+//
+// GROUND TRUTH IS REAL CLANG, which HARD-ERRORS
+// `weak declaration cannot have internal linkage` — so the fix follows clang and
+// fails loud rather than picking either binding.
+//
+// ★ THE RULE IS SYMMETRIC, and both orders are pinned because clang errors on
+// both: `static __attribute__((weak)) int x;` AND
+// `__attribute__((weak)) static int x;`. A "trailing must not clobber leading"
+// precedence rule would pass the first and silently accept the second.
+//
+// ★ ASSERTS THE APPLIED BINDING BESIDE THE MESSAGE, not a count. The binding is
+// the fact that was silently wrong (`Weak` where the source said `static`), and
+// `linkageFrom` has several producers of H_UnknownLinkageSpecifier, so a count
+// says nothing about WHICH fired or what binding survived. `Local` is the only
+// answer that means "the `static` was not overwritten".
+//
+// ★★ AND `Local` IN *BOTH* ARMS IS WHY THIS PIN IS A LOOP RATHER THAN ONE CASE.
+// The first cut of the guard rejected the conflict and simply left the binding
+// already in force standing — plain first-wins. MEASURED, that passed the
+// trailing arm (Local was first) and FAILED this one on the leading arm, which
+// read `Weak`: a rejected declaration still marked as escaping the TU. So the
+// guard now resolves a rejected conflict to the CONFINING binding, and pinning
+// both orders to the same value is what keeps that symmetric.
+//
+// RED-ON-DISABLE (observed): delete the conflict guard in `linkageFrom` (restore
+// the bare `attr.binding = *it->second.binding;` last-wins assignment) → the
+// message goes to EMPTY and the binding reads `Weak` in both arms, i.e. straight
+// back to the silent escape.
+TEST(HirLoweringCSubset, WeakOnInternalLinkageFailsLoudAndKeepsStatic) {
+    struct Case { char const* decl; char const* conflicting; };
+    for (Case const c : {
+             Case{"static int x __attribute__((weak)) = 7;\n", "weak"},
+             Case{"__attribute__((weak)) static int x = 7;\n", "static"}}) {
+        std::string const src = std::string(c.decl)
+                              + "int *px = &x;\n"
+                                "int main(void){ return *px; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << c.decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        // The message names the SECOND-folded specifier and the binding already
+        // in force, so the two arms report different (both correct) texts —
+        // matching on those two substrings keeps the pin order-symmetric without
+        // going vague about WHICH of `linkageFrom`'s several
+        // H_UnknownLinkageSpecifier producers fired.
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find(std::string{"'"} + c.conflicting + "' specifies '"),
+                  std::string::npos)
+            << c.decl << " — got: \"" << msg << "\"; an EMPTY message means the "
+                         "conflict went back to last-wins, which is the "
+                         "silent-escape bug";
+        EXPECT_NE(msg.find("conflicts with"), std::string::npos)
+            << c.decl << " — got: \"" << msg << "\"; must be the CONFLICT "
+                         "diagnostic, not the generic unrecognized-key "
+                         "fall-through";
+        EXPECT_EQ(declaredBinding(*res, model, "x"),
+                  std::optional{SymbolBinding::Local})
+            << c.decl << " — the `static` must SURVIVE the rejected `weak`: "
+                         "Weak here means the symbol escaped the TU (measured as "
+                         "`V x` in the ELF object), Global means both were lost";
+    }
+}
+
+// The other side of the same seam: an attribute that touches NO axis the prefix
+// set must leave the prefix's binding alone. `aligned` is axis-free for linkage
+// (its sink is the alignment side-table), so `static int sa
+// __attribute__((aligned(32)));` must stay LOCAL and stay SILENT — the conflict
+// guard above must not have turned "a trailing attribute is present" into a
+// rejection. Clang accepts this exact declaration with zero warnings.
+//
+// RED-ON-DISABLE: widen the conflict guard to fire whenever a trailing run is
+// folded at all (rather than only on a differing BINDING) → this reds with a
+// spurious H_UnknownLinkageSpecifier on legal C.
+TEST(HirLoweringCSubset, AxisFreeTrailingAttributeLeavesStaticBindingIntact) {
+    SemanticModel model = analyzeCSubset(
+        "static int sa __attribute__((aligned(32))) = 3;\n"
+        "int *psa = &sa;\n"
+        "int main(void){ return *psa; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+              std::string{})
+        << "an axis-free trailing attribute on a `static` is legal C";
+    EXPECT_EQ(declaredBinding(*res, model, "sa"),
+              std::optional{SymbolBinding::Local})
+        << "`static` must survive an attribute that sets no binding";
+    EXPECT_EQ(globalAlignment(*res, model, "sa"), 32u)
+        << "and the alignment must still APPLY — a guard that rejected the "
+           "clause would also have dropped its effect";
 }
 
 // ── FC5: goto / labels ──────────────────────────────────────────────────────

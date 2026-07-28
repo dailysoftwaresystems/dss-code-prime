@@ -188,7 +188,20 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         // `completeComposite` packed parameter is non-defaulted: this call FAILS TO
         // COMPILE if packed is forgotten). packed + explicit offsets never coexist
         // (completeComposite rejects the pair), so `offsets` is empty when packed.
-        dst.completeComposite(fwd, fields, src.isPacked(srcId), widths, offsets, aligns);
+        //
+        // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): carry the WHOLE-COMPOSITE explicit
+        // alignment across too. Dropping it here is the same class of silent
+        // miscompile as dropping packed, and strictly worse to notice: a
+        // `__attribute__((aligned(16)))` struct would cross a CU / static-link merge
+        // boundary and come back UNDER-ALIGNED with its size quietly shrunk (16 → 5
+        // for the packed+aligned witness), with no diagnostic anywhere. Unlike
+        // `packed` this parameter IS defaulted (an undefaulted one cannot follow the
+        // defaulted spans — see the header note), so the compile-time forcing does
+        // not apply and the guarantee is carried by the reintern round-trip pin
+        // instead: `CompositeExplicitAlignSurvivesReintern` asserts the value AND the
+        // resulting layout survive the hop.
+        dst.completeComposite(fwd, fields, src.isPacked(srcId), widths, offsets, aligns,
+                              src.explicitCompositeAlign(srcId));
         return fwd;
     }
 
@@ -280,6 +293,15 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         case TypeKind::Union:
             reinternFatal(kind, "is a nominal composite and must be re-interned via "
                                 "the forward-mint path, not the operand-DAG switch");
+
+        // ── qualifier skin: handled ABOVE (strip + re-wrap with the SAME QualBit
+        //    mask). Reaching here means that early return was bypassed, which would
+        //    silently DROP `volatile` / `_Atomic`. An explicit arm rather than a
+        //    `default:` — a catch-all would re-arm this trap for the next TypeKind
+        //    someone adds, which is exactly what -Wswitch exists to prevent. ──
+        case TypeKind::VolatileQual:
+            reinternFatal(kind, "is a qualifier skin and must be re-interned via the "
+                                "strip-and-rewrap path, not the operand-DAG switch");
 
         // ── enum: NO operands; name + scalars=[(int)underlyingTypeKind] ──
         case TypeKind::Enum:

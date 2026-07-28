@@ -281,10 +281,32 @@ public:
     // matters: a silently-unpacked round-trip is an ABI miscompile). packed +
     // non-empty `fieldOffsets` is contradictory (explicit offsets place fields
     // wholesale, overriding padding entirely) → fail loud here.
+    //
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): `explicitAlign` is the WHOLE-COMPOSITE
+    // explicit alignment request (C 6.7.5 / GNU `__attribute__((aligned(N)))` on a
+    // struct/union DEFINITION), in bytes; 0 = no request. It is a genuinely
+    // PER-COMPOSITE channel — NOT a smuggled `fieldAligns[0]`, which would lie about
+    // member 0's `_Alignof`, be unrepresentable for a zero-field composite, and
+    // reintern as a different type. `computeLayout` folds it with MAX semantics
+    // (6.7.5: the composite's alignment is max(natural, requested) — a request
+    // WEAKER than natural is a no-op, never a lowering), which is what makes
+    // `struct S { char a; int b; } __attribute__((packed, aligned(16)));` come out
+    // sizeof 16 / _Alignof 16 (clang-MEASURED) rather than packed's bare 5.
+    //
+    // UNLIKE `packed` this parameter IS defaulted, and the reason is a hard
+    // constraint, not a preference: an undefaulted parameter cannot follow the
+    // already-defaulted spans, and inserting one before them would break
+    // `completeComposite` call sites in files this change does not own
+    // (`src/hir/hir_text.cpp`, `tests/hir/test_hir_text.cpp`). What replaces the
+    // "forgetting it fails to COMPILE" guard is three RUNTIME/TEST guards: a
+    // non-power-of-two / >256 value aborts loud here; a re-completion that changes
+    // the value aborts loud as a conflicting re-completion; and the reintern
+    // round-trip pin asserts the value survives a cross-interner hop.
     void completeComposite(TypeId id, std::span<TypeId const> fields, bool packed,
                            std::span<std::int64_t const> fieldBitWidths = {},
                            std::span<std::uint64_t const> fieldOffsets = {},
-                           std::span<std::uint32_t const> fieldAligns = {});
+                           std::span<std::uint32_t const> fieldAligns = {},
+                           std::uint32_t explicitAlign = 0);
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -341,6 +363,21 @@ public:
                       std::span<std::int64_t const> fieldBitWidths,
                       std::span<std::uint64_t const> fieldOffsets,
                       std::span<std::uint32_t const> fieldAligns);
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the complete-at-once path for a struct
+    // carrying a WHOLE-COMPOSITE explicit alignment (`struct S {…}
+    // __attribute__((aligned(N)))`). `explicitAlign` is the requested byte alignment
+    // (a power of two ≤ 256; 0 = no request) and is part of the struct's CONTENT
+    // identity: two structs with identical (name, fields, widths, offsets, aligns)
+    // but DIFFERENT `explicitAlign` are DISTINCT interned types and must never
+    // collide in the intern map — they lay out to different sizes. `explicitAlign
+    // == 0` routes exactly like the 5-arg overload (byte-identical declSiteKey, zero
+    // TypeId churn). Independent of `fieldAligns`: a member alignas raises ONE
+    // field, this raises the WHOLE aggregate, and both fold with MAX at layout.
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns,
+                      std::uint32_t explicitAlign);
     // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
     // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
     [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
@@ -361,6 +398,14 @@ public:
     // ordinary (padded) composite. Mirrors `hasExplicitAligns`. The layout engine
     // reads it to seed the per-field baseline alignment to 1.
     [[nodiscard]] bool isPacked(TypeId id) const;
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE explicit alignment
+    // request on `id` in bytes, or 0 when the composite has none (the ordinary
+    // path) / `id` is not a Struct/Union. The per-COMPOSITE counterpart of the
+    // per-FIELD `explicitFieldAlign`, and the twin of `isPacked` — packed LOWERS the
+    // aggregate's baseline to 1, this RAISES its final alignment. The layout engine
+    // reads it to SEED `StructLayout::align` before the per-field MAX-fold, so the
+    // composite's alignment ends up max(natural, requested) exactly per C 6.7.5.
+    [[nodiscard]] std::uint32_t explicitCompositeAlign(TypeId id) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -576,6 +621,20 @@ private:
         // GUARDED on true, exactly like offsets/aligns). packed + explicit offsets is
         // contradictory (offsets place fields wholesale) → fail loud at completion.
         bool                      packed      = false;
+        // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE explicit
+        // alignment request in bytes (a power of two ≤ 256; 0 = none), for
+        // C 6.7.5 / GNU `__attribute__((aligned(N)))` on a struct/union
+        // DEFINITION. A SEPARATE channel from BOTH `fieldAligns` (per-FIELD, and
+        // `fieldAligns[0]` would lie about member 0's `_Alignof` and not exist at
+        // all for a zero-field composite) AND `packed` (which LOWERS the per-field
+        // baseline to 1 — this RAISES the aggregate's final alignment, and the two
+        // legitimately COMBINE: `packed, aligned(16)` is clang sizeof 16, not 5).
+        // `computeLayout` seeds `StructLayout::align` with it, so the per-field
+        // MAX-fold can only raise it further — never lower it (6.7.5: an
+        // `aligned(N)` weaker than natural is a no-op). 0 = no request (every
+        // existing composite → byte-identical TypeId — it enters
+        // `contentDeclSiteKey` GUARDED on non-zero, exactly like offsets/aligns).
+        std::uint32_t             explicitAlign = 0;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

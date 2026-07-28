@@ -9,6 +9,7 @@
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
+#include "core/types/attribute_naming.hpp"     // stripDunder — the ONE dunder normalizer, shared with the semantic attribute scans (TF-C73 drift cross-check)
 #include "core/types/data_model.hpp"           // dataModelFromName (FC3 c1 coreByDataModel keys)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
@@ -34,6 +35,77 @@ namespace dss::detail {
 namespace {
 
 using json = nlohmann::json;
+
+// ── the `$` documentation-key convention ──────────────────────────────────
+//
+// A key whose name starts with `$` (`$comment`, `$…Comment`) is PROSE, never
+// config: the codebase-wide way to explain a block inside the JSON that
+// declares it. Every closed-key vocabulary in this loader must skip such keys,
+// and so must every place that reads an object's keys AS IDENTIFIERS — most
+// sharply the `shapes` map, where a `$`-prefixed sibling of the rule names was
+// read as a SHAPE DEFINITION and its prose value as a rule REFERENCE, failing
+// the whole load with the paragraph echoed back as if it were a rule name.
+//
+// ★ ONE predicate, not a ninth copy of the same expression. The convention had
+// been open-coded identically at seven sites; a convention spelled out N times
+// is a convention that holds only where someone remembered it, and the shapes
+// map is the site where it was forgotten. Every site now calls this, so
+// "documentation key" has exactly one definition to read and to change.
+[[nodiscard]] constexpr bool isDocumentationKey(std::string_view key) {
+    return !key.empty() && key.front() == '$';
+}
+
+// ── the closed-key-vocabulary well-formedness check ───────────────────────
+//
+// Every `kSomethingKeys` table in this loader is a `std::array<string_view, N>`
+// whose N is written BY HAND next to the initializer list — and the compiler
+// does NOT check that the two agree in the dangerous direction.
+// `std::array<std::string_view, 57>` with 56 initializers is perfectly legal:
+// it value-initializes the tail, so element 56 becomes the EMPTY string_view
+// and the typo discriminator silently starts whitelisting a key of `""`.
+// (MEASURED on `kSemanticsKeys`: bumping 56→57 alone compiles clean, and a
+// `semantics` key of `""` then loads without a diagnostic.) A DUPLICATE entry
+// is silent in a mirror-image way — it inflates the count, so a key that is
+// actually missing looks accounted for by the number.
+//
+// ★ ONE helper, not a copy of the loop per table. The check had been written
+// once, for `kDeclarationRowKeys`, and the three sibling tables — including the
+// 56-entry `kSemanticsKeys`, the largest and most edit-prone of them — went
+// unguarded; a guard that must be remembered per table is a guard that holds
+// only where someone remembered it. Every closed-key table now calls this, at
+// compile time, so the next person to add a key cannot get the number wrong
+// without the build saying so.
+template <std::size_t N>
+[[nodiscard]] constexpr bool isWellFormedKeyVocabulary(
+    std::array<std::string_view, N> const& keys) {
+    for (std::size_t a = 0; a < N; ++a) {
+        if (keys[a].empty()) return false;             // under-filled ⇒ tail is ""
+        for (std::size_t b = a + 1; b < N; ++b)
+            if (keys[a] == keys[b]) return false;      // duplicate ⇒ count lies
+    }
+    return true;
+}
+// The same check for a name→value vocabulary (a verb table). The under-fill
+// hazard is WORSE here: the value half zero-initializes too, so the phantom
+// `""` verb silently maps to whatever enumerator happens to be 0.
+template <typename T, std::size_t N>
+[[nodiscard]] constexpr bool isWellFormedKeyVocabulary(
+    std::array<std::pair<std::string_view, T>, N> const& rows) {
+    for (std::size_t a = 0; a < N; ++a) {
+        if (rows[a].first.empty()) return false;
+        for (std::size_t b = a + 1; b < N; ++b)
+            if (rows[a].first == rows[b].first) return false;
+    }
+    return true;
+}
+// The one message every closed-key table shares, so the diagnosis reads the
+// same wherever the build breaks.
+#define DSS_CHECK_KEY_VOCABULARY(table)                                        \
+    static_assert(isWellFormedKeyVocabulary(table),                            \
+                  #table ": the declared std::array size must equal the "      \
+                  "initializer count (an under-filled array zero-fills and "   \
+                  "would whitelist the empty key) and every entry must be "    \
+                  "unique")
 
 // ── ScopeKind name lookup ─────────────────────────────────────────────────
 constexpr std::pair<std::string_view, ScopeKind> kBuiltinScopes[] = {
@@ -592,6 +664,7 @@ void collectReferences(json const& body,
             // Allowlist: anything other than atom/minPrecedence/wrapperRules
             // is a typo.
             for (auto const& [k, _] : exprBody.items()) {
+                if (isDocumentationKey(k)) continue;
                 if (k != "atom" && k != "minPrecedence" && k != "wrapperRules") {
                     c.emit(DiagnosticCode::C_UnknownShape,
                            std::format("{}/{}", exprPath, k),
@@ -676,6 +749,7 @@ void collectReferences(json const& body,
                         }
                     }
                     for (auto const& [k, _] : wr.items()) {
+                        if (isDocumentationKey(k)) continue;
                         if (k != "binary" && k != "unary" && k != "postfix" && k != "ternary") {
                             c.emit(DiagnosticCode::C_UnknownShape,
                                    std::format("{}/{}", wrPath, k),
@@ -1079,8 +1153,10 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
             } else if (guard.is_object()) {
                 static constexpr std::array<std::string_view, 2>
                     kGuardKeys{"rule", "polarity"};
+                DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
                 bool gOk = true;
                 for (auto it = guard.begin(); it != guard.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
                     bool known = false;
                     for (auto const& k : kGuardKeys) {
                         if (it.key() == k) { known = true; break; }
@@ -1972,6 +2048,43 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         return std::unexpected(std::move(coll).release());
     }
 
+    // Closed key vocabulary for the DOCUMENT itself (typo discriminator, the
+    // same shape the nested blocks use). This is the widest-blast-radius
+    // instance of the class: every block below is OPTIONAL and absence is
+    // meaningful ("no `semantics` ⇒ the analyzer performs no semantic
+    // analysis"), so a single misspelled block name — `"semantcs"`,
+    // `"lexerModes "` — used to load perfectly clean and silently drop that
+    // ENTIRE phase. Every name here is a key the loader genuinely reads.
+    static constexpr std::array<std::string_view, 18> kDocumentKeys{
+        // identity + loader gates
+        "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
+        // lexical surface
+        "lexerModes", "tokens", "keywords", "operators", "scopes",
+        "syncTokens", "numberStyle",
+        // type-extension + artifact declarations (SP2 / schema v3)
+        "typeExtensions", "artifactProfiles",
+        // grammar surface
+        "shapes",
+        // schema v4 blocks
+        "imports", "preprocess", "semantics", "hirLowering"};
+    DSS_CHECK_KEY_VOCABULARY(kDocumentKeys);
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        // `$`-prefixed keys are the codebase-wide documentation convention
+        // (`$comment` / `$…Comment`) — never a block, so exempt them from the
+        // typo discriminator (the same carve-out every nested block applies).
+        if (isDocumentationKey(it.key())) continue;
+        bool known = false;
+        for (auto const& k : kDocumentKeys) {
+            if (it.key() == k) { known = true; break; }
+        }
+        if (!known) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/{}", it.key()),
+                      std::format("unknown top-level key '{}' (typo "
+                                  "discriminator)", it.key()));
+        }
+    }
+
     // dssSchemaVersion ──
     if (!present(doc, "dssSchemaVersion", coll, std::string{sourceLabel})) {
         return std::unexpected(std::move(coll).release());
@@ -2128,6 +2241,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                       "'lexerModes' must be an object");
         } else {
             for (auto const& [modeName, _] : doc.at("lexerModes").items()) {
+                if (isDocumentationKey(modeName)) continue;
                 (void)registerMode(modeName);
             }
         }
@@ -2150,6 +2264,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // can never drift in meaning semantics. The helper owns its
             // own scope-pool reservation (the former Pass A) so no
             // reallocation occurs while it takes spans into the pool.
+            // ★ NO `$` documentation carve-out here, and that is deliberate.
+            // A key in this map is a LEXEME — arbitrary SOURCE TEXT the target
+            // language defines — not an identifier drawn from a vocabulary this
+            // loader owns. `$` is a perfectly ordinary operator character (a
+            // bare `$`, C#-style `$"…"` interpolation, `$$`), and this repo's
+            // own fixtures declare all three. Skipping `$`-led keys here would
+            // silently DELETE those operators from the language: measured, it
+            // broke `core/test_operator_table` and seven `core/test_lexer_modes`
+            // cases. A block comment for this table belongs on a `$`-prefixed
+            // sibling at DOCUMENT level, where the keys are the loader's own.
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
                 if (!arr.is_array()) {
                     coll.emit(DiagnosticCode::C_UnknownToken,
@@ -2245,6 +2369,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     std::unordered_set<std::uint32_t> tokensDefaultModes;
     if (doc.contains("lexerModes") && doc.at("lexerModes").is_object()) {
         for (auto const& [modeName, modeObj] : doc.at("lexerModes").items()) {
+            if (isDocumentationKey(modeName)) continue;
             const auto modePath = std::format("/lexerModes/{}", modeName);
             if (!modeObj.is_object()) {
                 coll.emit(DiagnosticCode::C_ConflictingField, modePath,
@@ -2271,8 +2396,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (dt.is_object()) {
                     static constexpr std::array<std::string_view, 4>
                         kDefaultTokenKeys{"kind", "flags", "coalesce", "closeToken"};
+                    DSS_CHECK_KEY_VOCABULARY(kDefaultTokenKeys);
                     for (auto it = dt.begin(); it != dt.end(); ++it) {
-                        if (!it.key().empty() && it.key().front() == '$') continue;
+                        if (isDocumentationKey(it.key())) continue;
                         bool known = false;
                         for (auto const& k : kDefaultTokenKeys) {
                             if (it.key() == k) { known = true; break; }
@@ -2473,6 +2599,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // meaning objects; a non-array value is a real config
                     // error (mirrors the top-level table's guard).
                     auto& modeTable = data.lexerModeTokens[modeId.v];
+                    // Same lexeme key space as the global table above —
+                    // no `$` carve-out, for the same reason.
                     for (auto const& [lex, arr] : tk.items()) {
                         const auto lexPath = std::format("{}/tokens/{}", modePath, lex);
                         if (!arr.is_array()) {
@@ -3071,9 +3199,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_MissingField, "/shapes",
                       "'shapes' must be an object");
         } else {
+            // The `$` documentation convention, applied to the shapes MAP.
+            // Filtered ONCE here rather than at each pass below: the block
+            // reads this object nine times (intern, wrapper collection,
+            // wrapper resolution, reference validation, the root check, and
+            // the three grammar-compilation helpers that take it whole), and a
+            // per-pass `continue` would have to be remembered nine times AND
+            // could not reach inside `computeFirstAndNullable` /
+            // `buildPositionTables` / `detectAmbiguousAlternatives` at all
+            // without changing their signatures. One filtered view means a
+            // documentation key is invisible to every consumer by
+            // construction — it is never interned as a rule, so it cannot
+            // leave a junk name in the table for a later typo to "resolve" to.
+            // Copying the object costs one pass at load time; a schema is
+            // loaded once per process.
+            json shapes = json::object();
+            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+                if (isDocumentationKey(shapeName)) continue;
+                shapes[shapeName] = body;
+            }
+
             // Pass A: intern every shape name so cross-references resolve
             // regardless of definition order.
-            for (auto const& [shapeName, _] : doc.at("shapes").items()) {
+            for (auto const& [shapeName, _] : shapes.items()) {
                 (void)data.rules->intern(shapeName);
             }
 
@@ -3124,7 +3272,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // schema (one config might use `bExpr`/`uExpr`/`pExpr`,
             // another `binaryExpr`/...).
             std::vector<std::string> wrapperNames;
-            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+            for (auto const& [shapeName, body] : shapes.items()) {
                 (void)shapeName;
                 walkExprBodies(walkExprBodies, body,
                                [&](json const& exprBody) {
@@ -3145,7 +3293,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                            wrapperNames.end()),
                                wrapperNames.end());
             for (auto const& name : wrapperNames) {
-                if (doc.at("shapes").contains(name)) {
+                if (shapes.contains(name)) {
                     coll.emit(
                         DiagnosticCode::C_UnknownShape,
                         std::format("/shapes/{}", name),
@@ -3169,7 +3317,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // Per-`expr`-rule wrapper-rule resolution. Keyed by the
             // owning expr rule's RuleId so the walker can look up the
             // bundle on entry.
-            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+            for (auto const& [shapeName, body] : shapes.items()) {
                 walkExprBodies(walkExprBodies, body,
                                [&](json const& exprBody) {
                     // Only record when the owning rule is a top-level
@@ -3205,7 +3353,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // to either a shape (RuleInterner) or a token kind
             // (SchemaTokenInterner). Diagnostics surface here; the compile
             // pass below trusts the references have already resolved.
-            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+            for (auto const& [shapeName, body] : shapes.items()) {
                 const auto shapePath = std::format("/shapes/{}", shapeName);
                 std::vector<std::string> refs;
                 collectReferences(body, shapePath, refs, coll);
@@ -3218,6 +3366,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ★ The emptiness test runs against the UNFILTERED object, NOT the
+            // `$`-filtered view. The `$` filter answers "which keys are rule
+            // DEFINITIONS?"; this test answers a different question — "did the
+            // author write a grammar at all?" — and the author who typed
+            //     "shapes": { "$wipComment": "commented out while I bisect" }
+            // DID write a non-empty block and is owed the missing-root error.
+            // Reading the filtered map here turns the last step of a
+            // comment-out-one-shape-at-a-time bisect into a clean load with NO
+            // grammar: `rootRule` stays invalid, zero diagnostics, and the
+            // compiler silently has nothing to parse with. A genuinely absent
+            // or `{}` `shapes` block stays exempt — that is a config that has
+            // not reached its grammar yet, which the loader has always allowed.
             if (data.rules->contains("root")) {
                 data.rootRule = data.rules->intern("root");
             } else if (!doc.at("shapes").empty()) {
@@ -3304,9 +3464,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                     }
                 }
-                computeFirstAndNullable    (data, doc.at("shapes"));
-                buildPositionTables        (data, doc.at("shapes"), coll);
-                detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
+                computeFirstAndNullable    (data, shapes);
+                buildPositionTables        (data, shapes, coll);
+                detectAmbiguousAlternatives(data, coll, shapes);
                 computeNullableTails       (data);
                 recomputeAltExpectedSets   (data);
                 computePredictivePrefixes  (data);
@@ -3369,7 +3529,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // place.
                     static constexpr std::array<std::string_view, 2>
                         kExponentKeys{"letters", "signOptional"};
+                    DSS_CHECK_KEY_VOCABULARY(kExponentKeys);
                     for (auto it = e.begin(); it != e.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
                         bool known = false;
                         for (auto const& k : kExponentKeys) {
                             if (it.key() == k) { known = true; break; }
@@ -3504,8 +3666,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                                 static constexpr std::array<std::string_view, 2>
                                     kFloatKeys{"exponent", "exponentDigits"};
+                                DSS_CHECK_KEY_VOCABULARY(kFloatKeys);
                                 bool badKey = false;
                                 for (auto it = fj.begin(); it != fj.end(); ++it) {
+                                    if (isDocumentationKey(it.key())) continue;
                                     bool known = false;
                                     for (auto const& k : kFloatKeys) {
                                         if (it.key() == k) { known = true; break; }
@@ -4486,6 +4650,66 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics",
                       "'semantics' must be an object");
         } else {
+            // Closed key vocabulary for the `semantics` object ITSELF (typo
+            // discriminator, same shape as `declarators`' kDeclaratorKeys
+            // below). Every name here is a key the loader genuinely READS —
+            // a misspelled sub-block (`"alinged"`, `"declarationz"`) would
+            // otherwise load perfectly clean and leave that entire facet
+            // silently unhonored: the knob-that-lies class this discipline
+            // exists to prevent. Listed in loader-read order so a new facet's
+            // key lands next to the reader that consumes it.
+            static constexpr std::array<std::string_view, 56> kSemanticsKeys{
+                // declaration / reference / scope surface (plan 08.6)
+                "declarators", "declarations", "references", "memberAccesses",
+                "scopes",
+                // the type surface
+                "builtinTypes", "typeShapes", "literalTypes", "typeSpecifiers",
+                "integerLiteralTyping", "floatLiteralTyping", "parameters",
+                "arithmeticConversions", "synthesizedTypes",
+                // SE4-SE7 expression facets
+                "assignments", "callRules", "casts",
+                // type-query operators + declaration specifiers
+                "sizeof", "alignof", "typeof", "bitInt", "alignas", "packed",
+                "noreturn", "constexpr", "threadLocal",
+                "predefinedFunctionNames",
+                // attribute surface (FC17)
+                "attributeSemantics", "nodiscard",
+                // remaining expression / declaration facets
+                "variadic", "staticAssertRule", "inlineAsmRule", "generic",
+                "compoundLiterals", "builtinFunctions",
+                // statement surface
+                "returnRules", "loopRules", "loopControls",
+                // single-token roles
+                "identifierToken", "bracketIdentifierToken", "pointerToken",
+                "volatileMarker", "atomicMarker",
+                // link / FFI surface
+                "externLibraryByFormat", "shippedLibDirs",
+                // the conversion lattice
+                "pointerConversions", "charConvertsToArith",
+                "bitIntConversions", "enumConvertsToArith",
+                "scalarConvertsToBool", "intCrossSignednessConverts",
+                "intSameSignednessNarrows", "intConvertsToFloat",
+                "floatConvertsToInt", "floatSameKindNarrows",
+                "pointerAliasing"};
+            DSS_CHECK_KEY_VOCABULARY(kSemanticsKeys);
+            for (auto it = sem.begin(); it != sem.end(); ++it) {
+                // `$`-prefixed keys are the codebase-wide documentation
+                // convention (`$comment` / `$…Comment`) — never a facet, so
+                // exempt them from the typo discriminator (same carve-out the
+                // `declarators` block applies below).
+                if (isDocumentationKey(it.key())) continue;
+                bool known = false;
+                for (auto const& k : kSemanticsKeys) {
+                    if (it.key() == k) { known = true; break; }
+                }
+                if (!known) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              std::format("/semantics/{}", it.key()),
+                              std::format("unknown key '{}' in 'semantics' "
+                                          "(typo discriminator)", it.key()));
+                }
+            }
+
             SemanticConfig cfg;
 
             // Core-kind name → TypeKind (only the subset that makes sense as
@@ -4518,6 +4742,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
                 bool ok = true;
                 for (auto const& [key, val] : obj.items()) {
+                    if (isDocumentationKey(key)) continue;
                     auto const dm = dataModelFromName(key);
                     if (!dm) {
                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -4572,6 +4797,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
                 bool ok = true;
                 for (auto const& [key, val] : obj.items()) {
+                    if (isDocumentationKey(key)) continue;
                     auto const lf = longDoubleFormatFromName(key);
                     if (!lf) {
                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -4731,13 +4957,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
                             // after-declarator attribute rules (attrSpec/stdAttr).
                             "afterDeclaratorAttrRules"};
+                    DSS_CHECK_KEY_VOCABULARY(kDeclaratorKeys);
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         // `$`-prefixed keys are the codebase-wide documentation
                         // convention (`$comment` / `$…Comment`) — never a role,
                         // so exempt them from the typo discriminator (matches how
                         // every other config block carries inline `$` comments).
-                        if (!it.key().empty() && it.key().front() == '$') continue;
+                        if (isDocumentationKey(it.key())) continue;
                         bool known = false;
                         for (auto const& k : kDeclaratorKeys) {
                             if (it.key() == k) { known = true; break; }
@@ -5034,6 +5261,65 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "each 'declarations' entry must be an object");
                             continue;
                         }
+                        // Closed keys per ROW (typo discriminator). Nearly
+                        // every field below is an OPTIONAL opt-in facet whose
+                        // absence is silent, so a near-miss spelling —
+                        // `linkageSpecifierIgnoredName` for the plural,
+                        // `specifierPrefx` — used to load clean and simply
+                        // no-op the facet. Listed in reader order; the nested
+                        // `gatedMarkers` entries carry their own closed-key
+                        // check further down.
+                        static constexpr std::array<std::string_view, 39>
+                            kDeclarationRowKeys{
+                                // the shape anchor + visible-child indices
+                                "rule", "name", "type", "init", "body",
+                                "params", "head", "declarator",
+                                "declaratorList", "kind", "nameMatch",
+                                // type-source / declarator-walk switches
+                                "inferTypeFromInitializer", "arrayToPointer",
+                                "anonymousNameAllowed",
+                                "requireNamedDeclarators",
+                                "nonDefiningDeclaration", "definesWhenChild",
+                                "kindByChild",
+                                // aggregate/member facets
+                                "fieldChildren", "bitfieldSuffix",
+                                "arraySuffix", "allowFlexibleArray",
+                                "enumUnderlyingType",
+                                // specifier + marker roles
+                                "specifierPrefix", "requiredSpecifierToken",
+                                "constMarker", "volatileMarker",
+                                "variadicMarker", "gatedMarkers",
+                                // linkage-specifier surface
+                                "linkageSpecifiers",
+                                "linkageSpecifierIgnoredKinds",
+                                "linkageSpecifierIgnoredNames",
+                                "linkageSpecifierIgnoredRules",
+                                // attribute surface (TF-C73)
+                                "declarationAttrSlotRules",
+                                "unknownStrictAttributeIsError",
+                                // driver-facing name sets + lint switches
+                                "entryFunctionNames",
+                                "implicitReturnZeroForFunctionNames",
+                                "prototypeSynthesizesExtern", "warnIfUnused"};
+                        // The declared SIZE is load-bearing and the compiler
+                        // does not check it — see `isWellFormedKeyVocabulary`.
+                        DSS_CHECK_KEY_VOCABULARY(kDeclarationRowKeys);
+                        for (auto it = entry.begin(); it != entry.end(); ++it) {
+                            // `$`-prefixed documentation keys stay exempt.
+                            if (isDocumentationKey(it.key())) continue;
+                            bool known = false;
+                            for (auto const& k : kDeclarationRowKeys) {
+                                if (it.key() == k) { known = true; break; }
+                            }
+                            if (!known) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          std::format("{}/{}", path, it.key()),
+                                          std::format("unknown key '{}' in "
+                                                      "'declarations[{}]' (typo "
+                                                      "discriminator)",
+                                                      it.key(), i));
+                            }
+                        }
                         if (!entry.contains("rule") || !entry.at("rule").is_string()) {
                             coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
                                       "'rule' is required and must be a string");
@@ -5260,6 +5546,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "text to a {{binding?, "
                                                       "visibility?}} effect", i));
                             } else {
+                                // No `$` carve-out: a key here is a specifier
+                                // SOURCE TEXT (matched against `tree().text()`),
+                                // the same arbitrary-source key space as the
+                                // `tokens` table, so reserving `$` would foreclose
+                                // a legal spelling. Documentation for this map goes
+                                // on a `$`-prefixed sibling of the ROW's own keys,
+                                // which IS the loader's vocabulary — the shipped
+                                // c-subset's `$linkageSpecifiersComment` does that.
                                 for (auto it = ls.begin(); it != ls.end(); ++it) {
                                     auto const& specText = it.key();
                                     auto const& eff = it.value();
@@ -5272,6 +5566,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                   "with optional 'binding' and/or "
                                                   "'visibility' string fields");
                                         continue;
+                                    }
+                                    // Closed keys on the EFFECT object. The
+                                    // "sets at least one axis" guard below only
+                                    // catches an object whose EVERY key is
+                                    // misspelled; `{"binding":"local",
+                                    // "visibilty":"hidden"}` satisfies it on the
+                                    // good key and silently drops the other axis
+                                    // — a linkage knob that lies, one nesting
+                                    // level under the row whose keys are closed.
+                                    static constexpr std::array<std::string_view, 4>
+                                        kLinkageEffectKeys{"binding", "visibility",
+                                                           "staticStorage",
+                                                           "threadStorage"};
+                                    DSS_CHECK_KEY_VOCABULARY(kLinkageEffectKeys);
+                                    for (auto ek = eff.begin(); ek != eff.end();
+                                         ++ek) {
+                                        if (isDocumentationKey(ek.key())) continue;
+                                        if (std::ranges::find(kLinkageEffectKeys,
+                                                              ek.key())
+                                            != kLinkageEffectKeys.end()) continue;
+                                        coll.emit(
+                                            DiagnosticCode::C_InvalidSemantics,
+                                            std::format("{}/{}", effPath, ek.key()),
+                                            std::format("unknown key '{}' in a "
+                                                        "linkage effect — allowed "
+                                                        "keys are 'binding', "
+                                                        "'visibility', "
+                                                        "'staticStorage', "
+                                                        "'threadStorage' (typo "
+                                                        "discriminator)", ek.key()));
                                     }
                                     LinkageSpecifierEffect effect{};
                                     bool any = false;
@@ -5486,6 +5810,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     }
                                     bool gOk = true;
                                     for (auto it = g.begin(); it != g.end(); ++it) {
+                                        if (isDocumentationKey(it.key())) continue;
                                         if (it.key() != "token"
                                             && it.key() != "code") {
                                             coll.emit(
@@ -5973,6 +6298,108 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     rule.linkageSpecifierIgnoredRules.push_back(
                                         data.rules->find(rn));
                                 }
+                            }
+                        }
+
+                        // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): optional
+                        // `declarationAttrSlotRules` — the RULES whose
+                        // direct-child instances on this declaration carry
+                        // attribute specifiers (the slots the semantic
+                        // attribute scan visits IN ADDITION to
+                        // `specifierPrefix`). Deliberately rule NAMES, not
+                        // child INDICES: a wrong index is SILENT (the scan
+                        // descends, finds no attributes, asserts nothing)
+                        // whereas a wrong name cannot resolve and is rejected
+                        // right here — see the field's header comment. Unknown
+                        // name ⇒ C_InvalidSemantics, matching the sibling
+                        // rule-reference keys' fail-loud posture.
+                        if (entry.contains("declarationAttrSlotRules")) {
+                            auto const& das = entry.at("declarationAttrSlotRules");
+                            if (!das.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/declarationAttrSlotRules",
+                                          std::format("'declarations[{}]."
+                                                      "declarationAttrSlotRules' must "
+                                                      "be an array of rule names", i));
+                            } else if (das.empty()) {
+                                // An empty list is byte-identical to omitting
+                                // the key, so writing it says nothing while
+                                // reading as a configured attribute surface —
+                                // the knob-that-lies shape this key's own
+                                // "named, not indexed" design exists to avoid.
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/declarationAttrSlotRules",
+                                          std::format("'declarations[{}]."
+                                                      "declarationAttrSlotRules' is "
+                                                      "empty — that is identical to "
+                                                      "omitting the key, so either "
+                                                      "name the attribute slots or "
+                                                      "drop it", i));
+                            } else {
+                                for (auto const& elem : das) {
+                                    if (!elem.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/declarationAttrSlotRules",
+                                                  "each attribute-slot entry must be a "
+                                                  "rule-name string");
+                                        continue;
+                                    }
+                                    auto const rn = elem.get<std::string>();
+                                    // A repeat entry makes the semantic attribute
+                                    // scan visit that slot TWICE — every clause
+                                    // under it is then seen twice, so a
+                                    // per-attribute diagnostic fires twice and a
+                                    // per-attribute effect is applied twice.
+                                    // Silent today, and never what was meant.
+                                    if (std::ranges::find(
+                                            rule.declarationAttrSlotRuleNames, rn)
+                                        != rule.declarationAttrSlotRuleNames.end()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/declarationAttrSlotRules",
+                                                  std::format("'declarations[{}]."
+                                                              "declarationAttrSlotRules' "
+                                                              "lists '{}' more than once "
+                                                              "— the attribute scan would "
+                                                              "visit that slot twice",
+                                                              i, rn));
+                                        continue;
+                                    }
+                                    if (!data.rules->contains(rn)) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/declarationAttrSlotRules",
+                                                  std::format("'declarations[{}]."
+                                                              "declarationAttrSlotRules' "
+                                                              "references unknown shape "
+                                                              "'{}' — an attribute slot "
+                                                              "is named, not indexed, "
+                                                              "precisely so this cannot "
+                                                              "be a silent no-op",
+                                                              i, rn));
+                                        continue;
+                                    }
+                                    rule.declarationAttrSlotRules.push_back(
+                                        data.rules->find(rn));
+                                    rule.declarationAttrSlotRuleNames.push_back(rn);
+                                }
+                            }
+                        }
+
+                        // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): optional
+                        // `unknownStrictAttributeIsError` — promote an
+                        // unrecognized attribute in the STRICT (GNU) form on
+                        // this row from the C23-ignorable warning to an error.
+                        // Default false = today's behavior, so the key can only
+                        // tighten a row that asks for it.
+                        if (entry.contains("unknownStrictAttributeIsError")) {
+                            json const& uv =
+                                entry.at("unknownStrictAttributeIsError");
+                            if (!uv.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/unknownStrictAttributeIsError",
+                                          "'unknownStrictAttributeIsError' must be "
+                                          "a boolean");
+                            } else {
+                                rule.unknownStrictAttributeIsError = uv.get<bool>();
                             }
                         }
 
@@ -6996,12 +7423,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         for (auto const& [key, _] : entry.items()) {
+                            if (isDocumentationKey(key)) continue;
                             if (key != "tokens" && key != "core"
                                 && key != "coreByDataModel"
                                 && key != "coreByLongDoubleFormat"
                                 && key != "complex"
-                                && key != "name" && key != "rank"
-                                && key.rfind("$", 0) != 0) {
+                                && key != "name" && key != "rank") {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'typeSpecifiers' field "
@@ -7357,10 +7784,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         for (auto const& [key, _] : entry.items()) {
+                            if (isDocumentationKey(key)) continue;
                             if (key != "suffixes" && key != "decimal"
                                 && key != "nondecimal"
-                                && key != "bitPrecise" && key != "signed"
-                                && key.rfind("$", 0) != 0) {
+                                && key != "bitPrecise" && key != "signed") {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'integerLiteralTyping' "
@@ -7595,8 +8022,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         for (auto const& [key, _] : entry.items()) {
-                            if (key != "suffixes" && key != "type"
-                                && key.rfind("$", 0) != 0) {
+                            if (isDocumentationKey(key)) continue;
+                            if (key != "suffixes" && key != "type") {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'floatLiteralTyping' "
@@ -7728,8 +8155,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'parameters' must be an object");
                 } else {
                     for (auto const& [key, _] : pj.items()) {
-                        if (key != "soleVoidMeansEmpty"
-                            && key.rfind("$", 0) != 0) {
+                        if (isDocumentationKey(key)) continue;
+                        if (key != "soleVoidMeansEmpty") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       "/semantics/parameters/" + key,
                                       std::format("unknown 'parameters' field "
@@ -7760,9 +8187,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 } else {
                     bool ok = true;
                     for (auto const& [key, _] : obj.items()) {
+                        if (isDocumentationKey(key)) continue;
                         if (key != "integerPromotion" && key != "mixedSignedness"
-                            && key != "promoteComparisons" && key != "shiftResult"
-                            && key.rfind("$", 0) != 0) {
+                            && key != "promoteComparisons"
+                            && key != "shiftResult") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       "/semantics/arithmeticConversions/" + key,
                                       std::format("unknown 'arithmeticConversions' "
@@ -7785,8 +8213,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     } else {
                         json const& ip = obj.at("integerPromotion");
                         for (auto const& [key, _] : ip.items()) {
-                            if (key != "minRankType" && key != "alsoPromote"
-                                && key.rfind("$", 0) != 0) {
+                            if (isDocumentationKey(key)) continue;
+                            if (key != "minRankType" && key != "alsoPromote") {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           "/semantics/arithmeticConversions/"
                                           "integerPromotion/" + key,
@@ -7996,7 +8424,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         SynthesizedTypeRule rule;
                         bool roleOk = true;
                         for (auto const& [key, val] : models.items()) {
-                            if (key.rfind("$", 0) == 0) continue;   // comment key
+                            if (isDocumentationKey(key)) continue;
                             auto const dm = dataModelFromName(key);
                             if (!dm.has_value()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -8040,7 +8468,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (roleOk) out = std::move(rule);
                     };
                     for (auto const& [key, _] : obj.items()) {
-                        if (key.rfind("$", 0) == 0) continue;
+                        if (isDocumentationKey(key)) continue;
                         if (key == "sizeof")                 readRole(key, cfg.sizeofResultType);
                         else if (key == "alignof")           readRole(key, cfg.alignofResultType);
                         else if (key == "pointerDifference") readRole(key, cfg.pointerDifferenceType);
@@ -8767,6 +9195,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // the effect VERB is validated against the CLOSED set
             // {suppressUnused, warnOnUse, warnOnDiscard, none} — an unknown verb
             // is C_InvalidSemantics (a typo can never silently disarm a row).
+            // The block's own keys are CLOSED for the same reason: a
+            // misspelled `stdAtrRule` would leave the block half-wired (no
+            // std-attribute surface at all) while loading clean.
             // Source-agnostic: nothing hardcodes a rule name or attribute name.
             if (sem.contains("attributeSemantics")) {
                 json const& as = sem.at("attributeSemantics");
@@ -8777,6 +9208,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "{ attrSpecRule, stdAttrRule, bareStatementRule, "
                               "effects }");
                 } else {
+                    // Closed keys (typo discriminator) — the `$`-prefixed
+                    // documentation convention stays exempt, exactly as in
+                    // `declarators` and the enclosing `semantics` object.
+                    static constexpr std::array<std::string_view, 5>
+                        kAttributeSemanticsKeys{"attrSpecRule", "stdAttrRule",
+                                                "bareStatementRule", "effects",
+                                                "attributeArgRule"};
+                    DSS_CHECK_KEY_VOCABULARY(kAttributeSemanticsKeys);
+                    for (auto it = as.begin(); it != as.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
+                        bool known = false;
+                        for (auto const& k : kAttributeSemanticsKeys) {
+                            if (it.key() == k) { known = true; break; }
+                        }
+                        if (!known) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                std::format("/semantics/attributeSemantics/{}",
+                                            it.key()),
+                                std::format("unknown key '{}' in "
+                                            "'attributeSemantics' (typo "
+                                            "discriminator)", it.key()));
+                        }
+                    }
                     auto readRule = [&](char const* key, char const* path,
                                         RuleId& outRule, std::string& outName) {
                         if (!as.contains(key) || !as.at(key).is_string()) {
@@ -8805,57 +9260,208 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                              "/semantics/attributeSemantics/bareStatementRule",
                              cfg.attrBareStatementRule,
                              cfg.attrBareStatementRuleName);
+                    // D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP: the attribute
+                    // ARGUMENT-group rule. OPTIONAL, unlike the three rules above:
+                    // a language may declare an attribute surface whose clauses
+                    // take no arguments at all, and ABSENT must keep the linkage
+                    // scan byte-identical to its pre-key behavior rather than
+                    // refuse to load. PRESENT-BUT-UNKNOWN is still LOUD
+                    // (C_UnknownShape) — the whole point of the closed vocabulary
+                    // is that a typo can never leave the mechanism half-wired,
+                    // and a silently-invalid rule id here would silently restore
+                    // the arg-soup bug this key exists to fix. This key REPLACES
+                    // the `attributeArgRule` that `attrSpec`/`attrArgs`'s
+                    // `$comment`s claimed for a full cycle without any
+                    // implementation behind it
+                    // (D-CONFIG-ATTRIBUTE-ARG-RULE-DOCUMENTED-BUT-UNIMPLEMENTED):
+                    // the identifier is now GREPPABLE to a loader arm, a
+                    // SemanticConfig field and a consumer.
+                    if (as.contains("attributeArgRule")) {
+                        json const& ar = as.at("attributeArgRule");
+                        if (!ar.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/attributeSemantics/"
+                                      "attributeArgRule",
+                                      "'attributeArgRule' must be a string naming "
+                                      "the attribute-argument shape");
+                        } else {
+                            std::string nm = ar.get<std::string>();
+                            if (!data.rules->contains(nm)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/attributeSemantics/"
+                                          "attributeArgRule",
+                                          std::format("'attributeSemantics."
+                                                      "attributeArgRule' references "
+                                                      "unknown shape '{}'", nm));
+                            } else {
+                                cfg.attributeArgRule = data.rules->find(nm);
+                                cfg.attributeArgRuleName = std::move(nm);
+                            }
+                        }
+                    }
                     if (!as.contains("effects") || !as.at("effects").is_array()) {
                         coll.emit(DiagnosticCode::C_MissingField,
                                   "/semantics/attributeSemantics/effects",
                                   "'effects' is required and must be an array of "
                                   "{ names, effect } rows");
                     } else {
-                        for (json const& row : as.at("effects")) {
+                        // The CLOSED verb set — ONE table, read BOTH by the
+                        // lookup below and by the rejection message.
+                        //
+                        // ★ The two used to be independent: an `else if` chain
+                        // and a hand-written "the closed set is …" literal with
+                        // no mechanical link between them. That made the message
+                        // free to drift into a lie — MEASURED: deleting the
+                        // `align` arm left the message still advertising `align`,
+                        // and the pin that asserts the message CONTAINS `align`
+                        // stayed green while the sentence became false. A config
+                        // author who mistypes a verb reads exactly this sentence
+                        // to learn the vocabulary, so it is derived from the
+                        // vocabulary rather than restated alongside it.
+                        static constexpr std::array<
+                            std::pair<std::string_view, AttributeEffect>, 5>
+                            kEffectVerbs{{
+                                {"suppressUnused", AttributeEffect::SuppressUnused},
+                                {"warnOnUse",      AttributeEffect::WarnOnUse},
+                                {"warnOnDiscard",  AttributeEffect::WarnOnDiscard},
+                                {"align",          AttributeEffect::Align},
+                                {"none",           AttributeEffect::None}}};
+                        DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
+
+                        // Closed keys per ROW. An unknown key here is the same
+                        // knob-that-lies as everywhere else in this loader —
+                        // `"efect": "align"` alongside a real `effect` loads
+                        // clean and the intended verb never takes.
+                        static constexpr std::array<std::string_view, 2>
+                            kEffectRowKeys{"names", "effect"};
+                        DSS_CHECK_KEY_VOCABULARY(kEffectRowKeys);
+
+                        // Every name seen so far, dunder-normalized → the verb
+                        // it was bound to. A second binding of the same name is
+                        // rejected below; see the note there for why.
+                        std::unordered_map<std::string, std::string> seenNames;
+
+                        for (std::size_t ri = 0; ri < as.at("effects").size();
+                             ++ri) {
+                            json const& row = as.at("effects")[ri];
+                            auto const rowPath = std::format(
+                                "/semantics/attributeSemantics/effects/{}", ri);
                             if (!row.is_object() || !row.contains("names")
                                 || !row.at("names").is_array()
                                 || !row.contains("effect")
                                 || !row.at("effect").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          "/semantics/attributeSemantics/effects",
+                                          rowPath,
                                           "each 'effects' row must be an object "
                                           "{ names: [strings], effect: string }");
                                 continue;
+                            }
+                            for (auto it = row.begin(); it != row.end(); ++it) {
+                                if (isDocumentationKey(it.key())) continue;
+                                if (std::ranges::find(kEffectRowKeys, it.key())
+                                    != kEffectRowKeys.end()) continue;
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    std::format("{}/{}", rowPath, it.key()),
+                                    std::format("unknown key '{}' in an "
+                                                "'effects' row — allowed keys "
+                                                "are 'names', 'effect' (typo "
+                                                "discriminator)", it.key()));
+                            }
+                            // An empty `names` array binds the verb to nothing:
+                            // the row is inert config that reads as configured.
+                            if (row.at("names").empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          rowPath + "/names",
+                                          "'names' must list at least one "
+                                          "attribute name — a row that names "
+                                          "nothing binds its effect to nothing "
+                                          "and can never fire");
                             }
                             AttributeSemanticsRow out;
                             for (json const& nm : row.at("names")) {
                                 if (!nm.is_string()) {
                                     coll.emit(
                                         DiagnosticCode::C_InvalidSemantics,
-                                        "/semantics/attributeSemantics/effects",
+                                        rowPath + "/names",
                                         "each 'names' entry must be a string");
                                     continue;
                                 }
-                                out.names.push_back(nm.get<std::string>());
+                                auto name = nm.get<std::string>();
+                                // No attribute clause can spell the empty name,
+                                // so such an entry is unreachable by
+                                // construction — always a typo or a stray comma.
+                                if (name.empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/names",
+                                        "an attribute name must be non-empty — "
+                                        "no clause can spell '', so the entry "
+                                        "could never match");
+                                    continue;
+                                }
+                                out.names.push_back(std::move(name));
                             }
                             std::string const verb =
                                 row.at("effect").get<std::string>();
-                            if (verb == "suppressUnused") {
-                                out.effect = AttributeEffect::SuppressUnused;
-                            } else if (verb == "warnOnUse") {
-                                out.effect = AttributeEffect::WarnOnUse;
-                            } else if (verb == "warnOnDiscard") {
-                                out.effect = AttributeEffect::WarnOnDiscard;
-                            } else if (verb == "none") {
-                                out.effect = AttributeEffect::None;
-                            } else {
+                            auto const arm = std::ranges::find(
+                                kEffectVerbs, verb,
+                                &std::pair<std::string_view,
+                                           AttributeEffect>::first);
+                            if (arm == kEffectVerbs.end()) {
                                 // CLOSED verb set — an unknown verb fails the
                                 // load loud; silently defaulting it would
                                 // disarm the row (e.g. a suppressUnused typo
                                 // would re-enable the unused warning).
+                                std::string closed;
+                                for (auto const& [name, _] : kEffectVerbs) {
+                                    if (!closed.empty()) closed += " | ";
+                                    closed += name;
+                                }
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics, rowPath,
+                                    std::format("unknown attribute effect '{}' "
+                                                "— the closed set is {}",
+                                                verb, closed));
+                                continue;
+                            }
+                            out.effect = arm->second;
+                            // ★ A name may be bound ONCE. Two rows claiming the
+                            // same name load cleanly today and leave WHICH ONE
+                            // WINS to consumer iteration order — and with `align`
+                            // in the vocabulary that is not a cosmetic ambiguity:
+                            // `[{"names":["aligned"],"effect":"align"},
+                            //   {"names":["aligned"],"effect":"none"}]` is exactly
+                            // the demotion `AttributeEffect::Align`'s own contract
+                            // forbids, because silencing `aligned` without a sink
+                            // produces a silently UNDER-ALIGNED object — a
+                            // miscompile, not a missing warning. Rejected whether
+                            // or not the verbs agree: a name declared twice is a
+                            // config error either way, and the harmless-looking
+                            // case is what trains an author to expect the
+                            // dangerous one to be fine. Normalized like every
+                            // other attribute-name comparison, so `aligned` and
+                            // `__aligned__` are the SAME binding.
+                            for (auto const& n : out.names) {
+                                auto const key = std::string{stripDunder(n)};
+                                auto const [it, fresh] =
+                                    seenNames.try_emplace(key, verb);
+                                if (fresh) continue;
                                 coll.emit(
                                     DiagnosticCode::C_InvalidSemantics,
-                                    "/semantics/attributeSemantics/effects",
-                                    std::format("unknown attribute effect '{}' — "
-                                                "the closed set is suppressUnused"
-                                                " | warnOnUse | warnOnDiscard | "
-                                                "none", verb));
-                                continue;
+                                    rowPath + "/names",
+                                    std::format(
+                                        "attribute name '{}' is already bound to "
+                                        "effect '{}' in "
+                                        "'attributeSemantics.effects' — a "
+                                        "name must have exactly ONE effect, or "
+                                        "which one applies is decided by "
+                                        "consumer iteration order. (For 'align' "
+                                        "that is a miscompile, not a lost "
+                                        "warning: the losing row silently "
+                                        "under-aligns the declared object.) "
+                                        "Merge the rows or drop one",
+                                        n, it->second));
                             }
                             cfg.attributeEffects.push_back(std::move(out));
                         }
@@ -9148,10 +9754,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             kBuiltinFnKeys{"name", "signature",
                                            "signatureByDataModel", "params",
                                            "result", "variadic", "lowering"};
+                        DSS_CHECK_KEY_VOCABULARY(kBuiltinFnKeys);
                         {
                             bool keysOk = true;
                             for (auto it = entry.begin(); it != entry.end(); ++it) {
-                                if (!it.key().empty() && it.key().front() == '$')
+                                if (isDocumentationKey(it.key()))
                                     continue;
                                 bool known = false;
                                 for (auto const& k : kBuiltinFnKeys) {
@@ -9205,6 +9812,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                                 bool dmOk = true;
                                 for (auto const& [key, val] : byDm.items()) {
+                                    if (isDocumentationKey(key)) continue;
                                     auto const dm = dataModelFromName(key);
                                     if (!dm.has_value()) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -9620,6 +10228,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "identities");
                 } else {
                     for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
                         auto const& formatName = it.key();
                         auto const& val = it.value();
                         auto const kindPath = std::format(
@@ -9789,6 +10398,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // about expected fields are sufficient — the
                     // closed allowlist forecloses unknown subkeys.
                     for (auto const& [k, _] : obj.items()) {
+                        if (isDocumentationKey(k)) continue;
                         if (k != "implicitToVoidPtr" &&
                             k != "implicitFromVoidPtr" &&
                             k != "nullPointerConstantFromIntegerZero" &&
@@ -9971,6 +10581,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("charTypesAliasAll",
                              cfg.pointerAliasing.charTypesAliasAll);
                     for (auto const& [k, _] : obj.items()) {
+                        if (isDocumentationKey(k)) continue;
                         if (k != "strictAliasingOnDistinctTypes" &&
                             k != "charTypesAliasAll") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -10006,6 +10617,216 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "/semantics/identifierToken",
                               "a 'lastIdentifier' nameMatch rule requires "
                               "'semantics.identifierToken' to be declared");
+                }
+            }
+
+            // ── TF-C73: the ABI-neutral attribute-name DRIFT cross-check ─────
+            //
+            // The attribute NAME vocabulary is spread over THREE independent
+            // lists that answer THREE DIFFERENT questions:
+            //   (1) `declarations[].linkageSpecifierIgnoredNames` — "which
+            //       specifier identifiers does the strict, fail-loud linkage
+            //       prefix scan SKIP?"
+            //   (2) `attributeSemantics.effects[].names`          — "which
+            //       attribute names does the language KNOW, and what does each
+            //       DO to the declared entity?"
+            //   (3) `packed.attributeNames` / `noreturn.attributeNames` — "which
+            //       names does a DEDICATED scan consume?"
+            // Their pairwise intersections are small and that is CORRECT — they
+            // are not three copies of one set and MERGING them would be wrong
+            // (measured: the c-subset lists are 18 / 12 / 2 with a 3-way overlap
+            // of just `noreturn`). What they can do is DRIFT, silently. The two
+            // clauses below are the subset relations that are actually IMPLIED
+            // by the lists' own definitions, so they can be enforced without
+            // over-constraining a language that legitimately differs.
+            //
+            // ★ What is deliberately NOT checked, and why. The tempting rule —
+            // "every `effects` name must be linkage-ignored on every row that
+            // declares `linkageSpecifiers`" — is UNSOUND in both directions.
+            // (a) Many `effects` names are not declaration-attached at all
+            //     (`fallthrough`/`likely` decorate STATEMENTS, `packed` decorates
+            //     a TYPE), so they never reach a declaration's specifier prefix
+            //     and requiring their ignore entries would reject correct config.
+            // (b) Whether an attribute clause can even REACH a given row's scan
+            //     depends on that row's prefix GRAMMAR (c-subset's `externDecl`
+            //     prefix admits only `extern` + the thread-local twins, so no
+            //     attribute identifier can occur there), and the semantic loader
+            //     holds only a name↔id `RuleInterner` — the shape graph is not
+            //     available here, so a grammar-reachability closure would mean
+            //     re-implementing grammar analysis inside the semantics loader.
+            // What clause B keys off instead is the signal that IS visible: a
+            // row whose strict scan runs, and which does NOT already neutralize
+            // every attribute-carrying rule WHOLESALE, must name every
+            // declaration-attached attribute it could meet.
+            //
+            // ★ The gate is `linkageSpecifierIgnoredRules`, NOT "the row lists
+            // at least one ignored NAME". That earlier gate was wrong in both
+            // directions and each error pushed the config the wrong way.
+            //  • FALSE NEGATIVE: deleting ONE name from a row's list failed
+            //    correctly, but deleting the WHOLE key emptied the list and
+            //    silently exempted the row — the larger and far more plausible
+            //    edit was the one that escaped.
+            //  • FALSE POSITIVE: a row that already ignores `attrSpec`/`stdAttr`
+            //    WHOLESALE BY RULE cannot see an attribute identifier at its
+            //    name lookup at all, yet adding one unrelated name to it turned
+            //    the gate on and demanded the full declaration-attached set.
+            //    The remedy that error asks for — "add more names to the
+            //    silence list" — pushes in exactly the wrong direction.
+            // Ignoring the attribute rules wholesale is the same claim the name
+            // list makes, made structurally, and the loader already holds it.
+            {
+                auto const norm = [](std::string const& s) {
+                    return std::string{stripDunder(s)};
+                };
+                // The union of every declared `effects` name, normalized.
+                std::unordered_set<std::string> effectNames;
+                for (auto const& row : cfg.attributeEffects)
+                    for (auto const& n : row.names) effectNames.insert(norm(n));
+
+                // ── Clause A: a DEDICATED-scan name must be KNOWN vocabulary ──
+                // `AttributeEffect::None`'s own contract is that such names are
+                // listed "so the UNKNOWN-attribute warning never false-fires on a
+                // name the language knows" — and a name a dedicated scan CONSUMES
+                // is known by construction. Missing from `effects`, `[[gnu::packed]]`
+                // warns S_UnknownAttribute about a name the compiler demonstrably
+                // acts on.
+                //
+                // ★ The gate is "does this language HAVE a standard-attribute
+                // surface?", which is `stdAttrRule` — NOT "is the effects table
+                // non-empty?". Those coincide today and differ exactly when it
+                // matters: commenting the `effects` rows out to debug something
+                // emptied the table and silently DISARMED the check, so the edit
+                // most likely to introduce the drift was the one that turned the
+                // detector off. The warning this clause protects against is
+                // emitted from the `[[...]]` form, so the presence of that form
+                // is what makes the requirement meaningful; an empty `effects`
+                // table under a declared `stdAttrRule` is itself drift, and now
+                // reports as such.
+                if (cfg.stdAttrRule.valid()) {
+                    auto const requireKnown =
+                        [&](std::vector<std::string> const& names,
+                            char const* listPath, char const* listLabel) {
+                            for (auto const& n : names) {
+                                if (effectNames.contains(norm(n))) continue;
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics, listPath,
+                                    std::format(
+                                        "attribute-vocabulary drift: '{}' is in "
+                                        "'{}' but in no "
+                                        "'semantics.attributeSemantics.effects' "
+                                        "row — a name a dedicated scan CONSUMES "
+                                        "must also be declared KNOWN vocabulary, "
+                                        "or the '[[...]]' spelling of that very "
+                                        "name warns S_UnknownAttribute. Add it to "
+                                        "'effects' (effect 'none' is the entry for "
+                                        "a name whose work happens elsewhere)",
+                                        n, listLabel));
+                            }
+                        };
+                    requireKnown(cfg.packedAttributeNames,
+                                 "/semantics/packed/attributeNames",
+                                 "semantics.packed.attributeNames");
+                    requireKnown(cfg.noreturnAttributeNames,
+                                 "/semantics/noreturn/attributeNames",
+                                 "semantics.noreturn.attributeNames");
+                }
+
+                // ── Clause B: a DECLARATION-ATTACHED effect must be WRITABLE ──
+                // Every verb except `None` names an effect on the DECLARED entity
+                // (suppress-unused / warn-on-use / warn-on-discard / align), so
+                // such an attribute must be spellable in a declaration's specifier
+                // prefix. On a row whose strict linkage scan runs (`linkageSpecifiers`
+                // non-empty), a name that is neither ignored nor a recognized
+                // linkage specifier fails H_UnknownLinkageSpecifier on legal
+                // source — so the effects row is UNREACHABLE config, and the
+                // compiler rejects the very attribute it claims to implement.
+                //
+                // ── WHICH ROWS THE CHECK APPLIES TO ──────────────────────────
+                // The loader cannot see the shape graph (only a name↔id
+                // `RuleInterner`), so it cannot PROVE whether a given row's
+                // prefix grammar admits an attribute clause at all. What it CAN
+                // read is what the row itself SAYS about attribute syntax, via
+                // `linkageSpecifierIgnoredRules`. Three tiers, most specific
+                // first, each keyed on a signal that is actually visible:
+                //
+                //  1. Ignores EVERY declared attribute rule wholesale ⇒ EXEMPT.
+                //     No attribute identifier can reach this row's name lookup,
+                //     so no per-name entry could change its behavior. Demanding
+                //     names of it is the false positive that made a guard whose
+                //     remedy is "silence more things" — MEASURED on c-subset's
+                //     `varDecl`, which ignores `attrSpec`+`stdAttr` wholesale:
+                //     adding ONE unrelated name to it demanded six more.
+                //  2. Ignores SOME attribute rule but not all ⇒ CHECKED. The row
+                //     has demonstrably reasoned about attribute syntax reaching
+                //     this declaration form and left part of it LIVE, so the
+                //     live part's identifiers do reach the strict name lookup.
+                //     ★ This is the tier that closes the false NEGATIVE: it
+                //     reads `linkageSpecifierIgnoredRules`, not the name list,
+                //     so deleting the ENTIRE `linkageSpecifierIgnoredNames` key
+                //     — the larger and more plausible edit, and previously the
+                //     one that escaped by emptying the list the gate keyed on —
+                //     still fires. (c-subset's `topLevelDecl` is this tier.)
+                //  3. Mentions NO attribute rule at all ⇒ checked only if it
+                //     ignores something BY NAME. Such a row makes no visible
+                //     claim about attribute syntax either way, and its prefix
+                //     grammar may legitimately admit none (c-subset's
+                //     `externDecl`, whose specifier prefix is `extern` plus the
+                //     thread-local twins). Retaining the name-list signal here
+                //     keeps every case the older gate caught; what changed is
+                //     that it is no longer the ONLY signal, so it can no longer
+                //     be switched off by deleting the list it reads.
+                std::vector<RuleId> attrRules;
+                if (cfg.attrSpecRule.valid()) attrRules.push_back(cfg.attrSpecRule);
+                if (cfg.stdAttrRule.valid())  attrRules.push_back(cfg.stdAttrRule);
+                for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                    auto const& d = cfg.declarations[i];
+                    if (d.linkageSpecifiers.empty()) continue;
+                    auto const ignoresRule = [&](RuleId r) {
+                        return std::ranges::find(d.linkageSpecifierIgnoredRules, r)
+                               != d.linkageSpecifierIgnoredRules.end();
+                    };
+                    const bool anyAttrRuleIgnored =
+                        std::ranges::any_of(attrRules, ignoresRule);
+                    const bool allAttrRulesIgnored =
+                        !attrRules.empty()
+                        && std::ranges::all_of(attrRules, ignoresRule);
+                    if (allAttrRulesIgnored) continue;              // tier 1
+                    if (!anyAttrRuleIgnored                         // tier 3
+                        && d.linkageSpecifierIgnoredNames.empty()) continue;
+                    std::unordered_set<std::string> covered;
+                    for (auto const& n : d.linkageSpecifierIgnoredNames)
+                        covered.insert(norm(n));
+                    for (auto const& kv : d.linkageSpecifiers)
+                        covered.insert(norm(kv.first));
+                    for (auto const& row : cfg.attributeEffects) {
+                        if (row.effect == AttributeEffect::None) continue;
+                        for (auto const& n : row.names) {
+                            if (covered.contains(norm(n))) continue;
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                std::format("/semantics/declarations/{}/"
+                                            "linkageSpecifierIgnoredNames", i),
+                                std::format(
+                                    "attribute-vocabulary drift: "
+                                    "'semantics.attributeSemantics.effects' gives "
+                                    "'{}' a declaration-attached effect, but "
+                                    "declaration '{}' runs the strict linkage "
+                                    "specifier scan and its "
+                                    "'linkageSpecifierIgnoredNames' does not cover "
+                                    "it — a leading '{}' on this declaration form "
+                                    "would fail H_UnknownLinkageSpecifier, making "
+                                    "that effects row unreachable. Add '{}' to "
+                                    "this row's 'linkageSpecifierIgnoredNames' "
+                                    "(the two lists answer different questions and "
+                                    "must not be merged, but a "
+                                    "declaration-attached effect must appear in "
+                                    "BOTH) — or, if this declaration form ignores "
+                                    "attribute syntax wholesale, list every "
+                                    "attribute rule in its "
+                                    "'linkageSpecifierIgnoredRules' instead",
+                                    n, d.ruleName, n, n));
+                        }
+                    }
                 }
             }
 
@@ -10502,6 +11323,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     formatMapOk = false;
                                 } else {
                                     for (auto const& [fkey, fval] : fmtObj.items()) {
+                                        if (isDocumentationKey(fkey)) continue;
                                         auto const fmt = objectFormatKindFromName(fkey);
                                         if (!fmt) {
                                             coll.emit(DiagnosticCode::C_InvalidHirLowering,

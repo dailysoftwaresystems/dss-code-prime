@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-GNU-ATTRIBUTE (TF-C72/C73): LINKAGE-bearing GNU attributes in BOTH positions — LEADING and AFTER-DECLARATOR — carried across a real CROSS-TU LINK (multi-CU: `sources` makes each file its own CompilationUnit and the linker merges them). The observable is what the LOADED PROGRAM sees, never that the declaration parsed. ★ WHY IT EXISTS: an adversarial audit named two shapes as the hardest regressions in this area and BOTH were REPRODUCED as hard compile failures against the tree at the start of this cycle — `extern int gg(void) __attribute__((__nothrow__, __leaf__));` failed error[H000C] \"'__attribute__' is not a recognized linkage specifier\" (the LITERAL glibc idiom: `<stdio.h>` spells `remove`/`rename` exactly that way, so every real C header hit it), and `int f(void) __attribute__((weak));` with the definition in a sibling TU failed error[H0009] \"HIR Ref to unbound symbol\". Both compile and run now; this example is the ratchet. ★★ NON-VACUITY PROVEN PER CHECK, with the honest split stated rather than papered over. Each check was isolated into its OWN two-CU program carrying ONLY the declarations that check needs (a shared header would let one broken declaration abort the compile and prove nothing about any particular check), then built three ways: as written; with exactly that check's attribute deleted from the source; and with exactly the config row that attribute rides removed from a PATCHED DSS_CONFIG_ROOT tree, live checkout untouched. MEASURED — check / ON / attr-deleted / config-row-removed: (1) gg()==10 nothrow+leaf / 42 / 42 / COMPILE-ERR H000C; (2) wp()==8 weak prototype / 42 / 42 / COMPILE-ERR H000C; (3) wfun()==12 weak fn LEADING / 42 / LINK-FAIL duplicate symbol / COMPILE-ERR H000C; (4) wd_lead==5 weak data LEADING / 42 / LINK-FAIL duplicate symbol / COMPILE-ERR H000C; (5) wd_tail==5 weak data TRAILING / 42 / LINK-FAIL duplicate symbol / COMPILE-ERR H000C; (6) vis_lead()==3 visibility LEADING / 42 / 42 / COMPILE-ERR H000C; (7) vis_tail()==4 visibility TRAILING / 42 / 42 / COMPILE-ERR H000C. Rows 3/4/5 are EXIT-CODE discriminating in the strongest sense available: cu_b.c defines each symbol STRONGLY, so a `weak` that parses but whose binding never reaches the symbol resolves to cu_a.c's own body and the program exits 3/4/5 instead of 42, while a `weak` deleted outright is a duplicate-symbol failure in DSS (K_SymbolRedefinedAcrossUnits) and in clang (ld: duplicate symbol) alike — a real strong-over-weak resolution, not a parse. Rows 1/2/6/7 are COMPILE-GATE witnesses and are labelled as such: `__nothrow__`/`__leaf__` are ABI-neutral hints and `visibility(\"hidden\")` does not change what a statically linked call returns, so deleting them CANNOT move an exit code; their honest disable is disconnecting the config row they ride, and each knob moves only its own rows (removing nothrow/leaf from `linkageSpecifierIgnoredNames` breaks only row 1; dropping the `weak` key from `linkageSpecifiers` breaks 2/3/4/5; dropping `visibility:hidden` breaks only 6/7). Those rows belong here because the regression they guard IS a compile failure — that is exactly how both audit findings presented. ★ DELIBERATELY NOT CHECKED: `local_b`, the second declarator of `int wd_tail __attribute__((weak)) = 100, local_b = 2;`. The observable half of per-declarator attachment (the attribute DOES attach to `wd_tail`) is row 5; the other half (it did NOT leak onto `local_b`) has NO runtime witness in a linkable program — a lone definition behaves identically strong or weak, and giving cu_b.c a competing strong `local_b` would make the CORRECT behavior a duplicate-symbol error, i.e. an example that only passes when the compiler is broken. `local_b` therefore CARRIES the exit code but is never gated by an `if`, and the leak direction is pinned at the unit tier. ★ `deprecated(\"msg\")` is declared in BOTH positions and never called: calling it makes clang emit -Wdeprecated-declarations and this corpus requires -Wall -Wextra CLEAN, and its only DSS observable is likewise a WARNING (S_DeprecatedSymbolUsed) which this runner cannot assert. Both positions are witnessed as PARSING and LOWERING with a string argument; warning emission is unit-pin territory. The `release` arm is MANDATORY: the point is that a real optimizer PRESERVES weak binding rather than inlining through it (the weak_inline_crosscu precedent) or DCE-ing a hidden symbol that is still called. VERIFIED clang-clean over BOTH CUs (`-fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)`: zero errors, zero warnings) and the clang-linked two-CU binary independently exits 42, so the expected exit code is ground truth from a real toolchain — a corpus example must witness REAL C, not merely C that DSS happens to accept.",
+  "language": "c-subset",
+  "sources": ["cu_a.c", "cu_b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "cu_a.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "cu_a",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

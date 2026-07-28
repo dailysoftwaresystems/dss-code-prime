@@ -508,6 +508,159 @@ TEST(TypeLayout, PackedPlusBitfieldFailsLoud) {
     EXPECT_FALSE(computeLayout(s, ti, kGnu16, DataModel::Lp64).has_value());  // belt
 }
 
+// ── D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE `aligned(N)` ──────
+//
+// `struct S {…} __attribute__((aligned(N)))` raises the AGGREGATE's own alignment
+// (C 6.7.5: the composite's alignment is the MAX of its natural alignment and the
+// request), which also rounds its size up. `computeLayout` realizes this by SEEDING
+// `StructLayout::align` from `TypeInterner::explicitCompositeAlign` before the
+// per-field folds, all of which are `maxAlign` — so it can only ever RAISE.
+//
+// Every number below was MEASURED with clang on arm64 macOS (compiled AND run,
+// `-fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)` clean).
+// Each is RED-ON-DISABLE: remove the `compositeSeedAlign` seed from the Struct or
+// Union arm and the assertion reverts to the un-raised natural value.
+
+[[nodiscard]] TypeId alignedComposite(TypeInterner& ti, TypeKind kind,
+                                      std::string_view name, std::uint64_t key,
+                                      std::span<TypeId const> fields,
+                                      std::uint32_t align, bool packed = false,
+                                      std::span<std::int64_t const> widths = {}) {
+    TypeId const s = ti.forwardComposite(kind, name, key);
+    ti.completeComposite(s, fields, packed, widths, /*fieldOffsets=*/{},
+                         /*fieldAligns=*/{}, align);
+    return s;
+}
+
+TEST(TypeLayout, CompositeAlignedRaisesAggregateAlignAndSize) {
+    auto ti = makeInterner(1);
+    // clang: `struct A { char c; unsigned v; } __attribute__((aligned(16)));`
+    //        → size 16, align 16 (natural would be 8 / 4).
+    // Field OFFSETS are UNCHANGED — the request touches the aggregate, not the
+    // fields: c@0, v@4 exactly as in the unaligned twin.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const a = alignedComposite(ti, TypeKind::Struct, "A", 1, fields, 16u);
+    EXPECT_EQ(ti.explicitCompositeAlign(a), 16u);
+    auto const l = layoutOf(a, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // natural placement — NOT pushed by the request
+    EXPECT_EQ(l.align.bytes(), 16u);    // RED-ON-DISABLE (natural 4)
+    EXPECT_EQ(l.size, 16u);             // RED-ON-DISABLE (natural 8)
+
+    // The same fields with NO request are a distinct type with the natural layout.
+    std::array<TypeId, 2> const fields2{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::U32)};
+    TypeId const nat = ti.structType("A", fields2);
+    EXPECT_EQ(ti.explicitCompositeAlign(nat), 0u);
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 8u);
+}
+
+TEST(TypeLayout, CompositeAlignedWeakerThanNaturalIsANoOp) {
+    auto ti = makeInterner(1);
+    // ★ THE MAX-vs-ASSIGNMENT CONTROL. clang:
+    //   `struct L { char c; unsigned v; } __attribute__((aligned(2)));` → 8 / 4.
+    // The request is WEAKER than the natural 4, so it does nothing — `aligned` may
+    // only RAISE (C 6.7.5). Implement the fold as an assignment instead of a MAX and
+    // this becomes 4 / 2 while every other pin in this group still passes.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const l2 = alignedComposite(ti, TypeKind::Struct, "L", 1, fields, 2u);
+    auto const l = layoutOf(l2, ti);
+    EXPECT_EQ(l.align.bytes(), 4u);   // natural 4 SURVIVES the weaker request
+    EXPECT_EQ(l.size, 8u);
+}
+
+TEST(TypeLayout, CompositeAlignedComposesWithPacked) {
+    auto ti = makeInterner(1);
+    // ★ THE HEADLINE WITNESS. clang:
+    //   `struct S { char a; int b; } __attribute__((packed, aligned(16)));` → 16 / 16.
+    // packed removes the inter-field padding (a@0, b@1, extent 5) and the request
+    // raises the aggregate — rounding 5 up to 16. Neither channel overrides the
+    // other: drop packed and it is 16/16 by a DIFFERENT route (b@4, extent 8); drop
+    // the request and it is packed's bare 5 / 1.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::I32)};
+    TypeId const s = alignedComposite(ti, TypeKind::Struct, "S", 1, fields, 16u,
+                                      /*packed=*/true);
+    EXPECT_TRUE(ti.isPacked(s));
+    EXPECT_EQ(ti.explicitCompositeAlign(s), 16u);
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 1u);   // packed still removes the padding
+    EXPECT_EQ(l.align.bytes(), 16u);    // ...and the request still raises the whole
+    EXPECT_EQ(l.size, 16u);             // clang MEASURED 16, NOT packed's 5
+}
+
+TEST(TypeLayout, CompositeAlignedOnUnionRaisesAlignAndSize) {
+    auto ti = makeInterner(1);
+    // clang: `union UA { char c; int i; } __attribute__((packed, aligned(8)));`
+    //        → size 8, align 8. packed alone would give align 1 / size 4.
+    std::array<TypeId, 2> const members{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::I32)};
+    TypeId const u = alignedComposite(ti, TypeKind::Union, "UA", 1, members, 8u,
+                                      /*packed=*/true);
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 8u);   // RED-ON-DISABLE (packed → 1)
+    EXPECT_EQ(l.size, 8u);            // RED-ON-DISABLE (max member 4)
+}
+
+TEST(TypeLayout, CompositeAlignedBitfieldStructRaisesThroughThePacker) {
+    auto ti = makeInterner(1);
+    // ★ The BIT-FIELD path must honor the request too — it is a SEPARATE code path
+    // (the per-ABI packers), and the seed is what covers it BY CONSTRUCTION rather
+    // than by a second edit. clang:
+    //   `struct BF { int x:3; int y:5; } __attribute__((aligned(16)));` → 16 / 16.
+    // (Unaligned it is 4 / 4: 8 bits in one int unit.)
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::I32),
+                                       ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    TypeId const s = alignedComposite(ti, TypeKind::Struct, "BF", 1, fields, 16u,
+                                      /*packed=*/false, widths);
+    auto const l = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 16u);   // RED-ON-DISABLE (int unit → 4)
+    EXPECT_EQ(l.size, 16u);            // RED-ON-DISABLE (4)
+    // The MSVC strategy raises identically — the seed is strategy-independent.
+    EXPECT_EQ(layoutOf(s, ti, kMsvc16).align.bytes(), 16u);
+}
+
+TEST(TypeLayout, CompositeAlignedPropagatesToArrayStrideAndEnclosingStruct) {
+    auto ti = makeInterner(1);
+    // The raised alignment is a property of the TYPE, so it flows outward with no
+    // extra wiring. clang:
+    //   struct A { char c; unsigned v; } __attribute__((aligned(16)));  → 16 / 16
+    //   struct A arr[2];                                                 → 32
+    //   struct Outer { char a; struct A inner; };  → size 32, align 16, inner@16
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const a = alignedComposite(ti, TypeKind::Struct, "A", 1, fields, 16u);
+    EXPECT_EQ(layoutOf(ti.array(a, 2), ti).size, 32u);   // stride 16, not 8
+    std::array<TypeId, 2> const outerFields{ti.primitive(TypeKind::Char), a};
+    auto const o = layoutOf(ti.structType("Outer", outerFields), ti);
+    ASSERT_EQ(o.fieldOffsets.size(), 2u);
+    EXPECT_EQ(o.fieldOffsets[1], 16u);   // inner pushed to 16  RED-ON-DISABLE (4)
+    EXPECT_EQ(o.align.bytes(), 16u);
+    EXPECT_EQ(o.size, 32u);
+}
+
+TEST(TypeLayout, CompositeAlignedAtTheAlignmentCap) {
+    auto ti = makeInterner(1);
+    // The upper bound of the `Alignment` newtype's domain. clang:
+    //   `struct E0 { int a; } __attribute__((aligned(256)));` → 256 / 256.
+    // NOTE `maxAlignment` in the params caps SCALAR alignment (the bounded
+    // natural-alignment rule), NOT an explicit aggregate request — which is why the
+    // request survives a params `maxAlignment` of 16 here, exactly as in clang.
+    std::array<TypeId, 1> const fields{ti.primitive(TypeKind::I32)};
+    TypeId const e = alignedComposite(ti, TypeKind::Struct, "E0", 1, fields, 256u);
+    auto const l = layoutOf(e, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 256u);
+    EXPECT_EQ(l.size, 256u);
+}
+
 TEST(TypeLayout, StructTailPaddingAndNesting) {
     auto ti = makeInterner(1);
     TypeId const i = ti.primitive(TypeKind::I32);

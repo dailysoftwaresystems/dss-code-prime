@@ -1188,24 +1188,153 @@ struct Lowerer {
         return false;
     }
 
-    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
-                                          bool* staticStorageOut = nullptr) {
-        LinkageAttr attr{};
-        if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
-        // Collect the prefix's tokens in SOURCE order (the composite-key
+    // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE — closing that row's pinned
+    // "after-declarator honoring" follow-up, which TF-C62 deferred by shipping
+    // the position as parse-and-ignore): every CST subtree
+    // of declaration `node` that may carry a linkage specifier — the SCAN ROOTS
+    // `linkageFrom` folds as ONE declaration.
+    //
+    // Root 1 is the declaration-specifier PREFIX (`declSpecifiers` — the LEADING
+    // `static` / `__attribute__((weak))` position), which used to be the only one.
+    // Roots 2..n are the AFTER-DECLARATOR attribute runs
+    // (`declarators.afterDeclaratorAttrRules` — `attrSpec`/`stdAttr` sitting between
+    // a declarator and its optional initializer, the position tcl.h and glibc
+    // actually put their attributes in).
+    //
+    // ★ WHY THIS EXISTS: measured at the pre-change HEAD, the after-declarator run
+    // was PARSE-AND-IGNORE — `int gv __attribute__((bogus_xyz));` and
+    // `int gv [[frobnicate]];` compiled SILENTLY CLEAN, and `int f(void)
+    // __attribute__((weak));` SILENTLY DROPPED the weak binding (wrong linkage at
+    // link time, no diagnostic anywhere). The run was consumed only by the
+    // init-detection skip, so `linkageFrom` never saw it. Feeding the roots into
+    // the SAME loop with the SAME last-wins merge is what makes an attribute in
+    // the trailing position behave identically to the same attribute in the
+    // leading position — two positions, one fold, no second code path to drift.
+    //
+    // GRANULARITY — the roots are PER-DECLARATOR, because that is what C means.
+    // The declaration-specifier prefix is shared by every declarator in the
+    // declaration (a storage class applies to all of them), but an
+    // after-declarator attribute belongs to the ONE declarator it follows:
+    // `int a __attribute__((weak)), b;` makes `a` weak and leaves `b` alone.
+    // Folding the trailing run at DECLARATION level would push `a`'s binding onto
+    // `b` — an over-application, and still a wrong answer even though it is less
+    // wrong than the silent drop that preceded it. So `linkagePrefixRoots` is the
+    // shared base and `linkageRootsFor` adds exactly one declarator's own run;
+    // both feed the SAME `linkageFrom` loop with the SAME last-wins merge, so a
+    // leading and a trailing spelling of one attribute still cannot diverge.
+    //
+    // ORDER IS LOAD-BEARING: the prefix root goes FIRST so the flattened token
+    // list stays in SOURCE order, which makes last-wins mean "the later spelling
+    // wins" — the trailing attribute overrides a conflicting leading one, exactly
+    // as reading the declaration left-to-right implies.
+
+    // The declaration-level (shared) scan root: the specifier prefix, if any.
+    [[nodiscard]] std::vector<NodeId>
+    linkagePrefixRoots(NodeId node, DeclarationRule const& decl) {
+        std::vector<NodeId> roots;
+        // A row with NO `linkageSpecifiers` facet folds nothing at all (typedefDecl
+        // — deliberately, this cycle), so do not even locate the prefix for it.
+        if (decl.linkageSpecifiers.empty()) return roots;
+        if (NodeId const pfx = specifierPrefixChild(tree(), node, decl); pfx.valid())
+            roots.push_back(pfx);
+        return roots;
+    }
+
+    // The shared prefix PLUS `declaratorNode`'s own after-declarator attribute run
+    // (`declarators.afterDeclaratorAttrRules` — `attrSpec`/`stdAttr` between a
+    // declarator and its optional initializer, the position tcl.h and glibc put
+    // their attributes in).
+    //
+    // ★ WHY THE TRAILING ROOTS EXIST AT ALL: measured at the pre-TF-C73 HEAD, the
+    // after-declarator run was PARSE-AND-IGNORE — `int gv __attribute__((bogus_xyz));`
+    // compiled SILENTLY CLEAN and `int f(void) __attribute__((weak));` SILENTLY
+    // DROPPED the weak binding (wrong linkage at link time, no diagnostic). The run
+    // was consumed only by the init-detection skip, so `linkageFrom` never saw it.
+    [[nodiscard]] std::vector<NodeId>
+    declaratorAttrRoots(DeclarationRule const& decl, NodeId declaratorNode) {
+        std::vector<NodeId> roots;
+        if (decl.linkageSpecifiers.empty() || !declaratorNode.valid()) return roots;
+        if (!sem.declarators.has_value()) return roots;
+        DeclaratorConfig const& dc = *sem.declarators;
+        if (dc.afterDeclaratorAttrRules.empty()) return roots;   // language has none
+        if (tree().kind(declaratorNode) != NodeKind::Internal) return roots;
+        // The attribute run is a DIRECT child of an `initDeclarator` (the grammar
+        // slot between the declarator and the initializer). Matching it there —
+        // rather than by a free DFS for any `attrSpec` in the declarator subtree —
+        // is what keeps a future attribute in some OTHER declarator-internal
+        // position (a param's `__attribute__((unused))`, its own open anchor) from
+        // being silently promoted to declaration-level linkage. A BARE declarator
+        // (not an `initDeclarator`) has no such slot and contributes nothing.
+        if (tree().rule(declaratorNode).v != dc.initDeclaratorRule.v) return roots;
+        for (NodeId c : visible(declaratorNode)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (RuleId ar : dc.afterDeclaratorAttrRules) {
+                if (tree().rule(c).v == ar.v) { roots.push_back(c); break; }
+            }
+        }
+        return roots;
+    }
+
+    // `base` (the shared prefix fold) with `declaratorNode`'s OWN trailing
+    // attribute run applied on top. Returns `base` untouched when that declarator
+    // carries no run — which is every declarator in every corpus program today,
+    // so the common path costs one empty-vector check and emits nothing.
+    //
+    // ★ The prefix is folded ONCE by the caller and only the TRAILING run is
+    // folded here, deliberately: re-folding the prefix per declarator would
+    // re-emit its `H_UnknownLinkageSpecifier` once per declarator, turning one
+    // typo in `__attribute__((frobnicate)) int a, b, c;` into three identical
+    // errors.
+    [[nodiscard]] LinkageAttr declaratorLinkage(LinkageAttr base,
+                                                DeclarationRule const& decl,
+                                                NodeId declaratorNode) {
+        std::vector<NodeId> const roots = declaratorAttrRoots(decl, declaratorNode);
+        if (roots.empty()) return base;
+        return linkageFrom(roots, decl, /*staticStorageOut=*/nullptr, base);
+    }
+
+    // `seed` is the linkage ALREADY folded from an earlier-in-source root set —
+    // the shared declaration prefix, when this call is folding one declarator's
+    // trailing run on top of it. Seeding rather than merging afterwards is what
+    // keeps the "no-op default clobber" hazard closed: a trailing attribute that
+    // sets NO axis leaves the seed's axes untouched, whereas merging two returned
+    // `LinkageAttr`s could not tell "specified as Global" from "never specified"
+    // and would silently overwrite a prefix `static`'s internal binding. Same
+    // last-wins rule as within one root set, just carried across two calls, so a
+    // leading and a trailing spelling of one attribute still cannot diverge.
+    [[nodiscard]] LinkageAttr linkageFrom(std::span<NodeId const> roots,
+                                          DeclarationRule const& decl,
+                                          bool* staticStorageOut = nullptr,
+                                          LinkageAttr seed = {}) {
+        LinkageAttr attr = seed;
+        if (roots.empty() || decl.linkageSpecifiers.empty()) return attr;
+        // Collect every root's tokens in SOURCE order (the composite-key
         // pairing below is order-sensitive), skipping the subtrees of any
         // `linkageSpecifierIgnoredRules` rule wholesale (FC4 c1 / D14 —
         // attribute forms the language parses but semantically ignores,
         // e.g. C23 `[[deprecated]]`: their identifiers must neither
         // resolve as linkage specifiers nor fail loud as unknown ones).
+        //
+        // TF-C73: `fromAttrArg` runs PARALLEL to `toks` and marks each token the
+        // DFS reached THROUGH an `attributeArgRule` node (nested arg groups
+        // inherit the mark). A marked token is skipped for the KEY LOOKUP but
+        // stays IN the list — see the flag's use below for why the distinction
+        // between "marked" and "removed" is the whole design.
         std::vector<NodeId> toks;
+        std::vector<char>   fromAttrArg;
         {
-            std::vector<NodeId> stack{prefixNode};
+            struct Frame { NodeId n; bool inArg; };
+            std::vector<Frame> stack;
+            stack.reserve(roots.size());
+            for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+                if (it->valid()) stack.push_back({*it, false});  // reverse → source order
             while (!stack.empty()) {
-                NodeId n = stack.back();
+                Frame const f = stack.back();
+                NodeId const n = f.n;
                 stack.pop_back();
                 if (isToken(n)) {
                     toks.push_back(n);
+                    fromAttrArg.push_back(f.inArg ? char{1} : char{0});
                     continue;
                 }
                 bool skip = false;
@@ -1234,9 +1363,18 @@ struct Lowerer {
                     }
                     continue;
                 }
+                // TF-C73: descending INTO the language's attribute-argument group
+                // marks everything below it (and `inArg` is inherited, so a NESTED
+                // arg group — `__nonnull__((1,3))` — stays marked). Config-driven:
+                // an INVALID `attributeArgRule` marks nothing, which is exactly the
+                // pre-key behavior for a language that declares no arg grammar.
+                bool const childInArg =
+                    f.inArg
+                    || (sem.attributeArgRule.valid()
+                        && tree().rule(n).v == sem.attributeArgRule.v);
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
-                    stack.push_back(*it);   // reverse-push → source order
+                    stack.push_back({*it, childInArg});   // reverse-push → source order
                 }
             }
         }
@@ -1321,6 +1459,41 @@ struct Lowerer {
                     if (bare == nm) { ignoredByName = true; break; }
                 if (ignoredByName) continue;
             }
+            // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP): a token that came
+            // from inside an attribute's ARGUMENT group is not a specifier NAME —
+            // skip the strict lookup for it. `__attribute__((aligned(16)))` no
+            // longer reports `16`, and `__attribute__((format(printf,1,2)))` no
+            // longer reports `printf`/`1`/`2`, as unrecognized linkage specifiers.
+            //
+            // ★★ ALL THREE PLACEMENT DETAILS BELOW ARE LOAD-BEARING AND MEASURED —
+            // this looks like it could be folded into a simpler surface, and each
+            // simplification is a different bug:
+            //
+            //  (1) NOT a wholesale `linkageSpecifierIgnoredRules` skip of the arg
+            //      subtree. That is the obvious fix and it BREAKS
+            //      `visibility("hidden")`: the composite key `<ident>:<body>` is
+            //      assembled by the FORWARD SCAN below over the flattened list, and
+            //      the string lives INSIDE the arg group — delete those tokens and
+            //      the pairing has nothing to pair with, so the bare `visibility`
+            //      misses the strict map. MEASURED on a patched config: it reports
+            //      `'visibility' is not a recognized linkage specifier` on legal C.
+            //      Hence: marked, NOT removed.
+            //
+            //  (2) Checked AFTER the by-name skip, not before. The two are not
+            //      commutative in intent: an ignored NAME must consume its clause
+            //      identifier at the ordinary identifier position regardless of
+            //      where the flag lands, and keeping this second preserves the
+            //      existing by-name semantics unchanged.
+            //
+            //  (3) Deliberately NOT added to `isIgnoredKind`, and deliberately NOT
+            //      applied inside the forward scan. Those two surfaces are what the
+            //      composite pairing walks, and an ignored-by-name clause
+            //      identifier sitting in the list is precisely what stops one
+            //      clause's name from pairing with a LATER clause's string. Widen
+            //      either surface and cross-clause mispairing returns — a wrong
+            //      linkage facet resolved silently, which is worse than the loud
+            //      arg soup this fix removes.
+            if (i < fromAttrArg.size() && fromAttrArg[i] != 0) continue;
             // Composite probe: the next non-ignored token opens a string
             // literal → pair this specifier with the decoded body.
             if (strStart.valid() && strBody.valid()) {
@@ -1367,7 +1540,75 @@ struct Lowerer {
             }
             auto it = decl.linkageSpecifiers.find(key);
             if (it != decl.linkageSpecifiers.end()) {
-                if (it->second.binding)    attr.binding    = *it->second.binding;
+                if (it->second.binding) {
+                    // ★★ THE BINDING AXIS IS NOT LAST-WINS. Every other axis
+                    // here is (a later spelling refines an earlier one), and
+                    // making binding an exception is deliberate and MEASURED.
+                    //
+                    // `static int x __attribute__((weak));` folds `static`
+                    // (Local) and then `weak` (Weak) over the SAME axis. Under
+                    // last-wins the `static` simply DISAPPEARS: the symbol was
+                    // emitted `V x` — a weak GLOBAL, name unmangled, escaping
+                    // the TU — with ZERO diagnostics, where the same
+                    // declaration without the attribute emits `d sym_N`, a
+                    // TU-local. Silent wrong linkage, the worst outcome
+                    // available: the program links against a DIFFERENT
+                    // definition than the source asked for.
+                    //
+                    // GROUND TRUTH is real clang on this Mac, which HARD-ERRORS
+                    // `weak declaration cannot have internal linkage` — and does
+                    // so in BOTH orders (`static __attribute__((weak)) int x;`
+                    // and `__attribute__((weak)) static int x;`). So the rule is
+                    // SYMMETRIC — a conflict, not a "trailing must not clobber
+                    // leading" precedence — and this test is symmetric to match:
+                    // it fires wherever the second, differing binding is folded,
+                    // in one root set or across the seed boundary.
+                    //
+                    // Sparse-by-construction: `Global` IS the unspecified state
+                    // (`recordLinkage` stores nothing for it), so
+                    // `attr.binding != Global` is exactly "a binding was already
+                    // specified" and re-folding the SAME binding (`static
+                    // constexpr`, both Local; a repeated `weak`) stays silent.
+                    // Source-agnostic: no specifier NAME is hardcoded — the
+                    // conflict is between two config-declared binding VALUES, so
+                    // any language whose `linkageSpecifiers` table can express
+                    // two bindings gets the same protection for free.
+                    if (attr.binding != SymbolBinding::Global
+                        && *it->second.binding != attr.binding) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              std::format(
+                                  "'{}' specifies '{}' binding, which conflicts "
+                                  "with the '{}' binding already specified for "
+                                  "this declaration",
+                                  key, symbolBindingName(*it->second.binding),
+                                  symbolBindingName(attr.binding)));
+                        // ★ THE RESIDUE OF A REJECTED CONFLICT IS THE CONFINING
+                        // BINDING, and it is NOT "whichever came first". Plain
+                        // first-wins is order-dependent in the one direction that
+                        // matters: `__attribute__((weak)) static int x;` folds
+                        // Weak before Local, so first-wins leaves the rejected
+                        // declaration marked Weak — a symbol that ESCAPES the TU
+                        // even though the source said `static`. MEASURED: the
+                        // symmetric pin caught exactly that, reading Weak on the
+                        // leading order while the trailing order read Local.
+                        //
+                        // The diagnostic already fails the build, so no artifact
+                        // is produced from either order — but `Local` is the only
+                        // residue that cannot BECOME a wrong export if any
+                        // consumer ever reads the attribute past the error, and
+                        // making the two orders agree keeps the rule symmetric in
+                        // its VALUE as well as in when it fires. `Local` is an
+                        // engine-level concept (`recordLinkage` already treats
+                        // `Global` as the unspecified state, and the
+                        // `prototypeSynthesizesExtern` gate already asks
+                        // specifically about `Local`), not a C specifier name —
+                        // no language vocabulary is hardcoded here.
+                        if (*it->second.binding == SymbolBinding::Local)
+                            attr.binding = SymbolBinding::Local;
+                        continue;
+                    }
+                    attr.binding = *it->second.binding;
+                }
                 if (it->second.visibility) attr.visibility = *it->second.visibility;
                 if (it->second.staticStorage && staticStorageOut != nullptr)
                     *staticStorageOut = true;
@@ -7859,8 +8100,21 @@ struct Lowerer {
     // declarator (`int x = 1, *p = q;` → two nodes). Appends to `out` so
     // multi-node consumers (lowerTopLevelInto's module globals) stay flat;
     // single-node statement consumers wrap via `lowerVarLike` below.
+    // `originsOut`, when non-null, receives ONE entry per HirNodeId appended to
+    // `out` by this call — the CST declarator that produced it, or the declaration
+    // node for the whole-declaration arms. It exists because the number of emitted
+    // nodes is NOT the number of declarators (a prototype that declines extern
+    // synthesis emits nothing), so a caller that needs per-declarator linkage
+    // cannot recover the mapping by index arithmetic. The two vectors are kept in
+    // lockstep by routing EVERY push through `pushOut` below — do not add a bare
+    // `out.push_back` to this function.
     void lowerVarLikeInto(NodeId node, bool asGlobal,
-                          std::vector<HirNodeId>& out) {
+                          std::vector<HirNodeId>& out,
+                          std::vector<NodeId>* originsOut = nullptr) {
+        auto const pushOut = [&](HirNodeId h, NodeId origin) {
+            out.push_back(h);
+            if (originsOut != nullptr) originsOut->push_back(origin);
+        };
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl =
             (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
@@ -7873,7 +8127,15 @@ struct Lowerer {
         bool staticStorage = false;
         LinkageAttr staticLinkage{};
         if (!asGlobal && decl != nullptr) {
-            staticLinkage = linkageFrom(specifierPrefixChild(tree(), node, *decl),
+            // PREFIX-ONLY, deliberately. The storage-class specifiers that set
+            // `staticStorage` (`static` / `thread_local` / `constexpr`) can appear
+            // ONLY in the declaration-specifier prefix — C has no trailing
+            // storage-class syntax — so a declarator's after-declarator attribute
+            // run can never contribute to this axis. Scanning prefix-only is
+            // therefore not a simplification but the exact rule, and it keeps this
+            // declaration-level fact declaration-level while the per-declarator
+            // linkage below varies per declarator.
+            staticLinkage = linkageFrom(linkagePrefixRoots(node, *decl),
                                         *decl, &staticStorage);
         }
         if (decl == nullptr || !decl->isDeclaratorMode()
@@ -7882,12 +8144,12 @@ struct Lowerer {
             // path (no shipped non-declarator language admits `static` locals).
             // Never silently lower it as an automatic local on the legacy path.
             if (staticStorage) {
-                out.push_back(reportedError(node,
+                pushOut(reportedError(node,
                     "static-storage-duration local declarations require "
-                    "declarator-mode lowering"));
+                    "declarator-mode lowering"), node);
                 return;
             }
-            out.push_back(lowerVarLikeLegacy(node, asGlobal, decl));
+            pushOut(lowerVarLikeLegacy(node, asGlobal, decl), node);
             return;
         }
         DeclaratorConfig const& dc = *sem.declarators;
@@ -7915,8 +8177,8 @@ struct Lowerer {
                 && interner.kind(slotTy) == TypeKind::Void) {
                 return;
             }
-            out.push_back(track(
-                builder.makeVarDecl(slotTy, 0, std::nullopt), node));
+            pushOut(track(
+                builder.makeVarDecl(slotTy, 0, std::nullopt), node), node);
         };
         if (!carrier.has_value() || *carrier >= vis.size()) {
             if (singleMode) emitAbstractSlot();
@@ -7997,10 +8259,29 @@ struct Lowerer {
             //   * neither ⇒ the empty-library import survives to the LINKER,
             //     which rejects it LOUD as an undefined symbol naming the
             //     symbol (ld's behavior).
-            // ONLY an external-linkage proto synthesizes: a `static` (Local)
-            // or weak proto must never bind another TU's public symbol
-            // (C 6.2.2p3) — those keep the pre-c86 loud H0009 at the first
-            // call. The node needs NO param children (the FnSig carries the
+            // ONLY an INTERNAL-linkage proto declines: a `static` prototype
+            // (Local) names a TU-private function, so binding it to another
+            // TU's public definition would be a wrong binding (C 6.2.2p3) —
+            // it keeps the pre-c86 loud H0009 at the first call.
+            //
+            // ★ WEAK IS NOT INTERNAL, and an earlier revision of this gate had
+            // that factually wrong (it tested `== Global`, so a Weak proto
+            // declined too). C 6.2.2 has no `weak` at all: `weak` is a GNU
+            // BINDING attribute that changes how the LINKER resolves a symbol,
+            // not a linkage class — a weak DECLARATION still has EXTERNAL
+            // linkage and binds a sibling TU's definition normally. GROUND
+            // TRUTH, real clang on this Mac, two TUs
+            // (`int f(void) __attribute__((weak)); int main(){return f();}`
+            // + `int f(void){return 42;}`): links, runs, exit 42 — in BOTH the
+            // leading `__attribute__((weak)) int f(void);` spelling and the
+            // trailing one. Testing `== Global` refused to synthesize the
+            // extern, so the call had nothing to bind and the whole program
+            // failed H0009 with no binary — legal C rejected. The RULE, not
+            // one spelling of it, is what the `!= Local` test fixes: the
+            // leading spelling reached this gate through the specifier prefix
+            // long before the after-declarator roots existed and was broken
+            // exactly the same way (MEASURED at the pre-TF-C73 HEAD).
+            // The node needs NO param children (the FnSig carries the
             // param types — the shipped-descriptor synthesis precedent). A
             // BLOCK-scope proto (re-homed to file scope per
             // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE) routes to the MODULE decls via
@@ -8014,22 +8295,32 @@ struct Lowerer {
                 // The proto's linkage: LOCALS reuse the entry-scan result
                 // (`staticLinkage` — already computed for !asGlobal, so no
                 // re-scan and no duplicated unknown-specifier diagnostics);
-                // GLOBALS re-scan ONLY when a specifier prefix exists (the
-                // bare sqlite3.h proto has none ⇒ zero extra scans; a
-                // prefix with an UNKNOWN specifier may re-emit its loud
-                // H_UnknownLinkageSpecifier — rare, never silent).
+                // GLOBALS re-scan ONLY when the declaration actually HAS a
+                // linkage-bearing subtree (the bare sqlite3.h proto has neither
+                // a specifier prefix nor an after-declarator attribute run ⇒
+                // the roots are empty ⇒ zero extra scans, exactly as
+                // when this gate read `pfx.valid()`; a root with an UNKNOWN
+                // specifier may re-emit its loud H_UnknownLinkageSpecifier —
+                // rare, never silent).
+                // TF-C73: routing this through the declarator's own roots is
+                // what lets a TRAILING `static`-equivalent binding reach the
+                // gate at all. It does NOT change the answer for `weak` — see
+                // the `!= Local` gate below and the paragraph above it: a weak
+                // proto has EXTERNAL linkage and must synthesize.
+                // PER-DECLARATOR (`d`), not per-declaration: the gate below asks
+                // whether THIS prototype has internal linkage, and a sibling
+                // declarator's binding attribute must not answer for it.
                 auto protoLinkage = [&]() -> LinkageAttr {
                     if (!asGlobal) return staticLinkage;
-                    NodeId const pfx =
-                        specifierPrefixChild(tree(), node, *decl);
-                    return pfx.valid() ? linkageFrom(pfx, *decl)
-                                       : LinkageAttr{};
+                    return declaratorLinkage(
+                        linkageFrom(linkagePrefixRoots(node, *decl), *decl),
+                        *decl, d);
                 };
                 if (decl->prototypeSynthesizesExtern
                     && pr->isProtoDeclaration && !pr->isAbsorbedProto
                     && pr->kind == DeclarationKind::Function
                     && pr->type.valid()
-                    && protoLinkage().binding == SymbolBinding::Global) {
+                    && protoLinkage().binding != SymbolBinding::Local) {
                     HirNodeId const ef = track(
                         builder.makeExternFunction(pr->type, sym.v, {}), d);
                     auto const* shipped =
@@ -8047,17 +8338,17 @@ struct Lowerer {
                         // silent bug the descriptor path fixes).
                         shipped != nullptr ? shipped->version : std::string{}});
                     if (asGlobal) {
-                        out.push_back(ef);
+                        pushOut(ef, d);
                     } else if (moduleDecls_ != nullptr) {
                         moduleDecls_->push_back(ef);
                     } else {
                         // Mirrors the static-local MF-3 guard: a block-scope
                         // proto outside a module tree walk is a bug — never a
                         // silent drop.
-                        out.push_back(reportedError(d,
+                        pushOut(reportedError(d,
                             "bare-prototype extern synthesized with no "
                             "module-decls accumulator (outside a module "
-                            "tree walk)"));
+                            "tree walk)"), d);
                     }
                 }
                 continue;
@@ -8088,9 +8379,9 @@ struct Lowerer {
                 // MF-3: the module-decls accumulator is set at lowerTree entry;
                 // a static seen outside a tree walk is a bug — fail loud.
                 if (moduleDecls_ == nullptr) {
-                    out.push_back(reportedError(d,
+                    pushOut(reportedError(d,
                         "static local lowered with no module-decls accumulator "
-                        "(outside a module tree walk)"));
+                        "(outside a module tree walk)"), d);
                     continue;
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
@@ -8169,7 +8460,7 @@ struct Lowerer {
                         || isPtrToVla))
                     captureVlaSize(d, sym);
             }
-            out.push_back(lowered);
+            pushOut(lowered, d);
         }
     }
 
@@ -8526,8 +8817,11 @@ struct Lowerer {
         }
         DeclaratorConfig const& dc = *sem.declarators;
         auto vis = declRoleChildren(tree(), node, decl);
-        LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+        // The SHARED base: the declaration-specifier prefix, folded once. Each
+        // declarator folds its OWN after-declarator run on top of this below, so
+        // `int a __attribute__((weak)), b;` weakens `a` alone.
+        LinkageAttr const prefixLink =
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         // Function iff the kindByChild discriminator matches (the block
         // tail). bodyPath empty ⇒ the matched node IS the body (the
         // declarator-mode convention — params live in the declarator).
@@ -8548,8 +8842,14 @@ struct Lowerer {
         collectDeclarators(tree(), vis[*carrier], dc, declarators);
 
         if (isFn) {
-            out.push_back(lowerDeclaratorModeFunction(node, decl, dc,
-                                                      discNode, linkAttr));
+            // A definition has exactly one declarator, so "the declarator's run"
+            // is unambiguous here. (A trailing attribute on a DEFINITION is
+            // rejected upstream today; wiring it anyway means this path needs no
+            // revisit when that gap closes.)
+            out.push_back(lowerDeclaratorModeFunction(
+                node, decl, dc, discNode,
+                declaratorLinkage(prefixLink, decl,
+                                  declarators.empty() ? NodeId{} : declarators[0])));
             return;
         }
 
@@ -8601,11 +8901,35 @@ struct Lowerer {
             return;
         }
 
-        // Globals — one per named declarator, each with the decl's linkage.
+        // Globals — one per named declarator, each with the SHARED prefix
+        // linkage plus THAT declarator's own after-declarator attribute run.
+        // `origins` carries the node→declarator mapping because the emitted-node
+        // count is not the declarator count (a prototype that declines extern
+        // synthesis emits nothing), so index arithmetic would silently misalign.
+        //
+        // ★ EVERY declarator is folded here, INCLUDING ones that emit no node.
+        // That fold is not just how the attribute is applied — it is also the
+        // VALIDATION that makes an unknown trailing attribute fail loud. Folding
+        // only the emitted nodes silently skipped the absorbed prototype in
+        // `int f(void) __attribute__((frobnicate)); int f(void){…}` (the proto is
+        // superseded by the definition, so it emits nothing), and the typo went
+        // back to being accepted in silence — MEASURED, this exact regression.
+        std::vector<LinkageAttr> perDeclarator;
+        perDeclarator.reserve(declarators.size());
+        for (NodeId d : declarators)
+            perDeclarator.push_back(declaratorLinkage(prefixLink, decl, d));
+
         std::size_t const before = out.size();
-        lowerVarLikeInto(node, /*asGlobal=*/true, out);
+        std::vector<NodeId> origins;
+        lowerVarLikeInto(node, /*asGlobal=*/true, out, &origins);
         for (std::size_t i = before; i < out.size(); ++i) {
-            recordLinkage(out[i], linkAttr);
+            NodeId const from = (i - before) < origins.size()
+                                    ? origins[i - before] : NodeId{};
+            LinkageAttr attr = prefixLink;
+            for (std::size_t k = 0; k < declarators.size(); ++k) {
+                if (declarators[k].v == from.v) { attr = perDeclarator[k]; break; }
+            }
+            recordLinkage(out[i], attr);
         }
     }
 
@@ -8626,7 +8950,7 @@ struct Lowerer {
         // prefix, attached below to the lowered Function/Global node and threaded
         // to MIR for DCE protection.
         LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
@@ -8754,8 +9078,10 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) sig = rec->type;
         }
+        // LEGACY positional path: no declarator vocabulary, so no
+        // after-declarator attribute slot exists — the prefix is the whole story.
         LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -8845,8 +9171,18 @@ struct Lowerer {
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v;
         }
         if (isFn) {
-            LinkageAttr const fnLink =
-                linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            // A DEFINITION has exactly one declarator; fold that declarator's own
+            // trailing run on top of the shared prefix so this arm matches the
+            // file-scope one rather than quietly disagreeing with it.
+            std::vector<NodeId> fnDeclarators;
+            if (decl.declaratorListChild.has_value()
+                && *decl.declaratorListChild < vis.size()) {
+                collectDeclarators(tree(), vis[*decl.declaratorListChild], dc,
+                                   fnDeclarators);
+            }
+            LinkageAttr const fnLink = declaratorLinkage(
+                linkageFrom(linkagePrefixRoots(node, decl), decl), decl,
+                fnDeclarators.empty() ? NodeId{} : fnDeclarators[0]);
             out.push_back(lowerDeclaratorModeFunction(node, decl, dc, discNode,
                                                       fnLink));
             return;
@@ -8889,8 +9225,10 @@ struct Lowerer {
         // every declarator — so resolve its linkage ONCE. D-CSUBSET-LINKAGE-UNKNOWN-
         // SPECIFIER-DIAGNOSTIC: route through the SAME linkageFrom chokepoint as
         // lowerTopLevel/lowerFunctionDecl so specifier validation is by-construction.
-        LinkageAttr const externLinkage =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+        // TF-C73: an AFTER-DECLARATOR attribute is per-DECLARATOR, so it is folded
+        // on top of this base inside `recordExtern`, not here.
+        LinkageAttr const externPrefixLink =
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
         // `stringLiteralExpr` after the declarator list is a DSS per-declaration
         // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
@@ -8904,8 +9242,9 @@ struct Lowerer {
             uniformLibraryMap(externLibraryOverride(node, decl));
         // FF6 Slice 2: record one FFI-synthesis import row per emitted extern node.
         // The canonical name is the SymbolRecord's unmangled identifier.
-        auto recordExtern = [&](HirNodeId h, SymbolId sym) {
-            recordLinkage(h, externLinkage);
+        auto recordExtern = [&](HirNodeId h, SymbolId sym, NodeId fromDeclarator) {
+            recordLinkage(h,
+                          declaratorLinkage(externPrefixLink, decl, fromDeclarator));
             auto const* rec = model.recordFor(sym);
             externDecls.push_back({h, rec ? rec->name : std::string{},
                                    libraryOverride});
@@ -8936,7 +9275,7 @@ struct Lowerer {
                 collectParams(d, params);
                 HirNodeId const ef =
                     track(builder.makeExternFunction(type, sym.v, params), d);
-                recordExtern(ef, sym);
+                recordExtern(ef, sym, d);
                 out.push_back(ef);
                 continue;
             }
@@ -8953,7 +9292,7 @@ struct Lowerer {
                 continue;
             }
             HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
-            recordExtern(g, sym);
+            recordExtern(g, sym, d);
             // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
             // record's flag rides the intra-module global side-table so HIR→MIR's
             // extern-data pre-pass stamps ExternImport.isThreadLocal.

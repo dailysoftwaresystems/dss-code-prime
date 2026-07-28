@@ -9,6 +9,7 @@
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "scratch_dir.hpp"
 
@@ -2043,58 +2044,136 @@ TEST(SemanticAnalyzerCSubset, UnknownC23AttributeIsIgnored) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION (F-1): the AFTER-KEYWORD packed position
-// `struct __attribute__((packed)) S {…}` is DEFERRED — only the TRAILING/suffix form
-// (`struct S {…} __attribute__((packed))`) is honored. That deferral's fail-loud
-// contract REQUIRES the after-keyword form to be LOUDLY REJECTED — NEVER a silent
-// tag-drop / accept-as-unpacked. The grammar admits `compositeAttrList` only as a
-// TRAILING element, so `struct __attribute__((packed))` parses (cleanly, no
-// tree-builder error) as an ANONYMOUS, body-less struct specifier — the attribute is
-// consumed as ITS trailing list — and the tag `S { … }` is then mis-read as a
-// function definition, failing loud S_InvalidFunctionDeclarator at SEMANTIC analysis
-// (verified: this is a semantic, not a parse, error). The pin is PHASE-AGNOSTIC
-// (tree parse-error OR semantic-model error) so a future shift between channels stays
-// green; ONLY a silent accept-as-unpacked — the regression F-1 guards against, an
-// after-keyword slot added WITHOUT fixing the ~6 positional tag readers — turns it
-// red. RED-ON-REGRESSION.
-TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedFailsLoudNotSilent) {
+// ── D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION — DEFERRAL CLOSED (TF-C73) ───────
+//
+// ★★ THESE TWO PINS WERE INVERTED ON 2026-07-28. They shipped as
+// `PackedAfterKeywordTaggedFailsLoudNotSilent` / `…AnonymousFailsLoudNotSilent`
+// and asserted that `struct __attribute__((packed)) S {…}` must be LOUDLY
+// REJECTED. That was the CORRECT reading of the fail-loud contract for exactly
+// as long as the position was DEFERRED: a deferred construct must never be
+// accepted-as-unpacked, so while the grammar admitted `compositeAttrList` only
+// as a TRAILING element, rejection WAS the safety property. The position has
+// since LANDED (`compositeAttrLead` in `shapes`, wired through the
+// structSpec/unionSpec rows' `declarationAttrSlotRules`) and is HONORED, so the
+// safety property is now satisfied by HONORING, not by rejecting — the struct
+// is correctly PACKED rather than silently unpacked. The old assertion no
+// longer guards anything; it merely pins the absence of a feature that exists.
+// The pins are kept, and kept HERE, because their real subject was never the
+// diagnostic — it was the POSITIONAL SYMMETRY between the after-keyword slot
+// and the trailing slot, and that intent survives the inversion intact.
+//
+// ★★ WHY THESE ASSERT A LAYOUT FACT AND NOT A DIAGNOSTIC COUNT. Post-landing,
+// EVERY regression mode of this feature is SILENT — there is no diagnostic to
+// count in either direction, so a count pin here would be permanently dead.
+// MEASURED, not argued (shipped CLI, arm64 macho, `--target
+// arm64:macho64-arm64-darwin-exec`, probe returning `sizeof*10 + _Alignof`):
+//
+//     shipped config                                   -> 51   (sizeof 5, align 1)
+//     scratch config, `declarationAttrSlotRules`
+//       ["compositeAttrLead"] deleted from the
+//       structSpec + unionSpec rows                     -> 84   (sizeof 8, align 4)
+//     diagnostics emitted by that broken build          -> 0
+//
+// Zero. The regression compiles clean and produces a WRONG ABI. Only an
+// applied-layout assertion — `isPacked`, the computed size/align, the field
+// OFFSETS — can see it, which is what these two now assert.
+//
+// ★★ CLANG GROUND TRUTH, measured not assumed
+// (`clang -isysroot $(xcrun --show-sdk-path) -std=c17 -Wall -Wextra`, zero
+// errors, zero warnings, binary run):
+//     struct __attribute__((packed)) S { char a; int b; };
+//         -> sizeof 5, _Alignof 1, offsetof(b) == 1
+//     struct __attribute__((packed))   { char a; int b; } v;   (anonymous)
+//         -> sizeof 5,             offsetof(b) == 1
+// DSS agrees on both, end to end through the shipped CLI, and the
+// attribute-deleted control diverges in BOTH compilers identically (sizeof 8).
+// The member order is `char` FIRST deliberately: with `int a; char b;` the two
+// field offsets are 0/4 whether or not packing ran, so the offsets would be
+// vacuous. `char a; int b;` moves all three observables at once (5 vs 8, 1 vs
+// 4, offset 1 vs 4) — one shape, three independent ways to catch a silent drop.
+//
+// ★ WHAT GUARDS THE BEHAVIOR NOW, i.e. what these pins actually hold down:
+//   * the lead surface REACHES the semantic tier at all — the config key
+//     `declarationAttrSlotRules: ["compositeAttrLead"]`, deleted above to
+//     produce the 84;
+//   * `scanCompositePacked` stays surface-COUNT-agnostic. It once selected the
+//     FIRST `compositeAttrList` child and `break`ed, which is precisely why an
+//     earlier cut of this grammar was reverted UNSHIPPED: a lead slot under a
+//     distinct rule name was invisible to it and `packed` — known-and-inert in
+//     the effects table — was dropped in silence;
+//   * the tag stays at visible-child 2. `compositeAttrLead` is a named rule
+//     over a lone `{repeat}`, so it emits its node even when EMPTY and the
+//     index cannot shift with or without a decoration. (That index has its own
+//     red-on-disable note on the structSpec row; it fails as a downstream
+//     S000D at the USE site, not as an unknown tag.)
+// The TRAILING position keeps its own coverage in the pins above
+// (`PackedStructHasAlignmentOneEndToEnd` and siblings); the positional-symmetry
+// claim is the pair of them, which is why these two stay adjacent to it.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedIsHonoredNotSilentlyUnpacked) {
     auto cu = buildShippedUnit("c-subset", {
-        "struct __attribute__((packed)) S { int a; };\n"
+        "struct __attribute__((packed)) S { char a; int b; };\n"
+        "struct S v;\n"
         "int main(void){ return 0; }\n",
     });
-    bool sawParseError = false;
-    for (auto const& t : cu->trees()) {
-        for (auto const& d : t.diagnostics().all()) {
-            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
-        }
-    }
+    assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
-    EXPECT_TRUE(sawParseError || model.hasErrors())
-        << "after-keyword packed (`struct __attribute__((packed)) S {…}`) must fail "
-           "LOUD (parse or semantic) — never a silent tag-drop / accept-as-unpacked "
-           "(the D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION deferral's fail-loud contract)";
+    EXPECT_FALSE(model.hasErrors())
+        << "the after-keyword composite attribute position LANDED — it must parse "
+           "and analyze cleanly (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION, closed)";
+    // The tag must survive the lead slot: `struct S v;` resolving to a Struct is
+    // the guard on `structSpec`'s name index staying at visible-child 2.
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr) << "the TAG was discarded — the lead slot shifted the "
+                             "name index off the identifier";
+    ASSERT_TRUE(v->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(v->type), TypeKind::Struct);
+    // THE APPLIED LAYOUT FACT. `packed` reached the layout sink, not merely the
+    // parser: clang-measured 5 / 1 / offset 1; a silent drop gives 8 / 4 / 4.
+    EXPECT_TRUE(ti.isPacked(v->type))
+        << "after-keyword `packed` parsed but never marked the composite — the "
+           "silent-unpack regression (MEASURED as sizeof 8 vs clang's 5)";
+    auto const layout = computeLayout(v->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 5u)          << "clang: sizeof == 5 (unpacked would be 8)";
+    EXPECT_EQ(layout->align.bytes(), 1u) << "clang: _Alignof == 1 (unpacked would be 4)";
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[0], 0u);
+    EXPECT_EQ(layout->fieldOffsets[1], 1u)
+        << "clang: offsetof(b) == 1 — the inter-field padding is gone (unpacked: 4)";
 }
 
-// The ANONYMOUS after-keyword variant is likewise LOUDLY REJECTED:
-// `struct __attribute__((packed)) { int a; } v;` — the anonymous, body-less struct
-// specifier consumes the attribute as its trailing list, then `{ int a; } v;` cannot
-// bind and fails loud (S_UnknownType on `v` today). Cheap sibling; same fail-loud
-// boundary, phase-agnostic.
-TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousFailsLoudNotSilent) {
+// The ANONYMOUS half of the positional-symmetry claim: the same lead slot on a
+// TAGLESS composite. Not redundant with the tagged pin — the tagged one also
+// exercises the tag-index guard, and this one exercises the path where
+// `anonymousNameAllowed` synthesizes the name while child 2 is a `structBody`
+// rather than an Identifier. Same clang-measured layout (5 / offset 1); DSS
+// end-to-end MEASURED at exit 42 on the runtime probe and at exit 1 with the
+// attribute deleted, in DSS and clang alike.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousIsHonoredNotSilentlyUnpacked) {
     auto cu = buildShippedUnit("c-subset", {
-        "struct __attribute__((packed)) { int a; } v;\n"
+        "struct __attribute__((packed)) { char a; int b; } v;\n"
         "int main(void){ return 0; }\n",
     });
-    bool sawParseError = false;
-    for (auto const& t : cu->trees()) {
-        for (auto const& d : t.diagnostics().all()) {
-            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
-        }
-    }
+    assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
-    EXPECT_TRUE(sawParseError || model.hasErrors())
-        << "anonymous after-keyword packed must also fail LOUD (parse or semantic), "
-           "never a silent accept-as-unpacked";
+    EXPECT_FALSE(model.hasErrors())
+        << "anonymous after-keyword packed must parse + analyze cleanly";
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(v->type), TypeKind::Struct);
+    EXPECT_TRUE(ti.isPacked(v->type))
+        << "the lead slot must be honored on an ANONYMOUS composite too — never a "
+           "silent accept-as-unpacked";
+    auto const layout = computeLayout(v->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 5u)          << "clang: sizeof == 5 (unpacked would be 8)";
+    EXPECT_EQ(layout->align.bytes(), 1u);
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[1], 1u)
+        << "clang: offsetof(b) == 1 (unpacked: 4)";
 }
 
 // ZERO: `alignas(0) int x;` is a NO-OP (6.7.5p3) — NO diagnostic, NO override.
@@ -8574,6 +8653,198 @@ TEST(SemanticAnalyzerCSubset, DeprecatedMessageIncluded) {
     }
 }
 
+// ★ THE TF-C62 REGRESSION PIN: the GNU `__attribute__((deprecated("m")))` form
+// must carry its message exactly like the C23 form. TF-C62 moved the GNU
+// argument out of a direct `stringLiteralExpr` child down into an `attrArgs`
+// subtree (`attrArgs > attrArgList > attrArgItem > attrArgAtom >
+// stringLiteralExpr` after TF-C72); the clause extractor still read the FIRST
+// Internal child, handing the decode chokepoint a node with no body children →
+// it returned "" (NOT nullopt) and the message was SILENTLY dropped. MEASURED at
+// the defect: `warning[S003D] got f` — the message simply gone. The bug survived
+// because the GNU form was pinned only by diagnostic COUNTS; this asserts TEXT.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use g\"))) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f: use g")
+                << "the GNU form's message must survive the attrArgs nesting";
+    }
+}
+
+// The GNU and C23 spellings are the SAME attribute: identical source message ⇒
+// identical diagnostic text. The parity assertion is the regression wall for the
+// C23 path (which worked throughout the defect) AND for the GNU path together —
+// a future reshape of EITHER argument grammar breaks this before it ships.
+TEST(SemanticAnalyzerCSubset, DeprecatedMessageSameForGnuAndC23) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use g\"))) int f(void);\n"
+        "[[deprecated(\"use g\")]] int h(void);\n"
+        "int f(void) { return 1; }\n"
+        "int h(void) { return 2; }\n"
+        "int main(void) { return f() + h(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u);
+    std::string gnuText;    // the GNU-declared f
+    std::string stdText;    // the C23-declared h
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        if (diag.actual.rfind("f", 0) == 0) gnuText = diag.actual;
+        if (diag.actual.rfind("h", 0) == 0) stdText = diag.actual;
+    }
+    EXPECT_EQ(gnuText, "f: use g") << "GNU form";
+    EXPECT_EQ(stdText, "h: use g") << "C23 form";
+}
+
+// C 5.1.1.2 phase 6: `deprecated("use " "g")` is ONE argument (adjacent literals
+// concatenate), not two — the subtree search STOPS at the `stringLiteralExpr`
+// node and hands the whole run to the shared `decodeAdjacentStringBodies`
+// chokepoint, so the pieces JOIN rather than reading as an ambiguous pair.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedAdjacentConcatMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use \" \"g\"))) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an adjacent-concatenated message is ONE argument, never ambiguous";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f: use g");
+    }
+}
+
+// `__attribute__((deprecated))` with NO argument is legal and has NO message —
+// the `.actual` is the BARE symbol name, with no `: ` separator and no crash.
+// A REGRESSION WALL (green before and after the attrArgs-descent fix), not a
+// red-on-disable pin: the extractor's nullopt-vs-"" distinction is real at the
+// EXTRACTION boundary, but MEASURED it cannot be observed here — making "found
+// nothing" yield "" instead of nullopt leaves this test GREEN, because
+// `AttributeSemanticsFacts`/`SymbolRecord` store the message as a `std::string`
+// merged first-NON-EMPTY-wins and the render site omits the `: ` separator for an
+// empty message. So `deprecated("")` and no-argument are indistinguishable
+// DOWNSTREAM today; carrying the distinction further is a separate change.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedNoArgumentHasNoMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated)) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f")
+                << "no argument ⇒ no message, NOT an empty one";
+}
+
+// FAIL LOUD: a MODELLED attribute whose clause carries TWO string arguments has
+// no unambiguous message — picking the first would be a fresh silent drop of the
+// second (the `linkageFrom` adjacent-concat fail-loud posture). S_UnknownTypeAttribute
+// at Error severity, and the deprecation warning stays MESSAGE-LESS: the engine
+// never guesses which string was meant.
+// RED-ON-DISABLE: drop the ambiguity branch and take the first string → no error
+// and `.actual` becomes "x: a".
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedTwoStringArgumentsFailLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated(\"a\", \"b\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an ambiguous attribute message must never compile silently";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnknownTypeAttribute) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Error);
+            EXPECT_EQ(diag.actual,
+                      "attribute 'deprecated' carries more than one string argument");
+        }
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "x")
+                << "the ambiguous message must be DROPPED, never guessed";
+    }
+}
+
+// FAIL LOUD, second door: the shared decode chokepoint returns nullopt on a
+// MALFORMED escape (C 5.1.1.2 phase 5). Unreported that is the SAME silent
+// message drop as the attrArgs-nesting defect — MEASURED before this gate:
+// `deprecated("bad\uZZZZ")` warned a bare `x`, the message quietly gone.
+// RED-ON-DISABLE: drop the `!out.message.has_value()` fail-loud → no error and
+// the deprecation warning silently loses its message again.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedMalformedEscapeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated(\"bad\\uZZZZ\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an undecodable attribute message must never be dropped silently";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_UnknownTypeAttribute)
+            EXPECT_EQ(diag.actual,
+                      "attribute 'deprecated' has a malformed escape in its "
+                      "string argument");
+}
+
+// A COMMA-separated sibling clause (`attrClauseTail`) is a DIFFERENT attribute —
+// its string is not this clause's message. The subtree search skips wholesale any
+// nested node carrying its OWN name identifier, which is precisely the "the name
+// is a direct identifier child" clause model applied recursively.
+// RED-ON-DISABLE: drop that skip → `deprecated` adopts the sibling's "hidden"
+// and `.actual` becomes "x: hidden" (a silently WRONG message).
+TEST(SemanticAnalyzerCSubset, GnuSiblingClauseStringIsNotThisClausesMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated, __visibility__(\"hidden\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "x")
+                << "a LATER clause's string must never become this one's message";
+}
+
+// The ambiguity gate is scoped to attributes the language MODELS. A real SDK-header
+// shape the effect table does not model — `__availability__(macos, message="a",
+// replacement="b")`, TF-C72's motivating case — carries two strings legitimately and
+// must stay exactly as inert as before: parsed, ignored, NEVER newly rejected.
+// RED-ON-DISABLE: drop the `row != nullptr` gate → this errors S_UnknownTypeAttribute
+// and every macOS SDK header using the availability form stops compiling.
+TEST(SemanticAnalyzerCSubset, UnmodelledGnuMultiStringAttributeStaysInert) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((__availability__(macos, message=\"a\","
+        " replacement=\"b\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an unmodelled multi-string GNU attribute must not be rejected";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+}
+
 // A `[[deprecated]]` PROTOTYPE + an unflagged definition: the flag OR-merges
 // into the surviving definition (the isNoreturn mergedFnDecls precedent), so a
 // call — which resolves to the survivor — still warns. RED-ON-DISABLE for the
@@ -10217,4 +10488,762 @@ TEST(SemanticAnalyzerCSubset, TgmathComplexArgFabsFailsLoudOnBothFormats) {
     auto pe = analyzeRealTgmath(src, ObjectFormatKind::Pe, DataModel::Llp64);
     EXPECT_EQ(countCode(pe.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
         << "fabs(double _Complex) must fail LOUD on pe (the f64 bridge arm)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): multi-root + multi-clause attribute scanning,
+// and the GNU `aligned(N)` sink.
+//
+// Every C snippet below was checked with
+//   clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)
+// and every layout number pinned here is clang's OWN measured answer, not a
+// guess — `struct S { char a; int b; } __attribute__((packed, aligned(16)));`
+// really is sizeof 16 / _Alignof 16 on arm64.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★★ THE LIVE SILENT MISCOMPILE (work item 7). `scanCompositePacked` used to do
+// `if (named) { packed = true; continue; }` over a WHOLE attribute node, so the
+// first clause naming `packed` SWALLOWED every clause after it. Measured before
+// the fix: DSS `sizeof` 5 against clang's 16 with ZERO diagnostics.
+//
+// The MIRROR of that swallow is what this test pins, because it is the half that
+// is fully fixable inside the semantic tier: an unknown name sitting AFTER
+// `packed` used to be accepted in total silence, defeating the typo protection
+// this scan exists for. It now fails loud, and the struct is STILL packed (the
+// recognized clause is honored, the unrecognized one is reported — neither
+// clause swallows the other).
+TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownAfterPackedFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((packed, bogus_xyz));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"still packed\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    // Exactly ONE diagnostic, and it NAMES the offending clause — not a bare
+    // count on a shared code, and not the whole `__attribute__((...))` blob.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a clause after `packed` must still be examined — the pre-TF-C73 "
+           "scan swallowed it and accepted the typo silently";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos)
+            << "the diagnostic must name the unrecognized clause, got: " << d.actual;
+    }
+    // The recognized clause is still honored: packed survives.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "`packed` must still apply when a sibling clause is unknown";
+}
+
+// The same swallow in the other clause ORDER: an unknown name BEFORE `packed`.
+// Pre-TF-C73 this was also silent (the subtree scan found `packed` anywhere in
+// the node and returned early). Both orders now behave identically — which is
+// the point: correctness must not depend on clause position.
+TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownBeforePackedFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((bogus_xyz, packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"still packed\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos) << d.actual;
+    }
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// REGRESSION WALL for the clause-by-clause rewrite: a SINGLE-clause
+// `__attribute__((packed))` must still be exactly as it was — packed honored,
+// no diagnostic. (The multi-clause enumeration must not change the common case.)
+TEST(SemanticAnalyzerCSubset, PackedSingleClauseUnchangedByClauseEnumeration) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "_Static_assert(_Alignof(struct S) == 1, \"packed align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ★ THE PHANTOM-CLAUSE EXCLUSION (work item 8). `format(printf,1,2)` nests its
+// argument identifier `printf` in an `attrArgAtom` whose direct child IS an
+// identifier — exactly the shape the trailing-clause rule looks for. Without the
+// `cfg.attributeArgRule` skip in `collectAttrClauses`, the walk would mint a
+// PHANTOM clause named `printf` and fail it loud on perfectly legal C.
+// The position is a TYPEDEF deliberately: `typedefDecl` sets
+// `unknownStrictAttributeIsError`, so a phantom clause there is not merely
+// ignored — it fails LOUD. That is what makes this pin actually red-on-disable
+// (on a row WITHOUT the strict gate an unknown GNU name is silent, and the test
+// would pass for the wrong reason).
+// RED-ON-DISABLE: delete the `attributeArgRule` guard in `collectAttrClauses`
+// and `printf` is minted as a clause → S_UnknownTypeAttribute on legal C.
+TEST(SemanticAnalyzerCSubset, AttrArgIdentifierNeverMintsPhantomClause) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef void (*fp)(const char *, ...) "
+        "__attribute__((format(printf,1,2)));\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "`printf` is an ARGUMENT, not a clause name — minting a phantom clause "
+           "would reject legal C";
+    for (auto const& d : model.diagnostics().all()) {
+        EXPECT_EQ(d.actual.find("printf"), std::string::npos)
+            << "an ARGUMENT identifier must never be read as a clause NAME, got: "
+            << d.actual;
+    }
+}
+
+// ★ `[[a, b]]` IS TWO CLAUSES, EACH FOLDED ONCE (work item 8 audit caveat). The
+// C23 form's per-item loop is the ONLY producer for that shape; the structural
+// trailing-clause descent is deliberately skipped for it (`collectAttrClauses`
+// returns immediately from the std arm) so no item is yielded twice.
+//
+// ★ MEASURED CAVEAT, recorded so nobody re-derives it: a genuine double-FOLD of
+// the same clause node is NOT observable through diagnostic counts, because
+// `DiagnosticReporter` carries a `dedupWindow` (default 4) that drops an
+// identical (code, buffer, span, rule, actual) diagnostic — and re-folding the
+// same node produces exactly that. Fact folding is idempotent too (booleans OR,
+// messages are first-non-empty-wins, alignment is a MAX). So this test pins the
+// direction that IS observable and does regress: BOTH items must be folded —
+// removing the per-item loop takes the count to 0.
+TEST(SemanticAnalyzerCSubset, StdAttrMultiItemEmitsNoDuplicateDiagnostics) {
+    auto cu = buildShippedUnit("c-subset", {
+        "[[frobnicate, blahblah]] int x;\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownAttribute), 2u)
+        << "[[a, b]] is TWO clauses — one warning each, never doubled";
+}
+
+// ★★ PER-DECLARATOR ISOLATION (work item 1). `int a __attribute__((deprecated)), b;`
+// annotates ONLY `a`. If the declarator-depth scan folded into the SHARED
+// declaration-level facts instead of a per-declarator COPY, `b` would silently
+// inherit the deprecation — a wrong fact on a symbol the programmer never marked.
+// This is the test that distinguishes a copy from a reference.
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrDoesNotLeakToSiblingDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "int a __attribute__((deprecated)), b;\n"
+        "int main(void) { return a + b; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "only `a` is deprecated — folding into shared facts would mark `b` too";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(d.actual, "a") << "the deprecation must land on `a`, never `b`";
+    }
+    SymbolRecord const* bRec = findSym(model, "b");
+    ASSERT_NE(bRec, nullptr);
+    EXPECT_FALSE(bRec->isDeprecated)
+        << "`b` carries no attribute and must not be marked";
+}
+
+// ROOT (b) — DECLARATOR-DEPTH. An attribute written AFTER the declarator used to
+// be parsed and silently ignored (the scan had exactly one root: the specifier
+// prefix). RED-ON-DISABLE: remove the after-declarator root loop and the
+// deprecation warning disappears entirely.
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrIsHonored) {
+    auto model = analyzeShipped("c-subset", {
+        "int x __attribute__((deprecated));\n"
+        "int main(void) { return x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "an after-declarator attribute must be honored, not parse-and-ignore";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(d.actual, "x");
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+    }
+}
+
+// The after-declarator MESSAGE decodes too (the shared string chokepoint is
+// reached from the new root exactly as from the prefix root).
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrMessageDecodes) {
+    auto model = analyzeShipped("c-subset", {
+        "int x __attribute__((deprecated(\"use y\")));\n"
+        "int main(void) { return x; }\n",
+    });
+    bool sawMessage = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        sawMessage = true;
+        EXPECT_NE(d.actual.find("use y"), std::string::npos)
+            << "the message must survive the declarator-depth root, got: " << d.actual;
+    }
+    EXPECT_TRUE(sawMessage);
+}
+
+// ── TF-C73: the GNU `aligned(N)` sink ────────────────────────────────────────
+// Before this cycle `aligned` had NO sink at all: it parsed, folded to nothing,
+// and the object was SILENTLY UNDER-ALIGNED. (That is why `aligned` was
+// deliberately kept OUT of the linkage-scan hint-ignore list — ignoring it would
+// have made the miscompile compile clean.)
+
+// OBJECT (leading position) → SymbolRecord.explicitAlignment. An APPLIED FACT,
+// not a diagnostic count. RED-ON-DISABLE: drop the Align arm and this is nullopt.
+TEST(SemanticAnalyzerCSubset, GnuAlignedLeadingSetsObjectExplicitAlignment) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "__attribute__((aligned(32))) int gv;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* gv = findSym(model, "gv");
+    ASSERT_NE(gv, nullptr);
+    ASSERT_TRUE(gv->explicitAlignment.has_value())
+        << "__attribute__((aligned(32))) must set explicitAlignment — an "
+           "unhonored alignment is a silently under-aligned object";
+    EXPECT_EQ(*gv->explicitAlignment, 32u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// OBJECT (after-declarator position) → the SAME sink, reached through the NEW
+// declarator-depth root. Both spellings must agree.
+TEST(SemanticAnalyzerCSubset, GnuAlignedAfterDeclaratorSetsObjectAlignment) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int gv2 __attribute__((aligned(32)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* gv2 = findSym(model, "gv2");
+    ASSERT_NE(gv2, nullptr);
+    ASSERT_TRUE(gv2->explicitAlignment.has_value());
+    EXPECT_EQ(*gv2->explicitAlignment, 32u);
+}
+
+// `aligned` MAX-folds with `alignas` on the same declaration (C 6.7.5p6: the
+// strictest wins). They write the SAME slot, so they cannot disagree.
+TEST(SemanticAnalyzerCSubset, GnuAlignedMaxFoldsWithAlignas) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "alignas(8) int g __attribute__((aligned(64)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 64u)
+        << "6.7.5p6: with several alignment specifiers the LARGEST wins";
+}
+
+// MEMBER → the existing `fieldAligns` path, end-to-end through the interner.
+// clang measures sizeof 16 / _Alignof 8 for this struct; so must DSS.
+TEST(SemanticAnalyzerCSubset, GnuAlignedOnMemberRaisesLayoutEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct M { char c; int v __attribute__((aligned(8))); };\n"
+        "_Static_assert(sizeof(struct M) == 16, \"member aligned 8\");\n"
+        "_Static_assert(_Alignof(struct M) == 8, \"member raises struct align\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a member `aligned(8)` must reach fieldAligns and change the layout";
+}
+
+// MULTI-CLAUSE FOLD (work item 8): `((deprecated, aligned(32)))` — BOTH clauses
+// take effect. Pre-TF-C73 only the FIRST was folded, so the alignment was
+// silently dropped. RED-ON-DISABLE: remove the trailing-clause descent in
+// `collectAttrClauses` and `explicitAlignment` goes nullopt while `deprecated`
+// still works — which is exactly the asymmetry that made the drop invisible.
+TEST(SemanticAnalyzerCSubset, GnuMultiClauseFoldsEveryClause) {
+    auto model = analyzeShipped("c-subset", {
+        "int q __attribute__((deprecated, aligned(32)));\n"
+        "int main(void) { return q; }\n",
+    });
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(q, nullptr);
+    EXPECT_TRUE(q->isDeprecated) << "clause 1 must fold";
+    ASSERT_TRUE(q->explicitAlignment.has_value())
+        << "clause 2 must fold too — folding only the first silently drops it";
+    EXPECT_EQ(*q->explicitAlignment, 32u);
+}
+
+// The reversed order folds identically — clause position must not matter.
+TEST(SemanticAnalyzerCSubset, GnuMultiClauseOrderIndependent) {
+    auto model = analyzeShipped("c-subset", {
+        "int r __attribute__((aligned(32), deprecated));\n"
+        "int main(void) { return r; }\n",
+    });
+    SymbolRecord const* r = findSym(model, "r");
+    ASSERT_NE(r, nullptr);
+    EXPECT_TRUE(r->isDeprecated);
+    ASSERT_TRUE(r->explicitAlignment.has_value());
+    EXPECT_EQ(*r->explicitAlignment, 32u);
+}
+
+// ★ THE SHARED-LADDER PROOF (work item 4). `aligned(3)` and `alignas(3)` must
+// produce the SAME code, because they run the SAME function. This is what makes
+// the extraction load-bearing rather than cosmetic: bypassing
+// `foldAlignmentOperand` (hand-rolling an equivalent fold in the Align arm)
+// makes the pow2 and >256 arms go SILENT for the attribute spelling while the
+// alignas spelling keeps working — an asymmetry no alignas test can see.
+TEST(SemanticAnalyzerCSubset, GnuAlignedSharesTheAlignasValidationLadder) {
+    {   // not a power of two — the SAME code alignas(3) emits
+        auto cu = buildShippedUnit("c-subset",
+                                   { "int x __attribute__((aligned(3)));\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+            << "aligned(3) must fail through the SHARED ladder, not silently";
+    }
+    {   // over the 256 cap — the SAME code alignas(512) emits
+        auto cu = buildShippedUnit("c-subset",
+                                   { "int x __attribute__((aligned(512)));\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasExceedsMax), 1u)
+            << "aligned(512) must hit the SAME >256 cap alignas does";
+    }
+    {   // the alignas TWIN — proves the two spellings agree, code for code
+        auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
+    }
+}
+
+// ★ KNOWN DIVERGENCE, PINNED DELIBERATELY SO IT IS VISIBLE RATHER THAN FOLKLORE.
+// `aligned(0)` currently reaches the SHARED ladder, whose zero arm implements
+// C 6.7.5p3 — "an alignment specification of zero has no effect" — and returns
+// "no override" with NO diagnostic. That paragraph governs C11 `_Alignas`; it does
+// NOT govern the GNU spelling, and clang REJECTS `__attribute__((aligned(0)))`
+// with "requested alignment is not a power of 2" (MEASURED:
+// `clang -fsyntax-only -Wall -Wextra`, exit 1).
+//
+// The behavior is a direct consequence of the design requirement that the GNU arm
+// call the alignas ladder unchanged — zero behavior change on the alignas path is
+// the regression wall, so the zero arm could not be special-cased for one caller
+// without splitting the ladder the extraction exists to unify. The consequence is
+// recorded here honestly: today `aligned(0)` is accepted and applies nothing, which
+// is the one place in this feature where DSS is LOOSER than clang. Closing it means
+// teaching the shared ladder that its zero arm is spelling-dependent (a `zeroIsNoOp`
+// parameter set true only by `evalOneAlignasSpec`) — a deliberate follow-up, not an
+// accident. This test PINS the current answer so the change is a visible test edit.
+TEST(SemanticAnalyzerCSubset, GnuAlignedZeroIsTheSharedNoOp) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int z __attribute__((aligned(0)));\n" });
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasExceedsMax), 0u);
+    SymbolRecord const* z = findSym(model, "z");
+    ASSERT_NE(z, nullptr);
+    EXPECT_FALSE(z->explicitAlignment.has_value())
+        << "6.7.5p3: an alignment of zero has NO effect";
+}
+
+// ★ BARE `__attribute__((aligned))` FAILS LOUD. gcc reads it as "the target's
+// maximum useful alignment" — a target-dependent number this engine must not
+// invent. clang ACCEPTS this spelling, so DSS is deliberately stricter here:
+// refusing loudly beats guessing an ABI.
+TEST(SemanticAnalyzerCSubset, GnuAlignedWithNoArgumentFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int bare __attribute__((aligned));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    bool named = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
+            << "the message must say WHY the bare form is refused, got: " << d.actual;
+        named = true;
+    }
+    EXPECT_TRUE(named);
+    SymbolRecord const* bare = findSym(model, "bare");
+    ASSERT_NE(bare, nullptr);
+    EXPECT_FALSE(bare->explicitAlignment.has_value())
+        << "never guess 'maximum useful alignment'";
+}
+
+// FUNCTIONS stay LOUD (measured cost: 0 of 204 SDK `aligned` sites).
+TEST(SemanticAnalyzerCSubset, GnuAlignedOnFunctionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "__attribute__((aligned(16))) int f(void);\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasInvalidContext) continue;
+        EXPECT_NE(d.actual.find("function"), std::string::npos) << d.actual;
+    }
+}
+
+// ── ★ THE TYPEDEF RULE (work item 6) ─────────────────────────────────────────
+// A typedef interns to the SAME TypeId as its aliasee, so `explicitAlignment` on
+// a typedef symbol is provably inert — storing it would be the "parses but sets
+// nothing" silent drop. So the request is JUDGED, in three graded arms.
+
+// ARM 1 — N > natural, layout params AVAILABLE ⇒ FAIL LOUD. The program asked for
+// stricter alignment than the alias can deliver, and we genuinely cannot deliver it.
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefStricterThanNaturalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int ti __attribute__((aligned(16)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+        << "aligned(16) on a typedef of int (natural 4) is a REAL drop — say so";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasInvalidContext) continue;
+        EXPECT_NE(d.actual.find("typedef"), std::string::npos) << d.actual;
+    }
+}
+
+// ARM 2 — N <= natural, layout params AVAILABLE ⇒ accept SILENTLY. The alias
+// already satisfies the request, so honoring it is a PROVEN no-op: nothing is
+// dropped, so there is nothing to warn about. (Warning here would be noise on
+// legal, already-satisfied C.)
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWeakerThanNaturalIsSilent) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int ts __attribute__((aligned(2)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "aligned(2) on a typedef of int (natural 4) is ALREADY satisfied";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ARM 3 — ★ layout params ABSENT ⇒ STAY SILENT. This deliberately diverges from
+// the alignas precedent (which fails loud when it cannot compute an alignment).
+// `src/lsp/lsp_server.cpp:429` calls `dss::analyze(cu)` with NO layout params, so
+// failing loud here would put a red squiggle under every real SDK typedef in the
+// editor while the same source compiles clean from the CLI.
+// CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWithoutLayoutParamsStaysSilent) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int ti __attribute__((aligned(16)));\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "no layout params = cannot determine — that must not become "
+           "cannot-compile (the LSP calls analyze() with no layout)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★ THE STRICT UNKNOWN-NAME GATE (work item 3). A `typedefDecl` declares no
+// `linkageSpecifiers`, so `linkageFrom` early-returns and an unknown GNU name in
+// a typedef position was reported by NOBODY — `typedef __attribute__((desprecated))
+// int T;` compiled clean with the decoration silently unapplied. With the row's
+// `unknownStrictAttributeIsError` opt-in it is now an ERROR, using the SAME code
+// and severity `scanCompositePacked` already uses for a strict unknown.
+// RED-ON-DISABLE: drop the `strictUnknownIsError` arm → count goes to 0.
+TEST(SemanticAnalyzerCSubset, TypedefUnknownStrictGnuAttributeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef __attribute__((desprecated)) int T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a typo'd GNU attribute on a typedef must not be silently unapplied";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("desprecated"), std::string::npos) << d.actual;
+    }
+}
+
+// The C23 `[[...]]` form on the SAME row keeps its SUPPRESSIBLE Warning — C23
+// REQUIRES an unknown standard attribute to be ignorable, so the strict gate must
+// not leak across forms. This is the control that proves the gate is GNU-only.
+//
+// The placement is the typedef's MIDDLE slot (`typedef int [[…]] T;`), which is
+// both valid C23 (clang -std=c2x accepts it, warning only about the unknown name)
+// and the SAME scan root the GNU strict test above uses — so the only variable
+// between the two tests is the attribute FORM, which is exactly what is being
+// controlled for. (`typedef [[…]] int T;` — attribute before the type — is NOT
+// valid C: clang rejects it with "an attribute list cannot appear here".)
+TEST(SemanticAnalyzerCSubset, TypedefUnknownC23AttributeStaysASuppressibleWarning) {
+    auto cu = buildShippedUnit("c-subset", { "typedef int [[frobnicate]] T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "C23 forbids a fatal unknown standard attribute — the strict gate is "
+           "GNU-only and must not leak across forms";
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_UnknownAttribute)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+}
+
+// ROOT (a) — DECLARATION-DEPTH SLOTS. `typedef int64_t __attribute__((__aligned__(8)))
+// T;` puts the attribute in the typedef's MIDDLE slot — outside `specifierPrefixChild`'s
+// reach, so pre-TF-C73 it was parsed and silently ignored. RED-ON-DISABLE: remove the
+// `declarationAttrSlotRules` loop and the loud typedef judgement disappears.
+TEST(SemanticAnalyzerCSubset, TypedefMiddleSlotAttributeIsReached) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int __attribute__((aligned(16))) T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+        << "the typedef's MIDDLE attribute slot must be a scan root — silently "
+           "ignoring it is how the SDK's dominant typedef spelling got dropped";
+}
+
+// ★★ THE COMPOSITE-DEFINITION `aligned` POSITION — NOW A REAL SINK
+// (D-CSUBSET-COMPOSITE-ALIGNED). This test is the CONVERSION of TF-C73's
+// `CompositeDefinitionAlignedFailsLoudPendingInternerChannel` pin, which asserted
+// that the clause failed LOUD because there was nowhere to put it. The interner now
+// carries a genuine per-COMPOSITE alignment channel
+// (`TypeInterner::explicitCompositeAlign`, seeded into `StructLayout::align` by
+// `computeLayout`), so the number is produced instead of refused.
+//
+// ★ CLANG GROUND TRUTH (MEASURED on this machine, arm64 macOS, compiled AND RUN,
+// `clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)` clean):
+//     struct S { char a; int b; } __attribute__((packed, aligned(16)));
+//         → sizeof 16, _Alignof 16
+// NOT 5: packed removes the inter-field padding (a@0, b@1, extent 5) and
+// `aligned(16)` then raises the WHOLE aggregate's alignment, which rounds the size
+// up to 16. Both channels apply; neither swallows the other.
+//
+// RED-ON-DISABLE: revert the `composedAlign.value_or(0u)` argument at the struct
+// `completeComposite` call (semantic_analyzer.cpp) — or the `compositeSeedAlign`
+// seed in type_layout.cpp's Struct arm — and this drops back to packed's bare
+// sizeof 5 / _Alignof 1, firing BOTH _Static_asserts.
+TEST(SemanticAnalyzerCSubset, CompositePackedPlusAlignedRaisesWholeAggregate) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((packed, aligned(16)));\n"
+        "_Static_assert(sizeof(struct S) == 16, \"clang: packed+aligned(16) = 16\");\n"
+        "_Static_assert(_Alignof(struct S) == 16, \"clang: _Alignof 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed removes the padding, aligned(16) raises the aggregate: clang "
+           "gives sizeof 16 / _Alignof 16, NOT packed's bare 5 / 1";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "the composite `aligned` clause is HONORED now, not refused as unknown";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The `aligned(N)` half ALONE on a composite definition — no packed.
+// CLANG (MEASURED, compiled and run): `struct A { char a; int b; }
+// __attribute__((aligned(16)));` → sizeof 16, _Alignof 16 (natural would be 8 / 4).
+// RED-ON-DISABLE: drop the layout seed and this falls to 8 / 4.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedAloneRaisesAlignAndSize) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct A { char a; int b; } __attribute__((aligned(16)));\n"
+        "_Static_assert(sizeof(struct A) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct A) == 16, \"clang: 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★ `aligned(N)` NEVER LOWERS (C 6.7.5 — the composite's alignment is the MAX of its
+// natural alignment and the request). CLANG (MEASURED): `struct L { char a; int b; }
+// __attribute__((aligned(2)));` → sizeof 8, _Alignof 4 — the request is WEAKER than
+// the natural 4 and is simply a no-op. This is the control that proves the fold is a
+// MAX and not an assignment: implement it as `out.align = requested` and this test
+// goes to sizeof 4 / _Alignof 2 while every other test in this group still passes.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedWeakerThanNaturalIsANoOp) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct L { char a; int b; } __attribute__((aligned(2)));\n"
+        "_Static_assert(sizeof(struct L) == 8, \"clang: natural 8 survives\");\n"
+        "_Static_assert(_Alignof(struct L) == 4, \"clang: natural 4 survives\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "aligned(N) may only RAISE — a weaker request is a no-op, not a lowering";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// UNION: the channel is per-COMPOSITE, not per-struct. CLANG (MEASURED):
+// `union U { char a; int b; } __attribute__((aligned(32)));` → sizeof 32,
+// _Alignof 32 (natural 4 / 4). RED-ON-DISABLE: drop the seed in computeLayout's
+// Union arm and this falls to 4 / 4.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedOnUnionRaisesAlignAndSize) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { char a; int b; } __attribute__((aligned(32)));\n"
+        "_Static_assert(sizeof(union U) == 32, \"clang: 32\");\n"
+        "_Static_assert(_Alignof(union U) == 32, \"clang: 32\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// THE THREE-CHANNEL INTERACTION: composite `aligned(16)` + composite `packed` + a
+// MEMBER `alignas(8)`. CLANG (MEASURED, compiled and run):
+//     struct K { char a; _Alignas(8) int b; } __attribute__((packed, aligned(16)));
+//         → sizeof 16, _Alignof 16
+// Each channel does its own job and none overrides another: packed drops the
+// per-field baseline to 1, the member alignas raises member `b` back to 8 (so b@8,
+// extent 12), and the composite aligned(16) raises the aggregate — rounding 12 up
+// to 16. `struct M` is the un-packed twin (same members, aligned(16), no packed) and
+// clang gives it 16 / 16 as well — the member alignas(8) already pushes `b` to 8
+// either way, so these two AGREE, which is the point: this pin is a clang-conformance
+// check on the three-way composition, NOT a packed discriminator. The pin that
+// isolates packed under a composite aligned is
+// `CompositeScanAccumulatesAcrossAdjacentAttrSpecifiers` (6/2 vs 5/1 vs 8/4).
+TEST(SemanticAnalyzerCSubset, CompositeAlignedComposesWithPackedAndMemberAlignas) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct K { char a; alignas(8) int b; }"
+        " __attribute__((packed, aligned(16)));\n"
+        "_Static_assert(sizeof(struct K) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct K) == 16, \"clang: 16\");\n"
+        "struct M { char a; alignas(8) int b; } __attribute__((aligned(16)));\n"
+        "_Static_assert(sizeof(struct M) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct M) == 16, \"clang: 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed (baseline 1), member alignas (raises one field) and composite "
+           "aligned (raises the aggregate) are three independent channels";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The SHARED alignment ladder still applies to the composite position — an
+// `aligned(3)` on a struct definition is not a power of two and fails loud with the
+// SAME code `alignas(3)` uses, because it is literally the same `foldAlignmentOperand`
+// call. RED-ON-DISABLE: route the composite clause around the shared ladder and this
+// count drops to 0 (the struct would silently lay out un-aligned).
+TEST(SemanticAnalyzerCSubset, CompositeAlignedNonPowerOfTwoFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct B { char a; int b; } __attribute__((aligned(3)));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "a composite aligned(3) must reject for the same reason and with the "
+           "same code as alignas(3) — one ladder, not two";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasNotPowerOfTwo) continue;
+        EXPECT_NE(d.actual.find("aligned"), std::string::npos) << d.actual;
+    }
+}
+
+// The BARE composite `__attribute__((aligned))` (no argument) means "the target's
+// maximum useful alignment" in gcc — a target-dependent number this engine refuses
+// to invent. It fails LOUD, exactly like the declaration-level bare form, rather
+// than being silently treated as no request at all.
+TEST(SemanticAnalyzerCSubset, CompositeBareAlignedWithNoArgumentFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct C { char a; int b; } __attribute__((aligned));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
+            << d.actual;
+    }
+}
+
+// ★★ THE MULTI-SURFACE COMPOSITE SCAN (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION).
+// `scanCompositePacked` must be surface-COUNT-agnostic: it accumulates EVERY
+// matching attribute surface on the specifier node rather than selecting the first
+// and stopping. The `break` it used to carry is what BLOCKED the after-keyword slot
+// (`struct __attribute__((packed)) S { … };`, the `mach-o/dyld_images.h` shape) —
+// with it, a lead slot under a distinct rule name is invisible to the scan and
+// `packed` is silently dropped, MEASURED as a clean compile at sizeof 8 against
+// clang's 5.
+//
+// ★ WHAT THIS TEST PINS, AND WHAT IT DOES NOT. The shipped c-subset grammar has
+// exactly ONE composite attribute surface today (the trailing `compositeAttrList`)
+// and declares no `declarationAttrSlotRules` on `structSpec`/`unionSpec`, so a
+// two-ROOT tree is not constructible from C source yet — the after-keyword pin is
+// WAITING on the config re-add and is NOT live here. What IS reachable, and is
+// pinned below, is the same generalization one level in: TWO ADJACENT attribute
+// SPECIFIERS under that one surface, contributing DIFFERENT facts. If the scan
+// stops at the first attribute node, `aligned(16)` is lost and the size reverts.
+//
+// ★ THE NUMBERS ARE CHOSEN TO DISCRIMINATE. `aligned(2)` on a `{char, int}` is the
+// one value where each attribute is independently observable — drop either and BOTH
+// assertions move, in DIFFERENT directions. CLANG GROUND TRUTH (MEASURED, compiled
+// and run on arm64 macOS, `-fsyntax-only -Wall -Wextra -isysroot $(xcrun
+// --show-sdk-path)` clean):
+//     struct V {char a; int b;} __attribute__((packed)) __attribute__((aligned(2)));
+//         → sizeof 6, _Alignof 2     ← BOTH honored
+//     ...with only `packed`                 → sizeof 5, _Alignof 1
+//     ...with only `aligned(2)`             → sizeof 8, _Alignof 4
+// Reversing the two specifiers (`struct W`) gives 6 / 2 as well: the scan is
+// ORDER-independent, which is the other half of "no clause swallows another".
+TEST(SemanticAnalyzerCSubset, CompositeScanAccumulatesAcrossAdjacentAttrSpecifiers) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct V { char a; int b; }"
+        " __attribute__((packed)) __attribute__((aligned(2)));\n"
+        "_Static_assert(sizeof(struct V) == 6, \"clang: 6 (both honored)\");\n"
+        "_Static_assert(_Alignof(struct V) == 2, \"clang: 2 (both honored)\");\n"
+        "struct W { char a; int b; }"
+        " __attribute__((aligned(2))) __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct W) == 6, \"clang: order-independent\");\n"
+        "_Static_assert(_Alignof(struct W) == 2, \"clang: order-independent\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the composite scan must examine EVERY attribute specifier on the "
+           "surface: keeping only the first gives 5/1 or 8/4, never clang's 6/2";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The strict UNKNOWN-name gate on a composite is UNCHANGED by the new `aligned`
+// arm — a typo'd GNU composite attribute still fails loud, and specifically a typo
+// of `aligned` itself does NOT slip through the effect-row match. This is the
+// control that proves the new arm keys on the DECLARED effect row, not on "the
+// clause has an argument".
+TEST(SemanticAnalyzerCSubset, CompositeMisspelledAlignedStillFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct D { char a; int b; } __attribute__((alinged(16)));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a typo'd composite attribute must not be silently unapplied";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_NE(d.actual.find("alinged"), std::string::npos) << d.actual;
+    }
 }

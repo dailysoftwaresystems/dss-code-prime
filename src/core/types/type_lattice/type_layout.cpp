@@ -39,6 +39,33 @@ namespace {
     return a.bytes() >= b.bytes() ? a : b;
 }
 
+// D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the SEED alignment a composite's own layout
+// starts from — its WHOLE-COMPOSITE explicit alignment request
+// (`__attribute__((aligned(N)))` on a struct/union DEFINITION), or 1 when it has
+// none. Seeding is what realizes C 6.7.5's MAX rule BY CONSTRUCTION: every
+// subsequent fold in the Struct/Union arms is `maxAlign(out.align, …)`, which can
+// only RAISE, so the aggregate ends at max(natural, requested) and a request WEAKER
+// than natural is automatically a no-op (clang: `struct {char;int;}
+// __attribute__((aligned(2)))` stays align 4 / size 8) — with no comparison branch
+// to get backwards, and no interaction to re-derive per arm.
+//
+// It composes with `packed` rather than fighting it: packed lowers the per-FIELD
+// baseline to 1 (removing inter-field padding), this raises the AGGREGATE's own
+// alignment, so `packed, aligned(16)` lands at clang's sizeof 16 — offsets packed
+// tight, total rounded up to 16 — and NOT at packed's bare 5.
+//
+// AGNOSTIC: `explicitCompositeAlign` is language/target-neutral interned data and
+// the cap is the `Alignment` newtype's own domain, not a hardcoded ABI number.
+// Returns nullopt when the stored value is not a representable alignment — an
+// upstream bug (`completeComposite` rejects it at the sink) — so layout fails LOUD
+// rather than silently mis-aligning, mirroring the member-alignas `fromBytes` reject.
+[[nodiscard]] std::optional<Alignment>
+compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
+    std::uint32_t const req = interner.explicitCompositeAlign(id);
+    if (req == 0) return Alignment::of<1>();   // no request → the unchanged path
+    return Alignment::fromBytes(req);
+}
+
 // Is the declared bit-field strategy one the engine actually realizes? A
 // declared-but-unbuilt strategy (e.g. a future ABI value) — and `None` (not
 // declared at all) — fail loud at the consumer rather than silently using a
@@ -457,7 +484,17 @@ computeLayout(TypeId id, TypeInterner const& interner,
         case TypeKind::Struct: {
             auto const fields = interner.operands(id);
             StructLayout out{};
-            out.align = Alignment::of<1>();
+            // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): SEED the aggregate alignment with
+            // the whole-composite `aligned(N)` request (1 when there is none — the
+            // unchanged path). Every later fold is a `maxAlign`, so this realizes
+            // C 6.7.5's max(natural, requested) rule for EVERY struct arm at once —
+            // the explicit-offset arm, the packed/plain byte arm, and both bit-field
+            // packers, which each end with `out.align.alignUp(...)`. Field OFFSETS
+            // are unaffected: they are placed from the per-FIELD `effectiveAlign`,
+            // never from `out.align`.
+            auto const seed = compositeSeedAlign(interner, id);
+            if (!seed) return std::nullopt;   // unrepresentable stored request
+            out.align = *seed;
             out.fieldOffsets.reserve(fields.size());
             // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct carrying EXPLICIT
             // per-field byte offsets (an FFI overlapping-union modeled as a struct)
@@ -485,9 +522,17 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // D-CSUBSET-PACKED: the whole-composite packed flag (C/C23
             // `__attribute__((packed))`) removes ALL derived inter-field padding —
             // the per-field baseline alignment becomes 1 — and the aggregate's own
-            // alignment stays 1 (out.align already seeded to 1). Read once; fed into
-            // `effectiveAlign`'s baseline below. An UNPACKED struct leaves `packed`
-            // false and the baseline is the field's natural align (the unchanged path).
+            // alignment stays at the seed (1 unless a whole-composite `aligned(N)`
+            // raised it). Read once; fed into `effectiveAlign`'s baseline below. An
+            // UNPACKED struct leaves `packed` false and the baseline is the field's
+            // natural align (the unchanged path).
+            //
+            // D-CSUBSET-COMPOSITE-ALIGNED: packed and a whole-composite `aligned(N)`
+            // are NOT in conflict and BOTH apply — packed removes the inter-field
+            // padding (baseline 1 below), the request raises the aggregate's own
+            // alignment (already in `out.align`). That combination is exactly why
+            // clang gives `struct S { char a; int b; } __attribute__((packed,
+            // aligned(16)));` sizeof 16 / _Alignof 16, not packed's bare 5 / 1.
             bool const packed = interner.isPacked(id);
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
@@ -584,7 +629,15 @@ computeLayout(TypeId id, TypeInterner const& interner,
         case TypeKind::Union: {
             auto const fields = interner.operands(id);
             StructLayout out{};
-            out.align = Alignment::of<1>();
+            // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): SEED with the whole-composite
+            // `aligned(N)` request (1 when none), exactly as the Struct arm does —
+            // the per-member folds below only ever RAISE it, and the arm's closing
+            // `out.align.alignUp(maxSize)` then grows the union's size to match.
+            // clang: `union U { char a; int b; } __attribute__((aligned(32)));`
+            // is sizeof 32 / _Alignof 32 (MEASURED).
+            auto const seed = compositeSeedAlign(interner, id);
+            if (!seed) return std::nullopt;   // unrepresentable stored request
+            out.align = *seed;
             out.fieldOffsets.assign(fields.size(), 0);  // every variant at offset 0
             // FC8 bitfields: a union bit-field member occupies bits [0, W) of its
             // OWN allocation unit at offset 0 (members are independent). This
@@ -597,7 +650,9 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // D-CSUBSET-PACKED: a packed union (`union {…} __attribute__((packed))`)
             // has natural alignment 1 — the members already sit at offset 0, so packed
             // only lowers the union's OWN alignment (and thus how it aligns when
-            // embedded). Read once; fed into effectiveAlign's baseline below.
+            // embedded). Read once; fed into effectiveAlign's baseline below. A
+            // whole-composite `aligned(N)` still RAISES it back (the seed above) —
+            // packed and the request are independent, as in the Struct arm.
             bool const packed = interner.isPacked(id);
             bool const anyBitfield = !interner.scalars(id).empty();
             // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the

@@ -2990,7 +2990,135 @@ struct AttributeSemanticsFacts {
     std::string deprecatedMessage;
     bool        nodiscard   = false;   // warnOnDiscard row matched
     std::string nodiscardMessage;
+    // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
+    // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
+    // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
+    // nullopt = no `aligned` clause (or every one of them errored / folded to the
+    // 6.7.5p3 no-op zero).
+    std::optional<std::uint32_t> alignment;
 };
+
+// TF-C73: the OPERAND node inside ONE attribute clause's argument group — the
+// node `foldAlignmentOperand` should fold for `__attribute__((aligned(N)))`.
+// Locates the clause's DIRECT `cfg.attributeArgRule` child (never a fixed index),
+// then descends through whatever list/item WRAPPERS the grammar interposes
+// (`attrArgs > attrArgList > attrArgItem > attrArgAtom` today) by following the
+// SOLE Internal visible child. DEPTH-AGNOSTIC on purpose: TF-C72 already added
+// one wrapper level to this exact path and silently broke a message decode by
+// reading a fixed depth; the next reshape must not be able to repeat that.
+// Returns an INVALID NodeId when the clause has no argument group at all (bare
+// `__attribute__((aligned))`) or an EMPTY one (`aligned()`) — the caller FAILS
+// LOUD on both rather than guessing "maximum useful alignment".
+[[nodiscard]] NodeId attrClauseArgOperand(SemanticConfig const& cfg,
+                                          Tree const& tree, NodeId clauseNode) {
+    if (!cfg.attributeArgRule.valid() || !clauseNode.valid()) return {};
+    NodeId group{};
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c).v == cfg.attributeArgRule.v) { group = c; break; }
+    }
+    if (!group.valid()) return {};
+    NodeId cur = group;
+    for (int guard = 0; guard < 32; ++guard) {
+        NodeId only{};
+        int n = 0;
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) == NodeKind::Internal) { only = c; ++n; }
+        }
+        if (n != 1) break;   // 0 = empty parens; >1 = a multi-argument list
+        cur = only;
+    }
+    if (cur.v == group.v) return {};   // `aligned()` — an argument group with nothing in it
+    return cur;
+}
+
+// TF-C73: collect every ATTRIBUTE NODE (a GNU `attrSpec` / a C23 `stdAttr`) in
+// `root`'s subtree, STOPPING AT each one (an attribute never nests inside another).
+// The ONE walk both attribute consumers share — `scanAttributeSemantics` (effect
+// folding) and `scanCompositePacked` (the composite `packed` scan) — so a grammar
+// reshape that moves attributes cannot fix one consumer and silently leave the
+// other reading the old shape. Tolerates a WRAPPER between `root` and the
+// attribute node (c-subset's `compositeAttr` alt), since it descends until it
+// matches rather than reading a fixed child.
+void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
+                      std::vector<NodeId>& out) {
+    if (!root.valid()) return;
+    if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
+    std::vector<NodeId> stack{root};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId const c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(c);
+        if ((cfg.stdAttrRule.valid()  && r.v == cfg.stdAttrRule.v)
+            || (cfg.attrSpecRule.valid() && r.v == cfg.attrSpecRule.v)) {
+            out.push_back(c);
+            continue;   // stop AT the attribute node
+        }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+}
+
+// TF-C73: enumerate the CLAUSES of ONE attribute node, and report which FORM it
+// is (return true = the C23 `[[...]]` standard form, whose unknown names are
+// standard-IGNORABLE; false = the GNU `__attribute__` form, whose unknown names
+// are meaningful and fail loud). Every clause is yielded EXACTLY ONCE, which is
+// the whole point: before this existed, only the FIRST clause of
+// `__attribute__((a, b))` was ever examined.
+//
+//   • C23 `[[a, b]]` → each `stdAttrItem` Internal child is one clause. The
+//     per-item loop is the ONLY producer for this form; a generic "nested node
+//     with a direct identifier child" descent would yield each item a SECOND time
+//     (and double-fire its diagnostics), so this arm returns immediately.
+//   • GNU `__attribute__((a, b))` → the `attrSpec` node ITSELF is clause #1 (its
+//     name is a DIRECT identifier child, which is exactly what
+//     `extractOneAttrClause` reads), and each trailing clause nests in its own
+//     node carrying its OWN direct identifier. Trailing clauses are found
+//     STRUCTURALLY ("a nested node with a direct name identifier"), never by rule
+//     NAME — the same model `extractOneAttrClause`'s sibling-clause skip already
+//     uses, so the two cannot disagree about what a clause is.
+//
+// ★ THE ARGUMENT-GROUP EXCLUSION is load-bearing: the descent NEVER enters a
+// `cfg.attributeArgRule` subtree. `format(printf,1,2)` nests its argument
+// identifier `printf` in an `attrArgAtom` whose direct child IS an identifier —
+// so without this skip the structural rule would mint a PHANTOM clause named
+// `printf` and fail it loud as an unknown attribute, on legal C.
+[[nodiscard]] bool
+collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
+                   std::vector<NodeId>& out) {
+    if (!attrNode.valid() || tree.kind(attrNode) != NodeKind::Internal) return false;
+    RuleId const r = tree.rule(attrNode);
+    if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
+        for (NodeId item : visibleChildren(tree, attrNode))
+            if (tree.kind(item) == NodeKind::Internal) out.push_back(item);
+        return true;   // the standard, ignorable form
+    }
+    if (!cfg.attrSpecRule.valid() || r.v != cfg.attrSpecRule.v) return false;
+    out.push_back(attrNode);   // clause #1 — its name is a direct child
+    auto const ownsName = [&](NodeId n) {
+        if (!cfg.identifierToken.valid()) return false;
+        for (NodeId g : visibleChildren(tree, n))
+            if (tree.kind(g) == NodeKind::Token
+                && tree.tokenKind(g) == cfg.identifierToken)
+                return true;
+        return false;
+    };
+    std::vector<NodeId> stack;
+    for (NodeId c : visibleChildren(tree, attrNode))
+        if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
+    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        NodeId const cur = stack.back(); stack.pop_back();
+        RuleId const cr = tree.rule(cur);
+        // ★ never descend into an ARGUMENT group (the phantom-clause exclusion),
+        // and never re-enter a nested attribute node (its own arm owns its clauses).
+        if (cfg.attributeArgRule.valid() && cr.v == cfg.attributeArgRule.v) continue;
+        if (cfg.stdAttrRule.valid()      && cr.v == cfg.stdAttrRule.v)      continue;
+        if (cr.v == r.v)                                                    continue;
+        if (ownsName(cur)) { out.push_back(cur); continue; }   // a trailing clause
+        for (NodeId g : visibleChildren(tree, cur))
+            if (tree.kind(g) == NodeKind::Internal) stack.push_back(g);
+    }
+    return false;   // the GNU, fail-loud form
+}
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): extract ONE attribute clause from a
 // clause node — a whole `attrSpec` (`__attribute__((deprecated("m")))` is ONE
@@ -2998,51 +3126,196 @@ struct AttributeSemanticsFacts {
 // `[[...]]`). The NAME is the LAST identifier among the node's DIRECT visible
 // children (the `::`-namespaced form's final segment — `gnu::packed` → `packed`;
 // both shapes inline their sequences, so the identifier(s) land flat),
-// dunder-normalized via the shared `stripDunder`. The OPTIONAL string argument
-// is the sole Internal direct child (a `stringLiteralExpr`), decoded via the
-// SHARED `decodeAdjacentStringBodies` chokepoint (the static_assert message
-// precedent — escapes + adjacent concat decode identically everywhere). A
-// clause with no identifier (an empty `__attribute__(())`) yields nullopt.
+// dunder-normalized via the shared `stripDunder`. A clause with no identifier
+// (an empty `__attribute__(())`) yields nullopt. The name is resolved to its
+// `attributeEffects` ROW here (`row` — nullptr = a name the language does not
+// model), so the clause's effect and its argument validity are decided at ONE
+// site.
+//
+// The OPTIONAL string argument is found by SEARCHING the clause's argument
+// subtree — deliberately NOT a fixed child index and NOT a fixed descent path.
+// Pre-TF-C62 the argument WAS the sole Internal direct child; TF-C62 pushed the
+// GNU form's argument down into an `attrArgs` subtree and TF-C72 added another
+// `attrArgAtom` level, so the string now sits an implementation-defined number
+// of levels deep (`attrArgs > attrArgList > attrArgItem > attrArgAtom >
+// stringLiteralExpr` today) — and an `attrSpec` may carry `attrClauseTail`
+// Internal children beside the argument. Reading the first Internal child
+// therefore handed `decodeAdjacentStringBodies` a node with NO body children:
+// it returned "" (its documented no-body-child result), NOT nullopt, and the
+// message was SILENTLY dropped (measured: `__attribute__((deprecated("use g")))`
+// warned `f`, the C23 `[[deprecated("use g")]]` warned `f: use g`). The search
+// is DEPTH-AGNOSTIC so the next grammar reshape cannot re-open that drop.
+//
+// Two scoping rules keep the search on THIS clause's argument:
+//   • a node matching the language's `stringLiteralExprRule` IS the string
+//     argument — descent STOPS there, so a C 5.1.1.2 phase-6 adjacent-concat run
+//     (`deprecated("use " "g")`) stays ONE argument and decodes through the
+//     SHARED `decodeAdjacentStringBodies` chokepoint (the static_assert message
+//     precedent — escapes + concat decode identically everywhere). A language
+//     that declares no such rule falls back to "a node with a direct body token",
+//     the shape that chokepoint decodes, so a message is never silently lost;
+//   • a nested Internal node carrying its OWN direct name identifier is a
+//     SIBLING CLAUSE (`__attribute__((deprecated, visibility("hidden")))` nests
+//     the second clause in `attrClauseTail`), never this clause's argument — it
+//     is skipped WHOLESALE. That is exactly the "the name is a direct identifier
+//     child" model this function uses for the clause itself, applied recursively;
+//     without it the first clause would silently adopt a LATER clause's string.
+//
+// EXACTLY ONE string argument ⇒ decoded into `message`. NONE ⇒ `message` stays
+// nullopt — which is why it is an optional at all: `__attribute__((deprecated))`
+// has NO message while `__attribute__((deprecated("")))` has an explicitly EMPTY
+// one, and collapsing both to "" is the silent drop above. MORE THAN ONE (the
+// message is AMBIGUOUS), or a MALFORMED escape (the chokepoint decodes nothing),
+// leaves `message` nullopt and fails loud S_UnknownTypeAttribute — the semantic
+// tier's "an attribute in a honored position whose form this implementation
+// cannot honor, fail loud rather than silently drop an attribute the program may
+// depend on" code (the mirror of `linkageFrom`'s H_UnknownLinkageSpecifier
+// fail-loud on a concatenated specifier argument). NEITHER path guesses.
+//
+// Both fail-louds are gated on the name being one the language MODELS
+// (`row != nullptr`), which is load-bearing: an UNMODELLED multi-string GNU
+// attribute (`__attribute__((__availability__(macos, message="a",
+// replacement="b")))` — real SDK-header shape, TF-C72's motivating case) has no
+// consumed message to lose, so it stays inert exactly as before, never newly
+// rejected.
 struct AttributeClause {
-    std::string_view name;      // dunder-normalized final name segment
-    std::string      message;   // decoded string argument ("" = none/undecodable)
+    std::string_view                name;      // dunder-normalized final name segment
+    std::optional<std::string>      message;   // decoded string argument (nullopt = NONE)
+    AttributeSemanticsRow const*    row = nullptr;   // matched effect row (nullptr = unmodelled)
 };
+//
+// ★ TF-C73 `emitDiagnostics` — the DOUBLE-FIRE gate. The two `failLoud` calls
+// below were previously UNCONDITIONAL while the unknown-NAME warning in the
+// caller was already gated on `emitUnknown`. That asymmetry meant any second
+// visit of the same clause (which multi-root scanning makes reachable) emitted
+// the malformed/ambiguous-argument S_UnknownTypeAttribute TWICE for ONE spelling
+// — a doubled error on a shared DiagnosticCode, which is precisely the failure a
+// bare-count test cannot see. The flag now covers EVERY diagnostic this function
+// can emit, so "am I the once-per-declaration emitting visit?" has ONE answer
+// instead of two. (Visiting is also exactly-once by construction — the caller
+// scans declaration-level roots ONCE and copies the facts per declarator — so
+// this gate is the belt to that braces.)
 [[nodiscard]] std::optional<AttributeClause>
 extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
-                     Tree const& tree, NodeId clauseNode) {
+                     Tree const& tree, NodeId clauseNode,
+                     bool emitDiagnostics) {
     NodeId nameTok{};
-    NodeId msgNode{};
     for (NodeId c : visibleChildren(tree, clauseNode)) {
-        if (tree.kind(c) == NodeKind::Token) {
-            if (cfg.identifierToken.valid()
-                && tree.tokenKind(c) == cfg.identifierToken) {
-                nameTok = c;   // LAST identifier wins → the ::-final segment
-            }
-            continue;
+        if (tree.kind(c) != NodeKind::Token) continue;
+        if (cfg.identifierToken.valid()
+            && tree.tokenKind(c) == cfg.identifierToken) {
+            nameTok = c;   // LAST identifier wins → the ::-final segment
         }
-        // The only Internal child either shape admits is the parenthesized
-        // string-literal argument (`stringLiteralExpr`).
-        if (!msgNode.valid()) msgNode = c;
     }
     if (!nameTok.valid()) return std::nullopt;
     AttributeClause out;
     out.name = stripDunder(tree.text(nameTok));
-    if (msgNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
-        if (auto decoded = decodeAdjacentStringBodies(
-                tree, msgNode, s.idx().stringLiteralBodyToken)) {
-            out.message = std::move(*decoded);
+    for (auto const& r : cfg.attributeEffects) {
+        for (auto const& nm : r.names) {
+            if (out.name == nm) { out.row = &r; break; }
         }
+        if (out.row != nullptr) break;
+    }
+    if (!s.idx().stringLiteralBodyToken.valid()) return out;
+    // A string-literal ARGUMENT node: the language's declared string-expression
+    // rule when it has one, else any node the shared chokepoint can decode (one
+    // carrying a direct body token). Keyed on config, never on a rule NAME here.
+    auto const isStringArg = [&](NodeId n) {
+        if (s.idx().stringLiteralExprRule.valid())
+            return tree.rule(n).v == s.idx().stringLiteralExprRule.v;
+        for (NodeId c : tree.children(n)) {
+            if (tree.kind(c) == NodeKind::Token
+                && tree.tokenKind(c).v == s.idx().stringLiteralBodyToken.v)
+                return true;
+        }
+        return false;
+    };
+    // A nested node with its OWN direct name identifier is a SIBLING clause.
+    auto const startsOwnClause = [&](NodeId n) {
+        if (!cfg.identifierToken.valid()) return false;
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Token
+                && tree.tokenKind(c) == cfg.identifierToken)
+                return true;
+        }
+        return false;
+    };
+    NodeId strNode{};
+    bool   ambiguous = false;
+    std::vector<NodeId> stack;
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
+    }
+    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        NodeId const cur = stack.back();
+        stack.pop_back();
+        if (isStringArg(cur)) {
+            if (strNode.valid()) { ambiguous = true; break; }
+            strNode = cur;
+            continue;   // STOP at the string node — an adjacent-concat run is ONE argument
+        }
+        if (startsOwnClause(cur)) continue;   // a later clause's args, not ours
+        for (NodeId g : visibleChildren(tree, cur)) {
+            if (tree.kind(g) == NodeKind::Internal) stack.push_back(g);
+        }
+    }
+    // Both message-loss paths report through ONE gate: a name the language MODELS
+    // (an unmodelled attribute's message is never consumed, so its argument form
+    // stays its own business and nothing is dropped).
+    auto const failLoud = [&](std::string reason) {
+        if (out.row == nullptr) return;
+        if (!emitDiagnostics) return;   // ★ not the emitting visit — never double-fire
+        // ★ TF-C73: the gate is "is this clause's MESSAGE actually CONSUMED?", not
+        // the weaker "is the NAME modelled?" it started as. Only the two warning
+        // effects ever read `message`; `none` / `suppressUnused` / `align` rows
+        // never look at it, so a string-argument problem costs them nothing and
+        // must not be reported. This matters the moment a real SDK attribute joins
+        // the table as INERT: `availability` is now a modelled `none` row, and
+        // `__attribute__((__availability__(macos, message="a", replacement="b")))`
+        // — genuine macOS SDK shape — legitimately carries TWO strings. Under the
+        // name-based gate that became an ERROR and every SDK header using the
+        // availability form stopped compiling (MEASURED as a regression here).
+        // Keying on consumption instead means a row can be added to the table for
+        // its NAME alone without inheriting an argument-form contract it does not
+        // participate in.
+        if (out.row->effect != AttributeEffect::WarnOnUse
+            && out.row->effect != AttributeEffect::WarnOnDiscard) return;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(clauseNode);
+        d.actual   = std::move(reason);
+        s.reporter.report(std::move(d));
+    };
+    if (ambiguous) {
+        failLoud(std::format("attribute '{}' carries more than one string argument",
+                             out.name));
+        return out;   // message stays nullopt — never guess WHICH string was meant
+    }
+    if (strNode.valid()) {
+        out.message = decodeAdjacentStringBodies(
+            tree, strNode, s.idx().stringLiteralBodyToken);
+        // The chokepoint returns nullopt on a MALFORMED escape (C 5.1.1.2 phase 5).
+        // Left unreported that is the SAME silent drop as the nesting defect above,
+        // just via a different door — `deprecated("bad\uZZZZ")` would warn with the
+        // message quietly gone (MEASURED before this gate existed).
+        if (!out.message.has_value())
+            failLoud(std::format("attribute '{}' has a malformed escape in its "
+                                 "string argument", out.name));
     }
     return out;
 }
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the attribute-semantics effects
 // over every attribute specifier in `startNode`'s subtree (a declaration's
-// STRIPPED specifier prefix, or a bare attribute-declaration statement). A
-// bounded descent that STOPS AT each attribute node: a `stdAttrRule` node
-// (C23 `[[...]]`) contributes one clause per Internal child (`stdAttrItem` —
-// `[[a, b]]` is two clauses); an `attrSpecRule` node (GNU `__attribute__`) is
-// ONE clause. Each clause's name is matched (dunder-normalized) against the
+// STRIPPED specifier prefix, a DECLARATOR's after-declarator attribute run, or a
+// bare attribute-declaration statement). The shared `collectAttrNodes` +
+// `collectAttrClauses` enumerators supply the clauses: a `stdAttrRule` node
+// (C23 `[[...]]`) contributes one clause per `stdAttrItem` (`[[a, b]]` is two),
+// and a GNU `attrSpecRule` node contributes its first clause PLUS every trailing
+// `, b` clause (TF-C73 — folding only the first is how `((__nothrow__,
+// aligned(32)))` silently dropped the alignment). Each name is matched against the
 // config's `attributeEffects` rows and the matched row's effect folds into
 // `out` (messages first-non-empty-wins).
 //
@@ -3053,27 +3326,55 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 // pre-existing loud gates (file-scope H_UnknownLinkageSpecifier at the HIR
 // linkage scan; the block-scope wholesale-ignore is the named deferral
 // D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME).
+// The GNU `aligned(N)` arm folds its operand through the SHARED alignment ladder,
+// which is DEFINED below this TU point (it sits with the alignas machinery it was
+// extracted from) — forward-declare it, the same way `constIntExpr` is.
+[[nodiscard]] std::optional<std::uint32_t>
+foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId argNode, NodeId diagNode, ScopeId fromScope);
+
 void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                             Tree const& tree, NodeId startNode,
-                            bool emitUnknown, AttributeSemanticsFacts& out) {
+                            bool emitUnknown, AttributeSemanticsFacts& out,
+                            ScopeId fromScope = {},
+                            bool strictUnknownIsError = false) {
     if (!startNode.valid()) return;
     if (cfg.attributeEffects.empty()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
     auto const foldClause = [&](NodeId clauseNode, bool fromStdForm) {
-        auto clause = extractOneAttrClause(s, cfg, tree, clauseNode);
+        auto clause = extractOneAttrClause(s, cfg, tree, clauseNode,
+                                           /*emitDiagnostics=*/emitUnknown);
         if (!clause.has_value()) return;
-        AttributeSemanticsRow const* row = nullptr;
-        for (auto const& r : cfg.attributeEffects) {
-            for (auto const& nm : r.names) {
-                if (clause->name == nm) { row = &r; break; }
-            }
-            if (row != nullptr) break;
-        }
+        // The name→effect-row match is `extractOneAttrClause`'s (it needs the row
+        // to decide whether a malformed argument is worth failing loud over), so
+        // there is exactly ONE match site and no drift between the two.
+        AttributeSemanticsRow const* row = clause->row;
         if (row == nullptr) {
             if (fromStdForm && emitUnknown) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::S_UnknownAttribute;
                 d.severity = DiagnosticSeverity::Warning;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(clauseNode);
+                d.actual   = std::string{tree.text(clauseNode)};
+                s.reporter.report(std::move(d));
+            }
+            // ★ TF-C73 — THE STRICT UNKNOWN-NAME GATE (work item 3).
+            // A `typedefDecl` declares NO `linkageSpecifiers`, so `linkageFrom`
+            // early-returns and an unknown GNU name in a typedef position was
+            // reported by NOBODY: `typedef __attribute__((desprecated)) int T;`
+            // compiled clean with the decoration silently unapplied. When the
+            // declaration row opts in (`unknownStrictAttributeIsError`) and the
+            // form is GNU, that is now an ERROR — the SAME code and severity
+            // `scanCompositePacked` already uses for an unrecognized strict
+            // attribute, so the two strict surfaces speak with one voice.
+            // The C23 `[[...]]` path is untouched: C23 REQUIRES an unknown
+            // standard attribute to be ignorable, so it keeps its suppressible
+            // S_UnknownAttribute Warning above and never reaches here.
+            if (!fromStdForm && emitUnknown && strictUnknownIsError) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(clauseNode);
                 d.actual   = std::string{tree.text(clauseNode)};
@@ -3087,66 +3388,104 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 break;
             case AttributeEffect::WarnOnUse:
                 out.deprecated = true;
-                if (out.deprecatedMessage.empty())
-                    out.deprecatedMessage = std::move(clause->message);
+                if (out.deprecatedMessage.empty() && clause->message.has_value())
+                    out.deprecatedMessage = std::move(*clause->message);
                 break;
             case AttributeEffect::WarnOnDiscard:
                 out.nodiscard = true;
-                if (out.nodiscardMessage.empty())
-                    out.nodiscardMessage = std::move(clause->message);
+                if (out.nodiscardMessage.empty() && clause->message.has_value())
+                    out.nodiscardMessage = std::move(*clause->message);
                 break;
+            case AttributeEffect::Align: {
+                // TF-C73: GNU `__attribute__((aligned(N)))`. The operand folds
+                // through the SAME `foldAlignmentOperand` ladder `alignas` uses —
+                // one power-of-two check, one >256 cap, one non-constant check, the
+                // same three diagnostic codes. MAX-fold per C 6.7.5p6.
+                NodeId const operand =
+                    attrClauseArgOperand(cfg, tree, clauseNode);
+                if (!operand.valid()) {
+                    // ★ BARE `__attribute__((aligned))` — gcc reads this as "the
+                    // largest alignment useful on this target", a TARGET-dependent
+                    // number this engine has no business inventing (and which is
+                    // exactly the sort of quiet guess that produces a wrong ABI).
+                    // FAIL LOUD instead; the programmer can write the number.
+                    if (emitUnknown) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(clauseNode);
+                        d.actual   = std::format(
+                            "attribute '{}' requires an explicit alignment argument "
+                            "(the bare form means the target's maximum useful "
+                            "alignment, which this implementation does not assume)",
+                            clause->name);
+                        s.reporter.report(std::move(d));
+                    }
+                    break;
+                }
+                if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
+                                                  /*diagNode=*/clauseNode,
+                                                  fromScope)) {
+                    if (!out.alignment.has_value() || *a > *out.alignment)
+                        out.alignment = a;
+                }
+                break;
+            }
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
     };
-    std::vector<NodeId> stack{startNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) != NodeKind::Internal) continue;
-        RuleId const r = tree.rule(c);
-        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
-            for (NodeId item : visibleChildren(tree, c)) {
-                if (tree.kind(item) == NodeKind::Internal)
-                    foldClause(item, /*fromStdForm=*/true);
-            }
-            continue;   // stop AT the attribute node
-        }
-        if (cfg.attrSpecRule.valid() && r.v == cfg.attrSpecRule.v) {
-            foldClause(c, /*fromStdForm=*/false);
-            continue;   // stop AT the attribute node
-        }
-        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    // TF-C73: EVERY clause of EVERY attribute node, via the shared enumerators.
+    // Previously only the FIRST clause of a GNU `__attribute__((a, b))` was folded,
+    // so `((__nothrow__, aligned(32)))` silently dropped the alignment.
+    std::vector<NodeId> attrNodes;
+    collectAttrNodes(cfg, tree, startNode, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId an : attrNodes) {
+        clauses.clear();
+        bool const stdForm = collectAttrClauses(cfg, tree, an, clauses);
+        for (NodeId cl : clauses) foldClause(cl, stdForm);
     }
 }
 
-// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
-// `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
-// `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
-// alignment via `computeLayout(...)->align` (== _Alignof(T)); anything else
-// (VALUE form) const-evaluates the constant-expression via the SAME `constIntExpr`
-// static_assert / array-dimension folding uses. Validates:
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS) + GNU `aligned(N)` (D-CSUBSET-GNU-ATTRIBUTE):
+// the SHARED alignment-operand ladder — compute + validate the alignment ONE
+// operand node requests. Extracted VERBATIM from `evalOneAlignasSpec` (TF-C73) so
+// the C11 `alignas` path and the GNU `__attribute__((aligned(N)))` path cannot
+// drift: one descent, one type-vs-value discrimination, one `constIntExpr` fold,
+// one no-layout-params guard, one 0/negative/power-of-two/>256 ladder, and the
+// SAME three diagnostics. A second, "equivalent" copy for the attribute path is
+// exactly how a validation ladder rots — `aligned(3)` must reject for the same
+// reason and with the same code as `alignas(3)`, forever, because it is literally
+// the same code. (Pinned: the shared-ladder tests bypass-check that removing this
+// function's pow2/max arms makes BOTH spellings go silent, which is what proves
+// SHARED rather than merely equivalent.)
+//
 //   • 0 ⇒ nullopt, NO error (6.7.5p3: "an alignment specification of zero has no
 //     effect" — a NO-OP, treated as "no override" by the caller);
 //   • not a power of two ⇒ S_AlignasNotPowerOfTwo, nullopt;
 //   • > 256 ⇒ S_AlignasExceedsMax, nullopt (the `Alignment` newtype cap);
 //   • non-constant value ⇒ S_AlignasNonConstant, nullopt.
-// The WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared
-// type). Returns the validated alignment in bytes, or nullopt on 0/error.
+//
+// `argNode` is the operand (an `alignasArg` alt wrapper, or a GNU attribute's
+// argument node); `diagNode` is the node whose span/text every diagnostic carries
+// — the caller's WHOLE construct (the `alignasSpec`, or the attribute clause), so
+// the message points at `alignas(3)` / `aligned(3)`, not at the bare `3`. The
+// WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared type).
 [[nodiscard]] std::optional<std::uint32_t>
-evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                   NodeId alignasSpecNode, ScopeId fromScope) {
+foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId argNode, NodeId diagNode, ScopeId fromScope) {
+    if (!argNode.valid() || !diagNode.valid()) return std::nullopt;
     auto emit = [&](DiagnosticCode code) {
         ParseDiagnostic d;
         d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
-        d.span     = tree.span(alignasSpecNode);
-        d.actual   = std::string{tree.text(alignasSpecNode)};
+        d.span     = tree.span(diagNode);
+        d.actual   = std::string{tree.text(diagNode)};
         s.reporter.report(std::move(d));
     };
-    auto kids = visibleChildren(tree, alignasSpecNode);
-    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
-    NodeId const argNode = kids[cfg.alignasArgChild];
     // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
     // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
     // child's rule. Descend to the sole visible child of the `alignasArg` alt
@@ -3209,9 +3548,40 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return static_cast<std::uint32_t>(uv);
 }
 
-// FC16 (D-CSUBSET-PACKED): scan a struct/union specifier node's TRAILING
-// composite-attribute list (`compositeAttrListRule`) for a honored `packed`
-// attribute. Returns true iff a recognized `packed` spelling is present.
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
+// `alignasSpec` node requests. Locates the `alignasArg` operand (visible-child
+// `alignasArgChild`) and hands it to the SHARED `foldAlignmentOperand` ladder —
+// which owns the type-vs-value discrimination, the fold, and every diagnostic.
+// `diagNode` is the whole `alignasSpec`, so each diagnostic's span/text is
+// byte-identical to the pre-extraction behavior (the regression wall: the alignas
+// path must not shift by one character).
+[[nodiscard]] std::optional<std::uint32_t>
+evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId alignasSpecNode, ScopeId fromScope) {
+    auto kids = visibleChildren(tree, alignasSpecNode);
+    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
+    return foldAlignmentOperand(s, cfg, tree, kids[cfg.alignasArgChild],
+                                /*diagNode=*/alignasSpecNode, fromScope);
+}
+
+// FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the whole-composite
+// attribute facts a struct/union DEFINITION's attribute surfaces contribute.
+//
+// `packed` and `alignment` are two INDEPENDENT channels of the interned composite,
+// not one decision: packed removes the inter-field padding, `aligned(N)` raises the
+// aggregate's own alignment, and they COMBINE (`packed, aligned(16)` is clang
+// sizeof 16 / _Alignof 16 — MEASURED — not packed's bare 5 / 1). Returning them
+// together is what lets ONE clause-by-clause scan feed both without either
+// swallowing the other, which is precisely the bug this function already carries a
+// tombstone for.
+struct CompositeAttrFacts {
+    bool                         packed = false;
+    std::optional<std::uint32_t> alignment;   // nullopt = no honored `aligned(N)`
+};
+
+// FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): scan a
+// struct/union specifier node's composite-attribute surfaces for the honored
+// whole-composite attributes — `packed`, and a GNU/C23 `aligned(N)`.
 //
 // When `emitDiagnostics` is true (the ONE composition site), an UNRECOGNIZED
 // attribute in the STRICT (GNU `__attribute__`) form fails loud
@@ -3228,63 +3598,177 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // IDENTIFIER leaf (dunder-normalized via the shared `stripDunder`, so `__packed__`
 // ≡ `packed` and `[[gnu::packed]]`'s final segment `packed` matches) against
 // `packedAttributeNames` — a string ARGUMENT (`section("packed")`) is a
-// string-literal leaf, not an identifier, so it never false-matches.
-[[nodiscard]] bool
+// string-literal leaf, not an identifier, so it never false-matches. The `aligned`
+// spelling is likewise NOT hardcoded: the clause name is matched against the
+// declared `attributeEffects` rows and honored iff the matched row's effect is
+// `Align`, the same table `scanAttributeSemantics` folds for declarations.
+[[nodiscard]] CompositeAttrFacts
 scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                    NodeId specNode, bool emitDiagnostics) {
-    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return false;
-    // The `compositeAttrList` is the structSpec/unionSpec's trailing direct child.
-    NodeId listNode{};
+                    NodeId specNode, bool emitDiagnostics, ScopeId fromScope = {}) {
+    CompositeAttrFacts facts;
+    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return facts;
+    // TF-C73 MULTI-ROOT, composite edition. A struct/union carries attributes in
+    // TWO positions, and scanning only one is the same silent-drop shape this
+    // cycle is closing everywhere else:
+    //   • the TRAILING `compositeAttrList` — `struct S {...} __attribute__((packed));`
+    //   • the LEADING slot(s) named by this composite row's `declarationAttrSlotRules`
+    //     — `__attribute__((packed)) struct S {...};`
+    // The lead slot is read from the COMPOSITE's own DeclarationRule via
+    // `declByRule` (RuleId → declarations index), so it stays rule-name-driven
+    // config with no new parameter to thread and no rule-name literal here.
+    //
+    // ★★ NO `break`, DELIBERATELY. This loop used to select the FIRST
+    // `compositeAttrList` direct child and STOP, and that single-surface assumption
+    // was load-bearing in the worst way: it is what BLOCKED the after-keyword
+    // composite attribute slot (`struct __attribute__((packed)) S { … };`, the
+    // `mach-o/dyld_images.h` shape — 64 of the SDK audit's 204 `aligned` sites).
+    // With the `break` in place a lead slot under a DISTINCT rule name is invisible
+    // to this scan, so `packed` — KNOWN-and-inert in the effects table — is silently
+    // DROPPED: MEASURED, that shape compiled CLEAN at sizeof 8 against clang's 5,
+    // turning a loud error into a silent miscompile. Reusing the existing rule name
+    // instead forces the slot to be `{optional}`, which shifts the tag off its
+    // positional index and binds a TAGGED struct anonymously. Neither branch is
+    // acceptable, and neither is closable from config.
+    //
+    // So the scan is surface-COUNT-agnostic in BOTH directions — it accumulates
+    // EVERY matching direct child (any number of `compositeAttrList` nodes) AND
+    // every child named by the composite row's own `declarationAttrSlotRules` (the
+    // general lead-slot mechanism this cycle added for typedefs and members). A
+    // scan that handles exactly one attribute list is the same single-site
+    // assumption that produced the clause-swallowing bug tombstoned below.
+    std::vector<RuleId> slotRules;
+    if (auto const dIt = s.idx().declByRule.find(tree.rule(specNode).v);
+        dIt != s.idx().declByRule.end()) {
+        slotRules = cfg.declarations[dIt->second].declarationAttrSlotRules;
+    }
+    std::vector<NodeId> roots;
     for (NodeId c : visibleChildren(tree, specNode)) {
-        if (tree.kind(c) == NodeKind::Internal
-            && tree.rule(c).v == cfg.compositeAttrListRule.v) {
-            listNode = c;
-            break;
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == cfg.compositeAttrListRule.v) { roots.push_back(c); continue; }
+        for (RuleId sr : slotRules)
+            if (tree.rule(c).v == sr.v) { roots.push_back(c); break; }
+    }
+    if (roots.empty()) return facts;
+    // ★★ TF-C73 — THE SILENT MISCOMPILE THIS LOOP USED TO BE.
+    // This scan previously treated a whole attribute NODE as one unit: it walked
+    // the entire subtree looking for ANY identifier naming `packed`, and on a hit
+    // did `packed = true; continue;` — SWALLOWING every other clause in the list.
+    // MEASURED end-to-end on arm64:
+    //     struct S { char a; int b; } __attribute__((packed, aligned(16)));
+    // gave DSS `sizeof` 5 against clang's 16, with ZERO diagnostics — the
+    // `aligned(16)` was parsed and thrown away because `packed` matched first.
+    // The mirror was just as bad: `__attribute__((bogus_xyz, packed))` was
+    // ACCEPTED silently, because the unknown name never got its own look — the
+    // typo protection this function exists for was defeated by clause order.
+    // Both are gone: the list is enumerated CLAUSE BY CLAUSE through the shared
+    // `collectAttrClauses`, so every clause is examined on its own merits and an
+    // unknown GNU name still fails loud no matter which position it sits in.
+    std::vector<NodeId> attrNodes;
+    for (NodeId root : roots) collectAttrNodes(cfg, tree, root, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId attr : attrNodes) {
+        // The STRICT (GNU) form's unknown names are meaningful → fail loud (typo
+        // protection); a C23 `[[...]]` is standard-ignorable. `compositeStrictAttrRule`
+        // names the strict shape for THIS feature; `collectAttrClauses`'s form flag is
+        // the general answer — require both to agree before failing loud, so a
+        // language that declares no strict rule never newly rejects.
+        bool const strict =
+            cfg.compositeStrictAttrRule.valid()
+            && tree.rule(attr).v == cfg.compositeStrictAttrRule.v;
+        clauses.clear();
+        bool const stdForm = collectAttrClauses(cfg, tree, attr, clauses);
+        for (NodeId cl : clauses) {
+            // The clause NAME is the LAST identifier among its DIRECT visible
+            // children — the same reading `extractOneAttrClause` uses (the
+            // `::`-namespaced form's final segment: `gnu::packed` → `packed`),
+            // dunder-normalized through the shared `stripDunder`. Reading DIRECT
+            // children only is what keeps a string ARGUMENT (`section("packed")`)
+            // and an argument IDENTIFIER (`format(printf,1,2)`) from false-matching.
+            NodeId nameTok{};
+            for (NodeId g : visibleChildren(tree, cl)) {
+                if (tree.kind(g) == NodeKind::Token
+                    && cfg.identifierToken.valid()
+                    && tree.tokenKind(g) == cfg.identifierToken)
+                    nameTok = g;
+            }
+            if (!nameTok.valid()) continue;   // an empty `__attribute__(())`
+            std::string_view const id = stripDunder(tree.text(nameTok));
+            bool named = false;
+            for (std::string const& nm : cfg.packedAttributeNames)
+                if (id == nm) { named = true; break; }
+            if (named) { facts.packed = true; continue; }
+            // ★★ TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED) — THE COMPOSITE `aligned(N)`
+            // SINK. Until the interner grew a per-COMPOSITE alignment channel there
+            // was nowhere to put this number, so the clause fell through to the
+            // strict-unknown arm below and failed loud — deliberately, because the
+            // alternative on offer (smuggling it into `fieldAligns[0]`) would have
+            // lied about member 0's `_Alignof`, been unrepresentable for a zero-field
+            // composite, and reinterned as a different type. The channel now exists,
+            // so the clause is HONORED here instead of refused.
+            //
+            // The name is matched against the DECLARED `attributeEffects` rows (the
+            // same table `scanAttributeSemantics` folds), and honored only when the
+            // matched row's effect is `Align` — so the spelling stays config
+            // vocabulary, never a literal in this engine. The operand goes through
+            // the SHARED `foldAlignmentOperand` ladder that `alignas` and the
+            // declaration-level `aligned(N)` both use: one pow2 check, one >256 cap,
+            // one non-constant check, the same three diagnostic codes. MAX-fold over
+            // repeated clauses per C 6.7.5p6 (the strictest wins).
+            //
+            // GATED on `emitDiagnostics`: `foldAlignmentOperand` reports
+            // unconditionally, and the OTHER caller of this function is the member-
+            // alignas baseline probe, which may run once PER MEMBER — folding there
+            // would multiply one bad `aligned(3)` into one diagnostic per member.
+            // The probe reads only `.packed`, so skipping the fold loses nothing.
+            if (emitDiagnostics) {
+                AttributeSemanticsRow const* alignRow = nullptr;
+                for (AttributeSemanticsRow const& row : cfg.attributeEffects) {
+                    if (row.effect != AttributeEffect::Align) continue;
+                    for (std::string const& nm : row.names)
+                        if (id == nm) { alignRow = &row; break; }
+                    if (alignRow != nullptr) break;
+                }
+                if (alignRow != nullptr) {
+                    NodeId const operand = attrClauseArgOperand(cfg, tree, cl);
+                    if (!operand.valid()) {
+                        // ★ BARE `__attribute__((aligned))` on a composite — gcc reads
+                        // it as "the largest alignment useful on this target", a
+                        // TARGET-dependent number this engine has no business
+                        // inventing. FAIL LOUD, exactly as the declaration-level arm
+                        // does; the programmer can write the number.
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(cl);
+                        d.actual   = std::format(
+                            "attribute '{}' requires an explicit alignment argument "
+                            "(the bare form means the target's maximum useful "
+                            "alignment, which this implementation does not assume)",
+                            id);
+                        s.reporter.report(std::move(d));
+                        continue;
+                    }
+                    if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
+                                                      /*diagNode=*/cl, fromScope)) {
+                        if (!facts.alignment.has_value() || *a > *facts.alignment)
+                            facts.alignment = a;
+                    }
+                    continue;   // honored (or already diagnosed) — never "unknown"
+                }
+            }
+            if (strict && !stdForm && emitDiagnostics) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(cl);
+                d.actual   = std::string{tree.text(cl)};
+                s.reporter.report(std::move(d));
+            }
         }
     }
-    if (!listNode.valid()) return false;
-    bool packed = false;
-    // Each visible child of the list is ONE composite attribute (`compositeAttr` ->
-    // attrSpec | stdAttr). For each: does it NAME a packed attribute? and is it the
-    // STRICT (GNU) form (unrecognized -> diagnose) or the ignorable (C23) form?
-    for (NodeId attr : visibleChildren(tree, listNode)) {
-        if (tree.kind(attr) != NodeKind::Internal) continue;
-        bool named  = false;   // this attribute names `packed`
-        bool strict = false;   // this attribute is the GNU `__attribute__` form
-        std::vector<NodeId> stack{attr};
-        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
-            NodeId const cur = stack.back();
-            stack.pop_back();
-            if (tree.kind(cur) == NodeKind::Internal) {
-                if (cfg.compositeStrictAttrRule.valid()
-                    && tree.rule(cur).v == cfg.compositeStrictAttrRule.v) {
-                    strict = true;
-                }
-                for (NodeId g : visibleChildren(tree, cur)) stack.push_back(g);
-                continue;
-            }
-            if (cfg.identifierToken.valid()
-                && tree.tokenKind(cur) == cfg.identifierToken) {
-                std::string_view const id = stripDunder(tree.text(cur));
-                for (std::string const& nm : cfg.packedAttributeNames) {
-                    if (id == nm) { named = true; break; }
-                }
-            }
-        }
-        if (named) { packed = true; continue; }
-        // Not a recognized packed attribute. A GNU `__attribute__` typo / unsupported
-        // spelling fails loud (typo protection); a C23 `[[...]]` is standard-ignorable.
-        if (strict && emitDiagnostics) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-            d.severity = DiagnosticSeverity::Error;
-            d.buffer   = tree.source().id();
-            d.span     = tree.span(attr);
-            d.actual   = std::string{tree.text(attr)};
-            s.reporter.report(std::move(d));
-        }
-    }
-    return packed;
+    return facts;
 }
 
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EFFECTIVE alignment override a
@@ -5826,13 +6310,41 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // `[[maybe_unused]] int a, b;` flags both. emitUnknown=true
                     // — this is the once-per-declaration site, so an unknown
                     // `[[frobnicate]]` warns exactly once even multi-declarator.
+                    // ★ TF-C73 MULTI-ROOT SCAN, roots (a). The scan used to run from
+                    // the specifier prefix ALONE, so an attribute written anywhere
+                    // else on the declaration was parsed and SILENTLY IGNORED — for
+                    // `typedefDecl` that is both of its `typedefAttrRun` slots, i.e.
+                    // the SDK's dominant spellings (`typedef int64_t
+                    // __attribute__((__aligned__(8))) _OSAtomic_int64_t;`).
+                    // `declarationAttrSlotRules` names the DIRECT-CHILD rules that
+                    // carry them, by RULE NAME so a mistake is a loud loader error.
+                    // ORDER IS SOURCE ORDER — prefix first, then the slots in
+                    // `visibleChildren` order — because the fold is
+                    // first-non-empty-wins, and that must mean the LEFTMOST spelling.
                     AttributeSemanticsFacts declAttrFacts;
                     scanAttributeSemantics(
                         s, cfg, tree, specifierPrefixChild(tree, node, decl),
-                        /*emitUnknown=*/true, declAttrFacts);
+                        /*emitUnknown=*/true, declAttrFacts, here,
+                        decl.unknownStrictAttributeIsError);
+                    for (NodeId slot : visibleChildren(tree, node)) {
+                        if (tree.kind(slot) != NodeKind::Internal) continue;
+                        bool isSlot = false;
+                        for (RuleId sr : decl.declarationAttrSlotRules)
+                            if (tree.rule(slot).v == sr.v) { isSlot = true; break; }
+                        if (!isSlot) continue;
+                        scanAttributeSemantics(s, cfg, tree, slot,
+                                               /*emitUnknown=*/true, declAttrFacts,
+                                               here,
+                                               decl.unknownStrictAttributeIsError);
+                    }
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
                     bool alignasContextReported = false;
+                    // TF-C73: the GNU `aligned(N)` twin of `alignasContextReported`
+                    // — a DECLARATION-LEVEL `aligned` is ONE spelling shared by every
+                    // declarator, so an un-honorable context reports once. A
+                    // DECLARATOR-LEVEL one is its own spelling and is NOT gated.
+                    bool attrAlignContextReported = false;
                     std::optional<std::uint32_t> declAlignOverride;
                     for (NodeId dNode : declarators) {
                         // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
@@ -6062,7 +6574,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         && scanCompositePacked(
                                                s, cfg, tree,
                                                s.scopes.scopes()[here.v].anchor,
-                                               /*emitDiagnostics=*/false)) {
+                                               /*emitDiagnostics=*/false).packed) {
                                         naturalBaseline = 1u;
                                     }
                                     declAlignOverride = resolveAlignasOverride(
@@ -6101,6 +6613,40 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // survivor by the post-1.5 sweep so a call sees the flag.
                         if (isFnSig && declHasNoreturn)
                             s.symbols.at(sym).isNoreturn = true;
+                        // ★ TF-C73 ROOT (b) — DECLARATOR-DEPTH ATTRIBUTES.
+                        // `scanAttributeSemantics` used to run from ONE root (the
+                        // specifier prefix), so an attribute written after the
+                        // declarator — `int x __attribute__((deprecated));`, the
+                        // shape SDK headers use constantly — parsed fine and was
+                        // SILENTLY IGNORED. The declarator's own attribute run
+                        // (`afterDeclaratorAttrRules`, the same set
+                        // `isAfterDeclaratorAttrNode` already keeps out of the
+                        // initializer scan) is now a second root.
+                        //
+                        // ★★ PER-DECLARATOR ISOLATION — `attrFacts` is a COPY of the
+                        // declaration-level facts, deliberately NOT a reference. The
+                        // declaration-level scan ran ONCE above (so its diagnostics
+                        // fire once); each declarator then folds ITS OWN trailing
+                        // attributes into a PRIVATE copy. Folding into the shared
+                        // `declAttrFacts` would leak leftward-to-rightward:
+                        // `int a __attribute__((deprecated)), b;` would mark **b**
+                        // deprecated too, silently — a wrong fact on a symbol the
+                        // programmer never annotated. SOURCE ORDER is preserved
+                        // (declaration-level first, then this declarator's), so
+                        // first-non-empty-wins still means the LEFTMOST spelling.
+                        AttributeSemanticsFacts attrFacts = declAttrFacts;
+                        if (cfg.declarators.has_value()
+                            && tree.kind(dNode) == NodeKind::Internal) {
+                            for (NodeId ac : visibleChildren(tree, dNode)) {
+                                if (!isAfterDeclaratorAttrNode(
+                                        tree, *cfg.declarators, ac)) continue;
+                                // emitUnknown=true: this run is THIS declarator's own
+                                // distinct spelling, so its unknown-name diagnostic is
+                                // the first and only one for that text.
+                                scanAttributeSemantics(s, cfg, tree, ac,
+                                                       /*emitUnknown=*/true, attrFacts);
+                            }
+                        }
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
                         // declaration's folded attribute facts to THIS
                         // declarator's symbol (C23 6.7.13: an attribute in the
@@ -6110,21 +6656,21 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // function arm, deprecated by any use — an
                         // inapplicable-kind flag is inert, never wrong bytes.
                         // Messages first-non-empty-wins (F7).
-                        if (declAttrFacts.maybeUnused)
+                        if (attrFacts.maybeUnused)
                             s.symbols.at(sym).isMaybeUnused = true;
-                        if (declAttrFacts.deprecated) {
+                        if (attrFacts.deprecated) {
                             auto& atRec = s.symbols.at(sym);
                             atRec.isDeprecated = true;
                             if (atRec.deprecatedMessage.empty())
                                 atRec.deprecatedMessage =
-                                    declAttrFacts.deprecatedMessage;
+                                    attrFacts.deprecatedMessage;
                         }
-                        if (declAttrFacts.nodiscard) {
+                        if (attrFacts.nodiscard) {
                             auto& atRec = s.symbols.at(sym);
                             atRec.isNodiscard = true;
                             if (atRec.nodiscardMessage.empty())
                                 atRec.nodiscardMessage =
-                                    declAttrFacts.nodiscardMessage;
+                                    attrFacts.nodiscardMessage;
                         }
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
@@ -6168,6 +6714,109 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 }
                             } else if (declAlignOverride.has_value()) {
                                 s.symbols.at(sym).explicitAlignment = declAlignOverride;
+                            }
+                        }
+                        // ★★ TF-C73 — THE GNU `aligned(N)` SINK (work items 5 + 6).
+                        // Until now `aligned` had NO sink at all: it parsed, folded to
+                        // nothing, and the object was silently UNDER-ALIGNED. It now
+                        // lands in the SAME `explicitAlignment` slot `alignas` uses —
+                        // MAX-folded with it, per C 6.7.5p6 — which is what carries it
+                        // to objects AND to struct/union members (the composite's
+                        // Pass-1 completion gathers each member's `explicitAlignment`
+                        // into the `fieldAligns` span). One slot, one layout rule; the
+                        // two spellings cannot disagree about what a field's alignment
+                        // is, because they write the same field.
+                        if (attrFacts.alignment.has_value()) {
+                            std::uint32_t const want = *attrFacts.alignment;
+                            // A DECLARATION-level `aligned` is one shared spelling
+                            // (gate its context diagnostic); a DECLARATOR-level one is
+                            // this declarator's own (never gated).
+                            bool const fromDeclLevel =
+                                declAttrFacts.alignment.has_value()
+                                && attrFacts.alignment == declAttrFacts.alignment;
+                            auto const reportCtx = [&](std::string reason) {
+                                if (fromDeclLevel) {
+                                    if (attrAlignContextReported) return;
+                                    attrAlignContextReported = true;
+                                }
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = std::move(reason);
+                                s.reporter.report(std::move(d));
+                            };
+                            DeclarationKind const adk = s.symbols.at(sym).kind;
+                            bool const isBitfield =
+                                s.symbols.at(sym).bitFieldWidth.has_value();
+                            if (isFnSig || isFunctionForm
+                                || adk == DeclarationKind::Function) {
+                                // FUNCTIONS stay LOUD. gcc accepts `aligned` on a
+                                // function (it aligns the code), DSS has no sink for
+                                // it, and the measured SDK cost of refusing is
+                                // 0 of 204 `aligned` sites — so refusing loudly beats
+                                // accepting it and dropping it.
+                                reportCtx("__attribute__((aligned)) on a function is "
+                                          "not supported (DSS aligns objects and "
+                                          "aggregate members only)");
+                            } else if (isBitfield) {
+                                reportCtx("__attribute__((aligned)) on a bit-field "
+                                          "member");
+                            } else if (adk == DeclarationKind::Type) {
+                                // ★ THE TYPEDEF RULE (work item 6). A typedef interns
+                                // to the SAME TypeId as its aliasee, so writing
+                                // `explicitAlignment` on the typedef's symbol is
+                                // provably INERT — every user of the alias reads the
+                                // aliasee's layout and never consults this record.
+                                // Storing it would therefore be the exact "parses but
+                                // sets nothing" silent drop this cycle exists to kill.
+                                // So the request is judged instead of stored:
+                                //
+                                //   • N > natural, layout params AVAILABLE ⇒ FAIL LOUD.
+                                //     The program asked for stricter alignment than the
+                                //     alias delivers and we genuinely cannot deliver it.
+                                //   • N <= natural, layout params AVAILABLE ⇒ accept
+                                //     SILENTLY. The alias ALREADY satisfies the request,
+                                //     so honoring it is a proven no-op — nothing is
+                                //     dropped and there is nothing to warn about.
+                                //   • layout params ABSENT ⇒ STAY SILENT, emit nothing.
+                                //     ★ This deliberately DIVERGES from the alignas
+                                //     precedent (which fails loud when it cannot compute
+                                //     an alignment). `src/lsp/lsp_server.cpp:429` calls
+                                //     `dss::analyze(cu)` with NO layout params, so
+                                //     failing loud here would put a red squiggle under
+                                //     every real SDK typedef in the editor while the
+                                //     very same source compiles clean from the CLI.
+                                //     CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
+                                //
+                                // ASYMMETRY WORTH STATING: GNU `aligned` on a typedef is
+                                // LEGAL C (clang accepts `typedef int t
+                                // __attribute__((aligned(16)));` clean), whereas C11
+                                // `alignas` on a typedef is a CONSTRAINT VIOLATION —
+                                // which is why this arm is a graded judgement and the
+                                // alignas arm is a flat rejection. NOTE the existing
+                                // `"alignas on a typedef"` arm above was MEASURED DEAD
+                                // (both spellings are P0001 parse errors before they
+                                // reach it); do not cite it as live behavior.
+                                if (declTy.valid() && s.aggregateLayout.has_value()) {
+                                    auto const lay = computeLayout(
+                                        declTy, s.lattice.interner(),
+                                        *s.aggregateLayout, s.dataModel);
+                                    if (lay && want > lay->align.bytes()) {
+                                        reportCtx(std::format(
+                                            "__attribute__((aligned({}))) on a typedef "
+                                            "cannot be honored: the alias resolves to "
+                                            "the same type as its aliasee, whose "
+                                            "alignment is {}",
+                                            want, lay->align.bytes()));
+                                    }
+                                }
+                            } else {
+                                auto& alRec = s.symbols.at(sym);
+                                if (!alRec.explicitAlignment.has_value()
+                                    || *alRec.explicitAlignment < want)
+                                    alRec.explicitAlignment = want;
                             }
                         }
                         if (isFunctionForm && declarators.size() == 1) {
@@ -6508,8 +7157,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // FieldChildrenDescriptor::compositeKind.
                                 CompositeKind const ck =
                                     decl.fieldChildren->compositeKind;
-                                // D-CSUBSET-PACKED: scan the composite's TRAILING
-                                // attribute list for a honored `packed` (emitting the
+                                // D-CSUBSET-PACKED: scan the composite's attribute
+                                // surfaces for a honored `packed` (emitting the
                                 // S_UnknownTypeAttribute typo diagnostic exactly ONCE
                                 // here). packed applies only to struct/union. A packed
                                 // composite that ALSO has a bit-field member is
@@ -6519,16 +7168,37 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // fails via the unsuppressable diagnostic; the layout
                                 // nullopt belt is the backstop for interner-direct
                                 // construction that bypasses this scan).
+                                //
+                                // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the SAME scan
+                                // now also returns a honored whole-composite
+                                // `aligned(N)`, which is handed to the interner's
+                                // per-composite alignment channel below. The two
+                                // travel together because they are two channels of one
+                                // composite and BOTH apply — `packed, aligned(16)` is
+                                // clang sizeof 16, not packed's bare 5.
                                 bool composedPacked = false;
+                                std::optional<std::uint32_t> composedAlign;
                                 NodeId const specNode =
                                     srec.structScope.valid()
                                         ? s.scopes.scopes()[srec.structScope.v].anchor
                                         : NodeId{};
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
-                                    composedPacked = scanCompositePacked(
+                                    // The composite's ENCLOSING scope is the right
+                                    // lookup context for the alignment operand — an
+                                    // `aligned(N)` naming a constant / a type-name
+                                    // (`aligned(_Alignof(double))`) resolves where the
+                                    // composite is DECLARED, not inside its own member
+                                    // scope (the enum-underlying arm's precedent).
+                                    ScopeId const attrScope =
+                                        srec.structScope.valid()
+                                            ? s.scopes.scopes()[srec.structScope.v].parent
+                                            : ScopeId{};
+                                    auto const composedAttrs = scanCompositePacked(
                                         s, cfg, tree, specNode,
-                                        /*emitDiagnostics=*/true);
+                                        /*emitDiagnostics=*/true, attrScope);
+                                    composedPacked = composedAttrs.packed;
+                                    composedAlign  = composedAttrs.alignment;
                                     if (composedPacked) {
                                         bool anyBitfieldMember = false;
                                         for (std::int64_t const w : fieldBitWidths)
@@ -6664,7 +7334,12 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         s.lattice.interner().completeComposite(
                                             compositeTy, fieldTypes, composedPacked,
                                             fieldBitWidths, /*fieldOffsets=*/{},
-                                            fieldAligns);
+                                            fieldAligns,
+                                            // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the
+                                            // whole-union `aligned(N)` request; 0 = none.
+                                            // clang: `union U {char a; int b;}
+                                            // __attribute__((aligned(32)));` is 32/32.
+                                            composedAlign.value_or(0u));
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -6897,7 +7572,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         s.lattice.interner().completeComposite(
                                             compositeTy, fieldTypes, composedPacked,
                                             fieldBitWidths, /*fieldOffsets=*/{},
-                                            fieldAligns);
+                                            fieldAligns,
+                                            // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the
+                                            // whole-struct `aligned(N)` request; 0 =
+                                            // none. This is the sink that makes
+                                            // `struct S {char a; int b;}
+                                            // __attribute__((packed, aligned(16)));`
+                                            // come out at clang's sizeof 16 / _Alignof
+                                            // 16 instead of failing loud as
+                                            // unhonorable.
+                                            composedAlign.value_or(0u));
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);

@@ -551,6 +551,43 @@ struct DSS_EXPORT DeclarationRule {
     // listed here (and not a recognized linkage specifier) STILL fails loud — the
     // strict default is preserved. Empty ⇒ nothing skipped by name.
     std::vector<std::string>   linkageSpecifierIgnoredNames;
+    // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): the ATTRIBUTE SLOTS of this declaration
+    // form — the rules whose DIRECT-CHILD instances on a node of this row carry
+    // attribute specifiers. A declaration can decorate in several structurally
+    // distinct positions (c-subset `typedefDecl`: the `typedefDeclSpecifiers`
+    // prefix, plus the two `typedefAttrRun` slots that bracket the declarator),
+    // and only the prefix is reachable through `specifierPrefixRule`. The
+    // semantic attribute scan reads THIS list to find the others, so honoring a
+    // new position is a config edit, not an engine edit. Empty ⇒ this row's only
+    // attribute surface is whatever `specifierPrefixRule` already exposes (every
+    // row before this key existed) — never a behavior change.
+    //
+    // ★ RULE NAMES, NOT CHILD INDICES — and that is the whole point of the key.
+    // The obvious alternative (a list of visible-child INDICES, matching `head` /
+    // `declarator` / `params`) was MEASURED and REJECTED: a wrong index is
+    // SILENT. The scan simply descends the named child, finds no attribute
+    // specifier under it, and asserts nothing — the config looks configured, the
+    // attributes are never honored, and nothing anywhere says so. A wrong rule
+    // NAME cannot do that: it does not resolve in the rule table and the LOADER
+    // rejects it (`C_InvalidSemantics`, same as every sibling rule-reference key
+    // — `linkageSpecifierIgnoredRules`, `definesWhenChild`, `fieldChildren`).
+    // Choosing the identifier space that has a loud failure mode over the one
+    // that has a silent one is the fail-loud principle applied to config SHAPE,
+    // not just to config VALUES. Secondary benefit: names survive a grammar edit
+    // that inserts a child, where every positional index would silently shift.
+    std::vector<RuleId>        declarationAttrSlotRules;
+    std::vector<std::string>   declarationAttrSlotRuleNames;  // source spellings, for diagnostics
+    // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): when true, an attribute in a STRICT
+    // (GNU `__attribute__((...))`) specifier on THIS declaration form whose name
+    // matches no `attributeSemantics.effects` row is an ERROR rather than the
+    // C23-ignorable warning. Mirrors the composite side's
+    // `compositeStrictAttrRule` posture (S_UnknownTypeAttribute): the C23
+    // `[[...]]` form is standard-ignorable BY THE STANDARD, but the GNU form
+    // carries no such guarantee, so a typo'd `__attribute__((desprecated))` is a
+    // silently unapplied decoration. Per-declaration opt-in, and the default is
+    // `false` = TODAY'S behavior — this key can only ever tighten a row that
+    // asks for it, so adding it cannot change any existing config's meaning.
+    bool                       unknownStrictAttributeIsError = false;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // FC4 c1 stage 2a: when true, every declarator under this (declarator-
@@ -1484,14 +1521,35 @@ struct DSS_EXPORT LoopControlRule {
 //     dedicated scan — noreturn/packed — or deliberately inert — fallthrough/
 //     likely/unlikely/reproducible/unsequenced). Listed so the UNKNOWN-
 //     attribute warning never false-fires on a name the language knows.
+//   • Align          — TF-C73: the attribute carries an ALIGNMENT for the
+//     declared entity (`[[gnu::aligned(N)]]` / `__attribute__((aligned(N)))` /
+//     `__attribute__((__aligned__(N)))`). The clause's ARGUMENT is the
+//     alignment, so this is the first verb whose row is only meaningful
+//     together with `attributeArgRule`; the consumer const-evaluates the
+//     argument and stores it exactly where `alignasSpec` stores its result
+//     (`SymbolRecord.explicitAlignment` / the composite's `fieldAligns`), so
+//     the two spellings share ONE sink and ONE validation path. Deliberately
+//     NOT `None`: `aligned` was fail-loud precisely because silencing it
+//     without a sink produces a silently UNDER-ALIGNED object — a miscompile,
+//     not a missing warning — so it must never be demoted back to a no-op
+//     while a sink exists.
 // A name matching NO row in the C23 `[[...]]` form warns S_UnknownAttribute
 // (suppressible — C23 forbids fatal unknown standard attributes). The loader
 // validates the effect verb against the closed set (C_InvalidSemantics on an
 // unknown verb — a typo can never silently disarm a row).
+//
+// ── DECLARATION-ATTACHED vs. inert (read by the loader's drift cross-check) ──
+// Every verb EXCEPT `None` names an effect on the DECLARED ENTITY, so such an
+// attribute must be WRITABLE in a declaration's specifier prefix. `None` names
+// vocabulary that may be statement-attached (`fallthrough`, `likely`) or
+// type-attached (`packed`) and therefore need not be. The loader's
+// `attributeEffects` ↔ `linkageSpecifierIgnoredNames` cross-check keys off
+// exactly that split — see `grammar_schema_json.cpp`'s drift cross-check.
 enum class AttributeEffect : std::uint8_t {
     SuppressUnused,
     WarnOnUse,
     WarnOnDiscard,
+    Align,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {
@@ -1753,6 +1811,26 @@ struct DSS_EXPORT SemanticConfig {
     RuleId attrSpecRule{};          std::string attrSpecRuleName;
     RuleId stdAttrRule{};           std::string stdAttrRuleName;
     RuleId attrBareStatementRule{}; std::string attrBareStatementRuleName;
+    // D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP: the attribute-ARGUMENT group rule
+    // (c-subset `attrArgs` — the balanced `( … )` holding one clause's arguments,
+    // NESTED arg groups included). `linkageFrom` flags every token reached THROUGH
+    // such a node and skips the flagged ones for the linkage-specifier KEY LOOKUP,
+    // so `__attribute__((format(printf,1,2)))`'s `printf`/`1`/`2` are not read as
+    // specifier names. The flagged tokens deliberately STAY in the flattened token
+    // list and stay visible to the composite `<ident>:<string-body>` forward scan —
+    // `visibility("hidden")`'s string lives INSIDE this subtree, so a WHOLESALE
+    // rule-skip (`linkageSpecifierIgnoredRules`) would delete the very token the
+    // pairing needs and break the composite key. MEASURED, both directions: with
+    // `attrArgs` added to `linkageSpecifierIgnoredRules` instead, the perfectly
+    // legal `__attribute__((visibility("hidden"))) int g;` fails
+    // `H_UnknownLinkageSpecifier: 'visibility' is not a recognized linkage
+    // specifier`. That is why this is a per-token FLAG and not another ignore list.
+    // OPTIONAL (unlike the three rules above): a language may declare an attribute
+    // surface with no argument grammar at all. INVALID ⇒ no token is ever flagged
+    // and the scan behaves exactly as it did before this key existed (toy/tsql, and
+    // c-subset before TF-C73) — never a silent behavior change. Source-AGNOSTIC:
+    // WHICH rule is per-language config; the engine never names `attrArgs`.
+    RuleId attributeArgRule{};      std::string attributeArgRuleName;
     std::vector<AttributeSemanticsRow> attributeEffects;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule
     // ids (the `semantics.nodiscard` block). A WarnOnDiscard-flagged call's
