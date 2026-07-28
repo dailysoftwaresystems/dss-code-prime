@@ -88,6 +88,10 @@ struct Lowerer {
     HirNoInlineMap const*    noInlineMap; // optional — native-FUNCTION inliner
                                            // opt-out (TF-C78, D-CSUBSET-NOINLINE).
                                            // nullptr / no entry ⇒ inlinable.
+    HirAlwaysInlineMap const* alwaysInlineMap;  // optional — native-FUNCTION
+                                           // inliner cost-model bypass (TF-C81,
+                                           // D-CSUBSET-ALWAYSINLINE). nullptr /
+                                           // no entry ⇒ threshold applies.
     HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
                                            // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
                                            // nullptr / no entry ⇒ mutable.
@@ -10319,7 +10323,16 @@ struct Lowerer {
         bool noInline = false;
         if (noInlineMap != nullptr)
             if (auto const* p = noInlineMap->tryGet(node)) noInline = p->isNoInline;
-        mir.addFunction(signature, symbol, la.binding, la.visibility, noInline);
+        // TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE SECOND MINT SITE — the one
+        // place the source-declared `always_inline` enters MIR, read from the
+        // SAME declaration node as the two attributes above so all three travel
+        // together. Everything downstream only COPIES this bit.
+        bool alwaysInline = false;
+        if (alwaysInlineMap != nullptr)
+            if (auto const* p = alwaysInlineMap->tryGet(node))
+                alwaysInline = p->isAlwaysInline;
+        mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
+                        alwaysInline);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
@@ -11902,7 +11915,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           std::unordered_map<std::uint32_t, std::string> const*
                                                    synthRecipeMap,
                           HirReturnsTwiceMap const* returnsTwiceMap,
-                          HirNoInlineMap const*    noInlineMap) {
+                          HirNoInlineMap const*    noInlineMap,
+                          HirAlwaysInlineMap const* alwaysInlineMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -11918,6 +11932,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
         .noInlineMap = noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+        .alwaysInlineMap = alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
         .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)

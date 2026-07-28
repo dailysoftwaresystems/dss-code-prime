@@ -185,9 +185,26 @@ struct Lowered {
                                     // stopped here, so any map added after this point
                                     // was invisible to every unit test in this file
                                     // while working in the real compiler.
+                                    // ★ TF-C81: THAT TRAP FIRED AGAIN, EXACTLY AS
+                                    // WARNED. `alwaysInlineMap` worked end-to-end
+                                    // through the real CLI (probed: the over-threshold
+                                    // callee's `bl` vanished from the release binary)
+                                    // while EVERY unit test here read a nullptr map
+                                    // and saw the flag as absent. So the warning above
+                                    // is not history — it is a live hazard, and it is
+                                    // load-bearing that the tests assert the APPLIED
+                                    // FACT: a test that only checked "it compiled"
+                                    // would have passed against a dead harness and
+                                    // hidden the gap instead of exposing it. THERE ARE
+                                    // FOUR `lowerToMir` CALL SITES IN THIS FILE (this
+                                    // one plus ~535, ~601, ~11459); a map added to
+                                    // only some of them fails in a shape-dependent
+                                    // subset of tests, which is harder to diagnose
+                                    // than failing in all of them. Update all four.
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
-                                    &hir->noInlineMap);
+                                    &hir->noInlineMap,
+                                    &hir->alwaysInlineMap);   // TF-C81
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -531,7 +548,8 @@ namespace {
                                     &hir->typedefVlaOriginBySymbol,
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
-                                    &hir->noInlineMap);   // TF-C78
+                                    &hir->noInlineMap,   // TF-C78
+                                    &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -596,7 +614,8 @@ namespace {
                                     &hir->typedefVlaOriginBySymbol,
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
-                                    &hir->noInlineMap);   // TF-C78
+                                    &hir->noInlineMap,   // TF-C78
+                                    &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -2311,6 +2330,317 @@ TEST(MirLoweringCSubsetLinkage, NoInlineSurvivesShippedReleasePipeline) {
     EXPECT_TRUE(helperPresent)
         << "the noinline callee must survive out-of-line, flag intact, after "
            "the full release pipeline";
+}
+
+// ── TF-C81 (D-CSUBSET-ALWAYSINLINE): source → MirFunc.alwaysInline, per FORM ──
+//
+// The `NoInlineFormCase` suite one axis over: the `attributeSemantics.effects`
+// `alwaysInline` verb → `SymbolRecord.isAlwaysInline` (FnSig-gated) →
+// `HirAlwaysInlineMap` → `MirFunc.alwaysInline`. Both GNU attribute POSITIONS
+// are parameterized separately because they reach `scanAttributeSemantics`
+// through different roots and one can regress without the other.
+//
+// ★ EVERY CASE ALSO ASSERTS `noInline` IS CLEAR. The two facts travel as
+// adjacent bools from `addFunction` onward, so "the right flag" is a distinct
+// claim from "a flag", and only the paired assertion can tell them apart.
+struct AlwaysInlineFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetAlwaysInlineForm
+    : public ::testing::TestWithParam<AlwaysInlineFormCase> {};
+
+TEST_P(MirLoweringCSubsetAlwaysInlineForm, ThreadsToMirFuncAlwaysInline) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    int flagged = 0;
+    int noInlineFlagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        if (m.funcAlwaysInline(m.funcAt(i))) ++flagged;
+        if (m.funcNoInline(m.funcAt(i)))     ++noInlineFlagged;
+    }
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((always_inline)) in the '" << c.label << "' position "
+           "must thread to EXACTLY one MirFunc.alwaysInline — 0 means the form "
+           "never reached the sink, 2 means it leaked onto an un-annotated "
+           "function";
+    EXPECT_EQ(noInlineFlagged, 0)
+        << "and it must NOT set noInline — the two flags are adjacent bools "
+           "from addFunction onward, so a swap must be visible here";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetAlwaysInlineForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator.
+        AlwaysInlineFormCase{
+            "mode2-after-type",
+            "static int __attribute__((always_inline)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Mode-3: the attribute sits in the specifier PREFIX, before the type.
+        AlwaysInlineFormCase{
+            "mode3-leading-prefix",
+            "static __attribute__((always_inline)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — one config entry covers both via `stripDunder`.
+        AlwaysInlineFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__always_inline__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ THE SQLITE SHAPE. `SQLITE_INLINE` expands to
+        // `__attribute__((always_inline)) inline`, so the attribute is COMBINED
+        // with the C99 `inline` function specifier TF-C79 landed. sqlite's ONE
+        // use site (btree.c:1846, `static SQLITE_INLINE int allocateSpace(…)`)
+        // is exactly this, and the two features must compose.
+        AlwaysInlineFormCase{
+            "combined-with-inline-specifier",
+            "static __attribute__((always_inline)) inline int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY: spelled on the declaration, and the DEFINITION lowers.
+        // Only the post-Pass-1.5 proto/def OR-merge makes this reach MIR
+        // (RED-ON-DISABLE: delete the `isAlwaysInline` OR-merge and this case
+        // alone goes to 0).
+        AlwaysInlineFormCase{
+            "prototype-only",
+            "static int helper(int k) __attribute__((always_inline));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+    [](::testing::TestParamInfo<AlwaysInlineFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the always_inline form suite.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasAlwaysInlineClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcAlwaysInline(m.funcAt(i)))
+            << "an un-annotated function must never carry alwaysInline";
+}
+
+namespace {
+// TF-C81: a callee whose body is deliberately far OVER the shipped release
+// pipeline's `inlineThreshold` (50). Built programmatically so the size is
+// obvious and adjustable rather than a wall of hand-written statements that
+// silently drifts under the threshold when the cost model changes.
+//
+// The parameter `k` is threaded through every statement so the callee body
+// cannot be const-folded away before the inliner sees it.
+std::string overThresholdSource(bool annotate) {
+    std::string s = annotate
+        ? "static __attribute__((always_inline)) int helper(int k) {\n"
+        : "static int helper(int k) {\n";
+    for (int i = 1; i <= 15; ++i) {
+        s += "  k = k * 3 + " + std::to_string(i) + ";";
+        s += " k = k ^ (k >> 2);";
+        s += " k = k + " + std::to_string(i * 7) + ";\n";
+    }
+    s += "  return k;\n}\n";
+    s += "int main() { return helper(37); }\n";
+    return s;
+}
+} // namespace
+
+// ── TF-C81: ★ THE LOAD-BEARING TEST OF THIS CYCLE ──────────────────
+//
+// An `always_inline` callee that EXCEEDS the shipped release pipeline's
+// `inlineThreshold` IS inlined by it — `release.pipeline.json` loaded BY NAME,
+// not a hand-written pass list, so the pin cannot drift from what users run.
+//
+// The assertion is the APPLIED FACT: the Call instruction is GONE from the
+// optimized module. Not "it compiled", and not "the flag arrived".
+//
+// The over-threshold precondition is PROVEN, not assumed, by the paired
+// `OverThresholdCalleeWithoutAlwaysInlineKeepsItsCall` below: the byte-identical
+// program without the attribute keeps its Call through the same pipeline. If the
+// callee ever drifts under the threshold that test goes red, so this one can
+// never quietly become vacuous.
+//
+// RED-ON-DISABLE (MEASURED against the final build): delete the
+// `&& !mir.funcAlwaysInline(callee)` clause from inlining.cpp rule 6 and the
+// Call reappears here.
+//
+// ★ AND THE MEASUREMENT THAT MATTERS MORE — WHAT THIS TEST CANNOT SEE. Dropping
+// the `funcAlwaysInline` argument in `mir_rebuild_helper.cpp` (the shared
+// substrate under every optimizer pass) leaves THIS TEST GREEN. `Inlining` runs
+// first in iteration 1, before any rebuild touches the module, so the splice has
+// already happened by the time a cleared flag could matter. That is the OPPOSITE
+// of TF-C78's `noinline` finding, where the same hop broke the end-to-end result
+// — a `noinline` flag must keep refusing on every iteration, an `alwaysInline`
+// flag only has to survive to the first opportunity.
+//
+// So this end-to-end pin does NOT subsume the propagation pin; it is blind to
+// that hop, and `MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` is the
+// only thing standing between that argument and silent deletion.
+TEST(MirLoweringCSubsetLinkage, AlwaysInlineBypassesThresholdInShippedRelease) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    // The callee's pre-optimization instruction count — the number rule 6
+    // compares against the threshold. Asserted so the fixture's whole premise
+    // is visible in the failure message rather than implied.
+    std::uint32_t calleeInsts = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        if (!m.funcAlwaysInline(f)) continue;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi)
+            calleeInsts += m.blockInstCount(m.funcBlockAt(f, bi));
+    }
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    ASSERT_GT(calleeInsts, loaded->inlineThreshold)
+        << "fixture precondition: the callee (" << calleeInsts << " insts) MUST "
+           "exceed the shipped release inlineThreshold ("
+        << loaded->inlineThreshold << ") — otherwise this test proves "
+           "nothing, since the callee would have been inlined anyway";
+    ASSERT_EQ(countCalls(), 1u) << "pre-optimization: main calls helper once";
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 0u)
+        << "THE APPLIED FACT: an over-threshold __attribute__((always_inline)) "
+           "callee MUST be inlined by the SHIPPED release pipeline — the Call "
+           "has to be GONE, not merely the program compiled";
+}
+
+// ── The NON-VACUOUS twin, and the over-threshold PROOF ─────────────
+// The byte-identical program WITHOUT the attribute keeps its Call through the
+// same shipped pipeline. This is what establishes that the callee is genuinely
+// over the threshold: if it ever drifts under, this test fails and the bypass
+// test above is exposed as vacuous rather than silently becoming so.
+TEST(MirLoweringCSubsetLinkage,
+     OverThresholdCalleeWithoutAlwaysInlineKeepsItsCall) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/false).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        ASSERT_FALSE(m.funcAlwaysInline(m.funcAt(i)));
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value());
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "the SAME callee WITHOUT always_inline must keep its Call — this is "
+           "the proof that the fixture is genuinely over-threshold, and hence "
+           "that the bypass test measures the attribute rather than the size";
+}
+
+// ── TF-C81: the DEBUG pipeline honestly does NOTHING with the flag ──
+//
+// ★ THIS TEST PINS AN ASYMMETRY RATHER THAN A FEATURE, AND THAT IS DELIBERATE.
+// The shipped `debug` pipeline is `Identity` only — there is no Inlining pass,
+// so there is no cost model for `always_inline` to bypass and the call stays
+// out-of-line. GCC and clang honour the attribute at -O0 because their inliner
+// always runs; DSS's does not.
+//
+// The config's `attributeSemantics.effects` row says exactly this in prose. This
+// test is what stops that prose from silently becoming false in either
+// direction: if a future cycle gives `debug` an inliner, this test goes red and
+// the config comment must be updated in the same commit. The flag itself must
+// still ARRIVE (asserted below) — the attribute is parsed and lowered under
+// debug, it simply has no consumer there.
+TEST(MirLoweringCSubsetLinkage, AlwaysInlineIsInertUnderShippedDebugPipeline) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u);
+
+    auto loaded = opt::loadShippedPipeline("debug");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'debug' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "under the SHIPPED debug pipeline (Identity only) always_inline is "
+           "VACUOUS — there is no inliner to bypass a threshold in. If this "
+           "goes red because debug gained an inliner, update the "
+           "c-subset.lang.json effects row in the SAME commit: it states this "
+           "asymmetry explicitly, and it must not be allowed to become a lie";
+
+    bool flagPresent = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcAlwaysInline(m.funcAt(i))) flagPresent = true;
+    EXPECT_TRUE(flagPresent)
+        << "the flag must still ARRIVE under debug — the attribute is parsed "
+           "and lowered, it simply has no consumer in this pipeline";
 }
 
 // D-CSUBSET-NORETURN linkage-safety (FC16): a `noreturn` attribute co-present
@@ -11150,7 +11480,8 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     &hir->typedefVlaOriginBySymbol,
                                     /*synthRecipeMap=*/nullptr,
                                     &hir->returnsTwiceMap,    // FC17.9(c) (D-CSUBSET-SETJMP)
-                                    &hir->noInlineMap);       // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
+                                    &hir->noInlineMap,        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
+                                    &hir->alwaysInlineMap);  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

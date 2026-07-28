@@ -997,6 +997,33 @@ enum class DiagnosticCode : std::uint16_t {
     // keyword but not the type. Renders error[S0059].
     S_InlineNonFunction = 0xE059,
 
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): one function carries BOTH
+    // `__attribute__((always_inline))` and `__attribute__((noinline))` — on a
+    // single declaration, or split across a prototype/definition pair that the
+    // redeclaration sweep merges. The two directives are exact contradictions:
+    // one forbids splicing the callee into a caller, the other exists solely to
+    // force splicing past the cost model. There is no reading under which both
+    // are honored.
+    //
+    // ★ THIS IS A DELIBERATE DIVERGENCE FROM CLANG, AND THE MEASUREMENT DROVE IT.
+    // Apple clang 21.0.0 was probed on four shapes (both attributes on one
+    // declaration, both inside one `__attribute__((a, b))` clause, and each
+    // order of the proto/def split) at `-fsyntax-only -Wall -Wextra` and at
+    // `-O2 -Weverything`: it emits NO diagnostic whatsoever and SILENTLY resolves
+    // the conflict in favour of `noinline` (the emitted LLVM function carries
+    // `noinline`, never `alwaysinline`, in BOTH source orders). Silently picking
+    // a winner is precisely the last-writer-wins outcome this project refuses:
+    // the author wrote two directives, exactly one can take effect, and which one
+    // is invisible at the source. DSS reports it instead. If corpus pressure ever
+    // demands clang source-compatibility here, the fallback is the MEASURED clang
+    // behaviour (noinline wins, downgraded to a warning) — which is ALSO already
+    // the MIR-tier precedence, because `inlining.cpp`'s rule-2b refusal is
+    // ordered before the rule-6 threshold bypass.
+    //
+    // Reported by the semantic tier, which is the only place that sees both
+    // attribute facts and the declared type. Renders error[S005A].
+    S_ConflictingInlineAttributes = 0xE05A,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

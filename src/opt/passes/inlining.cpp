@@ -175,6 +175,13 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // has no cost-model or scope escape hatch. sqlite's `SQLITE_NOINLINE` uses
     // it to BOUND STACK DEPTH on recursive paths — inlining anyway is a real
     // runtime regression (deeper frames), not a missed annotation.
+    // ★ TF-C81 ORDERING NOTE: rule 2b is checked BEFORE the rule-6 threshold
+    // bypass below, so if a MirFunc somehow carries BOTH `noInline` and
+    // `alwaysInline` the REFUSAL wins. The source tier rejects that combination
+    // outright (S_ConflictingInlineAttributes), so this ordering only decides
+    // hand-built MIR and parsed `.dssir` — but it decides it conservatively, and
+    // it happens to match what clang does with the same contradiction (MEASURED:
+    // Apple clang 21 silently keeps `noinline`, in both source orders).
     if (mir.funcNoInline(callee)) return std::nullopt;
 
     // Rule 3: never inline a call WITHIN A RECURSIVE CYCLE (OPT7 cycle 3).
@@ -431,7 +438,30 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // instruction over is refused. FAIL-SAFE: a threshold below the
     // smallest callee — including 0, if constructed programmatically (the
     // loader rejects 0) — refuses everything; nothing miscompiles.
-    if (instCount > inlineThreshold) return std::nullopt;
+    //
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ AND THIS — AND ONLY THIS — IS WHAT
+    // `__attribute__((always_inline))` WAIVES. The bypass is deliberately fused
+    // into rule 6's own condition rather than written as an early `return
+    // callee` above, and that placement IS the semantics: an early return would
+    // also skip the arity/type safety scan and the no-returning-path check in
+    // the loop above, turning a performance annotation into a licence to
+    // miscompile. Placed here, an `always_inline` callee has already passed
+    // every correctness rule — Weak, same-SCC recursion, address-escape,
+    // has-a-Return, arity/type — and the attribute overrides only the
+    // PROFITABILITY veto, which is the single thing it is actually asked to
+    // override in real code (sqlite's one `SQLITE_INLINE` site,
+    // `btree.c:allocateSpace`, is a hot helper the size bound would refuse).
+    //
+    // A callee that trips one of those correctness rules is still refused, and
+    // DSS says nothing about it — GCC errors ("inlining failed in call to
+    // always_inline") and clang warns. That silence is a KNOWN, conservative
+    // divergence: the program compiles and is correct, it just keeps a call the
+    // author hoped to remove. Making it loud needs a per-CALL-SITE reachability
+    // story (the refusal is a property of the call, not the declaration), which
+    // is deliberately out of this cycle's scope.
+    if (instCount > inlineThreshold && !mir.funcAlwaysInline(callee)) {
+        return std::nullopt;
+    }
     return callee;
 }
 
@@ -784,9 +814,14 @@ public:
         // functions INTO itself — the attribute constrains splicing it OUT, not
         // in), so its rebuilt copy has to keep the bit or the refusal survives
         // only until this pass' first iteration rewrites the module.
+        // TF-C81 (D-CSUBSET-ALWAYSINLINE): likewise for the cost-model bypass.
+        // An `always_inline` function is still a CALLER, and it may itself be
+        // over-threshold and inlined into someone else on a LATER iteration of
+        // this very pass — dropping the bit during this rebuild would silently
+        // end that after the first iteration.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
                          src_.funcBinding(caller), src_.funcVisibility(caller),
-                         src_.funcNoInline(caller));
+                         src_.funcNoInline(caller), src_.funcAlwaysInline(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

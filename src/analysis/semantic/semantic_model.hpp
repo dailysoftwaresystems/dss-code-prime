@@ -299,6 +299,28 @@ struct DSS_EXPORT SymbolRecord {
     // is propagated through every MirFunc copy/rebuild path rather than only the
     // lowering that mints it. Default false.
     bool            isNoInline = false;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): TRUE iff this FUNCTION symbol is declared
+    // `__attribute__((always_inline))` (GNU; no C11/C23 standard spelling). The
+    // exact structural mirror of `isNoInline` above — set at Pass-1.5 declarator
+    // resolution from the `attributeSemantics` table's `alwaysInline` effect verb
+    // (never a hardcoded name test), FnSig-gated, OR-merged across a proto/
+    // definition pair by the post-1.5 `mergedFnDecls` sweep, projected onto
+    // `HirAlwaysInlineMap` and stamped onto `MirFunc.alwaysInline`.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY: the inliner's §2.9 gate skips its
+    // SIZE-BASED cost model (rule 6) for this callee. It does NOT override any
+    // correctness refusal, and it does nothing at all under a pipeline with no
+    // `Inlining` pass. A DROPPED flag is therefore a PERFORMANCE miss, never a
+    // miscompile — the opposite direction from `isNoInline`, whose loss is a
+    // silent violation of the source's directive. It is nevertheless propagated
+    // through every MirFunc copy/rebuild path, because a half-landed flag and no
+    // flag are indistinguishable in the emitted binary (TF-C78's finding).
+    //
+    // ★ MUTUALLY EXCLUSIVE WITH `isNoInline` AT THE SOURCE TIER: a declaration —
+    // or a proto/definition pair — carrying both is a LOUD
+    // S_ConflictingInlineAttributes, so both bits are never set together on a
+    // record that survives semantic analysis. Default false.
+    bool            isAlwaysInline = false;
     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4): TRUE iff THIS
     // declaration of a FUNCTION symbol spells the `inline` specifier WITHOUT
     // `extern` — 6.7.4p7's exact clause, not merely "the word inline appears".

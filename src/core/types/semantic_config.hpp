@@ -1562,6 +1562,33 @@ enum class AttributeEffect : std::uint8_t {
     // it was not inert — the compiler had a live pass free to do exactly what the
     // attribute forbids. A verb with a real sink makes the vocabulary entry true.
     NoInline,
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the declared function is EXEMPT FROM THE
+    // INLINER'S SIZE-BASED COST MODEL. Folded onto `SymbolRecord.isAlwaysInline`
+    // (FnSig-gated, the `isNoInline` discipline), projected to
+    // `HirAlwaysInlineMap`, stamped onto `MirFunc.alwaysInline`, and consumed by
+    // the inliner's §2.9 legality gate as a BYPASS of rule 6 (`instCount >
+    // inlineThreshold`) — the exact mirror-image of `NoInline`'s refusal.
+    //
+    // ★ THE SINK IS A THRESHOLD BYPASS, NOT A GUARANTEE OF INLINING, AND THE
+    // NAMING OF THIS VERB IS DELIBERATE ABOUT THAT. Every CORRECTNESS refusal in
+    // the gate still wins over this verb — a Weak callee, a recursive (same-SCC)
+    // call, an address-escaped callee, a callee with no returning path, an arity/
+    // type mismatch. Those rules exist to prevent miscompiles and unbounded
+    // unrolling; a source annotation cannot license either. What the verb removes
+    // is the PROFITABILITY veto, which is the only thing `always_inline` is asked
+    // to override in practice.
+    //
+    // ★ AND IT IS SCOPED TO THE INLINER, NOT TO THE PROGRAM. A pipeline with no
+    // `Inlining` pass (the shipped `debug` pipeline is `Identity` only) has no
+    // cost model to bypass, so the verb is VACUOUS there and the call stays
+    // out-of-line. That is the same relationship `NoInline` already has with the
+    // debug pipeline — a prohibition with no inliner to prohibit — read in the
+    // other direction. GCC and clang honour `always_inline` at `-O0` because
+    // their inliner always runs; DSS's does not, so the claim this verb makes is
+    // stated as "exempt from the threshold wherever the inliner runs", never as
+    // "always inlined". See the `c-subset.lang.json` row, which says so in the
+    // config the user reads.
+    AlwaysInline,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {

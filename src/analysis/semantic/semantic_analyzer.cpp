@@ -3033,6 +3033,7 @@ struct AttributeSemanticsFacts {
     bool        nodiscard   = false;   // warnOnDiscard row matched
     std::string nodiscardMessage;
     bool        noInline    = false;   // noInline row matched (TF-C78)
+    bool        alwaysInline = false;  // alwaysInline row matched (TF-C81)
     // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
     // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
     // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
@@ -3480,6 +3481,14 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // message, no MAX-fold. Applied to the declarator's symbol below
                 // gated on the declared type being a FnSig.
                 out.noInline = true;
+                break;
+            case AttributeEffect::AlwaysInline:
+                // TF-C81 (D-CSUBSET-ALWAYSINLINE): a pure marker, exactly like
+                // the NoInline arm above — no argument, no message, no MAX-fold.
+                // Applied to the declarator's symbol below gated on the declared
+                // type being a FnSig, and CROSS-CHECKED against `noInline` there
+                // (the two directives contradict each other).
+                out.alwaysInline = true;
                 break;
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
@@ -6770,6 +6779,39 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // symbol whose kind cannot honor it.
                         if (isFnSig && attrFacts.noInline)
                             s.symbols.at(sym).isNoInline = true;
+                        // TF-C81 (D-CSUBSET-ALWAYSINLINE): the structural mirror
+                        // of the block above — same FnSig gate, same reasoning
+                        // (this bit feeds a CODEGEN decision, so a symbol whose
+                        // kind cannot honor it must not carry it).
+                        if (isFnSig && attrFacts.alwaysInline)
+                            s.symbols.at(sym).isAlwaysInline = true;
+                        // TF-C81: ★ THE CONTRADICTION GATE. `always_inline` and
+                        // `noinline` on ONE declaration are exact opposites — one
+                        // forbids splicing the callee, the other exists solely to
+                        // force splicing past the cost model — so exactly one can
+                        // take effect and which one is invisible at the source.
+                        // FAIL LOUD instead of picking. MEASURED: Apple clang
+                        // 21.0.0 emits nothing at all here (even -Weverything) and
+                        // silently resolves it to `noinline` in both source
+                        // orders; that silent resolution is the last-writer-wins
+                        // outcome this project refuses, so DSS diverges
+                        // DELIBERATELY. The proto/definition SPLIT of the same
+                        // contradiction is caught by the post-1.5 `mergedFnDecls`
+                        // sweep, which skips any pair whose conflict was already
+                        // reported HERE so one mistake yields one diagnostic.
+                        if (isFnSig && attrFacts.alwaysInline
+                            && attrFacts.noInline) {
+                            ParseDiagnostic d;
+                            d.code = DiagnosticCode::S_ConflictingInlineAttributes;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode.valid() ? nameNode
+                                                                    : node);
+                            d.actual   =
+                                "'always_inline' and 'noinline' on the same "
+                                "function are contradictory directives";
+                            s.reporter.report(std::move(d));
+                        }
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
                         // field is handled above); a PARAMETER carries its own
@@ -12384,6 +12426,59 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.symbols.at(survivor).isNoreturn = nr;
                 s.symbols.at(absorbed).isNoreturn = nr;
             }
+            // TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE SPLIT-CONTRADICTION GATE,
+            // AND IT MUST RUN **BEFORE** EITHER INLINE-FLAG OR-MERGE BELOW.
+            // Pass-1.5's per-declaration check cannot see
+            // `__attribute__((noinline)) int f(void);` followed by
+            // `__attribute__((always_inline)) int f(void){…}` — each declaration
+            // alone is consistent, and only the merge makes the contradiction
+            // visible. But the OR-merges below write the unioned flags back to
+            // BOTH records, after which "did ONE declaration carry both?" is no
+            // longer answerable: MEASURED, running this gate after the `noInline`
+            // merge made the survivor look like it had spelled both attributes
+            // itself and the split conflict was silently suppressed. Reading both
+            // records while they are still PRISTINE is the whole correctness of
+            // the `already` test.
+            //
+            // Reported at the ABSORBED (later / redundant) declaration with a
+            // related location at the survivor — the shape the signature-compat
+            // gate below already uses. `already` suppresses a SECOND diagnostic
+            // when one declaration carried both attributes on its own: Pass-1.5
+            // already reported that, and one mistake must not yield two errors.
+            {
+                auto const& svRec = s.symbols.at(survivor);
+                auto const& abRec = s.symbols.at(absorbed);
+                bool const ai      = svRec.isAlwaysInline || abRec.isAlwaysInline;
+                bool const ni      = svRec.isNoInline     || abRec.isNoInline;
+                bool const already = (svRec.isAlwaysInline && svRec.isNoInline)
+                                  || (abRec.isAlwaysInline && abRec.isNoInline);
+                if (ai && ni && !already) {
+                    auto aTreeIt = treeById.find(abRec.tree.v);
+                    if (aTreeIt != treeById.end()) {
+                        Tree const& aTree = *aTreeIt->second;
+                        ParseDiagnostic d;
+                        d.code =
+                            DiagnosticCode::S_ConflictingInlineAttributes;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = aTree.source().id();
+                        d.span     = aTree.span(abRec.declNode);
+                        d.actual   = std::format(
+                            "'always_inline' and 'noinline' are applied to '{}' "
+                            "across its declarations — contradictory directives",
+                            abRec.name);
+                        auto sTreeIt = treeById.find(svRec.tree.v);
+                        if (sTreeIt != treeById.end()) {
+                            Tree const& sTree = *sTreeIt->second;
+                            d.related.push_back(RelatedLocation{
+                                sTree.source().id(),
+                                sTree.span(svRec.declNode),
+                                "the conflicting declaration is here",
+                            });
+                        }
+                        s.reporter.report(std::move(d));
+                    }
+                }
+            }
             // TF-C78 (D-CSUBSET-NOINLINE): the same OR-merge, for the same
             // reason and in the same pre-type-gate position. `noinline` is
             // routinely spelled on the PROTOTYPE only (sqlite's SQLITE_NOINLINE
@@ -12396,6 +12491,18 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                              || s.symbols.at(absorbed).isNoInline;
                 s.symbols.at(survivor).isNoInline = ni;
                 s.symbols.at(absorbed).isNoInline = ni;
+            }
+            // TF-C81 (D-CSUBSET-ALWAYSINLINE): the same OR-merge for
+            // `always_inline`, in the same pre-type-gate position and for the
+            // identical reason — HIR→MIR stamps the flag from the DEFINITION's
+            // symbol, so a `always_inline` spelled only on the prototype would
+            // otherwise be lost. The contradiction gate that consumes these two
+            // records while they are still un-merged ran above; keep it there.
+            {
+                bool const ai = s.symbols.at(survivor).isAlwaysInline
+                             || s.symbols.at(absorbed).isAlwaysInline;
+                s.symbols.at(survivor).isAlwaysInline = ai;
+                s.symbols.at(absorbed).isAlwaysInline = ai;
             }
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the
             // inline-definition reading merges with **AND**, not OR — the one

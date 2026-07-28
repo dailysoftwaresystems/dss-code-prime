@@ -9139,13 +9139,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 6>
+                            std::pair<std::string_view, AttributeEffect>, 7>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
                                 {"warnOnDiscard",  AttributeEffect::WarnOnDiscard},
                                 {"align",          AttributeEffect::Align},
                                 {"noInline",       AttributeEffect::NoInline},
+                                // TF-C81 (D-CSUBSET-ALWAYSINLINE): the mirror of
+                                // `noInline` — exempts the callee from the
+                                // inliner's cost model instead of refusing it.
+                                {"alwaysInline",   AttributeEffect::AlwaysInline},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

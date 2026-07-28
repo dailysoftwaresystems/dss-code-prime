@@ -144,9 +144,35 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // constrain: the first pass to rebuild the module (ConstFold, Mem2Reg, …)
     // would hand a cleared flag to the NEXT Inlining iteration, which would then
     // splice the body the source forbade — silently.
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): `funcAlwaysInline` rides along too — but
+    // ★ ITS FAILURE MODE IS NOT ITS NEIGHBOUR'S, AND THE DIFFERENCE WAS
+    // MEASURED RATHER THAN ASSUMED.
+    //
+    // For `noInline` the flag must keep refusing on EVERY iteration, so clearing
+    // it here re-arms the inliner on iteration 2 and the end-to-end release
+    // outcome breaks. For `alwaysInline` the flag only has to be present at the
+    // FIRST inlining opportunity: `Inlining` runs first in iteration 1, before
+    // any rebuild has touched the module, so the splice has already happened by
+    // the time a cleared flag could matter.
+    //
+    // MEASURED CONSEQUENCE: dropping this argument leaves
+    // `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+    // GREEN — the end-to-end pin CANNOT detect this hop. Only the dedicated
+    // flag-survival assertions catch it
+    // (`MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` and the
+    // survives-the-rebuild check inside
+    // `Inlining.AlwaysInlineCalleeBypassesCostThreshold`). So the propagation
+    // pin is MORE load-bearing here than it was for `noInline`, not less: TF-C78
+    // had two indistinguishable failures, this one has a failure the end-to-end
+    // test is blind to entirely.
+    //
+    // The bit still matters in every shape where the first iteration does NOT
+    // finish the job — a callee that becomes inlinable only after an earlier
+    // pass simplifies a caller, or a cross-CU module merged after one round of
+    // optimization — which is exactly why it is carried rather than argued away.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
                      src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
-                     src_.funcNoInline(oldFn));
+                     src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn));
 
     // Phase 1: select + pre-create blocks. The policy decides which
     // blocks to walk (all blocks vs RPO-reachable subset etc.).

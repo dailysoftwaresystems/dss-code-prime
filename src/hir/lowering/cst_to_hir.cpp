@@ -228,6 +228,15 @@ struct Lowerer {
     // the silent loss of an explicit directive (see `NoInlineAttr`), which is why
     // all three Function lowering sites record it rather than just the common one.
     std::vector<std::pair<HirNodeId, NoInlineAttr>>& noInlineAcc;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the same accumulator, one axis over —
+    // (FUNCTION decl HIR node → AlwaysInlineAttr) pairs from the bound symbol's
+    // `SymbolRecord.isAlwaysInline`, applied to the result's HirAlwaysInlineMap
+    // after finish(). Recorded at ALL THREE Function lowering sites for the same
+    // reason `noInlineAcc` is: not because a miss here is unsafe (it is not — a
+    // lost `always_inline` only restores the cost model) but because a flag that
+    // reaches MIR from only two of three sites is an intermittent, shape-
+    // dependent optimization gap that no single test would localize.
+    std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwaysInlineAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
     // ThreadLocalAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
@@ -1054,6 +1063,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, NoInlineAttr>>& noinl,
+            std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwinl,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
@@ -1064,6 +1074,7 @@ struct Lowerer {
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
+          alwaysInlineAcc(alwinl),
           threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
@@ -1687,6 +1698,17 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isNoInline)
             noInlineAcc.push_back({node, NoInlineAttr{/*isNoInline=*/true}});
+    }
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the `recordNoInline` mirror — record the
+    // inliner cost-model bypass for a lowered Function node from its bound
+    // symbol's `SymbolRecord.isAlwaysInline` (sparse: only annotated functions
+    // are stored; absence ⇒ the size threshold applies as usual).
+    void recordAlwaysInline(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isAlwaysInline)
+            alwaysInlineAcc.push_back(
+                {node, AlwaysInlineAttr{/*isAlwaysInline=*/true}});
     }
     // Record const-ness for a lowered Global node from its bound symbol's
     // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
@@ -8916,7 +8938,8 @@ struct Lowerer {
         HirNodeId const fn_ =
             track(builder.makeFunction(sig, sym.v, params, body), node);
         recordLinkage(fn_, linkAttr);
-        recordNoInline(fn_, sym);   // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         return fn_;
     }
 
@@ -9243,7 +9266,8 @@ struct Lowerer {
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         recordLinkage(fn_, linkAttr);
-        recordNoInline(fn_, sym);   // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         return fn_;
     }
 
@@ -9520,7 +9544,8 @@ struct Lowerer {
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         recordLinkage(fn_, linkAttr);
-        recordNoInline(fn_, sym);   // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         return fn_;
     }
 
@@ -9668,6 +9693,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // TF-C78 (D-CSUBSET-NOINLINE): shared (Function decl node → NoInlineAttr)
     // accumulator, moved onto result->noInlineMap after finish().
     std::vector<std::pair<HirNodeId, NoInlineAttr>> noInlineAcc;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): shared (Function decl node →
+    // AlwaysInlineAttr) accumulator, moved onto result->alwaysInlineMap after
+    // finish().
+    std::vector<std::pair<HirNodeId, AlwaysInlineAttr>> alwaysInlineAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
@@ -9701,7 +9730,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, noInlineAcc,
+            mutability, noInlineAcc, alwaysInlineAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
@@ -9780,6 +9809,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE)
         result->noInlineMap.set(id, attr);
+    for (auto& [id, attr] : alwaysInlineAcc)   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        result->alwaysInlineMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1

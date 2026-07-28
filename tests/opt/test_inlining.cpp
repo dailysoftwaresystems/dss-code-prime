@@ -203,6 +203,79 @@ std::optional<bool> noInlineOfSymbol(Mir const& mir, std::uint32_t sym) {
     return std::nullopt;
 }
 
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): the `noInlineOfSymbol` twin, one axis over.
+std::optional<bool> alwaysInlineOfSymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym) return mir.funcAlwaysInline(f);
+    }
+    return std::nullopt;
+}
+
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): a caller/callee pair whose callee body is
+// `bodyInsts` instructions long, so a test can put it deliberately ABOVE or
+// BELOW a chosen `inlineThreshold`. The callee is GLOBAL-bound, single-block,
+// leaf, non-recursive, address-not-escaped and returns — i.e. it satisfies every
+// CORRECTNESS rule, so the size threshold is the only thing that can refuse it
+// and the `alwaysInline` flag is the only thing that can waive the threshold.
+//
+// `bodyInsts` counts the instructions the gate sees: `bodyInsts - 1` Consts plus
+// the Return. Both flags are parameters so the same fixture drives the bypass
+// test, its non-vacuous twin, and the both-flags-set precedence test.
+Mir buildSizedCalleeModule(TypeInterner& interner, std::uint32_t bodyInsts,
+                           bool calleeAlwaysInline, bool calleeNoInline = false) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Global,
+                   SymbolVisibility::Default, calleeNoInline,
+                   calleeAlwaysInline);
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    // `bodyInsts - 1` Consts, then a Return of the last one. Consts are used
+    // because they are inert: they cannot trip any other gate rule.
+    MirInstId last{};
+    for (std::uint32_t i = 0; i + 1 < bodyInsts; ++i)
+        last = mb.addConst(i32Lit(static_cast<std::int64_t>(i) + 1), i32);
+    mb.addReturn(last);
+
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps3[] = {calleeAddr};
+    MirInstId const call3 = mb.addInst(MirOpcode::Call, callOps3, i32);
+    mb.addReturn(call3);
+    return std::move(mb).finish();
+}
+
+// The instruction count the §2.9 gate computes for the callee — the number the
+// cost model compares against `inlineThreshold`. Kept as a helper so the tests
+// assert the fixture is genuinely over-threshold instead of assuming it.
+std::uint32_t calleeInstCount(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v != sym) continue;
+        std::uint32_t n = 0;
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi)
+            n += mir.blockInstCount(mir.funcBlockAt(f, bi));
+        return n;
+    }
+    return 0;
+}
+
+// The cost-model threshold every TF-C81 size test runs against. Deliberately
+// SMALL and deliberately a local constant: the point of these tests is the
+// relationship between the callee's size and the threshold, not the shipped
+// release value (50), and hard-coding a comparison against the shipped number
+// would make the tests re-fail whenever it is tuned.
+constexpr std::uint32_t kTestThreshold = 8;
+constexpr std::uint32_t kOverThresholdBody = kTestThreshold + 4;   // 12
+
 } // namespace
 
 // ── TF-C78 (D-CSUBSET-NOINLINE): a noinline callee is NOT inlined ──
@@ -272,6 +345,182 @@ TEST(Inlining, NoInlineFlagClearedInlinesTheSameCallee) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), constsBefore + 1)
         << "the callee's Const 7 must be SPLICED into main";
+}
+
+// ── TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE LOAD-BEARING PIN ───────
+// An `always_inline` callee that EXCEEDS the cost threshold is inlined
+// anyway. This asserts the APPLIED FACT — the Call is GONE from the
+// optimized module and the callee's body is present in the caller —
+// not merely that the attribute compiled.
+//
+// The fixture is genuinely over-threshold and the test PROVES it
+// rather than assuming it: `calleeInstCount` is asserted `>
+// kTestThreshold` up front, and the paired
+// `AlwaysInlineFlagClearedRefusesTheSameOverThresholdCallee` below
+// builds the byte-identical module with the flag CLEAR and asserts the
+// call SURVIVES. Without that pair this test would stay green even if
+// the callee were small enough to inline on its own merits.
+//
+// RED-ON-DISABLE (MEASURED against the final build): delete the
+// `&& !mir.funcAlwaysInline(callee)` clause from rule 6 and
+// `callsInlined` drops to 0 with the Call surviving.
+TEST(Inlining, AlwaysInlineCalleeBypassesCostThreshold) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildSizedCalleeModule(interner, kOverThresholdBody,
+                                     /*calleeAlwaysInline=*/true);
+
+    ASSERT_EQ(alwaysInlineOfSymbol(mir, 50), std::optional<bool>{true})
+        << "fixture precondition: the callee must carry the flag";
+    ASSERT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{false})
+        << "fixture precondition: ONLY alwaysInline is set — a fixture with "
+           "both bits could not distinguish a swapped argument pair";
+    ASSERT_GT(calleeInstCount(mir, 50), kTestThreshold)
+        << "fixture precondition: the callee MUST exceed the threshold, or "
+           "this test proves nothing — it would have been inlined anyway";
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    auto const constsBefore = countOpInModule(mir, MirOpcode::Const);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, kTestThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "an over-threshold callee the SOURCE declared "
+           "__attribute__((always_inline)) MUST still be inlined — the "
+           "attribute waives the size-based profitability veto";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "THE APPLIED FACT: the Call must be GONE from the optimized module";
+    EXPECT_GT(countOpInModule(mir, MirOpcode::Const), constsBefore)
+        << "the callee's body must have been SPLICED into main";
+
+    // ★ THE FLAG SURVIVES THE PASS' OWN REBUILD. `runInlining` rebuilds every
+    // function through `MultiBlockInliner::rebuildFunction`; a rebuild that
+    // dropped the bit would silently re-apply the threshold on the NEXT
+    // pipeline iteration — green here, wrong end to end.
+    EXPECT_EQ(alwaysInlineOfSymbol(mir, 50), std::optional<bool>{true})
+        << "the alwaysInline flag must survive the inlining pass' own rebuild";
+    EXPECT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{false})
+        << "and it must not have been rebuilt into the WRONG bit — the two "
+           "flags are adjacent bools at every addFunction copy site";
+}
+
+// ── NON-VACUOUS twin: the SAME over-threshold module WITHOUT the flag ──
+// Proves the test above measures the flag and not the callee's size:
+// the two fixtures differ in exactly one boolean, and this one REFUSES.
+// This is also what proves the callee is genuinely over-threshold.
+TEST(Inlining, AlwaysInlineFlagClearedRefusesTheSameOverThresholdCallee) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildSizedCalleeModule(interner, kOverThresholdBody,
+                                     /*calleeAlwaysInline=*/false);
+
+    ASSERT_EQ(alwaysInlineOfSymbol(mir, 50), std::optional<bool>{false});
+    ASSERT_GT(calleeInstCount(mir, 50), kTestThreshold);
+    auto const callsBefore = countOpInModule(mir, MirOpcode::Call);
+    ASSERT_EQ(callsBefore, 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, kTestThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "with the flag CLEAR the identical over-threshold callee MUST be "
+           "refused by the cost model — otherwise the bypass test above proves "
+           "nothing about the flag";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore)
+        << "the Call must survive: this is what makes the fixture "
+           "genuinely over-threshold rather than merely believed to be";
+}
+
+// ── The SAME callee UNDER the threshold inlines without the flag ────
+// Completes the 2x2: the refusal above is the THRESHOLD talking, not
+// some unrelated rule silently refusing every fixture in this family.
+TEST(Inlining, UnderThresholdCalleeInlinesWithoutAlwaysInline) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildSizedCalleeModule(interner, kTestThreshold - 4,
+                                     /*calleeAlwaysInline=*/false);
+
+    ASSERT_LE(calleeInstCount(mir, 50), kTestThreshold);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, kTestThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "an UNDER-threshold callee inlines with no attribute at all — so "
+           "the over-threshold refusal above is the cost model, not a "
+           "confounding rule that refuses this whole fixture family";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+}
+
+// ── TF-C81: BOTH flags set ⇒ the REFUSAL wins (MIR-tier precedence) ──
+// The source tier rejects this combination outright
+// (S_ConflictingInlineAttributes), so this state is only reachable via
+// hand-built MIR or parsed `.dssir`. It is pinned anyway because the
+// tier must not be left to rule ORDER by accident: `inlining.cpp`
+// checks rule 2b BEFORE the rule-6 bypass deliberately, and that
+// ordering is the whole decision.
+//
+// MEASURED: this is also what Apple clang 21 does with the same
+// contradiction — it silently keeps `noinline` in both source orders.
+TEST(Inlining, NoInlineWinsWhenBothInlineFlagsAreSet) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildSizedCalleeModule(interner, kTestThreshold - 4,
+                                     /*calleeAlwaysInline=*/true,
+                                     /*calleeNoInline=*/true);
+
+    ASSERT_EQ(alwaysInlineOfSymbol(mir, 50), std::optional<bool>{true});
+    ASSERT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{true});
+    // Deliberately UNDER threshold: the callee would inline on its own merits,
+    // so the ONLY thing that can refuse it here is the noinline rule.
+    ASSERT_LE(calleeInstCount(mir, 50), kTestThreshold);
+    auto const callsBefore = countOpInModule(mir, MirOpcode::Call);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, kTestThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "with BOTH directives set the REFUSAL must win — rule 2b is "
+           "ordered before the rule-6 bypass, conservatively";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore);
+}
+
+// ── TF-C81: always_inline does NOT override a CORRECTNESS refusal ───
+// The Weak rule is the gate's one true correctness rule (a strong def
+// may replace a weak one at link, so splicing the weak body bakes in
+// the wrong one). `always_inline` waives the PROFITABILITY veto only;
+// a source annotation cannot license a miscompile. This pins the
+// boundary of the feature, which is exactly what the config row and
+// `AlwaysInlineAttr` claim in prose.
+TEST(Inlining, AlwaysInlineDoesNotOverrideTheWeakCalleeRefusal) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Weak,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/true);
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const addr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const ops[] = {addr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, ops, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(alwaysInlineOfSymbol(mir, 50), std::optional<bool>{true});
+    auto const callsBefore = countOpInModule(mir, MirOpcode::Call);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "always_inline waives the SIZE threshold and nothing else — a Weak "
+           "callee is still refused, because inlining it would be a "
+           "miscompile and no source annotation licenses that";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore);
 }
 
 // ── THE correctness pin: a Weak callee is NOT inlined ──────────────

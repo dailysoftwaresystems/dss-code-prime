@@ -483,6 +483,96 @@ TEST(MirText, FunctionAttributesSurviveRoundTrip) {
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
 
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): the `alwaysinline` function attribute
+// survives the `.dssir` round-trip, and does so INDEPENDENTLY of `noinline`.
+//
+// Written as its own test rather than folded into the one above because the
+// interesting failure is not "the flag was dropped" but "the flag landed in the
+// WRONG BIT": `alwaysInline` is the second of two adjacent trailing bools at
+// `addFunction`, and printer/parser each name the two keywords separately. A
+// fixture that set both flags on one function could not tell a swap from a
+// correct carry, so every function here sets EXACTLY ONE of them and the
+// assertions check both directions on each.
+//
+// RED-ON-DISABLE: drop `alwaysInline` from `parseFunction`'s `addFunction` call,
+// or the `if (ai)` arm in `appendFuncAttrs`, and the first EXPECT below fails
+// while `FunctionAttributesSurviveRoundTrip` stays green.
+TEST(MirText, AlwaysInlineAttributeSurvivesRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    // %1 — alwaysinline ONLY (Global/Default, noInline clear): isolates the bit.
+    (void)b.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/false,
+                        /*alwaysInline=*/true);
+    MirBlockId e1 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e1); b.addReturn();
+    // %2 — noinline ONLY: the mirror. Together with %1 this pins the SWAP.
+    (void)b.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/true,
+                        /*alwaysInline=*/false);
+    MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e2); b.addReturn();
+    // %3 — alwaysinline COMPOSED with the linkage axes, all non-default.
+    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Local,
+                        SymbolVisibility::Hidden, /*noInline=*/false,
+                        /*alwaysInline=*/true);
+    MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e3); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "ai", "ni", "localhidden"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 3u);
+
+    auto findBySym = [&](std::uint32_t sym) -> MirFuncId {
+        std::size_t const nf = parsed->mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = parsed->mir.funcAt(i);
+            if (parsed->mir.funcSymbol(f).v == sym) return f;
+        }
+        return MirFuncId{};
+    };
+
+    MirFuncId const f1 = findBySym(1);
+    ASSERT_TRUE(f1.valid());
+    EXPECT_TRUE(parsed->mir.funcAlwaysInline(f1))
+        << "an alwaysinline function must come back alwaysinline — a dropped "
+           "flag here silently restores the inliner's size threshold:\n" << text;
+    EXPECT_FALSE(parsed->mir.funcNoInline(f1))
+        << "and must NOT come back noinline — that swap would invert the "
+           "directive into its exact opposite";
+
+    MirFuncId const f2 = findBySym(2);
+    ASSERT_TRUE(f2.valid());
+    EXPECT_TRUE(parsed->mir.funcNoInline(f2));
+    EXPECT_FALSE(parsed->mir.funcAlwaysInline(f2))
+        << "the mirror direction of the same swap";
+
+    MirFuncId const f3 = findBySym(3);
+    ASSERT_TRUE(f3.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f3),    SymbolBinding::Local);
+    EXPECT_EQ(parsed->mir.funcVisibility(f3), SymbolVisibility::Hidden);
+    EXPECT_TRUE(parsed->mir.funcAlwaysInline(f3))
+        << "all four per-function axes must survive together";
+    EXPECT_FALSE(parsed->mir.funcNoInline(f3));
+
+    // The keyword is the text format's own spelling, not the C attribute's.
+    EXPECT_NE(text.find("alwaysinline"), std::string::npos)
+        << "the printer must emit the `.dssir` keyword:\n" << text;
+
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    DiagnosticReporter r3;
+    EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
+}
+
 // TF-C78: an UNRECOGNIZED function attribute FAILS LOUD rather than being
 // skipped. A parser that silently ignored an unknown name is precisely how a
 // dropped field goes unnoticed for a long time (see the test above), so the

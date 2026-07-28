@@ -209,6 +209,14 @@ public:
     [[nodiscard]] bool funcNoInline(MirFuncId id) const {
         return funcArena_.at(id).noInline;
     }
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): TRUE iff the source declared this
+    // function `__attribute__((always_inline))`. The inliner's §2.9 legality gate
+    // SKIPS its size-based cost model (rule 6) for such a callee — the mirror of
+    // `funcNoInline`'s refusal, read at the same gate. Every correctness rule
+    // still applies. See `detail::MirFunc::alwaysInline`.
+    [[nodiscard]] bool funcAlwaysInline(MirFuncId id) const {
+        return funcArena_.at(id).alwaysInline;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -376,10 +384,20 @@ public:
     // naturally; every site that COPIES an existing MirFunc must pass the
     // source function's `funcNoInline(...)` explicitly, exactly as it already
     // passes `funcBinding`/`funcVisibility`.
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): `alwaysInline` stamps the per-function
+    // cost-model bypass, on the same terms.
+    //
+    // ★ THE TWO TRAILING BOOLS ARE ADJACENT AND OPPOSITE IN MEANING, so a swapped
+    // pair at a copy site would compile silently and invert the directive. That
+    // hazard is covered by TEST DESIGN rather than by types: every propagation
+    // pin sets exactly ONE of the two and asserts the OTHER is still clear, so a
+    // transposition fails a test instead of shipping. Keep that property when
+    // adding pins — a test that sets both flags cannot detect a swap.
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
-                          SymbolBinding    binding    = SymbolBinding::Global,
-                          SymbolVisibility visibility = SymbolVisibility::Default,
-                          bool             noInline   = false);
+                          SymbolBinding    binding      = SymbolBinding::Global,
+                          SymbolVisibility visibility   = SymbolVisibility::Default,
+                          bool             noInline     = false,
+                          bool             alwaysInline = false);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

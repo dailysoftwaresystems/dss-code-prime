@@ -374,6 +374,102 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoInline) {
     EXPECT_EQ(dst.funcVisibility(dst.funcAt(0)), SymbolVisibility::Default);
 }
 
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE SECOND PROPAGATION PIN — and MEASUREMENT
+// MADE IT MORE NECESSARY THAN ITS TF-C78 SIBLING, NOT LESS. THIS TEST IS THE ONLY
+// THING THAT CATCHES THIS HOP.
+//
+// TF-C78's finding was that two disable states (delete the rule / drop the flag
+// at one hop) produce BYTE-IDENTICAL breakage, so an end-to-end test can prove
+// the chain is broken but not which hop broke it. For `alwaysInline` the
+// situation is STRICTLY WORSE and it was MEASURED, not assumed: dropping
+// `src_.funcAlwaysInline(oldFn)` below leaves the end-to-end pin
+// `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+// COMPLETELY GREEN. The end-to-end test is BLIND to this hop.
+//
+// Why the asymmetry: `noInline` must keep REFUSING on every iteration, so a
+// cleared flag re-arms the inliner on iteration 2 and the output changes.
+// `alwaysInline` only has to be present at the FIRST inlining opportunity —
+// `Inlining` runs first in iteration 1, before any rebuild touches the module,
+// so in the simple shape the splice is already done. The flag still matters
+// wherever the first iteration does not finish the job (a callee that becomes
+// inlinable only after an earlier pass simplifies its caller; a cross-CU module
+// merged after a round of optimization), and those shapes are precisely the ones
+// an end-to-end fixture does not happen to construct.
+//
+// So: without THIS test the hop could be deleted and the whole suite would stay
+// green. That is the entire argument for a dedicated propagation pin, in its
+// sharpest form yet.
+//
+// ★ THE FIXTURE IS DELIBERATELY ASYMMETRIC: func #0 sets ONLY `alwaysInline` and
+// this test asserts its `noInline` is still CLEAR. The two flags are adjacent
+// trailing bools at every `addFunction` copy site, so a transposed pair would
+// compile silently and invert the directive; a fixture that set both could not
+// detect that. Keep the asymmetry when extending this test.
+//
+// RED-ON-DISABLE (MEASURED against the final build): drop the
+// `src_.funcAlwaysInline(oldFn)` argument in `mir_rebuild_helper.cpp` (let the
+// 6th parameter default to false) and exactly TWO assertions in the whole suite
+// fail — the first EXPECT_TRUE below, and the flag-survival check inside
+// `Inlining.AlwaysInlineCalleeBypassesCostThreshold`. Every other test,
+// INCLUDING the shipped-release end-to-end pin and the corpus example, stays
+// green.
+TEST(MirRebuildHelper, RebuildFunctionPreservesAlwaysInline) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: ALWAYS_INLINE only — Global/Default binding and noInline CLEAR,
+    // so this flag is the single non-default axis on the record.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: NOINLINE only — the mirror record. Its presence is what proves a
+    // swapped argument pair cannot pass: a transposition would make func #0 read
+    // noInline and func #1 read alwaysInline, failing both directions at once.
+    mb.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/true,
+                   /*alwaysInline=*/false);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    // func #2: plain — must acquire NEITHER flag.
+    mb.addFunction(fnSig, SymbolId{3});
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b2);
+    MirLiteralValue v2; v2.value = std::int64_t{9}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 3u);
+    ASSERT_TRUE(src.funcAlwaysInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 3u);
+
+    EXPECT_TRUE(dst.funcAlwaysInline(dst.funcAt(0)))
+        << "rebuildFunction must preserve the alwaysInline flag — this "
+           "rebuilder runs under every optimizer pass, so dropping it here "
+           "silently re-applies the size threshold on the next iteration";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — the two flags are adjacent "
+           "bools at the addFunction call, so a swap must fail here";
+    EXPECT_TRUE(dst.funcNoInline(dst.funcAt(1)))
+        << "the mirror record: noInline must survive independently";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(1)))
+        << "and must not bleed into the alwaysInline bit";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(2)))
+        << "an un-annotated function must not acquire the flag";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(2)));
+}
+
 TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32 = interner.primitive(TypeKind::I32);

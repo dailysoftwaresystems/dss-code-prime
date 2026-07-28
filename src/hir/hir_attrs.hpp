@@ -3,6 +3,7 @@
 #include "hir/hir.hpp"   // HirAttribute<T>
 
 #include "hir/attributes/alignment_attr.hpp"
+#include "hir/attributes/always_inline_attr.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
@@ -53,6 +54,16 @@ using HirLinkageMap = HirAttribute<LinkageAttr>;
 // on, beside the Weak-binding rule. Keyed on the same DECLARATION node as
 // `HirLinkageMap`, but a distinct axis (see `NoInlineAttr`).
 using HirNoInlineMap = HirAttribute<NoInlineAttr>;
+
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): native FUNCTION declarations the source
+// marked `__attribute__((always_inline))`. Populated by CST→HIR lowering from
+// the bound symbol's `SymbolRecord.isAlwaysInline`; read by HIR→MIR lowering to
+// stamp `MirFunc.alwaysInline` — the input that SUPPRESSES the inlining legality
+// gate's size threshold (rule 6), the mirror image of what `HirNoInlineMap`
+// feeds. Keyed on the same DECLARATION node as `HirLinkageMap` /
+// `HirNoInlineMap`, and a third distinct axis (see `AlwaysInlineAttr`, which
+// states precisely what the attribute does and does not promise).
+using HirAlwaysInlineMap = HirAttribute<AlwaysInlineAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

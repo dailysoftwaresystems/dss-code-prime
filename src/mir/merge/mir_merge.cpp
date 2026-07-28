@@ -184,9 +184,13 @@ public:
         // TF-C78 (D-CSUBSET-NOINLINE): carried across the cross-CU merge — the
         // merged module is what the optimizer then runs on, so a flag dropped
         // here would let a `noinline` function from CU A be inlined after link.
+        // TF-C81 (D-CSUBSET-ALWAYSINLINE): carried across the same boundary —
+        // the merged module is what the optimizer runs on, so a flag dropped
+        // here would silently restore the size threshold for an `always_inline`
+        // function that came from CU A.
         MirFuncId const newF = dst_.addFunction(
             sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
-            src_.funcNoInline(f));
+            src_.funcNoInline(f), src_.funcAlwaysInline(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);

@@ -270,7 +270,42 @@ struct MirFunc {
     // Steals one byte from the former 2-byte `_pad` — no struct-size growth
     // (the static_assert below still holds at 24).
     bool             noInline   = false;                     // 1
-    std::uint8_t  _pad          = 0;                         // 1  — explicit padding
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the source declared this function
+    // `__attribute__((always_inline))` — the optimizer's inliner must NOT let its
+    // SIZE-BASED cost model (rule 6, `instCount > inlineThreshold`) refuse this
+    // callee. Reaches here by the identical route its `noInline` neighbour takes:
+    // source → SymbolRecord.isAlwaysInline → HirAlwaysInlineMap → this bit.
+    //
+    // ★ IT SUPPRESSES ONE RULE, NOT THE GATE. Every CORRECTNESS refusal still
+    // wins — Weak binding, a same-SCC (recursive) call, an address-escaped
+    // callee, a callee with no returning path, an arity/type mismatch. And it is
+    // read only where an inliner runs at all: under the shipped `debug` pipeline
+    // (`Identity` only) there is no cost model to bypass and the bit is inert.
+    //
+    // ★ DIRECTION OF A DROPPED FLAG — THE MIRROR OF ITS NEIGHBOUR'S. A lost
+    // `noInline` true silently DOES the forbidden thing; a lost `alwaysInline`
+    // true merely re-applies the size threshold, so the program stays correct and
+    // only the optimization is missed. Both are still carried through every
+    // MirFunc creation/copy/rebuild/serialize path — and for THIS flag the
+    // argument is sharper than for its neighbour: MEASURED, dropping it at the
+    // `mir_rebuild_helper` hop leaves the end-to-end shipped-release pin GREEN
+    // (Inlining runs first in iteration 1, so the splice is already done), which
+    // means only the dedicated propagation pin can catch that hop at all.
+    //
+    // ★ IF BOTH BITS ARE SET (only reachable through hand-built MIR or parsed
+    // `.dssir` — the source tier rejects the combination as
+    // S_ConflictingInlineAttributes), the REFUSAL wins: `inlining.cpp` checks
+    // rule 2b before the rule-6 bypass. Conservative, and MEASURED to be what
+    // clang does with the same contradiction.
+    //
+    // Takes the LAST byte of the original 2-byte `_pad` — MEASURED, sizeof stays
+    // 24 and the static_assert below still holds.
+    bool             alwaysInline = false;                   // 1
+    // NOTE (TF-C81): there is deliberately NO `_pad` member any more. The four
+    // 1-byte fields above (binding, visibility, noInline, alwaysInline) now fill
+    // the 4-byte tail slot EXACTLY, so explicit padding would be a lie about the
+    // layout rather than documentation of it. The next 1-byte function flag is
+    // the one that grows the struct 24 → 32; it should re-introduce `_pad[3]`.
 };
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);

@@ -642,7 +642,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
                           &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
                           &hir->returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
-                          &hir->noInlineMap);   // TF-C78 (D-CSUBSET-NOINLINE)
+                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+                          &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;

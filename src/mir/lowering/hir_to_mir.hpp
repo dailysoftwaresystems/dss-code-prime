@@ -299,6 +299,16 @@ lowerToMir(Hir const&               hir,
            // the flag the optimizer's inlining legality gate refuses on, beside
            // the Weak-binding rule. Keyed on the same declaration node as
            // `linkageMap` and read at the same site.
-           HirNoInlineMap const*    noInlineMap = nullptr);
+           HirNoInlineMap const*    noInlineMap = nullptr,
+           // TF-C81 (D-CSUBSET-ALWAYSINLINE): the `noInlineMap` mirror —
+           // per-FUNCTION-DECLARATION inliner COST-MODEL BYPASS side-table,
+           // populated by the CST→HIR lowerer from each function's bound symbol
+           // `SymbolRecord.isAlwaysInline`. Optional: nullptr (or a decl with no
+           // entry) ⇒ the size threshold applies as usual, which is both the
+           // correct reading of an un-annotated C function and the behavior
+           // before this key existed. Read here to stamp `MirFunc.alwaysInline`.
+           // Keyed on the same declaration node as `linkageMap` / `noInlineMap`
+           // and read at the same site.
+           HirAlwaysInlineMap const* alwaysInlineMap = nullptr);
 
 } // namespace dss

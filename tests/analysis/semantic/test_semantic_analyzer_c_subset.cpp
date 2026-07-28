@@ -6182,6 +6182,112 @@ TEST(SemanticAnalyzerCSubset, InlineOnNonFunctionIsLoud) {
                         DiagnosticCode::S_InlineNonFunction), 1u);
 }
 
+// ── TF-C81 (D-CSUBSET-ALWAYSINLINE): the CONTRADICTION gate ───────
+//
+// `always_inline` and `noinline` on one function are exact opposites: one
+// forbids splicing the callee, the other exists solely to force splicing past
+// the cost model. Exactly one can take effect and which one is invisible at the
+// source, so DSS FAILS LOUD instead of picking.
+//
+// ★ THIS IS A DELIBERATE DIVERGENCE FROM CLANG, AND IT IS MEASURED, NOT
+// ASSUMED. Apple clang 21.0.0 was probed on all four shapes at
+// `-fsyntax-only -Wall -Wextra` AND at `-O2 -Weverything`: it emits NO
+// diagnostic whatsoever and SILENTLY resolves the conflict to `noinline` (the
+// emitted LLVM function carries `noinline`, never `alwaysinline`, in BOTH source
+// orders). That silent resolution is exactly the last-writer-wins outcome this
+// project refuses. The MIR tier keeps clang's answer as a conservative backstop
+// (inlining.cpp checks the noinline refusal before the threshold bypass), but a
+// source program that states both never gets that far.
+//
+// Diagnostic SETS, never bare counts: each case asserts the conflict code fires
+// exactly once AND that no unrelated error rides along.
+TEST(SemanticAnalyzerCSubset, AlwaysInlineWithNoInlineOnOneDeclarationIsLoud) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"static __attribute__((always_inline)) __attribute__((noinline)) "
+         "int f(int x){return x+1;}\n"
+         "int main(void){return f(41);}\n"});
+    EXPECT_TRUE(model.hasErrors())
+        << "two contradictory inline directives must not be silently resolved";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConflictingInlineAttributes), 1u);
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "exactly ONE diagnostic — the conflict, and nothing else";
+}
+
+// The same contradiction SPLIT across a prototype and its definition. Each
+// declaration alone is consistent; only the post-Pass-1.5 `mergedFnDecls` sweep
+// can see it.
+//
+// ★ RED-ON-DISABLE, AND THIS ONE ACTUALLY FIRED DURING THE CYCLE: the gate was
+// first written AFTER the `noInline` OR-merge, which had already written the
+// unioned flag into BOTH records — so the survivor looked like it had spelled
+// both attributes itself, the "already reported" suppression triggered, and the
+// split conflict was silently accepted (MEASURED: exit 0, no diagnostic). Moving
+// the gate ABOVE both OR-merges, where the two records are still pristine, is
+// what makes it fire. Reordering it back below them turns this test red.
+TEST(SemanticAnalyzerCSubset, AlwaysInlineWithNoInlineAcrossDeclarationsIsLoud) {
+    for (auto const* src : {
+             // noinline on the prototype, always_inline on the definition
+             "static __attribute__((noinline)) int f(int x);\n"
+             "static __attribute__((always_inline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // …and the opposite order, which must be equally loud
+             "static __attribute__((always_inline)) int f(int x);\n"
+             "static __attribute__((noinline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_TRUE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 1u)
+            << "the split contradiction must fire EXACTLY once, in either "
+               "declaration order";
+        EXPECT_EQ(model.diagnostics().all().size(), 1u);
+    }
+}
+
+// One mistake, one diagnostic: a declaration carrying BOTH attributes that ALSO
+// has a prototype must not be reported twice (once at the declarator, once at
+// the merge). This is what the `already` suppression in the merge sweep buys.
+TEST(SemanticAnalyzerCSubset, ConflictingInlineAttributesReportedExactlyOnce) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"static int f(int x);\n"
+         "static __attribute__((always_inline)) __attribute__((noinline)) "
+         "int f(int x){return x+1;}\n"
+         "int main(void){return f(41);}\n"});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConflictingInlineAttributes), 1u)
+        << "the declarator check and the merge check must not BOTH fire for a "
+           "single mistake";
+    EXPECT_EQ(model.diagnostics().all().size(), 1u);
+}
+
+// The NEGATIVE control for the whole conflict suite: each attribute ALONE, and
+// both present on DIFFERENT functions, must be completely clean. Without this a
+// gate that fired on the mere presence of either attribute would pass every
+// test above.
+TEST(SemanticAnalyzerCSubset, EitherInlineAttributeAloneIsClean) {
+    for (auto const* src : {
+             "static __attribute__((always_inline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             "static __attribute__((noinline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // both attributes present, but on DIFFERENT functions
+             "static __attribute__((always_inline)) int a(int x){return x+1;}\n"
+             "static __attribute__((noinline)) int b(int x){return x+2;}\n"
+             "int main(void){return a(1)+b(2);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "a single inline directive — or two on DIFFERENT functions — "
+               "is not a conflict";
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 0u);
+    }
+}
+
 // (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
 // `"noreturn": true` (the abort/exit shape) threads onto the injected
 // SymbolRecord's isNoreturn — a shipped extern has no user prototype to carry
