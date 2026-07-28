@@ -244,7 +244,33 @@ struct MirFunc {
     // Fits the existing 4-byte _pad slot — no struct-size growth.
     SymbolBinding    binding    = SymbolBinding::Global;     // 1
     SymbolVisibility visibility = SymbolVisibility::Default; // 1
-    std::uint16_t _pad          = 0;                         // 2  — explicit padding
+    // TF-C78 (D-CSUBSET-NOINLINE): the source declared this function
+    // `__attribute__((noinline))` — the optimizer's inliner MUST NOT splice its
+    // body into any caller. Reaches here as source → SymbolRecord.isNoInline →
+    // HirNoInlineMap → this bit (the `binding`/`visibility` route above, whose
+    // LinkageAttr shape it copies); read by `inlining.cpp`'s §2.9 legality gate
+    // beside the Weak refusal.
+    //
+    // ★ WHY A REAL SINK RATHER THAN AN IGNORED NAME. The cheap alternative was
+    // listing `noinline` as KNOWN-but-inert vocabulary (an `effects` `none` row).
+    // That row's contract is "consumed elsewhere or deliberately inert", and with
+    // `Inlining` in the SHIPPED release pipeline (release.pipeline.json) nothing
+    // consumed it and it was not inert — DSS had a live pass free to contradict
+    // the directive. sqlite writes `SQLITE_NOINLINE` to BOUND STACK DEPTH on
+    // recursive paths, so ignoring it has a runtime consequence, not a cosmetic
+    // one.
+    //
+    // ★ DIRECTION OF A DROPPED FLAG: a lost `true` means the function gets
+    // INLINED anyway — silent, and exactly the outcome the attribute exists to
+    // prevent. So it must survive every MirFunc creation/copy/rebuild/serialize
+    // path, not merely the lowering that mints it. The `mir_text` printer/parser
+    // pair dropped `binding`/`visibility` for exactly this reason before this
+    // cycle; both are now carried (see `emitFunction`/`parseFunction`).
+    //
+    // Steals one byte from the former 2-byte `_pad` — no struct-size growth
+    // (the static_assert below still holds at 24).
+    bool             noInline   = false;                     // 1
+    std::uint8_t  _pad          = 0;                         // 1  — explicit padding
 };
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);

@@ -2990,6 +2990,7 @@ struct AttributeSemanticsFacts {
     std::string deprecatedMessage;
     bool        nodiscard   = false;   // warnOnDiscard row matched
     std::string nodiscardMessage;
+    bool        noInline    = false;   // noInline row matched (TF-C78)
     // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
     // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
     // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
@@ -3432,6 +3433,12 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 }
                 break;
             }
+            case AttributeEffect::NoInline:
+                // TF-C78 (D-CSUBSET-NOINLINE): a pure marker — no argument, no
+                // message, no MAX-fold. Applied to the declarator's symbol below
+                // gated on the declared type being a FnSig.
+                out.noInline = true;
+                break;
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
@@ -6672,6 +6679,18 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 atRec.nodiscardMessage =
                                     attrFacts.nodiscardMessage;
                         }
+                        // TF-C78 (D-CSUBSET-NOINLINE): mark a FUNCTION symbol the
+                        // declaration annotated `noinline`. Gated on `isFnSig` —
+                        // the `isNoreturn` discipline one block below — so a
+                        // `__attribute__((noinline)) int x;` is INERT rather than
+                        // recorded on a data object that no inliner will ever
+                        // consult. Unlike the three effects above this one has a
+                        // type gate for a reason: those are diagnostic-only and an
+                        // inapplicable flag is merely unread, whereas this one
+                        // feeds a CODEGEN decision and should not be carried by a
+                        // symbol whose kind cannot honor it.
+                        if (isFnSig && attrFacts.noInline)
+                            s.symbols.at(sym).isNoInline = true;
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
                         // field is handled above); a PARAMETER carries its own
@@ -12285,6 +12304,19 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                              || s.symbols.at(absorbed).isNoreturn;
                 s.symbols.at(survivor).isNoreturn = nr;
                 s.symbols.at(absorbed).isNoreturn = nr;
+            }
+            // TF-C78 (D-CSUBSET-NOINLINE): the same OR-merge, for the same
+            // reason and in the same pre-type-gate position. `noinline` is
+            // routinely spelled on the PROTOTYPE only (sqlite's SQLITE_NOINLINE
+            // sits on both, but a header/impl split that annotates just the
+            // header is ordinary C); HIR→MIR stamps the flag from the DEFINITION's
+            // symbol, so without this merge the header-only spelling would lower
+            // to a MirFunc with the bit clear and the function would be inlined.
+            {
+                bool const ni = s.symbols.at(survivor).isNoInline
+                             || s.symbols.at(absorbed).isNoInline;
+                s.symbols.at(survivor).isNoInline = ni;
+                s.symbols.at(absorbed).isNoInline = ni;
             }
             // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): OR-merge deprecated /
             // nodiscard across the proto/def pair, the isNoreturn precedent —

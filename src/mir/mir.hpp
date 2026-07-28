@@ -202,6 +202,13 @@ public:
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
         return funcArena_.at(id).visibility;
     }
+    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff the source declared this function
+    // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
+    // splice such a callee — the sibling of the `funcBinding == Weak` refusal,
+    // and read at the same site. See `detail::MirFunc::noInline`.
+    [[nodiscard]] bool funcNoInline(MirFuncId id) const {
+        return funcArena_.at(id).noInline;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -363,9 +370,16 @@ public:
     // Open a function. Closes any open function first (which requires its current
     // block be terminated and the function have ≥1 block). `signature` is the
     // FnSig TypeId; `symbol` the declared SymbolId.
+    // TF-C78 (D-CSUBSET-NOINLINE): `noInline` stamps the per-function
+    // inliner opt-out. DEFAULTED to false so a SYNTHESIZED function (a shim,
+    // a funclet, a startup thunk — none of which the source annotated) reads
+    // naturally; every site that COPIES an existing MirFunc must pass the
+    // source function's `funcNoInline(...)` explicitly, exactly as it already
+    // passes `funcBinding`/`funcVisibility`.
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding    = SymbolBinding::Global,
-                          SymbolVisibility visibility = SymbolVisibility::Default);
+                          SymbolVisibility visibility = SymbolVisibility::Default,
+                          bool             noInline   = false);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

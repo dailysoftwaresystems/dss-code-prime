@@ -289,6 +289,16 @@ lowerToMir(Hir const&               hir,
            // carrier the optimizer's returns-twice-aware passes (mem2reg no-promote,
            // inliner callee-refusal) consult (noreturn is HIR-discharged and never
            // reaches MIR; returns-twice MUST, so it needs this flag).
-           HirReturnsTwiceMap const* returnsTwiceMap = nullptr);
+           HirReturnsTwiceMap const* returnsTwiceMap = nullptr,
+           // TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION-DECLARATION inliner
+           // opt-out side-table, populated by the CST→HIR lowerer from each
+           // function's bound symbol `SymbolRecord.isNoInline`. Optional:
+           // nullptr (or a decl with no entry) ⇒ freely inlinable, which is the
+           // correct reading of an un-annotated C function AND the behavior
+           // before this key existed. Read here to stamp `MirFunc.noInline` —
+           // the flag the optimizer's inlining legality gate refuses on, beside
+           // the Weak-binding rule. Keyed on the same declaration node as
+           // `linkageMap` and read at the same site.
+           HirNoInlineMap const*    noInlineMap = nullptr);
 
 } // namespace dss

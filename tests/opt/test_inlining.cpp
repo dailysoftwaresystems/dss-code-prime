@@ -165,7 +165,114 @@ Mir buildCallerCalleeModule(TypeInterner& interner, SymbolBinding calleeBinding,
     return std::move(mb).finish();
 }
 
+// TF-C78 (D-CSUBSET-NOINLINE): the `buildCallerCalleeModule` twin whose callee
+// carries the `noInline` flag instead of a non-default binding. Deliberately
+// GLOBAL-bound so the ONLY thing that can refuse the splice is rule 2b — a Weak
+// or Local callee would confound the two refusals and the test would stay green
+// with rule 2b deleted.
+Mir buildNoInlineCalleeModule(TypeInterner& interner, bool calleeNoInline,
+                              std::int64_t retVal = 7) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Global,
+                   SymbolVisibility::Default, calleeNoInline);
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    mb.addReturn(mb.addConst(i32Lit(retVal), i32));
+
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps2[] = {calleeAddr};
+    MirInstId const call2 = mb.addInst(MirOpcode::Call, callOps2, i32);
+    mb.addReturn(call2);
+    return std::move(mb).finish();
+}
+
+// The `funcNoInline` bit of the function carrying `sym`, or nullopt when no
+// such function survives in the module.
+std::optional<bool> noInlineOfSymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym) return mir.funcNoInline(f);
+    }
+    return std::nullopt;
+}
+
 } // namespace
+
+// ── TF-C78 (D-CSUBSET-NOINLINE): a noinline callee is NOT inlined ──
+// The §2.9 gate's rule 2b. The callee is GLOBAL-bound, a single-block
+// leaf, non-recursive, address-not-escaped and well under the cost
+// threshold — i.e. it satisfies EVERY other rule, so the flag is the
+// only thing that can refuse it. The paired
+// `NoInlineFlagClearedInlinesTheSameCallee` below builds the byte-
+// identical module with the flag CLEAR and asserts it IS inlined,
+// which is what makes this test non-vacuous.
+//
+// RED-ON-DISABLE (MEASURED): delete rule 2b from `inlineLegalityGate`
+// and `callsInlined` becomes 1, the Call disappears, and the callee's
+// `Const 7` is spliced into main.
+TEST(Inlining, NoInlineCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildNoInlineCalleeModule(interner, /*calleeNoInline=*/true, 7);
+
+    ASSERT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{true})
+        << "fixture precondition: the callee must carry the flag";
+    auto const callsBefore = countOpInModule(mir, MirOpcode::Call);
+    ASSERT_EQ(callsBefore, 1u);
+    auto const constsBefore = countOpInModule(mir, MirOpcode::Const);
+    ASSERT_EQ(constsBefore, 1u) << "before: only the callee holds the Const 7";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a callee the SOURCE declared __attribute__((noinline)) MUST NOT be "
+           "inlined — this is the optimizer obeying an explicit directive, not "
+           "protecting itself from an unsound splice";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore)
+        << "the Call opcode must survive in main";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), constsBefore)
+        << "the callee's body must NOT have been spliced into main";
+
+    // ★ THE FLAG ITSELF SURVIVES THE PASS. `runInlining` rebuilds every
+    // function through its own `MultiBlockInliner::rebuildFunction`; a
+    // rebuild that dropped the bit would leave this module inlinable on
+    // the NEXT pipeline iteration — green here, wrong end to end. This
+    // is the unit-tier counterpart of the halfway-revert that was
+    // MEASURED to produce output identical to deleting rule 2b outright.
+    EXPECT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{true})
+        << "the noInline flag must survive the inlining pass' own rebuild";
+}
+
+// ── NON-VACUOUS twin: the SAME module with the flag CLEAR inlines ──
+// Proves `NoInlineCalleeIsNotInlined` measures the flag and nothing
+// else: the two fixtures differ in exactly one boolean.
+TEST(Inlining, NoInlineFlagClearedInlinesTheSameCallee) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildNoInlineCalleeModule(interner, /*calleeNoInline=*/false, 7);
+
+    ASSERT_EQ(noInlineOfSymbol(mir, 50), std::optional<bool>{false});
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    auto const constsBefore = countOpInModule(mir, MirOpcode::Const);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "with the flag CLEAR the identical callee MUST inline — otherwise "
+           "the noinline test above proves nothing about the flag";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), constsBefore + 1)
+        << "the callee's Const 7 must be SPLICED into main";
+}
 
 // ── THE correctness pin: a Weak callee is NOT inlined ──────────────
 // cu_a-style: weak f() exists in the module AND main calls it intra-CU.

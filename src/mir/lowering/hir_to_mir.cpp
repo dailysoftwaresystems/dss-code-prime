@@ -85,6 +85,9 @@ struct Lowerer {
     HirLinkageMap const*     linkageMap;  // optional — native-decl binding/
                                            // visibility (D-CSUBSET-LINKAGE-
                                            // SPECIFIERS). nullptr ⇒ all Global.
+    HirNoInlineMap const*    noInlineMap; // optional — native-FUNCTION inliner
+                                           // opt-out (TF-C78, D-CSUBSET-NOINLINE).
+                                           // nullptr / no entry ⇒ inlinable.
     HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
                                            // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
                                            // nullptr / no entry ⇒ mutable.
@@ -10307,7 +10310,16 @@ struct Lowerer {
         LinkageAttr la{};
         if (linkageMap != nullptr)
             if (auto const* p = linkageMap->tryGet(node)) la = *p;
-        mir.addFunction(signature, symbol, la.binding, la.visibility);
+        // TF-C78 (D-CSUBSET-NOINLINE): ★ THE MINT SITE — the one place the
+        // source-declared `noinline` enters MIR. Everything downstream only
+        // COPIES this bit; if it is not read here the whole chain (config verb →
+        // SymbolRecord → HirNoInlineMap → MirFunc → the inliner's refusal) is
+        // wired but dead. Keyed on the SAME declaration node as the linkage
+        // attribute above, so the two travel together.
+        bool noInline = false;
+        if (noInlineMap != nullptr)
+            if (auto const* p = noInlineMap->tryGet(node)) noInline = p->isNoInline;
+        mir.addFunction(signature, symbol, la.binding, la.visibility, noInline);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
@@ -11889,7 +11901,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                                                    typedefVlaOriginMap,
                           std::unordered_map<std::uint32_t, std::string> const*
                                                    synthRecipeMap,
-                          HirReturnsTwiceMap const* returnsTwiceMap) {
+                          HirReturnsTwiceMap const* returnsTwiceMap,
+                          HirNoInlineMap const*    noInlineMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -11904,6 +11917,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .config    = config,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
+        .noInlineMap = noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
         .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)

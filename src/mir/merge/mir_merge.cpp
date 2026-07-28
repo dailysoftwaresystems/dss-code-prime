@@ -181,8 +181,12 @@ public:
     [[nodiscard]] MirFuncId clone(MirFuncId f, SymbolId mergedSymbol) {
         TypeId const sig = reinternType(srcInterner_, src_.funcSignature(f),
                                         host_, typeRemap());
+        // TF-C78 (D-CSUBSET-NOINLINE): carried across the cross-CU merge — the
+        // merged module is what the optimizer then runs on, so a flag dropped
+        // here would let a `noinline` function from CU A be inlined after link.
         MirFuncId const newF = dst_.addFunction(
-            sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f));
+            sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
+            src_.funcNoInline(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);

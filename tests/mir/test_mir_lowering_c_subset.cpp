@@ -27,6 +27,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -178,7 +179,15 @@ struct Lowered {
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,   // VLA C1a
                                     &hir->sizeofVlaSymbol,   // VLA C2
-                                    &hir->typedefVlaOriginBySymbol);   // VLA C4b
+                                    &hir->typedefVlaOriginBySymbol,   // VLA C4b
+                                    // TF-C78: the harness threads the SAME trailing
+                                    // maps `compile_pipeline.cpp` does. It previously
+                                    // stopped here, so any map added after this point
+                                    // was invisible to every unit test in this file
+                                    // while working in the real compiler.
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -519,7 +528,10 @@ namespace {
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,
                                     &hir->sizeofVlaSymbol,
-                                    &hir->typedefVlaOriginBySymbol);
+                                    &hir->typedefVlaOriginBySymbol,
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap);   // TF-C78
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -581,7 +593,10 @@ namespace {
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,
                                     &hir->sizeofVlaSymbol,
-                                    &hir->typedefVlaOriginBySymbol);
+                                    &hir->typedefVlaOriginBySymbol,
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap);   // TF-C78
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -2137,6 +2152,165 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
         if (m.funcBinding(m.funcAt(i)) == SymbolBinding::Weak) ++weakCount;
     EXPECT_EQ(weakCount, 1)
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
+}
+
+// ── TF-C78 (D-CSUBSET-NOINLINE): source → MirFunc.noInline, per FORM ──
+//
+// The full chain in one assertion: the `attributeSemantics.effects` `noInline`
+// verb → `SymbolRecord.isNoInline` (FnSig-gated) → `HirNoInlineMap` →
+// `MirFunc.noInline`. The two GNU attribute POSITIONS the c-subset grammar
+// admits are separately parameterized, because they reach
+// `scanAttributeSemantics` through DIFFERENT roots (the mode-2 mid-declarator
+// slot vs. the mode-3 specifier prefix) and one can regress without the other.
+//
+// Each case asserts a diagnostic-free lowering AND an exact per-symbol flag
+// SET — the annotated function true, `main` false. A count-only assertion
+// would stay green if the flag leaked onto the wrong symbol.
+struct NoInlineFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetNoInlineForm
+    : public ::testing::TestWithParam<NoInlineFormCase> {};
+
+TEST_P(MirLoweringCSubsetNoInlineForm, ThreadsToMirFuncNoInline) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    // EXACTLY ONE function carries the flag. 0 ⇒ the form never reached the
+    // sink; 2 ⇒ it leaked onto `main`, which the source never annotated.
+    int flagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcNoInline(m.funcAt(i))) ++flagged;
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((noinline)) in the '" << c.label << "' position must "
+           "thread to EXACTLY one MirFunc.noInline — 0 means the form never "
+           "reached the sink, 2 means it leaked onto an un-annotated function";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetNoInlineForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator.
+        NoInlineFormCase{
+            "mode2-after-type",
+            "static int __attribute__((noinline)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Mode-3: the attribute sits in the specifier PREFIX, before the type.
+        NoInlineFormCase{
+            "mode3-leading-prefix",
+            "static __attribute__((noinline)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — one `noinline` config entry must cover both via
+        // the shared `stripDunder` normalization, with no second config row.
+        NoInlineFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__noinline__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY: the flag is spelled on the declaration, and the
+        // DEFINITION is what lowers. Only the post-Pass-1.5 proto/def OR-merge
+        // makes this reach MIR (RED-ON-DISABLE: delete the `isNoInline` arm of
+        // the `mergedFnDecls` sweep and this case alone goes to 0).
+        NoInlineFormCase{
+            "prototype-only",
+            "static int helper(int k) __attribute__((noinline));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+    [](::testing::TestParamInfo<NoInlineFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the whole form suite: the identical program with NO
+// attribute must leave every MirFunc.noInline CLEAR. Without this, a lowering
+// that unconditionally set the flag would satisfy every case above.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasNoInlineClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoInline(m.funcAt(i)))
+            << "an un-annotated function must never carry noInline";
+}
+
+// ── TF-C78: THE APPLIED FACT, under the SHIPPED release pipeline ──
+//
+// ★ THIS IS THE LOAD-BEARING TEST OF THE WHOLE CYCLE. Everything above proves
+// the flag ARRIVES; this proves it is OBEYED by the exact pass composition the
+// product ships — `release.pipeline.json` loaded BY NAME, not a hand-written
+// one-pass list, so the pin cannot drift from what users actually run.
+//
+// The assertion is the APPLIED FACT (the Call instruction survives in the
+// optimized module), never "it compiled".
+//
+// RED-ON-DISABLE, BOTH MEASURED end-to-end on a real arm64 binary:
+//   * delete `inlining.cpp` rule 2b → helper is spliced away, `main` folds to
+//     a single `mov x29, #0x2a` and the helper function disappears entirely;
+//   * OR keep rule 2b and drop ONLY the `funcNoInline` argument in
+//     `mir_rebuild_helper.cpp` → BYTE-IDENTICAL breakage, because Inlining runs
+//     first in each of the 4 iterations and a rebuild between them clears the
+//     flag. The two failure modes are indistinguishable in the output, which is
+//     why the propagation has its own pin in test_mir_rebuild_helper.cpp.
+TEST(MirLoweringCSubsetLinkage, NoInlineSurvivesShippedReleasePipeline) {
+    auto L = lowerCSubset(
+        "static int __attribute__((noinline)) helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u) << "pre-optimization: main calls helper once";
+
+    // The SHIPPED pipeline, loaded by name — this is the composition that ships.
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "the call to a __attribute__((noinline)) function MUST survive the "
+           "SHIPPED release pipeline — this is the applied fact the whole "
+           "chain exists to produce, not merely that the program compiled";
+
+    // …and the function is still there to be called (DCE must not have removed
+    // a callee that still has a live call site).
+    bool helperPresent = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcNoInline(m.funcAt(i))) helperPresent = true;
+    EXPECT_TRUE(helperPresent)
+        << "the noinline callee must survive out-of-line, flag intact, after "
+           "the full release pipeline";
 }
 
 // D-CSUBSET-NORETURN linkage-safety (FC16): a `noreturn` attribute co-present
@@ -10975,7 +11149,8 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     &hir->sizeofVlaSymbol,
                                     &hir->typedefVlaOriginBySymbol,
                                     /*synthRecipeMap=*/nullptr,
-                                    &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
+                                    &hir->returnsTwiceMap,    // FC17.9(c) (D-CSUBSET-SETJMP)
+                                    &hir->noInlineMap);       // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

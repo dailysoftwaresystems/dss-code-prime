@@ -278,6 +278,27 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
+    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff this FUNCTION symbol is declared
+    // `__attribute__((noinline))` (GNU; no C11/C23 standard spelling). Set at
+    // Pass-1.5 declarator resolution from the `attributeSemantics` table's
+    // `noInline` effect verb — NOT from a hardcoded name test — gated on the
+    // declared type being a FnSig (the `isNoreturn` discipline: the attribute on
+    // a non-function is inert rather than wrongly recorded). OR-merged across a
+    // proto/definition pair by the post-1.5 `mergedFnDecls` sweep, so a call —
+    // which resolves to the DEFINITION — still sees a flag only the PROTOTYPE
+    // spelled (sqlite declares `SQLITE_NOINLINE` on both, but glibc-style headers
+    // often annotate the prototype alone).
+    //
+    // Projected onto the `HirNoInlineMap` side-table at CST→HIR lowering and
+    // stamped onto `MirFunc.noInline` at HIR→MIR, where the inliner's §2.9
+    // legality gate refuses to splice the callee.
+    //
+    // ★ A DROPPED FLAG IS NOT A SAFE MISS HERE — unlike `isNoreturn` (whose loss
+    // yields a loud H_VerifierFailure), losing this one means the function gets
+    // INLINED, silently, which is exactly what the source forbade. That is why it
+    // is propagated through every MirFunc copy/rebuild path rather than only the
+    // lowering that mints it. Default false.
+    bool            isNoInline = false;
     // FC17.9(c) (D-CSUBSET-SETJMP): TRUE iff this FUNCTION symbol "returns more than
     // once" (C11 7.13.1.1 — `setjmp`/`_setjmp`: a matching `longjmp` makes the setjmp
     // call appear to return a SECOND time). There is NO source syntax for it (unlike

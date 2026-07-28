@@ -307,6 +307,73 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
 // (`MirMerge.MergePreservesGlobalConstness`). RED-ON-DISABLE: drop the
 // `…globalIsConst(g)` argument at mir_rebuild_helper.cpp:54 / :96 (let it default to
 // false) → the const global's `isConst` flips to false and the `EXPECT_TRUE` fails.
+// TF-C78 (D-CSUBSET-NOINLINE): ★ THE LOAD-BEARING PROPAGATION PIN.
+//
+// `rebuildFunction` is the shared substrate under EVERY optimizer pass
+// (ConstFold, Mem2Reg, CopyProp, Cse, Licm, SimplifyCfg, Dce). The shipped
+// `release` pipeline runs `Inlining` FIRST in each of its 4 iterations, so a
+// `noInline` flag dropped by ANY of those rebuilds is gone by iteration 2 and
+// the callee is spliced then — with the inliner's refusal rule fully present
+// and correct.
+//
+// ★ THIS IS MEASURED, NOT REASONED. Removing ONLY the `src_.funcNoInline(oldFn)`
+// argument from `mir_rebuild_helper.cpp` — leaving `inlining.cpp` rule 2b
+// untouched — produced a release-pipeline binary IDENTICAL to deleting rule 2b
+// outright: the `noinline` helper gone entirely and `main` const-folded to a
+// single `mov x29, #0x2a`. A half-landed flag and no flag at all are
+// indistinguishable in the output, which is exactly why the refusal pin cannot
+// stand alone and this one has to exist.
+//
+// RED-ON-DISABLE: drop that argument (let the 5th parameter default to false)
+// and the `EXPECT_TRUE` below fails while every other rebuild test stays green.
+// The un-annotated sibling asserts the flag is not spuriously acquired, so the
+// test cannot be satisfied by hardcoding true.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoInline) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: NOINLINE (and deliberately Global/Default so the flag is the
+    // only non-default axis — a Local binding would let a binding-preserving
+    // rebuild look correct while dropping this bit).
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: plain — must NOT acquire the flag.
+    mb.addFunction(fnSig, SymbolId{2});
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 2u);
+    ASSERT_TRUE(src.funcNoInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(1)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+
+    EXPECT_TRUE(dst.funcNoInline(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noInline flag — this rebuilder "
+           "runs under every optimizer pass, so dropping it here silently "
+           "re-arms the inliner on the pipeline's next iteration";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(1)))
+        << "an un-annotated function must not acquire the flag";
+
+    // The sibling per-function axes must survive the same rebuild — they are
+    // carried by the same call and a regression to any of them has the same
+    // shape (this rebuilder is where `binding`/`visibility` are already pinned
+    // by test_dce_linkage, mirrored here so the three stay pinned together).
+    EXPECT_EQ(dst.funcBinding(dst.funcAt(0)),    SymbolBinding::Global);
+    EXPECT_EQ(dst.funcVisibility(dst.funcAt(0)), SymbolVisibility::Default);
+}
+
 TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32 = interner.primitive(TypeKind::I32);

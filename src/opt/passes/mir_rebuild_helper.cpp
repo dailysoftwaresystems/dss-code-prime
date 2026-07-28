@@ -137,8 +137,16 @@ MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
 }
 
 void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
+    // TF-C78 (D-CSUBSET-NOINLINE): `funcNoInline` rides along with
+    // binding/visibility. ★ THIS IS THE LOAD-BEARING PROPAGATION SITE — this
+    // rebuilder is the shared substrate under EVERY optimizer pass, so a flag
+    // dropped here is erased by the very release pipeline it exists to
+    // constrain: the first pass to rebuild the module (ConstFold, Mem2Reg, …)
+    // would hand a cleared flag to the NEXT Inlining iteration, which would then
+    // splice the body the source forbade — silently.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
-                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn));
+                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
+                     src_.funcNoInline(oldFn));
 
     // Phase 1: select + pre-create blocks. The policy decides which
     // blocks to walk (all blocks vs RPO-reachable subset etc.).

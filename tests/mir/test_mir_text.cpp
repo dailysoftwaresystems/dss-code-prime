@@ -12,6 +12,7 @@
 #include <array>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -371,4 +372,134 @@ TEST(MirText, UnnamedSymbolRoundTrips) {
     EXPECT_TRUE(rt.parseOk);
     EXPECT_EQ(rt.firstEmit, rt.secondEmit);
     EXPECT_NE(rt.firstEmit.find("%42 \"\""), std::string::npos);
+}
+
+// ── TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION attributes survive the
+// text round-trip ────────────────────────────────────────────────────
+//
+// ★ THIS TEST EXISTS BECAUSE THE ROUND-TRIP USED TO SILENTLY LOSE DATA.
+// Before this cycle `emitFunction` printed only `function %sym : <type> {` and
+// `parseFunction` called the 2-arg `addFunction`, so EVERY function came back
+// (Global, Default): a `static` function re-read as externally visible, a
+// `weak` one as strong. Adding `noInline` beside those without fixing them
+// would have reproduced the identical defect one field over.
+//
+// ★ AND NOTE WHY THE EXISTING `roundTrip` HELPER COULD NOT HAVE CAUGHT IT.
+// That helper asserts emit→parse→emit BYTE-EQUALITY, which is vacuous for a
+// field that was never printed in the first place: both emits omitted it, both
+// matched, the suite stayed green. So these assertions read the PARSED MODULE's
+// accessors directly rather than comparing text — the only formulation that can
+// observe a dropped field.
+//
+// RED-ON-DISABLE: delete any of the three arguments at `parseFunction`'s
+// `addFunction` call (or the matching arm in `appendFuncAttrs`) and the
+// corresponding EXPECT below fails. The all-default function pins the other
+// direction — the attribute list must be OMITTED when nothing is set, so an
+// unconditional emit that changed every existing golden text is caught here.
+TEST(MirText, FunctionAttributesSurviveRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    // %1 — noinline only (Global/Default otherwise): isolates the new bit.
+    (void)b.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/true);
+    MirBlockId e1 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e1); b.addReturn();
+    // %2 — the three axes at once, each non-default.
+    (void)b.addFunction(fnSig, SymbolId{2}, SymbolBinding::Local,
+                        SymbolVisibility::Hidden, /*noInline=*/true);
+    MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e2); b.addReturn();
+    // %3 — weak, NOT noinline: proves the flags are independent, not one bit.
+    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Weak,
+                        SymbolVisibility::Default, /*noInline=*/false);
+    MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e3); b.addReturn();
+    // %4 — everything default: must round-trip with NO attribute list.
+    (void)b.addFunction(fnSig, SymbolId{4});
+    MirBlockId e4 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e4); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "ni", "localhidden", "weakfn", "plain"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 4u);
+
+    // Read the PARSED module's per-function metadata back, keyed by symbol so
+    // the assertions do not depend on arena ordering.
+    auto findBySym = [&](std::uint32_t sym) -> MirFuncId {
+        std::size_t const nf = parsed->mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = parsed->mir.funcAt(i);
+            if (parsed->mir.funcSymbol(f).v == sym) return f;
+        }
+        return MirFuncId{};
+    };
+
+    MirFuncId const f1 = findBySym(1);
+    ASSERT_TRUE(f1.valid());
+    EXPECT_TRUE(parsed->mir.funcNoInline(f1))
+        << "a noinline function must come back noinline — a dropped flag here "
+           "makes the parsed module freely inlinable";
+    EXPECT_EQ(parsed->mir.funcBinding(f1), SymbolBinding::Global);
+
+    MirFuncId const f2 = findBySym(2);
+    ASSERT_TRUE(f2.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f2), SymbolBinding::Local)
+        << "binding was silently dropped by this round-trip before TF-C78";
+    EXPECT_EQ(parsed->mir.funcVisibility(f2), SymbolVisibility::Hidden)
+        << "visibility was silently dropped by this round-trip before TF-C78";
+    EXPECT_TRUE(parsed->mir.funcNoInline(f2))
+        << "all three axes must survive together";
+
+    MirFuncId const f3 = findBySym(3);
+    ASSERT_TRUE(f3.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f3), SymbolBinding::Weak);
+    EXPECT_FALSE(parsed->mir.funcNoInline(f3))
+        << "a weak function must NOT come back noinline — the axes are "
+           "independent, not one conflated bit";
+
+    MirFuncId const f4 = findBySym(4);
+    ASSERT_TRUE(f4.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f4),    SymbolBinding::Global);
+    EXPECT_EQ(parsed->mir.funcVisibility(f4), SymbolVisibility::Default);
+    EXPECT_FALSE(parsed->mir.funcNoInline(f4));
+
+    // The all-default function prints NO attribute list, so existing golden
+    // text for ordinary functions is byte-unchanged.
+    EXPECT_NE(text.find("function %4 : fn() -> void {"), std::string::npos)
+        << "an all-default function must emit no `[...]` list:\n" << text;
+
+    // And the emitted text is itself stable (emit → parse → emit).
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    DiagnosticReporter r3;
+    EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
+}
+
+// TF-C78: an UNRECOGNIZED function attribute FAILS LOUD rather than being
+// skipped. A parser that silently ignored an unknown name is precisely how a
+// dropped field goes unnoticed for a long time (see the test above), so the
+// permissive direction is closed by construction.
+TEST(MirText, UnknownFunctionAttributeIsMalformed) {
+    char const* text =
+        "dssir 1\n"
+        "module {\n"
+        "  function %1 : fn() -> void [frobnicate] {\n"
+        "    block %b0 [entry] {\n"
+        "      ret\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    DiagnosticReporter r;
+    auto res = parseMir(text, CompilationUnitId{1}, r);
+    EXPECT_FALSE(res->ok)
+        << "an unknown function attribute must not parse clean";
+    EXPECT_GT(r.errorCount(), 0u);
 }

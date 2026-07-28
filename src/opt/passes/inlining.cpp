@@ -168,6 +168,15 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // strong definition of the same name may replace it at link.
     if (mir.funcBinding(callee) == SymbolBinding::Weak) return std::nullopt;
 
+    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE) — never inline a callee the SOURCE
+    // declared `__attribute__((noinline))`. Unlike every other rule here this
+    // one is not the optimizer protecting itself from an unsound splice; it is
+    // the optimizer OBEYING an explicit directive, so it is unconditional and
+    // has no cost-model or scope escape hatch. sqlite's `SQLITE_NOINLINE` uses
+    // it to BOUND STACK DEPTH on recursive paths — inlining anyway is a real
+    // runtime regression (deeper frames), not a missed annotation.
+    if (mir.funcNoInline(callee)) return std::nullopt;
+
     // Rule 3: never inline a call WITHIN A RECURSIVE CYCLE (OPT7 cycle 3).
     // The call graph's SCCs collapse every recursive cycle to one id; a
     // call whose caller + callee share an SCC is part of a cycle, so
@@ -770,8 +779,14 @@ public:
     [[nodiscard]] bool malformed() const noexcept { return malformed_; }
 
     void rebuildFunction(MirFuncId caller) {
+        // TF-C78 (D-CSUBSET-NOINLINE): the inliner's OWN rebuild must carry the
+        // flag too. A `noinline` function is still a CALLER (it may inline other
+        // functions INTO itself — the attribute constrains splicing it OUT, not
+        // in), so its rebuilt copy has to keep the bit or the refusal survives
+        // only until this pass' first iteration rewrites the module.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
-                         src_.funcBinding(caller), src_.funcVisibility(caller));
+                         src_.funcBinding(caller), src_.funcVisibility(caller),
+                         src_.funcNoInline(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

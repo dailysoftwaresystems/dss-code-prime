@@ -100,6 +100,9 @@ struct DSS_EXPORT CstToHirResult {
     HirSourceMap   sourceMap;     // bound to `hir` — must stay at a stable address
     HirLinkageMap  linkageMap;    // bound to `hir` — native-decl binding/visibility
                                   // (D-CSUBSET-LINKAGE-SPECIFIERS); read at HIR→MIR
+    HirNoInlineMap noInlineMap;   // bound to `hir` — native-FUNCTION inliner opt-out
+                                  // (TF-C78, D-CSUBSET-NOINLINE); read at HIR→MIR to
+                                  // stamp MirFunc.noInline (the inliner's refusal)
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
@@ -171,7 +174,7 @@ struct DSS_EXPORT CstToHirResult {
 
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)
-        : hir(std::move(h)), sourceMap(hir), linkageMap(hir),
+        : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
           returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)) {}
 

@@ -8940,9 +8940,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // resolve like alignas's readRule (present-but-bad emits + fails the
             // load; an ABSENT block leaves everything invalid → no surface).
             // `effects` is an array of `{ names: [...], effect: <verb> }` rows;
-            // the effect VERB is validated against the CLOSED set
-            // {suppressUnused, warnOnUse, warnOnDiscard, none} — an unknown verb
-            // is C_InvalidSemantics (a typo can never silently disarm a row).
+            // the effect VERB is validated against the CLOSED set `kEffectVerbs`
+            // declares below — an unknown verb is C_InvalidSemantics (a typo can
+            // never silently disarm a row). The vocabulary is deliberately NOT
+            // restated here: this sentence used to list four verbs and had been
+            // wrong since `align` landed, which is the same drift the diagnostic
+            // message at `kEffectVerbs` was rewritten to derive rather than
+            // duplicate. Read the array; it is the authority.
             // The block's own keys are CLOSED for the same reason: a
             // misspelled `stdAtrRule` would leave the block half-wired (no
             // std-attribute surface at all) while loading clean.
@@ -9067,12 +9071,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 5>
+                            std::pair<std::string_view, AttributeEffect>, 6>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
                                 {"warnOnDiscard",  AttributeEffect::WarnOnDiscard},
                                 {"align",          AttributeEffect::Align},
+                                {"noInline",       AttributeEffect::NoInline},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

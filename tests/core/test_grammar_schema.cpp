@@ -2149,8 +2149,14 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 // the message can no longer drift from the vocabulary in either direction, and
 // the fix that makes this pass is deriving one from the other.
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
+    // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`. This list is the
+    // hand-maintained mirror of the loader's `kEffectVerbs`, and it going RED
+    // on a vocabulary change is the test working as designed — the whole point
+    // is that a verb cannot be added to the loader without the closed-set
+    // message and this mirror both accounting for it.
     constexpr std::string_view kVerbs[] = {"suppressUnused", "warnOnUse",
-                                           "warnOnDiscard", "align", "none"};
+                                           "warnOnDiscard", "align",
+                                           "noInline", "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
         R"([ { "names": ["aligned"], "effect": "algin" } ])", "", "");

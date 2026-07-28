@@ -7,6 +7,7 @@
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/mutability_attr.hpp"
+#include "hir/attributes/no_inline_attr.hpp"
 #include "hir/attributes/returns_twice_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
@@ -44,6 +45,14 @@ using HirFfiMap = HirAttribute<FfiMetadata>;
 // lowering to stamp `MirFunc`/`MirGlobal` binding+visibility — the input the
 // optimizer's DCE-protect predicate `isExternallyVisible()` consults.
 using HirLinkageMap = HirAttribute<LinkageAttr>;
+
+// TF-C78 (D-CSUBSET-NOINLINE): native FUNCTION declarations the source marked
+// `__attribute__((noinline))`. Populated by CST→HIR lowering from the bound
+// symbol's `SymbolRecord.isNoInline`; read by HIR→MIR lowering to stamp
+// `MirFunc.noInline` — the input the optimizer's inlining legality gate refuses
+// on, beside the Weak-binding rule. Keyed on the same DECLARATION node as
+// `HirLinkageMap`, but a distinct axis (see `NoInlineAttr`).
+using HirNoInlineMap = HirAttribute<NoInlineAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

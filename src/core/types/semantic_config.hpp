@@ -1550,6 +1550,18 @@ enum class AttributeEffect : std::uint8_t {
     WarnOnUse,
     WarnOnDiscard,
     Align,
+    // TF-C78 (D-CSUBSET-NOINLINE): the declared function must never be inlined
+    // into a caller. Folded onto `SymbolRecord.isNoInline` (gated on the declared
+    // type being a FnSig, the `isNoreturn` discipline), projected to
+    // `HirNoInlineMap`, stamped onto `MirFunc.noInline`, and REFUSED by the
+    // inliner's §2.9 legality gate beside the Weak rule.
+    //
+    // ★ THIS VERB EXISTS BECAUSE `None` WOULD HAVE BEEN A FALSE CLAIM. `None`
+    // means "KNOWN vocabulary, consumed elsewhere or deliberately inert". With
+    // `Inlining` in the shipped release pipeline, nothing consumed `noinline` and
+    // it was not inert — the compiler had a live pass free to do exactly what the
+    // attribute forbids. A verb with a real sink makes the vocabulary entry true.
+    NoInline,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {
