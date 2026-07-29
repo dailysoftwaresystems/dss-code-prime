@@ -59,6 +59,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_PreprocessorIncludeReentryRefused";
         case DiagnosticCode::S_PragmaPackAmbiguous:
             return "S_PragmaPackAmbiguous";
+        case DiagnosticCode::S_AsmLabelInvalid:
+            return "S_AsmLabelInvalid";
+        case DiagnosticCode::S_AsmLabelDuplicate:
+            return "S_AsmLabelDuplicate";
+        case DiagnosticCode::S_AsmLabelOnAutomaticVariable:
+            return "S_AsmLabelOnAutomaticVariable";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

@@ -133,6 +133,18 @@ struct DSS_EXPORT ExternDeclRef {
     // reference gate (an eager row is kept even when unreferenced). INVARIANT:
     // isEagerImport ⟹ library-bound. Non-eager (producers A/B) leaves it false.
     bool isEagerImport = false;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the EXPLICIT assembler name
+    // this extern was
+    // declared with, threaded verbatim from `HirExternRecord.asmName`. EMPTY = none
+    // ⇒ every downstream name is computed exactly as before this cycle. When set it
+    // REPLACES the format's C mangling for `FfiMetadata.mangledName` (via
+    // `ffi::linkNameFor`) — the import requests the labelled symbol, not the mangled
+    // C identifier — AND becomes the un-decorated key the binary-match lookup uses,
+    // because the library really exports the LABEL. PER-DECLARATOR, unlike
+    // `libraryOverride`. LAST field, mirroring `HirExternRecord`, so existing
+    // positional aggregate initializers (fixtures included) keep compiling and
+    // default it to "".
+    std::string_view asmName{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

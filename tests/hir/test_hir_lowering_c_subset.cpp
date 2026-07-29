@@ -7390,3 +7390,56 @@ TEST(HirLoweringCSubset, TrailingAttributeRunStillResolvesAfterTheHeadSlotOpened
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR) — the HIR-SHAPE pin.
+//
+// ★ THIS TEST EXISTS BECAUSE THE SEMANTIC TESTS CANNOT SEE THE DEFECT IT GUARDS.
+// Pass-1 mints one SYMBOL per declarator independently of the HIR lowering, so
+// every "all three aliases bind / each keeps its own suffix" assertion in
+// test_semantic_analyzer_c_subset.cpp stays GREEN if `lowerTypeDeclInto` emits
+// only the first node — the exact vacuity the removed `break; // typedefs
+// declare a single declarator` would reintroduce. A plain alias emits no code,
+// so an exit-code corpus example cannot see it either. Counting the NODES is the
+// only place the drop is observable.
+//
+// It matters because a VLA typedef's TypeDecl is where HIR→MIR FREEZES that
+// alias's runtime size slots (C99 6.7.7p2 evaluates the bound once, when the
+// typedef is REACHED) — a dropped node there is a real wrong-size miscompile.
+//
+// RED-ON-DISABLE: re-add the `break` after the first `out.push_back` in
+// `lowerTypeDeclInto` and this drops 5 → 3 while every other test stays green.
+TEST(HirLoweringCSubset, TypedefMultiDeclaratorEmitsOneTypeDeclPerAlias) {
+    SemanticModel model = analyzeCSubset(
+        "typedef unsigned int mach_port_t;\n"
+        "typedef mach_port_t vm_map_t, vm_map_read_t, vm_map_inspect_t;\n"
+        "vm_map_t origin;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    std::size_t typeDecls = 0;
+    for (HirNodeId d : decls)
+        if (res->hir.kind(d) == HirKind::TypeDecl) ++typeDecls;
+    EXPECT_EQ(typeDecls, 4u)
+        << "one TypeDecl for `mach_port_t` plus ONE PER ALIAS of the "
+           "three-declarator typedef — a lowering that stops after the first "
+           "declarator reports 2";
+    EXPECT_EQ(decls.size(), 5u) << "4 TypeDecls + the Global `origin`";
+
+    // Each alias's TypeDecl must carry its OWN symbol — four DISTINCT ids, not
+    // the same one repeated (which is what a loop that re-pushes the first
+    // declarator's symbol would produce, and which counts identically).
+    std::vector<std::uint32_t> syms;
+    for (HirNodeId d : decls)
+        if (res->hir.kind(d) == HirKind::TypeDecl)
+            syms.push_back(res->hir.typeDeclSymbol(d).v);
+    std::ranges::sort(syms);
+    EXPECT_EQ(std::ranges::unique(syms).begin() - syms.begin(),
+              static_cast<std::ptrdiff_t>(4))
+        << "the four TypeDecls must name four DIFFERENT symbols";
+}

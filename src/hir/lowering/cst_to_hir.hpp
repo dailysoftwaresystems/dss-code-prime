@@ -93,6 +93,26 @@ struct DSS_EXPORT HirExternRecord {
     // rule). INVARIANT: isEagerImport ⟹ library-bound (a descriptor always ships
     // a per-format `library` map); the flag never rides an empty-library row.
     bool isEagerImport = false;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5): the EXPLICIT assembler name this
+    // extern was declared with (`extern int f(int) __asm("_myextfn");`). EMPTY =
+    // none. When set it REPLACES the format's C mangling at ingest — the string is
+    // the imported symbol VERBATIM, which is how the macOS SDK's `__DARWIN_ALIAS`
+    // family binds `open` to `_open$UNIX2003`.
+    //
+    // ★ PER-DECLARATOR, unlike `libraryOverride` above. The library override is a
+    // per-DECLARATION string (one `extern … "lib.dll";` applies to every declarator
+    // in the declaration); an asm label belongs to the ONE declarator it follows,
+    // because `extern int a __asm("x"), b __asm("y");` imports two different
+    // symbols. It is read inside the declarator loop and set per row.
+    //
+    // ★ LAST FIELD ON PURPOSE: three producers build this struct with POSITIONAL
+    // aggregate initializers (the bare-proto, inline-synthesis and shipped-
+    // descriptor paths). Appending keeps all three compiling untouched and defaults
+    // the label to "" — the correct value for a synthesized row that has no
+    // declarator to read one from; each producer that DOES have a SymbolRecord sets
+    // it explicitly below.
+    std::string asmName;
 };
 
 struct DSS_EXPORT CstToHirResult {

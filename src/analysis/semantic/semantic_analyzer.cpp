@@ -2562,11 +2562,9 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
-            // TF-C62: an after-declarator attribute is not the initializer.
-            bool isAttr = false;
-            for (RuleId ar : cfg.declarators->afterDeclaratorAttrRules)
-                if (tree.rule(c).v == ar.v) { isAttr = true; break; }
-            if (isAttr) continue;
+            // TF-C62 / TF-C88: an after-declarator DECORATION (attribute or asm
+            // label) is not the initializer.
+            if (isDeclaratorDecorationNode(tree, *cfg.declarators, c)) continue;
             initNode = c;
             break;
         }
@@ -4714,10 +4712,81 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;   // skip the `=` token
         if (tree.rule(c) == dc.declaratorRule) continue;    // the declarator itself
-        if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
+        if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
         return true;   // any other internal child IS the initValue
     }
     return false;
+}
+
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5):
+// the EXPLICIT assembler name written on
+// declarator carrier `dNode`, or `nullopt` when it carries none.
+//
+// The label's payload is a `stringLiteralExpr`, NOT a lone string token, because the
+// macOS SDK spelling is an adjacent-concatenated run (`__asm("_" __STRING(sym)
+// __DARWIN_SUF_UNIX03)`). Decoding routes through the SHARED
+// `decodeAdjacentStringBodies` chokepoint — a consumer that read only the first body
+// would rename every SDK symbol to `_`.
+//
+// FAIL-LOUD, NEVER A SILENT FALL-BACK TO THE C NAME (which is what an asm label
+// exists to replace):
+//   * two labels on one declarator  → S_AsmLabelDuplicate (which one was meant is
+//     genuinely unknown; first-wins would rename to one of two names in silence);
+//   * a malformed escape            → S_AsmLabelInvalid;
+//   * a decoded-EMPTY name          → S_AsmLabelInvalid. An empty name is the most
+//     dangerous of the three: `compile_pipeline`'s `nameOf` reads "" as
+//     "module-private" and DROPS the symbol-table row, so the object writer
+//     substitutes a synthetic `sym_<id>` and the build stays green to link.
+//
+// Structural, not rule-name-keyed: the payload is the asm-label node's sole visible
+// Internal child (the grammar is `AsmKeyword '(' stringLiteralExpr ')'`).
+[[nodiscard]] std::optional<std::string>
+readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+             NodeId dNode) {
+    if (!cfg.declarators.has_value()) return std::nullopt;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    NodeId const labelNode = asmLabelNodeOf(tree, dNode, dc);
+    if (!labelNode.valid()) return std::nullopt;
+    auto const fail = [&](DiagnosticCode code, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(labelNode);
+        d.actual   = std::move(what);
+        s.reporter.report(std::move(d));
+        return std::optional<std::string>{};
+    };
+    if (asmLabelCountOf(tree, dNode, dc) > 1) {
+        return fail(DiagnosticCode::S_AsmLabelDuplicate,
+                    std::format("'{}' — a declarator may carry at most one asm "
+                                "label; which assembler name was intended cannot "
+                                "be inferred", tree.text(dNode)));
+    }
+    NodeId payload{};
+    for (NodeId c : visibleChildren(tree, labelNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        payload = c;
+        break;
+    }
+    if (!payload.valid()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    std::string{tree.text(labelNode)});
+    }
+    auto decoded = decodeAdjacentStringBodies(tree, payload,
+                                              s.idx().stringLiteralBodyToken);
+    if (!decoded.has_value()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    std::format("'{}' — the asm label has a malformed escape; the "
+                                "assembler name cannot be decoded",
+                                tree.text(payload)));
+    }
+    if (decoded->empty()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    "an asm label may not be empty — an empty assembler name "
+                    "would emit no symbol at all, silently");
+    }
+    return decoded;
 }
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): enforce the C11/C23 6.7.1 thread-storage
@@ -5081,6 +5150,20 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             // lowerExternDeclInto absorbed-skip).
             s.scopes.injectBinding(bindScope, name, newId);
             priorRec.isAbsorbedProto = true;
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label RIDES THE
+            // MERGE. MEASURED
+            // against /usr/bin/clang — `int deffn(int) __asm("mydeffn"); int
+            // deffn(int x){…}` emits the symbol `mydeffn`, i.e. a label on the
+            // absorbed DECLARATION renames the surviving DEFINITION, which is
+            // exactly how every `__DARWIN_ALIAS` header is meant to work (the
+            // header declares the rename, the library defines the function).
+            // Carried only when the survivor has none of its own, so an explicit
+            // label on the definition wins and two conflicting labels never
+            // silently swap. Empty stays empty.
+            if (s.symbols.at(newId).asmName.empty()
+                && !priorRec.asmName.empty()) {
+                s.symbols.at(newId).asmName = priorRec.asmName;
+            }
             s.nodeToSymbol.set(nameNode, newId);
             s.mergedFnDecls.push_back({newId, prior});
         } else {
@@ -5093,6 +5176,16 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             // an incompatible def→proto / def→extern). Aiming at `prior` would clobber
             // the survivor's resolved type and hide the mismatch.
             s.symbols.at(newId).isAbsorbedProto = true;
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the mirror direction — a
+            // definition (or an earlier
+            // declaration) survives and the NEW redundant declaration carries the
+            // label (`int deffn(int x){…} int deffn(int) __asm("mydeffn");`).
+            // Same rule, same reason: the survivor keeps its own label if it has
+            // one, else it adopts the absorbed declaration's.
+            if (priorRec.asmName.empty()
+                && !s.symbols.at(newId).asmName.empty()) {
+                priorRec.asmName = s.symbols.at(newId).asmName;
+            }
             s.nodeToSymbol.set(nameNode, newId);
             s.mergedFnDecls.push_back({prior, newId});
         }
@@ -5363,6 +5456,53 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.declRuleNode = node;
                         rec.tree         = tree.id();
                         rec.kind         = effectiveKind;
+                        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the EXPLICIT
+                        // assembler name
+                        // for THIS declarator. Read here — inside the per-declarator
+                        // loop, from `dNode` — because a label is per-declarator in
+                        // C: `int a __asm("x"), b __asm("y");` names two different
+                        // symbols, and a declaration-level read would give both the
+                        // same one. `readAsmLabel` fails loud on a duplicate /
+                        // malformed / empty label and returns nullopt, so a rejected
+                        // label leaves `asmName` empty and the symbol keeps its
+                        // ordinary mangled name — the diagnostic, not a wrong
+                        // symbol, is what the programmer sees.
+                        if (auto label = readAsmLabel(s, cfg, tree, dNode))
+                            rec.asmName = std::move(*label);
+                        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): an asm label on
+                        // an AUTOMATIC block-scope object
+                        // has nothing to rename — the object lives in a stack slot,
+                        // not the symbol table. WARN and DROP the label (matching
+                        // `/usr/bin/clang`, MEASURED: "ignored asm label 'x' on
+                        // automatic variable"). Erroring would refuse C every real
+                        // toolchain compiles; staying silent would leave the
+                        // programmer believing a rename happened. The storage test
+                        // reads the SAME `linkageSpecifiers` staticStorage facet the
+                        // static-local LOWERING routes on, so the warning and the
+                        // routing can never disagree about which locals are
+                        // automatic. A FUNCTION, a prototype, an `extern`, a
+                        // file-scope object and a `static` local all keep theirs.
+                        if (!rec.asmName.empty()
+                            && effectiveKind == DeclarationKind::Variable
+                            && !isProto
+                            && !decl.nonDefiningDeclaration
+                            && bindScope.v != fileScopeOf(s, tree, bindScope).v
+                            && !scanSpecifierPrefixStorage(tree, node, decl)
+                                    .staticStorage) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::
+                                S_AsmLabelOnAutomaticVariable;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            d.actual   = std::format(
+                                "asm label '{}' is ignored on '{}' — an automatic "
+                                "variable has no assembler symbol to rename "
+                                "(declare it 'static' or at file scope)",
+                                rec.asmName, name);
+                            s.reporter.report(std::move(d));
+                            rec.asmName.clear();
+                        }
                         // A function PROTOTYPE is a function DECLARATION, never an
                         // "unused variable" — suppress warnIfUnused for it. This
                         // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-
@@ -5846,7 +5986,7 @@ initializerNodeOf(Tree const& tree, NodeId dNode, DeclaratorConfig const& dc) {
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == dc.declaratorRule.v) continue;
-        if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
+        if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
         return c;   // the `= init` value subtree
     }
     return {};
@@ -6120,7 +6260,7 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == dc.declaratorRule) continue;
-            if (isAfterDeclaratorAttrNode(tree, dc, c)) continue;   // TF-C62
+            if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
             initNode = c;
             break;
         }
@@ -7057,12 +7197,33 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             }
                             if (tree.rule(dNode)
                                     == cfg.declarators->initDeclaratorRule) {
-                                std::size_t internals = 0;
+                                // TF-C88: count only the children that could BE an
+                                // initializer. This scan used to count EVERY
+                                // Internal child past the declarator, which made it
+                                // the SIXTH init-detection site in the compiler and
+                                // the one that never got TF-C62's decoration skip.
+                                // MEASURED at the pre-TF-C88 HEAD: `int f(void)
+                                // __attribute__((noinline)) { return 1; }` — which
+                                // clang compiles (with only a -Wgcc-compat warning)
+                                // — was REFUSED here as "cannot carry an
+                                // initializer", naming a construct the source does
+                                // not contain. The asm label would have inherited
+                                // the same mis-read. Routing through the shared
+                                // predicate makes this site agree with the other
+                                // five by construction.
+                                std::size_t initializers = 0;
                                 for (NodeId c : visibleChildren(tree, dNode)) {
-                                    if (tree.kind(c) == NodeKind::Internal)
-                                        ++internals;
+                                    if (tree.kind(c) != NodeKind::Internal)
+                                        continue;
+                                    if (tree.rule(c)
+                                        == cfg.declarators->declaratorRule)
+                                        continue;   // the declarator itself
+                                    if (isDeclaratorDecorationNode(
+                                            tree, *cfg.declarators, c))
+                                        continue;   // attribute / asm label
+                                    ++initializers;
                                 }
-                                if (internals > 1) {
+                                if (initializers > 0) {
                                     emitInvalidFn(
                                         dNode,
                                         "a function definition cannot carry "
@@ -9201,8 +9362,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             if (tree.kind(c) != NodeKind::Internal) continue;
                             if (tree.rule(c) == cfg.declarators->declaratorRule)
                                 continue;
-                            if (isAfterDeclaratorAttrNode(tree,
-                                    *cfg.declarators, c)) continue;   // TF-C62
+                            // TF-C62 / TF-C88
+                            if (isDeclaratorDecorationNode(tree,
+                                    *cfg.declarators, c)) continue;
                             initNode = c;
                             break;
                         }

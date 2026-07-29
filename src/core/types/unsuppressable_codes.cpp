@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 131> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 133> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -624,6 +624,20 @@ constexpr std::array<DiagnosticCode, 131> kUnsuppressableCodes{{
     // different offsets; suppressing the refusal does not remove the ambiguity,
     // it just picks one of them without saying so.
     DiagnosticCode::S_PragmaPackAmbiguous,
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a label the compiler
+    // cannot turn into an
+    // assembler name, and a declarator carrying two of them. Both are RENAMES —
+    // suppressing either does not restore the intended symbol name, it emits the
+    // C-mangled name (or one of two labels) instead, silently. The failure then
+    // surfaces as a foreign linker's undefined reference with no line number, or
+    // worse: `nameOf` treats an empty name as "module-private" and DROPS the
+    // symbol-table row, so the object writer falls back to a synthetic
+    // `sym_<id>` and the build stays green all the way to link.
+    // S_AsmLabelOnAutomaticVariable is deliberately NOT a member: it is a
+    // WARNING about a construct clang also ignores, translation continues, and no
+    // wrong symbol ships — the S_DeprecatedSymbolUsed posture.
+    DiagnosticCode::S_AsmLabelInvalid,
+    DiagnosticCode::S_AsmLabelDuplicate,
     // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
     // conditional-inclusion OPERATOR name (`__has_include` and siblings).
     // Suppressing it does not make the shadowing harmless — it lets the

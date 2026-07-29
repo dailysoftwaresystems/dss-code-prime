@@ -1,7 +1,0 @@
-P_NoAlternativeMatched 14:29-14:34
-P_NoAlternativeMatched 14:35-14:36
-P_UnexpectedToken 13:29-13:30
-P_UnexpectedToken 14:35-14:36
-P_UnexpectedToken 18:1-18:1
-S_DeclarationDeclaresNothing 13:29-18:2
-S_UnknownType 14:29-14:34

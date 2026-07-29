@@ -685,9 +685,19 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
         // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
         // `&cuMir` is safe — `cuMirs` is done growing.
+        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the DEFINITION arm routes
+        // through
+        // `linkNameFor`, which returns an explicit assembler name VERBATIM. That is
+        // what keeps this key in the SAME space as the IMPORT arm below: an
+        // extern's `mangledName` is itself built from `linkNameFor` at ingest, so a
+        // labelled definition and a labelled reference to it produce the identical
+        // string and `mir_merge` still collapses them. Honoring the label on one
+        // arm only would leave `definedNames.count(e.mangledName)` missing, the
+        // sibling-defined extern unstripped, and an intra-image call silently
+        // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
         in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
             if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
-                return dss::ffi::applyCMangling(r->name, fmtKind);
+                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind);
             }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;

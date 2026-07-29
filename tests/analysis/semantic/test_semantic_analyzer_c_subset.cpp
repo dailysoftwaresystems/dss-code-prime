@@ -11704,3 +11704,381 @@ TEST(SemanticAnalyzerCSubset, ExternTrailingNoreturnIsNotYetHonoredKnownGap) {
            "has been wired to the noreturn scan — flip this to EXPECT_TRUE and "
            "restore the symmetry loop";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C88 — GNU/Clang ASM LABEL (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME,
+// GCC 6.47.5) and TYPEDEF MULTI-DECLARATOR
+// (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR).
+//
+// The two defects behind 41 of the 49 macho-leg corpus errors at HEAD 2637623.
+// Every assertion below is on an OBSERVABLE PROPERTY (the recorded assembler
+// name, the resolved type of each alias), never on "it compiles clean" — a
+// parse-and-ignore asm label and a dropped 2nd typedef alias BOTH compile clean,
+// which is exactly what makes them dangerous.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// Every symbol spelled `name`, oldest first — a multi-declarator declaration and
+// a proto+definition merge both produce several records for one name, and the
+// distinction between them is load-bearing in the merge pin below.
+[[nodiscard]] std::vector<SymbolRecord const*>
+allSymbolsNamed(SemanticModel const& model, std::string_view name) {
+    std::vector<SymbolRecord const*> out;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == name) out.push_back(&model.symbols()[i]);
+    }
+    return out;
+}
+// The asm label recorded on the FIRST symbol spelled `name` that carries one —
+// the merge deliberately propagates the label onto the SURVIVOR, so a proto+def
+// pair must report it whichever record the scan reaches first.
+[[nodiscard]] std::string asmNameOf(SemanticModel const& model,
+                                    std::string_view name) {
+    for (auto const* r : allSymbolsNamed(model, name))
+        if (!r->asmName.empty()) return r->asmName;
+    return {};
+}
+} // namespace
+
+// FORM 1 — a label on an OBJECT at file scope. The MEASURED clang behavior is
+// that the string is the symbol VERBATIM; the assertion is therefore on the
+// exact bytes, `myglobal` and not `_myglobal`, because mangling the label on top
+// is the plausible wrong implementation and it compiles just as cleanly.
+// RED-ON-DISABLE: delete the `rec.asmName = ...` write in Pass-1's declarator
+// loop and this reads "" while the program still compiles.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnFileScopeObjectIsRecordedVerbatim) {
+    auto m = analyzeShipped("c-subset", {
+        "int gv __asm(\"myglobal\") = 7;\n"
+        "int main(void) { return gv; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "gv"), "myglobal");
+}
+
+// FORM 2 — a label on a FUNCTION DEFINITION (declarator + body in one).
+//
+// ★ A DELIBERATE, DOCUMENTED DIVERGENCE FROM CLANG, and the reason is a defect
+// this cycle also closed. `/usr/bin/clang` REJECTS this spelling ("expected ';'
+// after top level declarator") purely for GCC compatibility — GCC wants the label
+// on a preceding DECLARATION. DSS honors it, because the rename it asks for is
+// unambiguous and the symbol it names is right there. That is over-permissiveness,
+// never a silent drop: the label IS applied (asserted below), so nothing the
+// programmer wrote is ignored.
+//
+// The same edit is what makes `int f(void) __attribute__((noinline)) { … }`
+// compile. MEASURED at the pre-TF-C88 HEAD that shape was REFUSED as "a function
+// definition cannot carry an initializer" — a diagnostic naming a construct the
+// source does not contain — because the definition gate counted every Internal
+// child past the declarator and had never received TF-C62's decoration skip. It
+// was the sixth init-detection site and the one left behind.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnFunctionDefinitionIsRecorded) {
+    auto m = analyzeShipped("c-subset", {
+        "int fn(int x) __asm(\"myfn\") { return x; }\n"
+        "int main(void) { return fn(42); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "fn"), "myfn");
+
+}
+
+// TF-C88 — the PRE-EXISTING defect this cycle fixed in passing, with its OWN
+// guard so it has its own red-on-disable arm rather than riding an asm-label
+// test's coat-tails.
+//
+// THE DEFECT (MEASURED at 2637623, before any TF-C88 change): the function-
+// DEFINITION gate in `pass2Post` open-coded its own init detection as "count the
+// Internal children of the init-declarator; more than one means an initializer is
+// present". That counts the DECLARATOR itself as the one, so ANY second Internal
+// child trips it — including an after-declarator ATTRIBUTE. So
+// `int f(void) __attribute__((noinline)) { return 1; }` was refused
+// `S_InvalidFunctionDeclarator: a function definition cannot carry an
+// initializer` — a diagnostic naming a construct the source does not contain,
+// on code `/usr/bin/clang` compiles (it emits only a -Wgcc-compat warning that
+// GCC would not allow `noinline` in that position).
+//
+// It was the SIXTH of six init-detection scans in the SEMANTIC tier and the ONLY
+// one of the six TF-C62 never reached — the other five (declaratorHasInitializer,
+// initializerNodeOf, the constexpr scan, the auto-inference scan, the Pass-2
+// init-type scan) all received the attribute skip then. It is fixed HERE, not in
+// its own cycle, because the asm label would have inherited the identical
+// mis-read: TF-C87's lesson is that a defect fixed in one form and left live in
+// another is the expensive kind.
+//
+// RED-ON-DISABLE: restore the `internals > 1` count in place of the
+// decoration-aware `initializers > 0` and this test reds while every asm-label
+// test stays green (verified against the final build).
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorDecorationOnDefinitionIsNotAnInitializer) {
+    // The ATTRIBUTE form — the one that predates this cycle entirely.
+    auto attr = analyzeShipped("c-subset", {
+        "int g(void) __attribute__((noinline)) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(attr.diagnostics().hasErrors())
+        << "an after-declarator attribute on a DEFINITION is not an initializer";
+    EXPECT_EQ(countCode(attr.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+
+    // A REAL initializer on a definition must STILL fail loud — the fix narrows
+    // the count, it does not remove the gate. Without this the arm above could be
+    // satisfied by deleting the check outright.
+    auto real = analyzeShipped("c-subset", {
+        "int h(void) = 5 { return 1; }\n"
+        "int main(void) { return h(); }\n",
+    });
+    EXPECT_TRUE(real.diagnostics().hasErrors())
+        << "a genuine initializer on a function definition must stay rejected";
+}
+
+// FORM 3 — a label on a PROTOTYPE renames the later DEFINITION. This is the
+// shape every `__DARWIN_ALIAS` header actually uses (the header declares the
+// rename; the definition lives elsewhere), and MEASURED against clang the
+// emitted symbol is the label.
+//
+// ★ THE ASSERTION IS ON THE SURVIVING RECORD, NOT "some record named deffn".
+// The lax form was written first and the RED-ON-DISABLE battery caught it: with
+// the merge carry deleted, the ABSORBED proto still holds the label, so an
+// any-record scan reports "mydeffn" and the test passes while the DEFINITION —
+// the record `nameOf` actually reads — emits `_deffn`. The survivor is the record
+// with `isAbsorbedProto == false`; asserting there is the only form that can see
+// the carry at all.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnPrototypeRidesTheRedeclarationMerge) {
+    auto m = analyzeShipped("c-subset", {
+        "int deffn(int) __asm(\"mydeffn\");\n"
+        "int deffn(int x) { return x; }\n"
+        "int main(void) { return deffn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const recs = allSymbolsNamed(m, "deffn");
+    ASSERT_EQ(recs.size(), 2u) << "a proto + its definition mint two records";
+    SymbolRecord const* survivor = nullptr;
+    for (auto const* r : recs)
+        if (!r->isAbsorbedProto) survivor = r;
+    ASSERT_NE(survivor, nullptr) << "exactly one record must survive the merge";
+    EXPECT_EQ(survivor->asmName, "mydeffn")
+        << "the label must reach the SURVIVING (defining) record — that is the "
+           "one `nameOf` names the emitted symbol from";
+}
+
+// The mirror direction: the DEFINITION comes first and the labelled redundant
+// declaration follows. The survivor is the prior record, so the carry runs down
+// the other branch of the merge — a branch that would otherwise never be
+// exercised and would drift silently.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnTrailingRedeclarationRidesTheMerge) {
+    auto m = analyzeShipped("c-subset", {
+        "int deffn(int x) { return x; }\n"
+        "int deffn(int) __asm(\"mydeffn\");\n"
+        "int main(void) { return deffn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const recs = allSymbolsNamed(m, "deffn");
+    ASSERT_EQ(recs.size(), 2u);
+    SymbolRecord const* survivor = nullptr;
+    for (auto const* r : recs)
+        if (!r->isAbsorbedProto) survivor = r;
+    ASSERT_NE(survivor, nullptr);
+    EXPECT_EQ(survivor->asmName, "mydeffn");
+}
+
+// FORM 4 — a label on an `extern` declaration (the import rail's entry point).
+TEST(SemanticAnalyzerCSubset, AsmLabelOnExternDeclarationIsRecorded) {
+    auto m = analyzeShipped("c-subset", {
+        "extern int extfn(int) __asm(\"_myextfn\");\n"
+        "int main(void) { return extfn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "extfn"), "_myextfn");
+}
+
+// FORM 5 — the ADJACENT-CONCATENATED payload, which is the ONLY spelling the
+// macOS SDK ever produces (`__asm("_" __STRING(sym) __DARWIN_SUF_UNIX03)`).
+// A consumer that read only the first body would record "_" and rename every
+// SDK symbol to a single underscore — clean-compiling and catastrophic. The
+// assertion is on the JOINED bytes, which is what makes it catch that.
+TEST(SemanticAnalyzerCSubset, AsmLabelConcatenatesAdjacentStringPieces) {
+    auto m = analyzeShipped("c-subset", {
+        "#define __STRING(x) #x\n"
+        "#define SUF \"$UNIX2003\"\n"
+        "#define ALIAS(sym) __asm(\"_\" __STRING(sym) SUF)\n"
+        "int aliased(void) ALIAS(aliased);\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "the SDK spelling must parse";
+    EXPECT_EQ(asmNameOf(m, "aliased"), "_aliased$UNIX2003");
+}
+
+// FORM 6 — PER-DECLARATOR granularity. Two labels in ONE declaration must land
+// on their OWN symbols; a declaration-level read (the plausible wrong
+// implementation, and the shape `libraryOverride` legitimately uses) would give
+// both the same name and silently alias two symbols onto one.
+TEST(SemanticAnalyzerCSubset, AsmLabelsAreRecordedPerDeclarator) {
+    auto m = analyzeShipped("c-subset", {
+        "int a __asm(\"aa\") = 1, b __asm(\"bb\") = 2, plain = 3;\n"
+        "int main(void) { return a + b + plain; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "a"), "aa");
+    EXPECT_EQ(asmNameOf(m, "b"), "bb");
+    EXPECT_EQ(asmNameOf(m, "plain"), "")
+        << "an undecorated declarator in the same declaration must stay unlabelled";
+}
+
+// FORM 7 — a label INTERLEAVED with an attribute, both orders. The run is a
+// `{repeat alt}` precisely so neither order needs a rule, and both must keep the
+// initializer detection correct (the label is not the init value).
+TEST(SemanticAnalyzerCSubset, AsmLabelInterleavesWithAttributesEitherOrder) {
+    auto first = analyzeShipped("c-subset", {
+        "int p __asm(\"pp\") __attribute__((aligned(8))) = 1;\n"
+        "int main(void) { return p; }\n",
+    });
+    EXPECT_FALSE(first.diagnostics().hasErrors()) << "label before attribute";
+    EXPECT_EQ(asmNameOf(first, "p"), "pp");
+    auto second = analyzeShipped("c-subset", {
+        "int q __attribute__((aligned(8))) __asm(\"qq\") = 1;\n"
+        "int main(void) { return q; }\n",
+    });
+    EXPECT_FALSE(second.diagnostics().hasErrors()) << "attribute before label";
+    EXPECT_EQ(asmNameOf(second, "q"), "qq");
+}
+
+// FAIL-LOUD 1 — an EMPTY label. The most dangerous invalid form: an empty name
+// reaches `nameOf` as the module-private signal, the symbol-table row is
+// dropped, and the writer substitutes a synthetic `sym_<id>`. RED-ON-DISABLE:
+// remove the `decoded->empty()` arm in `readAsmLabel` and this compiles clean.
+TEST(SemanticAnalyzerCSubset, EmptyAsmLabelFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "int f(void) __asm(\"\");\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AsmLabelInvalid), 1u);
+}
+
+// FAIL-LOUD 2 — TWO labels on one declarator. Never first-wins: which assembler
+// name was intended is genuinely unknown.
+TEST(SemanticAnalyzerCSubset, DuplicateAsmLabelFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "int f(void) __asm(\"a\") __asm(\"b\");\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AsmLabelDuplicate), 1u);
+    EXPECT_EQ(asmNameOf(m, "f"), "")
+        << "a rejected label must not leave a half-applied rename behind";
+}
+
+// FAIL-LOUD 3 — a label on an AUTOMATIC local. WARNS and drops (matching clang,
+// MEASURED: "ignored asm label 'mylocal' on automatic variable"). Erroring would
+// refuse C every toolchain accepts; silence would leave the programmer believing
+// a rename happened. The `asmName` assertion is what proves the DROP actually
+// happened rather than the warning being cosmetic.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnAutomaticLocalWarnsAndIsDropped) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { int x __asm(\"mylocal\") = 1; return x; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "a warning, never an error";
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_AsmLabelOnAutomaticVariable), 1u);
+    EXPECT_EQ(asmNameOf(m, "x"), "");
+}
+
+// The COMPLEMENT of the warning above: a `static` local DOES have a symbol, so
+// its label is honored. Without this pin the warning could be widened to every
+// block-scope declaration and nothing would notice.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnStaticLocalIsHonored) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { static int s __asm(\"mystatic\") = 1; return s; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_AsmLabelOnAutomaticVariable), 0u);
+    EXPECT_EQ(asmNameOf(m, "s"), "mystatic");
+}
+
+// ── D-CSUBSET-TYPEDEF-MULTI-DECLARATOR ──────────────────────────────────────
+
+// THE corpus witness, verbatim from the macOS SDK (`mach/vm_types.h:87`).
+// Asserting all THREE aliases resolve to the SAME type is what catches the
+// "lowered only the first declarator" implementation — which compiles clean and
+// leaves aliases 2..N undeclared, so a `vm_map_read_t x;` later reads as an
+// implicit-int or an undeclared type depending on the tier that trips first.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorBindsEveryAlias) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef unsigned int mach_port_t;\n"
+        "typedef mach_port_t vm_map_t, vm_map_read_t, vm_map_inspect_t;\n"
+        "vm_map_t a; vm_map_read_t b; vm_map_inspect_t c;\n"
+        "int main(void) { return (int)(a + b + c); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "SDK mach/vm_types.h:87";
+    auto const* base = findSymbolNamed(m, "mach_port_t");
+    ASSERT_NE(base, nullptr);
+    for (char const* alias : {"vm_map_t", "vm_map_read_t", "vm_map_inspect_t"}) {
+        auto const* r = findSymbolNamed(m, alias);
+        ASSERT_NE(r, nullptr) << alias << " was not bound";
+        EXPECT_EQ(r->kind, DeclarationKind::Type) << alias;
+        EXPECT_EQ(r->type.v, base->type.v)
+            << alias << " must alias the SAME type as the shared head";
+    }
+}
+
+// PER-SLOT declarator suffixes. A shared-head implementation (one type for the
+// whole declaration) would type all three identically and compile clean — this
+// is the assertion that distinguishes a real per-declarator fold from a
+// copy-the-head one. `F` is a FUNCTION type, `P` a pointer, `A` an array.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorFoldsEachSuffixSeparately) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef int *P, A[4], F(void);\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    TypeInterner const& in = m.lattice().interner();
+    auto const* p = findSymbolNamed(m, "P");
+    auto const* a = findSymbolNamed(m, "A");
+    auto const* f = findSymbolNamed(m, "F");
+    ASSERT_NE(p, nullptr); ASSERT_NE(a, nullptr); ASSERT_NE(f, nullptr);
+    EXPECT_EQ(in.kind(p->type), TypeKind::Ptr)   << "P must be int*";
+    EXPECT_EQ(in.kind(a->type), TypeKind::Array) << "A must be int[4]";
+    EXPECT_EQ(in.kind(f->type), TypeKind::FnSig) << "F must be int(void)";
+}
+
+// The single-declarator form must be UNCHANGED — the list rule replaces the bare
+// declarator 1:1 at the same role index, so nothing about a one-alias typedef
+// moves. Without this the index flip could regress every existing typedef and
+// only the multi-declarator tests would notice.
+TEST(SemanticAnalyzerCSubset, TypedefSingleDeclaratorIsUnchanged) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef unsigned long long u_int64_t;\n"
+        "typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));\n"
+        "au_asflgs_t v;\n"
+        "int main(void) { return (int)v; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const* base = findSymbolNamed(m, "u_int64_t");
+    auto const* al   = findSymbolNamed(m, "au_asflgs_t");
+    ASSERT_NE(base, nullptr); ASSERT_NE(al, nullptr);
+    EXPECT_EQ(al->type.v, base->type.v);
+}
+
+// A BLOCK-SCOPE multi-declarator typedef — the statement position, which needs
+// its own Block wrapper because a statement holds exactly one HIR node. Both
+// aliases must bind IN the block.
+TEST(SemanticAnalyzerCSubset, BlockScopeTypedefMultiDeclaratorBindsEveryAlias) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { typedef int LA, LB; LA a = 1; LB b = 2; return a + b; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    for (char const* alias : {"LA", "LB"}) {
+        auto const* r = findSymbolNamed(m, alias);
+        ASSERT_NE(r, nullptr) << alias << " was not bound in the block";
+        EXPECT_EQ(r->kind, DeclarationKind::Type) << alias;
+    }
+}
+
+// An ABSTRACT slot in the middle of the list fails LOUD per slot — `typedef int
+// A, *, B;` declares nothing at slot 2. Silently binding A and B and skipping
+// the middle would declare fewer aliases than were written.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorAbstractSlotFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef int A, *, B;\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_GE(countCode(m.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 1u);
+}

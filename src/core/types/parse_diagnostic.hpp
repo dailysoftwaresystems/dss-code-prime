@@ -1133,6 +1133,48 @@ enum class DiagnosticCode : std::uint16_t {
     // erroring is picking one of two layouts silently.
     S_PragmaPackAmbiguous = 0xE05B,
 
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5): an asm label whose payload the
+    // compiler cannot turn into a usable assembler name — the label decoded to
+    // ZERO bytes (`__asm("")`), or its string carries a malformed escape so
+    // `decodeAdjacentStringBodies` returned nothing.
+    //
+    // ★ WHY IT IS AN ERROR AND NOT A SILENT FALL-BACK TO THE C NAME. An asm label
+    // is a RENAME: the whole point is that the emitted symbol differs from the
+    // declared identifier. Falling back to the C name on a bad label produces a
+    // clean-compiling program that references the WRONG symbol, and the failure
+    // then surfaces (if at all) as a foreign linker's "undefined reference" with
+    // no line number. Worse, an empty name reaching the definition rail is
+    // indistinguishable from "this symbol is module-private" at
+    // `compile_pipeline`'s `nameOf` — which SILENTLY DROPS the symbol-table row
+    // and lets the object writer fall back to a synthetic `sym_<id>`. Loud here
+    // is the only place the programmer can act on it.
+    S_AsmLabelInvalid = 0xE05C,
+
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): TWO asm labels on ONE declarator (`int x __asm("a") __asm("b");`).
+    // The grammar's `{repeat}` admits the run — deliberately, so an attribute and
+    // a label may interleave in any order — so the arity constraint is enforced
+    // here rather than by a grammar shape that would also forbid the legal
+    // interleavings. Never resolved by first-wins or last-wins: which symbol the
+    // programmer meant is genuinely unknown, and guessing renames the symbol to
+    // one of two names with no diagnostic.
+    S_AsmLabelDuplicate = 0xE05D,
+
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME, WARNING): an asm label on an
+    // AUTOMATIC block-scope variable. Such an
+    // object has no assembler symbol to rename — it lives in a stack slot — so the
+    // label cannot be honored.
+    //
+    // ★ A WARNING, NOT AN ERROR, AND THE CHOICE IS MEASURED. `/usr/bin/clang`
+    // accepts `int f(void){ int x __asm("mylocal"); … }` and emits exactly this
+    // diagnostic ("ignored asm label 'mylocal' on automatic variable"). Erroring
+    // would refuse C that every real toolchain compiles — the TF-C77 lesson that a
+    // gate which refuses valid C is worse than the silence it replaces. Staying
+    // SILENT is not an option either: the programmer wrote a rename that did not
+    // happen. So: honored where a symbol exists (file scope, `static` locals,
+    // externs), loudly ignored where none does.
+    S_AsmLabelOnAutomaticVariable = 0xE05E,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

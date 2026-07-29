@@ -343,6 +343,36 @@ struct DSS_EXPORT DeclaratorConfig {
     // `declarators` block at all) ⇒ zero behavior change.
     std::optional<RuleId> memberDeclaratorRule;
     std::optional<RuleId> memberListRule;
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the OPTIONAL THIRD list shape —
+    // a comma-separated run of BARE `declaratorRule` nodes, with NO per-slot
+    // wrapper, NO initializer slot and NO attribute run (c-subset's
+    // `typedefDeclaratorList`). `collectDeclarators` yields its `declaratorRule`
+    // children directly. It is a SEPARATE role rather than a second spelling of
+    // `listRule` because the three list shapes carry genuinely different per-slot
+    // grammar and the walk must descend each correctly: `listRule`'s slots own
+    // `= init` + an attribute run, `memberListRule`'s own a bit-field width, and
+    // this one owns neither — which is exactly what keeps `typedef int T = 5;` a
+    // LOUD parse error and keeps a typedef's honored trailing attribute run from
+    // being swallowed by an unhonored per-slot one. `nullopt` ⇒ the language has
+    // no such list (toy/tsql, and c-subset before this) ⇒ zero behavior change.
+    std::optional<RuleId> plainListRule;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5): the OPTIONAL rule carrying an
+    // explicit ASSEMBLER NAME for the declarator it follows (`int f(void)
+    // __asm("_myname");`). Its payload string REPLACES the symbol's on-binary name
+    // VERBATIM — the format's C mangling is bypassed, not applied on top.
+    //
+    // ★ IT IS DELIBERATELY **NOT** A MEMBER OF `afterDeclaratorAttrRules`, even
+    // though it sits in the same source position and needs the same init-detection
+    // skip. That list has a SECOND consumer — `declaratorAttrRoots` feeds it to the
+    // HIR LINKAGE fold — which would walk an asm label's `__asm` / `(` / string
+    // tokens as attribute clauses and fire a bogus H_UnknownLinkageSpecifier on
+    // perfectly legal C. Two roles, two keys; the shared skip lives in
+    // `isDeclaratorDecorationNode` (declarator_walk.hpp) so the init scans cannot
+    // drift apart from each other.
+    //
+    // `nullopt` ⇒ the language has no asm-label surface; every scan degrades to its
+    // pre-TF-C88 behavior exactly.
+    std::optional<RuleId> asmLabelRule;
     // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL abstract twin of
     // `directRule` — a `direct-abstract-declarator` (C 6.7.7) whose base EXCLUDES
     // the name token, used in TYPE-NAME position (cast/sizeof/compound/va_arg)
@@ -390,6 +420,8 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   listRuleName;
     std::string   memberDeclaratorRuleName;   // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
+    std::string   plainListRuleName;          // TF-C88 D-CSUBSET-TYPEDEF-MULTI-DECLARATOR
+    std::string   asmLabelRuleName;           // TF-C88 D-CSUBSET-ASM-LABEL-SYMBOL-RENAME
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
     std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA

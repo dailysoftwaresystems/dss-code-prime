@@ -417,10 +417,16 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // shipped-descriptor import (producer C) reaches the linker's
             // reference gate as eager (kept even when unreferenced). Non-eager
             // source/bare-proto externs leave it false → dropped if unreferenced.
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): carry the per-declarator
+            // assembler
+            // name so FF5/FF1 name the import with it VERBATIM instead of the
+            // C-mangled identifier. Empty for every extern without a label ⇒ the
+            // downstream naming is byte-identical there.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
                             r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
-                            r.isEagerImport});
+                            r.isEagerImport,
+                            r.asmName});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -1424,9 +1430,18 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // to the pre-fix output; adds the `_` on Mach-O only. A SymbolId with no
     // record (synthesized / out-of-range) yields "" — the LK11a symbol-table
     // populate then skips it as module-private, exactly as before.
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): routed through `linkNameFor`,
+    // which returns an
+    // explicit assembler name VERBATIM and falls back to `applyCMangling` when
+    // there is none — so this lambda is byte-identical for every symbol without a
+    // label (i.e. every symbol in every program before this cycle). This is the
+    // DEFINITION rail; `program.cpp`'s merge-key lambda is its cross-CU twin and
+    // MUST route through the same function (see linkNameFor's own comment for what
+    // a divergence between the two silently produces).
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? dss::ffi::applyCMangling(r->name, fmtKind) : std::string{};
+        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind)
+                 : std::string{};
     };
 
     // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's

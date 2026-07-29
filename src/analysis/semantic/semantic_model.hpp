@@ -77,6 +77,35 @@ struct DSS_EXPORT ScopeRecord {
 // initializer-inference runs.
 struct DSS_EXPORT SymbolRecord {
     std::string name;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5 "Controlling Names Used in
+    // Assembler Code"): the EXPLICIT assembler name written on this symbol's
+    // declarator — `int f(void) __asm("_myname");`. EMPTY (the overwhelmingly
+    // common case) means "no label; derive the on-binary name from `name` the
+    // usual way".
+    //
+    // THE CONTRACT, MEASURED against /usr/bin/clang on arm64-darwin: when set,
+    // this string IS the on-binary symbol name, VERBATIM — the format's C
+    // mangling (`applyCMangling`) is BYPASSED, not applied on top. `int gv
+    // __asm("myglobal");` emits `myglobal`, not `_myglobal`; that is exactly why
+    // the macOS SDK's `__DARWIN_ALIAS` family writes its own leading underscore
+    // (`__asm("_" __STRING(sym) …)`). The in-tree precedent for a pre-decorated,
+    // never-re-mangled name is a format descriptor's `importMangledName`
+    // (macho64-arm64-darwin-exec.format.json ships `"_exit"` and
+    // entry_trampoline.cpp uses it verbatim).
+    //
+    // ★ IT LIVES ON THE SYMBOL, NOT ON HIR, AND THAT IS FORCED. The two rails
+    // that turn a symbol into an emitted name — `compile_pipeline`'s `nameOf`
+    // and `program.cpp`'s cross-CU merge key — read `SemanticModel`, never HIR.
+    // A HIR side-table (the `HirLinkageMap` / `HirAlignmentMap` shape) would be
+    // structurally INVISIBLE to both, and a label that never reaches them is a
+    // parse-and-ignore rename: clean compile, wrong symbol, no diagnostic.
+    //
+    // ★ IT SURVIVES THE REDECLARATION MERGE. MEASURED: a label on a PROTOTYPE
+    // renames the later DEFINITION (`int deffn(int) __asm("mydeffn"); int
+    // deffn(int x){…}` emits `mydeffn`), so `mergeOrCollideRedeclaration` carries
+    // a non-empty label from the absorbed declaration onto the survivor.
+    std::string asmName;
     ScopeId     scope{};
     NodeId      declNode{};         // the declaration's name node (or the rule node if no name child)
     NodeId      declRuleNode{};     // the declaration rule node itself (for diagnostic spans)

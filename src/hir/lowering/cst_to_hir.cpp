@@ -8427,6 +8427,11 @@ struct Lowerer {
                         builder.makeExternFunction(pr->type, sym.v, {}), d);
                     auto const* shipped =
                         model.suppressedShippedSymbolFor(pr->name);
+                    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a bare-prototype
+                    // cross-TU reference carries the
+                    // prototype's own asm label (set below), so a labelled
+                    // prototype resolves against the labelled definition in the
+                    // sibling TU rather than against its C name.
                     externDecls.push_back(HirExternRecord{
                         ef, pr->name,
                         shipped != nullptr
@@ -8438,7 +8443,9 @@ struct Lowerer {
                         // prototype's synthesized import, else the versioned
                         // symbol misbinds unversioned (the realpath@GLIBC_2.2.5
                         // silent bug the descriptor path fixes).
-                        shipped != nullptr ? shipped->version : std::string{}});
+                        shipped != nullptr ? shipped->version : std::string{},
+                        /*isEagerImport=*/false,
+                        pr->asmName});   // TF-C88 (asm label)
                     if (asGlobal) {
                         pushOut(ef, d);
                     } else if (moduleDecls_ != nullptr) {
@@ -8636,7 +8643,19 @@ struct Lowerer {
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
 
-    HirNodeId lowerTypeDecl(NodeId node) {
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): a type declaration lowers to ONE
+    // `TypeDecl` PER NAMED DECLARATOR — `typedef mach_port_t vm_map_t,
+    // vm_map_read_t, vm_map_inspect_t;` emits three. The `Into` shape is the
+    // `lowerExternDeclInto` / `lowerVarLikeInto` pattern: the caller owns the
+    // container, so a top-level list appends flat and a statement-position list
+    // wraps once (see `lowerTypeDecl` below for why the wrap must exist).
+    //
+    // ★ WHY N NODES AND NOT ONE. A TypeDecl emits no code for an ordinary alias, so
+    // "just lower the first" would look green — but a VLA typedef's TypeDecl is
+    // where HIR→MIR FREEZES that alias's runtime size slots (C99 6.7.7p2 evaluates
+    // the bound once, when the typedef is REACHED). Dropping the 2nd..Nth node
+    // would silently leave those aliases' sizes unfrozen while every test passed.
+    void lowerTypeDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
         // Strip-aware for the same reason as `lowerVarLike` above: no shipped
@@ -8645,6 +8664,11 @@ struct Lowerer {
         auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
+        // TF-C88: true once the per-declarator loop has emitted at least one node,
+        // which is what tells the tail below NOT to fall through to the single-node
+        // anon-composite path (`enum {V=16};` — a row with NO named declarator at
+        // all, whose type is stamped on the declaration node itself).
+        bool emittedPerDeclarator = false;
         // FC4 c1: declarator-mode type rows (c-subset typedefDecl) carry the
         // declared name inside the declarator — the shared walk finds it.
         if (decl && decl->isDeclaratorMode() && sem.declarators.has_value()) {
@@ -8658,8 +8682,13 @@ struct Lowerer {
                 for (NodeId d : declarators) {
                     NodeId const nameNode =
                         declaratorNameNode(tree(), d, *sem.declarators);
+                    // An ABSTRACT declarator mints no symbol; Pass-1's
+                    // `requireNamedDeclarators` already erred
+                    // (S_DeclarationDeclaresNothing) on this row, so skipping is a
+                    // reported, not a silent, outcome.
                     if (!nameNode.valid()) continue;
-                    sym = model.symbolAt(nameNode);
+                    sym  = model.symbolAt(nameNode);
+                    type = InvalidType;
                     if (auto const* rec = model.recordFor(sym)) type = rec->type;
                     // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
                     // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
@@ -8692,13 +8721,21 @@ struct Lowerer {
                                 "a typedef that aliases a variable-length-array "
                                 "typedef is not yet supported");
                     }
-                    break;   // typedefs declare a single declarator
+                    // TF-C88: emit THIS alias's node, then continue to the next
+                    // slot. The `break` that used to sit here (commented "typedefs
+                    // declare a single declarator") was true only because the
+                    // GRAMMAR admitted one; it is the second half of the
+                    // multi-declarator unit.
+                    out.push_back(track(builder.makeTypeDecl(
+                        type.valid() ? type : model.typeAt(node), sym.v), d));
+                    emittedPerDeclarator = true;
                 }
             }
         } else if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl->nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        if (emittedPerDeclarator) return;
         // D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: an ANONYMOUS composite specifier
         // (tagless `enum {…}` / `struct {…}` / `union {…}`) binds its interned type
         // on the SPECIFIER node ITSELF (Pass-1.5 stamps `nodeToType[specNode]`), NOT
@@ -8710,7 +8747,22 @@ struct Lowerer {
         // HIR verifier even though the enum type resolved fine (the NAMED form is
         // clean because vis[nameChild] is the tag Identifier, where the symbol binds).
         if (!type.valid()) type = model.typeAt(node);
-        return track(builder.makeTypeDecl(type, sym.v), node);
+        out.push_back(track(builder.makeTypeDecl(type, sym.v), node));
+    }
+
+    // TF-C88: the SINGLE-node statement-context wrapper — the exact `lowerVarLike`
+    // shape. One declarator lowers to its bare TypeDecl (byte-identical to every
+    // single-declarator program before this cycle); a multi-declarator typedef
+    // statement wraps its N TypeDecls in a Block, because a statement position
+    // holds exactly one node AND the order must be preserved (a VLA typedef's size
+    // freeze happens AT its TypeDecl, so hoisting the extras out of the body — the
+    // block-scope-extern trick — would move the evaluation). Zero named declarators
+    // yield an empty Block, never silence: Pass-1 already erred.
+    HirNodeId lowerTypeDecl(NodeId node) {
+        std::vector<HirNodeId> out;
+        lowerTypeDeclInto(node, out);
+        if (out.size() == 1) return out[0];
+        return track(builder.makeBlock(out), node);
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
@@ -8887,7 +8939,9 @@ struct Lowerer {
             shipped != nullptr ? shipped->library
                                : std::unordered_map<std::string, std::string>{},
             /*noLibraryBinding=*/shipped == nullptr,
-            shipped != nullptr ? shipped->version : std::string{}});
+            shipped != nullptr ? shipped->version : std::string{},
+            /*isEagerImport=*/false,
+            rec->asmName});   // TF-C88 (asm label)
         outNode = ef;
         return true;
     }
@@ -9422,8 +9476,16 @@ struct Lowerer {
             recordLinkage(h,
                           declaratorLinkage(externPrefixLink, decl, fromDeclarator));
             auto const* rec = model.recordFor(sym);
-            externDecls.push_back({h, rec ? rec->name : std::string{},
-                                   libraryOverride});
+            HirExternRecord row{h, rec ? rec->name : std::string{},
+                                libraryOverride};
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
+            // DECLARATOR by
+            // Pass-1 and lives on the SymbolRecord, so this producer just carries
+            // it — no second parse, no chance of the two tiers disagreeing about
+            // which declarator owns which label. Empty for every extern declared
+            // without one, which makes the import rail byte-identical there.
+            if (rec != nullptr) row.asmName = rec->asmName;
+            externDecls.push_back(std::move(row));
         };
         for (NodeId d : declarators) {
             NodeId const nameNode = declaratorNameNode(tree(), d, dc);
@@ -9513,16 +9575,23 @@ struct Lowerer {
     // initializer — an initDeclarator with a visible Internal child that is NOT the
     // declarator (the `= initValue` subtree). Used to reject an extern-with-
     // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
-    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): is `c` an AFTER-DECLARATOR attribute node
-    // (`attrSpec`/`stdAttr`) rather than the initializer? The init-detection scans
-    // must skip these so `void f(void) __attribute__((noreturn));` is not
-    // mis-lowered with the attribute as its init value (S_TypeMismatch).
+    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) + TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): is `c` an
+    // AFTER-DECLARATOR DECORATION rather than the initializer? The init-detection
+    // scans read "the first visible Internal child that is not the declarator" as
+    // the init value, so every decoration the grammar may put in that slot must be
+    // skipped here — an attribute, else `void f(void) __attribute__((noreturn));`
+    // type-checks the attribute against the function type (S_TypeMismatch); an asm
+    // label, else `int gv __asm("myglobal") = 7;` lowers the LABEL as the
+    // initializer expression (MEASURED before this delegation: H0009 "expression
+    // form has no hirLowering mapping" on the label's string).
+    //
+    // Delegates to the SHARED `isDeclaratorDecorationNode` (declarator_walk.hpp) so
+    // this tier and the semantic tier cannot disagree about what a decoration is.
+    // NOTE it is deliberately WIDER than `declaratorAttrRoots` below, which reads
+    // `afterDeclaratorAttrRules` directly and must stay attribute-only — feeding an
+    // asm label to the linkage fold would fire a bogus H_UnknownLinkageSpecifier.
     [[nodiscard]] bool isAfterDeclaratorAttr(NodeId c, DeclaratorConfig const& dc) {
-        if (isToken(c)) return false;
-        RuleId const r = tree().rule(c);
-        for (RuleId ar : dc.afterDeclaratorAttrRules)
-            if (r.v == ar.v) return true;
-        return false;
+        return isDeclaratorDecorationNode(tree(), dc, c);
     }
 
     [[nodiscard]] bool
@@ -9648,7 +9717,10 @@ struct Lowerer {
         if (m->hirKind == "Skip")       return;
         if (m->hirKind == "Decl")       { lowerTopLevelInto(core, out); return; }
         if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
-        if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
+        // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): N declarators → N TypeDecl
+        // nodes, appended FLAT to the module decls (the `ExternDecl` arm below is
+        // the precedent). No Block wrapper here — module scope is already a list.
+        if (m->hirKind == "TypeDecl")   { lowerTypeDeclInto(core, out); return; }
         if (m->hirKind == "ExternDecl") {
             // D-CSUBSET-EXTERN-MULTI-DECLARATOR: N declarators → N extern nodes
             // (each an ExternGlobal/ExternFunction; an absorbed extern — superseded

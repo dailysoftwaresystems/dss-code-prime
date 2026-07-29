@@ -1,0 +1,5 @@
+P_UnexpectedToken 20:23-20:28
+P_UnexpectedToken 20:28-20:29
+P_UnexpectedToken 20:29-20:30
+S_AsmLabelDuplicate 19:22-19:32
+S_AsmLabelInvalid 18:23-18:32

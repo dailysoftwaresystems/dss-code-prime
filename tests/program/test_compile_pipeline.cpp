@@ -389,6 +389,61 @@ TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
            "symbol name (ld64 convention) — proves the single-CU nameOf mangle";
 }
 
+// ── TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the SINGLE-CU definition rail ──
+//
+// ★ THIS TEST EXISTS BECAUSE THE CORPUS EXAMPLE CANNOT REACH THIS CODE PATH, AND
+// THE RED-ON-DISABLE BATTERY IS WHAT PROVED IT. `examples/c-subset/asm_label` is
+// a TWO-CU program, so its definitions are named by `program.cpp`'s cross-CU
+// merge-key lambda and `compile_pipeline`'s MERGED arm (which reads
+// `merged.symbolNames`); the SINGLE-CU `nameOf` at compile_pipeline.cpp is never
+// entered. Disabling the label in that lambda alone left the example GREEN — a
+// vacuous guard over the exact rail an asm label is most likely to be used on.
+//
+// The assertion is on the emitted BYTES, and it is two-sided on purpose:
+//   * `dss_c88_single` MUST appear   — the label is the on-binary name;
+//   * `_dss_c88_single` must NOT     — the label REPLACES the Mach-O mangling
+//     rather than being mangled on top of it, which is the plausible wrong
+//     implementation and the one that silently breaks `__DARWIN_ALIAS` headers
+//     (they write their own leading underscore).
+// A one-sided "contains the label" check would pass under the double-mangle,
+// because `_dss_c88_single` contains `dss_c88_single` as a substring.
+//
+// RED-ON-DISABLE (re-verified against the final build): drop `r->asmName` from
+// the single-CU `nameOf` and the .o carries `_labelled_fn` instead.
+TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "labelled.c",
+        "int labelled_fn(void) __asm(\"dss_c88_single\");\n"
+        "int labelled_fn(void) { return 42; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwin"});
+    ASSERT_EQ(rc, 0);
+    auto const obj = outDir / "labelled.o";
+    ASSERT_TRUE(fs::exists(obj));
+
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+
+    EXPECT_NE(data.find(std::string("dss_c88_single")), std::string::npos)
+        << "the asm label must BE the emitted symbol name";
+    EXPECT_EQ(data.find(std::string("_dss_c88_single")), std::string::npos)
+        << "the label REPLACES applyCMangling — it must not be underscored on "
+           "top (MEASURED against clang: `int gv __asm(\"myglobal\");` emits "
+           "`myglobal`, and every __DARWIN_ALIAS header writes its own `_`)";
+    EXPECT_EQ(data.find(std::string("_labelled_fn")), std::string::npos)
+        << "the C identifier must NOT reach the object once a label renames it";
+}
+
 // ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling emits a real .o ──
 //
 // End-to-end pipeline proof for the arm64 Mach-O relocatable object

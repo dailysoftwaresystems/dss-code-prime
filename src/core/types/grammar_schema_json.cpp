@@ -4855,7 +4855,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 20>
+                    static constexpr std::array<std::string_view, 22>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4886,7 +4886,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "prototypeParamScopeRule",
                             // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
                             // after-declarator attribute rules (attrSpec/stdAttr).
-                            "afterDeclaratorAttrRules"};
+                            "afterDeclaratorAttrRules",
+                            // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the
+                            // OPTIONAL third list shape — a comma-separated run of
+                            // BARE declarators (no init slot, no attribute run).
+                            "plainListRule",
+                            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the OPTIONAL rule
+                            // carrying an explicit assembler name for a declarator.
+                            "asmLabelRule"};
                     DSS_CHECK_KEY_VOCABULARY(kDeclaratorKeys);
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
@@ -5051,6 +5058,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                          dc.memberDeclaratorRuleName);
                     readOptionalRuleRole("memberListRule", dc.memberListRule,
                                          dc.memberListRuleName);
+                    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the OPTIONAL
+                    // BARE-declarator list shape — same optional-role discipline
+                    // (absent ⇒ `collectDeclarators` never matches it, so a
+                    // language without one behaves exactly as before).
+                    readOptionalRuleRole("plainListRule", dc.plainListRule,
+                                         dc.plainListRuleName);
+                    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the OPTIONAL after-declarator
+                    // assembler-name rule — absent ⇒ no asm-label surface, every
+                    // init-detection scan degrades to its pre-TF-C88 behavior.
+                    readOptionalRuleRole("asmLabelRule", dc.asmLabelRule,
+                                         dc.asmLabelRuleName);
                     // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
                     // abstract direct-declarator role — same optional-role
                     // discipline (absent ⇒ no abstract type-name declarator).

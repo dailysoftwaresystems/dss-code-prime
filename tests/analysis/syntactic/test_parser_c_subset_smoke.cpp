@@ -2261,12 +2261,20 @@ TEST(ParserCSubsetSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
 //
 // `kCanonicalTypedefRoles` is that invariant written down: the shipped
 // declarations row addresses this rule's children BY INDEX (`head: 0`,
-// `declarator: 2`, POST-strip), so any change to this string is a change to
+// `declaratorList: 2`, POST-strip), so any change to this string is a change to
 // what those indices mean. Every position test below re-pins it, because a
 // decoration appearing in one slot must not shift the other slots.
+//
+// TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): slot 3 became
+// `typedefDeclaratorList` — a comma-separated run of BARE declarators — and the
+// row's key became `declaratorList: 2` in the SAME commit. The list rule replaces
+// the declarator node 1:1 at the SAME position, which is why this is a one-token
+// edit rather than an index move: `head: 0` and slot 2 are unchanged, and the
+// three decoration-position tests below still assert exactly what they asserted
+// before (a decoration in any slot shifts nothing).
 constexpr std::string_view kCanonicalTypedefRoles =
     "rule:typedefDeclSpecifiers/rule:typedefHeadFull/rule:typedefAttrRun/"
-    "rule:declarator/rule:typedefAttrRun/tok:EndStatement";
+    "rule:typedefDeclaratorList/rule:typedefAttrRun/tok:EndStatement";
 
 // TRAILING (after the declarator) — the real SDK witness
 // `bsm/audit.h:199`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`
