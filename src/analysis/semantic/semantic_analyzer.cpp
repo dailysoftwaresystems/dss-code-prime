@@ -1,6 +1,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 
 #include "analysis/compilation_unit/unit_attribute.hpp"
+#include "analysis/preprocess/preprocessor.hpp"   // TF-C82: kPragmaPackAmbiguous
 #include "analysis/semantic/scope_tree.hpp"
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
@@ -347,6 +348,25 @@ struct EngineState {
         return *active_;
     }
 
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the CURRENT tree's `#pragma pack` stamps
+    // (`CompilationUnit::pragmaPackFor`), or null when the pass is not inside a
+    // per-tree walk. Set beside `activate` in the Pass 1.5 loop — the ONE pass
+    // that composes composite types, and therefore the only one that can ask.
+    // Null / absent-offset both mean NO cap, which is exactly the pre-TF-C82
+    // layout, so every non-preprocessed and every pack-free TU is untouched.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* pragmaPack = nullptr;
+
+    // The `#pragma pack` member-alignment cap in effect where the token at synth
+    // byte `offset` was emitted; 0 = none. An EXACT per-token lookup, not a range
+    // search: the preprocessor stamps the state at EMISSION, so a composite that
+    // arrived from a macro replacement list answers with the cap at its
+    // INVOCATION rather than the one surrounding its `#define`.
+    [[nodiscard]] std::uint32_t packCapAtOffset(std::uint32_t offset) const {
+        if (pragmaPack == nullptr) return 0;
+        auto const it = pragmaPack->find(offset);
+        return it == pragmaPack->end() ? 0u : it->second;
+    }
+
     [[nodiscard]] TypeId typeAt(NodeId id) const {
         auto const* p = nodeToType.tryGet(id);
         return p ? *p : InvalidType;
@@ -386,6 +406,32 @@ nodeHasVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
         }
     }
     return false;
+}
+
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the synth byte offset of `node`'s LEFTMOST
+// TOKEN leaf — the key the preprocessor's `#pragma pack` stamps are recorded
+// under.
+//
+// ★ WHY THE LEFTMOST TOKEN AND NOT `tree.span(node).start()`. They agree today,
+// and relying on that is exactly the kind of incidental agreement that turns
+// into a silent wrong layout when a future grammar change gives an internal node
+// a span that starts before its first token (a synthesized lead slot, an
+// always-emitted empty run — this grammar already has both). The stamps are
+// keyed on REAL EMITTED TOKENS, so the lookup asks for a real emitted token.
+// Falls back to the node's own span start when the subtree holds no token at all
+// (an empty always-emitted run), which can only mean there was nothing to stamp.
+[[nodiscard]] std::uint32_t leftmostTokenOffset(Tree const& tree, NodeId node) {
+    NodeId cur = node;
+    for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+        if (tree.kind(cur) == NodeKind::Token) {
+            return static_cast<std::uint32_t>(tree.span(cur).start());
+        }
+        NodeId next{};
+        for (NodeId c : visibleChildren(tree, cur)) { next = c; break; }
+        if (!next.valid()) break;
+        cur = next;
+    }
+    return static_cast<std::uint32_t>(tree.span(node).start());
 }
 
 // FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the FIRST visible child of `node` whose
@@ -7318,10 +7364,57 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // clang sizeof 16, not packed's bare 5.
                                 bool composedPacked = false;
                                 std::optional<std::uint32_t> composedAlign;
+                                // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma
+                                // pack(N)` MEMBER-ALIGNMENT CAP in effect where this
+                                // composite is DEFINED. It comes from the
+                                // preprocessor (a lexically scoped push/pop state),
+                                // keyed on the specifier's leftmost EMITTED TOKEN, and
+                                // is the last hop of the only chain in this cycle that
+                                // changes bytes. 0 = no cap = the layout every
+                                // composite got before TF-C82.
+                                //
+                                // Read for BOTH struct and union and for BOTH
+                                // definition arms below: `#pragma pack` is lexical, so
+                                // it applies to whatever composite definition sits
+                                // inside the region — it has nothing to do with which
+                                // attribute surfaces the definition happens to carry.
                                 NodeId const specNode =
                                     srec.structScope.valid()
                                         ? s.scopes.scopes()[srec.structScope.v].anchor
                                         : NodeId{};
+                                std::uint32_t composedPackCap =
+                                    specNode.valid()
+                                        ? s.packCapAtOffset(
+                                              leftmostTokenOffset(tree, specNode))
+                                        : 0u;
+                                // ★ THE AMBIGUITY IS JUDGED HERE, NOT WHERE IT WAS
+                                // DETECTED. The preprocessor knows a token was
+                                // stamped under two caps; only THIS site knows the
+                                // token is a composite's LAYOUT KEY. MEASURED, the
+                                // distinction is not academic: erroring at
+                                // detection refused a program clang compiles — a
+                                // shared MEMBER macro used in two pack regions
+                                // stamps its own tokens twice while every
+                                // composite stays anchored on an unambiguous
+                                // `struct` keyword. Reaching this arm means the
+                                // composite ITSELF came from such a macro, so its
+                                // two candidate layouts differ in size and in
+                                // every field offset, and there is no defensible
+                                // way to pick one.
+                                if (composedPackCap == kPragmaPackAmbiguous) {
+                                    ParseDiagnostic d;
+                                    d.code = DiagnosticCode::S_PragmaPackAmbiguous;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(specNode);
+                                    d.actual   = std::string{srec.name};
+                                    s.reporter.report(std::move(d));
+                                    composedPackCap = 0u;   // lay out UNCAPPED so
+                                                            // the type still
+                                                            // completes; the
+                                                            // unsuppressable error
+                                                            // fails the build.
+                                }
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
                                     // The composite's ENCLOSING scope is the right
@@ -7479,7 +7572,13 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             // whole-union `aligned(N)` request; 0 = none.
                                             // clang: `union U {char a; int b;}
                                             // __attribute__((aligned(32)));` is 32/32.
-                                            composedAlign.value_or(0u));
+                                            composedAlign.value_or(0u),
+                                            // TF-C82: the `#pragma pack(N)` cap; 0 =
+                                            // none. Caps each member's alignment,
+                                            // which for a union (every member at
+                                            // offset 0) lowers the union's own
+                                            // alignment and therefore its size.
+                                            composedPackCap);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -7721,7 +7820,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             // come out at clang's sizeof 16 / _Alignof
                                             // 16 instead of failing loud as
                                             // unhonorable.
-                                            composedAlign.value_or(0u));
+                                            composedAlign.value_or(0u),
+                                            // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the
+                                            // `#pragma pack(N)` member-alignment cap;
+                                            // 0 = none. THE sink for this cycle —
+                                            // MEASURED, it is what turns
+                                            // `sys/fcntl.h`'s `struct log2phys` from
+                                            // the 24/8 DSS used to compute into
+                                            // clang's 20/4.
+                                            composedPackCap);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
@@ -12392,11 +12499,18 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     }
 
     // Pass 1.5 per tree: resolve declaration types + function signatures.
-    for (auto const& tree : trees) {
+    for (std::size_t ti = 0; ti < trees.size(); ++ti) {
+        auto const& tree = trees[ti];
         if (!tree.root().valid()) continue;
         s.activate(tree.schema());
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): point the engine at THIS tree's
+        // `#pragma pack` stamps for the duration of the walk that composes its
+        // composite types. Index-parallel to `trees()` by construction (the
+        // builder emits one map per tree); an empty/absent map means no cap.
+        s.pragmaPack = &cu->pragmaPackFor(ti);
         resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
     }
+    s.pragmaPack = nullptr;   // no tree is active outside the per-tree walk
 
     // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
     // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};

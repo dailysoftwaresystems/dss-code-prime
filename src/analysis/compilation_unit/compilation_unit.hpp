@@ -81,7 +81,10 @@ public:
                     std::vector<CrossTreeRef>            crossRefs,
                     std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                     std::uint32_t                        typeNameReparseCount = 0,
-                    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {});
+                    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {},
+                    // TF-C82: index-parallel to `trees` — see `pragmaPackFor`.
+                    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
+                        pragmaPackMaps = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -162,6 +165,21 @@ public:
     [[nodiscard]] std::span<std::shared_ptr<SourceBuffer> const>
     auxiliaryBuffers() const noexcept;
 
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): tree `treeIndex`'s `#pragma pack` stamps —
+    // synth byte offset of a token -> the MAXIMUM MEMBER ALIGNMENT (bytes) the
+    // preprocessor had in effect when it emitted that token. An offset ABSENT
+    // from the map means NO cap, so an empty map is exactly the pre-TF-C82
+    // behavior; it is empty for every tree that was not preprocessed and for
+    // every preprocessed TU containing no `#pragma pack` (all of them before
+    // this cycle). Out-of-range `treeIndex` yields the empty map.
+    //
+    // The semantic tier looks up a composite specifier's FIRST TOKEN offset here
+    // and feeds the answer to the interner's `maxFieldAlign` channel. This is the
+    // ONE hop that carries `#pragma pack` from the preprocessor — where the
+    // lexically-scoped state lives — to layout, where it changes bytes.
+    [[nodiscard]] std::unordered_map<std::uint32_t, std::uint32_t> const&
+    pragmaPackFor(std::size_t treeIndex) const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -171,6 +189,9 @@ private:
     std::vector<ShippedDescriptorRef>    shippedLibDescriptors_;  // FF11 neutral-JSON descriptor refs (path+span+buffer)
     std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
+    // TF-C82: index-parallel to `trees_` (the builder emits one entry per tree,
+    // so alignment is by construction, not by convention).
+    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -333,6 +354,14 @@ private:
         // diagnostics. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token ->
+        // the `#pragma pack` member-alignment cap in effect when the preprocessor
+        // emitted it. EMPTY for a tree that was not preprocessed, and for every
+        // preprocessed TU that uses no `#pragma pack`. Rides the SIDECAR rather
+        // than a parallel vector of its own so it stays index-aligned with
+        // `trees_` by construction — the same reason everything else per-tree
+        // lives here.
+        std::unordered_map<std::uint32_t, std::uint32_t> pragmaPack;
     };
 
     CompilationUnitId                    id_;

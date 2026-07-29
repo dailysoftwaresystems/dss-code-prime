@@ -87,7 +87,9 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<CrossTreeRef>            crossRefs,
                                  std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                                  std::uint32_t                        typeNameReparseCount,
-                                 std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers)
+                                 std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers,
+                                 std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
+                                     pragmaPackMaps)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -95,7 +97,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , crossRefs_(std::move(crossRefs))
     , shippedLibDescriptors_(std::move(shippedLibDescriptors))
     , typeNameReparseCount_(typeNameReparseCount)
-    , auxiliaryBuffers_(std::move(auxiliaryBuffers)) {}
+    , auxiliaryBuffers_(std::move(auxiliaryBuffers))
+    , pragmaPackMaps_(std::move(pragmaPackMaps)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -110,6 +113,17 @@ std::span<ShippedDescriptorRef const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
 std::span<std::shared_ptr<SourceBuffer> const>
 CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
+
+std::unordered_map<std::uint32_t, std::uint32_t> const&
+CompilationUnit::pragmaPackFor(std::size_t treeIndex) const noexcept {
+    // TF-C82: a tree with no stamps (not preprocessed, or preprocessed with no
+    // `#pragma pack`) and an out-of-range index answer identically — the EMPTY
+    // map, i.e. "no cap anywhere", which is exactly the pre-TF-C82 layout. A
+    // shared static keeps the reference valid without a per-call allocation.
+    static std::unordered_map<std::uint32_t, std::uint32_t> const kEmpty;
+    if (treeIndex >= pragmaPackMaps_.size()) return kEmpty;
+    return pragmaPackMaps_[treeIndex];
+}
 
 std::string CompilationUnit::compositeSourceLanguage() const {
     std::string out;
@@ -345,6 +359,10 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): carry the `#pragma pack` stamps to the
+        // finished CU. Empty for a TU with no `#pragma pack`, which is every TU
+        // that existed before this cycle.
+        sidecar.pragmaPack      = std::move(pp.pragmaPackByOffset);
         return trees_.back().id();
     }
     // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
@@ -812,6 +830,13 @@ CompilationUnit UnitBuilder::finish() && {
         }
     }
 
+    // TF-C82: flatten the per-tree `#pragma pack` stamps out of the sidecars, in
+    // tree order. `sidecars_` is index-parallel to `trees_` by construction
+    // (`addTree` appends exactly one sidecar), so this vector is too.
+    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps;
+    pragmaPackMaps.reserve(sidecars_.size());
+    for (auto& sc : sidecars_) pragmaPackMaps.push_back(std::move(sc.pragmaPack));
+
     finished_ = true;
     return CompilationUnit{
         CompilationUnit::PrivateTag{},
@@ -823,6 +848,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(shippedLibDescriptors),
         typeNameReparseCount,
         std::move(auxiliaryBuffers_),
+        std::move(pragmaPackMaps),
     };
 }
 

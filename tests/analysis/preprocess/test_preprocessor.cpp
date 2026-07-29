@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -916,6 +917,115 @@ reboundCSubset(std::string const& from, std::string const& to,
     return *loaded;
 }
 } // namespace
+
+// ── TF-C82 (D-PP-PRAGMA-REGISTRY): the LOADER's guards on `pragmaEffects` ──
+//
+// The registry mirrors `attributeEffects`, so it inherits that table's hard-won
+// rules: a CLOSED verb set (a typo can never silently disarm a row), no
+// DUPLICATE key (which row wins must not be decided by iteration order), no
+// EMPTY key (an empty prefix matches EVERY pragma and would silently disarm
+// `unknownPragmaIsError` wholesale), and no row without a SURFACE to fire on.
+// Each sub-case rebinds the shipped config and asserts the load REJECTS.
+namespace {
+[[nodiscard]] std::vector<ConfigDiagnostic>
+loadCSubsetExpectingFailure(std::string const& from, std::string const& to,
+                            std::string const& label) {
+    std::string text = loadShippedCSubsetText();
+    if (text.empty()) {
+        ADD_FAILURE() << "could not locate shipped c-subset config";
+        return {};
+    }
+    auto const pos = text.find(from);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "shipped c-subset config no longer carries: " << from;
+        return {};
+    }
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, label);
+    if (loaded.has_value()) {
+        ADD_FAILURE() << "the load should have FAILED for: " << label;
+        return {};
+    }
+    return loaded.error();
+}
+[[nodiscard]] bool hasCode(std::vector<ConfigDiagnostic> const& ds,
+                           DiagnosticCode code) {
+    for (auto const& d : ds) if (d.code == code) return true;
+    return false;
+}
+} // namespace
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsUnknownVerb) {
+    // The CLOSED verb set, and — like `kEffectVerbs` — the rejection message is
+    // DERIVED from the vocabulary rather than restated beside it, so it cannot
+    // drift into advertising a verb that no longer loads. This mirror going RED
+    // on a vocabulary change is the test working as designed.
+    constexpr std::string_view kVerbs[] = {"diagnosticsOnly", "annotationOnly",
+                                           "structPacking", "unsupported"};
+    auto const ds = loadCSubsetExpectingFailure(
+        "\"effect\": \"structPacking\" }", "\"effect\": \"strcutPacking\" }",
+        "<bad-pragma-verb>");
+    EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+        << "a misspelled pragma effect must fail the LOAD — silently defaulting "
+           "it would disarm the row, and for `structPacking` that is a wrong "
+           "struct layout rather than a lost warning";
+    std::string closed;
+    for (auto const& d : ds) {
+        if (d.message.find("unknown pragma effect") != std::string::npos) {
+            closed = d.message;
+        }
+    }
+    ASSERT_FALSE(closed.empty()) << "the rejection must name the closed set";
+    for (std::string_view v : kVerbs) {
+        EXPECT_NE(closed.find(v), std::string::npos)
+            << "the closed-set message omits the ACCEPTED verb '" << v
+            << "' — a config author reads exactly this sentence to learn the "
+               "vocabulary";
+    }
+}
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
+    {
+        // DUPLICATE: two rows claiming `pack`. Which wins would be decided by
+        // consumer iteration order, and here that is `structPacking` (a real
+        // layout) versus `unsupported` (a refusal) — never a cosmetic ambiguity.
+        auto const ds = loadCSubsetExpectingFailure(
+            "\"prefix\": [\"once\"],                  \"effect\": \"unsupported\" },",
+            "\"prefix\": [\"pack\"],                  \"effect\": \"unsupported\" },",
+            "<dup-pragma-prefix>");
+        EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+            << "a prefix bound twice must fail the load";
+    }
+    {
+        // EMPTY: `[]` is a prefix of EVERY pragma, so one such row silently
+        // turns the whole registry into a catch-all and disarms the loudness.
+        auto const ds = loadCSubsetExpectingFailure(
+            "\"prefix\": [\"once\"],                  \"effect\": \"unsupported\" },",
+            "\"prefix\": [],                        \"effect\": \"unsupported\" },",
+            "<empty-pragma-prefix>");
+        EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+            << "an empty prefix matches everything and must be rejected";
+    }
+}
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRequiresASurface) {
+    // A registry with no `pragmaDirective` AND no `pragmaOperator` is an
+    // incomplete contract: every row would read as configured and never fire —
+    // the knob-that-lies this loader rejects everywhere else.
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (char const* key : {"\"pragmaDirective\":          \"pragma\",",
+                            "\"pragmaOperator\":           \"_Pragma\","}) {
+        auto const pos = text.find(key);
+        ASSERT_NE(pos, std::string::npos) << key;
+        text.erase(pos, std::strlen(key));
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<registry-no-surface>");
+    ASSERT_FALSE(loaded.has_value())
+        << "a pragma registry with NO pragma surface must fail the load — the "
+           "rows could never fire, so declaring them would be a lie";
+    EXPECT_TRUE(hasCode(loaded.error(), DiagnosticCode::C_InvalidPreprocess));
+}
 
 TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
     namespace fs = std::filesystem;
@@ -2534,37 +2644,338 @@ namespace {
 }
 } // namespace
 
-// `#pragma` is consumed-and-DROPPED with NO error (C 6.10.6p2). The line carries
-// a GCC-style payload; only `int v = 1 ;` survives. RED-ON-DISABLE: without the
-// `#pragma`-consume arm the directive hits the generic unsupported-directive
-// fail-loud (P_PreprocessorUnsupported).
-TEST(Preprocessor, FC15cPragmaConsumedAndDropped) {
-    PreprocessResult r;
-    auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
-    EXPECT_FALSE(r.diagnostics->hasErrors())
-        << "a `#pragma` line must be silently consumed (C 6.10.6p2)";
-    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
-        << "a `#pragma` must NOT trip the unsupported-directive fail-loud";
-    ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives the dropped pragma";
-    EXPECT_EQ(lexs[0], "int");
-    EXPECT_EQ(lexs[1], "v");
-    EXPECT_EQ(lexs[2], "=");
-    EXPECT_EQ(lexs[3], "1");
-    EXPECT_EQ(lexs[4], ";");
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY) — REWRITTEN, not deleted. THIS TEST USED TO
+// PIN THE BUG. As `FC15cPragmaConsumedAndDropped` it asserted
+// `EXPECT_FALSE(r.diagnostics->hasErrors())` for `#pragma GCC optimize("O2")`
+// and called that correct, citing C 6.10.6p2. The citation was right and the
+// conclusion was wrong: 6.10.6p2 licenses IGNORING a pragma, and DSS was not
+// ignoring pragmas, it was ignoring the QUESTION — the same silence covered
+// `GCC optimize` (harmless here) and `pack(4)` (MEASURED: it makes
+// `sys/fcntl.h`'s `struct log2phys` 20 bytes where DSS computed 24, on a live
+// `fcntl(F_LOG2PHYS)` path). What is pinned now is the DISTINCTION: a pragma the
+// registry CLAIMS is ignored silently, and one it does not is LOUD.
+//
+// The token assertions are unchanged and still load-bearing in both arms: a
+// pragma line is never program text, whatever the verdict on its meaning.
+TEST(Preprocessor, TfC82RegisteredInertPragmaIsSilentUnknownIsLoud) {
+    // (A) REGISTERED as `diagnosticsOnly` -> ignored, and ignored because a ROW
+    // SAYS SO. `clang diagnostic` is the MEASURED most-reached pragma in the
+    // sqlite corpus (48 occurrences across 12 TUs).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma clang diagnostic push\nint v=1;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "a pragma whose `pragmaEffects` row is `diagnosticsOnly` is "
+               "ignored with NO diagnostic — the row is the justification";
+        ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives";
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[1], "v");
+        EXPECT_EQ(lexs[2], "=");
+        EXPECT_EQ(lexs[3], "1");
+        EXPECT_EQ(lexs[4], ";");
+    }
+    // (B) UNREGISTERED -> LOUD. This is the exact input the old test asserted
+    // was silent. `GCC optimize` matches no row, and DSS cannot know whether
+    // ignoring it is safe, so it says so instead of assuming.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an unregistered pragma must be LOUD under "
+               "`unknownPragmaIsError` — the whole thesis of this cycle";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "it is a RECOGNIZED directive with an unrecognized payload, not "
+               "an unsupported directive — the code must distinguish them";
+        ASSERT_EQ(lexs.size(), 5u)
+            << "the line is still not program text: a REFUSED pragma emits no "
+               "tokens either (a leaked payload would cascade into a parse error "
+               "that hides this accurate one)";
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[4], ";");
+    }
+    // (C) `unsupported` -> LOUD, and for a DIFFERENT reason than (B): the row
+    // exists and states that the pragma has real translation semantics DSS has
+    // not built. Both are `P_PreprocessorPragma`; what differs is that this one
+    // is a considered answer.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma STDC FP_CONTRACT OFF\nint v=1;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an `unsupported` row must fail loud, not be silently ignored";
+        ASSERT_EQ(lexs.size(), 5u);
+    }
 }
 
-// A `#pragma` inside a DEAD branch is silent too (the arm is past the
-// stackActive gate). `#if 0 ... #pragma ... #endif` -> no diagnostic, nothing
-// emitted from the dead group.
-TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+// ★ TF-C82: the OPT-OUT, and the red-on-disable for the loudness itself.
+// `unknownPragmaIsError: false` restores the pre-TF-C82 silent drop EXACTLY —
+// so the loud posture is a declared choice a language makes, not a behavior
+// baked into the engine. Without this pin, "loud" and "hard-coded" would be
+// indistinguishable from the outside.
+TEST(Preprocessor, TfC82UnknownPragmaIsErrorFalseRestoresSilence) {
+    auto schema = reboundCSubset("\"unknownPragmaIsError\":     true,",
+                                 "\"unknownPragmaIsError\":     false,",
+                                 "<silent-pragma-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_FALSE(schema->preprocess().unknownPragmaIsError)
+        << "the rebound schema must declare the silent posture";
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "with `unknownPragmaIsError` false an unregistered pragma is ignored "
+           "in silence — C 6.10.6p2's licence, taken deliberately rather than by "
+           "omission";
+}
+
+// ★★ TF-C82 — `#pragma pack` REALLY APPLIES, and the assertion is the NUMBER.
+// `pack` is the one registry row with a layout sink, so the pin is not "it
+// compiled": it reads the cap the preprocessor recorded for the tokens inside
+// the region, which is the value the semantic tier feeds to the interner.
+// MEASURED against clang for the same source: cap 4 inside, none outside.
+TEST(Preprocessor, TfC82PragmaPackStampsTheTokensInsideTheRegion) {
     PreprocessResult r;
-    auto lexs =
-        ppLexemes("#if 0\n#pragma whatever here\nint dead;\n#endif\nint x;\n", r);
-    EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives";
-    EXPECT_EQ(lexs[0], "int");
-    EXPECT_EQ(lexs[1], "x");
-    EXPECT_EQ(lexs[2], ";");
+    auto lexs = ppLexemes("#pragma pack(4)\nint inside;\n"
+                          "#pragma pack()\nint outside;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a well-formed `#pragma pack` is honored, not diagnosed";
+    ASSERT_EQ(lexs.size(), 6u) << "`int inside ; int outside ;` survives";
+
+    // Find the two identifier tokens and read their recorded caps.
+    std::optional<std::uint32_t> insideCap, outsideCap;
+    for (Token const& t : r.tokens) {
+        std::string_view const tx = r.synthBuffer->slice(t.span);
+        auto const  key = static_cast<std::uint32_t>(t.span.start());
+        auto const  it  = r.pragmaPackByOffset.find(key);
+        std::uint32_t const cap =
+            it == r.pragmaPackByOffset.end() ? 0u : it->second;
+        if (tx == "inside")  insideCap  = cap;
+        if (tx == "outside") outsideCap = cap;
+    }
+    ASSERT_TRUE(insideCap.has_value());
+    ASSERT_TRUE(outsideCap.has_value());
+    EXPECT_EQ(*insideCap, 4u)
+        << "a token inside the `pack(4)` region carries the cap 4 — the value "
+           "that makes `struct log2phys` 20 bytes instead of 24";
+    EXPECT_EQ(*outsideCap, 0u)
+        << "`pack()` RESETS to no cap (the depth-less idiom the SDK uses 14 "
+           "times); a token after it must carry no cap at all, or every struct "
+           "in the rest of the file is silently relaid out";
+}
+
+// ★★ TF-C82 — THE HALFWAY-STATE DISCRIMINATOR. `_Pragma` inside a macro
+// REPLACEMENT LIST must resolve at EXPANSION time, not at the directive scan.
+// Route `_Pragma` at the directive scan only and the file-scope case below stays
+// GREEN while this one silently does nothing — a green-looking half-feature. It
+// is the `sys/queue.h` shape (`__NULLABILITY_COMPLETENESS_PUSH`, expanded at 40
+// use sites) and MEASURED it is how 24 of the corpus's reached pragmas arrive.
+TEST(Preprocessor, TfC82PragmaOperatorResolvesAtExpansionNotAtDirectiveScan) {
+    // (A) FILE SCOPE — the easy half. Both routings pass this one.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("_Pragma(\"pack(4)\")\nint a;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u) << "`int a ;` — the operator emits nothing";
+        bool sawCap = false;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != "a") continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            sawCap = it != r.pragmaPackByOffset.end() && it->second == 4u;
+        }
+        EXPECT_TRUE(sawCap) << "a file-scope `_Pragma(\"pack(4)\")` applies";
+    }
+    // (B) FROM A MACRO REPLACEMENT LIST — the half that discriminates.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define PACK4 _Pragma(\"pack(4)\")\n"
+                              "PACK4\nint b;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u)
+            << "`int b ;` — the expanded `_Pragma` must leave no tokens behind";
+        bool sawCap = false;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != "b") continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            sawCap = it != r.pragmaPackByOffset.end() && it->second == 4u;
+        }
+        EXPECT_TRUE(sawCap)
+            << "a `_Pragma` reached through a macro must take effect at its "
+               "EXPANSION site — this is the assertion a directive-scan-only "
+               "routing fails while (A) above still passes";
+    }
+}
+
+// ★ TF-C82 — ONE REGISTRY, TWO SPELLINGS. `_Pragma("pack(4)")` must produce the
+// IDENTICAL state as `#pragma pack(4)`. Give the operator its own table and the
+// two drift; the pin compares them directly rather than checking each in
+// isolation.
+TEST(Preprocessor, TfC82PragmaOperatorAndDirectiveAgree) {
+    auto capOf = [](char const* src, char const* name) -> std::uint32_t {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        EXPECT_TRUE(r.diagnostics->all().empty()) << src;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != name) continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            return it == r.pragmaPackByOffset.end() ? 0u : it->second;
+        }
+        return 0xFFFFFFFFu;   // name not found — a broken fixture, never a pass
+    };
+    std::uint32_t const viaDirective = capOf("#pragma pack(4)\nint z;\n", "z");
+    std::uint32_t const viaOperator  = capOf("_Pragma(\"pack(4)\")\nint z;\n", "z");
+    EXPECT_EQ(viaDirective, 4u);
+    EXPECT_EQ(viaOperator, viaDirective)
+        << "the two spellings are one feature routed through one registry; a "
+           "divergence here means `_Pragma` grew a table of its own";
+}
+
+// ★ TF-C82 — C 6.10.9p1 DE-STRINGIZE: `\"` -> `"` and `\\` -> `\`. The escape
+// pass is exactly those two replacements, NOT the general string decoder (which
+// would turn a `\n` a pragma legitimately contains into a newline byte).
+// `sys/queue.h:225` needs this.
+TEST(Preprocessor, TfC82PragmaOperatorDestringizesPerC6109) {
+    PreprocessResult r;
+    // The operand de-stringizes to: clang diagnostic ignored "-Wfoo"
+    auto lexs = ppLexemes(
+        "_Pragma(\"clang diagnostic ignored \\\"-Wfoo\\\"\")\nint q;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "after de-stringizing, the pragma matches the `clang diagnostic` row "
+           "and is inert; a failure here means the `\\\"` escapes were not "
+           "collapsed and the leading words did not match";
+    ASSERT_EQ(lexs.size(), 3u) << "`int q ;`";
+}
+
+// ★ TF-C82 — AGNOSTICISM. `toy.lang.json` declares no `pragmaOperator`, so
+// `_Pragma` there is an ORDINARY IDENTIFIER and survives into the token stream.
+// The rebind proves the engine reads the CONFIG word rather than knowing the
+// spelling `_Pragma`.
+TEST(Preprocessor, TfC82PragmaOperatorIsConfigDrivenOrdinaryIdentifierWhenAbsent) {
+    auto schema = reboundCSubset("\"pragmaOperator\":           \"_Pragma\",",
+                                 "",
+                                 "<no-pragma-operator-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaOperator.empty())
+        << "the rebound schema must declare no pragma operator";
+    auto buf = SourceBuffer::fromString(
+        std::string{"int _Pragma;\n"}, "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "with no `pragmaOperator` declared, `_Pragma` is just an identifier";
+    std::size_t seen = 0;
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) == "_Pragma") ++seen;
+    }
+    EXPECT_EQ(seen, 1u)
+        << "the identifier must reach the parser untouched — the identity-pass "
+           "property for a language that declares no pragma operator";
+}
+
+// ★ TF-C82 — the `pack` operand forms that were MEASURED reachable, and the ones
+// that were not. Building a form nothing uses is how a wrong guess ships; the
+// unbuilt forms fail LOUD rather than silently doing nothing.
+TEST(Preprocessor, TfC82PragmaPackFormsBuiltAndRefused) {
+    struct Row { char const* src; bool loud; char const* why; };
+    Row const rows[] = {
+        {"#pragma pack(4)\nint x;\n",        false, "pack(N) — MEASURED 14x"},
+        {"#pragma pack()\nint x;\n",         false, "pack() reset — MEASURED 14x"},
+        {"#pragma pack(push, 4)\n#pragma pack(pop)\nint x;\n",
+                                              false, "push/pop — MEASURED 6x"},
+        // NOT built, and deliberately: bare `pack(push)` occurs 0 times in the
+        // whole macOS SDK, and the paren-less `pragma pack 8` occurs twice (both
+        // in an unreached `ffi/ffi.h`). A guess would silently relayout structs.
+        {"#pragma pack(push)\nint x;\n",     true,  "bare pack(push) — 0 in SDK"},
+        {"#pragma pack 8\nint x;\n",         true,  "paren-less — unreached"},
+        // Envelope: the cap lands in the same layout channel `alignas` uses.
+        {"#pragma pack(3)\nint x;\n",        true,  "non-power-of-two"},
+        {"#pragma pack(512)\nint x;\n",      true,  "over the 256 cap"},
+        // An unbalanced pop makes the alignment below it underivable from source.
+        {"#pragma pack(pop)\nint x;\n",      true,  "pop with an empty stack"},
+        // A push never popped: the `#endif`-balance argument.
+        {"#pragma pack(push, 4)\nint x;\n",  true,  "push unbalanced at EOF"},
+    };
+    for (Row const& row : rows) {
+        PreprocessResult r;
+        (void)ppLexemes(row.src, r);
+        EXPECT_EQ(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma), row.loud)
+            << row.why << "  [" << row.src << "]";
+    }
+}
+
+// ★ TF-C82 — the STACK-form vocabulary is CONFIG. Strip `pragmaPackPushWord` and
+// `pack(push, 4)` becomes an unbuilt form (LOUD), while `pack(4)` keeps working:
+// the red-on-disable for that pair, and the proof the engine never compares a
+// token to a literal `"push"`.
+TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
+    auto schema = reboundCSubset("\"pragmaPackPushWord\":       \"push\",",
+                                 "",
+                                 "<no-pack-push-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaPackPushWord.empty());
+    std::vector<std::filesystem::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma pack(push, 4)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "with no `pragmaPackPushWord` declared the push form is an "
+               "unbuilt form and must be REFUSED, never silently ignored";
+    }
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma pack(4)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "the set/reset forms are independent of the stack vocabulary";
+    }
+}
+
+// ★★ REACHABILITY, NOT RECOGNITION (C 6.10p1) — the `#error`/`#embed`/`#line`
+// parity. A `#pragma` inside a DEAD branch is entirely silent because the arm
+// sits past the `stackActive()` gate.
+//
+// ★ TF-C82 STRENGTHENED THIS TEST RATHER THAN LEAVING IT. It used to elide a
+// pragma (`whatever here`) that was silent EVERYWHERE, so it could not tell a
+// working reachability gate from a broken one. Now each dead-branch arm carries
+// a pragma that is MEASURABLY LOUD when reached — an UNREGISTERED one, an
+// `unsupported` one, and a MALFORMED `pack` — so the test fails the moment
+// recognition is hoisted above the gate. That hoist is not hypothetical: the
+// Apple SDK headers park hundreds of pragmas inside unsupported-configuration
+// branches, and erroring on them would break every macOS compile.
+TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+    char const* const deadPragmas[] = {
+        "#pragma whatever here",        // unregistered -> loud if reached
+        "#pragma STDC FP_CONTRACT OFF", // `unsupported` row -> loud if reached
+        "#pragma pack(3)",              // malformed operand -> loud if reached
+        "#pragma pack(pop)",            // unbalanced pop    -> loud if reached
+    };
+    for (char const* const dead : deadPragmas) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{"#if 0\n"} + dead
+                                  + "\nint dead;\n#endif\nint x;\n",
+                              r);
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "a pragma in a NOT-TAKEN branch is never recognized at all: "
+            << dead;
+        ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives: " << dead;
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[1], "x");
+        EXPECT_EQ(lexs[2], ";");
+    }
+    // The CONTROL that makes the four arms above non-vacuous: the same pragmas
+    // in a LIVE branch DO fire. Without this, a change that silenced pragmas
+    // everywhere would leave the loop above green.
+    for (char const* const live : deadPragmas) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{"#if 1\n"} + live + "\n#endif\nint x;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "reached, this pragma must be loud — else the dead-branch arms "
+               "above assert nothing: "
+            << live;
+    }
 }
 
 // OPT-OUT (RED-ON-DISABLE for the config match): with `pragmaDirective` stripped
@@ -6230,7 +6641,19 @@ TEST(Preprocessor, TfC70PragmaAndLinePayloadsAreNotScannedAsDirectives) {
                "directive: harvesting the prose `#define POISON` flips "
                "`#if defined(POISON)` in the PRE-SCAN ONLY and resolves an "
                "include the authoritative pass never executes";
-        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // ★ TF-C82: assert the diagnostic SET, not `hasErrors()`. `GCC poison`
+        // now matches an `unsupported` registry row and is LOUD — a REACHED
+        // pragma with real semantics DSS has not built. That is this cycle
+        // working, and it is orthogonal to what THIS test is about, so the
+        // expectation names both codes instead of collapsing them into a
+        // hasErrors() that would silently absorb a future regression.
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "`GCC poison` is an `unsupported` row — reached, it fails loud";
+        for (auto const& d : r.diagnostics->all()) {
+            EXPECT_EQ(d.code, DiagnosticCode::P_PreprocessorPragma)
+                << "the ONLY diagnostic this input may produce is the pragma "
+                   "refusal; anything else means the payload was scanned";
+        }
         EXPECT_TRUE(isIntXAssignOne(lexs));
     }
     // (B) `#pragma` payload carrying a prose `#endif`, inside a DEAD group that

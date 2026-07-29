@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 128> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 130> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -606,6 +606,24 @@ constexpr std::array<DiagnosticCode, 128> kUnsuppressableCodes{{
     // `--suppress` must stay able to silence exactly that advisory class — the
     // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
     DiagnosticCode::P_PreprocessorErrorDirective,
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
+    // one whose operand it cannot honour. Same argument as its `#error` neighbour
+    // above, arrived at from the other direction: the author did not write this
+    // one as an abort, but the thing it asks for — `#pragma pack(4)` — CHANGES
+    // MEMORY LAYOUT, and MEASURED, ignoring it turns `sys/fcntl.h`'s `struct
+    // log2phys` from 20 bytes into 24 on a live `fcntl(F_LOG2PHYS)` syscall path.
+    // A `--suppress` of this code does not hide a compiler opinion; it re-opens
+    // exactly the silent wrong-layout channel this cycle closed, and it would do
+    // so GREEN. The RECOGNIZED-and-inert pragmas never reach here at all: they
+    // match a `pragmaEffects` row that says, in config the user reads, why
+    // ignoring them is true — so membership costs nothing on conforming input.
+    // Reachability-gated identically (a pragma in a dead `#if` branch is silent).
+    DiagnosticCode::P_PreprocessorPragma,
+    // TF-C82: the semantic-tier half of the same guarantee. A composite whose
+    // layout key is ambiguous has TWO candidate layouts with different sizes and
+    // different offsets; suppressing the refusal does not remove the ambiguity,
+    // it just picks one of them without saying so.
+    DiagnosticCode::S_PragmaPackAmbiguous,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

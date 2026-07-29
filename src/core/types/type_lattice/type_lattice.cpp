@@ -395,7 +395,8 @@ contentDeclSiteKey(std::span<TypeId const> fields,
                    std::span<std::uint64_t const> fieldOffsets = {},
                    std::span<std::uint32_t const> fieldAligns = {},
                    bool packed = false,
-                   std::uint32_t explicitAlign = 0) {
+                   std::uint32_t explicitAlign = 0,
+                   std::uint32_t maxFieldAlign = 0) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
@@ -433,6 +434,16 @@ contentDeclSiteKey(std::span<TypeId const> fields,
     // existing composite keeps its EXACT declSiteKey (zero churn); only an
     // align-bearing composite gets the extra mix.
     if (explicitAlign != 0) h = fnvMix(h, static_cast<std::uint64_t>(explicitAlign));
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` member-alignment CAP
+    // enters the content identity for the SAME reason `explicitAlign` does — the
+    // identical field list under caps 4 and 8 lays out to different sizes AND
+    // different offsets, so aliasing them onto one TypeId is a layout miscompile
+    // (and would trip `completeComposite`'s conflicting-re-completion abort the
+    // moment both appeared in one CU). GUARDED on non-zero, so a composite defined
+    // outside any pack region — every composite before this cycle — hashes
+    // byte-identically to the pre-TF-C82 function: zero TypeId churn, goldens and
+    // round-trips unaffected.
+    if (maxFieldAlign != 0) h = fnvMix(h, static_cast<std::uint64_t>(maxFieldAlign));
     return h | (std::uint64_t{1} << 63);
 }
 
@@ -505,7 +516,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                                      std::span<std::int64_t const> fieldBitWidths,
                                      std::span<std::uint64_t const> fieldOffsets,
                                      std::span<std::uint32_t const> fieldAligns,
-                                     std::uint32_t explicitAlign) {
+                                     std::uint32_t explicitAlign,
+                                     std::uint32_t maxFieldAlign) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -558,6 +570,17 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: the whole-composite explicit alignment must "
                      "be a power of two in [1, 256] (or 0 for no request)");
     }
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` cap is held to the SAME
+    // envelope, and for the same reason — a value `computeLayout` cannot represent
+    // must be refused HERE, with a caller in scope, rather than silently rounded,
+    // clamped or dropped deep in layout. (The preprocessor already refuses a
+    // non-power-of-two operand at the pragma, with a source position; this is the
+    // structural backstop for every OTHER way a cap could reach the interner —
+    // reintern, a hand-built type, a descriptor.)
+    if (!representableCompositeAlign(maxFieldAlign)) {
+        latticeFatal("completeComposite: the #pragma pack member-alignment cap must "
+                     "be a power of two in [1, 256] (or 0 for no cap)");
+    }
     if (it->second.complete) {
         // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a
         // CONFLICTING re-completion is a caller bug — fail loud rather than
@@ -571,7 +594,12 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                  // whole-composite alignment is a conflicting re-completion, not a
                  // benign re-resolution — the two spellings lay out to different
                  // sizes. Fail loud rather than silently keep whichever ran first.
-                 && it->second.explicitAlign == explicitAlign;
+                 && it->second.explicitAlign == explicitAlign
+                 // TF-C82: a re-completion that CHANGES the pack cap is a
+                 // CONFLICTING re-completion — the two definitions lay out to
+                 // different sizes, so keeping whichever ran first would silently
+                 // pick one layout for a type the source gives two.
+                 && it->second.maxFieldAlign == maxFieldAlign;
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
@@ -592,6 +620,7 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     it->second.fieldAligns.assign(fieldAligns.begin(), fieldAligns.end());
     it->second.packed = packed;
     it->second.explicitAlign = explicitAlign;
+    it->second.maxFieldAlign = maxFieldAlign;
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
@@ -681,6 +710,27 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     return id;
 }
 
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets,
+                                std::span<std::uint32_t const> fieldAligns,
+                                std::uint32_t explicitAlign,
+                                std::uint32_t maxFieldAlign) {
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` cap enters the content
+    // identity, so the same field list under caps 4 and 8 is TWO interned types —
+    // they differ in size AND in every field offset past the first, so collapsing
+    // them onto one TypeId would be a layout miscompile. `maxFieldAlign == 0`
+    // routes exactly like the 6-arg overload (byte-identical declSiteKey).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(
+        TypeKind::Struct, name,
+        contentDeclSiteKey(fields, sc, fieldOffsets, fieldAligns, /*packed=*/false,
+                           explicitAlign, maxFieldAlign));
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths, fieldOffsets,
+                      fieldAligns, explicitAlign, maxFieldAlign);
+    return id;
+}
+
 bool TypeInterner::hasExplicitOffsets(TypeId id) const {
     id = materialId_(id);
     TypeKind const k = arena_.at(id).kind;
@@ -733,6 +783,16 @@ std::uint32_t TypeInterner::explicitCompositeAlign(TypeId id) const {
     if (k != TypeKind::Struct && k != TypeKind::Union) return 0;
     auto it = compositeFields_.find(id.v);
     return it == compositeFields_.end() ? 0u : it->second.explicitAlign;
+}
+
+std::uint32_t TypeInterner::maxFieldAlign(TypeId id) const {
+    // Same skin-strip as `isPacked`/`explicitCompositeAlign`: a qualifier never
+    // changes layout, so a `volatile struct S` carries S's pack cap.
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return 0;
+    auto it = compositeFields_.find(id.v);
+    return it == compositeFields_.end() ? 0u : it->second.maxFieldAlign;
 }
 
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {

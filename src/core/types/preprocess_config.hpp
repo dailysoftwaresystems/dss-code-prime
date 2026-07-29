@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,52 @@ struct DSS_EXPORT CAttributeDef {
 //   are NOT grammar keywords), so matching them by text keeps the grammar
 //   untouched. The loader validates each as a non-empty string.
 //
+// ── TF-C82: the `#pragma` / `_Pragma` effect registry (C 6.10.6 / 6.10.9) ──
+//
+// The CLOSED verb set a `pragmaEffects` row may declare. Mirrors
+// `AttributeEffect` exactly — one table, `static_assert`ed complete at the
+// switch, and an unknown verb is a LOAD error (`C_InvalidPreprocess`) so a typo
+// can never silently disarm a row.
+//
+// ★ WHY THREE FLAVOURS OF "DO NOTHING" RATHER THAN ONE. They make DIFFERENT
+// claims, and the whole reason this registry exists is that "the compiler was
+// silent" is not a claim at all:
+//
+//  • `DiagnosticsOnly` asserts the pragma's ENTIRE effect is to configure
+//    diagnostics of a compiler DSS is not, AND that DSS emits none of them. That
+//    is checkable — `clang diagnostic push/pop/ignored` tunes clang warnings;
+//    `clang assume_nonnull begin/end` scopes NULLABILITY qualifiers DSS neither
+//    parses nor diagnoses. Both are inert HERE for a stated reason, not by
+//    accident. (MEASURED reached in the sqlite corpus: 48 `clang diagnostic`
+//    + 24 `clang assume_nonnull` occurrences.)
+//  • `AnnotationOnly` asserts the pragma is pure authoring metadata with no
+//    translation semantics in ANY compiler (`#pragma mark` is an IDE bookmark).
+//  • `Unsupported` asserts the pragma DOES have translation semantics that DSS
+//    has not implemented — so it is LOUD, and (like `#error`) unsuppressable:
+//    silencing a real semantic effect is how a wrong-layout/wrong-code artifact
+//    ships green.
+//
+// `StructPacking` is the one verb with a real sink: it drives the C
+// `#pragma pack` member-alignment CAP into the composite layout channel.
+enum class PragmaEffect : std::uint8_t {
+    // Configures another compiler's diagnostics; DSS emits none of them.
+    DiagnosticsOnly,
+    // Authoring/IDE metadata with no translation semantics anywhere.
+    AnnotationOnly,
+    // C `#pragma pack` — a LEXICALLY SCOPED maximum member alignment. The one
+    // verb with a layout sink (`TypeInterner`'s `maxFieldAlign` channel).
+    StructPacking,
+    // Real translation semantics DSS has NOT implemented → loud + unsuppressable.
+    Unsupported,
+};
+
+// One registry row: the leading WORD(S) that identify a pragma, and what DSS
+// does with it. The LONGEST matching prefix wins.
+struct DSS_EXPORT PragmaEffectRow {
+    std::vector<std::string> prefix;   // e.g. {"clang","diagnostic"} or {"pack"}
+    PragmaEffect             effect = PragmaEffect::Unsupported;
+};
+
 // Every field is validated at load (`C_InvalidPreprocess` / `C_MissingField`
 // / `C_UnknownToken`) so a loaded schema is guaranteed self-consistent; the
 // engine's lookups are defensive only.
@@ -277,14 +324,91 @@ struct DSS_EXPORT PreprocessConfig {
 
     // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
     // TEXT against the token after `#` (like define/undef/include -- `pragma`
-    // lexes as a plain Identifier, NOT a grammar keyword). The preprocessor
-    // consumes-and-DROPS the whole `#pragma` line with NO error (C 6.10.6p2
-    // licenses ignoring an unrecognized pragma; DSS recognizes none, so every
-    // pragma is dropped). OPTIONAL -- empty means the language has NO `#pragma`
-    // directive, so a `#pragma` line then hits the generic unsupported-directive
-    // fail-loud (`P_PreprocessorUnsupported`). The engine matches THIS string,
-    // never a hard-coded "pragma".
+    // lexes as a plain Identifier, NOT a grammar keyword). OPTIONAL -- empty
+    // means the language has NO `#pragma` directive, so a `#pragma` line then
+    // hits the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`). The engine matches THIS string, never a
+    // hard-coded "pragma".
+    //
+    // ★★ TF-C82 — WHAT THIS FIELD USED TO MEAN, AND WHY THAT WAS A SILENT DROP.
+    // From FC15c until TF-C82 a recognized `#pragma` line was consumed and
+    // DROPPED with no diagnostic and no tokens, justified by C 6.10.6p2 ("an
+    // unrecognized pragma may be ignored"). The justification was sound for a
+    // pragma that DOES nothing and false for one that does: MEASURED on this
+    // Mac, the sqlite corpus REACHES 40 `#pragma pack` lines across 5 TUs, and
+    // `sys/fcntl.h`'s `#pragma pack(4)` region makes `struct log2phys` 20 bytes
+    // / align 4 where the unpacked layout is 24 / 8 — a wrong-ABI struct handed
+    // to a live `fcntl(F_LOG2PHYS)` syscall. 6.10.6p2 licenses IGNORING a
+    // pragma; it does not license claiming to have ignored one that changed the
+    // layout. So recognition is now a REGISTRY (`pragmaEffects`) and the
+    // unknown case is LOUD (`unknownPragmaIsError`).
     std::string pragmaDirective;
+
+    // TF-C82 (`_Pragma`; C 6.10.9): the PRAGMA OPERATOR word, matched by lexeme
+    // TEXT (an ordinary identifier, like `defined`/`__has_include`). `_Pragma(
+    // "string-literal")` is EXACTLY equivalent to a `#pragma` line whose
+    // pp-tokens are the DE-STRINGIZED literal (6.10.9p1: delete the `L` prefix
+    // if present, delete the outer quotes, replace `\"` with `"` and `\\` with
+    // `\`), so it routes through the SAME `pragmaEffects` registry — one
+    // registry, two spellings. OPTIONAL: empty ⇒ the language has no pragma
+    // operator and `_Pragma` is an ORDINARY identifier (toy / tsql — pinned).
+    //
+    // ★ IT RESOLVES AT EXPANSION TIME, NOT AT THE DIRECTIVE SCAN. `_Pragma` is
+    // an operator in the token stream, not a directive, so it can (and in the
+    // Apple SDK routinely does) arrive from inside a macro REPLACEMENT LIST:
+    // `sys/queue.h`'s `__NULLABILITY_COMPLETENESS_PUSH/POP` are exactly that
+    // shape, expanded at 40 use sites. Handling it only where directives are
+    // scanned would leave a file-scope `_Pragma` green while every macro-borne
+    // one silently vanished — the halfway state this field's test battery
+    // discriminates on.
+    std::string pragmaOperator;
+
+    // TF-C82: what a `#pragma` / `_Pragma` whose leading word(s) match NO
+    // `pragmaEffects` row does. TRUE (the C-subset posture) ⇒ fail loud
+    // (`P_PreprocessorPragma`). FALSE ⇒ silently ignored, the pre-TF-C82
+    // behavior, kept as a deliberate OPT-OUT rather than deleted: C 6.10.6p2
+    // genuinely permits it, and a language whose pragma surface is provably
+    // inert may say so. Default FALSE so a language that declares no registry
+    // at all is unchanged (a config must OPT IN to loudness).
+    //
+    // ★ THE POINT OF THE PAIR IS THAT SILENCE BECOMES A CLAIM. Before TF-C82
+    // every pragma was silently dropped and nothing distinguished "we checked
+    // and it is inert" from "we never looked". With the registry, an ignored
+    // pragma is ignored because a ROW SAYS SO, and anything else is loud.
+    bool unknownPragmaIsError = false;
+
+    // TF-C82: the pragma REGISTRY — the `attributeEffects` house pattern, keyed
+    // by the pragma's leading WORD(S) rather than by a single name (a real
+    // pragma's identity is a prefix: `clang diagnostic push` is a `clang
+    // diagnostic` pragma). The LONGEST matching prefix wins, so a future
+    // `["clang","diagnostic","push"]` row could refine `["clang","diagnostic"]`
+    // without either row being shadowed by declaration order.
+    //
+    // OPTIONAL: an empty registry with `unknownPragmaIsError == false` is
+    // byte-for-byte the pre-TF-C82 drop-everything behavior.
+    std::vector<PragmaEffectRow> pragmaEffects;
+
+    // TF-C82: the `structPacking` operand SUB-VOCABULARY — the two words that
+    // select the STACK forms of C's `#pragma pack` (`pack(push, N)` /
+    // `pack(pop)`), matched by lexeme TEXT. The depth-less SET/RESET forms
+    // (`pack(N)` / `pack()`) need no vocabulary at all: they are recognized
+    // structurally (one integer operand, or none).
+    //
+    // ★ WHY THESE ARE CONFIG AND `N` IS NOT. The engine owns the SEMANTIC of the
+    // `structPacking` verb — a maximum member alignment, its push/pop discipline,
+    // its power-of-two rule — exactly as `AttributeEffect::Align` owns
+    // `aligned(N)`'s. What it must never own is a WORD: a literal `"push"` in
+    // engine code is an identity branch on source vocabulary, the same class of
+    // hard-coding `pragmaDirective` exists to prevent. OPTIONAL and independent:
+    // a language declaring `structPacking` but NOT these words gets the set/reset
+    // forms and a LOUD refusal of the stack forms (never a silent no-op) — which
+    // is also the red-on-disable pin for this pair.
+    //
+    // MEASURED necessity: the reached sqlite corpus uses BOTH idioms — 13
+    // `pack(4)` + 1 `pack(1)` closed by 14 `pack()`, and 5 `pack(push, 4)` + 1
+    // `pack(push, 1)` closed by 6 `pack(pop)`. Building only one is insufficient.
+    std::string pragmaPackPushWord;
+    std::string pragmaPackPopWord;
 
     // FC15c (`__has_include`; C23 6.10.1p4): the `__has_include` OPERATOR
     // keyword, valid only inside a `#if`/`#elif` operand. `__has_include(<h>)` /

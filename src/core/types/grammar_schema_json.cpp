@@ -4229,9 +4229,181 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "string when present", key));
                 }
             };
-            // FC15c (`#pragma`; C 6.10.6): the pragma directive WORD. Consumed +
-            // DROPPED with no error. OPTIONAL.
+            // FC15c (`#pragma`; C 6.10.6): the pragma directive WORD. OPTIONAL.
+            // TF-C82: what a recognized `#pragma` DOES is now the `pragmaEffects`
+            // registry below, not an unconditional silent drop.
             readOptWord("pragmaDirective",       cfg.pragmaDirective);
+            // TF-C82 (`_Pragma`; C 6.10.9): the pragma OPERATOR word — the second
+            // SPELLING of the same feature, routed to the SAME registry. OPTIONAL
+            // (absent ⇒ `_Pragma` is an ordinary identifier; toy/tsql pin that).
+            readOptWord("pragmaOperator",        cfg.pragmaOperator);
+            // TF-C82: the `structPacking` STACK-form operand words. OPTIONAL and
+            // independent — absent ⇒ `pack(push,N)`/`pack(pop)` fail loud as
+            // unbuilt forms (never a silent no-op), which is this pair's
+            // red-on-disable pin.
+            readOptWord("pragmaPackPushWord",    cfg.pragmaPackPushWord);
+            readOptWord("pragmaPackPopWord",     cfg.pragmaPackPopWord);
+            // TF-C82: the OPT-OUT. Absent/false ⇒ an unregistered pragma is
+            // silently ignored (C 6.10.6p2, the pre-TF-C82 behavior); true ⇒ loud
+            // `P_PreprocessorPragma`. Default false so a language that declares no
+            // registry is byte-for-byte unchanged.
+            if (pp.contains("unknownPragmaIsError")) {
+                if (!pp.at("unknownPragmaIsError").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/unknownPragmaIsError",
+                              "'preprocess.unknownPragmaIsError' must be a boolean");
+                } else {
+                    cfg.unknownPragmaIsError =
+                        pp.at("unknownPragmaIsError").get<bool>();
+                }
+            }
+            // ── TF-C82: the `pragmaEffects` registry (the `attributeEffects`
+            // house pattern, keyed by leading WORD(S) instead of by one name) ──
+            if (pp.contains("pragmaEffects")) {
+                if (!pp.at("pragmaEffects").is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/pragmaEffects",
+                              "'preprocess.pragmaEffects' must be an array of "
+                              "{ prefix, effect } rows");
+                } else {
+                    // The CLOSED verb set — ONE table, read BOTH by the lookup
+                    // and by the rejection message, so the message can never
+                    // drift into advertising a verb that no longer exists (the
+                    // `kEffectVerbs` precedent, which was written after exactly
+                    // that drift was MEASURED in the attribute loader).
+                    static constexpr std::array<
+                        std::pair<std::string_view, PragmaEffect>, 4>
+                        kPragmaVerbs{{
+                            {"diagnosticsOnly", PragmaEffect::DiagnosticsOnly},
+                            {"annotationOnly",  PragmaEffect::AnnotationOnly},
+                            {"structPacking",   PragmaEffect::StructPacking},
+                            {"unsupported",     PragmaEffect::Unsupported}}};
+                    DSS_CHECK_KEY_VOCABULARY(kPragmaVerbs);
+                    static constexpr std::array<std::string_view, 2>
+                        kPragmaRowKeys{"prefix", "effect"};
+                    DSS_CHECK_KEY_VOCABULARY(kPragmaRowKeys);
+
+                    // Every prefix seen so far (joined by ' ') → the verb it was
+                    // bound to. A second binding of the same prefix is rejected:
+                    // which row wins would otherwise be decided by iteration
+                    // order, and for `structPacking` vs `unsupported` that is the
+                    // difference between a correct layout and a loud refusal.
+                    std::unordered_map<std::string, std::string> seenPrefixes;
+                    for (std::size_t ri = 0; ri < pp.at("pragmaEffects").size();
+                         ++ri) {
+                        json const& row     = pp.at("pragmaEffects")[ri];
+                        auto const  rowPath =
+                            std::format("/preprocess/pragmaEffects/{}", ri);
+                        if (!row.is_object() || !row.contains("prefix")
+                            || !row.at("prefix").is_array()
+                            || !row.contains("effect")
+                            || !row.at("effect").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, rowPath,
+                                      "each 'pragmaEffects' row must be an object "
+                                      "{ prefix: [strings], effect: string }");
+                            continue;
+                        }
+                        for (auto it = row.begin(); it != row.end(); ++it) {
+                            if (isDocumentationKey(it.key())) continue;
+                            if (std::ranges::find(kPragmaRowKeys, it.key())
+                                != kPragmaRowKeys.end()) continue;
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                std::format("{}/{}", rowPath, it.key()),
+                                std::format("unknown key '{}' in a "
+                                            "'pragmaEffects' row — allowed keys "
+                                            "are 'prefix', 'effect' (typo "
+                                            "discriminator)", it.key()));
+                        }
+                        // An EMPTY prefix would match EVERY pragma (the empty
+                        // string is a prefix of everything), silently converting
+                        // the whole registry into one catch-all row and disarming
+                        // `unknownPragmaIsError` entirely.
+                        if (row.at("prefix").empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      rowPath + "/prefix",
+                                      "'prefix' must name at least one word — an "
+                                      "empty prefix matches EVERY pragma and "
+                                      "would silently disarm "
+                                      "'unknownPragmaIsError'");
+                            continue;
+                        }
+                        PragmaEffectRow out;
+                        bool            badWord = false;
+                        for (json const& w : row.at("prefix")) {
+                            if (!w.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rowPath + "/prefix",
+                                          "each 'prefix' entry must be a string");
+                                badWord = true;
+                                continue;
+                            }
+                            auto word = w.get<std::string>();
+                            if (word.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rowPath + "/prefix",
+                                          "a 'prefix' word must be non-empty — no "
+                                          "pragma token can spell '', so the row "
+                                          "could never match");
+                                badWord = true;
+                                continue;
+                            }
+                            out.prefix.push_back(std::move(word));
+                        }
+                        if (badWord || out.prefix.empty()) continue;
+                        std::string const verb = row.at("effect").get<std::string>();
+                        auto const        arm  = std::ranges::find(
+                            kPragmaVerbs, verb,
+                            &std::pair<std::string_view, PragmaEffect>::first);
+                        if (arm == kPragmaVerbs.end()) {
+                            std::string closed;
+                            for (auto const& [name, _] : kPragmaVerbs) {
+                                if (!closed.empty()) closed += " | ";
+                                closed += name;
+                            }
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess, rowPath,
+                                std::format("unknown pragma effect '{}' — the "
+                                            "closed set is {}", verb, closed));
+                            continue;
+                        }
+                        out.effect = arm->second;
+                        std::string key;
+                        for (auto const& w : out.prefix) {
+                            if (!key.empty()) key += ' ';
+                            key += w;
+                        }
+                        auto const [pit, fresh] = seenPrefixes.try_emplace(key, verb);
+                        if (!fresh) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                rowPath + "/prefix",
+                                std::format(
+                                    "pragma prefix '{}' is already bound to effect "
+                                    "'{}' in 'preprocess.pragmaEffects' — a prefix "
+                                    "must have exactly ONE effect, or which one "
+                                    "applies is decided by consumer iteration "
+                                    "order. Merge the rows or drop one",
+                                    key, pit->second));
+                            continue;
+                        }
+                        cfg.pragmaEffects.push_back(std::move(out));
+                    }
+                }
+            }
+            // SELF-CONSISTENCY: a registry (or the loud posture) with NO pragma
+            // surface to apply it to is an incomplete contract — the rows would
+            // read as configured and never fire, which is precisely the
+            // knob-that-lies this loader rejects everywhere else.
+            if ((!cfg.pragmaEffects.empty() || cfg.unknownPragmaIsError)
+                && cfg.pragmaDirective.empty() && cfg.pragmaOperator.empty()) {
+                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                          "/preprocess/pragmaEffects",
+                          "'preprocess.pragmaEffects' / 'unknownPragmaIsError' "
+                          "require at least one pragma SURFACE — declare "
+                          "'pragmaDirective' (#pragma) and/or 'pragmaOperator' "
+                          "(_Pragma), else the registry can never fire");
+            }
             // FC15c (`__has_include` / `__has_c_attribute`; C23 6.10.1p4): the
             // operator WORDS. OPTIONAL (each folds to an ordinary identifier when
             // absent).

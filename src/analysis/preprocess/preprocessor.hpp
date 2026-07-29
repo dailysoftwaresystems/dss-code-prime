@@ -72,15 +72,23 @@
 #include "tokenizer/token_stream.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dss {
+
+// TF-C82 (D-PP-PRAGMA-REGISTRY): the `pragmaPackByOffset` sentinel for a token
+// emitted under TWO DIFFERENT `#pragma pack` caps. Not a representable
+// alignment (the channel's domain is a power of two <= 256), so it can never
+// collide with a real cap.
+inline constexpr std::uint32_t kPragmaPackAmbiguous = 0xFFFFFFFFu;
 
 // One contiguous run of the synthesized buffer that came VERBATIM from a
 // single origin buffer. The synth buffer is a concatenation of such runs
@@ -200,6 +208,36 @@ struct DSS_EXPORT PreprocessResult {
     // any C TU with only quote includes, and a descriptor reached ONLY through a
     // dead `#if 0` branch).
     std::vector<std::filesystem::path> resolvedShippedDescriptors;
+
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` product — synth byte
+    // offset of an emitted token -> the MAXIMUM MEMBER ALIGNMENT (in bytes) in
+    // effect when the preprocessor emitted it. An offset ABSENT from the map
+    // means "no cap", so an EMPTY map (every TU that uses no `#pragma pack` —
+    // i.e. every TU before this cycle) is exactly the old behavior at zero cost.
+    //
+    // `#pragma pack` is the one pragma with real translation semantics that the
+    // sqlite corpus REACHES: MEASURED, 40 lines across 5 TUs, and `sys/fcntl.h`'s
+    // `pack(4)` region is what makes `struct log2phys` 20 bytes / align 4 instead
+    // of 24 / 8 — a struct sqlite hands to `fcntl(F_LOG2PHYS)`. Dropping the
+    // pragma is a wrong-ABI miscompile, not a missing warning.
+    //
+    // ★ KEYED PER TOKEN, NOT AS BYTE REGIONS, AND THE DIFFERENCE IS LOAD-BEARING.
+    // A region list says where the PRAGMA sits; this says what was in effect when
+    // a TOKEN was emitted. They disagree exactly when a composite arrives from a
+    // macro REPLACEMENT LIST: its tokens carry the `#define` line's span, which
+    // is nowhere near the `pack(4)` region containing the INVOCATION, so a region
+    // lookup would answer "no cap" and lay the struct out wrong in silence. The
+    // consumer looks up a composite specifier's FIRST TOKEN offset.
+    //
+    // A value of `kPragmaPackAmbiguous` means the token was emitted under TWO
+    // DIFFERENT caps (a macro replacement expanded in two pack regions). The
+    // preprocessor records that and says nothing: it cannot know which offsets
+    // are used as a LAYOUT KEY, and MEASURED, erroring here refuses programs
+    // clang compiles (a shared MEMBER macro used in two regions, where every
+    // composite is still anchored on an unambiguous `struct` keyword). The
+    // semantic tier turns it into `S_PragmaPackAmbiguous` only when a composite
+    // actually lands on such an offset.
+    std::unordered_map<std::uint32_t, std::uint32_t> pragmaPackByOffset;
 
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the

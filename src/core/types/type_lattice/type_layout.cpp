@@ -553,6 +553,16 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 // lowers it. An align-free struct (the common case) leaves
                 // `hasAligns` false and this collapses to the unchanged path below.
                 bool const hasAligns = interner.hasExplicitAligns(id);
+                // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` CAP this
+                // composite was defined under (0 = none, i.e. every composite until
+                // this cycle). It CLAMPS each field's natural alignment — the exact
+                // dual of the whole-composite `aligned(N)` seeded into `out.align`
+                // above, which RAISES the aggregate's. MEASURED against clang on
+                // arm64: `sys/fcntl.h`'s `struct log2phys` under `#pragma pack(4)`
+                // is offsets 0/4/12, sizeof 20, _Alignof 4; uncapped it is 0/8/16,
+                // sizeof 24, _Alignof 8 — the wrong-ABI struct DSS used to compute
+                // for a live `fcntl(F_LOG2PHYS)` call.
+                std::uint32_t const packCap = interner.maxFieldAlign(id);
                 auto effectiveAlign =
                     [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
                     // D-CSUBSET-PACKED: a packed composite removes all derived padding
@@ -560,7 +570,22 @@ computeLayout(TypeId id, TypeInterner const& interner,
                     // still RAISES it via the MAX-fold below (alignas wins per-field
                     // even under packed — `alignas(8) int x;` in a packed struct keeps
                     // 8-byte alignment).
-                    Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                    //
+                    // TF-C82: `#pragma pack(N)` caps the baseline at N. `packed` is
+                    // the cap==1 special case and WINS when both apply (gcc agrees:
+                    // an explicit `__attribute__((packed))` is not weakened by a
+                    // surrounding `pack(4)`), which falls out of taking the packed
+                    // baseline FIRST and only clamping the natural one.
+                    Alignment baseline = packed ? Alignment::of<1>() : natural;
+                    if (!packed && packCap != 0 && packCap < baseline.bytes()) {
+                        auto const capped = Alignment::fromBytes(packCap);
+                        // The cap is validated a power of two in [1,256] at the
+                        // pragma AND again at `completeComposite`; an unrepresentable
+                        // value reaching here is an upstream bug, so fail loud rather
+                        // than silently lay the struct out uncapped.
+                        if (!capped) return std::nullopt;
+                        baseline = *capped;
+                    }
                     if (!hasAligns) return baseline;
                     std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
                     if (ovr == 0) return baseline;   // no override on this field
@@ -675,11 +700,21 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // overall alignment — and thus its size, rounded up — never a field's
             // offset.)
             bool const hasAligns = interner.hasExplicitAligns(id);
+            // TF-C82: a union defined under `#pragma pack(N)` is capped the same
+            // way a struct is. A union places every member at offset 0, so the cap
+            // cannot change an offset — it lowers the union's own ALIGNMENT, and
+            // therefore the size it rounds up to.
+            std::uint32_t const packCap = interner.maxFieldAlign(id);
             auto effectiveAlign =
                 [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
                 // D-CSUBSET-PACKED: a packed union removes the per-member baseline
                 // alignment (→ 1); a member `alignas` still RAISES it via the MAX-fold.
-                Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                Alignment baseline = packed ? Alignment::of<1>() : natural;
+                if (!packed && packCap != 0 && packCap < baseline.bytes()) {
+                    auto const capped = Alignment::fromBytes(packCap);
+                    if (!capped) return std::nullopt;   // upstream bug — never silent
+                    baseline = *capped;
+                }
                 if (!hasAligns) return baseline;
                 std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
                 if (ovr == 0) return baseline;   // no override on this member

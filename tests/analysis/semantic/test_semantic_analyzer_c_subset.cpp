@@ -2014,6 +2014,57 @@ TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
     EXPECT_TRUE(model.hasErrors());
 }
 
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` AMBIGUITY pair. These two
+// tests exist together because the FIRST implementation had only the second half
+// and MEASURED it refused a program clang compiles.
+//
+// (1) LEGITIMATE, must compile: a shared MEMBER macro expanded under TWO
+// different caps. Its replacement tokens really are stamped twice, but every
+// composite using it is anchored on its own unambiguous `struct` keyword, so
+// both layouts are fully determined. Raising the conflict where it is DETECTED
+// (in the preprocessor) rejects this; raising it where it is USED does not.
+TEST(SemanticAnalyzerCSubset, PragmaPackSharedMemberMacroAcrossCapsIsFine) {
+    auto cu = buildShippedUnit("c-subset", {
+        "#define MEMS unsigned a; long long b;\n"
+        "#pragma pack(4)\n"
+        "struct A { MEMS };\n"
+        "#pragma pack(2)\n"
+        "struct B { MEMS };\n"
+        "#pragma pack()\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PragmaPackAmbiguous), 0u)
+        << "the composites are anchored on unambiguous `struct` keywords — "
+           "clang compiles this, and MEASURED, so must DSS";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (2) GENUINELY AMBIGUOUS, must fail loud: the COMPOSITE ITSELF is minted by a
+// macro expanded under two different caps, so its layout key carries both. The
+// two candidate layouts differ in size AND in every field offset past the first;
+// picking one silently is the miscompile this whole cycle is about. ONE
+// diagnostic per affected composite, and the code is unsuppressable.
+TEST(SemanticAnalyzerCSubset, PragmaPackAmbiguousCompositeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "#define DEFS(n) struct n { unsigned a; long long b; };\n"
+        "#pragma pack(4)\n"
+        "DEFS(P)\n"
+        "#pragma pack(2)\n"
+        "DEFS(Q)\n"
+        "#pragma pack()\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PragmaPackAmbiguous), 2u)
+        << "both P and Q land on an ambiguous layout key";
+    EXPECT_TRUE(model.hasErrors());
+}
+
 // FAIL-LOUD: a TYPO in the GNU `__attribute__` packed slot → S_UnknownTypeAttribute
 // (typo protection, like H_UnknownLinkageSpecifier — a `pakced` typo must not
 // silently leave the struct unpacked).

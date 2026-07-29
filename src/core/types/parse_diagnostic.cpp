@@ -51,6 +51,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_PreprocessorErrorDirective";
         case DiagnosticCode::P_PreprocessorWarningDirective:
             return "P_PreprocessorWarningDirective";
+        case DiagnosticCode::P_PreprocessorPragma:
+            return "P_PreprocessorPragma";
+        case DiagnosticCode::S_PragmaPackAmbiguous:
+            return "S_PragmaPackAmbiguous";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

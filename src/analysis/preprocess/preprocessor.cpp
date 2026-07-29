@@ -1790,6 +1790,69 @@ struct MacroDef {
     bool                     isVariadic = false;
 };
 
+// ── TF-C82 (D-PP-PRAGMA-REGISTRY): the ONE pragma classifier ────────────────────
+//
+// LONGEST-prefix match of a pragma's leading WORDS against `pragmaEffects`.
+// `nullopt` = NO row matched; the caller (not this function) decides loud-vs-
+// silent from `unknownPragmaIsError`, so recognition and policy stay separable.
+//
+// Longest-wins rather than first-wins is deliberate: a future
+// `["clang","diagnostic","push"]` row must be able to refine the broader
+// `["clang","diagnostic"]` row without either being shadowed by DECLARATION
+// ORDER — the same reason the loader rejects a duplicate prefix outright.
+struct PragmaMatch {
+    PragmaEffect effect = PragmaEffect::Unsupported;
+    std::size_t  words  = 0;   // how many leading words the matched row consumed
+};
+[[nodiscard]] inline std::optional<PragmaMatch>
+matchPragmaEffect(PreprocessConfig const&      cfg,
+                  std::span<std::string const> words) {
+    std::optional<PragmaMatch> best;
+    for (PragmaEffectRow const& row : cfg.pragmaEffects) {
+        if (row.prefix.empty() || row.prefix.size() > words.size()) continue;
+        bool ok = true;
+        for (std::size_t i = 0; i < row.prefix.size(); ++i) {
+            if (words[i] != row.prefix[i]) { ok = false; break; }
+        }
+        if (!ok) continue;
+        if (!best.has_value() || row.prefix.size() > best->words) {
+            best = PragmaMatch{row.effect, row.prefix.size()};
+        }
+    }
+    return best;
+}
+
+// C 6.10.9p1 DE-STRINGIZE, for the `_Pragma("...")` operand: delete the leading
+// `L` when present, delete the outer quotes, then replace each `\"` with `"` and
+// each `\\` with `\`. Returns nullopt when `lexeme` is not a quoted string at all
+// (the caller fails loud — a `_Pragma` operand that is not a single string
+// literal is a constraint violation, not something to guess at).
+//
+// ★ The escape pass is NOT the general string-literal decoder: 6.10.9p1 names
+// exactly these two replacements, and running a full decoder here would silently
+// turn a `\n` that a pragma legitimately contains into a newline byte.
+//
+// `body` is the literal's BODY text — delimiters already excluded by the
+// tokenizer (an `L` prefix rides on the opener token), so the delete-the-quotes
+// half of 6.10.9p1 has already happened by construction and only the escape
+// replacement is left. Total, not fallible: the CALLER decides whether the
+// operand was a string literal at all, by TOKEN KIND rather than by inspecting
+// bytes for a `"`.
+[[nodiscard]] inline std::string destringizePragma(std::string_view body) {
+    std::string out;
+    out.reserve(body.size());
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        if (body[i] == '\\' && i + 1 < body.size()
+            && (body[i + 1] == '"' || body[i + 1] == '\\')) {
+            out.push_back(body[i + 1]);
+            ++i;
+            continue;
+        }
+        out.push_back(body[i]);
+    }
+    return out;
+}
+
 class MacroExpander {
 public:
     // `synth` is the PREFIX buffer (the synthesized text BEFORE any `#`/`##`
@@ -1935,6 +1998,23 @@ public:
         return productText_;
     }
 
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token -> the
+    // `#pragma pack` member-alignment cap in effect when it was emitted. EMPTY
+    // for every TU that uses no `#pragma pack` (i.e. all of them until this
+    // cycle), which is what makes the whole mechanism free when unused.
+    [[nodiscard]] std::unordered_map<std::uint32_t, std::uint32_t> const&
+    pragmaPackByOffset() const noexcept {
+        return packByOffset_;
+    }
+
+    // TF-C82: a `#pragma pack(push, N)` never closed by a `pack(pop)` at end of
+    // translation unit. The `#endif`-balance argument applies verbatim: an
+    // unbalanced push means the source's own pairing is broken, so `run()` fails
+    // loud rather than letting the imbalance read as intentional.
+    [[nodiscard]] bool packStackUnbalanced() const noexcept {
+        return !packStack_.empty();
+    }
+
     std::vector<Token> run(std::vector<Token> const& in) {
         // c18 (positional macro expansion, C 6.10.3): `body` accumulates the live
         // non-directive tokens since the LAST flush; `out` accumulates the
@@ -1981,7 +2061,7 @@ public:
                 // line -- undefined behavior (C 6.10.3p11) -- which the extra
                 // flush turns from a mis-expansion into a fail-loud unterminated-
                 // argument error. Never a silent miscompile.
-                if (isMutatingDirective(in, i)) {
+                if (isFlushBoundaryDirective(in, i)) {
                     flushExpand(body, out);
                     body.clear();
                 }
@@ -2031,6 +2111,20 @@ public:
                        static_cast<ByteOffset>(synth_->size())),
                    "unterminated conditional directive (missing #endif)");
         }
+        // TF-C82: the `#pragma pack` analogue of the missing-`#endif` check. A
+        // push with no pop means the alignment in effect over the tail of the TU
+        // is not derivable from the source's own pairing, so it fails loud for
+        // the same reason — and unlike the conditional case it would otherwise be
+        // completely invisible.
+        if (!packStack_.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   SourceSpan::empty(static_cast<ByteOffset>(synth_->size())),
+                   std::string{"unterminated '#pragma pack(push, ...)' — "}
+                       + std::to_string(packStack_.size())
+                       + " push(es) reach end of translation unit with no "
+                         "matching pop, so the alignment applied to everything "
+                         "below them is unbalanced");
+        }
         // c18: final flush of the tokens following the last table-mutating
         // directive (or the whole body, when there was none -- byte-identical to
         // the pre-c18 single end-expand).
@@ -2062,7 +2156,14 @@ public:
         std::vector<ExpToken> work;
         work.reserve(pending.size());
         for (Token const& t : pending) work.push_back(fromToken(t));
+        // TF-C82: THIS is the expansion whose output reaches the parser, so it is
+        // the one whose tokens carry a `#pragma pack` cap. The `#if`-operand
+        // expansions (`expandTokens`) run with the flag clear — their tokens are
+        // folded into an integer and discarded, and recording them would put
+        // offsets in the map that no tree node can ever reference.
+        recordPack_ = true;
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
+        recordPack_ = false;
         // FC15 paste residuals: a placemarker is normally consumed inside
         // `substitute`; this BACKSTOP drops any stray one so it never reaches the
         // parser as a garbage (default-constructed) token.
@@ -2072,20 +2173,36 @@ public:
         }
     }
 
-    // c18: TRUE iff the directive line at `hashIdx` is a table-MUTATING
-    // `#define`/`#undef` while the conditional stack is active (so it would
-    // actually be processed -- a dead-branch define is gated out in
-    // `handleDirective`). Pure: mirrors `handleDirective`'s own skipTrivia +
-    // word-read (so it sees the SAME directive word) without mutating any state.
-    // `run()` consults it to flush the pending body BEFORE the table changes.
-    [[nodiscard]] bool isMutatingDirective(std::vector<Token> const& in,
-                                           std::size_t hashIdx) const {
+    // c18: TRUE iff the directive line at `hashIdx` changes POSITIONAL state that
+    // the pending body must not be expanded under — a table-MUTATING
+    // `#define`/`#undef`, or (TF-C82) a `#pragma`, while the conditional stack is
+    // active (so it would actually be processed -- a dead-branch define is gated
+    // out in `handleDirective`). Pure: mirrors `handleDirective`'s own skipTrivia
+    // + word-read (so it sees the SAME directive word) without mutating any
+    // state. `run()` consults it to flush the pending body BEFORE the state
+    // changes.
+    //
+    // ★ TF-C82 — WHY `#pragma` JOINED THIS SET, AND WHAT BREAKS WITHOUT IT. The
+    // pack cap is stamped onto tokens when `flushExpand` emits them, and a flush
+    // covers everything accumulated since the previous boundary. Without a flush
+    // here, `struct A {...} #pragma pack(4) struct B {...}` would expand A and B
+    // in ONE run and stamp BOTH with the post-pragma cap — A would silently be
+    // laid out packed. It is the same positional argument `#define` already makes
+    // (c18: a use before a later same-name define must not be retroactively
+    // replaced), applied to the other piece of state a directive can move.
+    // Including EVERY `#pragma`, not just the packing ones, is deliberate: the
+    // cheap over-fire is an extra flush (output-neutral — `productText_` is
+    // append-only and a hide set never spans a directive line), whereas the cheap
+    // under-fire is a wrong struct layout.
+    [[nodiscard]] bool isFlushBoundaryDirective(std::vector<Token> const& in,
+                                                std::size_t hashIdx) const {
         if (!stackActive()) return false;
         const std::size_t end = lineEnd(in, hashIdx);
         const std::size_t p   = skipTrivia(in, hashIdx + 1);
         if (p >= end || isNewline(in[p])) return false;
         const std::string_view w = text(in[p]);
-        return w == cfg().defineDirective || w == cfg().undefDirective;
+        return w == cfg().defineDirective || w == cfg().undefDirective
+            || (!cfg().pragmaDirective.empty() && w == cfg().pragmaDirective);
     }
 
 private:
@@ -2184,6 +2301,305 @@ private:
     // table membership by text keeps expansion correct.
     static bool isWord(Token const& t) {
         return t.coreKind == CoreTokenKind::Word;
+    }
+
+    // ── TF-C82 (D-PP-PRAGMA-REGISTRY): the ONE pragma sink ────────────────────
+    //
+    // `toks` are a pragma's SIGNIFICANT pp-tokens — for `#pragma X ...` the line
+    // after the directive word, for `_Pragma("X ...")` the DE-STRINGIZED operand
+    // re-tokenized. BOTH spellings arrive here, which is what makes
+    // `_Pragma("pack(4)")` and `#pragma pack(4)` the same feature rather than two
+    // implementations that agree until they don't.
+    //
+    // ★ CALLED ONLY FROM REACHABLE POSITIONS. `handleDirective`'s arm sits BELOW
+    // the dead-branch gate and `expand` never runs on elided tokens, so a pragma
+    // in a not-taken `#if` branch never reaches this function at all — reachability,
+    // not recognition (C 6.10p1), the `#error`/`#embed`/`#line` parity. Hoisting
+    // recognition above that gate would fail loud on the hundreds of pragmas the
+    // Apple SDK parks in unsupported-configuration branches.
+    void applyPragma(std::span<Token const> toks, SourceSpan diagSpan) {
+        std::vector<std::string> words;
+        std::vector<Token>       sig;
+        for (Token const& t : toks) {
+            if (isTrivia(t) || isNewline(t)) continue;
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            sig.push_back(t);
+            words.emplace_back(text(t));
+        }
+        // C 6.10.6: `# pragma pp-tokens_opt` — a pragma with NO tokens has no
+        // effect, so it is silent. This is the standard saying nothing happened,
+        // not DSS declining to look.
+        if (words.empty()) return;
+
+        auto const m = matchPragmaEffect(cfg(), words);
+        if (!m.has_value()) {
+            if (!cfg().unknownPragmaIsError) return;   // the declared opt-out
+            std::string joined;
+            for (auto const& w : words) {
+                if (!joined.empty()) joined += ' ';
+                joined += w;
+            }
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   diagSpan,
+                   std::string{"unrecognized pragma '"} + joined
+                       + "' — no 'preprocess.pragmaEffects' row claims it, so "
+                         "this implementation cannot say whether ignoring it is "
+                         "safe. C 6.10.6p2 permits ignoring a pragma, not "
+                         "assuming one is inert: `pack` alone silently changes "
+                         "struct layout. Add a row declaring what it does (or "
+                         "set 'unknownPragmaIsError' false to ignore every "
+                         "unregistered pragma)");
+            return;
+        }
+        switch (m->effect) {
+            case PragmaEffect::DiagnosticsOnly:
+            case PragmaEffect::AnnotationOnly:
+                // IGNORED — and ignored because a ROW SAYS SO. That is the whole
+                // difference from the pre-TF-C82 behavior, which looked identical
+                // from the outside and asserted nothing.
+                return;
+            case PragmaEffect::StructPacking:
+                applyPackPragma(std::span<Token const>{sig}.subspan(m->words),
+                                diagSpan);
+                return;
+            case PragmaEffect::Unsupported: {
+                std::string joined;
+                for (auto const& w : words) {
+                    if (!joined.empty()) joined += ' ';
+                    joined += w;
+                }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                       diagSpan,
+                       std::string{"pragma '"} + joined
+                           + "' has translation semantics this implementation "
+                             "has not built, and its 'preprocess.pragmaEffects' "
+                             "row says so ('unsupported'). Ignoring it would "
+                             "change behavior silently");
+                return;
+            }
+        }
+    }
+
+    // C `#pragma pack` — the `structPacking` verb's operand grammar. `args` are
+    // the significant tokens AFTER the matched registry prefix.
+    //
+    // The BUILT forms are exactly the ones MEASURED reachable in the sqlite
+    // corpus (13 `pack(4)` + 1 `pack(1)`, 14 `pack()`, 5 `pack(push, 4)` + 1
+    // `pack(push, 1)`, 6 `pack(pop)`):
+    //     pack ( )            -> drop the cap back to the target default
+    //     pack ( N )          -> cap member alignment at N
+    //     pack ( push , N )   -> save the current cap, then cap at N
+    //     pack ( pop )        -> restore the saved cap
+    // Everything else FAILS LOUD, deliberately: the SDK's other spellings are the
+    // bare `pack(push)` (MEASURED 0 occurrences SDK-wide) and the paren-less
+    // `#pragma pack 8` (MEASURED 2, both in an unreached `ffi/ffi.h`). Guessing at
+    // an unbuilt form is how a wrong layout ships quietly; refusing it is a
+    // one-line config/compiler fix when something finally needs it.
+    //
+    // AGNOSTIC: the delimiters are matched by SCHEMA KIND (`parenOpen_`,
+    // `parenClose_`, `argSep_` — the same config lexemes the function-like macro
+    // machinery uses), and `push`/`pop` come from `pragmaPackPushWord` /
+    // `pragmaPackPopWord`. No `(`, `)`, `,`, `"push"` or `"pop"` byte appears in
+    // this function.
+    void applyPackPragma(std::span<Token const> args, SourceSpan diagSpan) {
+        auto const bad = [&](std::string_view why) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   diagSpan,
+                   std::string{"unsupported '#pragma pack' form: "}
+                       + std::string{why}
+                       + ". The built forms are pack(N), pack(), pack(push, N) "
+                         "and pack(pop); refusing rather than guessing, because a "
+                         "misread pack silently relayouts every struct after it");
+        };
+        auto const isKind = [&](Token const& t, SchemaTokenId k) {
+            return k.valid() && t.schemaKind == k;
+        };
+        if (args.size() < 2 || !isKind(args.front(), parenOpen_)
+            || !isKind(args.back(), parenClose_)) {
+            bad("the operand must be a parenthesized list");
+            return;
+        }
+        std::span<Token const> inner = args.subspan(1, args.size() - 2);
+
+        // pack() — reset to the target's natural alignment rules.
+        if (inner.empty()) {
+            packCurrent_ = 0;
+            return;
+        }
+        // pack(N)
+        if (inner.size() == 1 && inner[0].coreKind == CoreTokenKind::IntLiteral) {
+            if (auto n = packOperandValue(inner[0], diagSpan)) packCurrent_ = *n;
+            return;
+        }
+        // pack(pop)
+        if (inner.size() == 1 && !cfg().pragmaPackPopWord.empty()
+            && text(inner[0]) == cfg().pragmaPackPopWord) {
+            if (packStack_.empty()) {
+                // gcc warns and leaves the cap alone; DSS refuses. An unbalanced
+                // pop means the pushes and pops in this TU do not pair, so EVERY
+                // composite after it is laid out under a cap nobody can name from
+                // reading the source — the definition of a silent wrong layout.
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                       diagSpan,
+                       "'#pragma pack(pop)' with an empty pack stack — the "
+                       "push/pop pairs in this translation unit are unbalanced, "
+                       "so the alignment in effect below this line is not "
+                       "derivable from the source");
+                return;
+            }
+            packCurrent_ = packStack_.back();
+            packStack_.pop_back();
+            return;
+        }
+        // pack(push, N)
+        if (inner.size() == 3 && !cfg().pragmaPackPushWord.empty()
+            && text(inner[0]) == cfg().pragmaPackPushWord
+            && isKind(inner[1], argSep_)
+            && inner[2].coreKind == CoreTokenKind::IntLiteral) {
+            if (auto n = packOperandValue(inner[2], diagSpan)) {
+                packStack_.push_back(packCurrent_);
+                packCurrent_ = *n;
+            }
+            return;
+        }
+        // A `push`/`pop` spelling the language did NOT declare lands here — the
+        // red-on-disable pin for `pragmaPackPushWord`/`pragmaPackPopWord`.
+        bad("operand is not one of the built forms");
+    }
+
+    // Decode + VALIDATE a `#pragma pack` alignment operand. Must be a positive
+    // power of two no greater than 256 — the same envelope `alignas` /
+    // `__attribute__((aligned(N)))` are held to, because it lands in the same
+    // layout channel and a value the layout engine cannot represent would abort
+    // deep in `computeLayout` with no source position.
+    [[nodiscard]] std::optional<std::uint32_t> packOperandValue(
+        Token const& t, SourceSpan diagSpan) {
+        std::string_view const lex = text(t);
+        std::uint64_t          v   = 0;
+        for (char const c : lex) {
+            if (c < '0' || c > '9') { v = 0; break; }
+            v = v * 10 + static_cast<std::uint64_t>(c - '0');
+            if (v > 4096) break;   // far past the cap; stop before overflow
+        }
+        if (v == 0 || v > 256 || (v & (v - 1)) != 0) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   diagSpan,
+                   std::string{"'#pragma pack' alignment '"} + std::string{lex}
+                       + "' must be a power of two in [1, 256]");
+            return std::nullopt;
+        }
+        return static_cast<std::uint32_t>(v);
+    }
+
+    // ── TF-C82 (`_Pragma`; C 6.10.9): the OPERATOR spelling ───────────────────
+    //
+    // `work.front()` is a token whose lexeme matched `pragmaOperator`. Consume
+    // `( "..." )`, DE-STRINGIZE the operand per 6.10.9p1, re-tokenize it through
+    // the SAME `materializeSignificant` the `#`/`##` products use, and route the
+    // result through the SAME `applyPragma`. Returns TRUE when the whole
+    // construct was consumed (the caller must `continue`); FALSE leaves `work`
+    // untouched so the token falls through to ordinary macro handling.
+    //
+    // ★★ IT LIVES HERE, IN `expand`, AND THAT IS THE WHOLE POINT. `_Pragma` is an
+    // OPERATOR in the token stream, not a directive, so it routinely arrives from
+    // inside a macro REPLACEMENT LIST — `sys/queue.h`'s
+    // `__NULLABILITY_COMPLETENESS_PUSH/POP` are exactly that, expanded at 40 use
+    // sites, and MEASURED they are what puts 24 `clang assume_nonnull` +
+    // 2 `clang diagnostic ignored "-Wnullability-completeness"` lines in the
+    // corpus's REACHED pragma set. Routing `_Pragma` at the directive scan
+    // instead would leave a file-scope `_Pragma` working while every macro-borne
+    // one silently vanished — a halfway state that looks green from the outside,
+    // which is why the test battery discriminates on exactly that shape.
+    //
+    // NOTHING is emitted: like a directive, a pragma is not program text.
+    [[nodiscard]] bool consumePragmaOperator(std::deque<ExpToken>& work,
+                                             ExpToken const&       opTok) {
+        std::size_t const openIdx = nextSignificant(work, 1);
+        if (openIdx >= work.size() || !isParenOpen(work[openIdx].tok)) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   opTok.tok.span,
+                   std::string{"'"} + cfg().pragmaOperator
+                       + "' must be followed by a parenthesized string literal "
+                         "(C 6.10.9p1)");
+            return false;   // not a call shape — leave it to ordinary handling
+        }
+        // Find the matching close paren (balanced, so a `)` inside the literal's
+        // own body cannot terminate the operand early).
+        std::size_t closeIdx = 0;
+        int         depthP   = 0;
+        bool        found    = false;
+        for (std::size_t k = openIdx; k < work.size(); ++k) {
+            if (isParenOpen(work[k].tok)) ++depthP;
+            else if (isParenClose(work[k].tok)) {
+                if (--depthP == 0) { closeIdx = k; found = true; break; }
+            }
+        }
+        if (!found) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   opTok.tok.span,
+                   std::string{"unterminated '"} + cfg().pragmaOperator
+                       + "' operand (no closing parenthesis)");
+            return false;
+        }
+        // The operand: the significant tokens strictly between the parens. A
+        // string literal lexes as OPENER + BODY (+ CLOSER since
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), so the shape is 2 or 3 tokens.
+        // The opener is matched by the CONFIG kind — the same `quoteIncludeKind_`
+        // `handleEmbed` reuses as "this language's string-literal opener" — never
+        // by the `"` byte.
+        std::vector<Token> operand;
+        for (std::size_t k = openIdx + 1; k < closeIdx; ++k) {
+            if (isTrivia(work[k].tok) || isNewline(work[k].tok)) continue;
+            operand.push_back(work[k].tok);
+        }
+        bool const wellFormed = operand.size() >= 2 && operand.size() <= 3
+                                && quoteIncludeKind_.valid()
+                                && operand[0].schemaKind == quoteIncludeKind_;
+        if (!wellFormed) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   opTok.tok.span,
+                   std::string{"the operand of '"} + cfg().pragmaOperator
+                       + "' must be a single string literal (C 6.10.9p1) — "
+                         "refusing rather than guessing at its intent");
+            // Still CONSUME the construct: leaving `_Pragma ( ... )` in the token
+            // stream would cascade into an inscrutable parse error on top of this
+            // accurate one.
+            for (std::size_t k = 0; k <= closeIdx; ++k) work.pop_front();
+            return true;
+        }
+        // 6.10.9p1: `\"` -> `"` and `\\` -> `\`. The BODY token's text already
+        // excludes the delimiters (an `L` prefix rides on the opener), so this is
+        // exactly the escape pass and nothing more — a full string decoder would
+        // silently turn a `\n` a pragma legitimately contains into a newline.
+        std::string const inner = destringizePragma(text(operand[1]));
+        std::vector<Token> const toks = materializeSignificant(inner);
+        applyPragma(toks, opTok.tok.span);
+        for (std::size_t k = 0; k <= closeIdx; ++k) work.pop_front();
+        return true;
+    }
+
+    // TF-C82: stamp the pack cap in effect onto an EMITTED token. Sparse — a zero
+    // cap (every token in every TU that uses no `#pragma pack`) records nothing,
+    // so the map stays empty and the whole mechanism is free when unused.
+    //
+    // ★★ THE CONFLICT ARM RECORDS, IT DOES NOT REPORT — AND THAT DISTINCTION WAS
+    // MEASURED, NOT REASONED. One source token can reach the output twice under
+    // DIFFERENT caps: a macro replacement expanded inside two different pack
+    // regions. The first implementation failed loud right here, and it REFUSED A
+    // PROGRAM CLANG COMPILES — a shared MEMBER macro (`#define MEMS unsigned a;
+    // long long b;`) used in two pack regions stamps its own tokens under both
+    // caps, while every composite that uses it is anchored on an UNAMBIGUOUS
+    // `struct` keyword and lays out perfectly. The preprocessor cannot tell which
+    // offsets are used as a layout key; only the semantic tier can. So the
+    // ambiguity is RECORDED as `kPackAmbiguous` and judged there — it becomes an
+    // error (`S_PragmaPackAmbiguous`) only if a composite actually lands on it.
+    // Sticky: once ambiguous, a third stamp cannot resolve it back.
+    void notePackForToken(Token const& t) {
+        if (packCurrent_ == 0) return;
+        auto const key = static_cast<std::uint32_t>(t.span.start());
+        auto const [it, fresh] = packByOffset_.try_emplace(key, packCurrent_);
+        if (fresh || it->second == packCurrent_) return;
+        it->second = kPragmaPackAmbiguous;
     }
 
     bool firstOnLine(std::vector<Token> const& in, std::size_t idx) const {
@@ -2286,16 +2702,29 @@ private:
         // whole arm (including the unsupported-directive diagnostic) is skipped.
         if (!stackActive()) return end;
 
-        // FC15c (`#pragma`; C 6.10.6): consume-and-DROP the whole line with NO
-        // error. C 6.10.6p2 lets an implementation ignore a pragma it does not
-        // recognize; DSS recognizes none, so every `#pragma` is silently dropped
-        // (the line's tokens are NOT emitted into `body`). Placed AFTER the
-        // dead-branch gate (so a `#pragma` in an elided branch is silent too) and
-        // BEFORE the generic unsupported-directive `else`. Config-matched
-        // (`pragmaDirective`), never a hard-coded "pragma"; an empty config field
-        // (a language without `#pragma`) skips this arm -> the line falls through
-        // to the generic unsupported-directive fail-loud.
+        // FC15c / ★★ TF-C82 (D-PP-PRAGMA-REGISTRY; `#pragma`, C 6.10.6): the
+        // line's tokens are never emitted into `body` (a directive is not program
+        // text), but WHAT THE PRAGMA MEANS is now decided by the
+        // `preprocess.pragmaEffects` registry instead of being dropped in
+        // silence. Placed AFTER the dead-branch gate (so a `#pragma` in an elided
+        // branch is entirely silent — C 6.10p1, the `#error`/`#embed`/`#line`
+        // parity) and BEFORE the generic unsupported-directive `else`.
+        // Config-matched (`pragmaDirective`), never a hard-coded "pragma"; an
+        // empty config field (a language without `#pragma`) skips this arm -> the
+        // line falls through to the generic unsupported-directive fail-loud.
+        //
+        // ★ WHAT THIS ARM USED TO BE: `return end;`. MEASURED, that silence cost
+        // `sys/fcntl.h`'s `struct log2phys` its `#pragma pack(4)` — 24 bytes where
+        // clang says 20, on a struct sqlite hands to `fcntl(F_LOG2PHYS)`.
         if (!cfg().pragmaDirective.empty() && word == cfg().pragmaDirective) {
+            std::size_t const first = skipTrivia(in, p + 1);
+            std::size_t       last  = end;
+            while (last > first && (isNewline(in[last - 1])
+                                    || isTrivia(in[last - 1]))) --last;
+            if (last > first) {
+                applyPragma(std::span<Token const>{in}.subspan(first, last - first),
+                            in[p].span);
+            }
             return end;
         }
 
@@ -3830,6 +4259,21 @@ private:
         // exactly as before; `in` is moved-FROM here and not touched again.)
         std::deque<ExpToken> work(std::make_move_iterator(in.begin()),
                                   std::make_move_iterator(in.end()));
+        // TF-C82: THE emission chokepoint. Every token that leaves this frame is
+        // stamped with the `#pragma pack` cap in effect AT THAT MOMENT — which is
+        // what makes a `_Pragma("pack(4)")` sitting mid-run split the run
+        // correctly, and what makes a composite arriving from a macro replacement
+        // carry the cap of its INVOCATION rather than of its `#define` line.
+        // Only at depth 0: a depth>0 frame is ARGUMENT pre-expansion, whose
+        // tokens are spliced back and re-emitted through this same chokepoint by
+        // the parent. `recordPack_` keeps the `#if`-operand expansions (which
+        // reach no parser) out of the map.
+        auto emitOut = [&](ExpToken&& e) {
+            if (depth == 0 && recordPack_ && !e.placemarker) {
+                notePackForToken(e.tok);
+            }
+            out.push_back(std::move(e));
+        };
         while (!work.empty()) {
             // Audit fix #2 (UAF ordering): COPY the front token before any
             // pop/splice below -- `t.tok`, `t.hide`, `t.invOffset`, `t.tok.span`
@@ -3839,11 +4283,21 @@ private:
             // popped.
             ExpToken t = work.front();
             if (!isWord(t.tok)) {
-                out.push_back(std::move(t));
+                emitOut(std::move(t));
                 work.pop_front();
                 continue;
             }
             const std::string name{text(t.tok)};
+            // TF-C82 (`_Pragma`; C 6.10.9) — checked BEFORE the macro table, so a
+            // (constraint-violating) `#define _Pragma …` can never shadow the
+            // operator, and checked HERE rather than at the directive scan so a
+            // `_Pragma` reached through a macro REPLACEMENT LIST resolves at its
+            // expansion site. `pragmaOperator` is config: empty (toy / tsql) makes
+            // `_Pragma` an ordinary identifier and this arm unreachable.
+            if (!cfg().pragmaOperator.empty() && name == cfg().pragmaOperator
+                && consumePragmaOperator(work, t)) {
+                continue;
+            }
             auto it = table_.find(name);
             // Not a `#define`d macro, OR M is in THIS token's hide set (Prosser:
             // M ∉ hideset(T) required to expand).
@@ -3877,7 +4331,7 @@ private:
                         continue;   // rescan from the materialized value
                     }
                 }
-                out.push_back(std::move(t));
+                emitOut(std::move(t));
                 work.pop_front();
                 continue;
             }
@@ -3914,7 +4368,7 @@ private:
             // a function-like name not followed by `(` is not an invocation).
             std::size_t openIdx = nextSignificant(work, 1);
             if (openIdx >= work.size() || !isParenOpen(work[openIdx].tok)) {
-                out.push_back(std::move(t));
+                emitOut(std::move(t));
                 work.pop_front();
                 continue;
             }
@@ -3926,7 +4380,7 @@ private:
             if (!argsOpt) {
                 // Unterminated invocation already reported: emit the name as-is
                 // and resume after it (do NOT swallow the rest of the stream).
-                out.push_back(std::move(t));
+                emitOut(std::move(t));
                 work.pop_front();
                 continue;
             }
@@ -3968,7 +4422,7 @@ private:
                 // pop of `past` front tokens; leaving it a no-op (or popping only
                 // the name) would re-scan/re-expand the malformed args -> a SILENT
                 // divergence from the byte-identical output.
-                out.push_back(std::move(t));
+                emitOut(std::move(t));
                 for (std::size_t k = 0; k < past; ++k) work.pop_front();
                 continue;
             }
@@ -4135,6 +4589,38 @@ private:
     // decision -- the silent-miscompile class the pre-scan oracle had (it could
     // not see predefined/header macros) is gone by construction.
     std::vector<std::pair<ByteOffset, ByteOffset>> deadRanges_;
+    // ── TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` state ──
+    //
+    // `packCurrent_` is the maximum member alignment in effect RIGHT NOW, in
+    // bytes; 0 = no cap (the target's natural alignment rules, i.e. every
+    // composite laid out exactly as before this cycle). `packStack_` is the
+    // `pack(push, N)` / `pack(pop)` stack. ONE stack serves BOTH spellings:
+    // `#pragma pack` mutates it from `handleDirective`, `_Pragma("pack(...)")`
+    // from `expand`, and because `run()` is a SINGLE ordered walk over the token
+    // stream those two mutation sites interleave in genuine source order without
+    // any merge step.
+    std::vector<std::uint32_t>           packStack_;
+    std::uint32_t                        packCurrent_ = 0;
+    // True only during the ONE expansion whose output reaches the parser (see
+    // `flushExpand`). Keeps `#if`-operand expansions out of `packByOffset_`.
+    bool                                 recordPack_  = false;
+    // The product: synth byte offset of an EMITTED token -> the pack cap in
+    // effect when it was emitted. SPARSE — only tokens under a NON-ZERO cap get
+    // an entry, so a TU with no `#pragma pack` (every existing one) produces an
+    // EMPTY map and costs nothing. The semantic tier looks up a composite
+    // specifier's FIRST TOKEN offset here.
+    //
+    // ★ WHY PER-TOKEN AND NOT A SORTED LIST OF BYTE REGIONS. A region list is
+    // keyed on where the pragma SITS; this is keyed on where a token was
+    // EMITTED, and the two disagree for exactly the case that matters most:
+    // a composite arriving from a macro REPLACEMENT LIST carries the `#define`
+    // line's byte span, which is nowhere near the `pack(4)` region containing
+    // the INVOCATION. A region lookup would answer "no cap" and lay the struct
+    // out wrong, in silence. Stamping at emission answers with the state that
+    // was actually in effect. The one case a per-token map cannot express — the
+    // SAME source token emitted twice under DIFFERENT caps — is detected at
+    // insert and fails loud rather than letting last-writer-wins pick a layout.
+    std::unordered_map<std::uint32_t, std::uint32_t> packByOffset_;
 };
 
 } // namespace
@@ -4462,6 +4948,11 @@ PreprocessResult preprocess(
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.
     result.fatal = result.fatal || expander.truncated();
+
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): hand the `#pragma pack` stamps to the CU, so
+    // the semantic tier can ask what alignment cap was in effect at a composite
+    // specifier's first token. Empty for every TU that uses no `#pragma pack`.
+    result.pragmaPackByOffset = expander.pragmaPackByOffset();
 
     // c17 (authoritative dead-region oracle): promote the provisional tokenizer
     // diagnostics. A `P_IllegalChar` is forwarded to the real reporter UNLESS its

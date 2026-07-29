@@ -304,8 +304,21 @@ struct MirFunc {
     // NOTE (TF-C81): there is deliberately NO `_pad` member any more. The four
     // 1-byte fields above (binding, visibility, noInline, alwaysInline) now fill
     // the 4-byte tail slot EXACTLY, so explicit padding would be a lie about the
-    // layout rather than documentation of it. The next 1-byte function flag is
-    // the one that grows the struct 24 → 32; it should re-introduce `_pad[3]`.
+    // layout rather than documentation of it.
+    //
+    // ★ PADDING BUDGET — MEASURED (TF-C82), replacing a WRONG prediction this
+    // comment used to carry ("the next flag grows the struct 24 → 32; it should
+    // re-introduce `_pad[3]`"). Both halves of that were false, and the root of
+    // the error was assuming an 8-byte alignment: `TypeId` is sizeof 8 / ALIGNOF
+    // 4, so `MirFunc` is sizeof 24 / **alignof 4**, and the struct grows in
+    // 4-byte steps, not 8. Re-measured with `/usr/bin/clang++ -std=c++23 -I src`
+    // on arm64-apple-darwin against the real header plus field-for-field replica
+    // structs: +1 one-byte flag → **28** (not 32); +8 flags → 32, and the
+    // `<= 32` static_assert below STILL HOLDS; +9 flags → 36, the FIRST size
+    // that breaches it. So there is room for eight more 1-byte flags, and a
+    // re-introduced `_pad` would be padding to nothing until then.
+    // ★ Re-MEASURE before quoting these numbers again — a plausible-sounding
+    // size claim went unchecked into this comment once already.
 };
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);

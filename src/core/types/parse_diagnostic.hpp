@@ -133,6 +133,35 @@ enum class DiagnosticCode : std::uint16_t {
     // The SAME reachability invariant applies verbatim -- a `#warning` in an
     // elided branch is silent.
     P_PreprocessorWarningDirective = 0x001F,
+    // TF-C82 (D-PP-PRAGMA-REGISTRY; `#pragma` C 6.10.6 / `_Pragma` C 6.10.9):
+    // a REACHED pragma whose leading word(s) match NO `preprocess.pragmaEffects`
+    // row (and the language set `unknownPragmaIsError`), a pragma whose row says
+    // `unsupported`, or a MALFORMED operand of a row DSS does implement (a
+    // `pack(...)` form outside the measured-and-built set, a non-power-of-two
+    // operand, a `pack(pop)` with nothing pushed, a `_Pragma` operand that is not
+    // a single string literal).
+    //
+    // ★ WHY A REACHED-PRAGMA ERROR IS THE CONSERVATIVE CHOICE, NOT THE NOISY ONE.
+    // C 6.10.6p2 lets an implementation ignore a pragma it does not recognize, and
+    // DSS leaned on that from FC15c to TF-C82 to drop EVERY pragma in silence. The
+    // license is real but it is about IGNORING, not about pretending: MEASURED, the
+    // sqlite corpus reaches 40 `#pragma pack` lines, and the `sys/fcntl.h`
+    // `pack(4)` region makes `struct log2phys` 20/4 where DSS computed 24/8 — a
+    // wrong-ABI struct on a live `fcntl(F_LOG2PHYS)` path. An unrecognized pragma
+    // is indistinguishable at the point of recognition from one that silently
+    // relayouts memory, so the unknown case is loud and the ignorable cases are
+    // ignorable BY A REGISTRY ROW THAT SAYS SO.
+    //
+    // ★ REACHABILITY, NOT RECOGNITION. The emit sites sit BELOW `handleDirective`'s
+    // `if (!stackActive()) return end;` gate — the `#error`/`#embed`/`#line`
+    // parity — so a pragma in a NOT-TAKEN `#if` branch is entirely silent (C
+    // 6.10p1). Load-bearing: the Apple SDK headers park pragmas inside
+    // unsupported-configuration branches by the hundred.
+    //
+    // In the unsuppressable closed table, on the `#error` argument: the whole
+    // point of the code is that a pragma with real translation semantics must not
+    // be silenceable into shipping the wrong layout.
+    P_PreprocessorPragma          = 0x0020,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
@@ -1023,6 +1052,29 @@ enum class DiagnosticCode : std::uint16_t {
     // Reported by the semantic tier, which is the only place that sees both
     // attribute facts and the declared type. Renders error[S005A].
     S_ConflictingInlineAttributes = 0xE05A,
+
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): a composite specifier whose LEADING
+    // TOKEN was emitted by the preprocessor under TWO DIFFERENT `#pragma pack`
+    // caps — i.e. the composite is defined inside a macro replacement list that
+    // is expanded under more than one cap. The token's source position therefore
+    // does not determine its layout, and the two candidate layouts have different
+    // sizes and different field offsets.
+    //
+    // ★ WHY THIS IS A SEMANTIC CODE AND NOT A PREPROCESSOR ONE, MEASURED. The
+    // first implementation raised the conflict in the PREPROCESSOR, at the moment
+    // a token was stamped twice — and that fires on perfectly legal C: a shared
+    // MEMBER macro (`#define MEMS unsigned a; long long b;`) used inside two
+    // different pack regions stamps its own tokens under both caps, while every
+    // composite that uses it is anchored on an UNAMBIGUOUS `struct` keyword and
+    // lays out correctly. MEASURED: DSS refused a program clang compiles. Only
+    // the semantic tier knows which offsets are actually used as a composite's
+    // layout key, so that is where the ambiguity can be judged instead of merely
+    // detected. The preprocessor records the ambiguity (a sentinel cap) and says
+    // nothing; this fires only if a composite really lands on one.
+    //
+    // Unsuppressable, on the `P_PreprocessorPragma` argument: the alternative to
+    // erroring is picking one of two layouts silently.
+    S_PragmaPackAmbiguous = 0xE05B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

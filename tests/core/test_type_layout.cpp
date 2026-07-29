@@ -559,6 +559,120 @@ TEST(TypeLayout, CompositeAlignedRaisesAggregateAlignAndSize) {
     EXPECT_EQ(ln.size, 8u);
 }
 
+// ── ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` MEMBER-ALIGNMENT CAP ──
+//
+// The EXACT DUAL of the `aligned(N)` block above: that one RAISES the aggregate's
+// alignment, this one CLAMPS each member's — so it moves field OFFSETS, which
+// `aligned(N)` never does. `computeLayout` realizes it by capping each field's
+// baseline alignment before the member-`alignas` MAX-fold.
+//
+// Every number below was MEASURED with clang on arm64 macOS (compiled AND run).
+// Each is RED-ON-DISABLE: remove the cap from the Struct or Union arm and the
+// assertion reverts to the uncapped natural value.
+[[nodiscard]] TypeId cappedComposite(TypeInterner& ti, TypeKind kind,
+                                     std::string_view name, std::uint64_t key,
+                                     std::span<TypeId const> fields,
+                                     std::uint32_t cap, bool packed = false,
+                                     std::uint32_t explicitAlign = 0) {
+    TypeId const s = ti.forwardComposite(kind, name, key);
+    ti.completeComposite(s, fields, packed, /*fieldBitWidths=*/{},
+                         /*fieldOffsets=*/{}, /*fieldAligns=*/{}, explicitAlign,
+                         cap);
+    return s;
+}
+
+TEST(TypeLayout, PragmaPackCapsMemberAlignmentAndMovesOffsets) {
+    auto ti = makeInterner(1);
+    // THE CORPUS WITNESS, `sys/fcntl.h`'s `struct log2phys` under `#pragma
+    // pack(4)`: { unsigned int; long long; long long }.
+    // clang MEASURED: offsets 0/4/12, size 20, align 4.
+    // Uncapped it is  offsets 0/8/16, size 24, align 8 — the value DSS computed
+    // before this cycle, for a struct sqlite hands to `fcntl(F_LOG2PHYS)`.
+    std::array<TypeId, 3> const fields{ti.primitive(TypeKind::U32),
+                                       ti.primitive(TypeKind::I64),
+                                       ti.primitive(TypeKind::I64)};
+    TypeId const capped =
+        cappedComposite(ti, TypeKind::Struct, "log2phys", 1, fields, 4u);
+    EXPECT_EQ(ti.maxFieldAlign(capped), 4u);
+    auto const l = layoutOf(capped, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 3u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.fieldOffsets[2], 12u);  // RED-ON-DISABLE (uncapped 16)
+    EXPECT_EQ(l.align.bytes(), 4u);     // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 20u);             // RED-ON-DISABLE (uncapped 24)
+
+    // The CONTROL that makes every line above non-vacuous: the SAME fields with
+    // no cap. It is also the interning pin — the cap is part of the content
+    // identity, so these are two DISTINCT TypeIds and must not collapse.
+    std::array<TypeId, 3> const fields2{ti.primitive(TypeKind::U32),
+                                        ti.primitive(TypeKind::I64),
+                                        ti.primitive(TypeKind::I64)};
+    TypeId const nat = ti.structType("log2phys", fields2);
+    EXPECT_NE(nat.v, capped.v)
+        << "identical fields under different pack caps lay out to different "
+           "sizes; collapsing them onto one TypeId is a layout miscompile";
+    EXPECT_EQ(ti.maxFieldAlign(nat), 0u);
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.fieldOffsets[1], 8u);
+    EXPECT_EQ(ln.align.bytes(), 8u);
+    EXPECT_EQ(ln.size, 24u);
+}
+
+TEST(TypeLayout, PragmaPackCapWeakerThanNaturalIsANoOp) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(16)` over { char; unsigned } asks for a cap LOOSER than
+    // every member's natural alignment — a no-op, exactly like an `aligned(N)`
+    // weaker than natural. A cap that ROUNDED UP would be a silent over-align.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s = cappedComposite(ti, TypeKind::Struct, "L", 1, fields, 16u);
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);
+    EXPECT_EQ(l.align.bytes(), 4u);
+    EXPECT_EQ(l.size, 8u);
+}
+
+TEST(TypeLayout, PragmaPackCapAndPackedComposeWithPackedWinning) {
+    auto ti = makeInterner(1);
+    // gcc: an explicit `__attribute__((packed))` is NOT weakened by a
+    // surrounding `#pragma pack(4)` — the stricter (1) wins. { char; unsigned }
+    // is then 5/1, not the cap's 8/4.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s = cappedComposite(ti, TypeKind::Struct, "PK", 1, fields, 4u,
+                                     /*packed=*/true);
+    auto const l = layoutOf(s, ti);
+    EXPECT_EQ(l.fieldOffsets[1], 1u) << "packed wins over the pack cap";
+    EXPECT_EQ(l.align.bytes(), 1u);
+    EXPECT_EQ(l.size, 5u);
+
+    // And the cap composes with a whole-composite `aligned(N)` in the other
+    // direction: the cap lowers members, the request raises the aggregate.
+    std::array<TypeId, 2> const f2{ti.primitive(TypeKind::U32),
+                                   ti.primitive(TypeKind::I64)};
+    TypeId const both = cappedComposite(ti, TypeKind::Struct, "BOTH", 2, f2, 4u,
+                                        /*packed=*/false, /*explicitAlign=*/16u);
+    auto const lb = layoutOf(both, ti);
+    EXPECT_EQ(lb.fieldOffsets[1], 4u) << "the cap still moves the member";
+    EXPECT_EQ(lb.align.bytes(), 16u) << "the request still raises the aggregate";
+    EXPECT_EQ(lb.size, 16u);
+}
+
+TEST(TypeLayout, PragmaPackCapOnUnionLowersAlignAndSize) {
+    auto ti = makeInterner(1);
+    // A union places every member at offset 0, so a cap cannot move an offset —
+    // it lowers the union's own alignment, and therefore the size it rounds up
+    // to. { char; long long } under pack(4) is 8/4; uncapped it is 8/8.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::I64)};
+    TypeId const u = cappedComposite(ti, TypeKind::Union, "U", 1, fields, 4u);
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 8u);
+}
+
 TEST(TypeLayout, CompositeAlignedWeakerThanNaturalIsANoOp) {
     auto ti = makeInterner(1);
     // ★ THE MAX-vs-ASSIGNMENT CONTROL. clang:
