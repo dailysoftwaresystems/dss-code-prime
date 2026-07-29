@@ -4243,6 +4243,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // red-on-disable pin.
             readOptWord("pragmaPackPushWord",    cfg.pragmaPackPushWord);
             readOptWord("pragmaPackPopWord",     cfg.pragmaPackPopWord);
+            // TF-C85: the `optimizerControl` region words. OPTIONAL and
+            // independent on the same terms as the pack pair — absent ⇒ every
+            // `#pragma optimize` form fails loud as unbuilt (never a silent
+            // no-op), which is this pair's red-on-disable pin.
+            readOptWord("pragmaOptimizeOnWord",  cfg.pragmaOptimizeOnWord);
+            readOptWord("pragmaOptimizeOffWord", cfg.pragmaOptimizeOffWord);
             // TF-C82: the OPT-OUT. Absent/false ⇒ an unregistered pragma is
             // silently ignored (C 6.10.6p2, the pre-TF-C82 behavior); true ⇒ loud
             // `P_PreprocessorPragma`. Default false so a language that declares no
@@ -4272,11 +4278,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // `kEffectVerbs` precedent, which was written after exactly
                     // that drift was MEASURED in the attribute loader).
                     static constexpr std::array<
-                        std::pair<std::string_view, PragmaEffect>, 4>
+                        std::pair<std::string_view, PragmaEffect>, 6>
                         kPragmaVerbs{{
                             {"diagnosticsOnly", PragmaEffect::DiagnosticsOnly},
                             {"annotationOnly",  PragmaEffect::AnnotationOnly},
+                            {"realizationRequestOnly",
+                             PragmaEffect::RealizationRequestOnly},
                             {"structPacking",   PragmaEffect::StructPacking},
+                            {"optimizerControl", PragmaEffect::OptimizerControl},
                             {"unsupported",     PragmaEffect::Unsupported}}};
                     DSS_CHECK_KEY_VOCABULARY(kPragmaVerbs);
                     static constexpr std::array<std::string_view, 2>

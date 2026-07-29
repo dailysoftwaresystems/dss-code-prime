@@ -237,6 +237,13 @@ struct Lowerer {
     // reaches MIR from only two of three sites is an intermittent, shape-
     // dependent optimization gap that no single test would localize.
     std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwaysInlineAcc;
+    // ★★ TF-C85: the same accumulator, a FOURTH axis over — (FUNCTION decl HIR
+    // node → NoOptimizeAttr) pairs from the bound symbol's
+    // `SymbolRecord.isNoOptimize`, applied to the result's HirNoOptimizeMap
+    // after finish(). Recorded at ALL THREE Function lowering sites for the
+    // reason its two neighbours are: a flag arriving from only two of three
+    // sites is a shape-dependent gap no single test would localize.
+    std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noOptimizeAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
     // ThreadLocalAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
@@ -1064,6 +1071,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, NoInlineAttr>>& noinl,
             std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwinl,
+            std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noopt,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
@@ -1074,7 +1082,7 @@ struct Lowerer {
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
-          alwaysInlineAcc(alwinl),
+          alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
           threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
@@ -1709,6 +1717,17 @@ struct Lowerer {
         if (rec != nullptr && rec->isAlwaysInline)
             alwaysInlineAcc.push_back(
                 {node, AlwaysInlineAttr{/*isAlwaysInline=*/true}});
+    }
+    // ★★ TF-C85: the same shape again — record the optimizer opt-out for a
+    // lowered Function node from its bound symbol's `SymbolRecord.isNoOptimize`
+    // (sparse: only functions inside a `#pragma optimize("", off)` region are
+    // stored; absence ⇒ optimize normally, i.e. every function before TF-C85).
+    void recordNoOptimize(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isNoOptimize)
+            noOptimizeAcc.push_back(
+                {node, NoOptimizeAttr{/*isNoOptimize=*/true}});
     }
     // Record const-ness for a lowered Global node from its bound symbol's
     // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
@@ -8940,6 +8959,7 @@ struct Lowerer {
         recordLinkage(fn_, linkAttr);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         return fn_;
     }
 
@@ -9268,6 +9288,7 @@ struct Lowerer {
         recordLinkage(fn_, linkAttr);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         return fn_;
     }
 
@@ -9546,6 +9567,7 @@ struct Lowerer {
         recordLinkage(fn_, linkAttr);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         return fn_;
     }
 
@@ -9697,6 +9719,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // AlwaysInlineAttr) accumulator, moved onto result->alwaysInlineMap after
     // finish().
     std::vector<std::pair<HirNodeId, AlwaysInlineAttr>> alwaysInlineAcc;
+    // TF-C85: the `#pragma optimize("", off)` region flag accumulator.
+    std::vector<std::pair<HirNodeId, NoOptimizeAttr>> noOptimizeAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
@@ -9730,7 +9754,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, noInlineAcc, alwaysInlineAcc,
+            mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
@@ -9811,6 +9835,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->noInlineMap.set(id, attr);
     for (auto& [id, attr] : alwaysInlineAcc)   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         result->alwaysInlineMap.set(id, attr);
+    for (auto& [id, attr] : noOptimizeAcc)     // TF-C85 (#pragma optimize)
+        result->noOptimizeMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1

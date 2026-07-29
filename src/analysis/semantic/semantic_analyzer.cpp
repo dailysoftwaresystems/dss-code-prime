@@ -367,6 +367,24 @@ struct EngineState {
         return it == pragmaPack->end() ? 0u : it->second;
     }
 
+    // ★★ TF-C85: the CURRENT tree's `#pragma optimize` stamps
+    // (`CompilationUnit::pragmaNoOptimizeFor`), bound beside `pragmaPack` in the
+    // Pass 1.5 loop and null outside it. Null / absent-offset both mean
+    // "optimize normally", which is exactly the pre-TF-C85 behavior, so every
+    // non-preprocessed and every `#pragma optimize`-free TU is untouched.
+    std::unordered_set<std::uint32_t> const* pragmaNoOptimize = nullptr;
+
+    // TRUE iff the token at synth byte `offset` was emitted inside a
+    // `#pragma optimize("", off)` region. An EXACT per-token lookup, not a range
+    // search — the same argument as `packCapAtOffset`: the state is stamped at
+    // EMISSION, so a function definition that arrived from a macro replacement
+    // list answers with the state at its INVOCATION rather than the one
+    // surrounding its `#define`.
+    [[nodiscard]] bool noOptimizeAtOffset(std::uint32_t offset) const {
+        if (pragmaNoOptimize == nullptr) return false;
+        return pragmaNoOptimize->contains(offset);
+    }
+
     [[nodiscard]] TypeId typeAt(NodeId id) const {
         auto const* p = nodeToType.tryGet(id);
         return p ? *p : InvalidType;
@@ -6831,6 +6849,22 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // kind cannot honor it must not carry it).
                         if (isFnSig && attrFacts.alwaysInline)
                             s.symbols.at(sym).isAlwaysInline = true;
+                        // ★★ TF-C85: the `#pragma optimize("", off)` region flag.
+                        // Same FnSig gate and the same reason (it feeds a CODEGEN
+                        // decision), but its SOURCE is different in kind from the
+                        // two blocks above: not an attribute on this declaration,
+                        // but the lexically scoped preprocessor state that was in
+                        // effect where this declaration's LEFTMOST TOKEN was
+                        // EMITTED. `node` is this declaration's node; its leftmost
+                        // token is the key the preprocessor stamped (a macro-borne
+                        // definition therefore answers with the state at its
+                        // INVOCATION, which is the whole reason the stamps are
+                        // per-token rather than per-byte-range).
+                        if (isFnSig
+                            && s.noOptimizeAtOffset(
+                                   leftmostTokenOffset(tree, node))) {
+                            s.symbols.at(sym).isNoOptimize = true;
+                        }
                         // TF-C81: ★ THE CONTRADICTION GATE. `always_inline` and
                         // `noinline` on ONE declaration are exact opposites — one
                         // forbids splicing the callee, the other exists solely to
@@ -12508,9 +12542,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // composite types. Index-parallel to `trees()` by construction (the
         // builder emits one map per tree); an empty/absent map means no cap.
         s.pragmaPack = &cu->pragmaPackFor(ti);
+        // TF-C85: and at THIS tree's `#pragma optimize` stamps. Bound at the same
+        // seam for the same reason — Pass 1.5 is the walk that resolves function
+        // signatures, so it is the only pass that can ask "was this function
+        // DEFINED inside a no-optimize region".
+        s.pragmaNoOptimize = &cu->pragmaNoOptimizeFor(ti);
         resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
     }
     s.pragmaPack = nullptr;   // no tree is active outside the per-tree walk
+    s.pragmaNoOptimize = nullptr;
 
     // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
     // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};

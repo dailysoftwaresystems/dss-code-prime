@@ -188,9 +188,14 @@ public:
         // the merged module is what the optimizer runs on, so a flag dropped
         // here would silently restore the size threshold for an `always_inline`
         // function that came from CU A.
+        // TF-C85: and the optimizer opt-out, across the same boundary and for
+        // the same reason — the merged module is what the optimizer runs on, so
+        // a flag dropped here would let a function the source put inside a
+        // `#pragma optimize("", off)` region be optimized after link.
         MirFuncId const newF = dst_.addFunction(
             sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
-            src_.funcNoInline(f), src_.funcAlwaysInline(f));
+            src_.funcNoInline(f), src_.funcAlwaysInline(f),
+            src_.funcNoOptimize(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);

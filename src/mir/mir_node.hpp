@@ -301,10 +301,39 @@ struct MirFunc {
     // Takes the LAST byte of the original 2-byte `_pad` — MEASURED, sizeof stays
     // 24 and the static_assert below still holds.
     bool             alwaysInline = false;                   // 1
-    // NOTE (TF-C81): there is deliberately NO `_pad` member any more. The four
-    // 1-byte fields above (binding, visibility, noInline, alwaysInline) now fill
-    // the 4-byte tail slot EXACTLY, so explicit padding would be a lie about the
-    // layout rather than documentation of it.
+    // ★★ TF-C85: the source put this function inside an MSVC
+    // `#pragma optimize("", off)` region — the optimizer must rebuild it
+    // VERBATIM. Reaches here by a route whose LAST FOUR HOPS are its two
+    // neighbours' verbatim (SymbolRecord → HirNoOptimizeMap → this bit) but
+    // whose FIRST hop is different in kind: not an attribute on the declaration
+    // but a LEXICALLY SCOPED PREPROCESSOR REGION, stamped per emitted token so a
+    // macro-borne definition answers with the state at its INVOCATION.
+    //
+    // ★ IT NEUTERS POLICY, IT NEVER SKIPS A REBUILD. `MirFunctionRebuilder`
+    // swaps the pass's policy for an identity policy when this bit is set; it
+    // still calls `rebuildFunction`, because SKIPPING the call would not
+    // preserve the function — it would DELETE it from the rebuilt module.
+    //
+    // ★ DIRECTION OF A DROPPED FLAG: `alwaysInline`'s, not `noInline`'s. Every
+    // DSS optimizer pass is semantics-preserving, so a lost `true` means the
+    // function got optimized after all — a directive not honored, never a wrong
+    // program. It is carried through every MirFunc creation/copy/rebuild/
+    // serialize path regardless, because (TF-C81, MEASURED) a half-landed flag
+    // and no flag are indistinguishable in the emitted binary.
+    //
+    // ★ AND IT IS NOT AN FP FIX. sqlite's motivating use (`ext/misc/totype.c`)
+    // targets x87 excess precision, which MEASURED cannot occur in this tree —
+    // integer-only const-fold maps, no reassociation, no FMA/fast-math, `double`
+    // is SSE2 at exactly 64 bits. This bit is faithfulness to a source
+    // directive; describing it as repairing a live miscompile would be false.
+    //
+    // Takes one more byte from the tail; MEASURED (mir_node's own padding note)
+    // sizeof goes 24 → 28 and the `<= 32` static_assert below still holds.
+    bool             noOptimize = false;                     // 1
+    // NOTE (TF-C81, amended TF-C85): there is deliberately NO `_pad` member. The
+    // five 1-byte fields above (binding, visibility, noInline, alwaysInline,
+    // noOptimize) sit in the tail slot, so explicit padding would be a lie about
+    // the layout rather than documentation of it.
     //
     // ★ PADDING BUDGET — MEASURED (TF-C82), replacing a WRONG prediction this
     // comment used to carry ("the next flag grows the struct 24 → 32; it should

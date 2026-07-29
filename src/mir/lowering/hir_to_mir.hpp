@@ -309,6 +309,16 @@ lowerToMir(Hir const&               hir,
            // before this key existed. Read here to stamp `MirFunc.alwaysInline`.
            // Keyed on the same declaration node as `linkageMap` / `noInlineMap`
            // and read at the same site.
-           HirAlwaysInlineMap const* alwaysInlineMap = nullptr);
+           HirAlwaysInlineMap const* alwaysInlineMap = nullptr,
+           // ★★ TF-C85: per-FUNCTION-DECLARATION OPTIMIZER OPT-OUT side-table,
+           // populated by the CST→HIR lowerer from each function's bound symbol
+           // `SymbolRecord.isNoOptimize` — which the semantic tier set from the
+           // preprocessor's `#pragma optimize("", off)` REGION stamps, not from
+           // an attribute. Optional: nullptr (or a decl with no entry) ⇒
+           // optimize normally, which is both the correct reading of a function
+           // outside every region and the behavior before this key existed.
+           // Read here to stamp `MirFunc.noOptimize`. Keyed on the same
+           // declaration node as the three maps above and read at the same site.
+           HirNoOptimizeMap const*  noOptimizeMap = nullptr);
 
 } // namespace dss

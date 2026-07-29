@@ -204,7 +204,8 @@ struct Lowered {
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,
-                                    &hir->alwaysInlineMap);   // TF-C81
+                                    &hir->alwaysInlineMap,   // TF-C81
+                                    &hir->noOptimizeMap);   // TF-C85
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -549,7 +550,8 @@ namespace {
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,   // TF-C78
-                                    &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap);   // TF-C85 (#pragma optimize)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -615,7 +617,8 @@ namespace {
                                     &hir->synthRecipeBySymbol,
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,   // TF-C78
-                                    &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap);   // TF-C85 (#pragma optimize)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -2540,6 +2543,138 @@ TEST(MirLoweringCSubsetLinkage, AlwaysInlineBypassesThresholdInShippedRelease) {
         << "THE APPLIED FACT: an over-threshold __attribute__((always_inline)) "
            "callee MUST be inlined by the SHIPPED release pipeline — the Call "
            "has to be GONE, not merely the program compiled";
+}
+
+// ══ TF-C85: the `#pragma optimize("", off)` REGION, source -> MirFunc ════════
+namespace {
+// Two functions; the FIRST sits inside a no-optimize region, the second after
+// it. `guard` lets the same fixture be built WITHOUT the pragmas for the
+// non-vacuous twin, so the only difference between the two programs is the two
+// pragma lines.
+//
+// The region is spelled UNGUARDED (no `#if defined(_MSC_VER)`) on purpose: the
+// pragma vocabulary is language config, not target config, so it must work under
+// this harness's default elf target. The PROFILE-gating half is what
+// `Preprocessor.TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows`
+// pins; conflating the two here would make this test depend on predefines it has
+// no reason to care about.
+std::string noOptimizeRegionSource(bool guard) {
+    std::string s;
+    if (guard) s += "#pragma optimize(\"\", off)\n";
+    s += "int shielded(int k) { return k * 3 + 1; }\n";
+    if (guard) s += "#pragma optimize(\"\", on)\n";
+    s += "int exposed(int k) { return k * 5 + 2; }\n";
+    s += "int main(void) { return shielded(1) + exposed(2); }\n";
+    return s;
+}
+// The `noOptimize` bit of the function whose HIR symbol name is `name`, found by
+// walking the module's symbol names.
+[[nodiscard]] std::optional<bool> noOptimizeOfNamed(Lowered const& L,
+                                                    std::string_view name) {
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        auto const* rec = L.model.recordFor(SymbolId{m.funcSymbol(f).v});
+        if (rec == nullptr || rec->name != name) continue;
+        return m.funcNoOptimize(f);
+    }
+    return std::nullopt;
+}
+} // namespace
+
+// ★★ THE END-TO-END CHAIN, SOURCE TO MIR. `#pragma optimize("", off)` in C text
+// -> preprocessor region stamps -> SymbolRecord.isNoOptimize -> HirNoOptimizeMap
+// -> MirFunc.noOptimize. Six hops, and the assertion is the APPLIED FACT at the
+// far end rather than "it compiled".
+//
+// RED-ON-DISABLE (re-verified against the FINAL build): remove the
+// `["optimize"]` row from `c-subset.lang.json` and the source stops compiling at
+// all (the pragma goes unregistered and loud); keep the row but drop the
+// `noOptimizeMap` argument at `hir_to_mir.cpp`'s `addFunction` and the first
+// EXPECT below flips to false while everything else stays green.
+TEST(MirLoweringCSubsetNoOptimize, PragmaOptimizeRegionThreadsToMirFuncNoOptimize) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+
+    EXPECT_EQ(noOptimizeOfNamed(L, "shielded"), std::optional<bool>{true})
+        << "a function DEFINED inside the region must reach MIR with the flag";
+    EXPECT_EQ(noOptimizeOfNamed(L, "exposed"), std::optional<bool>{false})
+        << "`optimize(\"\", on)` CLOSES the region — a function after it must "
+           "NOT carry the flag, or the rest of the file stops being optimized";
+    EXPECT_EQ(noOptimizeOfNamed(L, "main"), std::optional<bool>{false});
+
+    // ANTI-SWAP: three adjacent trailing bools at every addFunction copy site.
+    // The shielded function sets exactly ONE of them, so a transposition fails.
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        EXPECT_FALSE(m.funcNoInline(f))
+            << "no source here spells noinline — the flag must not be acquired";
+        EXPECT_FALSE(m.funcAlwaysInline(f))
+            << "nor always_inline";
+    }
+}
+
+// ★ THE NON-VACUOUS TWIN: the byte-identical program WITHOUT the two pragma
+// lines. Every function comes through with the flag CLEAR, so the test above is
+// a statement about the pragma rather than about the fixture.
+TEST(MirLoweringCSubsetNoOptimize, WithoutThePragmaNoFunctionCarriesTheFlag) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/false).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_GT(m.moduleFuncCount(), 0u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoOptimize(m.funcAt(i)))
+            << "no `#pragma optimize` in the source ⇒ no function is excluded";
+}
+
+// ★★ AND IT SURVIVES THE SHIPPED RELEASE PIPELINE. The flag has to be present at
+// the far end of `opt::optimize` (loaded BY NAME from `release.pipeline.json`,
+// not a hand-written pass list) or the neuter is armed for exactly one pass and
+// gone. This is the pin that catches a dropped propagation argument at ANY of
+// the copy hops the shipped pipeline actually exercises.
+TEST(MirLoweringCSubsetNoOptimize, FlagSurvivesTheShippedReleasePipeline) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // The pre-optimization symbol of the shielded function, so the post-pipeline
+    // lookup does not depend on the semantic model surviving the move.
+    std::uint32_t shieldedSym = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcNoOptimize(f)) shieldedSym = m.funcSymbol(f).v;
+    }
+    ASSERT_NE(shieldedSym, 0u) << "fixture precondition: one function is flagged";
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value());
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    bool found = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcSymbol(f).v != shieldedSym) continue;
+        found = true;
+        EXPECT_TRUE(m.funcNoOptimize(f))
+            << "THE APPLIED FACT: the flag must still be set after the SHIPPED "
+               "release pipeline has run all 4 iterations over the module — a "
+               "flag cleared at any rebuild hop re-arms every pass on the next "
+               "iteration";
+    }
+    EXPECT_TRUE(found)
+        << "and the function must still EXIST — neutering swaps the rebuild "
+           "policy, it never skips the rebuild (skipping deletes the function)";
 }
 
 // ── The NON-VACUOUS twin, and the over-threshold PROOF ─────────────
@@ -11481,7 +11616,8 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     /*synthRecipeMap=*/nullptr,
                                     &hir->returnsTwiceMap,    // FC17.9(c) (D-CSUBSET-SETJMP)
                                     &hir->noInlineMap,        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
-                                    &hir->alwaysInlineMap);  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->alwaysInlineMap,  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap);  // TF-C85 (#pragma optimize)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

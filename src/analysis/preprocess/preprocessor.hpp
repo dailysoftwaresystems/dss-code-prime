@@ -80,6 +80,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dss {
@@ -238,6 +239,24 @@ struct DSS_EXPORT PreprocessResult {
     // semantic tier turns it into `S_PragmaPackAmbiguous` only when a composite
     // actually lands on such an offset.
     std::unordered_map<std::uint32_t, std::uint32_t> pragmaPackByOffset;
+
+    // ★★ TF-C85 (`optimizerControl`): the `#pragma optimize` product — the synth
+    // byte offsets of tokens the preprocessor emitted inside a
+    // `#pragma optimize("", off)` region. An offset ABSENT from the set means
+    // "optimize normally", so an EMPTY set (every TU that uses no
+    // `#pragma optimize` — i.e. every TU before this cycle) is exactly the old
+    // behavior at zero cost.
+    //
+    // Keyed PER TOKEN for the identical reason `pragmaPackByOffset` is: a region
+    // list says where the PRAGMA sits, while this says what was in effect when a
+    // TOKEN was emitted, and the two disagree exactly when a function definition
+    // arrives from a macro replacement list. The consumer (the semantic tier's
+    // Pass 1.5) looks up a function DECLARATION's leftmost emitted token.
+    //
+    // A token emitted BOTH inside and outside a region resolves to OFF and says
+    // nothing — see `noOptimizeByOffset_` in the .cpp for why that is a sound
+    // resolution here and was NOT one for `pack`.
+    std::unordered_set<std::uint32_t> pragmaNoOptimizeByOffset;
 
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the

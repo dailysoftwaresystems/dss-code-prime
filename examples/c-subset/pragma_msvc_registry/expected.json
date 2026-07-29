@@ -1,0 +1,45 @@
+{
+  "$comment": "TF-C85: the THREE MSVC pragmas the pe64 sqlite leg reaches are CLAIMED by `preprocess.pragmaEffects` rows -- `warning` -> diagnosticsOnly, `intrinsic` -> realizationRequestOnly (a NEW verb), `optimize` -> optimizerControl (a REAL per-function sink) -- and the sink produces a CORRECT runnable program under the SHIPPED release optimizer on all four targets. shielded(3)=10 and exposed(3)=10 by identical bodies, so the program exits 42.\n★ WHAT THIS REPAIRS. TF-C82 made an unclaimed `#pragma` a hard error and built its row set from a REACHED census taken with `clang -E` ON macOS -- an instrument that structurally cannot see MSVC-gated code, because `_MSC_VER` is never defined under it, while DSS's `pe` profile DOES define it (_MSC_VER=1943). MEASURED at TF-C85: the pe64 sqlite build was BROKEN by exactly 2135 `error[P0020]` across 113 of 189 TUs -- `warning` 1685 (src/msvc.h:19-33 x 112 + mutex_w32.c:40,41,64 + totype.c:439,504), `intrinsic` 448 (src/sqliteInt.h:312-315 x 112), `optimize` 2 (ext/misc/totype.c:440,505) -- rc=1, no binary. After this cycle: 0 error[P0020].\n★★ AND A GREEN BUILD DOES NOT PROVE THE ROW SET IS COMPLETE. A reached-set is a function of the manifest's defines AND of how far each TU gets. MEASURED: sqlite's `ext/rtree/rtree.c` carries two MORE `#pragma intrinsic` lines under the same guard and contributes ZERO, because its whole body sits in a not-taken `#if !defined(SQLITE_CORE) || defined(SQLITE_ENABLE_RTREE)` branch and C 6.10p1 makes an elided pragma entirely silent (re-confirmed by compiling that TU alone). Completeness is what the profile-census guard keeps reviewable, not what this example asserts.\n★ THE PRAGMAS ARE SPELLED UNGUARDED, DELIBERATELY. In sqlite they sit behind `#if defined(_MSC_VER)`; here they must be REACHED on every target, because the rows that claim them are LANGUAGE config, not target config. The profile-gating half -- pe reaches them, macho/elf elide them -- is pinned separately by `Preprocessor.TfC85NoUnclaimedPragmaUnderAnyPredefineClass` and its non-vacuity twin over `tests/corpus/c-subset/pragma_profile_census.c`.\n★★ WHY THE `intrinsic` ARM NAMES FOUR INTRINSICS AND CALLS NONE -- THAT IS THE WITNESS, NOT A GAP. `#pragma intrinsic` asks HOW a listed name is realized, never WHETHER it exists. MEASURED from shippedLibs/intrin.json: `_ReadWriteBarrier` IS realized (an always-on lowered builtin, `lowering:barrier`) while the three `_byteswap_*` are NOT DECLARED AT ALL. The row is true of all four anyway, because a reference to a name DSS does not provide fails loud at the CALL SITE (S0001) whether or not the pragma was honored -- MEASURED in the field the moment the pragma wall came down, at sqlite `src/btree.c:23784` (_byteswap_ushort) and `src/util.c:24880,24893` (_byteswap_ulong), which also REFUTES intrin.json's old claim that nothing references them (under the pe profile SQLITE_BYTEORDER IS 1234 and the fast path IS live). D-CSUBSET-INTRINSIC-BSWAP is consequently TRIGGERED on the pe leg, not merely gated.\n★★ WHAT THE `optimize` ARM WITNESSES, AND WHAT IT REFUSES TO CLAIM. Every DSS optimizer pass is semantics-preserving, so NO exit code can distinguish optimized from not-optimized -- which is why `shielded` and `exposed` have IDENTICAL bodies and the program asserts they AGREE. That agreement is NOT a tautology: `shielded` is rebuilt VERBATIM (the shared `MirFunctionRebuilder` swaps in an identity policy) while `exposed` goes through ConstFold/Mem2Reg/CopyProp/Cse/Licm/SimplifyCfg/Dce, so a defect in the neuter lands here as a wrong exit code on four targets at once. The body is SHAPED BY TWO REAL BUGS this cycle found in its own first draft, both MEASURED on the real pe64 corpus: (a) the for/if diamond gives `shielded` PHI NODES -- neutering without notifying `Mem2Reg` (which plans phis in `analyze` and wires them in a POST-rebuild step) ABORTED the whole build with 'phi marker has incomings but no emitted phi'; (b) the unreachable `return` gives it a DEAD BLOCK -- neutering `PruneUnreachable`, which is MANDATORY NORMALIZATION rather than optimization, left it alive and produced four `I_UnreachableBlock` verifier errors on `ext/misc/totype.c` alone. A `#pragma optimize` region switches optimization off; it has never meant 'emit invalid IR'.\n★ AND IT IS NOT A FLOATING-POINT FIX. MSVC's own motivating use (totype.c) targets x87 EXCESS PRECISION. MEASURED in this tree that hazard structurally CANNOT occur: const_fold's fold maps are integer-only (zero FAdd/FMul/FDiv/FCmp/SIToFP arms), there is no reassociation pass, there is no FMA or fast-math anywhere, and `double` is SSE2 at exactly 64 bits (x87 is F80-only). This sink is FAITHFULNESS to a real MSVC contract that also unblocks pe64 -- describing it as repairing a live miscompile would be a false claim.\n★ RED-ON-DISABLE, re-verified against the FINAL build. (a) Rename any of the three row PREFIXES in c-subset.lang.json (`warning`/`intrinsic`/`optimize`) and THIS EXAMPLE STOPS COMPILING -- the pragma becomes unregistered and P0020 fires; the dedicated pins are `Preprocessor.TfC85{Warning,Intrinsic}RowIsWhatMakesThe...PragmaSilent` and `TfC85OptimizeRowAndItsStateWordsAreConfigDriven`. (b) Delete `pragmaOptimizeOffWord` and the region form is refused as unbuilt (same test). (c) Drop the `src_.funcNoOptimize(oldFn)` argument at mir_rebuild_helper.cpp: THIS EXAMPLE STAYS GREEN (optimizing `shielded` is still correct, just not what the source asked for) and SIX unit assertions go red -- MEASURED, not predicted: MirRebuildHelper.{RebuildFunctionPreservesNoOptimize, NoOptimizeFunctionIsRebuiltVerbatimUnderAnInjectingPolicy, MandatoryNormalizationPolicyIsNotNeutered}, MirLoweringCSubsetNoOptimize.FlagSurvivesTheShippedReleasePipeline, and Inlining.{NoOptimizeCalleeIsNotInlined, NoOptimizeCallerGetsNothingInlinedIntoIt}. That is the same end-to-end-is-blind-to-a-hop shape TF-C81 measured, said plainly rather than implied. (d) Delete inliner rule 2c ENTIRELY and exactly `Inlining.NoOptimizeCalleeIsNotInlined` fails; delete ONLY its CALLER half and exactly `Inlining.NoOptimizeCallerGetsNothingInlinedIntoIt` fails. ★ The caller half was NOT discriminated at first: with a single-block callee the caller rebuild routes through `MirFunctionRebuilder`, where the neuter already suppresses the splice. The fixture was changed to a TWO-BLOCK callee -- which forces the `MultiBlockInliner` path, whose caller rebuild never touches the rebuilder -- and only then did the caller half become load-bearing. That correction came from running the disable, not from reading the code. (e) Set `mandatoryNormalization()` false in prune_unreachable.cpp and sqlite's `ext/misc/totype.c` alone yields four `I_UnreachableBlock`; remove Mem2RegPolicy's `onFunctionNeutered` override and the same TU SIGABRTs on 'phi marker has incomings but no emitted phi'. Both re-verified against the FINAL build.\n★ The `release` arm is MANDATORY, not decoration: this is an optimizer x feature composition, and a baseline-only example would leave the one interaction that matters unwitnessed.\n★ EXPECTED DSS DIAGNOSTICS: this example emits four `warning[H000D]` (unreachable statement) lines -- one per unreachable `return 0;`, per function. Those dead statements are LOAD-BEARING, not sloppiness: they are what gives `shielded` a dead BLOCK, and the dead block is what proves `PruneUnreachable` still runs on a no-optimize function. DSS is telling the truth; removing the statements would remove the witness.\n★ GROUND TRUTH: `/usr/bin/clang -O2` on this file produces a binary that exits 42, and `-fsyntax-only -Wall -Wextra` reports no errors and no warnings OTHER than `-Wunknown-pragmas` on the eight MSVC pragma lines. That warning is expected and is itself the point -- clang is not MSVC, which is exactly why a macOS clang census could not see these pragmas in the first place.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

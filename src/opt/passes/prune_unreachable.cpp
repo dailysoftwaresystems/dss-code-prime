@@ -39,6 +39,19 @@ public:
         return mirReversePostOrder(src, src.funcEntry(fn));
     }
 
+    // ★★ TF-C85: this pass is EXEMPT from the `MirFunc.noOptimize` neuter, and
+    // the exemption is the reason the flag on that hook is not merely
+    // theoretical. A `#pragma optimize("", off)` function still has to be
+    // WELL-FORMED: this prune is what makes dead-code-after-return (and every
+    // other eager-continuation construct) produce a CFG the MIR verifier
+    // accepts. MEASURED — neutering it here turned sqlite's `ext/misc/totype.c`
+    // (whose `torealFunc`/`tointegerFunc` ARE the corpus's only no-optimize
+    // functions) into four `I_UnreachableBlock` errors. The pragma switches
+    // optimization off; it does not license invalid IR.
+    [[nodiscard]] bool mandatoryNormalization() const noexcept override {
+        return true;
+    }
+
     // Phase 3: drop a phi incoming whose predecessor block did not
     // survive the prune. Mirrors DCE — a dead pred (e.g. a future
     // goto's dead block branching to a reachable label) would otherwise

@@ -217,6 +217,14 @@ public:
     [[nodiscard]] bool funcAlwaysInline(MirFuncId id) const {
         return funcArena_.at(id).alwaysInline;
     }
+    // ★★ TF-C85: TRUE iff the source defined this function inside an MSVC
+    // `#pragma optimize("", off)` region. `MirFunctionRebuilder` (the shared
+    // substrate under all 8 rebuild passes) swaps in an IDENTITY policy for such
+    // a function so it is copied verbatim, and the inliner refuses it in BOTH
+    // directions. See `detail::MirFunc::noOptimize`.
+    [[nodiscard]] bool funcNoOptimize(MirFuncId id) const {
+        return funcArena_.at(id).noOptimize;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -393,11 +401,16 @@ public:
     // pin sets exactly ONE of the two and asserts the OTHER is still clear, so a
     // transposition fails a test instead of shipping. Keep that property when
     // adding pins — a test that sets both flags cannot detect a swap.
+    // TF-C85: `noOptimize` stamps the per-function optimizer opt-out, on the
+    // same terms — a SYNTHESIZED function was never inside a source region, so
+    // the default reads naturally, and every site that COPIES an existing
+    // MirFunc must pass `funcNoOptimize(...)` explicitly.
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding      = SymbolBinding::Global,
                           SymbolVisibility visibility   = SymbolVisibility::Default,
                           bool             noInline     = false,
-                          bool             alwaysInline = false);
+                          bool             alwaysInline = false,
+                          bool             noOptimize   = false);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

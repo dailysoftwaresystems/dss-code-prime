@@ -2007,6 +2007,14 @@ public:
         return packByOffset_;
     }
 
+    // TF-C85 (`optimizerControl`): the synth byte offsets of tokens emitted
+    // inside a `#pragma optimize("", off)` region. EMPTY for every TU that uses
+    // no `#pragma optimize` — the same free-when-unused property as the pack map.
+    [[nodiscard]] std::unordered_set<std::uint32_t> const&
+    pragmaNoOptimizeByOffset() const noexcept {
+        return noOptimizeByOffset_;
+    }
+
     // TF-C82: a `#pragma pack(push, N)` never closed by a `pack(pop)` at end of
     // translation unit. The `#endif`-balance argument applies verbatim: an
     // unbalanced push means the source's own pairing is broken, so `run()` fails
@@ -2354,13 +2362,26 @@ private:
         switch (m->effect) {
             case PragmaEffect::DiagnosticsOnly:
             case PragmaEffect::AnnotationOnly:
+            case PragmaEffect::RealizationRequestOnly:
                 // IGNORED — and ignored because a ROW SAYS SO. That is the whole
                 // difference from the pre-TF-C82 behavior, which looked identical
                 // from the outside and asserted nothing.
+                //
+                // TF-C85: `RealizationRequestOnly` shares this arm and NOT its
+                // meaning. The other two say the pragma does not concern
+                // translation; this one says it concerns HOW a name is realized
+                // and never WHETHER it exists — so ignoring it cannot mask a
+                // missing symbol, because the reference itself is what fails
+                // loud, at the call site, in the semantic tier. See
+                // `PragmaEffect::RealizationRequestOnly`.
                 return;
             case PragmaEffect::StructPacking:
                 applyPackPragma(std::span<Token const>{sig}.subspan(m->words),
                                 diagSpan);
+                return;
+            case PragmaEffect::OptimizerControl:
+                applyOptimizePragma(
+                    std::span<Token const>{sig}.subspan(m->words), diagSpan);
                 return;
             case PragmaEffect::Unsupported: {
                 std::string joined;
@@ -2489,6 +2510,118 @@ private:
             return std::nullopt;
         }
         return static_cast<std::uint32_t>(v);
+    }
+
+    // ★★ TF-C85: MSVC `#pragma optimize` — the `optimizerControl` verb's operand
+    // grammar. `args` are the significant tokens AFTER the matched registry
+    // prefix.
+    //
+    // The BUILT forms are exactly the ones MEASURED reachable in the sqlite
+    // corpus (`ext/misc/totype.c:440` and `:505`, one each):
+    //     optimize ( "" , off )   -> open a no-optimize region
+    //     optimize ( "" , on )    -> close it
+    // The EMPTY option string is MSVC's "all optimizations". A NON-EMPTY one
+    // (`"gt"`, `"s"`, …) names a SELECTIVE subset of MSVC's own optimization
+    // vocabulary, which has no DSS translation at all — so it FAILS LOUD rather
+    // than being silently widened to "all off" (too pessimistic) or "ignored"
+    // (silently keeps a pass the source disabled). Same posture as the unbuilt
+    // `#pragma pack` spellings.
+    //
+    // ★ WHAT THIS SINK HONESTLY IS — DO NOT OVERSTATE IT. It is FAITHFULNESS to
+    // a real MSVC contract, and it is what unblocks the pe64 corpus leg. It is
+    // NOT a fix for a live floating-point miscompile. MEASURED in this tree: no
+    // pass in the shipped release pipeline can perturb float arithmetic —
+    // `const_fold.cpp`'s fold maps are integer-only (no FAdd/FMul/FDiv/FCmp/
+    // SIToFP arms), there is no reassociation pass, there is no FMA/fast-math
+    // anywhere, and `double` is SSE2 at exactly 64 bits (x87 is F80-only). So
+    // totype.c's ACTUAL hazard — x87 excess precision defeating its
+    // round-trip-equality test — structurally cannot occur here. The sink exists
+    // because the source says "do not optimize this function" and DSS now
+    // records and honors that, not because ignoring it was miscompiling today.
+    //
+    // ★ NO END-OF-TU BALANCE CHECK, DELIBERATELY — AND THIS IS WHERE IT DIVERGES
+    // FROM `pack`. `pack(push)` opens a STACK that must pair, so an unmatched
+    // push leaves an alignment nobody can name from the source and fails loud.
+    // `optimize("", off)` is a flat SWITCH: MSVC defines a region with no closing
+    // `on` as running to end of file, so refusing it would reject a legal
+    // program. Different construct, different rule.
+    //
+    // AGNOSTIC: the delimiters are matched by SCHEMA KIND (`parenOpen_`,
+    // `parenClose_`, `argSep_`, and `quoteIncludeKind_` for the string-literal
+    // opener — the same kinds the macro machinery and `_Pragma` already use), and
+    // `on`/`off` come from `pragmaOptimizeOnWord` / `pragmaOptimizeOffWord`. No
+    // `(`, `)`, `,`, `"`, `"on"` or `"off"` byte appears in this function.
+    void applyOptimizePragma(std::span<Token const> args, SourceSpan diagSpan) {
+        auto const bad = [&](std::string_view why) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                   diagSpan,
+                   std::string{"unsupported '#pragma optimize' form: "}
+                       + std::string{why}
+                       + ". The built forms are optimize(\"\", off) and "
+                         "optimize(\"\", on); refusing rather than guessing, "
+                         "because a misread optimize pragma either re-enables "
+                         "passes the source disabled or disables passes it "
+                         "never mentioned");
+        };
+        auto const isKind = [&](Token const& t, SchemaTokenId k) {
+            return k.valid() && t.schemaKind == k;
+        };
+        if (args.size() < 2 || !isKind(args.front(), parenOpen_)
+            || !isKind(args.back(), parenClose_)) {
+            bad("the operand must be a parenthesized list");
+            return;
+        }
+        std::span<Token const> inner = args.subspan(1, args.size() - 2);
+        // `"" , <word>` — at minimum a literal opener, its (empty) body, the
+        // separator and the state word.
+        if (inner.size() < 4 || !isKind(inner[inner.size() - 2], argSep_)) {
+            bad("the operand must be an option string, a separator and a state "
+                "word");
+            return;
+        }
+        // The option string: everything before the separator. A string literal
+        // lexes as OPENER + BODY (+ CLOSER), matched by the CONFIG kind, exactly
+        // as `consumePragmaOperator` matches a `_Pragma` operand — never by the
+        // `"` byte.
+        std::span<Token const> opt = inner.subspan(0, inner.size() - 2);
+        if (opt.size() < 2 || opt.size() > 3
+            || !quoteIncludeKind_.valid()
+            || opt[0].schemaKind != quoteIncludeKind_) {
+            bad("the first operand must be a string literal");
+            return;
+        }
+        if (!text(opt[1]).empty()) {
+            bad("only the EMPTY option string (MSVC's \"all optimizations\") is "
+                "built — a selective option list names optimizations this "
+                "implementation does not have");
+            return;
+        }
+        // The state word. Both spellings come from config and are INDEPENDENT:
+        // a language that declares only one gets the other refused as unbuilt,
+        // which is this pair's red-on-disable pin.
+        std::string_view const word = text(inner.back());
+        if (!cfg().pragmaOptimizeOffWord.empty()
+            && word == cfg().pragmaOptimizeOffWord) {
+            optimizeOff_ = true;
+            return;
+        }
+        if (!cfg().pragmaOptimizeOnWord.empty()
+            && word == cfg().pragmaOptimizeOnWord) {
+            optimizeOff_ = false;
+            return;
+        }
+        bad("the state word is not one the language declares "
+            "('pragmaOptimizeOnWord' / 'pragmaOptimizeOffWord')");
+    }
+
+    // TF-C85: stamp the `#pragma optimize` state onto an EMITTED token, at the
+    // SAME chokepoint and for the same reason as `notePackForToken` — an entity
+    // minted by a macro inside a region otherwise carries the `#define` line's
+    // span, which is nowhere near the region. Sparse: outside a region nothing is
+    // recorded, so the set stays empty and the mechanism is free when unused.
+    void noteNoOptimizeForToken(Token const& t) {
+        if (!optimizeOff_) return;
+        noOptimizeByOffset_.insert(static_cast<std::uint32_t>(t.span.start()));
     }
 
     // ── TF-C82 (`_Pragma`; C 6.10.9): the OPERATOR spelling ───────────────────
@@ -4271,6 +4404,14 @@ private:
         auto emitOut = [&](ExpToken&& e) {
             if (depth == 0 && recordPack_ && !e.placemarker) {
                 notePackForToken(e.tok);
+                // TF-C85: the `#pragma optimize` region rides the SAME
+                // chokepoint under the SAME gate. Both are lexically scoped
+                // pragmas whose product is keyed on EMISSION, so sharing the
+                // gate is what keeps them from drifting apart — a second
+                // stamping site with its own depth/`recordPack_` conditions is
+                // exactly how one of the two would silently stop tracking macro
+                // invocations.
+                noteNoOptimizeForToken(e.tok);
             }
             out.push_back(std::move(e));
         };
@@ -4621,6 +4762,33 @@ private:
     // SAME source token emitted twice under DIFFERENT caps — is detected at
     // insert and fails loud rather than letting last-writer-wins pick a layout.
     std::unordered_map<std::uint32_t, std::uint32_t> packByOffset_;
+
+    // ── TF-C85: the `#pragma optimize` state (the `optimizerControl` verb) ──
+    //
+    // `optimizeOff_` is TRUE between a `#pragma optimize("", off)` and the
+    // matching `("", on)`. Unlike `pack` this state has NO stack: MSVC's
+    // `#pragma optimize` is a flat on/off switch, not a push/pop discipline
+    // (`optimize("", on)` restores the COMMAND-LINE setting, it does not pop a
+    // saved one), so modelling it with a stack would invent a nesting rule the
+    // source language does not have.
+    bool optimizeOff_ = false;
+    // The product: the synth byte offsets of tokens EMITTED while `optimizeOff_`
+    // was set. SPARSE and STICKY — an offset is inserted once and never removed,
+    // so a TU with no `#pragma optimize` (every one before this cycle) produces
+    // an EMPTY set and costs nothing.
+    //
+    // ★ WHY STICKY RATHER THAN A `kAmbiguous` SENTINEL LIKE `pack`'s. The SAME
+    // source token CAN reach the output twice under different states (a macro
+    // whose replacement list is expanded both inside and outside a region) — the
+    // shape that forced `pack` to record an ambiguity and have the semantic tier
+    // judge it. Here that machinery would be dishonest ceremony, because the two
+    // candidate answers are NOT symmetric: `pack` has no safe default (either
+    // layout may be the wrong ABI), whereas every DSS optimizer pass is
+    // semantics-preserving, so resolving a contested token to OFF can only cost
+    // optimization, never correctness. Sticky-off IS that resolution, taken at
+    // the only place that can see the conflict. It is silent DELIBERATELY: there
+    // is no wrong artifact to warn about.
+    std::unordered_set<std::uint32_t> noOptimizeByOffset_;
 };
 
 } // namespace
@@ -4953,6 +5121,7 @@ PreprocessResult preprocess(
     // the semantic tier can ask what alignment cap was in effect at a composite
     // specifier's first token. Empty for every TU that uses no `#pragma pack`.
     result.pragmaPackByOffset = expander.pragmaPackByOffset();
+    result.pragmaNoOptimizeByOffset = expander.pragmaNoOptimizeByOffset();
 
     // c17 (authoritative dead-region oracle): promote the provisional tokenizer
     // diagnostics. A `P_IllegalChar` is forwarded to the real reporter UNLESS its

@@ -1004,6 +1004,64 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
 // keep this robust to any merge reordering. RED-ON-DISABLE: drop the
 // `m.globalIsConst(g)` argument at mir_merge.cpp:625 → both globals come back
 // mutable and the `constCount == 1` expectation fails.
+// ★★ TF-C85: the CROSS-CU merge is the THIRD `MirFunc` copy hop (the other two
+// are `mir_rebuild_helper` and the inliner's own rebuild). The merged module is
+// what the optimizer runs on for an N>1 build, so a `noOptimize` flag dropped
+// here lets a function the source put inside a `#pragma optimize("", off)`
+// region be optimized after link — invisibly, because the single-CU path stays
+// correct and only the multi-CU one changes.
+//
+// RED-ON-DISABLE: drop the `src_.funcNoOptimize(f)` argument at mir_merge.cpp's
+// addFunction (let it default to false) and the first EXPECT_TRUE fails. The
+// un-flagged sibling keeps the test from being satisfiable by hardcoding true,
+// and the cleared inline flags pin the adjacent-bool swap.
+TEST(MirMerge, MergePreservesFunctionNoOptimize) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32   = in0.primitive(TypeKind::I32);
+    TypeId const fnSig = in0.fnSig({}, i32, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // sym 400: noOptimize ONLY — the two inline flags deliberately clear, so
+        // a transposed argument at the copy site fails here.
+        mb.addFunction(fnSig, SymbolId{400}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*noInline=*/false,
+                       /*alwaysInline=*/false, /*noOptimize=*/true);
+        MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b0);
+        mb.addReturn(mb.addConst(i32Lit(7), i32));
+        // sym 401: plain.
+        mb.addFunction(fnSig, SymbolId{401});
+        MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b1);
+        mb.addReturn(mb.addConst(i32Lit(8), i32));
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{400, "shielded"}, {401, "plain"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleFuncCount(), 2u);
+    int flagged = 0, plain = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        MirFuncId const f = mm.funcAt(i);
+        if (mm.funcNoOptimize(f)) ++flagged; else ++plain;
+        EXPECT_FALSE(mm.funcNoInline(f))
+            << "neither source function is noinline — an adjacent-bool swap at "
+               "the merge copy site would land the flag here";
+        EXPECT_FALSE(mm.funcAlwaysInline(f));
+    }
+    EXPECT_EQ(flagged, 1)
+        << "the no-optimize function must survive the cross-CU merge still "
+           "excluded, or an N>1 build silently optimizes it after link";
+    EXPECT_EQ(plain, 1) << "and the plain function must not acquire the flag";
+}
+
 TEST(MirMerge, MergePreservesGlobalConstness) {
     TypeInterner in0{CompilationUnitId{1}};
     TypeId const i32 = in0.primitive(TypeKind::I32);

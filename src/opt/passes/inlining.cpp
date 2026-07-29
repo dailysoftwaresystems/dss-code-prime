@@ -184,6 +184,35 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // Apple clang 21 silently keeps `noinline`, in both source orders).
     if (mir.funcNoInline(callee)) return std::nullopt;
 
+    // ★★ Rule 2c: TF-C85 — never inline ACROSS a `#pragma optimize("", off)`
+    // boundary, in EITHER direction. Both halves are load-bearing and neither
+    // subsumes the other:
+    //   * a no-optimize CALLER must not have a body spliced into it. Inlining is
+    //     an optimization APPLIED TO THE CALLER, so splicing would optimize
+    //     exactly the function the source excluded.
+    //     ★ AND THE CALLER HALF IS NEEDED FOR A REASON THAT WAS MEASURED, NOT
+    //     ASSUMED. `runInlining` has TWO caller-rebuild paths. When every target
+    //     is a SINGLE-BLOCK leaf the caller goes through `MirFunctionRebuilder`
+    //     with an `InliningPolicy` whose `tryRewrite` performs the splice — so
+    //     the `noOptimize` NEUTER already suppresses it and this clause is
+    //     redundant there (MEASURED: with a single-block callee, deleting the
+    //     caller half changed nothing). But ANY multi-block target routes the
+    //     caller through `MultiBlockInliner`, which rebuilds callers with its
+    //     OWN `addFunction` and never touches the rebuilder — and THERE this
+    //     clause is the only protection (MEASURED: with a two-block callee,
+    //     deleting the caller half lets the splice through). The test fixture
+    //     was changed to a two-block callee for exactly that reason.
+    //   * a no-optimize CALLEE must not be spliced OUT. Its body would then be
+    //     re-emitted inside a caller that IS optimized, so every pass the source
+    //     excluded would run over the copy. The directive would hold for the
+    //     out-of-line body and silently not hold for the inlined one.
+    // Checked before rule 6's threshold bypass, so an `always_inline` callee that
+    // is ALSO no-optimize is refused — the conservative resolution of a genuine
+    // conflict of intent, the same ordering discipline rule 2b uses.
+    if (mir.funcNoOptimize(caller) || mir.funcNoOptimize(callee)) {
+        return std::nullopt;
+    }
+
     // Rule 3: never inline a call WITHIN A RECURSIVE CYCLE (OPT7 cycle 3).
     // The call graph's SCCs collapse every recursive cycle to one id; a
     // call whose caller + callee share an SCC is part of a cycle, so
@@ -819,9 +848,14 @@ public:
         // over-threshold and inlined into someone else on a LATER iteration of
         // this very pass — dropping the bit during this rebuild would silently
         // end that after the first iteration.
+        // TF-C85: likewise for the optimizer opt-out. A no-optimize function
+        // reaches this rebuild only as an unmodified caller (the gate below
+        // refuses every splice INTO it), so dropping the bit here would let the
+        // NEXT pass — or the next iteration of this one — start optimizing it.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
                          src_.funcBinding(caller), src_.funcVisibility(caller),
-                         src_.funcNoInline(caller), src_.funcAlwaysInline(caller));
+                         src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
+                         src_.funcNoOptimize(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

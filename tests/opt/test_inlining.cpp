@@ -251,6 +251,61 @@ Mir buildSizedCalleeModule(TypeInterner& interner, std::uint32_t bodyInsts,
     return std::move(mb).finish();
 }
 
+// ★★ TF-C85: the `noOptimize` twin of `buildNoInlineCalleeModule`. Either side
+// of the call can carry the flag, because rule 2c refuses in BOTH directions and
+// the two halves fail differently: a spliced-INTO no-optimize caller is being
+// optimized (the thing the pragma forbids), while a spliced-OUT no-optimize
+// callee gets a COPY of its body inside an optimized caller (the directive
+// silently not holding for the inlined instance). Both are GLOBAL-bound and tiny,
+// so nothing but rule 2c can refuse the splice.
+Mir buildNoOptimizePairModule(TypeInterner& interner, bool calleeNoOptimize,
+                              bool callerNoOptimize) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, calleeNoOptimize);
+    // ★★ TWO BLOCKS, DELIBERATELY — AND THE REASON IS MEASURED. `runInlining`
+    // has two caller-rebuild paths: a module whose targets are all SINGLE-BLOCK
+    // leaves goes through `MirFunctionRebuilder` (where the splice IS a policy
+    // hook, so the `noOptimize` NEUTER already suppresses it and rule 2c's
+    // caller half is redundant), while ANY multi-block target routes the caller
+    // through `MultiBlockInliner`, which rebuilds callers with its OWN
+    // `addFunction` and never touches the rebuilder. MEASURED: with a
+    // single-block callee, disabling the caller half of rule 2c changed NOTHING
+    // — the caller-side test stayed green and proved nothing. A two-block callee
+    // forces the MultiBlockInliner path, where rule 2c is the ONLY protection.
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fTail  = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(fEntry);
+    mb.addBr(fTail);
+    mb.beginBlock(fTail);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+
+    mb.addFunction(fnSig, SymbolId{100}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, callerNoOptimize);
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOpsNo[] = {calleeAddr};
+    MirInstId const callNo = mb.addInst(MirOpcode::Call, callOpsNo, i32);
+    mb.addReturn(callNo);
+    return std::move(mb).finish();
+}
+
+// The `funcNoOptimize` bit of the function carrying `sym`.
+std::optional<bool> noOptimizeOfSymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym) return mir.funcNoOptimize(f);
+    }
+    return std::nullopt;
+}
+
 // The instruction count the §2.9 gate computes for the callee — the number the
 // cost model compares against `inlineThreshold`. Kept as a helper so the tests
 // assert the fixture is genuinely over-threshold instead of assuming it.
@@ -3852,4 +3907,74 @@ TEST(Inlining, ComputedGotoHostInlinesSingleBlockCalleeAndKeepsGoto) {
     EXPECT_TRUE(verifier.verify(rep))
         << "the module must stay verifier-valid after inlining a single-block "
            "callee into a computed-goto host";
+}
+
+// ══ TF-C85: rule 2c — no inlining ACROSS a `#pragma optimize("", off)` edge ══
+//
+// Both directions, each with its own non-vacuous twin (the byte-identical module
+// with the flag CLEAR, which MUST inline). Without the twins a gate that refused
+// everything would pass.
+//
+// RED-ON-DISABLE (re-verified against the FINAL build): delete rule 2c from
+// `inlineLegalityGate` and the two `EXPECT_EQ(r.callsInlined, 0u)` assertions
+// below fail while every other inlining test stays green.
+TEST(Inlining, NoOptimizeCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildNoOptimizePairModule(interner, /*calleeNoOptimize=*/true,
+                                        /*callerNoOptimize=*/false);
+    ASSERT_EQ(noOptimizeOfSymbol(mir, 50), std::optional<bool>{true});
+    ASSERT_EQ(noOptimizeOfSymbol(mir, 100), std::optional<bool>{false});
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "splicing a no-optimize callee OUT would re-emit its body inside an "
+           "optimized caller — the directive would hold for the out-of-line "
+           "copy and silently not hold for the inlined one";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    EXPECT_EQ(noOptimizeOfSymbol(mir, 50), std::optional<bool>{true})
+        << "and the flag survives the inliner's OWN rebuild — its second "
+           "addFunction site, which does not route through MirFunctionRebuilder";
+}
+
+TEST(Inlining, NoOptimizeCallerGetsNothingInlinedIntoIt) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildNoOptimizePairModule(interner, /*calleeNoOptimize=*/false,
+                                        /*callerNoOptimize=*/true);
+    ASSERT_EQ(noOptimizeOfSymbol(mir, 100), std::optional<bool>{true});
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "inlining is an optimization applied to the CALLER, so splicing into "
+           "a no-optimize caller optimizes exactly the function the source "
+           "excluded — and the rebuild-policy neuter cannot catch this, because "
+           "the inliner rebuilds its callers itself";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    EXPECT_EQ(noOptimizeOfSymbol(mir, 100), std::optional<bool>{true});
+}
+
+// ★ THE NON-VACUITY TWIN for both directions at once: the byte-identical module
+// with NEITHER flag set must inline.
+TEST(Inlining, NoOptimizeFlagsClearedInlineTheSameCall) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildNoOptimizePairModule(interner, /*calleeNoOptimize=*/false,
+                                        /*callerNoOptimize=*/false);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "with both flags clear the SAME call is inlined — this is what makes "
+           "the two refusals above statements about the flag rather than about "
+           "the fixture";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
 }

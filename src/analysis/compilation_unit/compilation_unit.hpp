@@ -84,7 +84,10 @@ public:
                     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {},
                     // TF-C82: index-parallel to `trees` — see `pragmaPackFor`.
                     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
-                        pragmaPackMaps = {});
+                        pragmaPackMaps = {},
+                    // TF-C85: index-parallel to `trees` — see `pragmaNoOptimizeFor`.
+                    std::vector<std::unordered_set<std::uint32_t>>
+                        pragmaNoOptimizeSets = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -180,6 +183,22 @@ public:
     [[nodiscard]] std::unordered_map<std::uint32_t, std::uint32_t> const&
     pragmaPackFor(std::size_t treeIndex) const noexcept;
 
+    // ★★ TF-C85: tree `treeIndex`'s `#pragma optimize` stamps — the synth byte
+    // offsets of tokens the preprocessor emitted inside a
+    // `#pragma optimize("", off)` region. An offset ABSENT from the set means
+    // "optimize normally", so an empty set is exactly the pre-TF-C85 behavior;
+    // it is empty for every tree that was not preprocessed and for every
+    // preprocessed TU containing no `#pragma optimize`. Out-of-range `treeIndex`
+    // yields the empty set.
+    //
+    // The semantic tier looks up a FUNCTION DECLARATION's leftmost token offset
+    // here and folds the answer onto `SymbolRecord::isNoOptimize`, from which it
+    // reaches `MirFunc::noOptimize` and the optimizer's rebuild seams. The exact
+    // structural sibling of `pragmaPackFor`, and deliberately so: both are
+    // lexically scoped pragmas whose product is keyed on EMISSION.
+    [[nodiscard]] std::unordered_set<std::uint32_t> const&
+    pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -192,6 +211,8 @@ private:
     // TF-C82: index-parallel to `trees_` (the builder emits one entry per tree,
     // so alignment is by construction, not by convention).
     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
+    // TF-C85: index-parallel to `trees_`, on the same by-construction terms.
+    std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -362,6 +383,10 @@ private:
         // `trees_` by construction — the same reason everything else per-tree
         // lives here.
         std::unordered_map<std::uint32_t, std::uint32_t> pragmaPack;
+        // TF-C85: the synth byte offsets of tokens emitted inside a
+        // `#pragma optimize("", off)` region. Same sidecar, same
+        // index-alignment-by-construction argument as `pragmaPack`.
+        std::unordered_set<std::uint32_t> pragmaNoOptimize;
     };
 
     CompilationUnitId                    id_;

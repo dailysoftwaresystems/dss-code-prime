@@ -321,6 +321,33 @@ struct DSS_EXPORT SymbolRecord {
     // S_ConflictingInlineAttributes, so both bits are never set together on a
     // record that survives semantic analysis. Default false.
     bool            isAlwaysInline = false;
+    // ★★ TF-C85: TRUE iff this FUNCTION symbol's declaration sits inside an MSVC
+    // `#pragma optimize("", off)` region. Its two neighbours above come from an
+    // ATTRIBUTE on the declaration; this one comes from a LEXICALLY SCOPED
+    // PREPROCESSOR REGION, so it is set from the token-offset stamps
+    // (`State::noOptimizeAtOffset`, keyed on the declaration's leftmost EMITTED
+    // token) rather than from the `attributeSemantics` fold. Everything DOWNSTREAM
+    // of this record is identical to `isNoInline`'s route: projected onto
+    // `HirNoOptimizeMap` at CST→HIR and stamped onto `MirFunc.noOptimize` at
+    // HIR→MIR, where the optimizer's rebuild seams read it.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY AND HONESTLY. Every pass in the shipped
+    // release pipeline is semantics-PRESERVING, so this flag changes performance,
+    // never behavior — MEASURED, nothing in this tree can perturb float
+    // arithmetic (integer-only const-fold maps, no reassociation, no FMA/fast-math,
+    // `double` is SSE2 at exactly 64 bits). It exists because the source states a
+    // directive and DSS should honor what it records, and because it is what lets
+    // the pe64 corpus leg stop failing on an unclaimed pragma. It is NOT a fix for
+    // a live floating-point miscompile and must never be described as one.
+    //
+    // ★ NOT merged across a proto/definition pair, unlike its two neighbours, and
+    // deliberately: MSVC's pragma applies to functions DEFINED in the region, so a
+    // PROTOTYPE that happens to fall inside one says nothing about where the
+    // definition lives. Leaving each record to answer for its own declaration
+    // means a stray prototype cannot silently de-optimize a definition compiled
+    // elsewhere in the file — and in the shape where both land in the region (the
+    // sqlite case) both records carry it anyway. Default false.
+    bool            isNoOptimize = false;
     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4): TRUE iff THIS
     // declaration of a FUNCTION symbol spells the `inline` specifier WITHOUT
     // `extern` — 6.7.4p7's exact clause, not merely "the word inline appears".

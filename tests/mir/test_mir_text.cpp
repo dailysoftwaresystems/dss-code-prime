@@ -573,6 +573,95 @@ TEST(MirText, AlwaysInlineAttributeSurvivesRoundTrip) {
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
 
+// ★★ TF-C85: the `nooptimize` axis survives the `.dssir` round trip, and lands
+// in the RIGHT bit. Three adjacent trailing bools at every `addFunction` call
+// means a transposition compiles silently, so the fixture sets exactly ONE flag
+// per function and asserts the other two are clear — the anti-swap discipline
+// `mir.hpp`'s addFunction comment asks callers to preserve.
+TEST(MirText, NoOptimizeAttributeSurvivesRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    // %1 — nooptimize ONLY.
+    (void)b.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/false,
+                        /*alwaysInline=*/false, /*noOptimize=*/true);
+    MirBlockId e1 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e1); b.addReturn();
+    // %2 — noinline ONLY: the neighbour that must not be confused with it.
+    (void)b.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/true,
+                        /*alwaysInline=*/false, /*noOptimize=*/false);
+    MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e2); b.addReturn();
+    // %3 — nooptimize COMPOSED with both linkage axes, all non-default.
+    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Local,
+                        SymbolVisibility::Hidden, /*noInline=*/false,
+                        /*alwaysInline=*/false, /*noOptimize=*/true);
+    MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e3); b.addReturn();
+    // %4 — every flag DEFAULT: must print no attribute list at all, which is
+    // what pins the printer's "everything default -> print nothing" early return
+    // against silently dropping the new axis from that condition.
+    (void)b.addFunction(fnSig, SymbolId{4});
+    MirBlockId e4 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e4); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "no", "ni", "localhidden", "plain"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 4u);
+
+    auto findBySym = [&](std::uint32_t sym) -> MirFuncId {
+        std::size_t const nf = parsed->mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = parsed->mir.funcAt(i);
+            if (parsed->mir.funcSymbol(f).v == sym) return f;
+        }
+        return MirFuncId{};
+    };
+
+    MirFuncId const f1 = findBySym(1);
+    ASSERT_TRUE(f1.valid());
+    EXPECT_TRUE(parsed->mir.funcNoOptimize(f1))
+        << "a nooptimize function must come back nooptimize — a dropped flag "
+           "here silently re-enables every pass on it:\n" << text;
+    EXPECT_FALSE(parsed->mir.funcNoInline(f1));
+    EXPECT_FALSE(parsed->mir.funcAlwaysInline(f1));
+
+    MirFuncId const f2 = findBySym(2);
+    ASSERT_TRUE(f2.valid());
+    EXPECT_TRUE(parsed->mir.funcNoInline(f2));
+    EXPECT_FALSE(parsed->mir.funcNoOptimize(f2))
+        << "the mirror direction of the same swap";
+
+    MirFuncId const f3 = findBySym(3);
+    ASSERT_TRUE(f3.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f3),    SymbolBinding::Local);
+    EXPECT_EQ(parsed->mir.funcVisibility(f3), SymbolVisibility::Hidden);
+    EXPECT_TRUE(parsed->mir.funcNoOptimize(f3))
+        << "all the per-function axes must survive together";
+
+    MirFuncId const f4 = findBySym(4);
+    ASSERT_TRUE(f4.valid());
+    EXPECT_FALSE(parsed->mir.funcNoOptimize(f4))
+        << "an unmarked function must not acquire the flag";
+
+    EXPECT_NE(text.find("nooptimize"), std::string::npos)
+        << "the printer must emit the `.dssir` keyword:\n" << text;
+
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    DiagnosticReporter r3;
+    EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
+}
+
 // TF-C78: an UNRECOGNIZED function attribute FAILS LOUD rather than being
 // skipped. A parser that silently ignored an unknown name is precisely how a
 // dropped field goes unnoticed for a long time (see the test above), so the

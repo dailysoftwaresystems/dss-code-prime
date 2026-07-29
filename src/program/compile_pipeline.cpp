@@ -643,7 +643,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
                           &hir->returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
                           &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
-                          &hir->alwaysInlineMap);   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                          &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                          &hir->noOptimizeMap);   // TF-C85 (#pragma optimize region)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;

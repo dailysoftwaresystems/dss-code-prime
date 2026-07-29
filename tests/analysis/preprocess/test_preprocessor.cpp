@@ -15,6 +15,7 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
 #include "tokenizer/tokenizer.hpp"
+#include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
 
 #include <gtest/gtest.h>
 
@@ -3151,6 +3152,300 @@ TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
         PreprocessResult r = preprocess(buf, schema, noDirs);
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
             << "the set/reset forms are independent of the stack vocabulary";
+    }
+}
+
+// ══ TF-C85: the three rows the pe64 sqlite leg needed, and the `optimize` sink ══
+//
+// MEASURED at TF-C85 on the real pe64 corpus leg: 2135 `error[P0020]` across 113
+// of 189 TUs, partitioned `warning` 1685 / `intrinsic` 448 / `optimize` 2. Every
+// one of those is invisible to a macOS `clang -E` census, because `_MSC_VER` is
+// never defined there and DSS's `pe` profile DOES define it.
+namespace {
+// Preprocess `text` under an explicit predefine class. Returns the result by
+// out-param so a test can inspect BOTH the diagnostics and the pragma products.
+void ppUnderFormat(std::string text, std::optional<ObjectFormatKind> fmt,
+                   PreprocessResult& out) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines);
+}
+// TRUE iff the token spelled `name` was emitted inside a `#pragma optimize("",
+// off)` region — the exact lookup the semantic tier performs on a function
+// declaration's leftmost token.
+[[nodiscard]] bool tokenIsNoOptimize(PreprocessResult const& r,
+                                     std::string_view name) {
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) != name) continue;
+        return r.pragmaNoOptimizeByOffset.contains(
+            static_cast<std::uint32_t>(t.span.start()));
+    }
+    ADD_FAILURE() << "token '" << name << "' not found in the output";
+    return false;
+}
+} // namespace
+
+// ★ ONE `["warning"]` ROW, ALL FOUR REACHED PAYLOAD SHAPES. MEASURED in the
+// corpus: `disable : N` (msvc.h x15, mutex_w32.c, totype.c), `push`/`pop`
+// (mutex_w32.c:40,64) and `default : N` (totype.c:504). The row claims nothing
+// about the argument list, which is exactly why one row can cover four shapes —
+// and the test asserts all four rather than the one that happens to dominate.
+TEST(Preprocessor, TfC85WarningPragmaIsInertInEveryReachedShape) {
+    char const* const shapes[] = {
+        "#pragma warning(disable: 4127)\n",
+        "#pragma warning(push)\n",
+        "#pragma warning(pop)\n",
+        "#pragma warning(default: 4748)\n",
+    };
+    for (char const* s : shapes) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "a `diagnosticsOnly` row claims this pragma; it must be silent: "
+            << s;
+        EXPECT_EQ(lexs.size(), 3u) << "`int x ;` survives, the directive does not";
+    }
+}
+
+// ★ RED-ON-DISABLE for the `["warning"]` row: rename the PREFIX (the structural
+// key, never the prose) and the same pragmas go loud again.
+TEST(Preprocessor, TfC85WarningRowIsWhatMakesTheWarningPragmaSilent) {
+    auto schema = reboundCSubset("\"prefix\": [\"warning\"]",
+                                 "\"prefix\": [\"warningXX\"]",
+                                 "<no-warning-row-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma warning(disable: 4127)\nint x;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "with no row claiming `warning` the pragma is UNREGISTERED and loud — "
+           "which is precisely the state that broke pe64 for 1685 of 2135 lines";
+}
+
+// ★★ THE `realizationRequestOnly` VERB. Its claim is about the ENGINE, not about
+// the pragma's arguments: `#pragma intrinsic` asks HOW a listed name is realized,
+// never WHETHER it exists, and a name DSS does not provide fails loud at the CALL
+// SITE. That is why one PREFIX row can speak for names this implementation has
+// never heard of — asserted here with a deliberately invented name beside the
+// four MEASURED-reached ones.
+TEST(Preprocessor, TfC85IntrinsicPragmaIsInertForAnyNameList) {
+    char const* const lists[] = {
+        "#pragma intrinsic(_byteswap_ushort)\n",
+        "#pragma intrinsic(_byteswap_ulong)\n",
+        "#pragma intrinsic(_byteswap_uint64)\n",
+        "#pragma intrinsic(_ReadWriteBarrier)\n",
+        // NOT a name DSS knows, and deliberately so: the row's claim spans every
+        // name the pragma can list. A per-name claim would be false the moment a
+        // new one appeared.
+        "#pragma intrinsic(_no_such_intrinsic_anywhere)\n",
+        "#pragma intrinsic(_byteswap_ulong, _ReadWriteBarrier)\n",
+    };
+    for (char const* s : lists) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "the row claims the pragma requests a REALIZATION, so it is "
+               "inert regardless of the names listed: " << s;
+        EXPECT_EQ(lexs.size(), 3u);
+    }
+}
+
+TEST(Preprocessor, TfC85IntrinsicRowIsWhatMakesTheIntrinsicPragmaSilent) {
+    auto schema = reboundCSubset("\"prefix\": [\"intrinsic\"]",
+                                 "\"prefix\": [\"intrinsicXX\"]",
+                                 "<no-intrinsic-row-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma intrinsic(_byteswap_ulong)\nint x;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "with no row claiming `intrinsic` the pragma is UNREGISTERED and loud "
+           "— 448 of the 2135 pe64 failures";
+}
+
+// ★★ THE `optimizerControl` SINK, PREPROCESSOR HALF. A REGION, stamped per
+// EMITTED TOKEN — the `#pragma pack` mechanism, for the same reason: a function
+// definition arriving from a macro replacement list carries the `#define` line's
+// span, so a byte-RANGE lookup would answer "optimize" for exactly the case the
+// author was controlling.
+TEST(Preprocessor, TfC85OptimizePragmaStampsTheTokensInsideTheRegion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#pragma optimize(\"\", off)\nint inside;\n"
+                          "#pragma optimize(\"\", on)\nint outside;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a well-formed `#pragma optimize` is honored, not diagnosed";
+    ASSERT_EQ(lexs.size(), 6u) << "`int inside ; int outside ;` survives";
+    EXPECT_TRUE(tokenIsNoOptimize(r, "inside"))
+        << "a token inside the region must be stamped — this is the state the "
+           "semantic tier folds onto SymbolRecord.isNoOptimize";
+    EXPECT_FALSE(tokenIsNoOptimize(r, "outside"))
+        << "`optimize(\"\", on)` CLOSES the region; a token after it must carry "
+           "nothing, or the whole rest of the file stops being optimized";
+}
+
+// ★★ THE SINGLE-DISPATCH PIN. Every failing corpus site is `#pragma`-spelled, so
+// a directive-arm-only implementation would go GREEN on the corpus while silently
+// destroying the property `D-PP-PRAGMA-OPERATOR-FORM` closed. This asserts the
+// `_Pragma` spelling of the NEW row reaches the SAME sink — including from inside
+// a macro replacement list, which resolves at EXPANSION time.
+TEST(Preprocessor, TfC85OptimizeReachesTheSameSinkThroughThePragmaOperator) {
+    {   // file-scope operator form
+        PreprocessResult r;
+        auto lexs = ppLexemes("_Pragma(\"optimize(\\\"\\\", off)\")\nint a;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u) << "`int a ;` — the operator emits nothing";
+        EXPECT_TRUE(tokenIsNoOptimize(r, "a"))
+            << "the `_Pragma` spelling must drive the SAME region state as the "
+               "`#pragma` spelling — one registry, two spellings";
+    }
+    {   // ★ THE DISCRIMINATOR: from a macro REPLACEMENT LIST.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define NOOPT _Pragma(\"optimize(\\\"\\\", off)\")\n"
+            "NOOPT\nint b;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_TRUE(tokenIsNoOptimize(r, "b"))
+            << "a `_Pragma` reached through a macro takes effect at its "
+               "EXPANSION site; a directive-scan-only routing fails HERE while "
+               "the corpus stays green";
+    }
+}
+
+// ★ THE UNBUILT FORMS FAIL LOUD — the `#pragma pack` posture. A selective option
+// list names MSVC optimizations DSS does not have; widening it to "all off" or
+// dropping it are both silent wrong answers.
+TEST(Preprocessor, TfC85OptimizeUnbuiltFormsAreRefusedNotGuessed) {
+    char const* const refused[] = {
+        "#pragma optimize(\"gt\", off)\n",   // selective option list
+        "#pragma optimize(\"\", sideways)\n",// not a declared state word
+        "#pragma optimize(\"\")\n",          // no state word at all
+        "#pragma optimize off\n",            // paren-less
+    };
+    for (char const* s : refused) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an unbuilt `#pragma optimize` form must be REFUSED: " << s;
+    }
+}
+
+// ★ RED-ON-DISABLE for the `optimizerControl` sink AND for its config words.
+TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
+    {   // no row -> the pragma is unregistered -> loud
+        auto schema = reboundCSubset("\"prefix\": [\"optimize\"]",
+                                     "\"prefix\": [\"optimizeXX\"]",
+                                     "<no-optimize-row-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        std::vector<std::filesystem::path> noDirs;
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma));
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty())
+            << "and nothing is stamped — the sink is inert without its row";
+    }
+    {   // row present, but the OFF word undeclared -> the form is unbuilt -> loud
+        auto schema = reboundCSubset("\"pragmaOptimizeOffWord\":    \"off\",",
+                                     "",
+                                     "<no-optimize-off-word-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        ASSERT_TRUE(schema->preprocess().pragmaOptimizeOffWord.empty());
+        std::vector<std::filesystem::path> noDirs;
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "with no `pragmaOptimizeOffWord` declared the off form is an "
+               "unbuilt form and must be REFUSED, never silently ignored";
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty());
+    }
+}
+
+// ★★★ THE PROFILE-CENSUS GUARD (tier a) — THE CLASS FIX.
+//
+// TF-C82's row set came from a census taken under ONE predefine class, written up
+// as if it were universal. This preprocesses an in-repo fixture under ALL THREE
+// classes and asserts NO pragma goes unclaimed in any of them.
+//
+// MEASURED: `availableObjectFormats` keys on format KIND, so the 24 shipped
+// format files collapse to exactly three predefine classes — `pe`
+// (_WIN32/_WIN64/_MSC_VER + more), `macho` (__APPLE__/__MACH__), and the
+// NEITHER class (elf/spirv/wasm declare no identity predefines at all). Three
+// passes, not 24. `nullopt` is a FOURTH state (only universal entries survive)
+// and is included because the LSP / direct-API callers use it.
+//
+// ★ WHAT A GREEN RUN HERE DOES AND DOES NOT PROVE. It proves every pragma THIS
+// FIXTURE reaches has a row under every class. It does NOT prove the row set is
+// complete — a reached-set is a function of the defines in play and of how far
+// each TU gets (MEASURED: sqlite's `ext/rtree/rtree.c` carries two more
+// `#pragma intrinsic` lines that contribute nothing because its whole body sits
+// in a not-taken `#if`). Completeness is what tier (b), the corpus census
+// script, exists to keep reviewable.
+TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
+    namespace fs = std::filesystem;
+    fs::path const fixture =
+        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c";
+    ASSERT_TRUE(fs::exists(fixture))
+        << "the profile-census fixture must exist: " << fixture.string();
+    auto const text = test_support::readFile(fixture);
+    ASSERT_FALSE(text.empty());
+
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{}}) {
+        PreprocessResult r;
+        ppUnderFormat(text, fmt, r);
+        std::string const legName =
+            fmt.has_value() ? std::string{objectFormatKindName(*fmt)}
+                            : std::string{"<no active format>"};
+        // The ONE assertion that matters. `P_PreprocessorPragma` covers BOTH
+        // "no row claimed it" and "a row claimed it `unsupported`", which is
+        // exactly the pair a census is meant to surface.
+        std::string offending;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::P_PreprocessorPragma) continue;
+            offending += "\n    " + d.actual;
+        }
+        EXPECT_TRUE(offending.empty())
+            << "predefine class " << legName
+            << " reaches a pragma no `preprocess.pragmaEffects` row claims."
+               " Add a row (or fix the fixture) — do NOT relax this test:"
+            << offending;
+    }
+}
+
+// ★ NON-VACUITY FOR THE CENSUS GUARD. A census that preprocesses nothing passes
+// trivially, and the pe-only pragmas live behind `#if defined(_MSC_VER)` — so the
+// fixture MUST actually reach them on the pe leg and MUST NOT on the others.
+// Without this, deleting the fixture's whole body would leave the guard green.
+TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) {
+    namespace fs = std::filesystem;
+    auto const text = test_support::readFile(
+        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c");
+    ASSERT_FALSE(text.empty());
+    {   // pe: `_MSC_VER` is defined, so the MSVC arm is LIVE and its
+        // `#pragma optimize("", off)` region actually stamps a token.
+        PreprocessResult r;
+        ppUnderFormat(text, ObjectFormatKind::Pe, r);
+        EXPECT_FALSE(r.pragmaNoOptimizeByOffset.empty())
+            << "on the pe leg the fixture's `#pragma optimize` region must be "
+               "REACHED — otherwise this whole census is vacuous";
+        EXPECT_TRUE(tokenIsNoOptimize(r, "msvc_no_optimize_marker"));
+    }
+    {   // macho: `_MSC_VER` undefined -> the MSVC arm is a DEAD branch -> C
+        // 6.10p1 silence, and nothing is stamped.
+        PreprocessResult r;
+        ppUnderFormat(text, ObjectFormatKind::MachO, r);
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty())
+            << "the MSVC arm must be entirely elided off the pe leg — the "
+               "dead-branch gate is what keeps the Apple SDK compiling";
     }
 }
 

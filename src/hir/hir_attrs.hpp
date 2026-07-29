@@ -9,6 +9,7 @@
 #include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/mutability_attr.hpp"
 #include "hir/attributes/no_inline_attr.hpp"
+#include "hir/attributes/no_optimize_attr.hpp"
 #include "hir/attributes/returns_twice_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
@@ -64,6 +65,17 @@ using HirNoInlineMap = HirAttribute<NoInlineAttr>;
 // `HirNoInlineMap`, and a third distinct axis (see `AlwaysInlineAttr`, which
 // states precisely what the attribute does and does not promise).
 using HirAlwaysInlineMap = HirAttribute<AlwaysInlineAttr>;
+
+// ★★ TF-C85: native FUNCTION declarations that sat inside an MSVC
+// `#pragma optimize("", off)` region. Populated by CST→HIR lowering from the
+// bound symbol's `SymbolRecord.isNoOptimize`; read by HIR→MIR lowering to stamp
+// `MirFunc.noOptimize` — the input that makes the optimizer's shared function
+// rebuilder copy the function VERBATIM (an identity policy in place of the
+// pass's own) and makes the inliner leave it alone in both directions. Keyed on
+// the same DECLARATION node as the three maps above, and a FOURTH distinct axis:
+// unlike them it originates in a preprocessor REGION, not an attribute (see
+// `NoOptimizeAttr`, which also states plainly what this sink is not).
+using HirNoOptimizeMap = HirAttribute<NoOptimizeAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

@@ -149,21 +149,43 @@ struct DSS_EXPORT CAttributeDef {
 //    + 24 `clang assume_nonnull` occurrences.)
 //  • `AnnotationOnly` asserts the pragma is pure authoring metadata with no
 //    translation semantics in ANY compiler (`#pragma mark` is an IDE bookmark).
+//  • `RealizationRequestOnly` (TF-C85) asserts something NEITHER of the two
+//    above can say, and is why it needed its own verb rather than being folded
+//    into one of them. MSVC `#pragma intrinsic(f, g)` DOES concern translation —
+//    it is not a diagnostic knob and not metadata — but its entire content is a
+//    request about HOW a listed name is realized (inline expansion instead of a
+//    CRT call), never a claim that the name EXISTS or a change to what calling
+//    it means. DSS chooses realization itself: a name it lowers as a builtin
+//    never becomes a CRT call, and a name it does not provide fails loud at the
+//    CALL SITE (`S_UnknownIdentifier`) whether or not the pragma was honored. So
+//    ignoring the pragma cannot mask a missing symbol and cannot change program
+//    behavior. That is a checkable claim about the ENGINE, not about the
+//    pragma's arguments — which matters because the match is by PREFIX, so ONE
+//    row makes ONE claim covering EVERY name the pragma can list, including
+//    names this implementation has never heard of.
 //  • `Unsupported` asserts the pragma DOES have translation semantics that DSS
 //    has not implemented — so it is LOUD, and (like `#error`) unsuppressable:
 //    silencing a real semantic effect is how a wrong-layout/wrong-code artifact
 //    ships green.
 //
-// `StructPacking` is the one verb with a real sink: it drives the C
-// `#pragma pack` member-alignment CAP into the composite layout channel.
+// `StructPacking` and `OptimizerControl` are the verbs with a real sink:
+// `#pragma pack` drives the member-alignment CAP into the composite layout
+// channel; `#pragma optimize` drives a per-function optimizer opt-out into
+// `MirFunc.noOptimize`.
 enum class PragmaEffect : std::uint8_t {
     // Configures another compiler's diagnostics; DSS emits none of them.
     DiagnosticsOnly,
     // Authoring/IDE metadata with no translation semantics anywhere.
     AnnotationOnly,
+    // TF-C85: the pragma only requests HOW a name it LISTS is realized — never
+    // WHETHER that name exists. See the long argument on the enumerator below.
+    RealizationRequestOnly,
     // C `#pragma pack` — a LEXICALLY SCOPED maximum member alignment. The one
     // verb with a layout sink (`TypeInterner`'s `maxFieldAlign` channel).
     StructPacking,
+    // TF-C85: MSVC `#pragma optimize("", on|off)` — a LEXICALLY SCOPED
+    // per-function optimizer opt-out. The second verb with a real sink.
+    OptimizerControl,
     // Real translation semantics DSS has NOT implemented → loud + unsuppressable.
     Unsupported,
 };
@@ -440,6 +462,18 @@ struct DSS_EXPORT PreprocessConfig {
     // `pack(push, 1)` closed by 6 `pack(pop)`. Building only one is insufficient.
     std::string pragmaPackPushWord;
     std::string pragmaPackPopWord;
+
+    // TF-C85: the `optimizerControl` operand SUB-VOCABULARY — the two words that
+    // OPEN and CLOSE an MSVC `#pragma optimize("", off) … #pragma optimize("",
+    // on)` region, matched by lexeme TEXT. Same discipline as the `pack`
+    // push/pop pair above and for the same reason: the engine owns the SEMANTIC
+    // (a lexically scoped per-function optimizer opt-out), config owns the WORD.
+    //
+    // OPTIONAL and independent. A language declaring `optimizerControl` but NOT
+    // these words gets a LOUD refusal of every `#pragma optimize` form (never a
+    // silent no-op) — which is this pair's red-on-disable pin.
+    std::string pragmaOptimizeOnWord;
+    std::string pragmaOptimizeOffWord;
 
     // FC15c (`__has_include`; C23 6.10.1p4): the `__has_include` OPERATOR
     // keyword, valid only inside a `#if`/`#elif` operand. `__has_include(<h>)` /

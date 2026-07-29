@@ -25,6 +25,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <variant>
+#include <unordered_map>
+#include <optional>
 #include <vector>
 
 using namespace dss;
@@ -468,6 +471,238 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesAlwaysInline) {
     EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(2)))
         << "an un-annotated function must not acquire the flag";
     EXPECT_FALSE(dst.funcNoInline(dst.funcAt(2)));
+}
+
+// ══ TF-C85: the `#pragma optimize("", off)` per-function opt-out ══════════════
+namespace {
+// A policy that WOULD mangle any function it is let near: it drops every
+// non-terminator instruction (`shouldEmit` false) and keeps only the entry
+// block. Under the neuter it must be consulted ZERO times, so a `noOptimize`
+// function comes through with all of its blocks and instructions intact.
+//
+// ★ IT IS DELIBERATELY DESTRUCTIVE RATHER THAN MERELY DIFFERENT. A policy that
+// made a subtle change could pass a sloppy assertion; this one makes the
+// difference between "neutered" and "not neutered" impossible to miss, and it
+// exercises BOTH the block-selection hook and a per-instruction hook.
+// A policy that INJECTS one extra instruction at the head of every block it is
+// let near — the `Mem2Reg` shape (its `onBlockBegin` inserts IDF phis), and the
+// simplest transform that is both legal and trivially observable.
+//
+// ★ WHY A HOOK THAT ADDS RATHER THAN ONE THAT REMOVES. A policy that dropped
+// instructions would trip the rebuilder's own `D-OPT2-REWRITE-MAP-COMPLETENESS`
+// fail-loud the moment a surviving operand referenced a skipped instruction —
+// MEASURED while writing this test. Injection is unconditionally safe (an
+// unreferenced Const is legal MIR) and makes "the policy ran" a pure count.
+//
+// ★ NOTE `tryRewrite` IS NOT USABLE HERE: `emitValue` copies a `Const` verbatim
+// BEFORE consulting the hook, so a Const-rewriting policy is silently a no-op.
+// (MEASURED — the first draft of this test used exactly that and passed
+// vacuously on one arm.)
+class InjectingPolicy : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        ++selectBlocksCalls;
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    void onBlockBegin(MirBlockId /*oldB*/, MirBlockId /*newB*/,
+                      MirBuilder& dst,
+                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
+                      std::unordered_map<std::uint32_t, MirBlockId> const&
+                          /*blockMap*/) override {
+        ++onBlockBeginCalls;
+        MirLiteralValue v;
+        v.value = std::int64_t{999};
+        v.core  = TypeKind::I32;
+        (void)dst.addConst(v, i32Type);
+    }
+    TypeId      i32Type = InvalidType;
+    std::size_t selectBlocksCalls  = 0;
+    std::size_t onBlockBeginCalls  = 0;
+};
+
+// The same policy, but declaring itself a MANDATORY NORMALIZATION — the
+// `PruneUnreachable` posture. It must run even on a `noOptimize` function.
+class MandatoryInjectingPolicy final : public InjectingPolicy {
+public:
+    [[nodiscard]] bool mandatoryNormalization() const noexcept override {
+        return true;
+    }
+};
+
+// A policy recording whether the rebuilder told it a function was neutered —
+// the `Mem2Reg` notification, isolated.
+class NeuterNotedPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    void onFunctionNeutered(MirFuncId oldFn) override {
+        neutered.push_back(oldFn.v);
+    }
+    std::vector<std::uint32_t> neutered;
+};
+
+// Two single-block functions: #0 `noOptimize`, #1 plain. Each returns a const.
+[[nodiscard]] Mir buildNoOptimizePair(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    // func #0: noOptimize ONLY — noInline and alwaysInline deliberately CLEAR so
+    // this flag is the single non-default axis. The three are adjacent trailing
+    // bools at every `addFunction` copy site, so a transposed argument would
+    // compile silently; the asymmetry is what makes a swap fail here.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: plain.
+    mb.addFunction(fnSig, SymbolId{2});
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    return std::move(mb).finish();
+}
+} // namespace
+
+// ★ THE THIRD PROPAGATION PIN. Same argument as its two neighbours: this
+// rebuilder runs under every optimizer pass, so a flag dropped here means
+// iteration 2 starts optimizing a function the source excluded.
+//
+// RED-ON-DISABLE (re-verified against the FINAL build): drop the
+// `src_.funcNoOptimize(oldFn)` argument at `mir_rebuild_helper.cpp`'s
+// `addFunction` (let the 7th parameter default to false) and the first
+// EXPECT_TRUE below fails.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoOptimize) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    ASSERT_EQ(src.moduleFuncCount(), 2u);
+    ASSERT_TRUE(src.funcNoOptimize(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcAlwaysInline(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noOptimize flag";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — three adjacent bools at the "
+           "addFunction call, so a swap must fail here";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(1)))
+        << "an un-marked function must not acquire the flag";
+}
+
+// ★★ THE SINK ITSELF. A `noOptimize` function is rebuilt VERBATIM under a policy
+// that would otherwise gut it — and, critically, IT STILL EXISTS.
+//
+// ★ THE SURVIVES-AT-ALL ASSERTION IS THE POINT, NOT A FORMALITY. The obvious
+// implementation of "skip optimizing this function" is to `return` early from
+// `rebuildFunction`. That does not leave the function alone: `dst` is a FRESH
+// module containing exactly what the rebuilder puts in it, so an early return
+// DELETES the function and every caller is left referencing an undefined symbol.
+// `moduleFuncCount() == 2` is what fails first under that mistake.
+TEST(MirRebuildHelper, NoOptimizeFunctionIsRebuiltVerbatimUnderAnInjectingPolicy) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    std::uint32_t const srcInsts0 = src.blockInstCount(src.funcEntry(src.funcAt(0)));
+    std::uint32_t const srcInsts1 = src.blockInstCount(src.funcEntry(src.funcAt(1)));
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "NoOptimizeNeuter"),
+              GlobalClonePrelude::Cloned);
+    InjectingPolicy policy;
+    policy.i32Type = interner.primitive(TypeKind::I32);
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir dst = std::move(dstB).finish();
+
+    ASSERT_EQ(dst.moduleFuncCount(), 2u)
+        << "THE FUNCTION MUST STILL EXIST. Neutering means swapping the POLICY, "
+           "never skipping the rebuild — skipping deletes the function";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(0))), srcInsts0)
+        << "func #0 is noOptimize: it comes through VERBATIM because the "
+           "injecting policy was never consulted for it";
+    EXPECT_EQ(policy.selectBlocksCalls, 1u)
+        << "selectBlocks must be called for the PLAIN function only";
+    EXPECT_EQ(policy.onBlockBeginCalls, 1u)
+        << "…and so must the per-block hook";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(1))), srcInsts1 + 1u)
+        << "the plain function DOES get the injected instruction, proving the "
+           "policy is effective and the comparison above is not vacuous";
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(1)));
+}
+
+// ★★ THE EXEMPTION. A policy that declares itself a MANDATORY NORMALIZATION runs
+// on a `noOptimize` function anyway. MEASURED necessity: without this,
+// `PruneUnreachable` was neutered and sqlite's `ext/misc/totype.c` — the corpus's
+// only no-optimize TU — produced four `I_UnreachableBlock` verifier errors.
+// `#pragma optimize` switches optimization off; it does not license invalid IR.
+TEST(MirRebuildHelper, MandatoryNormalizationPolicyIsNotNeutered) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    std::uint32_t const srcInsts0 = src.blockInstCount(src.funcEntry(src.funcAt(0)));
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "MandatoryNormalization"),
+              GlobalClonePrelude::Cloned);
+    MandatoryInjectingPolicy policy;
+    policy.i32Type = interner.primitive(TypeKind::I32);
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir dst = std::move(dstB).finish();
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+    EXPECT_EQ(policy.selectBlocksCalls, 2u)
+        << "a mandatory-normalization policy is consulted for EVERY function, "
+           "including the noOptimize one";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(0))), srcInsts0 + 1u)
+        << "…and its hooks really ran on the noOptimize function";
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "…and the flag still rides through the exempt rebuild";
+}
+
+// ★ THE `onFunctionNeutered` NOTIFICATION. Fired for the neutered function and
+// only for it. MEASURED necessity: `Mem2Reg` plans IDF phis in `analyze`, emits
+// them in `onBlockBegin`, and wires them in a POST-rebuild step — silencing the
+// hooks without telling it aborted the whole pe64 sqlite build with "phi marker
+// has incomings but no emitted phi".
+TEST(MirRebuildHelper, NeuteredFunctionIsAnnouncedToThePolicy) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "NeuterNotice"),
+              GlobalClonePrelude::Cloned);
+    NeuterNotedPolicy policy;
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir unused = std::move(dstB).finish();
+    (void)unused;
+    ASSERT_EQ(policy.neutered.size(), 1u)
+        << "exactly one function is noOptimize, so exactly one notification";
+    EXPECT_EQ(policy.neutered[0], src.funcAt(0).v);
 }
 
 TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {

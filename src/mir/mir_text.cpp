@@ -47,6 +47,10 @@ inline constexpr std::string_view kMirTextNoInlineAttr = "noinline";
 // this is the `.dssir` text format's own keyword, matching LLVM's `alwaysinline`
 // / this file's `noinline` style, not the C source attribute's spelling.
 inline constexpr std::string_view kMirTextAlwaysInlineAttr = "alwaysinline";
+// TF-C85: the same one-spelling discipline for the per-function optimizer
+// opt-out. Again the `.dssir` text format's own keyword, matching this file's
+// `noinline` / `alwaysinline` style, not the MSVC pragma's spelling.
+inline constexpr std::string_view kMirTextNoOptimizeAttr = "nooptimize";
 
 // ── shared helpers ────────────────────────────────────────────────────
 
@@ -405,8 +409,9 @@ private:
         SymbolVisibility const v  = mir_.funcVisibility(f);
         bool             const ni = mir_.funcNoInline(f);
         bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
+        bool             const no = mir_.funcNoOptimize(f);     // TF-C85
         if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
-            && !ai) {
+            && !ai && !no) {
             return;
         }
         out_ += " [";
@@ -416,6 +421,7 @@ private:
         if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
         if (ni)                             { sep(); out_ += kMirTextNoInlineAttr; }
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
+        if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
         out_ += "]";
     }
 
@@ -1213,6 +1219,7 @@ private:
         SymbolVisibility visibility = SymbolVisibility::Default;
         bool             noInline   = false;
         bool             alwaysInline = false;   // TF-C81
+        bool             noOptimize   = false;   // TF-C85
         if (lex_.peek().kind == TokKind::LBracket) {
             lex_.take();
             while (true) {
@@ -1229,6 +1236,10 @@ private:
                     alwaysInline = true;
                     continue;
                 }
+                if (a.text == kMirTextNoOptimizeAttr) {   // TF-C85
+                    noOptimize = true;
+                    continue;
+                }
                 if (auto b = symbolBindingFromName(a.text); b.has_value()) {
                     binding = *b;
                     continue;
@@ -1240,14 +1251,16 @@ private:
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding "
                     "(local | global | weak), a visibility (default | hidden | "
-                    "protected | internal), '{}' or '{}'",
-                    a.text, kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr));
+                    "protected | internal), '{}', '{}' or '{}'",
+                    a.text, kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
+                    kMirTextNoOptimizeAttr));
                 break;
             }
         }
         MirFuncId const f =
             builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
-                                 alwaysInline);   // TF-C81
+                                 alwaysInline,    // TF-C81
+                                 noOptimize);     // TF-C85
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.

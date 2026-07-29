@@ -89,7 +89,9 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::uint32_t                        typeNameReparseCount,
                                  std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers,
                                  std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
-                                     pragmaPackMaps)
+                                     pragmaPackMaps,
+                                 std::vector<std::unordered_set<std::uint32_t>>
+                                     pragmaNoOptimizeSets)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -98,7 +100,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , shippedLibDescriptors_(std::move(shippedLibDescriptors))
     , typeNameReparseCount_(typeNameReparseCount)
     , auxiliaryBuffers_(std::move(auxiliaryBuffers))
-    , pragmaPackMaps_(std::move(pragmaPackMaps)) {}
+    , pragmaPackMaps_(std::move(pragmaPackMaps))
+    , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -123,6 +126,16 @@ CompilationUnit::pragmaPackFor(std::size_t treeIndex) const noexcept {
     static std::unordered_map<std::uint32_t, std::uint32_t> const kEmpty;
     if (treeIndex >= pragmaPackMaps_.size()) return kEmpty;
     return pragmaPackMaps_[treeIndex];
+}
+
+std::unordered_set<std::uint32_t> const&
+CompilationUnit::pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept {
+    // TF-C85: the exact sibling of `pragmaPackFor` above — a tree with no stamps
+    // and an out-of-range index both answer the EMPTY set, i.e. "optimize
+    // everything", which is exactly the pre-TF-C85 behavior.
+    static std::unordered_set<std::uint32_t> const kEmpty;
+    if (treeIndex >= pragmaNoOptimizeSets_.size()) return kEmpty;
+    return pragmaNoOptimizeSets_[treeIndex];
 }
 
 std::string CompilationUnit::compositeSourceLanguage() const {
@@ -363,6 +376,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // finished CU. Empty for a TU with no `#pragma pack`, which is every TU
         // that existed before this cycle.
         sidecar.pragmaPack      = std::move(pp.pragmaPackByOffset);
+        // TF-C85: same hop for the `#pragma optimize` stamps.
+        sidecar.pragmaNoOptimize = std::move(pp.pragmaNoOptimizeByOffset);
         return trees_.back().id();
     }
     // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
@@ -836,6 +851,13 @@ CompilationUnit UnitBuilder::finish() && {
     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps;
     pragmaPackMaps.reserve(sidecars_.size());
     for (auto& sc : sidecars_) pragmaPackMaps.push_back(std::move(sc.pragmaPack));
+    // TF-C85: the same flatten for the `#pragma optimize` stamps, on the same
+    // index-parallel-by-construction guarantee.
+    std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets;
+    pragmaNoOptimizeSets.reserve(sidecars_.size());
+    for (auto& sc : sidecars_) {
+        pragmaNoOptimizeSets.push_back(std::move(sc.pragmaNoOptimize));
+    }
 
     finished_ = true;
     return CompilationUnit{
@@ -849,6 +871,7 @@ CompilationUnit UnitBuilder::finish() && {
         typeNameReparseCount,
         std::move(auxiliaryBuffers_),
         std::move(pragmaPackMaps),
+        std::move(pragmaNoOptimizeSets),
     };
 }
 
