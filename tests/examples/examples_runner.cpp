@@ -839,8 +839,14 @@ compileAndRunArm(fs::path const& exampleDir,
     // override is present (so a per-target override alone still routes the pipe).
     bool const captureStdout =
         m.expectedStdout.has_value() || t.expectedStdoutOverride.has_value();
+    // kRunBudget bounds the PROGRAM's runtime only — runBinary absorbs the
+    // one-time OS process-admission cost in an untimed warm-up exec first
+    // (TF-C84; see run_binary.hpp for the measurements). Before that split
+    // this site was a bare `5000` literal that had to cover both, and the
+    // OS half — a Gatekeeper notarization round trip that serializes across
+    // concurrent execs — pushed 35/737 tests over it under `ctest -j8`.
     auto const result = runBinary(artifactPath,
-                                  std::chrono::milliseconds{5000},
+                                  kRunBudget,
                                   captureStdout,
                                   launcherPrefix);
     EXPECT_TRUE(result.spawned)
