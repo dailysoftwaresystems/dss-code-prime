@@ -5,7 +5,81 @@
 #include <algorithm>
 #include <format>
 
-namespace dss::detail {
+namespace dss {
+
+// Declared in `core/types/preprocess_config.hpp` (nlohmann-free, so tests can
+// reach it); defined here beside its only production caller.
+std::expected<long long, std::string>
+packVersionComponents(std::string_view           versionText,
+                      std::span<const long long> weights) {
+    // Split on '.' into non-negative decimal components. Anything else — an
+    // empty field ("1..2"), a non-digit ("1.0.2a"), a leading/trailing dot —
+    // is a malformed version, not something to salvage.
+    std::vector<long long> comps;
+    std::size_t            pos = 0;
+    while (true) {
+        const std::size_t      dot  = versionText.find('.', pos);
+        const std::string_view part = versionText.substr(
+            pos, dot == std::string_view::npos ? std::string_view::npos
+                                               : dot - pos);
+        if (part.empty()) {
+            return std::unexpected(std::format(
+                "version '{}' is not a dot-separated list of non-negative "
+                "integers", versionText));
+        }
+        long long v = 0;
+        for (char const c : part) {
+            if (c < '0' || c > '9') {
+                return std::unexpected(std::format(
+                    "version '{}' is not a dot-separated list of non-negative "
+                    "integers", versionText));
+            }
+            v = v * 10 + (c - '0');
+            if (v > 1000000000LL) {
+                return std::unexpected(std::format(
+                    "version '{}' has a component too large to encode",
+                    versionText));
+            }
+        }
+        comps.push_back(v);
+        if (dot == std::string_view::npos) break;
+        pos = dot + 1;
+    }
+    if (comps.size() != weights.size()) {
+        return std::unexpected(std::format(
+            "'componentWeights' declares {} component(s) but the version '{}' "
+            "has {}", weights.size(), versionText, comps.size()));
+    }
+    // ★ THE ENCODING HAS A BOUND, AND IT IS DERIVED, NOT HARD-CODED.
+    // Component i must not reach the NEXT-more-significant weight, or it
+    // carries into that field and the packing silently collapses: with
+    // [1000000,1000,1], `0.0.1000` would encode identically to `0.1.0` and
+    // a `#if`-time `>=` against the macro would start lying. (No identity
+    // macro is NAMED here on purpose — the engine knows the `version` KIND and
+    // the `componentWeights` key; which macro uses them is config's business,
+    // and a name in this comment is exactly what the agnosticism guard in
+    // tests/analysis/preprocess catches.) The bound for component i is
+    // weights[i-1]/weights[i] — read off the very weights the config declared,
+    // so a different encoding gets its own correct bound for free. The MOST
+    // significant component (i == 0) has no bound above it and is unbounded by
+    // construction. Loud, naming the component.
+    for (std::size_t i = 1; i < comps.size(); ++i) {
+        const long long bound = weights[i - 1] / weights[i];
+        if (comps[i] >= bound) {
+            return std::unexpected(std::format(
+                "version '{}' component #{} ({}) reaches its weight bound {} — "
+                "the packed encoding would collapse and compare wrongly",
+                versionText, i, comps[i], bound));
+        }
+    }
+    long long packed = 0;
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        packed += comps[i] * weights[i];
+    }
+    return packed;
+}
+
+namespace detail {
 
 using json = nlohmann::json;
 
@@ -64,11 +138,102 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             pm.kind = PredefinedMacroKind::Date;
         } else if (kind == "time") {
             pm.kind = PredefinedMacroKind::Time;
+        } else if (kind == "version") {
+            // TF-C83 (D-CSUBSET-TOOLCHAIN-IDENTITY-PREDEFINES). The BUILD's own version, packed
+            // into ONE integer by config-declared `componentWeights`.
+            //
+            // WHY A KIND AND NOT A `{{version}}` PLACEHOLDER. A templating
+            // syntax would be a NEW vocabulary the engine has to parse, with
+            // its own unknown-placeholder failure mode to invent. This table
+            // already has the exact shape needed: `date`/`time` are macros
+            // whose NAME is config and whose VALUE the engine derives. A
+            // version macro is the same shape with a different source, so it
+            // is the same mechanism — and an unknown KIND already fails loud
+            // (the `else` below), which is precisely the guarantee a
+            // placeholder scheme would have had to re-create.
+            //
+            // It LOWERS TO Constant: the input is build-invariant, so the
+            // derivation is a LOAD-time concern and the result is exactly the
+            // constant it claims to be. The expansion path is untouched —
+            // `date`/`time` stay the only genuinely per-run derived kinds.
+            pm.kind = PredefinedMacroKind::Constant;
+            if (!e.contains("componentWeights")) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          mpath + "/componentWeights",
+                          "a 'version' predefinedMacros entry requires "
+                          "'componentWeights' (e.g. [1000000, 1000, 1])");
+                continue;
+            }
+            json const& cw = e.at("componentWeights");
+            if (!cw.is_array() || cw.empty()) {
+                coll.emit(entryCode, mpath + "/componentWeights",
+                          "'componentWeights' must be a non-empty array of "
+                          "positive integers, most-significant FIRST");
+                continue;
+            }
+            std::vector<long long> weights;
+            bool                   wOk = true;
+            for (std::size_t wi = 0; wi < cw.size(); ++wi) {
+                if (!cw[wi].is_number_unsigned() || cw[wi].get<long long>() <= 0) {
+                    coll.emit(entryCode, mpath + "/componentWeights",
+                              "each 'componentWeights' entry must be a "
+                              "positive integer");
+                    wOk = false;
+                    break;
+                }
+                const long long w = cw[wi].get<long long>();
+                // STRICTLY DESCENDING. Equal or ascending weights make the
+                // packing non-injective (two versions encode alike) and break
+                // the ordering the encoding exists to provide.
+                if (!weights.empty() && w >= weights.back()) {
+                    coll.emit(entryCode, mpath + "/componentWeights",
+                              std::format("'componentWeights' must be strictly "
+                                          "descending; {} does not precede {}",
+                                          weights.back(), w));
+                    wOk = false;
+                    break;
+                }
+                weights.push_back(w);
+            }
+            if (!wOk) continue;
+            if (weights.back() != 1) {
+                coll.emit(entryCode, mpath + "/componentWeights",
+                          "the LAST 'componentWeights' entry must be 1 (the "
+                          "least-significant component is unscaled)");
+                continue;
+            }
+            // The version STRING is injected by the build from the repo-root
+            // `VERSION` file, which CMake already reads as the single source
+            // of truth. Nothing is duplicated: VERSION -> CMake -> here.
+            //
+            // The packing itself lives in `packVersionComponents` so that every
+            // failure mode below is reachable from a UNIT TEST with an
+            // arbitrary version string. Baking `kBuildVersionText` into this
+            // function would make the bound check testable only by editing
+            // VERSION and reconfiguring the build — i.e. effectively untested.
+            auto const packed =
+                packVersionComponents(kBuildVersionText, weights);
+            if (!packed.has_value()) {
+                coll.emit(entryCode, mpath + "/componentWeights",
+                          packed.error());
+                continue;
+            }
+            pm.value = std::format("{}", *packed);
         } else {
             coll.emit(entryCode, mpath + "/kind",
                       std::format("unknown predefined-macro kind '{}' "
-                                  "(expected line/file/constant/date/time)",
+                                  "(expected line/file/constant/date/time/"
+                                  "version)",
                                   kind));
+            continue;
+        }
+        // `componentWeights` belongs to the `version` kind alone. Silently
+        // ignoring it elsewhere would let a typo'd `kind` ship a macro whose
+        // declared encoding never ran.
+        if (kind != "version" && e.contains("componentWeights")) {
+            coll.emit(entryCode, mpath + "/componentWeights",
+                      "'componentWeights' is valid only on a 'version' "
+                      "predefinedMacros entry");
             continue;
         }
         // `value` -- REQUIRED iff kind==constant; the static replacement
@@ -223,4 +388,6 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
     }
 }
 
-} // namespace dss::detail
+} // namespace detail
+
+} // namespace dss

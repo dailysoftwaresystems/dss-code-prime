@@ -6,6 +6,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <expected>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,7 +33,35 @@
 // because each config family owns its own diagnostic vocabulary and its own
 // path spelling (`/preprocess/predefinedMacros/3` vs `/predefinedMacros/3`).
 
+// TF-C83: the BUILD's own version text, for the `version` predefine kind.
+//
+// SINGLE SOURCE OF TRUTH, NOT DUPLICATED DATA. The repo-root `VERSION` file is
+// the one place the version is written. CMake ALREADY reads it (top-level
+// `CMakeLists.txt` — `file(READ ... VERSION)` feeding `project(VERSION ...)`,
+// with a comment saying that is exactly why); `src/core/CMakeLists.txt` merely
+// forwards that same variable here. VERSION -> CMake -> this macro. Nothing
+// restates the number.
+//
+// WHY BUILD-INJECTED AND NOT READ FROM DISK AT CONFIG-LOAD TIME. Schemas can be
+// loaded from TEXT (`GrammarSchema::loadFromText`), where there is no config
+// root and therefore no sibling `VERSION` to read — a disk-reading design would
+// work for `loadShipped` and fail for `loadFromText`, i.e. it would fail
+// exactly where it is least visible. A compile-time constant has no such seam,
+// and it keeps schema parsing pure JSON->struct with no filesystem I/O.
+//
+// Undefined => the build is BROKEN, loudly, here and now. Defaulting to "0.0.0"
+// would ship a compiler that quietly reports the wrong identity.
+#ifndef DSS_PROJECT_VERSION
+#    error "DSS_PROJECT_VERSION is not defined — src/core/CMakeLists.txt must forward the repo-root VERSION file (see top-level CMakeLists.txt)."
+#endif
+
 namespace dss::detail {
+
+inline constexpr std::string_view kBuildVersionText = DSS_PROJECT_VERSION;
+// NOTE: `packVersionComponents` — the pure value transform this kind uses — is
+// declared in `preprocess_config.hpp`, NOT here. It has nothing to do with
+// JSON, and this header pulls <nlohmann/json.hpp>, which `core` links PRIVATE;
+// declaring it here would make it unreachable from tests.
 
 // Parse a `predefinedMacros` JSON ARRAY into `out`, appending one
 // `PredefinedMacroDef` per well-formed entry and emitting a diagnostic per

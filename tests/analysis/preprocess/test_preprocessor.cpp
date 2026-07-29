@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -2540,8 +2541,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // TARGET config, not the language, and are merged in at preprocess time. That
     // is why this count did not move in TF-C74. The effective language ⊕ target
     // sets are pinned by `TFC74EffectiveArchPredefinesForShippedTargets`.
-    EXPECT_EQ(pms.size(), 24u)
-        << "c-subset declares 11 un-gated + 11 pe-gated + 2 macho-gated predefined macros";
+    //
+    // TF-C83: +6 rows — the identities DSS
+    // presents. 5 un-gated (`__DSSCP__` the honest one, plus the dialect claim
+    // `__GNUC__`/`__GNUC_MINOR__`/`__GNUC_PATCHLEVEL__` and `__clang__`) and 1
+    // macho-gated (`__APPLE_CC__`). 11+5=16 un-gated, 11 pe-gated, 2+1=3
+    // macho-gated = 30.
+    EXPECT_EQ(pms.size(), 30u)
+        << "c-subset declares 16 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2571,14 +2578,19 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // target — reaching `sysconf(_SC_NPROCESSORS_ONLN)` instead of the `sysctl`
     // arm real Apple toolchains take. Mirrors the c95 `_WIN32`-for-pe precedent.
     std::sort(machoGatedNames.begin(), machoGatedNames.end());
-    EXPECT_EQ(machoGatedNames, (std::vector<std::string>{"__APPLE__", "__MACH__"}))
-        << "macho targets must predefine exactly __APPLE__ and __MACH__ — the "
-           "platform-selection macros clang/gcc define on Darwin; dropping either "
-           "makes every `#ifdef __APPLE__` in portable C take the wrong branch";
-    EXPECT_EQ(ungated, 11u)
+    EXPECT_EQ(machoGatedNames,
+              (std::vector<std::string>{"__APPLE_CC__", "__APPLE__", "__MACH__"}))
+        << "macho targets must predefine exactly __APPLE__, __MACH__ and (TF-C83) "
+           "__APPLE_CC__ — the platform-selection macros clang/gcc define on Darwin; "
+           "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
+           "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
+           "TargetConditionals.h:342 conjunction that gates the whole Darwin ladder";
+    EXPECT_EQ(ungated, 16u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
-           "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) are un-gated (every "
-           "format); __STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
+           "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
+           "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
+           "__GNUC_PATCHLEVEL__, __clang__) are un-gated (every format); "
+           "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
     EXPECT_EQ(peGated, 11u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
@@ -2609,6 +2621,215 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
     auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
     EXPECT_FALSE(loaded.has_value())
         << "an unknown availableObjectFormats name ('pee') must be a load error";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C83 — the six rows that make DSS present a
+// coherent identity to Apple SDK headers, and the `version` predefine kind that
+// derives `__DSSCP__` from the repo-root VERSION file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The VALUES, as an exact SET, every one MEASURED against
+// `/usr/bin/clang -dM -E -x c /dev/null` (2026-07-29):
+//   __GNUC__ 4 / __GNUC_MINOR__ 2 / __GNUC_PATCHLEVEL__ 1 / __APPLE_CC__ 6000 /
+//   __clang__ 1.
+// `__DSSCP__` is the one row with no clang counterpart — it is DSS's own
+// identity, packed from VERSION (0.0.2 -> 0*1000000 + 0*1000 + 2 == 2).
+//
+// WHY VALUES AND NOT JUST PRESENCE: `__GNUC__` alone would satisfy a
+// presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
+// 4002001 that sqliteInt.h:112 computes.
+TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    std::map<std::string, std::string> got;
+    for (auto const& pm : (*c)->preprocess().predefinedMacros) {
+        if (pm.name == "__GNUC__" || pm.name == "__GNUC_MINOR__"
+            || pm.name == "__GNUC_PATCHLEVEL__" || pm.name == "__APPLE_CC__"
+            || pm.name == "__clang__" || pm.name == "__DSSCP__") {
+            got[pm.name] = pm.value;
+        }
+    }
+    const std::map<std::string, std::string> want{
+        {"__APPLE_CC__", "6000"},     {"__DSSCP__", "2"},
+        {"__GNUC_MINOR__", "2"},      {"__GNUC_PATCHLEVEL__", "1"},
+        {"__GNUC__", "4"},            {"__clang__", "1"},
+    };
+    EXPECT_EQ(got, want)
+        << "the TF-C83 identity predefines must carry their clang-MEASURED "
+           "values; __DSSCP__ must be VERSION (0.0.2) packed to 2";
+    // The GCC_VERSION arithmetic sqliteInt.h:112 actually performs.
+    EXPECT_EQ(std::stoll(got.at("__GNUC__")) * 1000000
+                  + std::stoll(got.at("__GNUC_MINOR__")) * 1000
+                  + std::stoll(got.at("__GNUC_PATCHLEVEL__")),
+              4002001)
+        << "GCC_VERSION must evaluate to 4002001 — shipping __GNUC__ without "
+           "its two components would yield 4000000 and misreport the dialect";
+}
+
+// `__DSSCP__` FOLLOWS the VERSION file rather than restating a literal. The
+// packing is exercised directly with arbitrary version strings — the loader
+// calls this same function with the build's own version, so a green run here
+// plus the value pin above is the full chain.
+//
+// ORDERING is the property the encoding exists for: 0.0.2 < 0.1.0 < 1.0.0 must
+// hold as INTEGER comparison so `#if __DSSCP__ >= ...` behaves as anyone reading
+// it expects.
+TEST(Preprocessor, TFC83VersionPackingIsOrderPreserving) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    auto pack = [&](std::string_view v) {
+        auto r = dss::packVersionComponents(v, w);
+        EXPECT_TRUE(r.has_value()) << v << ": " << (r ? "" : r.error());
+        return r.value_or(-1);
+    };
+    EXPECT_EQ(pack("0.0.2"), 2);
+    EXPECT_EQ(pack("0.1.0"), 1000);
+    EXPECT_EQ(pack("1.0.0"), 1000000);
+    EXPECT_EQ(pack("4.2.1"), 4002001);   // the GCC_VERSION shape, same encoding
+    EXPECT_LT(pack("0.0.2"), pack("0.1.0"));
+    EXPECT_LT(pack("0.1.0"), pack("1.0.0"));
+    EXPECT_LT(pack("0.0.999"), pack("0.1.0"));
+
+    // RED-ON-DISABLE for the value pin above: a DIFFERENT VERSION produces a
+    // DIFFERENT macro body. If `__DSSCP__` were a hard-coded "2" this would be
+    // the assertion that could not hold.
+    EXPECT_NE(pack("0.0.3"), pack("0.0.2"));
+}
+
+// ★ THE BOUND IS DERIVED FROM THE WEIGHTS, NOT HARD-CODED — and it FAILS LOUD.
+// Under [1000000,1000,1] a component of 1000 carries into the next field:
+// 0.0.1000 would pack to 1000, byte-identical to 0.1.0, and every `#if
+// __DSSCP__ >= ...` downstream would silently compare wrongly. That is the
+// wrong-value-with-no-diagnostic class this arc keeps closing, so it is an
+// ERROR naming the offending component — never a wraparound.
+TEST(Preprocessor, TFC83VersionPackingBoundFailsLoud) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    auto bad = dss::packVersionComponents("0.0.1000", w);
+    ASSERT_FALSE(bad.has_value())
+        << "0.0.1000 must be REFUSED — it packs to 1000, identical to 0.1.0";
+    EXPECT_NE(bad.error().find("component #2"), std::string::npos)
+        << "the diagnostic must name the offending component: " << bad.error();
+    EXPECT_NE(bad.error().find("1000"), std::string::npos) << bad.error();
+    // The collision the bound prevents, stated as the fact it is.
+    auto collide = dss::packVersionComponents("0.1.0", w);
+    ASSERT_TRUE(collide.has_value());
+    EXPECT_EQ(*collide, 1000);
+
+    EXPECT_FALSE(dss::packVersionComponents("1.2000.0", w).has_value())
+        << "a middle component at its bound must be refused too";
+    // The MOST-significant component has no field above it -> unbounded.
+    EXPECT_TRUE(dss::packVersionComponents("9999.0.0", w).has_value())
+        << "the leading component has no more-significant neighbour to collide "
+           "with and must NOT be bounded";
+
+    // A DIFFERENT declared encoding gets its own correct bound for free —
+    // proving 1000 is nowhere in the engine.
+    const std::vector<long long> w2{10000, 100, 1};
+    EXPECT_FALSE(dss::packVersionComponents("0.0.100", w2).has_value())
+        << "under [10000,100,1] the bound is 100, derived from the weights";
+    EXPECT_TRUE(dss::packVersionComponents("0.0.99", w2).has_value());
+}
+
+// Shape mismatches and malformed version text are load errors, not guesses.
+TEST(Preprocessor, TFC83VersionPackingRejectsMalformed) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    for (auto const* v : {"0.0", "0.0.2.1", "", "0..2", "0.0.x", "1.0.2a"}) {
+        EXPECT_FALSE(dss::packVersionComponents(v, w).has_value())
+            << "'" << v << "' must be refused, never silently coerced";
+    }
+    auto countErr = dss::packVersionComponents("0.0", w);
+    ASSERT_FALSE(countErr.has_value());
+    EXPECT_NE(countErr.error().find("component"), std::string::npos)
+        << countErr.error();
+}
+
+// LOADER fail-loud for the `version` kind. RED-ON-DISABLE: each corruption must
+// make the load FAIL — a tolerated one would ship a macro whose declared
+// encoding never ran.
+TEST(Preprocessor, TFC83VersionKindLoadFailures) {
+    // Match only the FIELDS of the version row (the row also carries a
+    // `$comment`, so the whole-object spelling is not stable to match on).
+    const std::string good =
+        "\"name\": \"__DSSCP__\",           \"kind\": \"version\",  "
+        "\"componentWeights\": [1000000, 1000, 1]";
+    struct Case { const char* what; std::string to; };
+    const std::vector<Case> cases{
+        {"componentWeights missing",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\""},
+        {"weights ascending (non-injective packing)",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1, 1000, 1000000]"},
+        {"last weight not 1",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1000000, 1000, 10]"},
+        {"weight count != version component count",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1000, 1]"},
+        {"componentWeights on a non-version kind",
+         "\"name\": \"__DSSCP__\", \"kind\": \"constant\", \"value\": \"2\", "
+         "\"componentWeights\": [1000000, 1000, 1]"},
+        {"unknown kind stays loud",
+         "\"name\": \"__DSSCP__\", \"kind\": \"vershion\", "
+         "\"componentWeights\": [1000000, 1000, 1]"},
+    };
+    for (auto const& c : cases) {
+        std::string text = loadShippedCSubsetText();
+        ASSERT_FALSE(text.empty());
+        auto const pos = text.find(good);
+        ASSERT_NE(pos, std::string::npos)
+            << "the __DSSCP__ version entry must be present verbatim";
+        text.replace(pos, good.size(), c.to);
+        auto loaded = GrammarSchema::loadFromText(text, "<tfc83-version>");
+        EXPECT_FALSE(loaded.has_value()) << "must be a load error: " << c.what;
+    }
+    // Control: the UNMODIFIED text still loads, so the cases above fail for the
+    // reason claimed and not because the fixture text is stale.
+    auto ok = GrammarSchema::loadFromText(loadShippedCSubsetText(),
+                                          "<tfc83-version-control>");
+    EXPECT_TRUE(ok.has_value()) << "the shipped c-subset text must still load";
+}
+
+// AGNOSTICISM: not one of these macro spellings may appear in engine C++. The
+// engine knows the KIND verbs (`version`, `constant`, …) and the config key
+// (`componentWeights`); it must never know that `__DSSCP__` or `__GNUC__`
+// exist. Guarded here rather than by review because this is exactly the rule a
+// well-meaning "just special-case it" patch breaks.
+TEST(Preprocessor, TFC83IdentityMacroNamesAreNotInEngineCpp) {
+    namespace fs = std::filesystem;
+    auto root = fs::path{__FILE__}.parent_path().parent_path().parent_path()
+                    .parent_path() / "src";
+    ASSERT_TRUE(fs::is_directory(root)) << root.string();
+    const std::vector<std::string> banned{"__DSSCP__", "__GNUC__", "__clang__",
+                                          "__APPLE_CC__"};
+    std::vector<std::string> hits;
+    for (auto const& e : fs::recursive_directory_iterator(root)) {
+        if (!e.is_regular_file()) continue;
+        auto const p = e.path();
+        // Only ENGINE sources. `src/dss-config/` is config — the macro names
+        // are supposed to live there, that is the entire point.
+        if (p.extension() != ".cpp" && p.extension() != ".hpp") continue;
+        if (p.string().find("dss-config") != std::string::npos) continue;
+        std::ifstream in(p);
+        std::string   line;
+        int           n = 0;
+        while (std::getline(in, line)) {
+            ++n;
+            for (auto const& b : banned) {
+                if (line.find(b) != std::string::npos) {
+                    hits.push_back(p.filename().string() + ":"
+                                   + std::to_string(n) + " " + b);
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(hits.empty())
+        << "identity macro spellings must live ONLY in config, never in engine "
+           "C++; found: "
+        << [&] {
+               std::string s;
+               for (auto const& h : hits) s += "\n  " + h;
+               return s;
+           }();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

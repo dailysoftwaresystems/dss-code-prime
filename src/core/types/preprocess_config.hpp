@@ -3,7 +3,10 @@
 #include "core/export.hpp"
 
 #include <cstdint>
+#include <expected>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss {
@@ -23,6 +26,34 @@ namespace dss {
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
 enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// TF-C83 (D-CSUBSET-TOOLCHAIN-IDENTITY-PREDEFINES). Pack a dot-separated version ("0.0.2")
+// into ONE integer using `weights` (most-significant first, last entry 1):
+// sum(component[i] * weights[i]). With [1000000, 1000, 1] this is the
+// GCC_VERSION encoding, so the result ORDERS correctly — 0.0.2 (2) < 0.1.0
+// (1000) < 1.0.0 (1000000) — so a `#if`-time `>=` against the resulting macro
+// behaves as read. Which macro that is stays CONFIG's business; the engine
+// knows only the `version` kind and the `componentWeights` key.
+//
+// Returns the packed value, or an ERROR MESSAGE. Every rejection is a case
+// where the encoding would otherwise be silently WRONG rather than merely
+// unusual:
+//   * malformed version text (empty field / non-digit / absurd component);
+//   * component count != weight count (the config describes a different
+//     version shape than the build actually has);
+//   * a component that REACHES its derived bound weights[i-1]/weights[i] —
+//     e.g. 0.0.1000 under [1000000,1000,1] packs to 1000, indistinguishable
+//     from 0.1.0. The bound is read off the weights the CONFIG declared; no
+//     magic 1000 exists in the engine, so a different declared encoding is
+//     bounded correctly for free.
+//
+// Split out of the `version`-kind loader specifically so these paths are
+// reachable from unit tests with an ARBITRARY version string — baking the
+// build's own version in would make them testable only by editing the repo's
+// VERSION file and reconfiguring, which in practice means untested.
+[[nodiscard]] DSS_EXPORT std::expected<long long, std::string>
+packVersionComponents(std::string_view           versionText,
+                      std::span<const long long> weights);
 
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the

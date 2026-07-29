@@ -46,6 +46,15 @@ target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # to live here for __declspec(dllexport) in core/export.hpp to fire on MSVC.
 target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
+# TF-C83 — forward the repo-root VERSION file to the `version` predefine kind
+# (`core/types/predefined_macro_json.hpp`). `DSS_VERSION` is the STRIPPED
+# contents of that file, already read by the top-level CMakeLists as the single
+# source of truth for `project(VERSION ...)`; re-using the same variable is what
+# keeps `__DSSCP__` from becoming a second place the version is written. The
+# header `#error`s if this definition is missing, so a botched wireup fails the
+# BUILD rather than silently predefining a wrong identity.
+target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
+
 # nlohmann/json is included by exactly one translation unit
 # (grammar_schema_json.cpp). PRIVATE keeps the include path off the
 # transitive consumers — every other file in `core` (and every consumer
