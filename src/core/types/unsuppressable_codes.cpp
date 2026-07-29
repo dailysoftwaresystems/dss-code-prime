@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 130> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 131> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -624,6 +624,20 @@ constexpr std::array<DiagnosticCode, 130> kUnsuppressableCodes{{
     // different offsets; suppressing the refusal does not remove the ambiguity,
     // it just picks one of them without saying so.
     DiagnosticCode::S_PragmaPackAmbiguous,
+    // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
+    // conditional-inclusion OPERATOR name (`__has_include` and siblings).
+    // Suppressing it does not make the shadowing harmless — it lets the
+    // program's `__has_include(<h>)` answer 0 while `#include <h>` still
+    // splices the header, so the guard and the include it guards disagree
+    // about the same file. MEASURED, that disagreement is what turned FIVE
+    // present-and-readable SDK headers into `F001A: not found` before this
+    // cycle (`mach/boolean.h`, `mach/kern_return.h`, `mach/port.h`,
+    // `mach/vm_types.h`, `malloc/_malloc_type.h`; the sixth,
+    // `mach/mach_types.h`, is blocked by a SEPARATE guarded-include-cycle
+    // defect). The universal `#ifndef __has_include` shim never reaches this
+    // code (its guard is dead once the operator is `defined`), so membership
+    // costs conforming input nothing.
+    DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

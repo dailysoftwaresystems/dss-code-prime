@@ -163,6 +163,38 @@ enum class DiagnosticCode : std::uint16_t {
     // be silenceable into shipping the wrong layout.
     P_PreprocessorPragma          = 0x0020,
 
+    // P_PreprocessorOperatorNameNotDefinable: TF-C86
+    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named one of the
+    // language's CONDITIONAL-INCLUSION OPERATORS — the `#if`-only
+    // `__has_include` / `__has_embed` / `__has_c_attribute` spellings the
+    // grammar declares (`isConditionalInclusionOperator`). C23 6.10.1 reserves
+    // those identifiers to the implementation, and DSS IMPLEMENTS them, so a
+    // program cannot take the name over.
+    //
+    // Why an ERROR and not a silent accept: honoring the redefinition makes
+    // `#include <h>` and `__has_include(<h>)` answer DIFFERENTLY about the same
+    // header — the header gets textually spliced while the guard that decides
+    // whether to splice it reads 0. That is a silent miscompile, and it is
+    // exactly the shape that produced the TF-C86 `F001A` cascade before the
+    // operators became `defined`.
+    //
+    // ★ THIS ARM IS A BELT, NOT A BREAK. The ubiquitous portability shim
+    //       #ifndef __has_include
+    //       #define __has_include(x) 0
+    //       #endif
+    //   (Apple SDK `sys/cdefs.h:91`, glibc, musl, ...) is now DEAD code on DSS
+    //   — `#ifndef __has_include` is false because the operator IS defined — so
+    //   the `#define` inside it never executes and this code never fires for
+    //   it. MEASURED: zero occurrences of an UNGUARDED `#define`/`#undef` of
+    //   these three names across the 189-TU sqlite corpus. What remains for
+    //   this code to catch is a program that really does try to shadow the
+    //   operator outright.
+    //
+    // Member of `kUnsuppressableCodes`: suppressing it would restore precisely
+    // the silent include/`__has_include` disagreement it exists to prevent.
+    // Remediation: guard the shim with `#ifndef`, or stop shadowing the name.
+    P_PreprocessorOperatorNameNotDefinable = 0x0021,
+
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
     // ParserConfig::maxExpressionDepth) is reported HERE at the offending

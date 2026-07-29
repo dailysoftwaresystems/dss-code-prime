@@ -612,4 +612,51 @@ struct DSS_EXPORT PreprocessConfig {
     bool variadicCommaElision = false;
 };
 
+// ── TF-C86 (D-CSUBSET-STDARG-F001A): the conditional-inclusion OPERATOR names ──
+//
+// A language's `#if`-only operators (`__has_include`, `__has_embed`,
+// `__has_c_attribute`) are IMPLEMENTATION-OWNED IDENTIFIERS, not ordinary
+// undefined names. Two consequences a preprocessor MUST honor, and which DSS
+// did not until TF-C86:
+//
+//   (1) `#ifdef`/`#ifndef`/`#elifdef`/`#elifndef`/`defined()` see them as
+//       DEFINED. MEASURED on the host clang
+//       (`clang -std=c2x -E`): `#ifdef __has_include` -> taken;
+//       likewise `__has_embed`, `__has_c_attribute`. This is the entire point
+//       of the ubiquitous portability shim
+//           #ifndef __has_include
+//           #define __has_include(x) 0
+//           #endif
+//       (Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc,
+//       musl, Boost, zlib, ...): the guard is DEAD on a compiler that has the
+//       operator. Reading the name as undefined takes the arm and SHADOWS the
+//       real operator with a function-like macro that answers 0 forever.
+//       MEASURED consequence before this predicate existed: every
+//       `#if __has_include(<mach/…>)`-guarded include in `malloc/_platform.h`
+//       became `F001A` — not because the header was missing (it is right there
+//       in the SDK) but because the pre-scan saw a function-like macro in the
+//       guard, went conservative-uncertain, skipped the angle SOURCE splice,
+//       and the post-parse import resolver then hard-failed the surviving
+//       directive as a missing system header.
+//
+//   (2) They are NOT names a program may `#define` or `#undef` (C23 6.10.1).
+//       Honoring such a redefinition would make `#include <h>` and
+//       `__has_include(<h>)` disagree — a silent miscompile — so DSS refuses
+//       it LOUDLY (`P_PreprocessorOperatorNameNotDefinable`).
+//
+// `definedOperator` is deliberately NOT a member of this set: `defined` is an
+// operator spelling, not a macro name. MEASURED on the same clang:
+// `#ifdef defined` is NOT taken.
+//
+// Config-driven throughout — the set is whatever spellings THIS language
+// declares, so a grammar that names its operator something else is covered and
+// one that declares none has an empty set. No hard-coded `__has_include`.
+[[nodiscard]] inline bool
+isConditionalInclusionOperator(std::string_view        name,
+                               PreprocessConfig const& cfg) noexcept {
+    return (!cfg.hasIncludeOperator.empty()    && name == cfg.hasIncludeOperator)
+        || (!cfg.hasEmbedOperator.empty()      && name == cfg.hasEmbedOperator)
+        || (!cfg.hasCAttributeOperator.empty() && name == cfg.hasCAttributeOperator);
+}
+
 } // namespace dss

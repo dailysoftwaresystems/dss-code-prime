@@ -21,12 +21,27 @@
 #     so their pragmas are never reached. Closing those blockers will RAISE this
 #     number. Do not read a low count as "few pragmas there".
 #
+# ★ TF-C86 UPDATE (2026-07-29) — AND THIS IS THE PREDICTION ABOVE COMING TRUE.
+#   TF-C86 made the conditional-inclusion operators DEFINED names, which stopped
+#   `sys/cdefs.h`'s `#ifndef __has_include` shim from shadowing `__has_include`,
+#   which un-blocked the `mach/*` + `malloc/*` include chain, and shipped a
+#   `stdbool.json` descriptor. macho TUs consequently get FURTHER, and the macho
+#   reached set grew EXACTLY as this file warned it would:
+#       macho pack   8 -> 22   (+14)
+#       macho mark   -  ->  4   (new prefix, first time reached)
+#   REVIEWED, and NEITHER needs a new `pragmaEffects` row: `pack` is already
+#   claimed as `structPacking` (TF-C82 implements it for real) and `mark` is
+#   already claimed as `annotationOnly` (an Xcode editor-navigation marker with no
+#   translation semantics). So the armed build gains ZERO new `P0020` from this —
+#   the growth is reach, not new unclaimed vocabulary. `macho` total 20 -> 38.
+#
 # MEASURED corollary of the same effect: `ext/rtree/rtree.c` carries two more
 # `#pragma intrinsic` lines and contributes ZERO on every class, because the whole
 # file body sits in a not-taken `#if !defined(SQLITE_CORE) || defined(...RTREE)`
 # branch and C 6.10p1 makes an elided pragma entirely silent.
 macho clang 12
-macho pack 8
+macho mark 4
+macho pack 22
 pe intrinsic 448
 pe optimize 2
 pe warning 1685

@@ -14,6 +14,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
+#include "core/types/unsuppressable_codes.hpp"  // TF-C86: the refusal's closed-table pin
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
 
@@ -7675,4 +7676,394 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
                   (std::vector<std::string>{"__amd64", "__amd64__", "__x86_64",
                                             "__x86_64__"}));
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C86 (D-CSUBSET-STDARG-F001A) — the conditional-inclusion OPERATORS are
+// DEFINED NAMES, and are not names a program may take over.
+//
+// WHAT WAS BROKEN. `sbNameDefined` (pre-scan) and `MacroExpander::isDefined`
+// (authoritative) both answered FALSE for `__has_include`. The universal
+// portability shim
+//     #ifndef __has_include
+//     #define __has_include(x) 0
+//     #endif
+// — Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc, musl,
+// Boost — therefore went LIVE, shadowing an operator DSS actually implements
+// with a function-like macro that answers 0 forever. The damage was not the 0:
+// it was that the pre-scan's FIX-3 arm (preprocessor.cpp, "a function-like-macro
+// invocation in the guard is NOT evaluated by this weaker pre-scan") then went
+// conservative-UNCERTAIN on every `#if __has_include(<h>)`, which skipped the
+// angle SOURCE splice, which left the directive verbatim, which made the
+// post-parse import resolver hard-fail it as `F001A` — a MISSING-HEADER error
+// for headers sitting readable on the include path. MEASURED on the sqlite
+// corpus at bb75fb8: 5 of the 7 macho `F001A` were this, all of them reached
+// through `malloc/_platform.h`.
+//
+// THE CONTRACT HAS FORMS, AND EVERY FORM IS TESTED BELOW: three declared
+// operators x {#ifdef, #ifndef, defined(), !defined(), #elifdef, #elifndef},
+// plus the `defined` NEGATIVE pin, plus the end-to-end splice witness, plus
+// both `#define` and `#undef` refusals, plus the config opt-out.
+// ════════════════════════════════════════════════════════════════════════════
+
+// The three spellings the shipped c-subset declares. Read from CONFIG, so a
+// grammar that renames one is covered and this test cannot drift from the
+// engine's own notion of the set.
+namespace {
+[[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
+    auto const& pp = cSubset()->preprocess();
+    std::vector<std::string> names;
+    for (std::string const* s : {&pp.hasIncludeOperator, &pp.hasEmbedOperator,
+                                 &pp.hasCAttributeOperator}) {
+        if (!s->empty()) names.push_back(*s);
+    }
+    return names;
+}
+} // namespace
+
+// FORM 1-4: `#ifdef` / `#ifndef` / `#if defined()` / `#if !defined()`.
+// MEASURED against the host toolchain (`clang -std=c2x -E`): `#ifdef
+// __has_include` is TAKEN, and likewise `__has_embed` and `__has_c_attribute`.
+// RED-ON-DISABLE: drop the `isConditionalInclusionOperator` arm from
+// `MacroExpander::isDefined` -> every `yes` below becomes `no`.
+TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedEveryForm) {
+    auto const ops = tfc86DeclaredOperators();
+    ASSERT_EQ(ops.size(), 3u)
+        << "the shipped c-subset must declare all three operators; if one was "
+           "removed this test is measuring less than it claims";
+    for (std::string const& op : ops) {
+        {   // FORM 1 — #ifdef NAME -> taken
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes")
+                << "#ifdef " << op << " must be TAKEN — the implementation "
+                   "provides the operator";
+        }
+        {   // FORM 2 — #ifndef NAME -> NOT taken. This is the exact shape of
+            //          the shim that caused the F001A cascade.
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#ifndef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no")
+                << "#ifndef " << op << " must NOT be taken — this is the arm "
+                   "the sys/cdefs.h shadowing shim lives in";
+        }
+        {   // FORM 3 — #if defined(NAME) -> true
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if defined(" + op + ")\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes")
+                << "defined(" << op << ") must agree with #ifdef " << op;
+        }
+        {   // FORM 4 — #if !defined(NAME) -> false (the inverted polarity: a
+            //          predicate that only fixed the positive direction reds here)
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if !defined(" + op + ")\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no") << "!defined(" << op << ") must be FALSE";
+        }
+    }
+}
+
+// FORMS 5-6: the C23 `#elifdef` / `#elifndef` spellings route through the SAME
+// definedness callbacks (`handleElif`, "the definedness callbacks are the SAME
+// ones handleIf binds"). Tested separately anyway: "routes through the same
+// code" is a claim, and an untested claim is how a multi-form contract ends up
+// half-implemented.
+TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        {   // #elifdef NAME -> taken (the leading #if is false)
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if 0\nint first;\n#elifdef " + op
+                + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes") << "#elifdef " << op << " must be TAKEN";
+        }
+        {   // #elifndef NAME -> NOT taken
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if 0\nint first;\n#elifndef " + op
+                + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no")
+                << "#elifndef " << op << " must NOT be taken";
+        }
+    }
+}
+
+// ★ THE NEGATIVE PIN. `defined` is an OPERATOR SPELLING, not a macro name, and
+// `definedOperator` is deliberately NOT a member of
+// `isConditionalInclusionOperator`. MEASURED on the host clang: `#ifdef defined`
+// is NOT taken. RED-ON-DISABLE: add `definedOperator` to the predicate -> this
+// reds. Without this test an over-broad predicate would pass every assertion
+// above while quietly changing what `#ifdef defined` means.
+TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
+    auto const& pp = cSubset()->preprocess();
+    ASSERT_FALSE(pp.definedOperator.empty());
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef " + pp.definedOperator + "\nint yes;\n#else\nint no;\n#endif\n", r);
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "`" << pp.definedOperator << "` is an operator spelling, NOT a macro "
+           "name — #ifdef of it must be FALSE (measured: clang agrees)";
+}
+
+// ★★ THE END-TO-END WITNESS — the property the whole cycle is about, and the
+// one no definedness assertion above can see. Reproduces `sys/cdefs.h`'s shim
+// VERBATIM, then guards a real angle SOURCE include with `__has_include`, and
+// requires the header to be TEXTUALLY SPLICED (its macro must EXPAND — a
+// symbol-only cross-ref would carry no macros).
+//
+// RED-ON-DISABLE, MEASURED: with the `isDefined` arm reverted, the shim goes
+// live, `__has_include` becomes a function-like macro, the pre-scan's FIX-3 arm
+// bails uncertain, the splice is skipped, `MARKER_OK` never expands and the
+// directive's `#` survives verbatim — which is exactly the state that produced
+// `F001A: got mach/boolean.h` on a header that was present the whole time.
+TEST(Preprocessor, TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd) {
+    namespace fs = std::filesystem;
+    auto inc = fs::temp_directory_path() / "dss_tfc86_shim_endtoend";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "guarded.h", std::ios::binary)
+        << "#define MARKER_OK 4242\nint guarded_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        // The shim, byte-for-byte as the SDK writes it ...
+        "#ifndef __has_include\n"
+        "#define __has_include(x) 0\n"
+        "#endif\n"
+        // ... then the guarded include it is supposed to leave alone.
+        "#if __has_include(<guarded.h>)\n"
+        "#include <guarded.h>\n"
+        "#endif\n"
+        "int u = MARKER_OK;\n",
+        r, {inc}, {});
+
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the shim is DEAD code here (its #ifndef is false), so nothing in "
+           "this TU may error";
+    EXPECT_FALSE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "the GUARDED shim must never trip the redefinition refusal — the "
+           "belt must not break the world's most common portability idiom";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("guarded_sym"))
+        << "the guarded header must be textually spliced despite the shim";
+    EXPECT_TRUE(has("4242"))
+        << "MARKER_OK must EXPAND — proving a real textual splice, which is the "
+           "property F001A's cascade destroyed";
+    EXPECT_FALSE(has("#"))
+        << "the include directive must be consumed, not left verbatim for the "
+           "import resolver to hard-fail as a missing system header";
+    fs::remove_all(inc, ec);
+}
+
+// The `#define` refusal, for EVERY declared operator. An UNGUARDED shadow is a
+// silent miscompile (the guard would answer 0 while `#include` still splices),
+// so it is refused loudly and the operator KEEPS working.
+TEST(Preprocessor, TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define " + op + "(x) 0\n"
+            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "#define " << op << " must fail LOUD";
+        ASSERT_EQ(lexs.size(), 3u) << op;
+        EXPECT_EQ(lexs[1], "yes")
+            << op << " must STILL be the operator after the refusal — a "
+                     "refusal that also dropped the name would leave the "
+                     "program in the shadowed state it was refused for";
+    }
+}
+
+// The `#undef` half. Symmetric, and equally load-bearing: an `#undef` that
+// SUCCEEDED would turn the operator back into an ordinary identifier folding
+// to 0 — the same include-vs-guard disagreement by a different route.
+TEST(Preprocessor, TFC86UndefOfOperatorFailsLoudEveryOperator) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#undef " + op + "\n"
+            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "#undef " << op << " must fail LOUD";
+        ASSERT_EQ(lexs.size(), 3u) << op;
+        EXPECT_EQ(lexs[1], "yes")
+            << op << " must survive the refused #undef";
+    }
+}
+
+// The refusal is UNSUPPRESSABLE: `--suppress` of it would restore exactly the
+// silent include-vs-guard disagreement it exists to prevent.
+TEST(Preprocessor, TFC86OperatorNameRefusalIsUnsuppressable) {
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "suppressing this code re-opens the silent miscompile channel";
+}
+
+// AGNOSTICISM (opt-OUT). With `hasIncludeOperator` stripped from config, DSS no
+// longer provides the operator — so `#ifndef __has_include` becomes TRUE and the
+// shim is correct to fire, exactly as it is on a compiler that lacks it. Pins
+// that the definedness comes from the CONFIG-DECLARED set and not from a
+// hard-coded `__has_include` lexeme. RED-ON-DISABLE: hard-code the name in
+// `isConditionalInclusionOperator` -> the stripped grammar still reports it
+// defined -> `no`.
+TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (std::string const& line :
+         {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
+          std::string{"    \"hasIncludeAngleOpenToken\":  \"LtOp\",\n"},
+          std::string{"    \"hasIncludeAngleCloseToken\": \"GtOp\",\n"}}) {
+        auto const pos = text.find(line);
+        ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
+        text.erase(pos, line.size());
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    ASSERT_TRUE(loaded.has_value());
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_TRUE(schema->preprocess().hasIncludeOperator.empty());
+
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#ifndef __has_include\nint yes;\n#else\nint no;\n#endif\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "yes")
+        << "with the operator stripped from CONFIG, DSS does not provide it, so "
+           "#ifndef __has_include is TRUE and the portability shim correctly "
+           "fires — the definedness must follow config, never a baked-in name";
+}
+
+// ★ THE PRE-SCAN'S OWN PIN — added because the first red-on-disable pass
+// MEASURED that it was MISSING. Reverting `SynthBuilder::sbNameDefined`'s
+// operator arm left all eight tests above GREEN, because the pre-scan carries
+// TWO independent guards (this one, and the define-TRACKING refusal that keeps
+// a shadowing `#define` out of `localMacros`) and every test above is satisfied
+// by the second one alone. A guard whose assertion is already met by a
+// DIFFERENT mechanism on the tested path is not a guard.
+//
+// This input isolates `sbNameDefined` exactly: the include's liveness is
+// decided BY the operator's definedness, and no `#define` of the operator
+// appears anywhere, so the define-tracking arm is inert here.
+//
+// With `sbNameDefined` correct, the pre-scan reads `#ifdef __has_include` LIVE,
+// `includeResolvable()` is true, and the angle SOURCE arm splices `probe.h`
+// textually — so `PRESCAN_MARKER` EXPANDS. Reverted, the pre-scan reads the
+// group DEAD, skips the splice, leaves the directive verbatim, and the marker
+// never expands (while the authoritative pass, which has its own correct
+// `isDefined`, considers the branch live — the pre-scan/authoritative
+// DIVERGENCE that the one-directional-lockstep invariant forbids).
+//
+// RED-ON-DISABLE: MEASURED — replacing `sbNameDefined`'s operator arm with
+// `return false;` reds this test and only this test.
+TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
+    namespace fs = std::filesystem;
+    auto inc = fs::temp_directory_path() / "dss_tfc86_prescan_gate";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "probe.h", std::ios::binary)
+        << "#define PRESCAN_MARKER 9191\nint prescan_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        // No `#define` of the operator ANYWHERE — the define-tracking arm
+        // cannot be what makes this pass.
+        "#ifdef __has_include\n"
+        "#include <probe.h>\n"
+        "#endif\n"
+        "int u = PRESCAN_MARKER;\n",
+        r, {inc}, {});
+
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("prescan_sym"))
+        << "the PRE-SCAN must read `#ifdef __has_include` as LIVE, or it never "
+           "splices the header the authoritative pass then believes is there";
+    EXPECT_TRUE(has("9191"))
+        << "PRESCAN_MARKER must EXPAND — only a real textual splice carries the "
+           "header's macros, and only a live-reading pre-scan performs one";
+    EXPECT_FALSE(has("#"))
+        << "the directive must be consumed by the pre-scan, not survive to be "
+           "hard-failed downstream as a missing system header";
+    fs::remove_all(inc, ec);
+}
+
+// The pre-scan's SECOND guard, pinned on its own for the same reason. Here the
+// shadowing `#define` IS present but UNGUARDED, so `sbNameDefined` cannot be
+// what saves it (the operator is defined either way): what must hold is that
+// the pre-scan REFUSES to record the operator into `localMacros`. If it
+// recorded it, FIX-3 would see a function-like macro in the following
+// `#if __has_include(<...>)` guard, go conservative-uncertain, and skip the
+// splice — reproducing the F001A cascade with the definedness fix in place.
+//
+// RED-ON-DISABLE: MEASURED — dropping the `isConditionalInclusionOperator`
+// filter from the pre-scan's `#define` arm reds this test.
+TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
+    namespace fs = std::filesystem;
+    auto inc = fs::temp_directory_path() / "dss_tfc86_prescan_norecord";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "norec.h", std::ios::binary)
+        << "#define NOREC_MARKER 7373\nint norec_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#define __has_include(x) 0\n"      // UNGUARDED — refused, and refused
+        "#if __has_include(<norec.h>)\n"    // loudly (asserted below)
+        "#include <norec.h>\n"
+        "#endif\n"
+        "int u = NOREC_MARKER;\n",
+        r, {inc}, {});
+
+    EXPECT_TRUE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "the unguarded shadow must be refused LOUDLY";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("norec_sym"))
+        << "the refused #define must leave the operator INTACT in the pre-scan "
+           "too — a pre-scan that recorded it would go FIX-3-uncertain on the "
+           "next guard and skip this splice";
+    EXPECT_TRUE(has("7373"))
+        << "NOREC_MARKER must EXPAND — the splice really happened";
+    fs::remove_all(inc, ec);
 }

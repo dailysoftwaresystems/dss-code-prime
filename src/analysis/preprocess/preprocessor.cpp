@@ -570,7 +570,12 @@ struct SynthBuilder {
         for (PredefinedMacroDef const& pm : effectivePredefines) {
             if (pm.name == n) return true;
         }
-        return false;
+        // TF-C86 (D-CSUBSET-STDARG-F001A): the language's conditional-inclusion
+        // OPERATORS are DEFINED names. Kept in lockstep with the authoritative
+        // `MacroExpander::isDefined` — both call the one shared predicate, so the
+        // pre-scan can never read `#ifndef __has_include` live while the real pass
+        // reads it dead (the one-directional divergence invariant above).
+        return isConditionalInclusionOperator(n, cfg());
     }
 
     std::optional<fs::path> resolveQuote(std::string_view filename,
@@ -769,6 +774,23 @@ struct SynthBuilder {
     // scan buffer. A malformed `#define` (no name) is ignored here (the macro
     // pass reports it authoritatively). Mirrors the redefinition-tolerant table
     // write (last definition wins; the pre-scan needs no compatibility check).
+    // TF-C86 (D-CSUBSET-STDARG-F001A): the SUBJECT of a `#define`/`#undef` — the
+    // first significant Word on the directive line, or empty when the line is
+    // malformed (the authoritative pass owns that diagnostic). Extracted so both
+    // pre-scan arms can ask "is this name one the implementation owns?" using the
+    // same reading of the line that `sbTrackDefine` does.
+    [[nodiscard]] static std::string_view
+    sbFirstNameOnLine(std::vector<PPToken> const& toks, std::size_t nameP,
+                      std::size_t end) {
+        std::size_t p = nameP;
+        while (p < end && isTrivia(toks[p].tok)) ++p;
+        if (p >= end || isNewline(toks[p].tok)
+            || toks[p].tok.coreKind != CoreTokenKind::Word) {
+            return {};
+        }
+        return toks[p].text;
+    }
+
     void sbTrackDefine(std::vector<PPToken> const& toks, std::size_t nameP,
                        std::size_t end, SourceBuffer const& buf) {
         std::size_t p = nameP;
@@ -1344,18 +1366,31 @@ struct SynthBuilder {
             // branch only improves later-guard accuracy, never causes a wrong
             // include. Then skip the directive line (the replacement list must not
             // be scanned as include syntax). ──
+            // TF-C86 (D-CSUBSET-STDARG-F001A): `sbFirstNameOnLine` reads the
+            // directive's SUBJECT so both arms can refuse a conditional-inclusion
+            // OPERATOR name — the pre-scan must reach the SAME macro state the
+            // authoritative pass will, and that pass REFUSES the define/undef
+            // (P_PreprocessorOperatorNameNotDefinable). Recording it here would
+            // put a function-like `__has_include` in `localMacros`, which is
+            // precisely what tripped FIX-3's uncertainty bail and produced the
+            // F001A cascade. The DIAGNOSTIC stays with the authoritative pass
+            // alone (this pre-scan re-walks the same lines; emitting here would
+            // double-report one root cause).
             if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
-                sbTrackDefine(toks, j + 1, lineEndTok, *scanBuf);
+                auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
+                if (!isConditionalInclusionOperator(subject, cfg())) {
+                    sbTrackDefine(toks, j + 1, lineEndTok, *scanBuf);
+                }
                 i = lineEndTok - 1;
                 continue;
             }
             if (sbStackActive(sbCondStack) && dirWord == cfg().undefDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
-                std::size_t u = j + 1;
-                while (u < lineEndTok && isTrivia(toks[u].tok)) ++u;
-                if (u < lineEndTok && toks[u].tok.coreKind == CoreTokenKind::Word) {
-                    localMacros.erase(std::string{toks[u].text});
+                auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
+                if (!subject.empty()
+                    && !isConditionalInclusionOperator(subject, cfg())) {
+                    localMacros.erase(std::string{subject});
                 }
                 i = lineEndTok - 1;
                 continue;
@@ -3004,8 +3039,18 @@ private:
         // a `defined()` context — the two must agree). predefined_ already
         // reflects the per-format availability filter, so a format-gated macro is
         // `defined` only on its target format.
+        // TF-C86 (D-CSUBSET-STDARG-F001A): + the language's conditional-inclusion
+        // OPERATORS (`__has_include` & siblings). They are implementation-owned
+        // identifiers this preprocessor IMPLEMENTS, so `#ifdef __has_include` is
+        // TRUE — MEASURED to match clang. Reading them undefined made the
+        // universal `#ifndef __has_include / #define __has_include(x) 0` shim
+        // LIVE, which shadowed the real operator with a function-like macro and
+        // cascaded into F001A on headers that were present all along. The SAME
+        // predicate backs `SynthBuilder::sbNameDefined`, so the two oracles
+        // cannot drift.
         return table_.find(std::string{name}) != table_.end()
-            || predefined_.find(std::string{name}) != predefined_.end();
+            || predefined_.find(std::string{name}) != predefined_.end()
+            || isConditionalInclusionOperator(name, cfg());
     }
 
     // The token-text accessor + the macro-state callbacks the shared `sbHandle*`
@@ -3369,6 +3414,22 @@ private:
             return;
         }
 
+        // TF-C86 (D-CSUBSET-STDARG-F001A): the sibling constraint for the
+        // CONDITIONAL-INCLUSION OPERATORS (C23 6.10.1). Same posture as the
+        // predefined arm above and the same reason at a different tier: honoring
+        // `#define __has_include(x) 0` would let the guard answer 0 while
+        // `#include <h>` still splices the header — one program, two verdicts on
+        // one file. Config-driven name set, no hard-coded spelling.
+        if (isConditionalInclusionOperator(name, cfg())) {
+            emitPP(rep_,
+                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+                   synth_->id(), in[nameIdx].span,
+                   std::string{"'"} + name
+                       + "' is a conditional-inclusion operator this "
+                         "implementation provides and may not be #defined");
+            return;
+        }
+
         MacroDef def;
         // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
         // to the macro name (C 6.10.3p3: no white space between the name and
@@ -3673,6 +3734,19 @@ private:
                    synth_->id(), in[p].span,
                    std::string{"'"} + name
                        + "' is a predefined macro and may not be #undef'd");
+            return;
+        }
+        // TF-C86 (D-CSUBSET-STDARG-F001A): the `#undef` half. An `#undef
+        // __has_include` that SUCCEEDED would silently turn the operator back
+        // into an ordinary undefined identifier folding to 0 — the same
+        // include-vs-guard disagreement the `#define` arm refuses.
+        if (isConditionalInclusionOperator(name, cfg())) {
+            emitPP(rep_,
+                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+                   synth_->id(), in[p].span,
+                   std::string{"'"} + name
+                       + "' is a conditional-inclusion operator this "
+                         "implementation provides and may not be #undef'd");
             return;
         }
         table_.erase(name);
