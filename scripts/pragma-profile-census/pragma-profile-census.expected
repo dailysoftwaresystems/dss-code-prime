@@ -1,5 +1,5 @@
 # TF-C85 — the CHECKED-IN expected reached pragma vocabulary, per predefine class.
-# Regenerate with `scripts/pragma-profile-census.sh --update` (read the diff first).
+# Regenerate with `scripts/pragma-profile-census/pragma-profile-census.sh --update` (read the diff first).
 # Format: <class> <pragma-leading-word> <count>.   `#` lines are documentation.
 #
 # ★★ THIS IS A FLOOR, NOT A TOTAL, AND THE DIFF IS EXPECTED TO MOVE. A reached-set

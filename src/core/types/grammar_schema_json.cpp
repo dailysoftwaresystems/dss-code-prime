@@ -4278,7 +4278,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // `kEffectVerbs` precedent, which was written after exactly
                     // that drift was MEASURED in the attribute loader).
                     static constexpr std::array<
-                        std::pair<std::string_view, PragmaEffect>, 6>
+                        std::pair<std::string_view, PragmaEffect>, 7>
                         kPragmaVerbs{{
                             {"diagnosticsOnly", PragmaEffect::DiagnosticsOnly},
                             {"annotationOnly",  PragmaEffect::AnnotationOnly},
@@ -4286,7 +4286,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                              PragmaEffect::RealizationRequestOnly},
                             {"structPacking",   PragmaEffect::StructPacking},
                             {"optimizerControl", PragmaEffect::OptimizerControl},
-                            {"unsupported",     PragmaEffect::Unsupported}}};
+                            {"unsupported",     PragmaEffect::Unsupported},
+                            {"includeOnce",     PragmaEffect::IncludeOnce}}};
                     DSS_CHECK_KEY_VOCABULARY(kPragmaVerbs);
                     static constexpr std::array<std::string_view, 2>
                         kPragmaRowKeys{"prefix", "effect"};

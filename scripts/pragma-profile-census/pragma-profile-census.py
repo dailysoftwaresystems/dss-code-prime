@@ -31,7 +31,7 @@
 # never touched.
 #
 # The result is diffed against the CHECKED-IN expected set
-# (`scripts/pragma-profile-census.expected`). A non-empty diff is a REVIEWABLE
+# (`scripts/pragma-profile-census/pragma-profile-census.expected`). A non-empty diff is a REVIEWABLE
 # CHANGE, not automatically a failure.
 #
 # ═══ ★★ THE EXPECTED SET IS A FLOOR, NOT A TOTAL — A DIFF IS NOT A BUG ══════
@@ -53,8 +53,8 @@
 #
 # ═══ ONE IMPLEMENTATION, TWO LAUNCHERS (TF-C86) ══════════════════════════════
 #
-# The logic lives HERE. `scripts/pragma-profile-census.sh` and
-# `scripts/pragma-profile-census.ps1` locate a Python 3 and exec this file,
+# The logic lives HERE. `scripts/pragma-profile-census/pragma-profile-census.sh` and
+# `scripts/pragma-profile-census/pragma-profile-census.ps1` locate a Python 3 and exec this file,
 # propagating the exit code and doing nothing else. Before TF-C86 this census
 # existed ONLY as bash — half-shipped, and the missing half was the one Windows
 # CI runs. Two hand-written ports would drift instead, and a drifted census is
@@ -62,7 +62,7 @@
 #
 # ═══ USAGE ═══════════════════════════════════════════════════════════════════
 #
-#   scripts/pragma-profile-census.py [--update]
+#   scripts/pragma-profile-census/pragma-profile-census.py [--update]
 #
 #   --update   rewrite the expected file from this run (review the diff first!)
 #
@@ -91,10 +91,32 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_FILE = REPO_ROOT / "scripts" / "pragma-profile-census.expected"
-
+# Resolved from THIS FILE, which now lives one level deeper
+# (`scripts/pragma-profile-census/`) than it used to. Counting `..` hops is
+# exactly the fragility that broke on the move, so the walk is ANCHORED on a
+# marker the repo root always has and a script directory never does.
 EXIT_MATCH, EXIT_DIFFERS, EXIT_CANNOT_RUN = 0, 1, 2
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "CMakeLists.txt").is_file() and (cand / "src").is_dir():
+            return cand
+    # TF-C87: there is deliberately NO hop-counting fallback here. A
+    # `here.parent.parent.parent` guess is EXACTLY what silently produced a wrong
+    # REPO_ROOT when this family moved one level deeper, and a wrong root does not
+    # fail -- it censuses the wrong tree and reports the result as fact. Failing
+    # loud is the only honest answer when the marker walk finds nothing.
+    print(f"pragma-profile-census: FATAL: no repo root at or above {here} "
+          f"(looked for a directory holding both CMakeLists.txt and src/)",
+          file=sys.stderr)
+    sys.exit(EXIT_CANNOT_RUN)
+
+REPO_ROOT = _repo_root()
+# The golden file is this script's SIBLING, so it is resolved from the script
+# rather than from REPO_ROOT: a repo-root-anchored literal silently breaks the
+# next time this family is relocated, which is precisely what happened here.
+EXPECTED_FILE = Path(__file__).resolve().parent / "pragma-profile-census.expected"
 
 # MEASURED: `availableObjectFormats` keys on format KIND, so the 24 shipped
 # format files collapse to exactly these three classes.

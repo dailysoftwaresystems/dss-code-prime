@@ -55,6 +55,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_PreprocessorPragma";
         case DiagnosticCode::P_PreprocessorOperatorNameNotDefinable:
             return "P_PreprocessorOperatorNameNotDefinable";
+        case DiagnosticCode::P_PreprocessorIncludeReentryRefused:
+            return "P_PreprocessorIncludeReentryRefused";
         case DiagnosticCode::S_PragmaPackAmbiguous:
             return "S_PragmaPackAmbiguous";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";

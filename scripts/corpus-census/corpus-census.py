@@ -89,8 +89,8 @@
 #
 # ═══ WHY PYTHON, WITH .sh AND .ps1 LAUNCHERS ═════════════════════════════════
 #
-# The census logic lives HERE, once. `scripts/corpus-census.sh` and
-# `scripts/corpus-census.ps1` are thin launchers that locate an interpreter and
+# The census logic lives HERE, once. `scripts/corpus-census/corpus-census.sh` and
+# `scripts/corpus-census/corpus-census.ps1` are thin launchers that locate an interpreter and
 # exec this file, propagating the exit code and nothing else. Two hand-written
 # ports of one census WOULD drift, and a drifted census is worse than a missing
 # one: the platforms then disagree about the corpus and no one knows which to
@@ -116,13 +116,32 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
+# Resolved from THIS FILE, which now lives one level deeper
+# (`scripts/corpus-census/`) than it used to. Counting `..` hops is exactly
+# the fragility that broke on the move, so the walk is ANCHORED on a marker
+# the repo root always has and a script directory never does.
 EXIT_OK, EXIT_INCOMPLETE, EXIT_CANNOT_RUN = 0, 1, 2
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "CMakeLists.txt").is_file() and (cand / "src").is_dir():
+            return cand
+    # TF-C87: there is deliberately NO hop-counting fallback here. A
+    # `here.parent.parent.parent` guess is EXACTLY what silently produced a wrong
+    # REPO_ROOT when this family moved one level deeper, and a wrong root does not
+    # fail -- it censuses the wrong tree and reports the result as fact. Failing
+    # loud is the only honest answer when the marker walk finds nothing.
+    print(f"corpus-census: FATAL: no repo root at or above {here} "
+          f"(looked for a directory holding both CMakeLists.txt and src/)",
+          file=sys.stderr)
+    sys.exit(EXIT_CANNOT_RUN)
+
+REPO_ROOT = _repo_root()
 
 # The three predefine classes. `availableObjectFormats` keys on format KIND, so
 # the shipped format files collapse to exactly these (same list, same reason, as
-# scripts/pragma-profile-census.py).
+# scripts/pragma-profile-census/pragma-profile-census.py).
 DEFAULT_TARGETS = [
     "x86_64:pe64-x86_64-windows-exec",
     "arm64:macho64-arm64-darwin-exec",

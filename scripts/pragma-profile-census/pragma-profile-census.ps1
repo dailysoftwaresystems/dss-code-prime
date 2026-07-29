@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 # TF-C85 pragma census / TF-C86 (D-CSUBSET-STDARG-F001A) pairing retrofit — LAUNCHER ONLY (Windows sibling of
-# scripts/pragma-profile-census.sh).
+# scripts/pragma-profile-census/pragma-profile-census.sh).
 #
-# The census itself lives in `scripts/pragma-profile-census.py`, once. This file finds a
+# The census itself lives in `scripts/pragma-profile-census/pragma-profile-census.py`, once. This file finds a
 # Python 3 and runs it. Its ONLY other job is to propagate the exit code
 # EXACTLY: `$LASTEXITCODE` is read into a local IMMEDIATELY after the call and
 # nothing is allowed to run in between, because any later statement (even a
@@ -13,7 +13,7 @@
 # machines it exists for. Both launchers call the same .py, so the two platforms
 # cannot drift into disagreeing about the corpus.
 #
-# Usage / options / exit codes: see scripts/pragma-profile-census.py (`--help`).
+# Usage / options / exit codes: see scripts/pragma-profile-census/pragma-profile-census.py (`--help`).
 
 [CmdletBinding()]
 param(

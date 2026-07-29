@@ -150,14 +150,25 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
         << "transitive quote include must be recursively inlined";
 }
 
-TEST(ImportResolver, CSubsetQuoteIncludeCycleTerminates) {
-    // FC13: a circular quote-`#include` chain is broken by the preprocessor's
-    // include-stack guard, which emits P_PreprocessorIncludeError on the
-    // back-edge instead of looping forever. The parse still produces one tree.
+// ★ TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) REWROTE THIS TEST, and the old
+// version WAS THE BUG. As `CSubsetQuoteIncludeCycleTerminates` it built an
+// UNGUARDED a.h <-> b.h pair, asserted `P_PreprocessorIncludeError`, and called
+// that the whole contract — so it read as if EVERY include back-edge were an
+// error. It is not. A back-edge into a GUARDED header is legal, conforming C
+// that a real cpp terminates via the guard, and DSS was rejecting it: MEASURED
+// on the macho corpus leg, `mach/mach_types.h -> mach/task_policy.h ->
+// mach/mach_types.h` produced 4 `F_ShippedHeaderNotFound` plus the spurious
+// refusal. The pair below pins BOTH halves, because the value is entirely in
+// the CONTRAST — either test alone can be satisfied by a compiler that gets the
+// other one wrong.
+
+TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
+    // No include guard anywhere, so the back-edge really is an infinite cycle:
+    // refused on sight, LOUDLY, and the parse still produces one tree.
     //
-    // RED-ON-DISABLE: removing the `std::find(includeStack...)` cycle guard in
-    // preprocessor.cpp SynthBuilder::build either hangs (infinite recursion) or
-    // overflows the depth guard -- either way this test stops passing cleanly.
+    // RED-ON-DISABLE: removing the `std::find(includeStack...)` test in
+    // preprocessor.cpp `SynthBuilder::build` either hangs or runs to the depth
+    // backstop -- either way this stops passing cleanly.
     TempDir dir;
     auto a = dir.write("a.h", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"a.h\"\nint b() { return 0; }\n");
@@ -167,14 +178,59 @@ TEST(ImportResolver, CSubsetQuoteIncludeCycleTerminates) {
     auto cu = std::move(builder).finish();
 
     ASSERT_EQ(cu.trees().size(), 1u);              // terminates, one tree
-    // The back-edge of the cycle is reported (on the tree's reporter, remapped
-    // to the originating header).
-    bool sawCycleDiag = false;
+    bool sawRefusal = false, sawGenericIncludeError = false;
     for (auto const& d : cu.trees()[0].diagnostics().all()) {
-        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawCycleDiag = true;
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeReentryRefused) {
+            sawRefusal = true;
+        }
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) {
+            sawGenericIncludeError = true;
+        }
     }
-    EXPECT_TRUE(sawCycleDiag)
-        << "a circular quote-include must emit P_PreprocessorIncludeError";
+    EXPECT_TRUE(sawRefusal)
+        << "an UNGUARDED include cycle must be refused under the refusal's own "
+           "code — `P_PreprocessorIncludeError` is shared with the nesting-depth "
+           "backstop, so reporting it there leaves the two indistinguishable";
+    EXPECT_FALSE(sawGenericIncludeError)
+        << "and must NOT also fire the generic include error: one root cause, "
+           "one diagnostic";
+}
+
+TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
+    // ★ THE HALF THAT WAS BROKEN. The same a.h <-> b.h shape, with ordinary
+    // include guards. A real cpp terminates this via the guard and reports
+    // NOTHING; so must DSS. Both bodies must land exactly once — 0 means a
+    // header was dropped, 2 means the guard failed to empty the re-entered copy.
+    TempDir dir;
+    auto a = dir.write("a.h",
+                       "#ifndef A_H\n#define A_H\n#include \"b.h\"\n"
+                       "int a() { return 0; }\n#endif\n");
+    dir.write("b.h",
+              "#ifndef B_H\n#define B_H\n#include \"a.h\"\n"
+              "int b() { return 0; }\n#endif\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addFile(a);
+    auto cu = std::move(builder).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "a GUARDED include cycle is legal C that terminates via the guard — "
+           "diagnosing it rejects conforming code (MEASURED: this is what cost "
+           "the macho corpus leg 4 F001A on mach/mach_types.h)";
+    std::string const text{cu.trees()[0].source().text()};
+    EXPECT_NE(text.find("int b()"), std::string::npos)
+        << "b.h must really have been spliced — a 'no errors' that came from "
+           "silently dropping the header would be worse than the diagnostic";
+    // ★ WHY THERE IS NO "EXACTLY ONCE" COUNT HERE, deliberately. `source()` is
+    // the SYNTH BUFFER, and the re-entered copy of a.h is present in it as DEAD
+    // BYTES — the guard elides it from the TOKEN STREAM, not from the text (the
+    // preprocessor copies non-directive bytes verbatim and lets the
+    // authoritative conditional pass decide what is live). So a raw-text count
+    // legitimately reads 2 here and would be pinning a retention detail, not the
+    // contract. The real "spliced exactly once" property is pinned where the
+    // post-elision stream is observable: `Preprocessor.Tf87Reentry*` count the
+    // emitted LEXEMES.
 }
 
 TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {

@@ -993,7 +993,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
         // consumer iteration order, and here that is `structPacking` (a real
         // layout) versus `unsupported` (a refusal) — never a cosmetic ambiguity.
         auto const ds = loadCSubsetExpectingFailure(
-            "\"prefix\": [\"once\"],                  \"effect\": \"unsupported\" },",
+            "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
             "\"prefix\": [\"pack\"],                  \"effect\": \"unsupported\" },",
             "<dup-pragma-prefix>");
         EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
@@ -1003,7 +1003,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
         // EMPTY: `[]` is a prefix of EVERY pragma, so one such row silently
         // turns the whole registry into a catch-all and disarms the loudness.
         auto const ds = loadCSubsetExpectingFailure(
-            "\"prefix\": [\"once\"],                  \"effect\": \"unsupported\" },",
+            "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
             "\"prefix\": [],                        \"effect\": \"unsupported\" },",
             "<empty-pragma-prefix>");
         EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
@@ -8066,4 +8066,574 @@ TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
     EXPECT_TRUE(has("7373"))
         << "NOREC_MARKER must EXPAND — the splice really happened";
     fs::remove_all(inc, ec);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) — GUARD-AWARE INCLUDE RE-ENTRY.
+//
+// ★ WHAT THIS BLOCK PINS. `includeStack` used to REFUSE re-entry into any header
+// already on the stack, emitting `P_PreprocessorIncludeError`. That rejects
+// LEGAL, STANDARD-CONFORMING C. MEASURED on the macho corpus leg at 5093341,
+// `src/mem1.c`:
+//     mach/mach_types.h -> mach/task_policy.h -> mach/mach_types.h
+// terminates perfectly under a real cpp — the second entry hits
+// `#ifndef _MACH_MACH_TYPES_H_` and expands to nothing. cpp has NO
+// refuse-re-entry rule; it has a NESTING DEPTH limit, and the include guard is
+// what terminates the cycle. That one false positive was the sole cause of the
+// leg's 4 residual `F_ShippedHeaderNotFound`.
+//
+// ★ WHY THERE IS ONE TEST PER GUARD SPELLING RATHER THAN ONE FOR "GUARDS".
+// Guard DETECTION GATES re-entry, so an unrecognised but LEGAL guard becomes a
+// REFUSED include — which presents to a user as a compiler bug. The corpus
+// exercises exactly ONE spelling (`#ifndef`); every other spelling below was
+// MEASURED in the macOS SDK and/or the sqlite tree and would otherwise ship
+// untested. Counts are from `scratchpad/guard-shape-census.py` over the 3100 SDK
+// headers + 52 sqlite headers.
+//
+// Shared shape of every POSITIVE test: `outer.h` includes `inner.h`, and
+// `inner.h` includes `outer.h` BACK. Under the old rule the back-edge was
+// refused and errored. Under the new one it is permitted, the guard empties the
+// second expansion, and `OUTER_MARK` — defined in outer.h AFTER the back-edge
+// resolves — must still reach the program text exactly once.
+
+namespace {
+
+// Build the outer/inner pair in a fresh dir and preprocess a main.c that
+// includes `outer.h`. `outerGuardOpen`/`outerGuardClose` are the SPELLING under
+// test; `outerBody` is spliced between them.
+struct ReentryFixture {
+    std::filesystem::path dir;
+    PreprocessResult      result;
+    std::vector<std::string> lexemes;
+
+    [[nodiscard]] bool has(std::string_view s) const {
+        for (auto const& l : lexemes) if (l == s) return true;
+        return false;
+    }
+    [[nodiscard]] std::size_t count(std::string_view s) const {
+        std::size_t n = 0;
+        for (auto const& l : lexemes) if (l == s) ++n;
+        return n;
+    }
+    [[nodiscard]] std::vector<std::string> messages() const {
+        std::vector<std::string> out;
+        for (auto const& d : result.diagnostics->all()) out.push_back(d.actual);
+        return out;
+    }
+    [[nodiscard]] bool anyMessageContains(std::string_view needle) const {
+        for (auto const& m : messages()) {
+            if (m.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+};
+
+// `guardedOuter` is outer.h's FULL text and must (a) include "inner.h" and
+// (b) define OUTER_MARK to 8787 after it.
+[[nodiscard]] ReentryFixture runReentry(std::string const& tag,
+                                        std::string const& guardedOuter,
+                                        std::string const& innerText) {
+    namespace fs = std::filesystem;
+    ReentryFixture f;
+    f.dir = fs::temp_directory_path() / ("dss_tf87_" + tag);
+    std::error_code ec;
+    fs::remove_all(f.dir, ec);
+    fs::create_directories(f.dir, ec);
+    { std::ofstream(f.dir / "outer.h", std::ios::binary) << guardedOuter; }
+    { std::ofstream(f.dir / "inner.h", std::ios::binary) << innerText; }
+    f.lexemes = ppLexemesWithDirs("#include \"outer.h\"\nint m = OUTER_MARK;\n",
+                                  f.result, {f.dir}, {});
+    fs::remove_all(f.dir, ec);   // the splice is complete; nothing re-reads it
+    return f;
+}
+
+// inner.h ALWAYS includes outer.h back — that back-edge is the whole point.
+constexpr char const* kInnerIncludesOuterBack =
+    "#include \"outer.h\"\nint inner_sym_8787;\n";
+
+// ★ ONE constant, read by BOTH the test that requires this phrase and the two
+// that require its ABSENCE. Two hand-typed copies is how a message-assertion
+// goes vacuous: the `EXPECT_FALSE` half passes for free the moment the phrasing
+// drifts, and nothing says so. (TF-C86 shipped exactly that gap once.)
+constexpr char const* kNoMechanismPhrase = "include-once mechanism was found";
+constexpr char const* kDepthCapPhrase    = "include nesting deeper than";
+constexpr char const* kRefusalPhrase     = "refusing to re-enter";
+
+// Assert the POSITIVE contract: no diagnostic at all, the back-edge produced no
+// duplicate text, and the marker really expanded.
+void expectReentryPermitted(ReentryFixture const& f, char const* what) {
+    EXPECT_FALSE(f.result.diagnostics->hasErrors())
+        << what << ": re-entry into a GUARDED header must be PERMITTED — the "
+                   "guard is what makes the second expansion empty, exactly as "
+                   "in cpp. First diagnostic: "
+        << (f.messages().empty() ? std::string{"<none>"} : f.messages().front());
+    EXPECT_EQ(f.count("8787"), 1u)
+        << what << ": OUTER_MARK must expand EXACTLY ONCE — 0 means the header "
+                   "was dropped, >1 means the guard failed to empty the "
+                   "re-entered copy and the text was spliced twice";
+    EXPECT_EQ(f.count("inner_sym_8787"), 1u)
+        << what << ": inner.h's own text must appear exactly once";
+}
+
+}  // namespace
+
+// ── FORM 1: canonical `#ifndef X` / `#define X`. ────────────────────────────
+// MEASURED 2942 of 3100 SDK headers and 35 of 52 sqlite headers. THE corpus
+// shape (`mach/mach_types.h`).
+TEST(Preprocessor, Tf87ReentryPermittedForCanonicalIfndefGuard) {
+    auto f = runReentry("ifndef",
+                        "#ifndef OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#ifndef X / #define X");
+}
+
+// ── FORM 2: `#if !defined(X)` / `#define X`. ────────────────────────────────
+// MEASURED 10 SDK headers (`_inttypes.h`, `odmodule/*`) + 1 sqlite
+// (`ext/expert/sqlite3expert.h`).
+TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedParenGuard) {
+    auto f = runReentry("ifnotdef_paren",
+                        "#if !defined(OUTER_H)\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined(X) / #define X");
+}
+
+// ── FORM 3: `#if !defined X` — NO PARENTHESES. ──────────────────────────────
+// MEASURED as real SDK vocabulary (`math.h:809`, `libxslt/xsltconfig.h:173`,
+// `Spatial/SPPose3D.h:23` …) though never as a first-line guard in this tree.
+// Supported because a spelling that is legal C must not become a refused
+// include the day someone uses it as a guard.
+TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedNoParenGuard) {
+    auto f = runReentry("ifnotdef_noparen",
+                        "#if !defined OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined X (no parens) / #define X");
+}
+
+// ── FORM 4: COMPOUND, all-negative. ─────────────────────────────────────────
+// MEASURED verbatim in `pcap/bpf.h`:
+//   #if !defined(_NET_BPF_H_) && !defined(_BPF_H_) && … && !defined(lib_pcap_bpf_h)
+// The guard name is the LAST of five, so a detector that only reads the first
+// operand refuses this header.
+TEST(Preprocessor, Tf87ReentryPermittedForCompoundAllNegativeGuard) {
+    auto f = runReentry("compound_neg",
+                        "#if !defined(_ALT_A) && !defined(_ALT_B) "
+                        "&& !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined(A) && !defined(B) && !defined(X)");
+}
+
+// ── FORM 5: COMPOUND with MIXED polarity. ───────────────────────────────────
+// MEASURED in the sqlite corpus ITSELF — `ext/misc/windirent.h`:
+//   #if defined(_WIN32) && defined(_MSC_VER) && !defined(SQLITE_WINDIRENT_H)
+// and `ext/session/sqlite3session.h`:
+//   #if !defined(__SQLITESESSION_H_) && defined(SQLITE_ENABLE_SESSION)
+// A detector that pattern-matches "the condition is a negation" fails both.
+TEST(Preprocessor, Tf87ReentryPermittedForCompoundMixedPolarityGuard) {
+    auto f = runReentry("compound_mixed",
+                        "#define GATE_ON 1\n"
+                        "#if defined(GATE_ON) && !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if defined(ON) && !defined(X)");
+}
+
+// ── FORM 6: the `#define` is NOT the next line. ─────────────────────────────
+// MEASURED 15 headers (libc++ `inttypes.h` / `stdint.h` put it 5 logical lines
+// down; `sys/_types/_os_inline.h` 2). Comments, blank lines AND a nested `#if`
+// all sit between the guard open and its `#define` here.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardDefineIsNotAdjacent) {
+    auto f = runReentry("define_far",
+                        "#ifndef OUTER_H\n"
+                        "\n"
+                        "/* a banner comment\n   spanning lines */\n"
+                        "#if 1\n"
+                        "#endif\n"
+                        "\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard #define 6 lines below the #ifndef");
+}
+
+// ── FORM 7: the guard is NOT the FIRST conditional in the file. ─────────────
+// MEASURED 9 SDK + 2 sqlite headers. `netinet6/in6.h` opens with
+// `#ifndef __KAME_NETINET_IN_H_INCLUDED_` (an umbrella check with no matching
+// `#define`) and only THEN opens the real guard. A "the first conditional is
+// the guard" rule refuses every one of these.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardIsNotFirstConditional) {
+    auto f = runReentry("guard_not_first",
+                        "#ifndef _UMBRELLA_CHECK_\n"
+                        "#endif\n"
+                        "#ifdef SOMETHING_ELSE\n"
+                        "#endif\n"
+                        "#ifndef OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard preceded by two unrelated conditionals");
+}
+
+// ── FORM 8: the controlling name arrives on an `#elif`, not the `#if`. ──────
+// The `#elif`/`#elifdef`/`#elifndef` operands are further controlling
+// expressions of the SAME group, so they must extend that group's name set.
+// Pins the elif arm of the detector, which no other test in this block reaches.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardNameComesFromElif) {
+    auto f = runReentry("guard_via_elif",
+                        "#if defined(NEVER_DEFINED_ZZZ)\n"
+                        "#elif !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#elif !defined(X) / #define X");
+}
+
+// ── THE NEGATIVE: an UNGUARDED self-including header is REFUSED, LOUDLY, ────
+// and with a message a reader can act on. Refusing immediately beats churning
+// to the depth cap: this names the header on the first back-edge.
+//
+// ★ THE MESSAGE ASSERTIONS ARE THE POINT, not decoration. Because guard
+// detection GATES re-entry, a DETECTOR GAP and a REAL CYCLE produce the same
+// refusal — so the message must say which one the compiler believes it saw and
+// must not be confusable with the depth-cap backstop.
+TEST(Preprocessor, Tf87UnguardedSelfIncludeIsRefusedLoudlyAndDiagnosably) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_unguarded";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    // No conditional names a macro this header then #defines, and no
+    // include-once #pragma: nothing terminates the cycle.
+    { std::ofstream(dir / "loop.h", std::ios::binary)
+          << "int loop_sym;\n#include \"loop.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"loop.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    // ★ THE CODE IS THE MACHINE-READABLE HALF OF THE DISTINGUISHABILITY
+    // REQUIREMENT. `P_PreprocessorIncludeError` (0x0016) is four-way overloaded
+    // — not found, unreadable, this refusal, and the depth cap — so a shared
+    // code leaves every census / log filter / tool unable to tell a GUARD-
+    // DETECTOR GAP from "your includes nest too deeply". The refusal therefore
+    // has its OWN code and the depth cap keeps 0x0016.
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "an unguarded self-including header IS an infinite cycle and must be "
+           "refused LOUDLY, under the refusal's OWN diagnostic code";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "and NOT under the overloaded include-error code — sharing it with "
+           "the depth cap is exactly what makes a detector gap undiagnosable";
+    bool sawRefusal = false, sawDepthCap = false, sawDetectorGapHint = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) != std::string::npos) {
+            sawRefusal = true;
+            if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+                sawDetectorGapHint =
+                    d.actual.find("GAP IN THE GUARD DETECTOR")
+                    != std::string::npos;
+            }
+        }
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+    }
+    EXPECT_TRUE(sawRefusal)
+        << "the refusal must NAME the header and say it is refusing to re-enter";
+    EXPECT_TRUE(sawDetectorGapHint)
+        << "the refusal must say WHY (no include-once mechanism found) AND tell "
+           "the reader that a guarded header reaching this message is a DETECTOR "
+           "GAP, not a cycle in their code — without that a detector gap is "
+           "indistinguishable from a real cycle";
+    EXPECT_FALSE(sawDepthCap)
+        << "an immediate refusal must NOT be reported as the depth-cap backstop "
+           "— the two are different failures and must read differently";
+}
+
+// ── `#pragma once` — RECOGNISED as a mechanism, and refused with its OWN ────
+// message. MEASURED: 21 macOS SDK headers carry `#pragma once`, 18 of them
+// (AppleArchive/*) with NO macro guard at all. DSS declares `once` `includeOnce`
+// in `preprocess.pragmaEffects` and has NOT built include-once dedup, so it
+// cannot make the repeat expansion empty — but reporting "no include guard
+// detected" would be a FALSE accusation that sends the reader hunting a
+// detector gap that is not there.
+TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_pragma_once";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "once.h", std::ios::binary)
+          << "#pragma once\nint once_sym;\n#include \"once.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"once.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "the `#pragma once` re-entry refusal is a REFUSAL and must carry the "
+           "refusal code, not the overloaded include-error code";
+    // ★ AND THE PRAGMA ITSELF IS STILL LOUD. `includeOnce` is a REFINEMENT of
+    // `unsupported`, not an escape from it: this cycle must not let `#pragma
+    // once` quietly start working as a side effect of teaching the guard
+    // detector to recognise it.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "`#pragma once` must STILL fail loud at its own line — the registry "
+           "row says DSS has not built include-once dedup, and recognising the "
+           "shape in the guard detector changes nothing about that";
+    bool sawOnceRefusal = false, sawNoMechanismClaim = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) == std::string::npos) continue;
+        if (d.actual.find("'includeOnce'") != std::string::npos) {
+            sawOnceRefusal = true;
+        }
+        if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawNoMechanismClaim = true;
+        }
+    }
+    EXPECT_TRUE(sawOnceRefusal)
+        << "a `#pragma once` header's re-entry refusal must NAME the mechanism "
+           "and the registry verb that declares it";
+    EXPECT_FALSE(sawNoMechanismClaim)
+        << "it must NOT claim no include-once mechanism was found — the header "
+           "carries one; this implementation just has not built it. Saying "
+           "otherwise sends the reader hunting a detector gap that is not there";
+}
+
+// ── THE DEPTH CAP REALLY FIRES on a GUARDED-BUT-STILL-RECURSIVE header. ─────
+// The detector is deliberately GENEROUS (over-recognition is the safe direction
+// under PERMIT), so a value-default `#ifndef MIN` / `#define MIN` — MEASURED as
+// a real shape in `sqlite/src/btreeInt.h` — reads as a guard. Here the
+// self-include sits OUTSIDE that region, so the guard cannot empty anything and
+// the recursion is real. The BACKSTOP must catch it, LOUDLY, and say something
+// different from the refusal.
+TEST(Preprocessor, Tf87DepthCapFiresLoudlyOnGuardedButStillRecursiveHeader) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_depthcap";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "rec.h", std::ios::binary)
+          << "#ifndef REC_MIN\n#define REC_MIN 1\n#endif\n"
+             "#include \"rec.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"rec.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(r.fatal)
+        << "an include nesting that reaches the backstop TRUNCATES the splice, "
+           "so the preprocess result must be fatal — a truncated splice reported "
+           "as merely 'an error' would let a partial TU flow downstream";
+    // ★ THE CODE SPLIT, FROM THE OTHER SIDE. The depth cap is a genuine
+    // resource/structure limit and makes NO claim about guards, so it keeps
+    // `P_PreprocessorIncludeError`; the guard-detection refusal must NOT appear
+    // here. Together with the negative test's mirror assertions this pins the
+    // separation in BOTH directions — either code leaking into the other case
+    // reds exactly one of the two.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the depth-cap backstop keeps the include-error code";
+    EXPECT_FALSE(hasPPCode(r,
+                           DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "a depth-cap failure must NOT be reported as a refused re-entry: a "
+           "guard WAS detected here, and telling the reader otherwise sends them "
+           "hunting a detector gap that does not exist";
+    bool sawDepthCap = false, sawNoMechanismClaim = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+        if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawNoMechanismClaim = true;
+        }
+    }
+    EXPECT_TRUE(sawDepthCap)
+        << "the guarded-but-recursive case must reach the DEPTH CAP and say so";
+    EXPECT_FALSE(sawNoMechanismClaim)
+        << "the depth cap must not be reported as a missing guard — a guard WAS "
+           "detected here; it simply did not neutralize the repeat include";
+}
+
+// ── THE BACKSTOP MUST TERMINATE THE WHOLE SPLICE, NOT JUST ONE ARM. ────────
+// `fatal` is shared by reference across the builder tree, but before TF-C87 it
+// only truncated the recursion that hit the cap. A header that includes a
+// recursive sibling TWICE then re-enters the cap path down BOTH arms at every
+// level — 2^64 builds. `build()` now returns immediately once `fatal` is set.
+//
+// ★ RED-ON-DISABLE IS A HANG, NOT A FAILURE: delete `if (fatal) return;` from
+// `SynthBuilder::build` and this test does not finish (ctest reports a timeout).
+// That is the honest red for an exponential-blowup guard; there is no cheaper
+// witness, because the blowup is only reachable AT the cap depth.
+TEST(Preprocessor, Tf87DepthCapShortCircuitsTheWholeSpliceNotJustOneArm) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_depthcap_branch";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "rec2.h", std::ios::binary)
+          << "#ifndef REC2_MIN\n#define REC2_MIN 1\n#endif\n"
+             "#include \"rec2.h\"\n#include \"rec2.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"rec2.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(r.fatal)
+        << "the backstop must still fire on the branching shape";
+    fs::remove_all(dir, ec);
+}
+
+// ── THE ANGLE ARM HAS THE SAME CONTRACT. ───────────────────────────────────
+// ★ THIS IS THE ARM THE CORPUS DEFECT WAS ON. `mach/mach_types.h` is reached as
+// an ANGLE include resolved to a real source header on the -I path
+// (`AngleIncludeKind::Source`), and that arm's refusal `continue`d WITHOUT
+// dropping the directive — so the surviving `#include <…>` line reached the
+// post-parse import resolver and became `F_ShippedHeaderNotFound`. A quote-only
+// fix would have left all 4 F001A in place.
+TEST(Preprocessor, Tf87ReentryPermittedThroughTheAngleSourceIncludeArm) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_angle";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "sub", ec);
+    { std::ofstream(dir / "sub" / "outer_ang.h", std::ios::binary)
+          << "#ifndef OUTER_ANG_H\n#define OUTER_ANG_H\n"
+             "#include <sub/inner_ang.h>\n#define ANG_MARK 9191\n#endif\n"; }
+    { std::ofstream(dir / "sub" / "inner_ang.h", std::ios::binary)
+          << "#include <sub/outer_ang.h>\nint ang_inner_sym;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <sub/outer_ang.h>\nint m = ANG_MARK;\n", r, {dir}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the ANGLE-source include arm must make the same re-entry decision as "
+           "the quote arm — this is the arm the corpus F001A came from";
+    std::size_t marks = 0, inners = 0;
+    for (auto const& l : lexs) {
+        if (l == "9191") ++marks;
+        if (l == "ang_inner_sym") ++inners;
+    }
+    EXPECT_EQ(marks, 1u) << "ANG_MARK must expand exactly once";
+    EXPECT_EQ(inners, 1u) << "the angle-spliced inner header must appear once";
+    fs::remove_all(dir, ec);
+}
+
+// ── AGNOSTICISM: the detector reads its directive vocabulary from CONFIG. ───
+// Rebind `ifndefDirective` to a non-C spelling and re-run the FORM-1 fixture
+// with that spelling. If any part of the detector hard-coded "ifndef", the
+// rebound guard goes unrecognised and the back-edge is refused.
+TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::string cfgText = loadShippedCSubsetText();
+    ASSERT_FALSE(cfgText.empty()) << "could not locate the shipped c-subset JSON";
+    const std::string from = "\"ifndefDirective\":     \"ifndef\"";
+    const std::string to   = "\"ifndefDirective\":     \"unlesseth\"";
+    auto const at = cfgText.find(from);
+    ASSERT_NE(at, std::string::npos)
+        << "shipped c-subset config no longer carries ifndefDirective=ifndef";
+    cfgText.replace(at, from.size(), to);
+
+    auto loaded =
+        GrammarSchema::loadFromText(cfgText, "<rebound-ifndef-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "the rebound config must still load — otherwise this test proves "
+           "nothing about the detector";
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_EQ(schema->preprocess().ifndefDirective, "unlesseth");
+
+    auto dir = fs::temp_directory_path() / "dss_tf87_agnostic";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "outer.h", std::ios::binary)
+          << "#unlesseth OUTER_H\n#define OUTER_H\n"
+             "#include \"inner.h\"\n#define OUTER_MARK 8787\n#endif\n"; }
+    { std::ofstream(dir / "inner.h", std::ios::binary)
+          << kInnerIncludesOuterBack; }
+    auto buf = SourceBuffer::fromString(
+        "#include \"outer.h\"\nint m = OUTER_MARK;\n", "main.c");
+    std::vector<fs::path> dirs{dir};
+    auto out = preprocess(buf, schema, dirs);
+    EXPECT_FALSE(out.diagnostics->hasErrors())
+        << "the guard detector must recognise the CONFIG-declared `#ifndef` "
+           "spelling — a hard-coded \"ifndef\" refuses this legal header";
+    std::size_t marks = 0;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "8787") ++marks;
+    }
+    EXPECT_EQ(marks, 1u)
+        << "the rebound-spelling guard must empty the re-entered copy exactly "
+           "as the C spelling does";
+    fs::remove_all(dir, ec);
+}
+
+// ── THE `#define` MUST BE INSIDE THE REGION THE CONDITIONAL CONTROLS. ──────
+// A `#ifndef X` group that CLOSES before `#define X` is not a guard: the define
+// runs unconditionally, so a repeat include is not emptied by anything. Pins the
+// `#endif` POP — without it the closed frame's names stay in scope, this header
+// reads as guarded, re-entry is permitted, and the failure degrades from an
+// immediate named refusal into a 64-level churn to the depth cap. That
+// degradation is precisely what the "refuse an unguarded header immediately"
+// half of this design exists to avoid.
+TEST(Preprocessor, Tf87DefineOutsideTheClosedConditionalIsNotAGuard) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_tf87_halfguard";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "half.h", std::ios::binary)
+          << "#ifndef HALF_H\n#endif\n"       // group opens AND closes
+             "#define HALF_H\n"               // …the define is OUTSIDE it
+             "int half_sym;\n#include \"half.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"half.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    bool sawRefusal = false, sawDepthCap = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) != std::string::npos
+            && d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawRefusal = true;
+        }
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+    }
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "the refusal must carry the refusal code";
+    EXPECT_TRUE(sawRefusal)
+        << "a `#define X` OUTSIDE the closed `#ifndef X` group is not a guard — "
+           "this header must be refused by name on the first back-edge";
+    EXPECT_FALSE(sawDepthCap)
+        << "and refused IMMEDIATELY, not churned to the depth cap: naming the "
+           "header on the first back-edge is the whole point of refusing an "
+           "unguarded one";
+    fs::remove_all(dir, ec);
+}
+
+// ── A GUARD SPLIT ACROSS A LINE CONTINUATION. ──────────────────────────────
+// C 5.1.1.2 phase 2 splices `\`-newline BEFORE directives are recognised, so a
+// multi-line `#if` is ONE logical controlling line. The detector must splice
+// too: harvesting names per PHYSICAL line loses every operand past the first
+// backslash — i.e. UNDER-recognises, the direction that turns a legal header
+// into a refused include. Multi-line `#if !defined(A) && \` guards are ordinary
+// in C.
+TEST(Preprocessor, Tf87GuardSplitAcrossLineContinuationIsStillDetected) {
+    auto f = runReentry("continuation",
+                        "#if !defined(_ALT_ZZZ) && \\\n"
+                        "    !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard operand on a continuation line");
 }

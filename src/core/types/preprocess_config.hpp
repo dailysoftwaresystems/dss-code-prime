@@ -167,6 +167,17 @@ struct DSS_EXPORT CAttributeDef {
 //    has not implemented — so it is LOUD, and (like `#error`) unsuppressable:
 //    silencing a real semantic effect is how a wrong-layout/wrong-code artifact
 //    ships green.
+//  • `IncludeOnce` (TF-C87) asserts the pragma declares its FILE include-once
+//    (C's `#pragma once`). It is a REFINEMENT of `Unsupported`, not an escape
+//    from it: DSS does not implement include-once dedup, so `applyPragma` is
+//    just as LOUD on this verb as on `Unsupported`. What the separate verb buys
+//    is that ONE OTHER reader — the include-guard detector
+//    (D-PP-INCLUDE-REENTRY-GUARD-AWARE) — can tell "this header's include-once
+//    mechanism is a pragma I don't implement" apart from "this header carries no
+//    include-once mechanism at all". Those are different facts about the user's
+//    code and they need different messages; without the verb the detector would
+//    have to recognise the WORD `once`, which is exactly the identity branch the
+//    registry exists to forbid.
 //
 // `StructPacking` and `OptimizerControl` are the verbs with a real sink:
 // `#pragma pack` drives the member-alignment CAP into the composite layout
@@ -188,6 +199,11 @@ enum class PragmaEffect : std::uint8_t {
     OptimizerControl,
     // Real translation semantics DSS has NOT implemented → loud + unsuppressable.
     Unsupported,
+    // TF-C87: the pragma declares its FILE include-once (C's `#pragma once`).
+    // Still loud at `applyPragma` (DSS implements no include-once dedup); the
+    // verb exists so the include-guard detector can NAME the mechanism instead
+    // of reporting "no include guard detected". See the argument above.
+    IncludeOnce,
 };
 
 // One registry row: the leading WORD(S) that identify a pragma, and what DSS

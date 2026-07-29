@@ -195,6 +195,31 @@ enum class DiagnosticCode : std::uint16_t {
     // Remediation: guard the shim with `#ifndef`, or stop shadowing the name.
     P_PreprocessorOperatorNameNotDefinable = 0x0021,
 
+    // P_PreprocessorIncludeReentryRefused: TF-C87
+    // (D-PP-INCLUDE-REENTRY-GUARD-AWARE). An `#include` of a header ALREADY ON
+    // THE INCLUDE STACK was refused because the header carries no include-once
+    // mechanism this implementation can honour.
+    //
+    // ★ WHY THIS NEEDED ITS OWN CODE RATHER THAN A REWORDED MESSAGE.
+    // `P_PreprocessorIncludeError` (0x0016) is FOUR-WAY OVERLOADED: target not
+    // found, target unreadable, this refusal, and the NESTING-DEPTH backstop.
+    // The last two are the ones that must never be confused, and the reason is
+    // structural, not cosmetic. Re-entry is now gated on GUARD DETECTION, so a
+    // refusal has two possible causes with opposite remedies:
+    //   (a) the user's header really has no guard  -> fix the header;
+    //   (b) the guard detector failed to recognise a LEGAL guard -> a COMPILER
+    //       BUG, and one whose only symptom is this diagnostic.
+    // A reader (or a census, or any tooling filtering by code) that cannot tell
+    // this refusal from the depth-cap backstop cannot tell (b) from "your
+    // includes nest too deeply", which is the failure mode this whole cycle
+    // exists to remove. The depth cap deliberately KEEPS 0x0016: it is a genuine
+    // resource/structure limit, not a claim about guards.
+    //
+    // The message additionally states outright that a guarded header reaching
+    // this code is a detector gap — the code makes it MACHINE-separable, the
+    // message makes it HUMAN-actionable, and neither substitutes for the other.
+    P_PreprocessorIncludeReentryRefused = 0x0022,
+
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
     // ParserConfig::maxExpressionDepth) is reported HERE at the offending

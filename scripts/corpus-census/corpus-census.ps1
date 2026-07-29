@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 # TF-C86 (D-CSUBSET-STDARG-F001A) — LAUNCHER ONLY (Windows sibling of
-# scripts/corpus-census.sh).
+# scripts/corpus-census/corpus-census.sh).
 #
-# The census itself lives in `scripts/corpus-census.py`, once. This file finds a
+# The census itself lives in `scripts/corpus-census/corpus-census.py`, once. This file finds a
 # Python 3 and runs it. Its ONLY other job is to propagate the exit code
 # EXACTLY: `$LASTEXITCODE` is read into a local IMMEDIATELY after the call and
 # nothing is allowed to run in between, because any later statement (even a
@@ -13,7 +13,7 @@
 # machines it exists for. Both launchers call the same .py, so the two platforms
 # cannot drift into disagreeing about the corpus.
 #
-# Usage / options / exit codes: see scripts/corpus-census.py (`--help`).
+# Usage / options / exit codes: see scripts/corpus-census/corpus-census.py (`--help`).
 
 [CmdletBinding()]
 param(

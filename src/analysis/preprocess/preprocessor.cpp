@@ -431,6 +431,229 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
 // sites iterate that ONE list. There is deliberately no named predicate left
 // for a fifth site to call — the filter is structurally unrepeatable.
 
+// ── TF-C82 (D-PP-PRAGMA-REGISTRY): the ONE pragma classifier ────────────────────
+//
+// LONGEST-prefix match of a pragma's leading WORDS against `pragmaEffects`.
+// `nullopt` = NO row matched; the caller (not this function) decides loud-vs-
+// silent from `unknownPragmaIsError`, so recognition and policy stay separable.
+//
+// Longest-wins rather than first-wins is deliberate: a future
+// `["clang","diagnostic","push"]` row must be able to refine the broader
+// `["clang","diagnostic"]` row without either being shadowed by DECLARATION
+// ORDER — the same reason the loader rejects a duplicate prefix outright.
+//
+// TF-C87 moved this block UP from just below `SynthBuilder` (a pure move, no
+// logic change) because the include-guard detector below is its second reader.
+struct PragmaMatch {
+    PragmaEffect effect = PragmaEffect::Unsupported;
+    std::size_t  words  = 0;   // how many leading words the matched row consumed
+};
+[[nodiscard]] inline std::optional<PragmaMatch>
+matchPragmaEffect(PreprocessConfig const&      cfg,
+                  std::span<std::string const> words) {
+    std::optional<PragmaMatch> best;
+    for (PragmaEffectRow const& row : cfg.pragmaEffects) {
+        if (row.prefix.empty() || row.prefix.size() > words.size()) continue;
+        bool ok = true;
+        for (std::size_t i = 0; i < row.prefix.size(); ++i) {
+            if (words[i] != row.prefix[i]) { ok = false; break; }
+        }
+        if (!ok) continue;
+        if (!best.has_value() || row.prefix.size() > best->words) {
+            best = PragmaMatch{row.effect, row.prefix.size()};
+        }
+    }
+    return best;
+}
+
+// ══ TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) ═══════════════════════════════
+//
+// ★ WHAT THIS REPLACES. `includeStack` used to REFUSE re-entry into any header
+// already on the stack, with `P_PreprocessorIncludeError` "circular include of
+// X". That rejects LEGAL, STANDARD-CONFORMING C. MEASURED on the macho corpus
+// leg at 5093341:
+//     mach/mach_types.h -> mach/task_policy.h -> mach/mach_types.h
+// terminates perfectly under a real cpp, because the second entry hits
+// `#ifndef _MACH_MACH_TYPES_H_` (already defined by the first) and expands to
+// nothing. cpp has NO refuse-re-entry rule at all — it has a NESTING DEPTH
+// limit, and the include guard is what terminates the cycle. That single false
+// positive was the sole cause of the leg's 4 residual `F_ShippedHeaderNotFound`.
+//
+// ★ THE MODEL NOW. Re-entry is PERMITTED for a header that carries a MACRO
+// include guard, because the guard is what makes the repeat expansion empty:
+// `localMacros` is SHARED across the whole builder tree, so on re-entry the
+// guard's controlling name is already defined, the whole body reads DEAD, no
+// nested include inside it resolves, and the recursion converges after exactly
+// one extra level. The AUTHORITATIVE `MacroExpander` pass then elides the
+// duplicated text for the same reason. `kMaxIncludeDepth` is the loud backstop
+// for anything that still recurses.
+//
+// ★ WHY THE DETECTOR IS DELIBERATELY GENEROUS. Guard DETECTION GATES re-entry,
+// so an unrecognised but LEGAL guard becomes a refused include — and that
+// presents to the user as a compiler bug. Under-recognition is therefore the
+// DANGEROUS direction. Over-recognition is the SAFE one, and only because
+// re-entry is PERMITTED rather than SKIPPED: if the "guard" turns out not to be
+// one, the body is spliced again and the REAL conditional logic decides, with
+// the depth cap as the backstop. Had this skipped instead, over-recognition
+// would silently DROP content a real cpp would have included — the one outcome
+// worth engineering against. So the rule below is the most generous one that
+// still says NO for a header with no include-once mechanism at all.
+//
+// ★ THE RULE, and why it needs no `!`/`defined` parsing:
+//
+//     A header carries a MACRO include guard iff, for some name N, the header
+//     `#define`s N INSIDE a conditional region whose CONTROLLING LINE mentions N.
+//
+// "Mentions" is purely lexical — is the Word `N` among the controlling line's
+// tokens — which is what makes this cover every guard SHAPE MEASURED in the wild
+// with ONE rule and NO shape vocabulary:
+//     #ifndef N / #define N                            (canonical; 2942 SDK, 35 sqlite)
+//     #if !defined(N) / #define N                      (10 SDK, 1 sqlite)
+//     #if !defined N   (no parens)                     (10+ SDK occurrences)
+//     #if !defined(A) && !defined(B) && !defined(N)    (pcap/bpf.h)
+//     #if defined(_WIN32) && !defined(N)               (sqlite ext/misc/windirent.h)
+//     #if !defined(N) && defined(SQLITE_ENABLE_SESSION) (sqlite ext/session/*)
+//     ...with the `#define` NOT on the next line       (15 measured, up to 5 lines)
+//     ...with the guard NOT the first conditional      (11 measured; netinet6/in6.h
+//                                                       opens with an umbrella check)
+// A future spelling this project has never seen is covered too, as long as the
+// guard names the macro it tests — which is what a guard IS.
+//
+// ★ AGNOSTIC. Every directive word comes from `PreprocessConfig`
+// (`ifDirective`/`ifndefDirective`/`elif*`/`endifDirective`/`defineDirective`/
+// `pragmaDirective`); `#pragma once` is recognised through the `pragmaEffects`
+// REGISTRY's `includeOnce` verb, never the word `once`. No header name, no path,
+// no SDK knowledge appears anywhere in here.
+enum class IncludeOnceMechanism : std::uint8_t {
+    // No include-once mechanism found. Re-entry is a real infinite cycle.
+    None,
+    // A macro include guard (any spelling). Re-entry is safe — the guard empties it.
+    MacroGuard,
+    // A `#pragma` whose registry row declares the file include-once. DSS has not
+    // built include-once dedup, so this is refused — but with its OWN message.
+    OncePragma,
+};
+
+// Classify `buf` (a header's raw file text). Cheap enough to run on the refusal
+// path only, which is where it is called from — a header must ALREADY be on the
+// include stack before anyone asks.
+[[nodiscard]] IncludeOnceMechanism
+detectIncludeOnceMechanism(std::shared_ptr<SourceBuffer> const&        buf,
+                           std::shared_ptr<GrammarSchema const> const& schema) {
+    PreprocessConfig const& cfg = schema->preprocess();
+    if (!cfg.enabled || !buf) return IncludeOnceMechanism::None;
+    const auto hashKind = schema->schemaTokens().find(cfg.directiveIntroToken);
+    if (!hashKind.valid()) return IncludeOnceMechanism::None;
+
+    // Phase-2 continuation splice FIRST, exactly as `SynthBuilder::build` does:
+    // a multi-line `#if !defined(A) && \` … `!defined(N)` is ONE logical
+    // directive line, and harvesting names per PHYSICAL line would miss `N` —
+    // i.e. would UNDER-recognise, the dangerous direction. The line map is a
+    // throwaway: nothing here is emitted and no offset here reaches a diagnostic.
+    std::string spliced;
+    LineMap     throwawayMap;
+    appendWithContinuationSplice(buf->text(), buf, 0, spliced, throwawayMap);
+    auto scanBuf = SourceBuffer::fromString(spliced, std::string{buf->name()});
+
+    // A THROWAWAY reporter: a tokenizer complaint about a header this pass is
+    // only INSPECTING is not this detector's to report. The authoritative pass
+    // re-tokenizes the same bytes and owns every diagnostic about them.
+    DiagnosticReporter scratch;
+    auto const         toks = tokenizeToPP(scanBuf, schema, scratch);
+
+    // One frame per OPEN conditional group, holding the Word lexemes that appear
+    // in that group's controlling lines. `#elif`/`#elifdef`/`#elifndef` extend
+    // the CURRENT group's set (they are further controlling expressions of the
+    // same group); `#else` adds none; `#endif` pops.
+    std::vector<std::vector<std::string_view>> control;
+    bool                                       sawOncePragma = false;
+
+    auto firstOnLine = [&](std::size_t idx) {
+        for (std::size_t p = idx; p-- > 0;) {
+            if (isNewline(toks[p].tok)) return true;
+            if (!isTrivia(toks[p].tok)) return false;
+        }
+        return true;
+    };
+    auto lineEndOf = [&](std::size_t start) {
+        std::size_t e = start;
+        while (e < toks.size() && !isNewline(toks[e].tok)) ++e;
+        return e;   // EXCLUSIVE of the newline
+    };
+    auto wordsIn = [&](std::size_t from, std::size_t to) {
+        std::vector<std::string_view> out;
+        for (std::size_t p = from; p < to; ++p) {
+            if (toks[p].tok.coreKind == CoreTokenKind::Word) {
+                out.push_back(toks[p].text);
+            }
+        }
+        return out;
+    };
+
+    for (std::size_t i = 0; i < toks.size(); ++i) {
+        if (toks[i].tok.schemaKind != hashKind || !firstOnLine(i)) continue;
+        std::size_t j = i + 1;
+        while (j < toks.size() && isTrivia(toks[j].tok)) ++j;
+        if (j >= toks.size()) break;
+        std::string_view const  dirWord = toks[j].text;
+        std::size_t const       lineEnd = lineEndOf(i);
+        std::size_t const       opStart = j + 1;
+
+        if (dirWord == cfg.ifDirective || dirWord == cfg.ifdefDirective
+            || dirWord == cfg.ifndefDirective) {
+            control.push_back(wordsIn(opStart, lineEnd));
+        } else if (dirWord == cfg.elifDirective
+                   || (!cfg.elifdefDirective.empty()
+                       && dirWord == cfg.elifdefDirective)
+                   || (!cfg.elifndefDirective.empty()
+                       && dirWord == cfg.elifndefDirective)) {
+            if (!control.empty()) {
+                auto more = wordsIn(opStart, lineEnd);
+                control.back().insert(control.back().end(), more.begin(),
+                                      more.end());
+            }
+        } else if (dirWord == cfg.endifDirective) {
+            // An UNBALANCED `#endif` (more closes than opens) is a malformed
+            // header the authoritative pass reports; here it must not underflow.
+            if (!control.empty()) control.pop_back();
+        } else if (dirWord == cfg.defineDirective) {
+            std::size_t p = opStart;
+            while (p < lineEnd && isTrivia(toks[p].tok)) ++p;
+            if (p < lineEnd && toks[p].tok.coreKind == CoreTokenKind::Word) {
+                std::string_view const subject = toks[p].text;
+                for (auto const& frame : control) {
+                    for (std::string_view n : frame) {
+                        if (n == subject) return IncludeOnceMechanism::MacroGuard;
+                    }
+                }
+            }
+        } else if (!cfg.pragmaDirective.empty()
+                   && dirWord == cfg.pragmaDirective) {
+            std::vector<std::string> words;
+            for (std::size_t p = opStart; p < lineEnd; ++p) {
+                if (isTrivia(toks[p].tok)) continue;
+                if (toks[p].tok.coreKind == CoreTokenKind::Eof) continue;
+                words.emplace_back(toks[p].text);
+            }
+            auto const m = matchPragmaEffect(cfg, words);
+            if (m.has_value() && m->effect == PragmaEffect::IncludeOnce) {
+                // RECORDED, not returned: a header carrying BOTH mechanisms
+                // (MEASURED: `MacTypes.h`, `mach/arm/traps.h`) must be reported
+                // as GUARDED, because the macro guard is the one DSS can actually
+                // honour — so the walk continues and a later guard hit wins.
+                // Deliberately NOT gated on the conditional stack: a `#pragma
+                // once` inside a conditional is still this file's declaration
+                // about itself, and reading it as ABSENT is the dangerous
+                // direction.
+                sawOncePragma = true;
+            }
+        }
+        i = lineEnd;   // ++i steps past the newline
+    }
+    return sawOncePragma ? IncludeOnceMechanism::OncePragma
+                         : IncludeOnceMechanism::None;
+}
+
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
@@ -1100,6 +1323,82 @@ struct SynthBuilder {
         return *v != 0;
     }
 
+    // ── TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) ────────────────────────────
+    // The ONE re-entry decision, called by BOTH include arms (angle-source and
+    // quote) so the two can never drift into disagreeing about what a cycle is —
+    // they already had two hand-copied `std::find(includeStack…)` blocks with two
+    // separately-worded messages.
+    //
+    // Returns TRUE to PERMIT the re-entry (the caller proceeds to splice exactly
+    // as for a first entry). Returns FALSE having ALREADY EMITTED the refusal —
+    // and WHICH refusal is the point of this function: a user who hits a gap in
+    // `detectIncludeOnceMechanism` must be able to SEE it is a detector gap
+    // rather than be told "circular include" and left guessing.
+    //
+    // ★ THE SEPARATION IS BY DIAGNOSTIC CODE, NOT ONLY BY PROSE.
+    // `P_PreprocessorIncludeError` (0x0016) is FOUR-WAY OVERLOADED — not found,
+    // unreadable, THIS refusal, and the nesting-depth backstop — so rewording
+    // the message alone would leave the two conditions that matter most
+    // indistinguishable to every census, log filter and tool that keys on the
+    // code. This refusal therefore carries its OWN code,
+    // `P_PreprocessorIncludeReentryRefused` (0x0022). The depth cap in `build()`
+    // deliberately KEEPS 0x0016: it is a genuine resource/structure limit and
+    // makes no claim about guards. So:
+    //   • permitted   → no diagnostic at all
+    //   • OncePragma  → 0x0022, naming `#pragma once` as a mechanism DSS has not
+    //                   built; explicitly "not a missing guard"
+    //   • None        → 0x0022, saying NO include-once mechanism was FOUND,
+    //                   spelling out what was looked for, and saying outright
+    //                   that a guarded header reaching it is a DETECTOR GAP
+    //   • depth cap   → 0x0016, "include nesting deeper than N levels"
+    // The two 0x0022 arms are separated from each other by prose only, and that
+    // is sufficient: both mean "this header was not re-entered", they differ
+    // only in WHY, and neither is ever confusable with a depth limit.
+    [[nodiscard]] bool
+    permitReentry(std::shared_ptr<SourceBuffer> const& headerBuf,
+                  std::string_view                     name) {
+        switch (detectIncludeOnceMechanism(headerBuf, schema)) {
+            case IncludeOnceMechanism::MacroGuard:
+                // The guard's controlling name is already in `localMacros` from
+                // the first entry (the map is SHARED across the builder tree), so
+                // the re-entered body reads DEAD, resolves no nested include, and
+                // the recursion converges after exactly one extra level.
+                return true;
+            case IncludeOnceMechanism::OncePragma:
+                emitPP(rep,
+                       DiagnosticCode::P_PreprocessorIncludeReentryRefused,
+                       BufferId{}, SourceSpan::empty(0),
+                       std::string{"refusing to re-enter "} + std::string{name}
+                           + ": its include-once mechanism is a '#pragma' whose "
+                             "'preprocess.pragmaEffects' row declares "
+                             "'includeOnce', and this implementation has not "
+                             "built include-once dedup — it relies on macro "
+                             "include guards. This is NOT a missing guard and NOT "
+                             "a cycle in your code: re-entry is refused because "
+                             "DSS cannot make the repeat expansion empty the way a "
+                             "macro guard does. The pragma is reported separately "
+                             "at its own line");
+                return false;
+            case IncludeOnceMechanism::None:
+                emitPP(rep,
+                       DiagnosticCode::P_PreprocessorIncludeReentryRefused,
+                       BufferId{}, SourceSpan::empty(0),
+                       std::string{"refusing to re-enter "} + std::string{name}
+                           + ": it is already on the include stack and NO "
+                             "include-once mechanism was found in it — no "
+                             "conditional whose controlling expression names a "
+                             "macro the header then '#define's (that is what an "
+                             "include guard is, in every spelling), and no "
+                             "include-once '#pragma'. A self-including header "
+                             "with no such mechanism is a genuine infinite "
+                             "include cycle. ★ If this header IS guarded, what "
+                             "you have hit is a GAP IN THE GUARD DETECTOR, not a "
+                             "cycle in your code");
+                return false;
+        }
+        return false;   // unreachable — every IncludeOnceMechanism handled above
+    }
+
     void build(std::shared_ptr<SourceBuffer> const& source,
                std::string& out, LineMap& map) {
         // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the `"` / `>` byte constants that
@@ -1110,11 +1409,30 @@ struct SynthBuilder {
         // agnostic — a language whose string/header closer is not `"`/`>` now
         // splices correctly too.
         const char newline    = '\n';
+        // TF-C87: once the backstop below has fired ANYWHERE in the builder tree
+        // the whole preprocess result is already fatal, so every further splice is
+        // pure waste — and not merely waste. `fatal` is shared by reference, but
+        // before this it only truncated the ONE recursion that hit the cap; a
+        // header that includes a recursive sibling TWICE would re-enter the cap
+        // path down both arms at every level, which is exponential in `depth`.
+        // Short-circuiting makes the FIRST cap hit stop the whole splice, which is
+        // what "fatal" already claimed to mean.
+        if (fatal) return;
         if (depth > kMaxIncludeDepth) {
             emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
                    SourceSpan::empty(0),
-                   std::string{"include nesting too deep (possible cycle): "}
-                       + std::string{source->name()});
+                   std::string{"include nesting deeper than "}
+                       + std::to_string(kMaxIncludeDepth) + " levels, at "
+                       + std::string{source->name()}
+                       + " — the guard-aware re-entry BACKSTOP. Re-entry into a "
+                         "header that carries an include guard is PERMITTED (that "
+                         "is how a legal a.h -> b.h -> a.h chain terminates: the "
+                         "guard makes the second expansion empty), so reaching "
+                         "this depth means a header whose guard WAS detected is "
+                         "still recursing — the guard is not neutralizing the "
+                         "repeat include. This is NOT the refused-re-entry "
+                         "diagnostic, which names the header and says no include "
+                         "guard was detected in it");
             fatal = true;   // splice truncated — PP fatal
             return;
         }
@@ -1530,19 +1848,21 @@ struct SynthBuilder {
                     std::error_code ec;
                     fs::path canon = fs::weakly_canonical(angleRes.path, ec);
                     if (ec) canon = angleRes.path;
-                    if (std::find(includeStack.begin(), includeStack.end(), canon)
-                        != includeStack.end()) {
-                        emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
-                               BufferId{}, SourceSpan::empty(0),
-                               std::string{"circular include of "} + angleName);
-                        continue;
-                    }
+                    // TF-C87: the buffer is loaded BEFORE the stack test now,
+                    // because the re-entry decision reads the header's own text.
+                    // Order-independent in practice: a header already ON the stack
+                    // was readable when it was pushed.
                     auto headerBuf = SourceBuffer::fromFile(angleRes.path);
                     if (!headerBuf) {
                         emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                                BufferId{}, SourceSpan::empty(0),
                                std::string{"system include unreadable: "} + angleName);
                         continue;
+                    }
+                    if (std::find(includeStack.begin(), includeStack.end(), canon)
+                            != includeStack.end()
+                        && !permitReentry(headerBuf, angleName)) {
+                        continue;   // permitReentry emitted the refusal
                     }
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
                     includeStack.push_back(canon);
@@ -1686,15 +2006,8 @@ struct SynthBuilder {
             std::error_code ec;
             fs::path canon = fs::weakly_canonical(*resolved, ec);
             if (ec) canon = *resolved;
-            if (std::find(includeStack.begin(), includeStack.end(), canon)
-                != includeStack.end()) {
-                emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
-                       BufferId{}, SourceSpan::empty(0),
-                       std::string{"circular include of "} + filename);
-                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
-                copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
-                continue;
-            }
+            // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
+            // the header's own text) — see the angle arm's note.
             auto headerBuf = SourceBuffer::fromFile(*resolved);
             if (!headerBuf) {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
@@ -1702,6 +2015,16 @@ struct SynthBuilder {
                        std::string{"quote include unreadable: "} + filename);
                 copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
                 copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
+                continue;
+            }
+            if (std::find(includeStack.begin(), includeStack.end(), canon)
+                    != includeStack.end()
+                && !permitReentry(headerBuf, filename)) {
+                // permitReentry emitted the refusal; drop the directive line so
+                // the macro pass's unresolved-live-quote-include fail-loud does
+                // not re-report one root cause twice (TF-C60 Finding 5).
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;
                 continue;
             }
 
@@ -1824,38 +2147,6 @@ struct MacroDef {
     // its replacement is then a constraint violation (fail loud).
     bool                     isVariadic = false;
 };
-
-// ── TF-C82 (D-PP-PRAGMA-REGISTRY): the ONE pragma classifier ────────────────────
-//
-// LONGEST-prefix match of a pragma's leading WORDS against `pragmaEffects`.
-// `nullopt` = NO row matched; the caller (not this function) decides loud-vs-
-// silent from `unknownPragmaIsError`, so recognition and policy stay separable.
-//
-// Longest-wins rather than first-wins is deliberate: a future
-// `["clang","diagnostic","push"]` row must be able to refine the broader
-// `["clang","diagnostic"]` row without either being shadowed by DECLARATION
-// ORDER — the same reason the loader rejects a duplicate prefix outright.
-struct PragmaMatch {
-    PragmaEffect effect = PragmaEffect::Unsupported;
-    std::size_t  words  = 0;   // how many leading words the matched row consumed
-};
-[[nodiscard]] inline std::optional<PragmaMatch>
-matchPragmaEffect(PreprocessConfig const&      cfg,
-                  std::span<std::string const> words) {
-    std::optional<PragmaMatch> best;
-    for (PragmaEffectRow const& row : cfg.pragmaEffects) {
-        if (row.prefix.empty() || row.prefix.size() > words.size()) continue;
-        bool ok = true;
-        for (std::size_t i = 0; i < row.prefix.size(); ++i) {
-            if (words[i] != row.prefix[i]) { ok = false; break; }
-        }
-        if (!ok) continue;
-        if (!best.has_value() || row.prefix.size() > best->words) {
-            best = PragmaMatch{row.effect, row.prefix.size()};
-        }
-    }
-    return best;
-}
 
 // C 6.10.9p1 DE-STRINGIZE, for the `_Pragma("...")` operand: delete the leading
 // `L` when present, delete the outer quotes, then replace each `\"` with `"` and
@@ -2431,6 +2722,33 @@ private:
                              "has not built, and its 'preprocess.pragmaEffects' "
                              "row says so ('unsupported'). Ignoring it would "
                              "change behavior silently");
+                return;
+            }
+            case PragmaEffect::IncludeOnce: {
+                // TF-C87: a REFINEMENT of `Unsupported`, and refused with exactly
+                // the same force. The verb is not a licence to ignore the pragma —
+                // DSS implements no include-once dedup, so honouring it would mean
+                // guessing, and ignoring it means a header the author declared
+                // single-inclusion gets textually included twice. The ONLY thing
+                // the separate verb changes is that the include-guard detector can
+                // say "this header's include-once mechanism is one I do not
+                // implement" instead of falsely reporting "no include guard
+                // detected" (D-PP-INCLUDE-REENTRY-GUARD-AWARE).
+                std::string joined;
+                for (auto const& w : words) {
+                    if (!joined.empty()) joined += ' ';
+                    joined += w;
+                }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
+                       diagSpan,
+                       std::string{"pragma '"} + joined
+                           + "' declares this file include-once, and its "
+                             "'preprocess.pragmaEffects' row says so "
+                             "('includeOnce'). This implementation has not built "
+                             "include-once dedup — it relies on macro include "
+                             "guards — so honouring the pragma would be a guess "
+                             "and ignoring it would include this file's text "
+                             "twice");
                 return;
             }
         }
