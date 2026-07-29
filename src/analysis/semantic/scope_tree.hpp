@@ -56,6 +56,35 @@ public:
     lookup(ScopeId scope, std::string_view name,
            SymbolNamespace ns = SymbolNamespace::Ordinary) const noexcept;
 
+    // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+    // the PREDICATE-FILTERED sibling of `lookup`. Same
+    // innermost-first parent-chain walk, but a hop whose binding does not
+    // satisfy `accept` is SKIPPED and the walk CONTINUES outward instead of
+    // stopping there. Returns InvalidSymbol when no hop's binding is accepted.
+    //
+    // This exists because C 6.2.1p7 scopes an identifier "just after the
+    // completion of its declarator": in the region BEFORE an inner
+    // declaration of a name, the ENCLOSING declaration of that name is the one
+    // in scope. This scope tree binds a whole file's declarations up front and
+    // therefore cannot tell "before" from "after" positionally — but a caller's
+    // own usability test (e.g. "is this a TYPE symbol with a resolved type?")
+    // is a faithful proxy, so the outer binding is reachable exactly when the
+    // inner one is not yet usable. Plain `lookup` (nearest binding wins,
+    // period) stays the default; nothing here is language-, target-, or
+    // format-specific — `accept` is entirely the caller's predicate.
+    template <typename Accept>
+    [[nodiscard]] SymbolId
+    lookupIf(ScopeId scope, std::string_view name, Accept&& accept,
+             SymbolNamespace ns = SymbolNamespace::Ordinary) const {
+        while (scope.valid() && scope.v < scopes_.size()) {
+            ScopeRecord const& rec = scopes_[scope.v];
+            SymbolId const found = bindingIn(rec, name, ns);
+            if (found.valid() && accept(found)) return found;
+            scope = rec.parent;
+        }
+        return InvalidSymbol;
+    }
+
     // Snapshot of every (name, namespace, SymbolId) binding directly in
     // `scope` (no parent walk), across BOTH namespaces. Used by the
     // cross-tree import-injection step to copy a defining tree's root-scope
@@ -76,6 +105,13 @@ public:
     [[nodiscard]] std::vector<ScopeRecord> const& scopes() const noexcept { return scopes_; }
 
 private:
+    // The ONE per-scope binding probe both `lookup` and `lookupIf` walk with —
+    // namespace selection lives here so the two walks can never drift on which
+    // C 6.2.3 namespace map they read.
+    [[nodiscard]] static SymbolId
+    bindingIn(ScopeRecord const& rec, std::string_view name,
+              SymbolNamespace ns) noexcept;
+
     std::vector<ScopeRecord> scopes_;
 };
 

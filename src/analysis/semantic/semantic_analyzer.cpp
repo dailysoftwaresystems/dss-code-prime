@@ -2063,14 +2063,33 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // SE5: a non-builtin name in type position may be a type alias.
         // Resolve it through the scope chain; a Type-kind symbol with a
         // valid type contributes the aliased type.
+        //
+        // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+        // the walk uses `lookupIf` — an unusable binding (not a TYPE
+        // symbol, or a TYPE symbol whose own type has not been resolved yet)
+        // is SKIPPED and the walk CONTINUES OUTWARD, instead of stopping at the
+        // innermost binding and failing. C 6.2.1p7 scopes a declarator's
+        // identifier "just after the completion of its declarator", so in the
+        // region BEFORE an inner declaration of the name the ENCLOSING
+        // declaration is the one in scope — and the scope tree binds a whole
+        // file's declarations up front, so "its type is not resolved yet" is
+        // this engine's faithful proxy for "we are still before it" (Pass 1.5
+        // resolves declaration types in TREE ORDER). MEASURED consequence of
+        // stopping early: a TU that uses a shipped typedef and LATER
+        // redeclares it (SQLite's `typedef INT16_TYPE i16;` over the macOS
+        // SDK's own `typedef short int16_t;`) resolved the name to NOTHING for
+        // every use above the redeclaration.
+        //
+        // A name with NO usable binding anywhere on the chain still returns
+        // InvalidType and the caller's miss arm fails LOUD — this widens WHERE
+        // a type may be found, never WHETHER a miss is reported.
         if (scope.valid()) {
-            SymbolId const aliasSym = s.scopes.lookup(scope, text);
-            if (aliasSym.valid()) {
-                auto const& rec = s.symbols.at(aliasSym);
-                if (rec.kind == DeclarationKind::Type && rec.type.valid()) {
-                    return rec.type;
-                }
-            }
+            SymbolId const aliasSym =
+                s.scopes.lookupIf(scope, text, [&s](SymbolId cand) {
+                    auto const& r = s.symbols.at(cand);
+                    return r.kind == DeclarationKind::Type && r.type.valid();
+                });
+            if (aliasSym.valid()) return s.symbols.at(aliasSym).type;
         }
         return InvalidType;
     }
@@ -12299,6 +12318,13 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // root scope's own tree is a real user decl (injected cross-tree
         // bindings carry the DEFINING tree's id; builtins carry InvalidTree).
         std::unordered_set<std::string> userDeclaredNames;
+        // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+        // the subset of `userDeclaredNames` claimed by a declaration
+        // that is NOT a TYPE declaration (an object / function / prototype —
+        // anything whose kind is not DeclarationKind::Type). The goal-2 skip
+        // for a descriptor TYPEDEF keys on THIS set instead of the full one;
+        // see the typedef-injection loop below for why.
+        std::unordered_set<std::string> userNonTypeDeclaredNames;
         for (auto const& [treeV, scope] : treeRootScope) {
             // Across BOTH namespaces: a user declaration of `name` (object,
             // function, typedef, OR a struct/union/enum tag) blocks a
@@ -12310,6 +12336,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 (void)ns;
                 if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
                     userDeclaredNames.insert(std::string{name});
+                    if (s.symbols.at(sym).kind != DeclarationKind::Type)
+                        userNonTypeDeclaredNames.insert(std::string{name});
                 }
             }
         }
@@ -12601,8 +12629,42 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // resolution, so a descriptor typedef is visible to a `T x;`
             // declaration. (A builtin type of the same name wins —
             // resolveTypeNode checks `builtinTypeIds` before the alias lookup.)
+            //
+            // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+            // the goal-2 skip here keys on `userNonTypeDeclaredNames`,
+            // NOT on the full `userDeclaredNames`. A user TYPEDEF of the same
+            // name is a REDECLARATION (C11 6.7p3 — legal when it denotes the
+            // same type), not a competing definition, and the full-set skip
+            // made it DELETE the shipped typedef for the WHOLE translation
+            // unit. That is wrong in a way that is invisible until it bites:
+            // `userDeclaredNames` is a WHOLE-TU, POSITION-BLIND name set, while
+            // the user's own typedef is POSITION-SENSITIVE (Pass 1.5 resolves
+            // declaration types in TREE ORDER, so its SymbolRecord::type is
+            // still InvalidType while EARLIER declarations resolve). The result
+            // was a DEAD WINDOW from the top of the TU to the user's
+            // redeclaration point in which the name resolved to NOTHING — no
+            // shipped symbol (skipped) and no user symbol (not yet typed) —
+            // even though C 6.2.1p7 puts the OUTER declaration in scope for
+            // exactly that region ("the scope of an identifier declared by a
+            // declarator begins just after the completion of its declarator").
+            // MEASURED on the SQLite corpus (arm64 macho): `sqliteInt.h` uses
+            // `int16_t`/`int8_t`/`uintptr_t` early (`typedef INT16_TYPE i16;`
+            // etc.), the platform's own `typedef short int16_t;` arrives LATER
+            // in the same TU through the SDK's `<sys/_types/_int16_t.h>`, and
+            // i16 / i8 / LogEst / ynVar ALL died with the deleted shipped
+            // typedef — 80 of the 123 S0006 on that leg (MEASURED before and
+            // after: 123 -> 43).
+            //
+            // A NON-type user claim (an object / function of that spelling)
+            // KEEPS the original skip: there the user decl really is the sole
+            // authority and a shipped typedef of the name must not compete.
+            // Injection lands in `cuRoot`, an ANCESTOR of every tree root
+            // scope, so the user's own binding SHADOWS this one wherever the
+            // user's declaration is resolvable: no duplicate binding, no
+            // S_RedeclaredSymbol (the Pass-1 collision check is same-scope
+            // only), and a typedef carries no link surface to double-bind.
             for (auto const& td : desc->typedefs) {
-                if (userDeclaredNames.contains(td.name)) continue;
+                if (userNonTypeDeclaredNames.contains(td.name)) continue;
                 if (!injectedNames.insert(td.name).second) continue;  // first wins
                 SymbolRecord rec;
                 rec.name  = td.name;

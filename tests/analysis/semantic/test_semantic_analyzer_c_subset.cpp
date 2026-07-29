@@ -12082,3 +12082,174 @@ TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorAbstractSlotFailsLoud) {
     EXPECT_GE(countCode(m.diagnostics(),
                         DiagnosticCode::S_DeclarationDeclaresNothing), 1u);
 }
+
+// ── TF-C89 — THE SHIPPED-TYPEDEF DEAD WINDOW ─────────────────────────────────
+// D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION
+//
+// MEASURED on the SQLite corpus (arm64 macho, per-TU isolated census at
+// fc0908d, per-code cap temporarily lifted in a local build because the shipped
+// cap of 50 was saturated on two TUs): 80 of the leg's 123 `S0006` came from ONE
+// mechanism — MEASURED after the fix, S0006 123 -> 43. The
+// shipped-descriptor TYPEDEF injection's goal-2 skip ("a user declaration of
+// the name wins") keyed on `userDeclaredNames` — a WHOLE-TU, POSITION-BLIND
+// name set. The user's own typedef, by contrast, is POSITION-SENSITIVE: Pass
+// 1.5 resolves declaration types in TREE ORDER, so its `SymbolRecord::type` is
+// still InvalidType while EARLIER declarations resolve. One user typedef
+// anywhere in the TU therefore DELETED the shipped typedef, leaving a DEAD
+// WINDOW from the top of the TU down to the user's redeclaration point in
+// which the name resolved to NOTHING — no shipped symbol (skipped) and no user
+// symbol (not yet typed). C 6.2.1p7 puts the ENCLOSING declaration in scope for
+// exactly that region.
+//
+// SQLite hits it because `sqliteInt.h` USES the names early
+// (`#define INT16_TYPE int16_t` + `typedef INT16_TYPE i16;` / `LogEst`,
+// `typedef uintptr_t uptr;`) and the platform's OWN `typedef short int16_t;`
+// (the macOS SDK's `<sys/_types/_int16_t.h>`, pulled in later by
+// `<malloc/malloc.h>` / `<sys/sysctl.h>`) lands LATER in the same TU. i16 / i8 /
+// LogEst / ynVar all died with the deleted shipped typedef.
+//
+// The fix has TWO arms and NEITHER works alone:
+//   A) the typedef injection's goal-2 skip keys on `userNonTypeDeclaredNames` —
+//      a user TYPEDEF of the name no longer deletes the shipped one (a user
+//      OBJECT/FUNCTION claim still does);
+//   B) `resolveTypeNodeImpl`'s alias arm walks with `ScopeTree::lookupIf`, so a
+//      binding that is not usable as a type alias (not Type-kind, or Type-kind
+//      with an unresolved type) is SKIPPED and the walk CONTINUES OUTWARD.
+// Every pin below names which arm(s) turn it red.
+
+namespace {
+
+// Build + analyze `mainSrc` against the REAL src/dss-config/shippedLibs — the
+// same descriptors the production driver ships — so a regression in stdint.json
+// itself flips the pin red rather than being mirrored green by a scratch copy.
+[[nodiscard]] SemanticModel analyzeWithRealShippedLibs(std::string mainSrc) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu);
+}
+
+} // namespace
+
+// FORM 1 — THE CORPUS FORM, against the REAL shipped <stdint.h>. Byte-for-byte
+// the SQLite shape: use `int16_t` in a typedef ABOVE the platform's own
+// `typedef short int16_t;`, then use the alias. RED on arm A ALONE (the shipped
+// int16_t is deleted, so the alias's base is unknown) and RED on arm B ALONE
+// (the not-yet-typed user binding stops the walk before the shipped one).
+//
+// The assertion is TWO-SIDED: `alias16` must be exactly I16. "No S_UnknownType"
+// alone would pass on a resolution that silently picked some other width.
+TEST(SemanticAnalyzerCSubset, TFC89ShippedTypedefUsedAboveUserRedeclaration) {
+    auto model = analyzeWithRealShippedLibs(
+        "#include <stdint.h>\n"
+        "typedef int16_t alias16;\n"   // the USE, ABOVE the redeclaration
+        "typedef short int16_t;\n"     // the platform's own, C11 6.7p3 legal
+        "int main(void) { alias16 a = 1; return (int)a; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "int16_t is in scope above the redeclaration (C 6.2.1p7) — the "
+           "shipped typedef must not be deleted by a LATER user redeclaration";
+    auto const* alias = findSymbolNamed(model, "alias16");
+    ASSERT_NE(alias, nullptr);
+    ASSERT_TRUE(alias->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(alias->type), TypeKind::I16)
+        << "alias16 must be exactly the 16-bit core the shipped int16_t names";
+}
+
+// FORM 2 — ARM A's OWN pin, on the SURVIVING INJECTION rather than on
+// resolution. With a user typedef of the same name present, BOTH declarations
+// must exist (the injected one in the CU root, the user's in the tree root, one
+// shadowing the other) — and, because they live in DIFFERENT scopes, the Pass-1
+// same-scope collision check must NOT fire. RED on arm A alone: the count drops
+// to 1. Deliberately independent of arm B, which cannot move either number.
+TEST(SemanticAnalyzerCSubset, TFC89ShippedTypedefSurvivesUserTypedefOfSameName) {
+    ScratchDir sysDir{Location::Temp, "tfc89-survive"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "my16.json",
+        R"({ "header": "my16.h",
+             "typedefs": [ { "name": "my16_t", "type": "i16" } ] })",
+        "#include <my16.h>\n"
+        "typedef short my16_t;\n"
+        "int main(void) { my16_t v = 1; return (int)v; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "my16_t"), 2u)
+        << "the shipped typedef is injected in the CU root AND the user's is "
+           "bound in the tree root — a user TYPEDEF redeclaration must not "
+           "delete the shipped declaration";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol))
+        << "the two bindings are in DIFFERENT scopes — no same-scope collision";
+}
+
+// FORM 3 — ARM B's OWN pin, with NO shipped descriptor anywhere in the CU, so
+// arm A cannot possibly influence it. A BLOCK-SCOPE redeclaration of a
+// file-scope typedef, USED above the redeclaration: C 6.2.1p7 scopes the inner
+// `T` only after its declarator completes, so `typedef T U;` above it must see
+// the FILE-SCOPE `int`. RED on arm B alone (the not-yet-typed inner binding
+// stops the walk); untouched by arm A.
+//
+// TWO-SIDED on purpose: `U` must be I32 (the OUTER int), not I16 (the inner
+// short). A "no diagnostics" pin would accept the wrong declaration winning.
+TEST(SemanticAnalyzerCSubset, TFC89InnerRedeclarationDoesNotHideOuterTypedef) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "int main(void) {\n"
+        "    typedef T U;\n"       // must resolve to the FILE-SCOPE T (int)
+        "    typedef short T;\n"   // the inner redeclaration, LATER
+        "    U u = 1;\n"
+        "    return (int)u;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the file-scope T is in scope above the block-scope redeclaration";
+    auto const* u = findSymbolNamed(model, "U");
+    ASSERT_NE(u, nullptr);
+    ASSERT_TRUE(u->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(u->type), TypeKind::I32)
+        << "U aliases the OUTER `typedef int T`, not the inner `short`";
+}
+
+// THE GOAL-2 GUARD (arm A must stay SELECTIVE, not become "always inject"). A
+// user declaration that is NOT a type — an OBJECT of the shipped typedef's
+// spelling — still WINS: the shipped typedef stays skipped, so the name in TYPE
+// position keeps failing LOUD and exactly one symbol carries the name. RED if
+// arm A is widened to drop the skip unconditionally.
+TEST(SemanticAnalyzerCSubset, TFC89NonTypeUserDeclStillSuppressesShippedTypedef) {
+    ScratchDir sysDir{Location::Temp, "tfc89-goal2"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "myint.json",
+        R"({ "header": "myint.h",
+             "typedefs": [ { "name": "my_int_t", "type": "i32" } ] })",
+        "#include <myint.h>\n"
+        "int my_int_t;\n"                       // a user OBJECT of that name
+        "int main(void) { my_int_t = 5; return my_int_t; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "my_int_t"), 1u)
+        << "a user OBJECT claim keeps the goal-2 skip: the descriptor typedef "
+           "must NOT be injected alongside it";
+    auto const* obj = findSymbolNamed(model, "my_int_t");
+    ASSERT_NE(obj, nullptr);
+    EXPECT_EQ(obj->kind, DeclarationKind::Variable)
+        << "the surviving symbol is the user's object, not a Type";
+}
+
+// THE FAIL-LOUD GUARD for arm B: widening WHERE a type may be found must never
+// widen WHETHER a miss is reported. A type name with NO usable binding on the
+// whole chain still fails loud — arm B must not invent a fallback.
+TEST(SemanticAnalyzerCSubset, TFC89UnresolvableTypeNameStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef NoSuchTypeName Alias;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "an unresolvable type name must still fail loud after the walk "
+           "runs off the end of the scope chain";
+}
