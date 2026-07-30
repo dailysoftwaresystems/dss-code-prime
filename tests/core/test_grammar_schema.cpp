@@ -2150,14 +2150,16 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 // the fix that makes this pass is deriving one from the other.
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
     // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
-    // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`. This list is the
+    // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
+    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`. This list is the
     // hand-maintained mirror of the loader's `kEffectVerbs`, and it going RED
     // on a vocabulary change is the test working as designed — the whole point
     // is that a verb cannot be added to the loader without the closed-set
     // message and this mirror both accounting for it.
     constexpr std::string_view kVerbs[] = {"suppressUnused", "warnOnUse",
                                            "warnOnDiscard", "align",
-                                           "noInline", "alwaysInline", "none"};
+                                           "noInline", "alwaysInline",
+                                           "noSanitizeThread", "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
         R"([ { "names": ["aligned"], "effect": "algin" } ])", "", "");
@@ -2442,6 +2444,64 @@ TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid
         << "the diagnostic must be the drift one, AT the ignore-names path, "
            "naming 'deprecated' — asserting only that the load failed would "
            "pass for any unrelated error";
+}
+
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the NEW verb participates in the SAME
+// mechanical coupling — asserted per-verb rather than assumed from the check's
+// `effect != None` shape.
+//
+// ★ WHY A DEDICATED CASE FOR THIS VERB RATHER THAN TRUSTING THE GENERIC GATE. The
+// shipped c-subset config needed THREE coordinated edits for this attribute (the
+// `effects` row plus BOTH declaration rows' `linkageSpecifierIgnoredNames`), and the
+// only thing that makes forgetting one of them impossible is this cross-check. Its
+// generality is a property of the current implementation, not of the contract — a
+// future refactor could special-case a verb and nothing would notice. This pins the
+// contract for the verb whose config edits are newest and therefore likeliest to be
+// half-reverted.
+//
+// BOTH DIRECTIONS ARE ASSERTED: without the ignored name the load must FAIL with the
+// drift diagnostic naming the attribute; with it the load must SUCCEED. The second
+// half matters as much as the first — a check that rejected the consistent
+// configuration too would be indistinguishable from a working one here.
+TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
+    constexpr std::string_view kEffects =
+        R"([ { "names": ["no_sanitize_thread"], "effect": "noSanitizeThread" } ])";
+
+    // (a) the effect row alone — the half-landed config edit.
+    auto const missing = attrVocabSchema(
+        kEffects, R"("linkageSpecifierIgnoredRules": ["stdAttr"],)", "");
+    auto rBad = GrammarSchema::loadFromText(missing);
+    ASSERT_FALSE(rBad.has_value())
+        << "a declaration-attached `noSanitizeThread` effect whose name is NOT in "
+           "this row's linkageSpecifierIgnoredNames must fail the LOAD — otherwise "
+           "the effects row is unreachable config: a leading "
+           "__attribute__((no_sanitize_thread)) would die at the linkage tier "
+           "before the semantic scan ever runs";
+    EXPECT_TRUE(hasDiagCode(rBad.error(), DiagnosticCode::C_InvalidSemantics));
+    bool rightDrift = false;
+    for (auto const& d : rBad.error()) {
+        if (d.code == DiagnosticCode::C_InvalidSemantics
+            && d.path == "/semantics/declarations/0/"
+                         "linkageSpecifierIgnoredNames"
+            && d.message.find("attribute-vocabulary drift") != std::string::npos
+            && d.message.find("no_sanitize_thread") != std::string::npos) {
+            rightDrift = true;
+        }
+    }
+    EXPECT_TRUE(rightDrift)
+        << "the diagnostic must be the drift one, AT the ignore-names path, and it "
+           "must NAME the attribute the author has to add: "
+        << errorDiags(rBad.error());
+
+    // (b) both halves present — must load clean. This is the shape the shipped
+    // c-subset config uses on BOTH its topLevelDecl and externDecl rows.
+    auto const consistent = attrVocabSchema(
+        kEffects, R"("linkageSpecifierIgnoredNames": ["no_sanitize_thread"],)", "");
+    auto rGood = GrammarSchema::loadFromText(consistent);
+    ASSERT_TRUE(rGood.has_value())
+        << "the CONSISTENT pairing must load — a gate that also rejected this "
+           "would look identical to a working one in half (a): "
+        << errorDiags(rGood.error());
 }
 
 // (i-b) TIER 3 — a row that mentions NO attribute rule at all and ignores

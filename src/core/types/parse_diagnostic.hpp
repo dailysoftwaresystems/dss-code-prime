@@ -1475,10 +1475,17 @@ enum class DiagnosticCode : std::uint16_t {
     // token that is neither a declared structural-syntax kind
     // (`linkageSpecifierIgnoredKinds` — e.g. `__attribute__`, parens) nor a
     // recognized entry in the language's `linkageSpecifiers` map — a typo
-    // (`__attribute__((wek))`) or an unsupported attribute (`((noinline))`). Fail
-    // loud rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
+    // (`__attribute__((wek))`) or an attribute DSS has no sink for. Fail loud
+    // rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
     // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
     // per-language config; the engine never hardcodes a specifier identity.
+    //   ★ The old example here was `((noinline))`, which has been WRONG since
+    //   TF-C78 gave noinline a real sink (and TF-C81 always_inline, TF-C92
+    //   no_sanitize_thread). Corrected TF-C92 — a stale "unsupported" example is
+    //   worse than none, because it invites re-adding a name that is already
+    //   honored. If a fresh example is ever wanted, pick one by CHECKING the
+    //   shipped `linkageSpecifiers`/`attributeSemantics` tables first, not from
+    //   memory. See D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS.
     H_UnknownLinkageSpecifier     = 0xF00C,
     // H_UnreachableCode: a statement following an unconditional terminator
     //   (Return / Unreachable / Break / Continue) within a Block — control can

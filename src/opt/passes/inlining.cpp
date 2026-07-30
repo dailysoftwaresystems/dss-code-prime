@@ -852,10 +852,15 @@ public:
         // reaches this rebuild only as an unmodified caller (the gate below
         // refuses every splice INTO it), so dropping the bit here would let the
         // NEXT pass — or the next iteration of this one — start optimizing it.
+        // TF-C92: likewise for the thread-sanitizer exclusion. This pass has its
+        // OWN rebuild (it does not go through `MirFunctionRebuilder`), so it is a
+        // second, independently-editable copy site for all four trailing flags —
+        // and the only one for which no pass-behaviour test could notice a drop.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
                          src_.funcBinding(caller), src_.funcVisibility(caller),
                          src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
-                         src_.funcNoOptimize(caller));
+                         src_.funcNoOptimize(caller),
+                         src_.funcNoSanitizeThread(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

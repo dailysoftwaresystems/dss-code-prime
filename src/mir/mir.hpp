@@ -225,6 +225,16 @@ public:
     [[nodiscard]] bool funcNoOptimize(MirFuncId id) const {
         return funcArena_.at(id).noOptimize;
     }
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): TRUE iff the source declared this
+    // function `__attribute__((no_sanitize_thread))`. ★ NO OPTIMIZER PASS READS
+    // THIS — DSS ships no sanitizer (MEASURED: `grep -rni sanitiz src/` is empty).
+    // Its observable consumer is `mir_text`'s `appendFuncAttrs`, which prints it as
+    // the `nosanitizethread` function attribute so the per-function fact is
+    // queryable and survives a `.dssir` round trip. See
+    // `detail::MirFunc::noSanitizeThread`.
+    [[nodiscard]] bool funcNoSanitizeThread(MirFuncId id) const {
+        return funcArena_.at(id).noSanitizeThread;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -405,12 +415,31 @@ public:
     // same terms — a SYNTHESIZED function was never inside a source region, so
     // the default reads naturally, and every site that COPIES an existing
     // MirFunc must pass `funcNoOptimize(...)` explicitly.
+    // TF-C92: `noSanitizeThread` stamps the per-function thread-sanitizer
+    // exclusion, on the same terms — a SYNTHESIZED function carries no source
+    // attribute, so the default reads naturally, and every site that COPIES an
+    // existing MirFunc must pass `funcNoSanitizeThread(...)` explicitly. ★ THE
+    // TRAILING-BOOL RUN IS NOW FOUR WIDE (noInline, alwaysInline, noOptimize,
+    // noSanitizeThread), so the anti-swap discipline stated above for the first pair
+    // applies to the whole run: every SWAP-DETECTION record sets EXACTLY ONE of the
+    // four and asserts the other three are clear. ★ "Swap-detection record", NOT
+    // "every pin" — the distinction is deliberate and the stronger wording was
+    // FALSE. Some records exist precisely to prove these axes COMPOSE, and they must
+    // set more than one: `MirText.NoSanitizeThreadAttributeSurvivesRoundTrip`'s
+    // function %3 carries noInline AND noSanitizeThread together on purpose (this
+    // axis contradicts nothing, unlike the noinline/always_inline pair, so both
+    // keywords must print and re-parse on one function). Such a record is not a swap
+    // detector and cannot be one; the rule is that EVERY axis is covered by at least
+    // one single-flag record somewhere, not that every record is single-flag. For
+    // THIS flag that discipline is the only detector available at all, since no
+    // codegen difference exists to observe.
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding      = SymbolBinding::Global,
                           SymbolVisibility visibility   = SymbolVisibility::Default,
                           bool             noInline     = false,
                           bool             alwaysInline = false,
-                          bool             noOptimize   = false);
+                          bool             noOptimize   = false,
+                          bool             noSanitizeThread = false);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

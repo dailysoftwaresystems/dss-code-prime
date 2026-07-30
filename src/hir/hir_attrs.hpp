@@ -10,6 +10,7 @@
 #include "hir/attributes/mutability_attr.hpp"
 #include "hir/attributes/no_inline_attr.hpp"
 #include "hir/attributes/no_optimize_attr.hpp"
+#include "hir/attributes/no_sanitize_thread_attr.hpp"
 #include "hir/attributes/returns_twice_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
@@ -76,6 +77,17 @@ using HirAlwaysInlineMap = HirAttribute<AlwaysInlineAttr>;
 // unlike them it originates in a preprocessor REGION, not an attribute (see
 // `NoOptimizeAttr`, which also states plainly what this sink is not).
 using HirNoOptimizeMap = HirAttribute<NoOptimizeAttr>;
+
+// TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): native FUNCTION declarations the source
+// marked `__attribute__((no_sanitize_thread))`. Populated by CST→HIR lowering from
+// the bound symbol's `SymbolRecord.isNoSanitizeThread`; read by HIR→MIR lowering to
+// stamp `MirFunc.noSanitizeThread` — which `mir_text`'s `appendFuncAttrs` surfaces
+// as the `nosanitizethread` function attribute. Keyed on the same DECLARATION node
+// as the four maps above, and a FIFTH distinct axis: unlike them its consumer is
+// STORAGE, not a pass — DSS ships no sanitizer (MEASURED: `grep -rni sanitiz src/`
+// is empty), so the observable property is that the fact survives and is queryable
+// (see `NoSanitizeThreadAttr`, which refuses to overstate that).
+using HirNoSanitizeThreadMap = HirAttribute<NoSanitizeThreadAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

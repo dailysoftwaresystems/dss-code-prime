@@ -605,6 +605,94 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoOptimize) {
         << "an un-marked function must not acquire the flag";
 }
 
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): THE FOURTH PROPAGATION PIN — AND THE
+// ONLY ONE OF THE FOUR WITH **NO** BEHAVIOURAL BACKSTOP ANYWHERE IN THE SUITE.
+//
+// The argument, sharpened from TF-C81's: `noInline` must keep refusing on every
+// iteration (so dropping it changes the end-to-end release output);
+// `alwaysInline`'s hop is invisible to the end-to-end pin but a dedicated
+// inliner-behaviour test still exists; `noOptimize` reaches the rebuilder's own
+// policy swap, which a behaviour test observes. `noSanitizeThread` reaches NO PASS
+// AT ALL — MEASURED, `grep -rni sanitiz src/` returns zero hits — so dropping the
+// argument below changes NOTHING that any pass-behaviour test could see. The only
+// detectors are this pin and the MIR-text assertions.
+//
+// ★ THE FIXTURE IS DELIBERATELY ASYMMETRIC: func #0 sets ONLY `noSanitizeThread`
+// and this test asserts its other three flags are still CLEAR. Four adjacent
+// trailing bools at every `addFunction` copy site means a transposed pair compiles
+// silently; a fixture that set two flags could not detect it. Func #1 sets ONLY
+// `noOptimize` — the IMMEDIATE neighbour in the argument list — so a one-position
+// shift fails both records at once. Keep the asymmetry when extending this test.
+//
+// RED-ON-DISABLE (verified against the final build): drop the
+// `src_.funcNoSanitizeThread(oldFn)` argument at `mir_rebuild_helper.cpp`'s
+// `addFunction` (let the 8th parameter default to false) and the first EXPECT_TRUE
+// below fails, together with the post-optimize MIR-text assertions in
+// `MirLoweringCSubsetLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
+// Nothing else in the suite moves.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoSanitizeThread) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: NO_SANITIZE_THREAD only — Global/Default binding and all three
+    // sibling flags CLEAR, so this flag is the single non-default axis on the record.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/false,
+                   /*noSanitizeThread=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{11}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: NOOPTIMIZE only — the adjacent-argument mirror. Its presence is what
+    // proves a shifted argument list cannot pass: a one-position shift would make
+    // func #0 read noOptimize and func #1 read noSanitizeThread, failing both
+    // directions at once.
+    mb.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/true,
+                   /*noSanitizeThread=*/false);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{12}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    // func #2: plain — must acquire NEITHER flag.
+    mb.addFunction(fnSig, SymbolId{3});
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b2);
+    MirLiteralValue v2; v2.value = std::int64_t{13}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 3u);
+    ASSERT_TRUE(src.funcNoSanitizeThread(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoOptimize(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 3u);
+
+    EXPECT_TRUE(dst.funcNoSanitizeThread(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noSanitizeThread flag — this "
+           "rebuilder runs under every optimizer pass, and because NO pass reads "
+           "the flag, dropping it here is invisible to every behavioural test in "
+           "the suite; this assertion is the only guard";
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — four adjacent bools at the "
+           "addFunction call, so a shift must fail here";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(0)));
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(1)))
+        << "the mirror record: noOptimize must survive independently";
+    EXPECT_FALSE(dst.funcNoSanitizeThread(dst.funcAt(1)))
+        << "and must not bleed into the noSanitizeThread bit";
+    EXPECT_FALSE(dst.funcNoSanitizeThread(dst.funcAt(2)))
+        << "an un-annotated function must not acquire the flag";
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(2)));
+}
+
 // ★★ THE SINK ITSELF. A `noOptimize` function is rebuilt VERBATIM under a policy
 // that would otherwise gut it — and, critically, IT STILL EXISTS.
 //

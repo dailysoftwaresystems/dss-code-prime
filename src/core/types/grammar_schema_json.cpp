@@ -9339,7 +9339,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 7>
+                            std::pair<std::string_view, AttributeEffect>, 8>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
@@ -9350,6 +9350,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // `noInline` — exempts the callee from the
                                 // inliner's cost model instead of refusing it.
                                 {"alwaysInline",   AttributeEffect::AlwaysInline},
+                                // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): records
+                                // a per-function EXCLUSION from thread-sanitizer
+                                // instrumentation. A DECLARATION-ATTACHED verb
+                                // like its two neighbours (so the Clause-B drift
+                                // cross-check below REQUIRES its names in every
+                                // strict-scan row's `linkageSpecifierIgnoredNames`
+                                // — the mechanical coupling that stops the config
+                                // halves from drifting apart), but its sink is
+                                // STORAGE rather than a pass decision: DSS has no
+                                // sanitizer (MEASURED: `grep -rni sanitiz src/`
+                                // is empty), so the honest effect is that the fact
+                                // survives to `MirFunc.noSanitizeThread` and is
+                                // queryable in `.dssir` MIR text.
+                                {"noSanitizeThread",
+                                 AttributeEffect::NoSanitizeThread},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

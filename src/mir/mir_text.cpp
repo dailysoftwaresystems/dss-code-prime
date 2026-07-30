@@ -51,6 +51,17 @@ inline constexpr std::string_view kMirTextAlwaysInlineAttr = "alwaysinline";
 // opt-out. Again the `.dssir` text format's own keyword, matching this file's
 // `noinline` / `alwaysinline` style, not the MSVC pragma's spelling.
 inline constexpr std::string_view kMirTextNoOptimizeAttr = "nooptimize";
+// TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same one-spelling discipline for the
+// per-function thread-sanitizer exclusion. Again the `.dssir` text format's own
+// keyword, matching this file's `noinline` / `alwaysinline` / `nooptimize` style
+// rather than the C attribute's `no_sanitize_thread` underscores.
+// ★★ AND FOR THIS AXIS THE PRINTER IS THE SINK, NOT A CONVENIENCE. `noinline`
+// reaches the inliner, `nooptimize` reaches the rebuilder; `no_sanitize_thread`
+// reaches NOTHING in this compiler (MEASURED: `grep -rni sanitiz src/` is empty),
+// so `appendFuncAttrs` emitting this keyword IS the observable effect the whole
+// source→MIR chain exists to produce. Deleting the printer arm below does not
+// degrade a diagnostic — it erases the feature.
+inline constexpr std::string_view kMirTextNoSanitizeThreadAttr = "nosanitizethread";
 
 // ── shared helpers ────────────────────────────────────────────────────
 
@@ -410,8 +421,9 @@ private:
         bool             const ni = mir_.funcNoInline(f);
         bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
         bool             const no = mir_.funcNoOptimize(f);     // TF-C85
+        bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
         if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
-            && !ai && !no) {
+            && !ai && !no && !ns) {
             return;
         }
         out_ += " [";
@@ -422,6 +434,7 @@ private:
         if (ni)                             { sep(); out_ += kMirTextNoInlineAttr; }
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
         if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
+        if (ns)                             { sep(); out_ += kMirTextNoSanitizeThreadAttr; }
         out_ += "]";
     }
 
@@ -1220,6 +1233,7 @@ private:
         bool             noInline   = false;
         bool             alwaysInline = false;   // TF-C81
         bool             noOptimize   = false;   // TF-C85
+        bool             noSanitizeThread = false;   // TF-C92
         if (lex_.peek().kind == TokKind::LBracket) {
             lex_.take();
             while (true) {
@@ -1240,6 +1254,10 @@ private:
                     noOptimize = true;
                     continue;
                 }
+                if (a.text == kMirTextNoSanitizeThreadAttr) {   // TF-C92
+                    noSanitizeThread = true;
+                    continue;
+                }
                 if (auto b = symbolBindingFromName(a.text); b.has_value()) {
                     binding = *b;
                     continue;
@@ -1251,16 +1269,17 @@ private:
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding "
                     "(local | global | weak), a visibility (default | hidden | "
-                    "protected | internal), '{}', '{}' or '{}'",
+                    "protected | internal), '{}', '{}', '{}' or '{}'",
                     a.text, kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
-                    kMirTextNoOptimizeAttr));
+                    kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr));
                 break;
             }
         }
         MirFuncId const f =
             builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
                                  alwaysInline,    // TF-C81
-                                 noOptimize);     // TF-C85
+                                 noOptimize,      // TF-C85
+                                 noSanitizeThread);   // TF-C92
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.

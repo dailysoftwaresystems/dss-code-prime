@@ -192,10 +192,16 @@ public:
         // the same reason — the merged module is what the optimizer runs on, so
         // a flag dropped here would let a function the source put inside a
         // `#pragma optimize("", off)` region be optimized after link.
+        // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): and the thread-sanitizer
+        // exclusion, across the same boundary. No pass reads it, so the argument
+        // for carrying it is provenance rather than codegen: the merged module is
+        // the artifact a `.dssir` dump describes, and a per-function fact that
+        // silently disappears at the CU boundary is a fact the compiler cannot be
+        // said to record at all.
         MirFuncId const newF = dst_.addFunction(
             sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
             src_.funcNoInline(f), src_.funcAlwaysInline(f),
-            src_.funcNoOptimize(f));
+            src_.funcNoOptimize(f), src_.funcNoSanitizeThread(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);

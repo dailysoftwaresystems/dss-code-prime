@@ -1621,6 +1621,54 @@ enum class AttributeEffect : std::uint8_t {
     // "always inlined". See the `c-subset.lang.json` row, which says so in the
     // config the user reads.
     AlwaysInline,
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the declared function is EXCLUDED
+    // FROM THREAD-SANITIZER INSTRUMENTATION. Folded onto
+    // `SymbolRecord.isNoSanitizeThread` (FnSig-gated, the `isNoInline`
+    // discipline), projected to `HirNoSanitizeThreadMap`, stamped onto
+    // `MirFunc.noSanitizeThread`, and SURFACED in `.dssir` MIR text by
+    // `appendFuncAttrs` as the `nosanitizethread` function attribute.
+    //
+    // ★★ THE SINK IS "OBSERVABLY STORED AND QUERYABLE", NOT "OBEYED BY A PASS",
+    // AND THAT IS THE HONEST CLAIM FOR THIS ONE — say it here rather than let a
+    // reader infer a consumer that does not exist. MEASURED: `grep -rni sanitiz
+    // src/` has ZERO hits — DSS has no sanitizer, no instrumentation pass, and no
+    // `-fsanitize` surface of any kind. So unlike `NoInline` (which the inliner
+    // REFUSES on) and `AlwaysInline` (which waives rule 6), there is no live pass
+    // for this verb to constrain, and inventing one would be worse than useless.
+    //
+    // ★ WHY IT IS STILL A VERB AND NOT AN `effects` `none` ROW / IGNORE-LIST
+    // ENTRY. `None` means "KNOWN vocabulary, consumed elsewhere or deliberately
+    // inert", and an ignore-list-only entry means "not linkage, and nothing reads
+    // it". Both would make the per-function FACT unrecoverable: the day an
+    // instrumentation pass exists it would have to re-derive from source which
+    // functions opted out, and the attribute would have been thrown away three
+    // tiers earlier with nothing to point at. Storing it makes the row TRUE now
+    // ("DSS records the exclusion") instead of true-by-vacuity, and the standing
+    // project rule is that every new attribute gets a REAL sink
+    // ([[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]], registry:545).
+    //
+    // ★ DIRECTION OF A DROPPED FLAG: `AlwaysInline`'s, not `NoInline`'s — with
+    // no sanitizer to disarm, a lost `true` cannot make a wrong program, only an
+    // unrecorded directive. It is nevertheless threaded through every MirFunc
+    // creation/copy/rebuild/serialize path, because (TF-C81's MEASURED finding) a
+    // half-landed flag and no flag are indistinguishable in the output.
+    //
+    // PROVENANCE: sqlite `src/wal.c:932` `# define SQLITE_NO_TSAN
+    // __attribute__((no_sanitize_thread))`, guarded at `:931` on the CLANG-IDENTITY
+    // predefine together with `!defined(SQLITE_NO_TSAN)` — a guard DSS honestly opens,
+    // because it ships that identity predefine from `c-subset.lang.json`. Two use
+    // sites, both `static <attr> T f(…)`: `wal.c:942` `walIndexWriteHdr` and
+    // `wal.c:2590` `walIndexTryHdr`.
+    //
+    // ★ The identity predefine is named DESCRIPTIVELY here, never spelled: TF-C92's
+    // gate caught the literal spelling on these two lines via the TF-C83 guard
+    // `Preprocessor.TFC83IdentityMacroNamesAreNotInEngineCpp`
+    // (tests/analysis/preprocess/test_preprocessor.cpp:2873), which enforces that
+    // identity macro spellings live ONLY in config. A provenance COMMENT is not an
+    // engine identity branch, but the guard is deliberately spelling-based rather
+    // than semantic — it cannot tell a comment from a `if (name == …)`, and that
+    // conservatism is the point. Cite such macros by description in engine C++.
+    NoSanitizeThread,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {

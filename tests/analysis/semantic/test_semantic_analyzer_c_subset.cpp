@@ -6339,6 +6339,134 @@ TEST(SemanticAnalyzerCSubset, EitherInlineAttributeAloneIsClean) {
     }
 }
 
+// ══ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the SYMBOL-TIER facts ═══════════════
+//
+// The downstream hops (HirNoSanitizeThreadMap → MirFunc → `.dssir` text) are pinned
+// in tests/mir; these three pin the SOURCE-TIER contract at the record itself, where
+// a failure is localized to the fold/apply/merge rather than to lowering.
+//
+// ★ THE OR-MERGE IS ASSERTED ON **BOTH** RECORDS, and that is not belt-and-braces.
+// A call resolves to the DEFINITION (the survivor), so the load-bearing direction is
+// INTO the survivor — but the merge writes both, and `mergedFnDecls` order is not a
+// property a test should depend on. Asserting both makes the pin order-independent.
+//
+// RED-ON-DISABLE: delete the `isNoSanitizeThread` OR-merge block from the
+// `mergedFnDecls` sweep in semantic_analyzer.cpp and the prototype-only case below
+// leaves the DEFINITION's record false — which is exactly the shape that would ship
+// a silently unrecorded exclusion for the ordinary header/impl split.
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOrMergesAcrossPrototypeAndDefinition) {
+    for (auto const* src : {
+             // spelled on the PROTOTYPE only — the glibc-style header/impl split
+             "static int f(int x) __attribute__((no_sanitize_thread));\n"
+             "static int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // …and on the DEFINITION only, which must merge the other way
+             "static int f(int x);\n"
+             "static __attribute__((no_sanitize_thread)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "the attribute alone is not an error: "
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        int marked = 0;
+        int named  = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            if (model.symbols()[i].name != "f") continue;
+            ++named;
+            if (model.symbols()[i].isNoSanitizeThread) ++marked;
+        }
+        ASSERT_GT(named, 0) << "the fixture must declare `f`";
+        EXPECT_EQ(marked, named)
+            << "EVERY record for `f` must carry the exclusion after the "
+               "proto/definition OR-merge — the definition is what HIR→MIR stamps "
+               "from, so a merge that only marks the spelling side loses the fact";
+    }
+}
+
+// TF-C92: the FnSig GATE at the record. `__attribute__((no_sanitize_thread))` on a
+// DATA object is ACCEPTED but records nothing — the flag feeds a per-FUNCTION
+// decision, so a symbol whose kind could never honor it must not carry it. This test
+// asserts the CURRENT behaviour, which is acceptance plus total silence.
+//
+// ★★ THE SILENCE IS A TRACKED **DIVERGENCE FROM CLANG**, NOT THE INTENDED CONTRACT.
+// clang accepts the same declaration and WARNS (`-Wignored-attributes` class); DSS
+// accepts it and emits nothing, so an author who attached the attribute to the wrong
+// kind of entity is told nothing. Registered as
+// [[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]] — read the
+// `EXPECT_FALSE(hasErrors)` below as "this is what DSS does today", never as "no
+// diagnostic belongs here".
+//
+// ★ A FUTURE CYCLE FLIPS THIS TEST RATHER THAN DELETING IT: when that row is closed,
+// the same fixture must expect `S_AttributeIgnoredForDeclarationKind` and the
+// records-nothing loop below stays untouched (the gate still has to hold — a
+// diagnostic that ALSO recorded the flag would be a worse bug than the silence).
+//
+// WHAT BREAKS THIS: dropping the `isFnSig &&` guard from the apply in
+// semantic_analyzer.cpp. Nothing else in the suite moves — the program still
+// compiles clean — which is why the gate needs its own assertion.
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOnDataObjectRecordsNothing) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"__attribute__((no_sanitize_thread)) int gv = 7;\n"
+         "int main(void){return gv;}\n"});
+    EXPECT_FALSE(model.hasErrors())
+        << "CURRENT behaviour, and a tracked divergence from clang (which warns) "
+           "rather than the contract — see "
+           "D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT: "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        EXPECT_FALSE(model.symbols()[i].isNoSanitizeThread)
+            << "no symbol may carry the flag when the only annotated declaration "
+               "is a data object — symbol '" << model.symbols()[i].name << "'";
+    }
+}
+
+// TF-C92: the NEGATIVE control for the symbol-tier suite — an un-annotated program
+// must leave every record clear. Without it, an apply that unconditionally set the
+// flag would satisfy the OR-merge test above.
+//
+// ★ AND THE COMPOSITION CLAIM, in the same test because it is the same shape: this
+// axis contradicts NOTHING, so `no_sanitize_thread` together with `noinline` (and
+// with `always_inline`) must be clean — no `S_ConflictingInlineAttributes`, unlike
+// the inline pair. A future contradiction gate written by analogy to that pair would
+// turn this red, which is the intent.
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadComposesAndDefaultsClear) {
+    {
+        auto model = analyzeShipped(
+            "c-subset",
+            {"static int f(int x){return x+1;}\nint main(void){return f(41);}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            EXPECT_FALSE(model.symbols()[i].isNoSanitizeThread)
+                << "an un-annotated program records no exclusion";
+    }
+    for (auto const* src : {
+             "static __attribute__((no_sanitize_thread)) __attribute__((noinline)) "
+             "int f(int x){return x+1;}\nint main(void){return f(41);}\n",
+             "static __attribute__((no_sanitize_thread)) "
+             "__attribute__((always_inline)) "
+             "int f(int x){return x+1;}\nint main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "no_sanitize_thread composes with either inline directive — it is "
+               "an orthogonal axis, not a third member of a mutually exclusive set: "
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 0u);
+        int marked = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == "f"
+                && model.symbols()[i].isNoSanitizeThread) ++marked;
+        EXPECT_EQ(marked, 1)
+            << "and the exclusion is still recorded alongside the inline directive";
+    }
+}
+
 // (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
 // `"noreturn": true` (the abort/exit shape) threads onto the injected
 // SymbolRecord's isNoreturn — a shipped extern has no user prototype to carry

@@ -4632,4 +4632,176 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
     EXPECT_FALSE(desc.has_value());
 }
 
+// ── TF-C92: the real <sys/ioctl.h> request-ENCODING macros, per format ────────
+//
+// sqlite/src/os_unix.c uses this header's macros at TWO measured sites — macho
+// os_unix.c:2986 `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed at :3013 by
+// `fsctl`), and elf os_unix.c:392-396 `_IO` x4 + `_IOR` x1 under `#ifdef
+// __linux__`. Because an angle include resolves to DESCRIPTORS ONLY (the real
+// <sys/ioccom.h> text is never read), a missing row let `_IOWR` reach the parser
+// as a call whose 3rd argument is a TYPE-NAME: `error[P0009] … got 'struct'` at
+// os_unix.c:2986:56 — MEASURED as the sole diagnostic in that TU, and MEASURED to
+// come back the instant the `_IOWR` row (or just its macho variant) is removed.
+//
+// The two OSes disagree on the DIRECTION FIELD ENTIRELY — Darwin gives each
+// direction its own bit high in the word (VOID 0x20000000, OUT 0x40000000,
+// IN 0x80000000, INOUT 0xc0000000) and masks the size to 13 bits; Linux
+// asm-generic packs a 2-bit direction CODE at bit 30 (NONE 0, WRITE 1, READ 2,
+// so _IOWR is 3) and does not mask. So this pins the exact per-format
+// replacement TEXT, not just that some replacement exists: a copy-paste between
+// the two arms would compute a plausible-looking but WRONG ioctl number, and a
+// wrong request number is silent at every layer below the syscall.
+//
+// RED-ON-DISABLE: drop a row → its EXPECT_TRUE(has …) fails; swap either arm's
+// direction constant or shift → the exact-text EXPECT fails; add `_IOC` or the
+// IOC_*/_IOC_* direction vocabulary → the deliberate-omission EXPECTs fail (that
+// line is a decision recorded in the descriptor's `$comment`, not an oversight,
+// so re-crossing it must be a conscious edit). The VALUE side is pinned
+// end-to-end by `examples/c-subset/shipped_ioctl_iowr_macho/`, which
+// `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
+// against the real SDK sys/ioccom.h.
+TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    fs::path const path = root / "sys" / "ioctl.json";
+    ASSERT_TRUE(fs::exists(path)) << path.generic_string();
+
+    // Read through the interner-FREE preprocessor path — the tier that actually
+    // splices these as synthetic `#define`s at include resolution.
+    auto macrosFor = [&](ObjectFormatKind fmt) {
+        DiagnosticReporter rep;
+        auto m = readShippedLibMacros(path, rep, fmt);
+        EXPECT_FALSE(rep.hasErrors()) << "sys/ioctl.json must read clean";
+        EXPECT_TRUE(m.has_value());
+        return m.value_or(std::vector<ShippedMacro>{});
+    };
+    auto find = [](std::vector<ShippedMacro> const& ms, std::string_view name)
+        -> ShippedMacro const* {
+        for (auto const& m : ms)
+            if (m.name == name) return &m;
+        return nullptr;
+    };
+
+    auto const macho = macrosFor(ObjectFormatKind::MachO);
+    auto const elf   = macrosFor(ObjectFormatKind::Elf);
+
+    // Exactly the four PORTABLE encoding macros, on BOTH formats — one row per
+    // name with a variant per format, so neither format is silently short.
+    std::vector<std::string> const expected{"_IO", "_IOR", "_IOW", "_IOWR"};
+    ASSERT_EQ(macho.size(), expected.size());
+    ASSERT_EQ(elf.size(), expected.size());
+    for (auto const& name : expected) {
+        EXPECT_NE(find(macho, name), nullptr) << name << " missing on macho";
+        EXPECT_NE(find(elf, name), nullptr) << name << " missing on elf";
+    }
+
+    // ARITY: `_IO` takes (group, num); the three sized ones take (group, num,
+    // type). `params` PRESENT (not nullopt) is what makes them FUNCTION-LIKE —
+    // an object-like row would not consume `('z', 23, struct T)` at all.
+    auto expectArity = [&](std::vector<ShippedMacro> const& ms,
+                           std::string_view name, std::size_t arity,
+                           char const* fmtName) {
+        auto const* m = find(ms, name);
+        ASSERT_NE(m, nullptr) << name << " on " << fmtName;
+        ASSERT_TRUE(m->params.has_value())
+            << name << " must be FUNCTION-like on " << fmtName;
+        EXPECT_EQ(m->params->size(), arity) << name << " on " << fmtName;
+        EXPECT_FALSE(m->variadic) << name << " is not variadic";
+        EXPECT_FALSE(m->replacement.empty()) << name << " must have a body";
+    };
+    expectArity(macho, "_IO",   2u, "macho");
+    expectArity(macho, "_IOR",  3u, "macho");
+    expectArity(macho, "_IOW",  3u, "macho");
+    expectArity(macho, "_IOWR", 3u, "macho");
+    expectArity(elf,   "_IO",   2u, "elf");
+    expectArity(elf,   "_IOR",  3u, "elf");
+    expectArity(elf,   "_IOW",  3u, "elf");
+    expectArity(elf,   "_IOWR", 3u, "elf");
+
+    // EXACT per-format replacement text. macho ← the SDK sys/ioccom.h layout;
+    // elf ← the musl/asm-generic layout. Every direction literal carries `u`:
+    // on elf that is LOAD-BEARING (`2 << 30` overflows a signed int, and DSS and
+    // clang were measured to widen that UB differently — 0x80000000 vs
+    // 0xffffffff80000000 — so a signed spelling computes a request number no
+    // native consumer of the same header agrees with).
+    auto expectBody = [&](std::vector<ShippedMacro> const& ms,
+                          std::string_view name, char const* body,
+                          char const* fmtName) {
+        auto const* m = find(ms, name);
+        ASSERT_NE(m, nullptr) << name << " on " << fmtName;
+        EXPECT_EQ(m->replacement, body) << name << " on " << fmtName;
+    };
+    expectBody(macho, "_IO",
+               "(0x20000000u | (((0u) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOR",
+               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOW",
+               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOWR",
+               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(elf, "_IO",
+               "(((0u) << 30) | ((g) << 8) | (n) | ((0u) << 16))", "elf");
+    expectBody(elf, "_IOR",
+               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+    expectBody(elf, "_IOW",
+               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+    expectBody(elf, "_IOWR",
+               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+
+    // The per-format VARIANT SELECTION really diverged — if the selector ever
+    // handed one format the other's arm, these would compare equal. This is the
+    // property the `$comment`'s agnosticism claim rests on.
+    for (auto const& name : expected) {
+        auto const* m = find(macho, name);
+        auto const* e = find(elf, name);
+        ASSERT_NE(m, nullptr);
+        ASSERT_NE(e, nullptr);
+        EXPECT_NE(m->replacement, e->replacement)
+            << name << ": the macho and elf encodings are NOT the same layout";
+    }
+
+    // No `sizeof` in `_IO` (len is a literal 0 on both formats), and `sizeof(t)`
+    // present in each sized one — the type-name-through-a-macro-parameter
+    // mechanism the c92 defect proved untested.
+    for (auto const* ms : {&macho, &elf}) {
+        auto const* io = find(*ms, "_IO");
+        ASSERT_NE(io, nullptr);
+        EXPECT_EQ(io->replacement.find("sizeof"), std::string::npos)
+            << "_IO encodes no parameter length";
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*ms, name);
+            ASSERT_NE(sized, nullptr) << name;
+            EXPECT_NE(sized->replacement.find("sizeof(t)"), std::string::npos)
+                << name << " must take its length from sizeof(t)";
+        }
+    }
+
+    // DELIBERATE OMISSIONS (no-over-ship line, justified in the `$comment`):
+    // `_IOC` and the per-OS direction-bit vocabulary are NOT the portable
+    // interface and no corpus site names them; their absence is LOUD (an
+    // undeclared identifier), never a silent wrong number.
+    for (auto const* ms : {&macho, &elf})
+        for (auto const& name : {"_IOC", "IOC_VOID", "IOC_OUT", "IOC_IN",
+                                 "IOC_INOUT", "IOCPARM_MASK", "_IOC_NONE",
+                                 "_IOC_WRITE", "_IOC_READ"})
+            EXPECT_EQ(find(*ms, name), nullptr)
+                << name << " is deliberately NOT shipped — see the $comment";
+
+    // The macros ride ALONGSIDE the pre-existing link surface; `ioctl`'s request
+    // parameter is the u64 these encodings widen into, so the two halves of this
+    // descriptor have to keep agreeing.
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(path, interner, typeReg, ObjectFormatKind::MachO);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].name, "ioctl");
+    EXPECT_EQ(desc->macros.size(), expected.size())
+        << "the full read must select the same four macros as the pp read";
+    // No `constants` surface: the numerics are inlined into each macro body so
+    // every row is self-contained (adding IOC_* constants would be a new claim).
+    EXPECT_TRUE(desc->constants.empty())
+        << "sys/ioctl.json ships no constant surface by design";
+}
+
 } // namespace

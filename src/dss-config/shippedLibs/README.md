@@ -66,22 +66,46 @@ target's object format picks the runtime image from the map at resolution time.
 }
 ```
 
+The table below is the **complete** closed key set the reader accepts. Any other
+top-level key **fails loud** (`F_ShippedLibDescriptorMalformed`, `(root)`), so a
+typo is never a silently-ignored surface.
+
 | Field       | Required | Meaning |
 |-------------|----------|---------|
 | `header`    | **yes**  | The header these symbols come from (`stdio.h`). This is the provenance answer to *"where does `puts` come from?"* — a descriptor that omitted it would defeat the purpose, so the reader **fails loud** (`F_ShippedLibDescriptorMalformed`) if it is missing or empty. |
 | `standard`  | no       | The language standard the surface targets (`c89`, `c99`, …). Provenance only. |
 | `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. |
-| `symbols`   | no\*     | The exported LINK surface (extern functions/objects). Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`. |
-| `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like / float / string macro is out of scope (not a constant). |
+| `availableObjectFormats` | no | Per-target AVAILABILITY — which object formats this header EXISTS on (the sibling axis to `library`, which says which IMAGE per format). ABSENT/EMPTY = available on **every** format (C-standard headers omit it); a POSIX-only header carries `["elf","macho"]`, so `#include <sys/time.h>` **fails loud** for a windows-pe target and `__has_include` answers the per-target truth. Same object-format vocabulary as `library` — an unknown name **fails loud** on read. A `symbols` entry may carry its own `availableObjectFormats` to gate one symbol (see `stdio.json`'s `__stdinp` / `_wfopen`). |
+| `includes`  | no       | The transitive sibling headers this header `#include`s in the real world (`inttypes.json` declares `["stdint.h"]`, mirroring C 7.8p1). Including the parent injects each declared sibling's surface too, walking the config-declared graph cycle-safely. Each entry is a header NAME resolved by the same `<stem>.json` convention as a source angle-include (`"sys/uio.h"` → `sys/uio.json`). ABSENT/EMPTY = no transitive edges. **`includes` does NOT count toward "declares something"** — an includes-only descriptor still fails loud. |
+| `symbols`   | no\*     | The exported LINK surface (extern functions/objects). Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`; optionally `availableObjectFormats` and a symbol `version`. |
+| `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`), OR per-target `variants` (`when` + `value` + `type`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like macro belongs in `macros`; a float one in `floatConstants`. |
+| `floatConstants` | no\* | The header's FLOATING-point macro-constants (`math.json` ships `INFINITY` and `HUGE_VAL`) — the `constants` surface is integer-ONLY, so a float there fails loud. Each entry: `name`, `value` (a **string** — JSON has no Infinity/NaN, so `"inf"`/`"+inf"`/`"-inf"` map to the IEEE-754 infinities and any other string is a finite literal parsed by the one float decoder), `type` (a FLOAT scalar, `f32`/`f64`). A finite literal that OVERFLOWS to ±inf **fails loud** — only the explicit `inf` tokens may produce an infinity. |
 | `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, and EITHER a flat `type` (any hir-text type) OR per-target `variants` (`when` + `type`). Injected as a type-position name. A builtin type of the same name wins. |
+| `structs`   | no\*     | The header's `struct tag { … };` with NAMED fields (e.g. `struct timeval`), since the hir-text `struct "N" { T,… }` spelling carries field types positionally but no names. Each entry: `name` (the tag) and EITHER `fields` (each `name` + `type`, plus an optional explicit byte `offset` for a foreign OVERLAPPING layout — all-or-none within one struct) OR per-target `variants` (`when` + `fields`, as `fcntl.json`'s reordered `struct flock` needs). The tag lands in the TAG namespace with a field scope; offsets are DERIVED by natural alignment unless given. |
+| `unions`    | no\*     | The header's `union tag { … };` with NAMED members. Entry keys are `name` + `fields` ONLY — members overlay at offset 0 by union semantics, so an explicit `offset` on a member is **rejected**, and (unlike `structs`) there is **no `variants`** key: a per-target union layout is not expressible today. |
+| `macros`    | no\*     | The header's `#define`s that are NOT compile-time constants — a PREPROCESSOR substitution rather than a semantic injection. Resolving `#include <header.h>` splices each as a synthetic `#define` into the macro table, so it expands in the rest of the TU BEFORE parse. Each entry: `name`, plus EITHER a flat body (`replacement`; optional `params` and `variadic`) OR per-FORMAT `variants` (each `when: {format}` carrying its own `replacement`/`params`/`variadic`). Declaring both a body key and `variants` **fails loud**. `params` ABSENT = object-like (`#define X 1`); PRESENT — even `[]` — = function-like (`assert(e)`, `_IOWR(g,n,t)`); `variadic` marks a trailing `...` and requires `params`. `replacement` may be empty (a null macro `#define X`). Unlike the other `variants` axes, a macro's `when` is **format-only** — arch is not threaded into the preprocessor. A newline in any macro field **fails loud** (it would break the spliced directive). Examples: `assert.json` (function-like), `errno.json` + `stdio.json` (per-format), `sys/ioctl.json` (per-format function-like). |
+| `$comment`  | no       | The repo-wide config-documentation convention: a human provenance note (which real headers the values were measured against, which deferral applies, why a divergence exists). Accepted and ignored — never consumed by lowering. |
 
 \* A descriptor must declare **at least one** of `symbols` / `constants` /
-`typedefs` (a descriptor that declares nothing **fails loud**). A header may
-legitimately carry only `constants` (e.g. `<limits.h>` — all macros, no link
-surface; see `limits.json`) or only `typedefs`. Because a C `.h` is C-syntax
-TEXT, shipping one would couple the language-NEUTRAL config to C — so a header's
-macros + typedefs live here as neutral data, injected by the semantic phase,
-NOT spliced as text (Item 1, 2026-06-22).
+`floatConstants` / `typedefs` / `structs` / `unions` / `macros` (a descriptor
+that declares nothing **fails loud** — and note `includes` does *not* count). A
+header may legitimately carry only `constants` (e.g. `<limits.h>` — all macros,
+no link surface; see `limits.json`), only `typedefs`, or only `macros` (e.g.
+`<assert.h>` — `assert` is a function-like macro with no link surface at all;
+see `assert.json`). For `constants` / `typedefs` / `structs` / `unions` /
+`macros` the check counts the JSON DECLARATION, not the post-selection
+injection — so a **variants-only** descriptor that injects nothing on the current
+target (or when read with no active format, as the provenance sweep does) is
+still a valid declaration, not a false "declares nothing". Of those, the surfaces
+that actually accept a `variants` key are `constants`, `typedefs`, `structs` and
+`macros`; `unions` does not.
+
+Because a C `.h` is C-syntax TEXT, shipping one would couple the
+language-NEUTRAL config to C — so a header's constants + typedefs + tags live
+here as neutral data injected by the semantic phase (Item 1, 2026-06-22).
+`macros` is the one surface that must reach the PREPROCESSOR rather than the
+semantic phase, so it alone is reconstructed as `#define` text — from neutral
+fields, never by reading the real header.
 
 The `signature` grammar is the IR type-text vocabulary documented in
 [`docs/ir-type-text.md`](../../../docs/ir-type-text.md) — the same codec the

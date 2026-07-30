@@ -133,6 +133,13 @@ struct DSS_EXPORT CstToHirResult {
                                   // off)` REGION (TF-C85); read at HIR→MIR to
                                   // stamp MirFunc.noOptimize (the rebuilder
                                   // copies such a function verbatim)
+    HirNoSanitizeThreadMap noSanitizeThreadMap; // bound to `hir` — native-FUNCTION
+                                  // thread-sanitizer EXCLUSION (TF-C92,
+                                  // D-CSUBSET-NO-SANITIZE-THREAD); read at HIR→MIR
+                                  // to stamp MirFunc.noSanitizeThread, which
+                                  // `mir_text` surfaces as `nosanitizethread`. Its
+                                  // sink is STORAGE, not a pass — DSS ships no
+                                  // sanitizer (see NoSanitizeThreadAttr)
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
@@ -205,7 +212,7 @@ struct DSS_EXPORT CstToHirResult {
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
-          alwaysInlineMap(hir), noOptimizeMap(hir),
+          alwaysInlineMap(hir), noOptimizeMap(hir), noSanitizeThreadMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
           returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)) {}
 

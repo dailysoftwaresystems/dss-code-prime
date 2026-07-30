@@ -3115,6 +3115,7 @@ struct AttributeSemanticsFacts {
     std::string nodiscardMessage;
     bool        noInline    = false;   // noInline row matched (TF-C78)
     bool        alwaysInline = false;  // alwaysInline row matched (TF-C81)
+    bool        noSanitizeThread = false;  // noSanitizeThread row matched (TF-C92)
     // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
     // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
     // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
@@ -3570,6 +3571,37 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // type being a FnSig, and CROSS-CHECKED against `noInline` there
                 // (the two directives contradict each other).
                 out.alwaysInline = true;
+                break;
+            case AttributeEffect::NoSanitizeThread:
+                // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): a pure marker, exactly
+                // like the two arms above — no argument, no message, no MAX-fold.
+                // Applied to the declarator's symbol below gated on the declared
+                // type being a FnSig. NO cross-check against a partner verb: this
+                // axis contradicts nothing (see `SymbolRecord.isNoSanitizeThread`).
+                //
+                // ★ THE STRING-ARGUMENT SPELLING `no_sanitize("thread")` DOES NOT
+                // REACH THIS ARM, DELIBERATELY, AND IT FAILS LOUD RATHER THAN
+                // SILENTLY MISSING. That form's clause NAME is `no_sanitize`, and
+                // `linkageFrom`'s composite-key pairing turns it into the key
+                // `no_sanitize:thread` before the semantic tier ever runs.
+                // MEASURED at TF-C92 HEAD with the shipped CLI:
+                // `static __attribute__((no_sanitize("thread"))) int g(int k){…}`
+                // → `error[H000C] 'no_sanitize:thread' is not a recognized linkage
+                // specifier`. Matching it here would need the effects table to key
+                // on a clause ARGUMENT VALUE, which no verb does; sqlite writes
+                // only the bare `no_sanitize_thread` spelling, so the loud refusal
+                // is the correct residue, not a gap. TF-C92 fold: PINNED, no
+                // longer prose-only — HirLoweringCSubset
+                // .NoSanitizeStringArgumentFormIsRefusedLoud asserts exactly one
+                // H_UnknownLinkageSpecifier naming the composite key, for BOTH
+                // `("thread")` and `("address")`. The same statement in the file a
+                // config author reads is the `★ THE STRING-ARGUMENT SPELLING`
+                // paragraph of this effect's own row `$comment` in
+                // `semantics.attributeSemantics.effects` (c-subset.lang.json,
+                // `"names": ["no_sanitize_thread"]`) — there is deliberately no
+                // separate `$noSanitizeStringFormComment` key, which an earlier
+                // draft of THIS comment cited by name and which never existed.
+                out.noSanitizeThread = true;
                 break;
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
@@ -7008,6 +7040,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // kind cannot honor it must not carry it).
                         if (isFnSig && attrFacts.alwaysInline)
                             s.symbols.at(sym).isAlwaysInline = true;
+                        // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the third
+                        // attribute-borne per-function fact, same FnSig gate and
+                        // the same reason as its two neighbours — the flag exists
+                        // to be read by a CODEGEN/instrumentation consumer, so a
+                        // symbol whose kind could never honor it must not carry
+                        // it. `__attribute__((no_sanitize_thread)) int x;` is
+                        // therefore INERT rather than recorded on a data object.
+                        if (isFnSig && attrFacts.noSanitizeThread)
+                            s.symbols.at(sym).isNoSanitizeThread = true;
                         // ★★ TF-C85: the `#pragma optimize("", off)` region flag.
                         // Same FnSig gate and the same reason (it feeds a CODEGEN
                         // decision), but its SOURCE is different in kind from the
@@ -12881,6 +12922,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                              || s.symbols.at(absorbed).isAlwaysInline;
                 s.symbols.at(survivor).isAlwaysInline = ai;
                 s.symbols.at(absorbed).isAlwaysInline = ai;
+            }
+            // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same OR-merge, for the
+            // same reason as its two neighbours above — HIR→MIR stamps the flag
+            // from the DEFINITION's symbol, so `no_sanitize_thread` spelled only
+            // on the prototype (the glibc-style header/impl split) would otherwise
+            // lower to a MirFunc with the bit clear and the recorded exclusion
+            // would vanish between the two declarations. Position is free here:
+            // unlike the inline pair this axis feeds NO contradiction gate, so
+            // nothing needs the two records pristine.
+            {
+                bool const nst = s.symbols.at(survivor).isNoSanitizeThread
+                              || s.symbols.at(absorbed).isNoSanitizeThread;
+                s.symbols.at(survivor).isNoSanitizeThread = nst;
+                s.symbols.at(absorbed).isNoSanitizeThread = nst;
             }
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the
             // inline-definition reading merges with **AND**, not OR — the one

@@ -662,6 +662,129 @@ TEST(MirText, NoOptimizeAttributeSurvivesRoundTrip) {
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
 
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the `nosanitizethread` axis survives
+// the `.dssir` round trip, and lands in the RIGHT bit. FOUR adjacent trailing bools
+// at every `addFunction` call now, so a transposition compiles silently; the fixture
+// sets exactly ONE flag per function and asserts the other three are clear.
+//
+// ★ THIS TEST CARRIES MORE WEIGHT THAN ITS THREE SIBLINGS, AND THE REASON IS
+// STRUCTURAL, NOT STYLISTIC. `noinline`/`alwaysinline`/`nooptimize` each also reach
+// an optimizer pass whose OUTPUT changes when the flag is lost, so a behavioural
+// test can corroborate them. `no_sanitize_thread` reaches NO pass — MEASURED,
+// `grep -rni sanitiz src/` is empty — so the printer/parser pair IS the feature's
+// only surface. If this round trip drops the flag, the fact is unrecoverable and
+// nothing else in the suite notices.
+//
+// RED-ON-DISABLE: drop `noSanitizeThread` from `parseFunction`'s `addFunction` call
+// (let the 8th parameter default to false) → the first EXPECT_TRUE below fails and
+// `NoOptimizeAttributeSurvivesRoundTrip` stays green. Delete the `if (ns)` arm in
+// `appendFuncAttrs` → the keyword vanishes, so both the flag assertions AND the
+// `text.find` assertion fail. Forget `!ns` in the printer's all-default early return
+// → function %1 (whose only non-default axis is this one) prints no `[...]` list at
+// all and comes back clean.
+TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    // %1 — nosanitizethread ONLY. Its whole point is that this is the SOLE
+    // non-default axis: it is what forces the printer's all-default early return to
+    // account for the new flag, and what would silently print nothing if it did not.
+    (void)b.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/false,
+                        /*alwaysInline=*/false, /*noOptimize=*/false,
+                        /*noSanitizeThread=*/true);
+    MirBlockId e1 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e1); b.addReturn();
+    // %2 — nooptimize ONLY: the IMMEDIATE neighbour in the argument list, so a
+    // one-position transposition fails both directions at once.
+    (void)b.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                        SymbolVisibility::Default, /*noInline=*/false,
+                        /*alwaysInline=*/false, /*noOptimize=*/true,
+                        /*noSanitizeThread=*/false);
+    MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e2); b.addReturn();
+    // %3 — nosanitizethread COMPOSED with both linkage axes AND with `noinline`.
+    // ★ THE COMPOSITION IS DELIBERATE AND IS ITS OWN CLAIM: unlike the
+    // noinline/always_inline pair this axis contradicts nothing, so a function may
+    // carry both, and the printer must emit both keywords in one `[...]` list.
+    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Local,
+                        SymbolVisibility::Hidden, /*noInline=*/true,
+                        /*alwaysInline=*/false, /*noOptimize=*/false,
+                        /*noSanitizeThread=*/true);
+    MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e3); b.addReturn();
+    // %4 — every flag DEFAULT: prints no attribute list, so existing golden text
+    // for ordinary functions stays byte-unchanged by this cycle.
+    (void)b.addFunction(fnSig, SymbolId{4});
+    MirBlockId e4 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e4); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "ns", "no", "localhiddenni", "plain"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 4u);
+
+    auto findBySym = [&](std::uint32_t sym) -> MirFuncId {
+        std::size_t const nf = parsed->mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = parsed->mir.funcAt(i);
+            if (parsed->mir.funcSymbol(f).v == sym) return f;
+        }
+        return MirFuncId{};
+    };
+
+    MirFuncId const f1 = findBySym(1);
+    ASSERT_TRUE(f1.valid());
+    EXPECT_TRUE(parsed->mir.funcNoSanitizeThread(f1))
+        << "a nosanitizethread function must come back nosanitizethread — a "
+           "dropped flag here erases the ONLY record DSS keeps of the source's "
+           "thread-sanitizer exclusion:\n" << text;
+    EXPECT_FALSE(parsed->mir.funcNoOptimize(f1))
+        << "and must NOT come back nooptimize — the adjacent-argument swap";
+    EXPECT_FALSE(parsed->mir.funcNoInline(f1));
+    EXPECT_FALSE(parsed->mir.funcAlwaysInline(f1));
+
+    MirFuncId const f2 = findBySym(2);
+    ASSERT_TRUE(f2.valid());
+    EXPECT_TRUE(parsed->mir.funcNoOptimize(f2));
+    EXPECT_FALSE(parsed->mir.funcNoSanitizeThread(f2))
+        << "the mirror direction of the same swap";
+
+    MirFuncId const f3 = findBySym(3);
+    ASSERT_TRUE(f3.valid());
+    EXPECT_EQ(parsed->mir.funcBinding(f3),    SymbolBinding::Local);
+    EXPECT_EQ(parsed->mir.funcVisibility(f3), SymbolVisibility::Hidden);
+    EXPECT_TRUE(parsed->mir.funcNoSanitizeThread(f3))
+        << "all five per-function axes must survive together";
+    EXPECT_TRUE(parsed->mir.funcNoInline(f3))
+        << "and the two COMPOSE — this axis contradicts nothing, so both keywords "
+           "must round-trip on one function";
+    EXPECT_FALSE(parsed->mir.funcNoOptimize(f3));
+
+    MirFuncId const f4 = findBySym(4);
+    ASSERT_TRUE(f4.valid());
+    EXPECT_FALSE(parsed->mir.funcNoSanitizeThread(f4))
+        << "an unmarked function must not acquire the flag";
+    EXPECT_NE(text.find("function %4 : fn() -> void {"), std::string::npos)
+        << "an all-default function must still emit NO `[...]` list — the new "
+           "axis must not have leaked into the early-return condition's inverse:\n"
+        << text;
+
+    EXPECT_NE(text.find("nosanitizethread"), std::string::npos)
+        << "the printer must emit the `.dssir` keyword — this IS the sink:\n" << text;
+
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    DiagnosticReporter r3;
+    EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
+}
+
 // TF-C78: an UNRECOGNIZED function attribute FAILS LOUD rather than being
 // skipped. A parser that silently ignored an unknown name is precisely how a
 // dropped field goes unnoticed for a long time (see the test above), so the

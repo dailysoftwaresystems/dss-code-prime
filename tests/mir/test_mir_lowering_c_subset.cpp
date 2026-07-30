@@ -195,7 +195,17 @@ struct Lowered {
                                     // load-bearing that the tests assert the APPLIED
                                     // FACT: a test that only checked "it compiled"
                                     // would have passed against a dead harness and
-                                    // hidden the gap instead of exposing it. THERE ARE
+                                    // hidden the gap instead of exposing it.
+                                    // ★★ TF-C92: AND IT FIRED A **THIRD** TIME, WITH
+                                    // THE WARNING ABOVE ALREADY ON THE SCREEN.
+                                    // `noSanitizeThreadMap` was threaded through the
+                                    // product AND compile_pipeline.cpp, the real CLI
+                                    // accepted `no_sanitize_thread` and emitted a clean
+                                    // object file — and all FIVE form cases in this file
+                                    // still read 0, because the harness passed nothing
+                                    // here. Three cycles, three identical misses: treat
+                                    // updating these call sites as PART OF adding a map,
+                                    // never as a follow-up. THERE ARE
                                     // FOUR `lowerToMir` CALL SITES IN THIS FILE (this
                                     // one plus ~535, ~601, ~11459); a map added to
                                     // only some of them fails in a shape-dependent
@@ -205,7 +215,8 @@ struct Lowered {
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,
                                     &hir->alwaysInlineMap,   // TF-C81
-                                    &hir->noOptimizeMap);   // TF-C85
+                                    &hir->noOptimizeMap,   // TF-C85
+                                    &hir->noSanitizeThreadMap);   // TF-C92
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -551,7 +562,8 @@ namespace {
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,   // TF-C78
                                     &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
-                                    &hir->noOptimizeMap);   // TF-C85 (#pragma optimize)
+                                    &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -618,7 +630,8 @@ namespace {
                                     &hir->returnsTwiceMap,
                                     &hir->noInlineMap,   // TF-C78
                                     &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
-                                    &hir->noOptimizeMap);   // TF-C85 (#pragma optimize)
+                                    &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -2776,6 +2789,492 @@ TEST(MirLoweringCSubsetLinkage, AlwaysInlineIsInertUnderShippedDebugPipeline) {
     EXPECT_TRUE(flagPresent)
         << "the flag must still ARRIVE under debug — the attribute is parsed "
            "and lowered, it simply has no consumer in this pipeline";
+}
+
+// ══ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): source → MirFunc.noSanitizeThread ══
+//
+// The `NoInlineFormCase`/`AlwaysInlineFormCase` suites a FIFTH axis over: the
+// `attributeSemantics.effects` `noSanitizeThread` verb → `SymbolRecord.
+// isNoSanitizeThread` (FnSig-gated) → `HirNoSanitizeThreadMap` →
+// `MirFunc.noSanitizeThread` → the `nosanitizethread` keyword in `.dssir` text.
+//
+// ★★ WHY EVERY CASE ASSERTS THE **MIR TEXT**, NOT JUST THE BOOL. DSS has NO
+// sanitizer (MEASURED: `grep -rni sanitiz src/` is empty), so this axis has NO
+// behavioural consequence anywhere in codegen — there is no spliced call to look
+// for, no threshold to observe, no instruction that changes. The ONLY observable
+// property the whole chain produces is that the fact is STORED AND QUERYABLE, and
+// `appendFuncAttrs` printing `nosanitizethread` is precisely that observation. A
+// test that asserted only `funcNoSanitizeThread(...)` would pin the accessor while
+// leaving the printer — the actual sink — unguarded, which is the weak-test class
+// [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] warns about wearing a different hat.
+//
+// ★ AND EVERY CASE ASSERTS THE OTHER THREE PER-FUNCTION FLAGS ARE CLEAR. The four
+// bools are adjacent trailing arguments at every `addFunction` call site, so a
+// transposition compiles silently; "the right flag" is a distinct claim from "a
+// flag", and only the paired assertion separates them.
+struct NoSanitizeThreadFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetNoSanitizeThreadForm
+    : public ::testing::TestWithParam<NoSanitizeThreadFormCase> {};
+
+namespace {
+// Occurrences of `needle` in `hay`. Used to assert the `.dssir` keyword appears
+// EXACTLY once — 0 means the printer never emitted it (the sink is dead), >1 means
+// it leaked onto a function the source never annotated.
+[[nodiscard]] std::size_t countSubstr(std::string const& hay,
+                                      std::string_view   needle) {
+    std::size_t n = 0;
+    for (std::size_t p = hay.find(needle); p != std::string::npos;
+         p = hay.find(needle, p + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+} // namespace
+
+TEST_P(MirLoweringCSubsetNoSanitizeThreadForm, ThreadsToMirTextNoSanitizeThread) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_GE(m.moduleFuncCount(), 2u)
+        << "every fixture defines the annotated function plus main";
+
+    int flagged = 0;
+    int noInlineFlagged = 0;
+    int alwaysInlineFlagged = 0;
+    int noOptimizeFlagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcNoSanitizeThread(f)) ++flagged;
+        if (m.funcNoInline(f))         ++noInlineFlagged;
+        if (m.funcAlwaysInline(f))     ++alwaysInlineFlagged;
+        if (m.funcNoOptimize(f))       ++noOptimizeFlagged;
+    }
+    // WHAT BREAKS THIS — and the FIRST item is the one that justifies the whole
+    // cycle, so read it rather than skimming the list. ★ Deleting the
+    // `no_sanitize_thread` effects row from c-subset.lang.json while leaving the two
+    // `linkageSpecifierIgnoredNames` entries in place — i.e. the "config-only,
+    // just-ignore-it" alternative — does NOT make the program fail: MEASURED, it
+    // compiles with exit 0 and ZERO diagnostics while the attribute is thrown away,
+    // because the linkage tier skips the name by NAME and no other tier claims it.
+    // `model.hasErrors()` above stays FALSE and this count drops to 0. That silent
+    // drop is [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] in the flesh, and this
+    // assertion is what makes it visible.
+    // Also breaks it: deleting the `isFnSig && attrFacts.noSanitizeThread` apply in
+    // semantic_analyzer.cpp; deleting any of the three
+    // `recordNoSanitizeThread(fn_, sym)` lowering sites (this goes to 0 for the
+    // shape that site owns); deleting the `noSanitizeThreadMap` read at the HIR→MIR
+    // mint site; dropping `&hir->noSanitizeThreadMap` in compile_pipeline.cpp; or —
+    // MEASURED THREE CYCLES RUNNING — forgetting to thread the map through the FOUR
+    // `lowerToMir` call sites in THIS FILE's own harness.
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((no_sanitize_thread)) in the '" << c.label << "' form "
+           "must thread to EXACTLY one MirFunc.noSanitizeThread — 0 means the "
+           "form never reached the sink, 2 means it leaked onto an un-annotated "
+           "function";
+    // WHAT BREAKS THIS: transposing any pair of the four trailing bools at
+    // `addFunction` — in hir_to_mir's mint call, mir_text's parse call,
+    // mir_rebuild_helper, mir_merge or inlining. Each transposition compiles
+    // silently and inverts which directive the module records.
+    EXPECT_EQ(noInlineFlagged, 0)
+        << "and it must NOT set noInline — the four per-function flags are "
+           "adjacent bools from addFunction onward, so a swap must be visible here";
+    EXPECT_EQ(alwaysInlineFlagged, 0) << "nor alwaysInline";
+    EXPECT_EQ(noOptimizeFlagged, 0)   << "nor noOptimize";
+
+    // ★ THE SINK ITSELF. `appendFuncAttrs` is the only consumer this axis has, so
+    // this is the assertion that makes the feature observable rather than merely
+    // present in a header.
+    //
+    // WHAT BREAKS THIS: deleting the `if (ns)` arm in `appendFuncAttrs`
+    // (mir_text.cpp) — the bool assertions above stay GREEN and only this one
+    // fires, which is exactly why it is written separately; or forgetting `!ns` in
+    // the all-default early-return guard just above it, which suppresses the whole
+    // `[...]` list for a function whose ONLY non-default axis is this one (the
+    // shape every fixture below deliberately produces).
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 1u)
+        << "the `.dssir` printer must surface the recorded exclusion EXACTLY "
+           "once — this is the ONLY observable effect the whole chain produces, "
+           "since DSS has no sanitizer for the flag to switch off:\n" << text;
+
+    // …and the text is re-parseable with the flag intact (the printer and parser
+    // are separate anonymous namespaces hundreds of lines apart).
+    // WHAT BREAKS THIS: deleting the `kMirTextNoSanitizeThreadAttr` arm in
+    // `parseFunction`, which makes the keyword an UNKNOWN attribute → the parse
+    // emits `malformed` and `parsed->ok` goes false. A silently-skipped keyword
+    // would instead leave the flag clear, which the EXPECT_TRUE below catches.
+    DiagnosticReporter parseRep;
+    auto parsed = parseMir(text, CompilationUnitId{1}, parseRep);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok)
+        << (parseRep.all().empty() ? "" : parseRep.all()[0].actual) << "\n" << text;
+    int reparsedFlagged = 0;
+    for (std::uint32_t i = 0; i < parsed->mir.moduleFuncCount(); ++i)
+        if (parsed->mir.funcNoSanitizeThread(parsed->mir.funcAt(i)))
+            ++reparsedFlagged;
+    EXPECT_EQ(reparsedFlagged, 1)
+        << "the exclusion must survive emit → parse:\n" << text;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetNoSanitizeThreadForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator
+        // (topLevelDecl's `declAttrRun` slot).
+        NoSanitizeThreadFormCase{
+            "mode2-after-type",
+            "int __attribute__((no_sanitize_thread)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ MODE-3 IS **THE SQLITE SHAPE**: the attribute sits in the specifier
+        // PREFIX between `static` and the type, so it routes through
+        // `declSpecifiers` into the topLevelDecl row. Both of sqlite's use sites
+        // (`static SQLITE_NO_TSAN void walIndexWriteHdr(Wal*)`, wal.c:942, and
+        // `static SQLITE_NO_TSAN int walIndexTryHdr(Wal*,int*)`, wal.c:2590) are
+        // exactly this, so this case is the one the provenance rests on.
+        NoSanitizeThreadFormCase{
+            "mode3-leading-prefix-sqlite-shape",
+            "static __attribute__((no_sanitize_thread)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — ONE `no_sanitize_thread` effects entry must cover both
+        // via the shared `stripDunder` normalization, with NO second config row.
+        // RED-ON-DISABLE: this case is the witness that the effects table is on the
+        // NORMALIZED side of the asymmetry (`linkageSpecifiers`, keyed by raw token
+        // text, is not); adding a literal `__no_sanitize_thread__` row to the config
+        // would make it pass for the wrong reason, so it must stay absent.
+        NoSanitizeThreadFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__no_sanitize_thread__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY, topLevelDecl row: the attribute is spelled on the
+        // declaration and the DEFINITION is what lowers. Only the post-Pass-1.5
+        // proto/def OR-merge makes this reach MIR (RED-ON-DISABLE: delete the
+        // `isNoSanitizeThread` OR-merge arm in the `mergedFnDecls` sweep and this
+        // case alone drops to 0 while every other case stays green).
+        NoSanitizeThreadFormCase{
+            "topleveldecl-prototype-only-or-merge",
+            "static int helper(int k) __attribute__((no_sanitize_thread));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ THE **externDecl** POSITION — the second declaration row this cycle
+        // adds the name to, on the house rule that one attribute must not mean two
+        // different things depending on where it is written. The attribute lands in
+        // `externSpecifiers`' TF-C77 repeat rather than `declSpecifiers`, which is a
+        // DIFFERENT scan root reached through a DIFFERENT `linkageSpecifierIgnored
+        // Names` array — so it can regress independently of every case above.
+        // RED-ON-DISABLE: remove `no_sanitize_thread` from the externDecl row's
+        // `linkageSpecifierIgnoredNames` and the LOADER refuses the config outright
+        // (the Clause-B drift cross-check), so this case fails at schema load rather
+        // than at the assertion — a louder failure than the one it replaces.
+        NoSanitizeThreadFormCase{
+            "externdecl-position-or-merge",
+            "extern __attribute__((no_sanitize_thread)) int helper(int k);\n"
+            "int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+        // ★ A `gnu-namespaced-c23-spelling` case was REMOVED from this list, and the
+        // reason is worth keeping: it was left behind as an explicitly-labelled
+        // "N1 PROBE (temporary)" by a fold pass that DIED mid-task, and its own
+        // fixture misspelled the attribute (`no_sanitize_thraed`). It therefore
+        // failed for a reason that had nothing to do with the property it named —
+        // and, read carelessly, it looked like proof that `[[gnu::…]]` does not
+        // reach the sink. It is not proof of anything. Whether the C23 namespaced
+        // spelling reaches the verb is genuinely UNPINNED; see
+        // D-CSUBSET-NO-SANITIZE-THREAD, which records it as a known test gap
+        // shared with `noinline`/`always_inline` (all three headers claim the
+        // `[[gnu::…]]` spelling and none of the three tests it). Add it back as ONE
+        // parameterized case across all three attributes, with a correctly-spelled
+        // fixture AND a misspelled negative control — a misspelling inside a `gnu::`
+        // namespace is itself silently accepted today, which is worth its own pin.
+    [](::testing::TestParamInfo<NoSanitizeThreadFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the whole TF-C92 form suite: the identical program with
+// NO attribute must leave every MirFunc.noSanitizeThread CLEAR **and** must emit no
+// `nosanitizethread` keyword. Without this, a lowering that unconditionally set the
+// flag — or a printer that unconditionally emitted the word — would satisfy every
+// case above.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasNoSanitizeThreadClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoSanitizeThread(m.funcAt(i)))
+            << "an un-annotated function must never carry noSanitizeThread";
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 0u)
+        << "no keyword may appear for an un-annotated program:\n" << text;
+}
+
+// TF-C92: the FnSig GATE. `__attribute__((no_sanitize_thread))` on a DATA object is
+// INERT — the flag feeds a (future) per-FUNCTION instrumentation decision, so a
+// symbol whose kind could never honor it must not carry it. This test asserts the
+// CURRENT behaviour: the declaration is ACCEPTED and records nothing.
+//
+// ★★ AND THE CURRENT BEHAVIOUR IS A TRACKED **DIVERGENCE FROM CLANG**, NOT THE
+// CONTRACT — SAID HERE BECAUSE A TEST THAT ONLY ASSERTED THE SILENCE WOULD READ AS
+// "SILENCE IS CORRECT". clang does NOT go quiet on this: it accepts the declaration
+// and WARNS (`-Wignored-attributes` class), telling the author the attribute was
+// discarded. DSS accepts it and says NOTHING, so an author who wrote the attribute
+// on the wrong entity gets no signal at all. That gap is registered as
+// [[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]].
+//
+// ★ WHAT A FUTURE CYCLE DOES WITH THIS TEST: it FLIPS it, it does not delete it.
+// When the registry row is closed, the same fixture must expect a
+// `S_AttributeIgnoredForDeclarationKind` diagnostic — the `ASSERT_FALSE(hasErrors)`
+// becomes an assertion ON the diagnostic — while the "no function carries the flag"
+// half stays exactly as it is. Deleting the test instead would drop the FnSig gate's
+// only MIR-tier pin along with the divergence marker.
+//
+// WHAT BREAKS THIS: dropping the `isFnSig &&` guard from the apply in
+// semantic_analyzer.cpp. The program still compiles, so no other assertion in the
+// suite moves — only the keyword count below, which is why this test exists
+// separately from the form suite rather than as another case in it.
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadOnDataObjectIsInert) {
+    auto L = lowerCSubset(
+        "__attribute__((no_sanitize_thread)) int gv = 7;\n"
+        "int main() { return gv; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoSanitizeThread(m.funcAt(i)))
+            << "an attribute on a DATA object must not mark any function";
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 0u)
+        << "the FnSig gate must keep the flag off every record:\n" << text;
+}
+
+// ── TF-C92: THE FLAG SURVIVES THE **TWO MIR COPY PATHS** ──────────────────────
+namespace {
+// ★★ THE FIXTURE SHAPE IS THE WHOLE ARGUMENT OF THE NEXT TWO TESTS, SO IT IS
+// SPELLED OUT RATHER THAN LEFT TO BE INFERRED FROM THE SOURCE TEXT.
+//
+// `runInlining` routes EACH function to exactly ONE of two rebuilders, and the
+// router is `planHasMultiBlock` (inlining.cpp): true iff some inlinable callee has
+// `funcBlockCount(callee) != 1`. True → the caller is re-minted by the inliner's
+// OWN `MultiBlockInliner::rebuildFunction`; false → by the shared
+// `MirFunctionRebuilder` that every other rebuild pass also uses. Two DISTINCT,
+// independently-editable `addFunction` copy sites, and a flag argument dropped at
+// either one is invisible at the other.
+//
+// So the fixture is built to hit BOTH:
+//   * the CALLEE is multi-block (`if (k > 0) …`) — that inequality IS the router's
+//     predicate, which is why both tests ASSERT it on the lowered module instead of
+//     trusting the `if`. A lowering change that collapsed this body to one block
+//     would otherwise make both tests silently stop exercising the inliner's path.
+//   * the ATTRIBUTE is on the **CALLER**, because the caller is the function
+//     `MultiBlockInliner` re-mints — `src_.funcNoSanitizeThread(caller)` at
+//     inlining.cpp is the argument under test. A flag on the CALLEE would ride the
+//     shared rebuilder only: the callee is a leaf here, so its own plan is empty and
+//     it never routes to the multi-block path at all. ★ THAT IS THE MISTAKE THIS
+//     FIXTURE REPLACES — the previous version (single-block leaf callee, flag on the
+//     CALLEE) claimed to cover both paths and covered the shared one twice, leaving
+//     the inliner's copy site with NO detector in the whole suite while two comments
+//     asserted it had one.
+// The caller is `main`, so it is a DCE root and the subject cannot be deleted out
+// from under the assertions; the callee is deliberately NOT `static` for the same
+// reason (an externally-visible function survives DCE even once fully inlined).
+constexpr char kNoSanitizeThreadMultiBlockCalleeSource[] =
+    "int helper(int k) { if (k > 0) return k + 5; return -1; }\n"
+    "__attribute__((no_sanitize_thread)) int main() { return helper(37); }\n";
+
+// The MirFuncId whose bound HIR symbol is named `name` — the `noOptimizeOfNamed`
+// shape one level lower, returning the id so a caller can ask about BLOCKS (the
+// router's predicate) as well as about flags. Invalid id = no such function.
+[[nodiscard]] MirFuncId funcIdOfNamed(Lowered const& L, std::string_view name) {
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        auto const* rec = L.model.recordFor(SymbolId{m.funcSymbol(f).v});
+        if (rec != nullptr && rec->name == name) return f;
+    }
+    return MirFuncId{};
+}
+} // namespace
+
+// ── TF-C92: THE FLAG SURVIVES THE **SHIPPED RELEASE PIPELINE** ────────────────
+//
+// `release.pipeline.json` loaded BY NAME (not a hand-written pass list) so the pin
+// cannot drift from what users actually run. Its 9 passes × 4 iterations rebuild the
+// module through BOTH copy sites described above, so this is the end-to-end pin; the
+// test after it isolates the inliner's site alone so a red here can be localized.
+//
+// ★ THIS IS AS CLOSE TO AN "APPLIED FACT" AS THIS AXIS CAN GET, AND SAYING SO
+// PLAINLY IS THE POINT. Its siblings assert a Call that survives (noinline) or
+// disappears (always_inline); here nothing in codegen depends on the flag, so the
+// applied fact IS the recorded fact: after the full optimizer, the module still
+// says this function is excluded from thread-sanitizer instrumentation. That is the
+// property a future instrumentation pass would consume, and it is the property a
+// dropped propagation argument destroys.
+//
+// RED-ON-DISABLE (MEASURED against this build, both directions, one at a time):
+// drop `src_.funcNoSanitizeThread(oldFn)` in `mir_rebuild_helper.cpp` OR
+// `src_.funcNoSanitizeThread(caller)` in `inlining.cpp` and the post-optimize
+// assertion goes red while the pre-optimize one stays green — a propagation hop,
+// not lowering. Which of the two it was is what the next test answers.
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadSurvivesShippedReleasePipeline) {
+    auto L = lowerCSubset(kNoSanitizeThreadMultiBlockCalleeSource);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // FIXTURE NON-VACUITY, and it is the router's own predicate verbatim: unless the
+    // callee has more than one block, `main` never reaches `MultiBlockInliner` and
+    // this test degrades to a second copy of the shared-rebuilder pin.
+    MirFuncId const callee = funcIdOfNamed(L, "helper");
+    ASSERT_TRUE(callee.valid()) << "the fixture must define `helper`";
+    ASSERT_GT(m.funcBlockCount(callee), 1u)
+        << "`planHasMultiBlock` routes the CALLER to MultiBlockInliner only when "
+           "`funcBlockCount(callee) != 1` — a single-block callee here means the "
+           "inliner's own copy site is not exercised at all";
+
+    auto countFlagged = [&] {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+            if (m.funcNoSanitizeThread(m.funcAt(i))) ++n;
+        return n;
+    };
+    ASSERT_EQ(countFlagged(), 1) << "pre-optimization: the flag must have arrived";
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countFlagged(), 1)
+        << "the recorded thread-sanitizer exclusion MUST survive every rebuild in "
+           "the SHIPPED release pipeline — a flag that is erased by the optimizer "
+           "is a fact the compiler cannot be said to record at all";
+
+    // And it is still OBSERVABLE in the optimized module's text.
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 1u)
+        << "post-optimization `.dssir` must still carry the keyword:\n" << text;
+}
+
+// ★★ TF-C92: THE INLINER'S **OWN** COPY SITE, ALONE — the direct detector for
+// `src_.funcNoSanitizeThread(caller)` at inlining.cpp's
+// `MultiBlockInliner::rebuildFunction`.
+//
+// WHY A SECOND TEST RATHER THAN TRUSTING THE PIPELINE PIN. The cycle's doctrine
+// (mir_rebuild_helper.cpp) is that each propagation hop needs its OWN direct
+// assertion, because for this axis nothing in codegen changes and the recorded fact
+// is not the best evidence, it is the ONLY evidence. The release pipeline runs both
+// copy sites, so a red there names a hop only by elimination. A hand-built ONE-PASS
+// `{Inlining}` pipeline (deliberately NOT the shipped one — hop isolation is the
+// point, so drift-proofing is not) puts exactly one rebuild between lowering and the
+// assertion, and `main` is routed to `MultiBlockInliner` by the multi-block callee.
+// Together the two localize: both red ⇒ the inliner's site; pipeline red + this one
+// green ⇒ `mir_rebuild_helper`'s.
+//
+// ANTI-VACUITY IS LOAD-BEARING HERE, in a way that is easy to get wrong. If the
+// legality gate ever refuses this splice, `planHasMultiBlock` returns false, `main`
+// falls back to `MirFunctionRebuilder` — and the flag assertion would STILL PASS,
+// via the other hop, testing nothing. So this test also pins that the splice
+// actually happened: `main` must lose its Call and gain blocks.
+//
+// RED-ON-DISABLE (MEASURED): drop `src_.funcNoSanitizeThread(caller)` at
+// inlining.cpp and this test's flag assertion goes red; drop
+// `src_.funcNoSanitizeThread(oldFn)` in mir_rebuild_helper.cpp instead and this test
+// stays GREEN (no `MirFunctionRebuilder` rebuild of `main` happens in a one-pass
+// Inlining pipeline) while the release-pipeline pin above goes red.
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadSurvivesTheInlinersOwnRebuild) {
+    auto L = lowerCSubset(kNoSanitizeThreadMultiBlockCalleeSource);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    MirFuncId const callee = funcIdOfNamed(L, "helper");
+    MirFuncId const caller = funcIdOfNamed(L, "main");
+    ASSERT_TRUE(callee.valid());
+    ASSERT_TRUE(caller.valid());
+    ASSERT_GT(m.funcBlockCount(callee), 1u)
+        << "the CALLEE must be multi-block or `main` never reaches "
+           "MultiBlockInliner — `planHasMultiBlock`'s predicate";
+    ASSERT_TRUE(m.funcNoSanitizeThread(caller))
+        << "the flag must be on the CALLER — that is the function the inliner "
+           "re-mints, and the only one whose flag its copy site can drop";
+    // The pre-pass symbol, so the post-pass lookup does not depend on the semantic
+    // model's ids surviving the module move.
+    std::uint32_t const callerSym = m.funcSymbol(caller).v;
+    std::uint32_t const callerBlocksBefore = m.funcBlockCount(caller);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"nosanitizethread-inline-only",
+                              {opt::PassId::Inlining}};
+    auto const result =
+        opt::optimize(m, **targetR, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    bool found = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcSymbol(f).v != callerSym) continue;
+        found = true;
+        EXPECT_TRUE(m.funcNoSanitizeThread(f))
+            << "the CALLER's exclusion must survive the inliner's own "
+               "`addFunction` — this is the ONE hop no pass-behaviour test can "
+               "notice, since no pass reads the flag";
+        // ANTI-SWAP: the flagged caller sets exactly ONE of the four trailing bools,
+        // so a transposition at this copy site fails here rather than shipping.
+        EXPECT_FALSE(m.funcNoInline(f));
+        EXPECT_FALSE(m.funcAlwaysInline(f));
+        EXPECT_FALSE(m.funcNoOptimize(f));
+        // ANTI-VACUITY: the splice must really have run through MultiBlockInliner.
+        std::size_t calls = 0;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++calls;
+        }
+        EXPECT_EQ(calls, 0u)
+            << "the call must have been spliced away — a REFUSED splice routes "
+               "`main` back through MirFunctionRebuilder and this test would then "
+               "pass via the OTHER hop, proving nothing";
+        EXPECT_GT(m.funcBlockCount(f), callerBlocksBefore)
+            << "and the caller must have GAINED blocks — the cloned callee CFG "
+               "plus its continuation, i.e. the multi-block splice ran";
+    }
+    EXPECT_TRUE(found) << "the caller must still exist after the pass";
 }
 
 // D-CSUBSET-NORETURN linkage-safety (FC16): a `noreturn` attribute co-present
@@ -5856,6 +6355,74 @@ TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
     EXPECT_TRUE(findFunc(plainSym).valid())
         << "plain_unused (Global/Default) must survive — externally "
            "visible symbols are linkage-protected";
+}
+
+// ── TF-C92 (D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS):
+//    `visibility("default")` reaches MIR as an APPLIED SymbolVisibility::Default
+//
+// The tier that can assert the applied FACT rather than the absence of a
+// diagnostic: `MirFunc.visibility` / `MirGlobal.visibility` are DENSE fields
+// (`funcVisibility` / `globalVisibility` read them unconditionally), unlike the
+// HIR linkage side-table, which is SPARSE and stores nothing for the
+// Global+Default pair the row produces. So this is where `default` is readable
+// at all on an ordinary declaration.
+//
+// ★★ THE FALSE COMFORT THIS PIN IS CAREFUL NOT TO BE. The visibility pin above
+// (HiddenVisibilityUnusedFunctionIsDceEliminated) already asserts
+// `funcVisibility(plainFn) == SymbolVisibility::Default` — but `plain_unused`
+// carries NO attribute, so that line exercises the ABSENCE of a row, and it stays
+// green with every `visibility:default` row deleted from the config. The
+// difference here is that the declarations DO carry the attribute: delete the
+// `topLevelDecl` row and these sources no longer LOWER (H000C
+// H_UnknownLinkageSpecifier at the HIR tier ⇒ `L.hir->ok` false), which is the
+// red this test contributes. The value assertions then add the second half: that
+// what got applied is Default and not some other facet a config typo could name.
+// Independently pinned at the HIR tier (HirLoweringCSubset.VisibilityDefault*),
+// including the two-rows-are-independent perturbation lever.
+TEST(MirLoweringCSubset, VisibilityDefaultAttributeAppliesDefaultVisibility) {
+    auto L = lowerCSubset(
+        "__attribute__((visibility(\"default\"))) int g_vd = 7;\n"
+        "__attribute__((visibility(\"default\"))) int f_vd(int v) "
+        "{ return v + g_vd; }\n"
+        "int main(void) { return f_vd(1) - 8; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok)
+        << "the attribute must LOWER — a missing `visibility:default` row makes "
+           "this H000C: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+
+    // Resolve by NAME through the semantic model so the pin is independent of
+    // minting order (the HiddenVisibility pin's shape).
+    SymbolId vdSym;
+    for (std::size_t i = 1; i < L.model.symbols().size(); ++i) {
+        if (L.model.symbols()[i].name == "f_vd") {
+            vdSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+    }
+    ASSERT_TRUE(vdSym.valid());
+    MirFuncId vdFn;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        if (m.funcSymbol(m.funcAt(i)) == vdSym) vdFn = m.funcAt(i);
+    }
+    ASSERT_TRUE(vdFn.valid());
+    EXPECT_EQ(m.funcVisibility(vdFn), SymbolVisibility::Default)
+        << "the row's VALUE must arrive as Default — a typo naming another facet "
+           "would flip this while leaving every diagnostic count at zero";
+    EXPECT_EQ(m.funcBinding(vdFn), SymbolBinding::Global)
+        << "the visibility fold must not disturb the binding axis";
+    EXPECT_TRUE(isExternallyVisible(m.funcBinding(vdFn), m.funcVisibility(vdFn)))
+        << "Global+Default is what all three linkers consume as `exported`; a "
+           "Hidden here would hand DCE a licence to delete an exported symbol";
+
+    // The OBJECT form, through the dense MirGlobal field.
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_EQ(m.globalVisibility(g), SymbolVisibility::Default);
+    EXPECT_TRUE(
+        isExternallyVisible(m.globalBinding(g), m.globalVisibility(g)));
 }
 
 // FC7 C3 (AAPCS64/Apple x8 sret) — N-3 host-independent MIR pin. A >16-byte struct
@@ -11617,7 +12184,8 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     &hir->returnsTwiceMap,    // FC17.9(c) (D-CSUBSET-SETJMP)
                                     &hir->noInlineMap,        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
                                     &hir->alwaysInlineMap,  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
-                                    &hir->noOptimizeMap);  // TF-C85 (#pragma optimize)
+                                    &hir->noOptimizeMap,  // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);  // TF-C92 (no_sanitize_thread)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

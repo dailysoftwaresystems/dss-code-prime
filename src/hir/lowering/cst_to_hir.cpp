@@ -244,6 +244,15 @@ struct Lowerer {
     // reason its two neighbours are: a flag arriving from only two of three
     // sites is a shape-dependent gap no single test would localize.
     std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noOptimizeAcc;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same accumulator, a FIFTH axis
+    // over — (FUNCTION decl HIR node → NoSanitizeThreadAttr) pairs from the bound
+    // symbol's `SymbolRecord.isNoSanitizeThread`, applied to the result's
+    // HirNoSanitizeThreadMap after finish(). Recorded at ALL THREE Function
+    // lowering sites for its neighbours' reason: a flag arriving from only two of
+    // three sites is a shape-dependent gap no single test would localize — and for
+    // THIS axis that risk is sharper, because nothing in the emitted binary
+    // changes, so an intermittent miss has no behavioural symptom at all.
+    std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& noSanitizeThreadAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
     // ThreadLocalAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
@@ -1072,6 +1081,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, NoInlineAttr>>& noinl,
             std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwinl,
             std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noopt,
+            std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& nosanthr,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
@@ -1083,6 +1093,7 @@ struct Lowerer {
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
           alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
+          noSanitizeThreadAcc(nosanthr),
           threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
@@ -1728,6 +1739,18 @@ struct Lowerer {
         if (rec != nullptr && rec->isNoOptimize)
             noOptimizeAcc.push_back(
                 {node, NoOptimizeAttr{/*isNoOptimize=*/true}});
+    }
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same shape a fifth time — record
+    // the thread-sanitizer exclusion for a lowered Function node from its bound
+    // symbol's `SymbolRecord.isNoSanitizeThread` (sparse: only annotated functions
+    // are stored; absence ⇒ no recorded exclusion, which is every function before
+    // TF-C92).
+    void recordNoSanitizeThread(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isNoSanitizeThread)
+            noSanitizeThreadAcc.push_back(
+                {node, NoSanitizeThreadAttr{/*isNoSanitizeThread=*/true}});
     }
     // Record const-ness for a lowered Global node from its bound symbol's
     // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
@@ -9014,6 +9037,7 @@ struct Lowerer {
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
         return fn_;
     }
 
@@ -9343,6 +9367,7 @@ struct Lowerer {
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
         return fn_;
     }
 
@@ -9637,6 +9662,7 @@ struct Lowerer {
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
         return fn_;
     }
 
@@ -9793,6 +9819,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     std::vector<std::pair<HirNodeId, AlwaysInlineAttr>> alwaysInlineAcc;
     // TF-C85: the `#pragma optimize("", off)` region flag accumulator.
     std::vector<std::pair<HirNodeId, NoOptimizeAttr>> noOptimizeAcc;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): shared (Function decl node →
+    // NoSanitizeThreadAttr) accumulator, moved onto result->noSanitizeThreadMap
+    // after finish().
+    std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>> noSanitizeThreadAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
@@ -9827,6 +9857,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
+            noSanitizeThreadAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
@@ -9909,6 +9940,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->alwaysInlineMap.set(id, attr);
     for (auto& [id, attr] : noOptimizeAcc)     // TF-C85 (#pragma optimize)
         result->noOptimizeMap.set(id, attr);
+    for (auto& [id, attr] : noSanitizeThreadAcc)   // TF-C92 (no_sanitize_thread)
+        result->noSanitizeThreadMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1

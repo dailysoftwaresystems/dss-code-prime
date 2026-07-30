@@ -319,6 +319,16 @@ lowerToMir(Hir const&               hir,
            // outside every region and the behavior before this key existed.
            // Read here to stamp `MirFunc.noOptimize`. Keyed on the same
            // declaration node as the three maps above and read at the same site.
-           HirNoOptimizeMap const*  noOptimizeMap = nullptr);
+           HirNoOptimizeMap const*  noOptimizeMap = nullptr,
+           // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): per-FUNCTION-DECLARATION
+           // thread-sanitizer EXCLUSION side-table, populated by the CST→HIR
+           // lowerer from each function's bound symbol
+           // `SymbolRecord.isNoSanitizeThread`. Optional: nullptr (or a decl with
+           // no entry) ⇒ no recorded exclusion, which is both the correct reading
+           // of an un-annotated C function and the behavior before this key
+           // existed. Read here to stamp `MirFunc.noSanitizeThread`, which
+           // `mir_text` surfaces as `nosanitizethread`. Keyed on the same
+           // declaration node as the four maps above and read at the same site.
+           HirNoSanitizeThreadMap const* noSanitizeThreadMap = nullptr);
 
 } // namespace dss

@@ -97,6 +97,15 @@ struct Lowerer {
                                            // `#pragma optimize("", off)` region
                                            // (TF-C85). nullptr / no entry ⇒
                                            // optimize normally.
+    HirNoSanitizeThreadMap const* noSanitizeThreadMap;  // optional — native-
+                                           // FUNCTION thread-sanitizer EXCLUSION.
+                                           // nullptr / no entry ⇒ no recorded
+                                           // exclusion.
+                                           // TF-C92, D-CSUBSET-NO-SANITIZE-THREAD
+                                           // (kept on ONE line: a wrapped anchor
+                                           // name is invisible to the guard's
+                                           // whole-token regex and reads as a
+                                           // second, unresolvable anchor).
     HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
                                            // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
                                            // nullptr / no entry ⇒ mutable.
@@ -10344,8 +10353,18 @@ struct Lowerer {
         if (noOptimizeMap != nullptr)
             if (auto const* p = noOptimizeMap->tryGet(node))
                 noOptimize = p->isNoOptimize;
+        // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): THE FOURTH MINT SITE — the one
+        // place the source-declared `no_sanitize_thread` enters MIR, read from the
+        // SAME declaration node as the four attributes above so all five travel
+        // together. Everything downstream only COPIES this bit. ★ If this read is
+        // missing the ENTIRE feature is dead with no other symptom: no pass
+        // consumes the flag, so nothing but the MIR-text pins would notice.
+        bool noSanitizeThread = false;
+        if (noSanitizeThreadMap != nullptr)
+            if (auto const* p = noSanitizeThreadMap->tryGet(node))
+                noSanitizeThread = p->isNoSanitizeThread;
         mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
-                        alwaysInline, noOptimize);
+                        alwaysInline, noOptimize, noSanitizeThread);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
@@ -11930,7 +11949,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirReturnsTwiceMap const* returnsTwiceMap,
                           HirNoInlineMap const*    noInlineMap,
                           HirAlwaysInlineMap const* alwaysInlineMap,
-                          HirNoOptimizeMap const*  noOptimizeMap) {
+                          HirNoOptimizeMap const*  noOptimizeMap,
+                          HirNoSanitizeThreadMap const* noSanitizeThreadMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -11948,6 +11968,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .noInlineMap = noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
         .alwaysInlineMap = alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         .noOptimizeMap = noOptimizeMap,       // TF-C85 (#pragma optimize region)
+        .noSanitizeThreadMap = noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
         .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)

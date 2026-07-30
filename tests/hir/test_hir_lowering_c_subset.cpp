@@ -2426,6 +2426,283 @@ TEST(HirLoweringCSubset, SingleStringLinkageArgResolvesHiddenVisibility) {
     EXPECT_EQ(res->linkageMap.get(f).binding, SymbolBinding::Global);
 }
 
+// ── TF-C92 (D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS):
+//    the `visibility:default` twin of the row above ────────────────────────────
+//
+// ★★ WHAT THESE PINS DO **NOT** CLAIM, STATED FIRST BECAUSE THE OBVIOUS PIN HERE
+// IS WRONG. An earlier draft of this cycle justified `visibility:default` by
+// claiming that `visibility("hidden")` followed by `visibility("default")` must
+// WIDEN back to Default, and proposed that widening as the red-on-disable
+// witness. MEASURED with the host `/usr/bin/clang -Wall -Wextra`, BOTH orders:
+// clang REJECTS two conflicting visibility attributes on one declaration as a
+// HARD ERROR (`error: visibility does not match previous declaration`) and emits
+// no object; GCC is documented to warn and keep the EARLIER one. DSS's plain
+// last-wins fold is NEITHER — a silent divergence, tracked as
+// D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS — so pinning the
+// widening would have enshrined a divergence as this row's contract. There is
+// deliberately NO conflicting-visibility test here.
+//
+// ★ WHAT IS PINNED INSTEAD, AND WHY IT IS THE HONEST FACT. `Default` IS
+// `recordLinkage`'s unspecified state (Global+Default stores NOTHING in the
+// sparse side-table), so on a non-conflicting declaration this row is
+// VALUE-NEUTRAL by construction: its job is to make legal C **compile** with the
+// fact threaded, not to change bytes. So the observable contract is exactly two
+// things — (1) ZERO H_UnknownLinkageSpecifier in BOTH declaration positions, and
+// (2) the visibility that is APPLIED is Default and not some other facet. (2)
+// needs a side-table entry to read, and Global+Default has none, so it is read
+// off a declaration that carries a co-present `weak` (binding Weak ⇒ the row IS
+// stored) — which additionally witnesses that the visibility fold does not
+// clobber the binding axis.
+//
+// PROVENANCE: this arrives from Tcl, not sqlite — tcl.h:210
+// `#define DLLEXPORT __attribute__((visibility("default")))` under
+// `__GNUC__ > 3`, reaching tclsqlite-ex.c through TCL_STORAGE_CLASS/EXTERN.
+
+// (1) `topLevelDecl` position — the plain and function forms both lower CLEAN.
+TEST(HirLoweringCSubset, VisibilityDefaultTopLevelDeclLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((visibility(\"default\"))) int g_vd = 7;\n"
+        "__attribute__((visibility(\"default\"))) int f_vd(int v) "
+        "{ return v + 1; }\n"
+        "int main(void){ return f_vd(g_vd); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`visibility(\"default\")` is ordinary legal C in both the object and "
+           "the function form — delete the topLevelDecl row and this is H000C";
+    // The sparse side-table has NOTHING for Global+Default — asserted, not
+    // assumed, so nobody later reads an absent entry as a dropped facet.
+    HirNodeId const f = functionNamed(res->hir, model, "f_vd");
+    ASSERT_TRUE(f.valid());
+    EXPECT_FALSE(res->linkageMap.has(f))
+        << "Global+Default is recordLinkage's unspecified state — an entry here "
+           "would mean the sparsity contract changed, and the APPLIED-fact pin "
+           "below (and MirLoweringCSubsetLinkage.VisibilityDefaultAppliesDefault"
+           "Visibility) would need rewriting";
+}
+
+// (2) the APPLIED FACT — read off a decl whose co-present `weak` forces the
+// sparse row to exist. Default, not Hidden/Protected: a config typo in the row's
+// VALUE turns this red where a diagnostic count alone stays green.
+TEST(HirLoweringCSubset, VisibilityDefaultAppliesDefaultVisibilityBesideWeak) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((weak, visibility(\"default\"))) int f_wd(int v) "
+        "{ return v + 1; }\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    HirNodeId const f = functionNamed(res->hir, model, "f_wd");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "the co-present `weak` is a NON-default binding, so the sparse row "
+           "must exist — without it there is nothing to read the visibility off";
+    EXPECT_EQ(res->linkageMap.get(f).visibility, SymbolVisibility::Default)
+        << "the row's VALUE must be `default`, not another facet";
+    EXPECT_EQ(res->linkageMap.get(f).binding, SymbolBinding::Weak)
+        << "the visibility fold must not clobber the binding axis";
+}
+
+// (3) `externDecl` position — a DIFFERENT scan root with its own
+// `linkageSpecifiers` map, and THE one Tcl actually reaches (tcl.h:306
+// `#define EXTERN extern TCL_STORAGE_CLASS` puts the attribute AFTER `extern`,
+// into `externSpecifiers`' TF-C77 repeat rather than `declSpecifiers`).
+TEST(HirLoweringCSubset, VisibilityDefaultExternDeclLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "extern __attribute__((visibility(\"default\"))) int g_ed;\n"
+        "extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
+        "int main(void){ return f_ed(g_ed); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "the externDecl row is independently regressable — deleting IT while "
+           "leaving the topLevelDecl twin leaves this form H000C";
+}
+
+// (4) THE DUNDER SPELLING IS **NOT** MATCHED — pinned as the TRUE behaviour, not
+// as the desirable one, because the alternative is leaving a loud refusal
+// undocumented until someone "fixes" it by widening the wrong surface.
+//
+// WHY, from the code: `linkageFrom` (cst_to_hir.cpp) applies `stripDunder` to
+// exactly ONE surface — the `linkageSpecifierIgnoredNames` membership test — and
+// the strict `linkageSpecifiers` lookup then runs on the RAW token text. So the
+// composite pairing assembles `__visibility__:default`, which is not a key in
+// either map, and the fail-loud fall-through reports it. The `effects` table for
+// attribute SEMANTICS is dunder-normalized; the linkage map is not, and the
+// config's own `$comment` on the `no_sanitize_thread` row states that asymmetry
+// as the reason a honored spelling belongs in `effects` rather than here.
+//
+// This is a VOCABULARY-COMPLETENESS limit, not a silent drop: `visibility:hidden`
+// has carried the identical limit since FC4 c1. Closing it means either two more
+// keys per value or dunder-normalizing the lookup — a mechanism change with its
+// own design. Real headers reaching DSS today (tcl.h:210, sqlite) write the bare
+// spelling, so the loud refusal is the correct residue.
+TEST(HirLoweringCSubset, VisibilityDefaultDunderSpellingIsRefusedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((__visibility__(\"default\"))) int g_dd = 7;\n"
+        "int main(void){ return g_dd - 7; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "the raw-key lookup cannot see through the dunder — and it must FAIL "
+           "LOUD rather than silently discard the visibility request";
+    EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
+                  .find("__visibility__:default"),
+              std::string::npos)
+        << "the message must name the COMPOSITE key actually looked up, so the "
+           "reader can see that the pairing worked and only the key missed";
+}
+
+namespace {
+// H_UnknownLinkageSpecifier count from lowering `src` under a c-subset schema in
+// which the Nth (1-based, file order) `visibility:default` row of
+// `semantics.declarations[*].linkageSpecifiers` has been DISABLED — row 1 is
+// `topLevelDecl`, row 2 is `externDecl`.
+//
+// The row is disabled by RENAMING ITS KEY to a spelling no source token can
+// produce, which is behaviourally identical to deleting it (the lookup is by raw
+// key) while keeping the JSON structurally valid — no trailing-comma surgery, and
+// no chance of a malformed-config false green. Surgical textual swap on the
+// shipped text, the `shiftResultKind` shape.
+//
+// The quoted key occurs EXACTLY TWICE in the shipped file (verified): the two
+// `$visibilityDefaultComment` prose blocks spell it in BACKTICKS, so the search
+// cannot land in a comment. The count-mismatch guard below makes a future third
+// row a loud test failure rather than a silently mis-aimed perturbation.
+[[nodiscard]] std::size_t unknownLinkageWithDefaultRowDisabled(
+    std::string const& src, int nth) {
+    constexpr auto kBad = static_cast<std::size_t>(-1);
+    std::string text = shippedCSubsetText();
+    std::string const needle = "\"visibility:default\"";
+    std::size_t pos = std::string::npos;
+    std::size_t from = 0;
+    for (int i = 0; i < nth; ++i) {
+        pos = text.find(needle, from);
+        if (pos == std::string::npos) {
+            ADD_FAILURE() << "shipped c-subset carries fewer than " << nth
+                          << " `visibility:default` rows — this lever is stale";
+            return kBad;
+        }
+        from = pos + needle.size();
+    }
+    text.replace(pos, needle.size(), "\"visibility:default__UNREACHABLE\"");
+    auto schema = GrammarSchema::loadFromText(
+        text, "<visibility-default-row-" + std::to_string(nth) + "-disabled>");
+    if (!schema) {
+        ADD_FAILURE() << "perturbed schema failed to load (row " << nth << ")";
+        return kBad;
+    }
+    UnitBuilder builder{*schema};
+    builder.addInMemory(src, "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu);
+    if (model.hasErrors()) {
+        ADD_FAILURE() << "front-end errors under the perturbed schema (row "
+                      << nth << ")";
+        return kBad;
+    }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    return countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+}
+} // namespace
+
+// (5) THE TWO ROWS ARE INDEPENDENTLY LOAD-BEARING — the red-on-disable lever run
+// BY THE SUITE rather than claimed in prose. Disabling row N must break the form
+// that routes through root N and leave the OTHER form clean; that cross-check is
+// what proves the two scan roots really do consult separate maps (a single shared
+// map would make both forms go red on either perturbation, and one deleted row
+// would then look harmless).
+TEST(HirLoweringCSubset, VisibilityDefaultRowsAreIndependentlyLoadBearing) {
+    std::string const topLevelSrc =
+        "__attribute__((visibility(\"default\"))) int g_vd = 7;\n"
+        "__attribute__((visibility(\"default\"))) int f_vd(int v) "
+        "{ return v + 1; }\n"
+        "int main(void){ return f_vd(g_vd); }\n";
+    std::string const externSrc =
+        "extern __attribute__((visibility(\"default\"))) int g_ed;\n"
+        "extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
+        "int main(void){ return f_ed(g_ed); }\n";
+
+    // Row 1 = topLevelDecl: both attributed top-level declarations go loud.
+    EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(topLevelSrc, 1), 2u)
+        << "one H000C per attributed topLevelDecl once the row is unreachable";
+    EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(externSrc, 1), 0u)
+        << "the externDecl form must NOT depend on the topLevelDecl row";
+
+    // Row 2 = externDecl: the mirror image.
+    EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(externSrc, 2), 2u)
+        << "one H000C per attributed externDecl once the row is unreachable";
+    EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(topLevelSrc, 2), 0u)
+        << "the topLevelDecl form must NOT depend on the externDecl row";
+}
+
+// ── TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the STRING-ARGUMENT spelling
+//    `no_sanitize("thread")` is REFUSED LOUD ────────────────────────────────────
+//
+// DSS honors the bare GNU `no_sanitize_thread` (an `attributeSemantics` effect
+// that reaches MirFunc.noSanitizeThread and prints as `nosanitizethread` in
+// `.dssir`). The clang-style STRING form is a different clause name entirely:
+// `linkageFrom`'s by-NAME skip runs on the bare dunder-stripped identifier
+// (`no_sanitize`) BEFORE the composite pairing, and `no_sanitize` is in NEITHER
+// `linkageSpecifierIgnoredNames` list — so the pairing assembles the composite
+// key `no_sanitize:<arg>`, the strict lookup misses, and H000C fires. sqlite
+// writes only the bare spelling (src/wal.c:932), so the loud refusal is the
+// correct residue and not a gap.
+//
+// ★★ WHY THIS PIN EXISTS AT ALL: THE WRONG FIX IS A ONE-TOKEN EDIT. Adding
+// `no_sanitize` to either `linkageSpecifierIgnoredNames` array would make
+// `no_sanitize("thread")`, `("address")` and `("undefined")` ALL silently
+// accepted-and-discarded — a sanitizer exclusion the source asked for and DSS
+// threw away, with no diagnostic anywhere. The config loader's attribute-
+// vocabulary cross-check constrains effects→names only, never the inverse, so
+// NOTHING else in the suite goes red on that edit. These two pins are the whole
+// wall. The ARGUMENT is asserted (not just the count) because every unrecognized
+// key shares one DiagnosticCode: a count-only pin cannot tell "refused the
+// string form" from "refused the clause name and dropped the argument".
+TEST(HirLoweringCSubset, NoSanitizeStringArgumentFormIsRefusedLoud) {
+    struct Case {
+        char const* arg;
+        char const* compositeKey;
+    };
+    // `("thread")` is the one a reader would expect DSS to honor (it names the
+    // same sanitizer as the bare spelling DSS DOES honor) — so it is the shape
+    // most likely to be "fixed" by an ignore-list entry. `("address")` is the
+    // collateral: it names a sanitizer with no DSS spelling at all, and would be
+    // swallowed by the same one-token edit.
+    for (Case const& c : {Case{"thread", "no_sanitize:thread"},
+                          Case{"address", "no_sanitize:address"}}) {
+        SemanticModel model = analyzeCSubset(
+            std::string{"static __attribute__((no_sanitize(\""} + c.arg
+            + "\"))) int f(int k){ return k + 1; }\n"
+              "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << "setup: the string form parses and analyzes cleanly — the "
+               "refusal is at lowering, not at parse/semantic (arg=" << c.arg
+            << ")";
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        (void)res;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+            << "exactly one refusal — one clause, one wall (arg=" << c.arg << ")";
+        EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
+                      .find(c.compositeKey),
+                  std::string::npos)
+            << "the message must name the COMPOSITE key `" << c.compositeKey
+            << "`, which is what proves the string ARGUMENT reached the lookup "
+               "instead of being dropped off a bare `no_sanitize`";
+    }
+}
+
 // (The `static __attribute__((deprecated))` no-clobber pin — the co-present
 // `static` keeping its INTERNAL binding — lives at the MIR tier where the
 // binding is observable: MirLoweringCSubsetLinkage

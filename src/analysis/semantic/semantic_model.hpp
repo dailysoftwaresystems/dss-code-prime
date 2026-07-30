@@ -350,6 +350,36 @@ struct DSS_EXPORT SymbolRecord {
     // S_ConflictingInlineAttributes, so both bits are never set together on a
     // record that survives semantic analysis. Default false.
     bool            isAlwaysInline = false;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): TRUE iff this FUNCTION symbol is
+    // declared `__attribute__((no_sanitize_thread))` (GNU; no C11/C23 standard
+    // spelling). The structural twin of `isNoInline` above — set at Pass-1.5
+    // declarator resolution from the `attributeSemantics` table's
+    // `noSanitizeThread` effect verb (never a hardcoded name test), FnSig-gated,
+    // OR-merged across a proto/definition pair by the post-1.5 `mergedFnDecls`
+    // sweep, projected onto `HirNoSanitizeThreadMap` and stamped onto
+    // `MirFunc.noSanitizeThread`.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY AND WITHOUT INVENTING A CONSUMER: the fact
+    // is RECORDED and stays queryable through the whole tier stack, surfacing in
+    // `.dssir` MIR text as the `nosanitizethread` function attribute. DSS has NO
+    // sanitizer — MEASURED, `grep -rni sanitiz src/` returns nothing — so there is
+    // no instrumentation pass for the flag to switch off today, and this record is
+    // deliberately NOT described as suppressing one. It exists so the day such a
+    // pass lands it has a per-function input instead of a discarded attribute.
+    //
+    // ★ WHY OR-MERGED LIKE `isNoInline` AND NOT PER-DECLARATION LIKE
+    // `isNoOptimize`: this is an ATTRIBUTE ON THE DECLARATION, not a lexical
+    // preprocessor region, so the ordinary C shape — annotate the prototype in a
+    // header, define plainly in the .c — must reach the DEFINITION's symbol,
+    // which is the one HIR→MIR stamps from. (sqlite's own two sites annotate the
+    // definition directly, so the merge is not what makes sqlite work; it is what
+    // makes the glibc-style split work.)
+    //
+    // ★ NOT MUTUALLY EXCLUSIVE WITH ANYTHING. Unlike the inline pair above there
+    // is no contradicting partner attribute to gate — `no_sanitize_thread`
+    // composes freely with `noinline`, `always_inline` and the pragma-borne
+    // `isNoOptimize`. Default false.
+    bool            isNoSanitizeThread = false;
     // ★★ TF-C85: TRUE iff this FUNCTION symbol's declaration sits inside an MSVC
     // `#pragma optimize("", off)` region. Its two neighbours above come from an
     // ATTRIBUTE on the declaration; this one comes from a LEXICALLY SCOPED

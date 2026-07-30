@@ -174,10 +174,22 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // reason — the merged/rebuilt module is what the NEXT pass sees, so a flag
     // cleared here would let iteration 2 start optimizing a function the source
     // excluded.
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): `funcNoSanitizeThread` rides along
+    // too, and ★ ITS PIN IS THE MOST LOAD-BEARING OF THE FOUR, not the least.
+    // The other three flags each reach a consumer whose OUTPUT changes when the
+    // flag is lost (a splice that happens, a threshold that re-applies, a function
+    // that gets optimized), so at least one end-to-end fixture can in principle go
+    // red. This flag reaches NO pass at all — DSS ships no sanitizer — so dropping
+    // this argument changes NOTHING observable anywhere in the pipeline except the
+    // `.dssir` text of a module that has been rebuilt. There is no end-to-end
+    // witness to fall back on, by construction: `MirRebuildHelper.
+    // RebuildFunctionPreservesNoSanitizeThread` is the ONLY thing standing between
+    // this argument and silent deletion.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
                      src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
                      src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn),
-                     src_.funcNoOptimize(oldFn));
+                     src_.funcNoOptimize(oldFn),
+                     src_.funcNoSanitizeThread(oldFn));
 
     // ★★ TF-C85 (D-OPT-NOOPTIMIZE-NEUTERS-POLICY): THE per-function optimizer
     // opt-out, applied at the ONE shared chokepoint under all 8 rebuild passes.

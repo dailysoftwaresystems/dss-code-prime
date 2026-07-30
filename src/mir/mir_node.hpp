@@ -330,10 +330,47 @@ struct MirFunc {
     // Takes one more byte from the tail; MEASURED (mir_node's own padding note)
     // sizeof goes 24 → 28 and the `<= 32` static_assert below still holds.
     bool             noOptimize = false;                     // 1
-    // NOTE (TF-C81, amended TF-C85): there is deliberately NO `_pad` member. The
-    // five 1-byte fields above (binding, visibility, noInline, alwaysInline,
-    // noOptimize) sit in the tail slot, so explicit padding would be a lie about
-    // the layout rather than documentation of it.
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the source declared this function
+    // `__attribute__((no_sanitize_thread))` — it is EXCLUDED from thread-sanitizer
+    // instrumentation. Reaches here by the route its `noInline`/`alwaysInline`
+    // neighbours take, hop for hop: source → SymbolRecord.isNoSanitizeThread →
+    // HirNoSanitizeThreadMap → this bit.
+    //
+    // ★★ ITS CONSUMER IS THE SERIALIZER, NOT A PASS — AND THAT IS THE WHOLE
+    // HONEST CLAIM. MEASURED: `grep -rni sanitiz src/` has ZERO hits. DSS ships no
+    // sanitizer, no instrumentation pass and no `-fsanitize` surface, so there is
+    // nothing here for this bit to switch off. What it DOES is be observable:
+    // `mir_text`'s `appendFuncAttrs` prints it as `nosanitizethread` and
+    // `parseFunction` reads it back, so the per-function fact is queryable in the
+    // `.dssir` a user can dump and survives a round trip. Do not rewrite this
+    // comment to imply a pass reads it until one does.
+    //
+    // ★ WHY CARRY IT AT ALL: an ignore-list entry would have discarded the fact
+    // three tiers earlier, and the day an instrumentation pass lands it would have
+    // to re-derive from source what the front-end already parsed
+    // ([[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]]). sqlite's `SQLITE_NO_TSAN`
+    // (wal.c:932) marks the two wal-index header functions whose races are
+    // DELIBERATE and benign — a fact about the program's concurrency contract, not
+    // a performance hint, which is exactly the kind a compiler should not silently
+    // forget.
+    //
+    // ★ DIRECTION OF A DROPPED FLAG: `alwaysInline`'s, not `noInline`'s — nothing
+    // reads it, so a lost `true` cannot make a wrong program, only an unrecorded
+    // directive. Carried through every MirFunc creation/copy/rebuild/serialize path
+    // regardless, on TF-C81's MEASURED ground that a half-landed flag and no flag
+    // are indistinguishable downstream. ★ AND FOR THIS AXIS THERE IS NO END-TO-END
+    // BEHAVIOURAL WITNESS AT ALL (no codegen difference exists to observe), so each
+    // propagation hop needs its own direct assertion — the MIR-text and rebuild
+    // pins are not the best evidence, they are the ONLY evidence.
+    //
+    // Takes one more byte from the tail; MEASURED (see the padding-budget note
+    // below, re-measured at TF-C92) sizeof stays 28 and the `<= 32` static_assert
+    // holds with room to spare.
+    bool             noSanitizeThread = false;                // 1
+    // NOTE (TF-C81, amended TF-C85 and TF-C92): there is deliberately NO `_pad`
+    // member. The six 1-byte fields above (binding, visibility, noInline,
+    // alwaysInline, noOptimize, noSanitizeThread) sit in the tail slot, so explicit
+    // padding would be a lie about the layout rather than documentation of it.
     //
     // ★ PADDING BUDGET — MEASURED (TF-C82), replacing a WRONG prediction this
     // comment used to carry ("the next flag grows the struct 24 → 32; it should
@@ -346,9 +383,46 @@ struct MirFunc {
     // `<= 32` static_assert below STILL HOLDS; +9 flags → 36, the FIRST size
     // that breaches it. So there is room for eight more 1-byte flags, and a
     // re-introduced `_pad` would be padding to nothing until then.
+    // ★ Re-MEASURED AT TF-C92 (this cycle added the sixth flag,
+    // `noSanitizeThread`) with `/usr/bin/clang++ -std=c++23 -I src` on
+    // arm64-apple-darwin against the REAL header — not a replica:
+    // **sizeof 28, alignof 4**, unchanged by the addition. The TF-C82 numbers
+    // above are stated relative to the then-current FOUR-flag / 24-byte record, so
+    // they still read correctly; the closed form they describe is
+    // `size = roundUp4(20 + flagCount)`, which puts the ceiling at **12 flags
+    // (= 32)** and the first breach at 13 (= 36). At six flags that leaves room
+    // for SIX more before the static_assert below fails.
     // ★ Re-MEASURE before quoting these numbers again — a plausible-sounding
     // size claim went unchecked into this comment once already.
 };
+// ★★ TF-C92: the EXACT size + alignment, not only the ceiling. The `<= 32`
+// budget assert below has FOUR BYTES OF SLACK at the current 28, so it pinned
+// neither the measured size nor the 4-byte alignment the whole padding-budget
+// comment above rests on — and it would NOT have caught this cycle's added flag
+// (24 → 28 fits the ceiling silently). It is kept as the BUDGET statement (that
+// is what its message says) and joined by the two exact pins the comment's
+// arithmetic actually claims:
+//   • 28 = roundUp4(20 + 6 flags) — 20 bytes of {TypeId 0-7, blockStart 8-11,
+//     blockCount 12-15, symbol 16-19} plus six 1-byte flags at 20-25, rounded to
+//     the 4-byte alignment. MEASURED on arm64-apple-darwin with
+//     `/usr/bin/clang++ -std=c++23 -I src` against this real header via
+//     `offsetof`: signature 0, blockStart 8, blockCount 12, symbol 16,
+//     binding 20, visibility 21, noInline 22, alwaysInline 23, noOptimize 24,
+//     noSanitizeThread 25.
+//   • alignof 4, NOT 8 — `TypeId` is a two-`uint32_t` arena id, so the struct
+//     grows in 4-byte steps. Assuming 8 is the exact error that put a wrong size
+//     prediction into the comment above once already; pinning it stops the next
+//     reader from having to re-derive it.
+// A flag added WITHOUT updating these two lines is now a compile error naming the
+// new size, which is the moment to re-do the budget arithmetic rather than to
+// discover later that a stale comment was quoted.
+static_assert(sizeof(MirFunc) == 28,
+              "detail::MirFunc is 28 bytes (roundUp4(20 + 6 one-byte flags)) — "
+              "if you added a flag, re-measure and update the padding-budget "
+              "comment above along with this number");
+static_assert(alignof(MirFunc) == 4,
+              "detail::MirFunc is 4-byte aligned because TypeId is two uint32_t "
+              "— the whole padding budget above assumes 4-byte growth steps");
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);
 

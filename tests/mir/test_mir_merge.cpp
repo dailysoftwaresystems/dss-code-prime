@@ -1062,6 +1062,68 @@ TEST(MirMerge, MergePreservesFunctionNoOptimize) {
     EXPECT_EQ(plain, 1) << "and the plain function must not acquire the flag";
 }
 
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the SAME cross-CU copy hop for the
+// thread-sanitizer exclusion. The merged module is the artifact an N>1 build's
+// `.dssir` describes, so a flag dropped here means a per-function fact recorded in
+// CU A silently disappears at the link boundary — and because NO pass reads this
+// flag (MEASURED: `grep -rni sanitiz src/` is empty), nothing else in the suite
+// would notice. Single-CU builds stay correct, which is exactly what makes the
+// multi-CU loss invisible without this pin.
+//
+// RED-ON-DISABLE: drop the `src_.funcNoSanitizeThread(f)` argument at mir_merge.cpp's
+// addFunction (let the 8th parameter default to false) and the `flagged == 1`
+// expectation fails. The un-flagged sibling keeps the test from being satisfiable by
+// hardcoding true; `noOptimize` is asserted CLEAR on both records because it is the
+// IMMEDIATELY PRECEDING argument, so a one-position shift fails here too.
+TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32   = in0.primitive(TypeKind::I32);
+    TypeId const fnSig = in0.fnSig({}, i32, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // sym 500: noSanitizeThread ONLY — all three sibling flags deliberately
+        // clear, so a transposed/shifted argument at the copy site fails here.
+        mb.addFunction(fnSig, SymbolId{500}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*noInline=*/false,
+                       /*alwaysInline=*/false, /*noOptimize=*/false,
+                       /*noSanitizeThread=*/true);
+        MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b0);
+        mb.addReturn(mb.addConst(i32Lit(9), i32));
+        // sym 501: plain.
+        mb.addFunction(fnSig, SymbolId{501});
+        MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b1);
+        mb.addReturn(mb.addConst(i32Lit(10), i32));
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{500, "racy_ok"}, {501, "plain2"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleFuncCount(), 2u);
+    int flagged = 0, plain = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        MirFuncId const f = mm.funcAt(i);
+        if (mm.funcNoSanitizeThread(f)) ++flagged; else ++plain;
+        EXPECT_FALSE(mm.funcNoOptimize(f))
+            << "neither source function is nooptimize — a one-position argument "
+               "shift at the merge copy site would land the flag here";
+        EXPECT_FALSE(mm.funcNoInline(f));
+        EXPECT_FALSE(mm.funcAlwaysInline(f));
+    }
+    EXPECT_EQ(flagged, 1)
+        << "the thread-sanitizer exclusion must survive the cross-CU merge, or a "
+           "fact recorded in one CU vanishes at link with no other symptom";
+    EXPECT_EQ(plain, 1) << "and the plain function must not acquire the flag";
+}
+
 TEST(MirMerge, MergePreservesGlobalConstness) {
     TypeInterner in0{CompilationUnitId{1}};
     TypeId const i32 = in0.primitive(TypeKind::I32);
