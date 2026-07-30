@@ -1938,6 +1938,15 @@ TEST(X86VariableEncoder, XchgMem64EmitsRexWSeqCstStore) {
     EXPECT_EQ(bytes[6], 0x00);
 }
 
+TEST(X86VariableEncoder, AtomicFenceSeqCstEmits0F_AE_F0) {
+    // D-CSUBSET-ATOMIC-FENCE (__sync_synchronize): MFENCE — the STANDALONE
+    // seq_cst fence, distinct from the fused store_seqcst XCHG above. 0F AE F0,
+    // MEASURED via clang -c -arch x86_64 + otool -t on `__sync_synchronize()`
+    // (2026-07-30, this machine). Zero operands, no ModR/M, no REX — a fixed
+    // 3-byte instruction (the CQO/xor_rdx_zero zero-operand shape).
+    expectDivBytes("atomic_fence_seqcst", std::nullopt, {0x0F, 0xAE, 0xF0});
+}
+
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
     // `mov [r12 + 0x10], rax` → 49 89 44 24 10 00 00 00
     // r12 is rsp-family in REX-extended space.

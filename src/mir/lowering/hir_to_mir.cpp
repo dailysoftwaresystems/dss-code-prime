@@ -2810,6 +2810,26 @@ struct Lowerer {
                                            foldAtomicOrder(kids[2]),
                                            MirInstFlags::None);
                     }
+                    case BuiltinLowering::AtomicFence: {
+                        // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER:
+                        // __sync_synchronize() → AtomicFence(payload=seq_cst). The builtin takes NO arguments and IS the
+                        // strongest fence by definition (GCC __sync builtins are
+                        // full barriers), so the order is const-baked at 5 —
+                        // there is no order argument to fold. R::None ⇒
+                        // InvalidType (the CompilerBarrier/Store convention).
+                        // Unlike Barrier below (zero instructions), this op
+                        // survives to mir_to_lir and emits a REAL fence
+                        // instruction (x86 MFENCE, arm64 DMB ISH).
+                        if (!operands.empty()) {
+                            unsupported(node,
+                                "__sync_synchronize expects exactly 0 args");
+                            return InvalidMirInst;
+                        }
+                        return mir.addInst(MirOpcode::AtomicFence, operands,
+                                           InvalidType,
+                                           /*payload=*/kAtomicOrderSeqCst,
+                                           MirInstFlags::None);
+                    }
                     case BuiltinLowering::Barrier:
                         // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
                         // a 0-operand, void, side-effecting compiler fence

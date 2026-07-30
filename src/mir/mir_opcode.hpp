@@ -85,6 +85,17 @@ enum class MirOpcode : std::uint16_t {
     // Load/Store is reordered ACROSS it. A pure compile-time ordering
     // constraint -- identical on every target/format.
     CompilerBarrier,
+    // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER: __sync_synchronize
+    // -- a standalone CPU memory fence (a C11 atomic_thread_fence in MIR terms).
+    // ZERO operands, NO result (R::None); the C11 memory_order rides `payload`
+    // (the AtomicLoad/AtomicStore 0..5 encoding -- __sync_synchronize is always
+    // seq_cst=5). Unlike CompilerBarrier (zero instructions), this emits a REAL
+    // fence instruction (x86 MFENCE, arm64 DMB ISH). hasSideEffects=TRUE (DCE
+    // keeps it, CSE/LICM never move IT) AND in the `opcodeClobbersMemory`
+    // positive list (no Load/Store is reordered ACROSS it) -- omitting the
+    // clobber membership would let CSE/LICM silently move memory ops across
+    // the fence, the exact miscompile the op exists to forbid.
+    AtomicFence,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -387,6 +398,11 @@ struct MirOpcodeInfo {
         // CSE'd/hoisted) + in the opcodeClobbersMemory list (a fence to
         // Load/Store motion across it). Lowers to ZERO instructions.
         case MirOpcode::CompilerBarrier: return {0, 0, 0, 0, R::None, false, true, false, "compiler_barrier"};
+        // D-CSUBSET-ATOMIC-FENCE: 0 operands, NO result (R::None), side-effecting
+        // (never DCE'd, never CSE'd/hoisted) + in the opcodeClobbersMemory list.
+        // Unlike CompilerBarrier it lowers to a REAL fence instruction; the C11
+        // memory_order rides `payload` (seq_cst=5, the sole shipped producer).
+        case MirOpcode::AtomicFence: return {0, 0, 0, 0, R::None, false, true, false, "atomic_fence"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};
@@ -644,6 +660,12 @@ struct MirOpcodeInfo {
         case MirOpcode::AtomicLoad:
         case MirOpcode::AtomicStore:
         case MirOpcode::CompilerBarrier:
+        // D-CSUBSET-ATOMIC-FENCE: a standalone CPU fence (__sync_synchronize) is
+        // a full ordering barrier -- no Load/Store may be reordered across it.
+        // ★ Membership HERE is the op's entire optimizer contract: without it
+        // CSE/LICM would move memory ops across the fence, SILENTLY (pinned by
+        // test_mir_alias's AtomicFence region-walk clobber test).
+        case MirOpcode::AtomicFence:
         // c115 SEH region boundaries: memory state must be exactly ordered at
         // SehTryBegin (the filter/handler observe fault-time memory — pre-try
         // loads may not be forwarded past it) and SehTryEnd. SehFilterReturn is

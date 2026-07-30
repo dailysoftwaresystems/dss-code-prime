@@ -982,6 +982,17 @@ enum class BuiltinLowering : std::uint16_t {
     ComplexReal,
     ComplexImag,
     ComplexConj,
+    // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER: __sync_synchronize
+    // — the GCC full CPU memory barrier (sqlite mutex_unix.c's memory-barrier
+    // path). Maps to the dedicated MirOpcode::AtomicFence at hir_to_mir with the
+    // C11 seq_cst order (5) const-baked into MirInst.payload — the builtin takes
+    // no order argument and is DEFINED as the strongest fence. Unlike Barrier
+    // (_ReadWriteBarrier, zero instructions) this emits a REAL fence instruction
+    // (x86 MFENCE, arm64 DMB ISH). APPENDED (not grouped by Barrier) so every
+    // pre-existing enumerator keeps its integer value — the BuiltinCall payload
+    // prints numerically in `.dsshir` text (the AtomicLoad/Store + ComplexConj
+    // numeric-stability precedent).
+    AtomicFence,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -994,6 +1005,8 @@ builtinLoweringFromName(std::string_view name) noexcept {
     // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
     if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
     if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
+    // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — the standalone seq_cst fence.
+    if (name == "atomic_fence") { return BuiltinLowering::AtomicFence; }
     // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
     if (name == "complex_make") { return BuiltinLowering::ComplexMake; }
     if (name == "complex_real") { return BuiltinLowering::ComplexReal; }

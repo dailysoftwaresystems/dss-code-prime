@@ -735,6 +735,25 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): DMB ISH — the STANDALONE seq_cst CPU fence MIR AtomicFence (__sync_synchronize) lowers to. 0xD5033BBF (3573758911), MEASURED via clang -c -arch arm64 + otool -t on `__sync_synchronize()` (this machine, 2026-07-30); cross-checked against the acquire-only `__atomic_thread_fence(__ATOMIC_ACQUIRE)` = dmb ishld 0xD50339BF — the two differ in exactly the CRm nibble (ISH=0xB full barrier vs ISHLD=0x9 load-only), so a transposed word FAILS the byte-pin. Zero operands, no result, no register fields — a fixed word (the setcc no-wire shape, minus the result). NOTE the deliberate asymmetry with store_seqcst above: STLR (RCsc) needs NO DMB when fencing a STORE it fuses with, but a store-LESS __sync_synchronize() call site (sqlite3MemoryBarrier) has no STLR to lean on — the standalone fence must be a real DMB ISH.",
+      "mnemonic":      "atomic_fence_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3573758911 }
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC1 V2-4.X (2026-06-10): NEG Xd, Xm = SUB Xd, XZR, Xm (shifted-register alias, Rn=XZR baked). Base = 0xCB000000 | (XZR=31 << 5) = 0xCB0003E0. Slots: Rd, Rm. Surfaced by the modulo corpus' negative literals — under the BASELINE (no-ConstFold) pipeline a unary minus reaches LIR as a live `neg`, and arm64 had never declared one (every prior arm64 corpus avoided unary minus).",
       "mnemonic":      "neg",
       "result":        "value",

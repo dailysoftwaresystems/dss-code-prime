@@ -38,6 +38,7 @@ namespace {
         case MirOpcode::AtomicCas:     return "AtomicCas";
         case MirOpcode::AtomicLoad:    return "AtomicLoad";   // FC17.9(d)
         case MirOpcode::AtomicStore:   return "AtomicStore";  // FC17.9(d)
+        case MirOpcode::AtomicFence:   return "AtomicFence";  // D-CSUBSET-ATOMIC-FENCE
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -335,6 +336,13 @@ enum class MnemonicSlot : std::uint8_t {
     // acquire/release/seqcst slot FAILS LOUD (reportMissingOpcode) — the one
     // forbidden miscompile direction (a silent under-fence) can never happen.
     LoadAcquire, StoreRelease, StoreSeqCst,
+    // D-CSUBSET-ATOMIC-FENCE: the STANDALONE seq_cst CPU fence realization MIR
+    // AtomicFence (__sync_synchronize) lowers to — x86 MFENCE (0F AE F0), arm64
+    // DMB ISH (0xD5033BBF). A 0-operand, no-result instruction (the xor_rdx_zero
+    // shape). Slot-presence probed like the three per-order slots above; a target
+    // that declares no realization FAILS LOUD (reportMissingOpcode) — never a
+    // silent no-op "fence".
+    AtomicFenceSeqCst,
     // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): the x87 80-bit `long double`
     // memory-sequence ops. An F80 value lives in MEMORY (never a register —
     // the x87 stack st0-7 is invisible to the flat linear-scan allocator), so
@@ -474,6 +482,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
     {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
     {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
+    {MnemonicSlot::AtomicFenceSeqCst,  "atomic_fence_seqcst"},  // D-CSUBSET-ATOMIC-FENCE: x86 MFENCE / arm64 DMB ISH
     // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit long-double sequence ops (x86_64-only).
     {MnemonicSlot::FldM80,             "fld_m80"},
     {MnemonicSlot::FstpM80,            "fstp_m80"},
@@ -1872,6 +1881,10 @@ struct Lowerer {
             // slot — never a silent under-fence).
             case MirOpcode::AtomicLoad:  return lowerAtomicLoad(id);
             case MirOpcode::AtomicStore: return lowerAtomicStore(id);
+            // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — a standalone seq_cst
+            // CPU fence. Unlike CompilerBarrier below it emits a REAL fence
+            // instruction (the AtomicFenceSeqCst slot: x86 MFENCE, arm64 DMB ISH).
+            case MirOpcode::AtomicFence: return lowerAtomicFence(id);
             // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
             // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
             // effect (forbidding CSE/LICM from moving memory ops across it) is
@@ -6759,6 +6772,56 @@ struct Lowerer {
             LirOperand::makeMemOffset(0),
         };
         emitInst(*stOp, InvalidLirReg, ops, /*payload=*/0, widthFlags);
+    }
+
+    // D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): lower a MIR
+    // AtomicFence (__sync_synchronize) to the target's STANDALONE seq_cst fence
+    // instruction. 0 operands, no result; the order (`payload`) is seq_cst (5)
+    // from the sole shipped producer. Slot-presence probed (the lowerAtomicLoad/
+    // Store precedent, NEVER an arch identity): the AtomicFenceSeqCst slot binds
+    // x86 MFENCE (0F AE F0) / arm64 DMB ISH (0xD5033BBF) — both MEASURED via
+    // clang -c + otool on __sync_synchronize (2026-07-30, this machine; the
+    // acquire-only cross-check dmb ishld = 0xD50339BF differs in exactly the CRm
+    // nibble). A target that declares no slot FAILS LOUD (reportMissingOpcode).
+    void lowerAtomicFence(MirInstId id) {
+        if (!mir.instOperands(id).empty()) {
+            reportUnsupported(MirOpcode::AtomicFence, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order != kAtomicOrderSeqCst) {
+            // FAIL LOUD, never a silent under-fence: no producer emits a
+            // non-seq_cst standalone fence today (__sync_synchronize is always
+            // seq_cst), and the house rule in this file is "over-fence, never
+            // under-fence" (lowerAtomicLoad/Store above). A weaker payload here
+            // means a NEW producer (atomic_thread_fence is one lang.json row
+            // away via the AtomicLoadExplicit/StoreExplicit const-fold
+            // machinery) landed WITHOUT its per-order fence matrix — refusing
+            // beats guessing a weaker dmb/no-op realization that could
+            // silently under-fence. When atomic_thread_fence lands a consumer,
+            // THAT cycle designs the per-order matrix; D-CSUBSET-ATOMIC-FENCE
+            // records only the seq_cst pair (arm64 `dmb ish` / x86 `mfence`).
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR AtomicFence (inst {}): a standalone fence with "
+                    "non-seq_cst memory order {} is not lowered on target '{}' "
+                    "— the only shipped producer (__sync_synchronize) is "
+                    "always seq_cst (payload=5), so a weaker order means a new "
+                    "producer landed without its per-order fence matrix "
+                    "(D-CSUBSET-ATOMIC-FENCE); failing loud, never a silent "
+                    "under-fence.",
+                    id.v, order, target.name()));
+            return;
+        }
+        auto const fenceOp = opcode(MnemonicSlot::AtomicFenceSeqCst);
+        if (!fenceOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::AtomicFenceSeqCst,
+                                mirOpcodeName(MirOpcode::AtomicFence));
+            return;
+        }
+        emitInst(*fenceOp, InvalidLirReg, std::span<LirOperand const>{});
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,

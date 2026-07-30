@@ -874,6 +874,46 @@ TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
     EXPECT_EQ(bytes[3], 0x88);
 }
 
+TEST(Arm64Encoder, AtomicFenceSeqCstEncodesDmbIsh) {
+    // D-CSUBSET-ATOMIC-FENCE (__sync_synchronize): dmb ish — the STANDALONE
+    // seq_cst fence. 0xD5033BBF, MEASURED via clang -c -arch arm64 + otool -t
+    // on `__sync_synchronize()` (2026-07-30, this machine) — LE bytes:
+    // BF 3B 03 D5. Cross-check: the acquire-only dmb ishld = 0xD50339BF
+    // differs in exactly the CRm nibble (ISH=0xB vs ISHLD=0x9), so a
+    // transposed word fails at byte 1 (0x3B vs 0x39). ZERO registers, zero
+    // wires — fence + ret is the whole function, and the ret word
+    // (0xD65F03C0 → C0 03 5F D6) pins that the fixed word consumed exactly
+    // 4 bytes of the stream. NOTE the arm64 asymmetry with StoreSeqCst
+    // above: a seq_cst STORE needs no DMB (STLR is RCsc), but a store-LESS
+    // fence call site has no STLR to lean on — it must be a real DMB ISH.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fenceOp = (*s)->opcodeByMnemonic("atomic_fence_seqcst");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fenceOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    (void)b.addInst(*fenceOp, InvalidLirReg, std::span<LirOperand const>{});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xBF);  // dmb ish = 0xD5033BBF, little-endian
+    EXPECT_EQ(bytes[1], 0x3B);  // ← the ISH CRm byte (ishld would be 0x39)
+    EXPECT_EQ(bytes[2], 0x03);
+    EXPECT_EQ(bytes[3], 0xD5);
+    EXPECT_EQ(bytes[4], 0xC0);  // ret = 0xD65F03C0 immediately after
+    EXPECT_EQ(bytes[5], 0x03);
+    EXPECT_EQ(bytes[6], 0x5F);
+    EXPECT_EQ(bytes[7], 0xD6);
+}
+
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
 // slot's first consumer; rule 3's fused remainder realization) ─────
 

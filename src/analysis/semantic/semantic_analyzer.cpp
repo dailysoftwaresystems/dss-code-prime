@@ -12418,6 +12418,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: `__builtin_va_list` is the
+                // COMPILER-PROVIDED spelling of the SAME type — the Darwin SDK
+                // reaches va_list only through `typedef __builtin_va_list
+                // __darwin_va_list;` (<sys/_types/_va_list.h>), so no descriptor
+                // can supply the name. Bind the IDENTICAL TypeId (never a
+                // re-derived twin): a typedef chain through either name stays
+                // identity-equal per calling convention. Mirrored in ALL THREE
+                // strategy branches of this if/else chain.
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = vaStructTy;   // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = vaStructTy;   // c82: descriptor alias
                 s.vaListType      = vaStructTy;   // c82: adjustment exclusion
             } else if (strat == VaListStrategy::HomogeneousPointer) {
@@ -12431,6 +12448,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = charPtr;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
+                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = charPtr;      // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = charPtr;      // c82: descriptor alias
                 s.vaListType      = charPtr;      // c82: adjustment exclusion
             } else {
@@ -12472,6 +12500,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaListTy;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
+                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = vaListTy;     // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = vaListTy;     // c82: descriptor alias
                 s.vaListType      = vaListTy;     // c82: adjustment exclusion
             }

@@ -1406,6 +1406,22 @@ namespace {
     return std::move(mb).finish();
 }
 
+// D-CSUBSET-ATOMIC-FENCE: fn() -> int { AtomicFence(order); return 0; } —
+// the standalone-fence shape (__sync_synchronize): 0 operands, no result, the
+// C11 order in the payload (seq_cst=5 from the sole shipped producer).
+[[nodiscard]] Mir buildAtomicFenceFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    (void)mb.addInst(MirOpcode::AtomicFence, {}, InvalidType, order);
+    MirLiteralValue lv; lv.value = std::int64_t{0}; lv.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(lv, i32));
+    return std::move(mb).finish();
+}
+
 // Count LIR insts (fn 0, block 0) whose opcode is `mnemonic` on `sch`.
 [[nodiscard]] int countLirMnemonic(Lir const& lir, TargetSchema const& sch,
                                    std::string_view mnemonic) {
@@ -1558,6 +1574,112 @@ TEST(MirToLirAtomic, AcquireLoadFailsLoudWhenLoadAcquireSlotMissing) {
     }
     EXPECT_TRUE(sawDiag)
         << "the fail-loud diagnostic must name the missing 'load_acquire' slot.";
+}
+
+// ── D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): the standalone
+// seq_cst fence (__sync_synchronize → MIR AtomicFence). Unlike CompilerBarrier
+// (zero instructions) it must emit EXACTLY ONE real fence instruction via the
+// atomic_fence_seqcst slot; a non-seq_cst payload (no shipped producer) and a
+// missing slot both FAIL LOUD — never a silent no-op or under-fence. ──────────
+
+TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnX86) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
+        << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
+           "(MFENCE) instruction — zero is a dropped fence, two is a double fence.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "a standalone fence must not borrow the fused store_seqcst (xchg) slot.";
+}
+
+TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnArm64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
+        << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
+           "(DMB ISH) instruction on arm64 (bytes pinned in test_asm_arm64).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+}
+
+TEST(MirToLirAtomic, FenceNonSeqCstOrderFailsLoud) {
+    // The audit-mandated arm: NO producer emits a non-seq_cst standalone fence
+    // today (__sync_synchronize is always seq_cst=5), and the registry row's
+    // "weaker orders → 0 instructions" would be a SILENT UNDER-FENCE one config
+    // edit away (atomic_thread_fence via the existing explicit-order const-fold
+    // machinery). So EVERY payload 0..4 must FAIL the lowering with a diagnostic
+    // NAMING the numeric order — never emit nothing, never guess a weaker fence.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (std::uint32_t order = 0; order <= 4; ++order) {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicFenceFnMir(order, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+        EXPECT_FALSE(lirR.ok)
+            << "AtomicFence payload " << order
+            << " (non-seq_cst) must FAIL the lowering — no producer emits it.";
+        bool sawDiag = false;
+        std::string const needle = "memory order " + std::to_string(order);
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+                && d.actual.find("AtomicFence") != std::string::npos
+                && d.actual.find(needle) != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << "the fail-loud diagnostic for payload " << order
+            << " must carry L_UnsupportedLoweringForOpcode naming AtomicFence "
+               "and the exact '" << needle << "'.";
+    }
+}
+
+TEST(MirToLirAtomic, FenceSeqCstFailsLoudWhenAtomicFenceSeqCstSlotMissing) {
+    // The I2 fail-loud belt on BOTH shipped targets: a target that declares NO
+    // atomic_fence_seqcst realization must FAIL LOUD (reportMissingOpcode) on a
+    // seq_cst AtomicFence — never silently lower __sync_synchronize to nothing
+    // (that would be the CompilerBarrier no-op, an under-fence on a real CPU).
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+            targetName, {"atomic_fence_seqcst"});
+        ASSERT_TRUE(mutated.has_value())
+            << targetName
+            << ": removing the OPTIONAL atomic_fence_seqcst opcode must not "
+               "fail the loader.";
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+        EXPECT_FALSE(lirR.ok)
+            << targetName
+            << ": a seq_cst fence with no atomic_fence_seqcst slot MUST fail "
+               "the lowering — never a silent no-op fence.";
+        bool sawDiag = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+                && d.actual.find("atomic_fence_seqcst") != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << targetName
+            << ": the fail-loud diagnostic must name the missing "
+               "'atomic_fence_seqcst' slot.";
+    }
 }
 
 // ── FC3.5 sweep-c1: capability-driven shift lowering ────────────────────

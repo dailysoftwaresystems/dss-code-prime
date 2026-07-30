@@ -12257,6 +12257,55 @@ TEST(MirLoweringCSubset, InlineAsmEmptyTemplateNoVolatileLowersToCompilerBarrier
     EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1);
 }
 
+// ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──
+// The BUILTIN→OPCODE half of the fence feature, and the ONLY test that covers it:
+// every other AtomicFence pin (test_mir_to_lir's slot routing, the test_asm_* byte
+// pins, test_mir_alias's clobber walk, test_mir_opcode's shape row) BUILDS the MIR
+// op by hand, so not one of them can see the builtin bound to the wrong lowering
+// verb — only an end-to-end corpus run would otherwise catch it.
+// ★ WHY THE ZERO-CompilerBarrier HALF IS LOAD-BEARING, not decoration: the registry
+// anchor warns in capitals that routing `__sync_synchronize` to
+// `BuiltinLowering::Barrier` → `MirOpcode::CompilerBarrier` emits ZERO target
+// instructions on EVERY target (mir_to_lir's `case CompilerBarrier: return;`). That
+// rebind is a one-word JSON edit, it compiles clean, it silences the S0001, and it
+// is a SILENT UNDER-FENCE MISCOMPILE — invisible on a single-threaded corpus run,
+// and not a diagnostic. Asserting the AtomicFence count ALONE would stay green if
+// someone ADDED a barrier beside the fence; asserting 0 CompilerBarrier is what
+// makes the routing exclusive.
+// RED-ON-DISABLE: flip the `__sync_synchronize` row's `"lowering"` in
+// c-subset.lang.json to `"barrier"` (or drop the addInst in hir_to_mir's
+// `case BuiltinLowering::AtomicFence:`) → AtomicFence 1→0 AND CompilerBarrier 0→1,
+// so BOTH halves red. Re-bake the order to anything but seq_cst → the payload pin
+// reds (and mir_to_lir would fail loud on it — no silent weaker fence).
+TEST(MirLoweringCSubset, SyncSynchronizeLowersToAtomicFenceSeqCst) {
+    auto L = lowerCSubset("void f(void){ __sync_synchronize(); }");
+    // The builtin is ALWAYS-injected (c-subset.lang.json builtinFunctions), so an
+    // unbound name would surface here as a semantic S0001 rather than at MIR.
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::AtomicFence), 1)
+        << "__sync_synchronize() must lower to EXACTLY ONE MirOpcode::AtomicFence";
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 0)
+        << "the fence must NOT route through CompilerBarrier — that opcode emits "
+           "ZERO target instructions, so the rebind is a silent under-fence "
+           "miscompile that no exit-code or corpus probe can see";
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0)
+        << "a compiler intrinsic must not lower to a Call";
+    // The memory order is CONST-BAKED at seq_cst (5): the builtin declares no order
+    // parameter and GCC defines every __sync builtin as a FULL barrier, so there is
+    // nothing to fold — a wrong bake here is a weaker fence than the source promised.
+    MirInstId const fence = stdbitFirstOp(m, ids, MirOpcode::AtomicFence);
+    ASSERT_TRUE(fence.valid());
+    EXPECT_EQ(m.instPayload(fence), 5u)   // memory_order_seq_cst
+        << "__sync_synchronize is a FULL barrier — the payload must be seq_cst (5)";
+    EXPECT_EQ(m.instOperands(fence).size(), 0u)
+        << "AtomicFence is a 0-operand op — the builtin takes no arguments";
+}
+
 // leading_zeros = clz(x) − (P − W): a single Clz, NO Popcount/Ctz/Shl.
 TEST(MirLoweringCSubset, StdbitLeadingZerosComposesClz) {
     auto L = lowerCSubset(

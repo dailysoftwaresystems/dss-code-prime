@@ -179,6 +179,31 @@ TEST(MirOpcode, CompilerBarrierIsSideEffectingMemoryClobber) {
     EXPECT_FALSE(isCommutative(MirOpcode::CompilerBarrier));
 }
 
+// D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): __sync_synchronize
+// lowers to MirOpcode::AtomicFence — CompilerBarrier's CPU-fence sibling (same
+// 0-operand/no-result/side-effecting/clobbering table shape) but lowering to a
+// REAL fence instruction (x86 MFENCE, arm64 DMB ISH) instead of zero; the C11
+// memory_order rides `payload` (seq_cst=5 from the sole shipped producer).
+// RED-ON-DISABLE: flip hasSideEffects to false OR drop AtomicFence from
+// opcodeClobbersMemory (mir_opcode.hpp) and the corresponding EXPECT fails
+// (the behavioral twin is test_mir_alias RegionWalkTreatsAtomicFenceAsClobber).
+TEST(MirOpcode, AtomicFenceIsSideEffectingMemoryClobber) {
+    // 0 operands, NO result (R::None), mnemonic "atomic_fence".
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicFence).minOperands, 0);
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicFence).maxOperands, 0);
+    EXPECT_EQ(resultRule(MirOpcode::AtomicFence), MirResultRule::None);
+    EXPECT_EQ(mnemonic(MirOpcode::AtomicFence), "atomic_fence");
+    // hasSideEffects — the DCE-liveness / CSE-exclusion / LICM-exclusion axis.
+    EXPECT_TRUE(opcodeInfo(MirOpcode::AtomicFence).hasSideEffects);
+    // opcodeClobbersMemory — the Load-motion fence axis. ★ THE load-bearing
+    // membership: without it CSE/LICM silently move memory ops across the fence.
+    EXPECT_TRUE(opcodeClobbersMemory(MirOpcode::AtomicFence));
+    // Neither a terminator, phi, nor a commutative op.
+    EXPECT_FALSE(isTerminator(MirOpcode::AtomicFence));
+    EXPECT_FALSE(isPhi(MirOpcode::AtomicFence));
+    EXPECT_FALSE(isCommutative(MirOpcode::AtomicFence));
+}
+
 TEST(MirOpcode, InvalidSentinelHasImpossibleArity) {
     // The slot-0 sentinel's impossible {min=1, max=0} arity surfaces any
     // accidental use loudly (no real opcode can satisfy min > max).

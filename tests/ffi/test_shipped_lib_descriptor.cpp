@@ -4804,4 +4804,301 @@ TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
         << "sys/ioctl.json ships no constant surface by design";
 }
 
+// ── D-CSUBSET-DARWIN-BSD-SYMBOL-CLUSTER: the Darwin/BSD vocabulary sqlite
+//    os_unix.c's proxy/AFP-locking region consumes ────────────────────────────
+//
+// strlcpy/strlcat (<string.h>), random/srandomdev (<stdlib.h>), futimes
+// (<sys/time.h>), fsctl + the uuid_t typedef (<unistd.h>). Every consumer lives
+// inside sqlite os_unix.c's `#if defined(__APPLE__) &&
+// SQLITE_ENABLE_LOCKING_STYLE` region (strlcpy first at :7434, strlcat :7443,
+// random :3197, srandomdev :6169, futimes :7883, fsctl :3013, uuid_t
+// :7600/:7607/:7791), and every name lives in a REAL SDK header the shipped
+// descriptor SHADOWS totally (an angle-include never reads the SDK text) — so
+// the descriptor row is the ONLY possible source, and each name is S0001
+// (uuid_t: S0006) without it. Hence the macho-ONLY gates: no elf/pe consumer
+// exists (the no-over-ship rule), and srandomdev/fsctl/uuid_t do not even
+// exist off Darwin.
+//
+// THE PRESENCE+ABSENCE PAIRS BELOW *ARE* THE RED-ON-DISABLE: delete any of the
+// six symbol rows and its PRESENT assert fails; widen a row's
+// availableObjectFormats beyond ["macho"] (or drop the set) and its exact-set +
+// gate asserts fail; delete the uuid_t macho variant (or add an elf one) and
+// the typedef PRESENT/ABSENT asserts fail. Runtime witnesses: the
+// shipped_strlcpy_strlcat_macho and shipped_bsd_random_futimes_uuid_macho
+// corpora on the darwin CI leg.
+//
+// TWO DIFFERENT ABSENCE MECHANISMS, each asserted the way its architecture
+// actually works:
+//   * SYMBOLS: decode keeps EVERY row regardless of the requested format (the
+//     c106 pin-shape lesson — see RealStdlibAtexitPerFormatAvailabilitySplit);
+//     the per-symbol gate filters at semantic INJECTION. So the elf ABSENCE is
+//     pinned via the exact availability set + the injector's own
+//     `objectFormatInAvailabilitySet` predicate — the atexit-test idiom — not
+//     via row disappearance.
+//   * TYPEDEFS: there is no per-typedef availableObjectFormats key (closed key
+//     set {name,type,variants}); availability IS which `variants` exist, and
+//     selection happens AT DECODE — zero matches ⇒ the typedef is not in
+//     `desc->typedefs` at all (the sys/types fixpt_t/segsz_t mechanism), so
+//     the elf ABSENCE is a straight lookup miss.
+
+// One (arch, format) read of a REAL descriptor for the cluster tests: the
+// interner rides along so signatures/typedefs can be inspected STRUCTURALLY
+// (never a string compare of raw JSON).
+struct DarwinBsdClusterRead {
+    TypeInterner       interner{CompilationUnitId{1}};
+    TypeRegistry       typeReg;
+    DiagnosticReporter rep;
+    std::optional<ShippedLibDescriptor> desc;
+};
+
+static void readDarwinBsdCluster(fs::path const& path, std::string_view arch,
+                                 ObjectFormatKind fmt, DarwinBsdClusterRead& out) {
+    out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg, out.rep,
+                                        DataModel::Lp64, arch, fmt);
+    ASSERT_TRUE(out.desc.has_value())
+        << path.generic_string() << " failed to load for arch=" << arch;
+    ASSERT_FALSE(out.rep.hasErrors())
+        << path.generic_string() << " emitted diagnostics for arch=" << arch;
+}
+
+static ShippedSymbol const* findDarwinBsdSymbol(DarwinBsdClusterRead const& r,
+                                                std::string_view name) {
+    for (auto const& s : r.desc->symbols)
+        if (s.name == name) return &s;
+    return nullptr;
+}
+
+// PRESENT side of one macho-only symbol: exact decoded FnSig shape
+// (result + params, param pointees where the param is a pointer) + the exact
+// ["macho"] availability set + the injector gate excluding elf/pe.
+static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view name,
+                              TypeKind ret,
+                              std::vector<TypeKind> const& params,
+                              std::vector<std::optional<TypeKind>> const& pointees) {
+    ASSERT_EQ(params.size(), pointees.size()) << "test-table shape";
+    auto const* sym = findDarwinBsdSymbol(r, name);
+    ASSERT_NE(sym, nullptr) << name << " row absent (RED-ON-DISABLE: this is "
+                               "the delete-the-row red)";
+    ASSERT_EQ(r.interner.kind(sym->signature), TypeKind::FnSig) << name;
+    EXPECT_EQ(r.interner.kind(r.interner.fnResult(sym->signature)), ret)
+        << name << " return kind";
+    auto ps = r.interner.fnParams(sym->signature);
+    ASSERT_EQ(ps.size(), params.size()) << name << " arity";
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        EXPECT_EQ(r.interner.kind(ps[i]), params[i]) << name << " param " << i;
+        if (pointees[i].has_value()) {
+            auto elem = r.interner.operands(ps[i]);
+            ASSERT_EQ(elem.size(), 1u) << name << " param " << i << " pointee";
+            EXPECT_EQ(r.interner.kind(elem[0]), *pointees[i])
+                << name << " param " << i << " pointee kind";
+        }
+    }
+    EXPECT_EQ(sym->availableObjectFormats, (std::vector<std::string>{"macho"}))
+        << name << " must be gated macho-ONLY: its only consumers are inside "
+           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and "
+           "DSS eager-imports every DECLARED shipped extern";
+    EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                              ObjectFormatKind::MachO)) << name;
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf)) << name;
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Pe)) << name;
+}
+
+TEST(ShippedLibDescriptor, RealStringJsonStrlcpyStrlcatMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "string.json";
+
+    using K = TypeKind;
+    // BSD semantics make the RESULT the load-bearing kind: both return the
+    // length of the string they TRIED to create (a size_t/u64), NOT the dest
+    // pointer strcpy/strcat return — a Ptr result here would silently break
+    // the corpus exit arithmetic (5*8+2).
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        for (auto const* name : {"strlcpy", "strlcat"})
+            expectMachoOnlyFn(m, name, K::U64,
+                              {K::Ptr, K::Ptr, K::U64},
+                              {K::Char, K::Char, std::nullopt});
+    }
+
+    // (x86_64, Elf) read: the rows are STILL in the decode (symbol gating
+    // filters at injection, not at decode — the c106 pin-shape lesson), and the
+    // availability set is format-invariant, so the elf ABSENCE asserted above
+    // (gate == false) is the whole story. Positive control: strlen (ungated)
+    // must carry an EMPTY set — without it a decode that dropped every
+    // availability set would pass the exact-set asserts vacuously... it cannot,
+    // but the control also proves THIS read decoded a real symbol surface.
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"strlcpy", "strlcat"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr)
+            << name << " must still DECODE on an elf read (gating is at "
+               "injection); its absence on elf is the gate assert above";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf)) << name;
+    }
+    auto const* strlen_ = findDarwinBsdSymbol(e, "strlen");
+    ASSERT_NE(strlen_, nullptr) << "positive control: strlen must be present";
+    EXPECT_TRUE(strlen_->availableObjectFormats.empty())
+        << "positive control: strlen ships ungated (every format)";
+}
+
+TEST(ShippedLibDescriptor, RealStdlibJsonRandomSrandomdevMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "stdlib.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // `long random(void)` — the i64 result is the LP64 C `long`; a FLAT
+        // signature is correct because the [macho] gate means only LP64
+        // targets can ever select this row (asserted right below).
+        expectMachoOnlyFn(m, "random", K::I64, {}, {});
+        expectMachoOnlyFn(m, "srandomdev", K::Void, {}, {});
+    }
+
+    // Elf read: rows persist in the decode; the gate is the absence (same
+    // rationale as the string.json test). Positive control: rand (ungated).
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"random", "srandomdev"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf)) << name;
+    }
+    auto const* rand_ = findDarwinBsdSymbol(e, "rand");
+    ASSERT_NE(rand_, nullptr) << "positive control: rand must be present";
+    EXPECT_TRUE(rand_->availableObjectFormats.empty())
+        << "positive control: rand ships ungated (every format)";
+}
+
+TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's
+        // sole call passes NULL, so no layout knowledge rides on the param).
+        expectMachoOnlyFn(m, "futimes", K::I32,
+                          {K::I32, K::Ptr},
+                          {std::nullopt, K::Void});
+    }
+
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    auto const* sym = findDarwinBsdSymbol(e, "futimes");
+    ASSERT_NE(sym, nullptr) << "futimes must still decode on elf";
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    auto const* utimes = findDarwinBsdSymbol(e, "utimes");
+    ASSERT_NE(utimes, nullptr) << "positive control: utimes must be present";
+    EXPECT_TRUE(utimes->availableObjectFormats.empty())
+        << "positive control: utimes rides the header-level [elf,macho] gate "
+           "with no per-symbol set";
+}
+
+TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // SDK unistd.h:785 `int fsctl(const char *, unsigned long, void *,
+        // unsigned int)` — the FULL 4-param shape must decode: the u64 request
+        // param is the one the sys/ioctl.json _IOWR encoding widens into at
+        // sqlite os_unix.c:3013, so a truncated/reordered decode here would
+        // corrupt that call's request value silently.
+        expectMachoOnlyFn(m, "fsctl", K::I32,
+                          {K::Ptr, K::U64, K::Ptr, K::U32},
+                          {K::Char, std::nullopt, K::Void, std::nullopt});
+    }
+
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    auto const* sym = findDarwinBsdSymbol(e, "fsctl");
+    ASSERT_NE(sym, nullptr) << "fsctl must still decode on elf";
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    auto const* close_ = findDarwinBsdSymbol(e, "close");
+    ASSERT_NE(close_, nullptr) << "positive control: close must be present";
+    EXPECT_TRUE(close_->availableObjectFormats.empty())
+        << "positive control: close ships with no per-symbol set";
+}
+
+TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    auto findTypedef = [](DarwinBsdClusterRead const& r,
+                          std::string_view name) -> TypeId {
+        for (auto const& td : r.desc->typedefs)
+            if (td.name == name) return td.type;
+        return {};
+    };
+
+    // ── macho (both arches): uuid_t PRESENT as Array of U8, length 16 ──
+    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h:89) — the
+    // 16 is load-bearing: sqlite os_unix.c:7607 asserts PROXY_HOSTIDLEN ==
+    // sizeof(uuid_t), and the shipped_bsd_random_futimes_uuid_macho corpus
+    // exit arithmetic IS sizeof(uuid_t).
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        TypeId const t = findTypedef(m, "uuid_t");
+        ASSERT_TRUE(t.valid())
+            << "uuid_t must be injected on macho (arch=" << arch << ") — "
+               "RED-ON-DISABLE: deleting the macho variant reds this";
+        ASSERT_EQ(m.interner.kind(t), TypeKind::Array) << "uuid_t is an ARRAY";
+        auto const ops = m.interner.operands(t);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(m.interner.kind(ops[0]), TypeKind::U8)
+            << "uuid_t element is unsigned char (u8)";
+        auto const lens = m.interner.scalars(t);
+        ASSERT_EQ(lens.size(), 1u);
+        EXPECT_EQ(lens[0], 16) << "uuid_t is 16 bytes (PROXY_HOSTIDLEN)";
+        // The whole shape in one interned identity (kind+element+length).
+        EXPECT_EQ(t, m.interner.array(m.interner.primitive(TypeKind::U8), 16))
+            << "uuid_t must BE arr<u8, 16>";
+    }
+
+    // ── elf: ABSENT — typedef variants select AT DECODE (unlike symbols), so
+    // zero matching variants means uuid_t is simply not in desc->typedefs.
+    // Positive control on the SAME read: the `close` symbol must be present,
+    // so a descriptor that failed to load (or a typedefs array that silently
+    // decoded to empty-everything) cannot satisfy this vacuously. ──
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    EXPECT_FALSE(findTypedef(e, "uuid_t").valid())
+        << "uuid_t is Darwin-only (__darwin_uuid_t) and must NOT be injected "
+           "on elf — RED-ON-DISABLE: adding an elf variant reds this";
+    EXPECT_NE(findDarwinBsdSymbol(e, "close"), nullptr)
+        << "positive control: the elf read must still decode the symbol "
+           "surface (guards vacuous ABSENT passes)";
+}
+
 } // namespace

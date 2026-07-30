@@ -772,6 +772,25 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): MFENCE — the STANDALONE seq_cst CPU fence MIR AtomicFence (__sync_synchronize) lowers to. 0F AE F0, MEASURED via clang -c -arch x86_64 + otool -t on `__sync_synchronize()` (this machine, 2026-07-30). Zero operands, no result, no ModR/M — a fixed 3-byte instruction (the xor_rdx_zero match-any shape; deliberately WIDTH-ABSENT, a fence has no operand width). hasSideEffects=true so no LIR pass drops or reorders it. Distinct from store_seqcst above (xchg — a fence FUSED to a store): this is the fence ALONE, for the store-less __sync_synchronize call sites (sqlite3MemoryBarrier).",
+      "mnemonic":      "atomic_fence_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 174, 240] }
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",
