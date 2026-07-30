@@ -3122,6 +3122,31 @@ struct AttributeSemanticsFacts {
     // nullopt = no `aligned` clause (or every one of them errored / folded to the
     // 6.7.5p3 no-op zero).
     std::optional<std::uint32_t> alignment;
+
+    // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): EVERY MATCHED
+    // CLAUSE, kept as itself so the decl-kind gate can REPORT.
+    //
+    // ★ WHY THIS MEMBER HAS TO EXIST AT ALL. Everything above is a BOOLEAN (or a
+    // folded number): there is no attribute NAME and no `NodeId` anywhere in these
+    // facts, because until now nothing needed to say WHICH spelling produced a
+    // fact or WHERE it was written. The gate needs both — a warning that cannot
+    // name the attribute or underline it is not actionable — so the facts grow a
+    // per-clause record rather than the gate re-walking the tree and risking a
+    // second, differently-shaped enumeration of what a clause is.
+    //
+    // ★★ POPULATED BEFORE THE VERB SWITCH, WHICH IS THE WHOLE DESIGN. See
+    // `scanAttributeSemantics`: the push happens as soon as `row != nullptr` is
+    // established and BEFORE `switch (row->effect)`, so the list is
+    // VERB-AGNOSTIC BY CONSTRUCTION and a verb added tomorrow inherits the gate
+    // without touching it. A `none` row lands here too and is exempted
+    // STRUCTURALLY (its `appliesTo` is empty — the loader guarantees the
+    // equivalence), so the engine tests the CONFIG, never the verb.
+    struct KindScopedClause {
+        std::string                  name;          // dunder-normalized spelling
+        AttributeSemanticsRow const* row = nullptr; // the matched effects row
+        NodeId                       clauseNode{};  // the clause, for the span
+    };
+    std::vector<KindScopedClause> kindScopedClauses;
 };
 
 // TF-C73: the OPERAND node inside ONE attribute clause's argument group — the
@@ -3508,6 +3533,27 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
             }
             return;
         }
+        // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) — RECORD
+        // THE CLAUSE FOR THE DECL-KIND GATE, DELIBERATELY **ABOVE** THE SWITCH.
+        //
+        // Placement is the design, not convenience. Below the switch this would
+        // have to be one push per arm (or a per-verb allow-list), and a verb added
+        // later would be silently exempt from the gate — the exact shape of the
+        // defect being closed, re-created one tier up. Here the ONLY precondition
+        // is "the language MODELS this name", so every present and future verb is
+        // covered by construction and the engine names no attribute and no verb.
+        //
+        // A `none`-verb clause is recorded too and exempted STRUCTURALLY at the
+        // gate (`appliesTo.empty()`); the loader is what makes that equivalent to
+        // "the verb is `none`", by REQUIRING a non-empty `appliesTo` on every
+        // other verb and REFUSING the key on `none`.
+        //
+        // `clause->name` is COPIED, not moved: the Align arm below still formats
+        // with it (and it is a `string_view` into the tree, so it is a copy either
+        // way at this boundary).
+        out.kindScopedClauses.push_back(
+            AttributeSemanticsFacts::KindScopedClause{
+                std::string{clause->name}, row, clauseNode});
         switch (row->effect) {
             case AttributeEffect::SuppressUnused:
                 out.maybeUnused = true;
@@ -6664,6 +6710,26 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // declarator, so an un-honorable context reports once. A
                     // DECLARATOR-LEVEL one is its own spelling and is NOT gated.
                     bool attrAlignContextReported = false;
+                    // ★★ TF-C93: the decl-kind gate's latch — the clause nodes it
+                    // has ALREADY reported for this declaration
+                    // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). Same
+                    // declaration scope and same purpose as the two flags above,
+                    // one granularity finer: keyed on the offending SPELLING
+                    // rather than on "has anything been reported", so
+                    // `__attribute__((noinline)) int a, b, c;` warns ONCE (the
+                    // declaration-level facts are copied into every declarator
+                    // carrying the same clause `NodeId`) while TWO differently
+                    // misplaced attributes on one declaration still get one
+                    // diagnostic EACH. `NodeId::v` (the raw handle) is stored so
+                    // the latch needs no ordering/hashing support from `NodeId`;
+                    // the list is at most one entry per attribute clause on one
+                    // declaration, so a linear scan is the right shape.
+                    // ⚠ MEASURED: deleting this latch does NOT change today's
+                    // output — `DiagnosticReporter`'s `dedupWindow` already
+                    // collapses the identical repeats. It is kept so the property
+                    // belongs to the gate rather than to a configurable noise cap;
+                    // the full reasoning is at the gate itself, below.
+                    std::vector<decltype(NodeId{}.v)> declKindAttrReported;
                     std::optional<std::uint32_t> declAlignOverride;
                     for (NodeId dNode : declarators) {
                         // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
@@ -6924,6 +6990,46 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // ★★ TF-C93: "WHAT KIND OF ENTITY DOES THIS DECLARATOR
+                        // EFFECTIVELY DECLARE?" — ONE definition, THREE readers.
+                        //
+                        // The predicate `isFnSig || isFunctionForm || kind ==
+                        // Function` existed in TWO independent copies before this
+                        // (the `alignas` context gate and the GNU-`aligned` sink),
+                        // and TF-C93 needs a third reader. Three hand-copies of a
+                        // three-term disjunction is how one of them quietly loses a
+                        // term; a lambda gives them one body.
+                        //
+                        // ★ IT READS `.kind` AT CALL TIME, ON PURPOSE. The two
+                        // existing sites each re-read `s.symbols.at(sym).kind`
+                        // where they stand, so a lambda (rather than a value
+                        // hoisted to here) is what makes this extraction
+                        // behavior-PRESERVING rather than behavior-adjacent. The
+                        // shipped `aligned` pins are the regression net for that
+                        // claim.
+                        //
+                        // ★★ AND NOTE THE TYPE CHANGE THE THIRD READER FORCED: the
+                        // existing expression is a **bool** ("is this effectively a
+                        // function?"), but a gate that walks a config-declared SET
+                        // of kinds needs an actual `DeclarationKind`. The mapping
+                        // is `isEffectivelyFunction ? Function : kind` — i.e. an
+                        // effectively-function declarator answers `Function` even
+                        // when its recorded `kind` is `Variable` (a definition
+                        // whose type failed to resolve, or a `kindByChild`
+                        // discriminated form), and everything else answers its
+                        // recorded kind unchanged. Each existing `if/else if`
+                        // ladder rewrites to an EQUIVALENT test on this value:
+                        // `eff == Function` is exactly the old disjunction, and
+                        // `eff == Type` is exactly the old `else if (kind ==
+                        // Type)` (reachable only when the disjunction was false).
+                        auto const effectiveDeclarationKind =
+                            [&]() -> DeclarationKind {
+                            DeclarationKind const k = s.symbols.at(sym).kind;
+                            if (isFnSig || isFunctionForm
+                                || k == DeclarationKind::Function)
+                                return DeclarationKind::Function;
+                            return k;
+                        };
                         // FC16 (D-CSUBSET-NORETURN): mark a FUNCTION symbol whose
                         // declaration named the attribute. Gated on `isFnSig` so a
                         // `_Noreturn int x;` (non-function) is INERT (a safe miss —
@@ -7022,6 +7128,151 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 atRec.nodiscardMessage =
                                     attrFacts.nodiscardMessage;
                         }
+                        // ★★★ TF-C93 — THE **ONE SHARED** DECL-KIND GATE
+                        // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT).
+                        //
+                        // An attribute written on a kind of entity the LANGUAGE'S
+                        // OWN CONFIG says it does not appertain to was ACCEPTED and
+                        // SILENTLY DISCARDED. MEASURED at HEAD `199fe7d` with the
+                        // shipped CLI — four axes, every one exit 0 with ZERO
+                        // diagnostics: `__attribute__((no_sanitize_thread)) int gv =
+                        // 7;`, `__attribute__((noinline)) int gv2 = 7;`, the
+                        // `always_inline` twin, and `int gw1
+                        // __attribute__((warn_unused_result)) = 1;`. Host clang
+                        // diagnoses all four.
+                        //
+                        // ★★ THE GATE REPORTS; THE GUARDS BELOW STILL REFUSE. The
+                        // three `isFnSig &&` discard guards immediately following
+                        // are UNCHANGED and must stay that way. Both TF-C92 tests
+                        // say so explicitly: a diagnostic that ALSO recorded the
+                        // flag would be a WORSE bug than the silence — a data-object
+                        // symbol carrying a codegen directive no consumer can honor.
+                        // Report-and-refuse, never report-and-accept.
+                        //
+                        // ★★ AGNOSTICISM — WHAT THIS LOOP DOES **NOT** CONTAIN. No
+                        // attribute name, no effect verb, no `DiagnosticCode` per
+                        // axis. It walks the clauses the config matched and compares
+                        // the effective declaration kind against the kind set THAT
+                        // ROW declared (`appliesTo`). Adding a fifth axis is a
+                        // config row; adding a fifth VERB inherits this gate for
+                        // free, because the clause list is populated above the verb
+                        // switch in `scanAttributeSemantics`.
+                        //
+                        // ★ THE `appliesTo.empty()` SKIP **IS** THE `none`-VERB
+                        // EXEMPTION, expressed as a property of the config rather
+                        // than as a verb test. The loader makes the two equivalent:
+                        // it REQUIRES a non-empty `appliesTo` on every verb but
+                        // `none` and REFUSES the key on `none`. So an empty set can
+                        // only mean "this row declares no kind axis" — never "a row
+                        // that forgot the key", which is the
+                        // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] trap.
+                        //
+                        // ★★ THE LATCH, AND AN HONEST ACCOUNT OF WHAT IT BUYS —
+                        // BECAUSE THE OBVIOUS CLAIM ABOUT IT IS **MEASURABLY
+                        // FALSE**. This gate sits inside the per-DECLARATOR loop
+                        // while `attrFacts` folds once per DECLARATION and is
+                        // COPIED into every declarator, so `__attribute__((noinline))
+                        // int a, b, c;` reaches `report()` THREE times.
+                        //
+                        // ★ IT DOES **NOT** FOLLOW THAT THE USER SEES THREE
+                        // DIAGNOSTICS WITHOUT THIS LATCH — MEASURED, and the plan
+                        // for this cycle asserted otherwise. `DiagnosticReporter`
+                        // carries a `dedupWindow` (default 4) that drops a report
+                        // whose (code, buffer, span, ruleContext, `actual`) matches
+                        // a recent one, and all three of these match EXACTLY (same
+                        // clause span, and the message names the attribute and the
+                        // kind, neither of which varies across the declarators).
+                        // MEASURED with the latch DELETED: `int a, b, c;` still
+                        // yields ONE warning, and interleaving 13 other diagnostics
+                        // does not change that (they are emitted in a later pass,
+                        // so the three reports stay adjacent). So the latch is
+                        // REDUNDANT with respect to today's observable output.
+                        //
+                        // ★★ IT IS KEPT ANYWAY — BUT **NOT** FOR THE REASON AN
+                        // EARLIER DRAFT OF THIS COMMENT GAVE, WHICH WAS ITSELF
+                        // MEASURABLY FALSE AND IS RETRACTED HERE. That draft argued
+                        // the window is a knob some paths turn off, and contrasted
+                        // this harness's window of 4 with a driver that sets
+                        // `dedupWindow = 0`. ★ THAT CONTRAST DOES NOT EXIST.
+                        // `S_AttributeIgnoredForDeclarationKind` reports into
+                        // `s.reporter` — `EngineState::reporter`, a
+                        // DEFAULT-constructed `DiagnosticReporter` (hence window 4)
+                        // that nothing in this file ever reassigns or reconfigures,
+                        // and which is MOVED WHOLE into the returned
+                        // `SemanticModel`. So the window is 4 on EVERY path, the
+                        // CLI included, and the eight `dedupWindow = 0` reporters
+                        // (`compilation_unit.cpp`, `program.cpp`) are DRIVER and
+                        // per-CU / per-target SCRATCH reporters that receive
+                        // semantic diagnostics ALREADY deduped by this one. There
+                        // is no configuration of this compiler in which the cap is
+                        // absent here. VERIFIED, TF-C93.
+                        //
+                        // ★★ THE SECOND REASON IS SUFFICIENT ON ITS OWN, AND IT NOW
+                        // CARRIES THE WHOLE JUSTIFICATION. The dedup key is (code,
+                        // buffer, span, ruleContext, `actual`) — so the window stops
+                        // helping THE MOMENT THE MESSAGE GAINS PER-DECLARATOR
+                        // DETAIL. Naming the declared identifier is a natural
+                        // improvement to this very diagnostic, and it would make
+                        // `actual` differ across `int a, b, c;`; a gate leaning on
+                        // the cap would at that moment silently start emitting three
+                        // warnings for one mistake, with nothing in the diff to show
+                        // it. The single-diagnostic property must therefore be a
+                        // property of THIS GATE rather than of a noise cap that
+                        // exists for a different purpose and whose dedup key this
+                        // gate's own message text controls.
+                        //
+                        // ★ KEYED ON THE **CLAUSE NODE**, NOT A BARE BOOL. A single
+                        // bool would collapse the multi-declarator repeat but also
+                        // swallow the second of TWO DISTINCT misplaced attributes on
+                        // one declaration (`__attribute__((noinline))
+                        // __attribute__((warn_unused_result)) int gv;`) — a fresh
+                        // silent drop in the cycle that exists to remove them, and
+                        // one the reporter's dedup would NOT have caused (differing
+                        // `actual` ⇒ differing key; MEASURED: two warnings). Keying
+                        // on the clause node gives exactly ONE diagnostic PER
+                        // OFFENDING SPELLING: declaration-level entries carry
+                        // identical `NodeId`s in every declarator's copy (repeats
+                        // collapse), while a DECLARATOR-level attribute is its own
+                        // node and still reports — the same
+                        // decl-level/declarator-level distinction the
+                        // `attrAlignContextReported` gate draws with `fromDeclLevel`.
+                        for (auto const& ksc : attrFacts.kindScopedClauses) {
+                            if (ksc.row == nullptr) continue;
+                            if (ksc.row->appliesTo.empty()) continue;
+                            DeclarationKind const eff =
+                                effectiveDeclarationKind();
+                            if (std::ranges::find(ksc.row->appliesTo, eff)
+                                != ksc.row->appliesTo.end()) continue;
+                            if (std::ranges::find(declKindAttrReported,
+                                                  ksc.clauseNode.v)
+                                != declKindAttrReported.end()) continue;
+                            declKindAttrReported.push_back(ksc.clauseNode.v);
+                            std::string allowed;
+                            for (DeclarationKind ak : ksc.row->appliesTo) {
+                                if (!allowed.empty()) allowed += ", ";
+                                allowed += declarationKindName(ak);
+                            }
+                            ParseDiagnostic d;
+                            d.code = DiagnosticCode::
+                                S_AttributeIgnoredForDeclarationKind;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            // Underline the CLAUSE the programmer wrote when it is
+                            // available (that is the text to fix); fall back to the
+                            // declared name, then to the declaration, so the
+                            // diagnostic always has a position.
+                            d.span     = tree.span(
+                                ksc.clauseNode.valid() ? ksc.clauseNode
+                                : nameNode.valid()     ? nameNode
+                                                       : node);
+                            d.actual   = std::format(
+                                "attribute '{}' is ignored on this declaration and "
+                                "its effect was discarded: the declaration declares "
+                                "a {}, and this language declares the attribute "
+                                "applicable to {} only",
+                                ksc.name, declarationKindName(eff), allowed);
+                            s.reporter.report(std::move(d));
+                        }
                         // TF-C78 (D-CSUBSET-NOINLINE): mark a FUNCTION symbol the
                         // declaration annotated `noinline`. Gated on `isFnSig` —
                         // the `isNoreturn` discipline one block below — so a
@@ -7107,10 +7358,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // following one. Threading the stored value to globals/locals
                         // codegen is a SEPARATE deferred task (unconsumed for variables).
                         if (!decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
-                            DeclarationKind const dk = s.symbols.at(sym).kind;
+                            // TF-C93: reads the ONE extracted predicate. `eff ==
+                            // Function` is exactly the former `isFnSig ||
+                            // isFunctionForm || dk == Function`, and `eff == Type`
+                            // exactly the former `else if (dk == Type)` — the
+                            // `else` was only reachable when the disjunction was
+                            // false, which is precisely when `eff` keeps the
+                            // recorded kind.
+                            DeclarationKind const dk = effectiveDeclarationKind();
                             char const* badCtx = nullptr;
-                            if (isFnSig || isFunctionForm
-                                || dk == DeclarationKind::Function)
+                            if (dk == DeclarationKind::Function)
                                 badCtx = "alignas on a function";
                             else if (dk == DeclarationKind::Type)
                                 badCtx = "alignas on a typedef";
@@ -7167,11 +7424,13 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 d.actual   = std::move(reason);
                                 s.reporter.report(std::move(d));
                             };
-                            DeclarationKind const adk = s.symbols.at(sym).kind;
+                            // TF-C93: the second reader of the ONE extracted
+                            // predicate (see the `alignas` gate above for why the
+                            // three-way ladder is equivalent term-for-term).
+                            DeclarationKind const adk = effectiveDeclarationKind();
                             bool const isBitfield =
                                 s.symbols.at(sym).bitFieldWidth.has_value();
-                            if (isFnSig || isFunctionForm
-                                || adk == DeclarationKind::Function) {
+                            if (adk == DeclarationKind::Function) {
                                 // FUNCTIONS stay LOUD. gcc accepts `aligned` on a
                                 // function (it aligns the code), DSS has no sink for
                                 // it, and the measured SDK cost of refusing is

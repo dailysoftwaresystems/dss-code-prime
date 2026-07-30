@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kDeclarationKindTable)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
@@ -52,6 +53,46 @@ enum class DeclarationKind : std::uint8_t {
     Table,
     Type,
 };
+
+// ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): the enum's
+// name table, so the SPELLINGS of these four kinds have ONE home and BOTH
+// directions exist.
+//
+// ★ WHY BOTH DIRECTIONS, AND WHY THIS IS NOT A NEW VOCABULARY. Before this the
+// only config-facing spelling of a `DeclarationKind` was an ad-hoc four-line
+// `else if` lambda inside the loader (`grammar_schema_json.cpp`'s `parseKind`,
+// used by `declarations[].kind` and `kindByChild.whenKind`) with NO reverse
+// direction at all. TF-C93's `attributeSemantics.effects[].appliesTo` needs
+// both: the loader's rejection message must ENUMERATE the closed set (the drift
+// discipline — a hand-restated "allowed values are …" literal is free to lie),
+// and the semantic tier's ignored-attribute warning must NAME the kind it
+// actually found ("this declaration declares a variable"). Deriving the
+// `appliesTo` vocabulary from the engine's OWN enum — rather than inventing a
+// parallel entity-kind vocabulary for attributes — is what keeps the gate
+// source-language-agnostic: a language declares which of the kinds IT already
+// declares an attribute applies to, and nothing in the engine names an
+// attribute or an effect verb.
+//
+// `Table` is spellable but unwritten by c-subset (no SQL-style table
+// declarations there); that is inert config of exactly the same shape as
+// `kSymbolVisibilityTable` accepting `protected`/`internal` for formats that
+// have no such visibility. The table's ORDER also fixes `name()`'s fall-back
+// (row 0 = `variable`), matching the enum's own default.
+inline constexpr EnumNameTable<DeclarationKind, 4> kDeclarationKindTable{{{
+    { DeclarationKind::Variable, "variable" },
+    { DeclarationKind::Function, "function" },
+    { DeclarationKind::Table,    "table"    },
+    { DeclarationKind::Type,     "type"     },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+declarationKindName(DeclarationKind k) noexcept {
+    return kDeclarationKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<DeclarationKind>
+declarationKindFromName(std::string_view s) noexcept {
+    return kDeclarationKindTable.fromName(s);
+}
 
 enum class NameMatchMode : std::uint8_t {
     Self,
@@ -1674,6 +1715,29 @@ enum class AttributeEffect : std::uint8_t {
 struct DSS_EXPORT AttributeSemanticsRow {
     std::vector<std::string> names;                        // dunder-normalized match set
     AttributeEffect          effect = AttributeEffect::None;
+    // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): the ENTITY
+    // KINDS this attribute may appertain to. The semantic tier's ONE shared
+    // decl-kind gate walks THIS set against the effective kind of the declarator
+    // it is applying facts to, and warns
+    // `S_AttributeIgnoredForDeclarationKind` when the kind is absent — so the
+    // engine names no attribute and no effect verb, it walks a config-declared
+    // kind set.
+    //
+    // ★ REQUIRED on every row whose `effect != None`; EXEMPT (and therefore
+    // EMPTY) on a `none` row. The loader enforces exactly that split — see the
+    // `appliesTo` block in `grammar_schema_json.cpp`, which extends the SAME
+    // `row.effect == AttributeEffect::None` predicate Clause B's drift
+    // cross-check already computes. A permissive "absent ⇒ applies to
+    // everything" default was REJECTED: it is the silent-permissive trap of
+    // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]], where a row that simply
+    // forgot the key reads as deliberately universal.
+    //
+    // ★ CONSEQUENCE THE ENGINE RELIES ON: an EMPTY set means "this row declares
+    // no kind axis", which — given the loader's guarantee — is exactly the
+    // `None` exemption, and the gate skips such a row. The engine therefore
+    // tests the CONFIG (`appliesTo.empty()`), never the verb, and a future verb
+    // inherits the gate by being required to declare its kinds.
+    std::vector<DeclarationKind> appliesTo;
 };
 
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a

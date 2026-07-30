@@ -1175,6 +1175,49 @@ enum class DiagnosticCode : std::uint16_t {
     // externs), loudly ignored where none does.
     S_AsmLabelOnAutomaticVariable = 0xE05E,
 
+    // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT, WARNING): ONE
+    // SHARED code for "this attribute was written on a kind of entity the
+    // language's own config says it does not appertain to, so the compiler
+    // DISCARDED it". Emitted by the single decl-kind gate in
+    // `semantic_analyzer.cpp`, which walks the matched
+    // `attributeSemantics.effects` row's `appliesTo` set against the effective
+    // `DeclarationKind` of the declarator. NAMES NO ATTRIBUTE AND NO EFFECT VERB
+    // — one code covers every present and future verb, which is the whole reason
+    // it is shared rather than per-attribute.
+    //
+    // WHAT IT REPLACED: total silence. MEASURED at `199fe7d` with the shipped
+    // CLI, all four axes, exit 0 and ZERO diagnostics while the attribute was
+    // thrown away — `__attribute__((no_sanitize_thread)) int gv = 7;`,
+    // `__attribute__((noinline)) int gv2 = 7;`,
+    // `__attribute__((always_inline)) …`, and
+    // `int gw1 __attribute__((warn_unused_result)) = 1;`.
+    //
+    // ★★ A WARNING, NOT AN ERROR, AND THE GROUNDS ARE MEASURED — READ THEM
+    // BEFORE PROMOTING IT. (1) Host clang treats `noinline`/`always_inline` on a
+    // data object as `-Wignored-attributes` WARNINGS, so erroring would refuse C
+    // that every real toolchain compiles (the TF-C77 lesson). (2) The registry
+    // row itself prescribes "ONE shared warning". (3) A warning adds ZERO errors
+    // to the corpus, so the fix cannot regress a passing program. (4)
+    // `--warnings-as-errors` already exists for a strict posture, so the strict
+    // reading is available without making it the default.
+    // ★ NOT justified by "an error would mask the HIR-tier diagnostic" — that is
+    // true but proves too much: it would equally forbid the shipped
+    // `S_AlignasInvalidContext` error two codes up.
+    //
+    // ★ A DELIBERATE, RECORDED DIVERGENCE: clang HARD-ERRORS
+    // `no_sanitize_thread` on a data object (`'no_sanitize_thread' attribute
+    // only applies to functions`) where DSS warns. The divergence is uniform
+    // across the four axes on purpose — one code, one severity, no per-attribute
+    // severity table — and it is recorded here and in the config row rather than
+    // left to be discovered.
+    //
+    // SUPPRESSIBLE, deliberately: it is the `S_AsmLabelOnAutomaticVariable`
+    // posture (a loudly-ignored annotation the program does not depend on for
+    // correct bytes), NOT the `S_AlignasInvalidContext` posture (a layout
+    // constraint whose silence is a miscompile). Do NOT add it to
+    // `unsuppressable_codes.cpp`.
+    S_AttributeIgnoredForDeclarationKind = 0xE05F,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

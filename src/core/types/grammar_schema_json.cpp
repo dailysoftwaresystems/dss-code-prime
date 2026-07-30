@@ -4760,12 +4760,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 return ok;
             };
 
-            auto const parseKind = [](std::string_view name) -> std::optional<DeclarationKind> {
-                if (name == "variable") return DeclarationKind::Variable;
-                if (name == "function") return DeclarationKind::Function;
-                if (name == "table")    return DeclarationKind::Table;
-                if (name == "type")     return DeclarationKind::Type;
-                return std::nullopt;
+            // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): ONE
+            // HOME for the declaration-kind spellings. This was a hand-written
+            // four-line `else if` chain with NO reverse direction, so the kind
+            // vocabulary existed twice the moment anything needed to PRINT a
+            // kind — and `appliesTo` needs exactly that (its rejection message
+            // must enumerate the closed set, and the semantic tier's warning
+            // must name the kind it found). Both directions now come off
+            // `kDeclarationKindTable` beside the enum in `semantic_config.hpp`,
+            // the `kSymbolBindingTable`/`kSymbolVisibilityTable` pattern, so a
+            // new enumerator is ONE table row and no reader can drift from it.
+            auto const parseKind = [](std::string_view name) {
+                return declarationKindFromName(name);
+            };
+            // …and the REJECTION MESSAGE is derived from the same table, never
+            // restated beside it. Three call sites hand-wrote "(expected
+            // 'variable', 'function', 'table', or 'type')", which is the drift
+            // hazard already written up at this loader's effect-verb closed set:
+            // a fifth enumerator would leave every one of them advertising a
+            // vocabulary that no longer matches, and a pin asserting the sentence
+            // CONTAINS a kind name would stay green while the sentence became a
+            // lie.
+            auto const closedKindSet = [] {
+                std::string out;
+                for (auto const& [k, nm] : kDeclarationKindTable.rows) {
+                    (void)k;
+                    if (!out.empty()) out += " | ";
+                    out += nm;
+                }
+                return out;
             };
 
             auto const parseConstructor = [](std::string_view name) -> std::optional<TypeConstructor> {
@@ -6486,9 +6509,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                                               path + "/kind",
                                               std::format("unknown declaration kind '{}' "
-                                                          "(expected 'variable', 'function', "
-                                                          "'table', or 'type')",
-                                                          entry.at("kind").get<std::string>()));
+                                                          "— the closed set is {}",
+                                                          entry.at("kind").get<std::string>(),
+                                                          closedKindSet()));
                                 } else {
                                     rule.kind = *k;
                                 }
@@ -6617,10 +6640,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                       kPath + "/whenKind",
                                                       std::format("unknown declaration "
-                                                                  "kind '{}' (expected "
-                                                                  "'variable', 'function', "
-                                                                  "'table', or 'type')",
-                                                                  k.at("whenKind").get<std::string>()));
+                                                                  "kind '{}' — the closed "
+                                                                  "set is {}",
+                                                                  k.at("whenKind").get<std::string>(),
+                                                                  closedKindSet()));
                                             dOk = false;
                                         } else {
                                             disc.whenKind = *wk;
@@ -9372,8 +9395,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // knob-that-lies as everywhere else in this loader —
                         // `"efect": "align"` alongside a real `effect` loads
                         // clean and the intended verb never takes.
-                        static constexpr std::array<std::string_view, 2>
-                            kEffectRowKeys{"names", "effect"};
+                        //
+                        // ★★ TF-C93 grew this 2 → 3 for `appliesTo`
+                        // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT).
+                        // That correctly extends the unknown-key loop below —
+                        // but note what `DSS_CHECK_KEY_VOCABULARY` does and does
+                        // NOT do: MEASURED at `config_key_vocabulary.hpp:92-97`,
+                        // it is a `static_assert` on ARRAY WELL-FORMEDNESS only
+                        // (no empty / duplicate entries, count matches the
+                        // declared size). It says nothing whatsoever about a
+                        // key's VALUE, so `appliesTo`'s contents get their own
+                        // explicit validation further down — is-array, non-empty,
+                        // every entry a string, every value a known kind, no
+                        // duplicates.
+                        static constexpr std::array<std::string_view, 3>
+                            kEffectRowKeys{"names", "effect", "appliesTo"};
                         DSS_CHECK_KEY_VOCABULARY(kEffectRowKeys);
 
                         // Every name seen so far, dunder-normalized → the verb
@@ -9405,7 +9441,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     std::format("{}/{}", rowPath, it.key()),
                                     std::format("unknown key '{}' in an "
                                                 "'effects' row — allowed keys "
-                                                "are 'names', 'effect' (typo "
+                                                "are 'names', 'effect', "
+                                                "'appliesTo' (typo "
                                                 "discriminator)", it.key()));
                             }
                             // An empty `names` array binds the verb to nothing:
@@ -9466,6 +9503,140 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             out.effect = arm->second;
+                            // ★★ TF-C93 — `appliesTo`: the ENTITY KINDS this
+                            // attribute may appertain to
+                            // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT).
+                            //
+                            // ★ REQUIRED on every row whose verb is not `none`,
+                            // and that is a DELIBERATE break with "optional keys
+                            // degrade to a permissive default". A row that simply
+                            // FORGOT the key would otherwise read as "applies to
+                            // every kind" and go silent on exactly the misuse the
+                            // gate exists to catch — the silent-permissive trap
+                            // of [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]],
+                            // filed one cycle before this one. The predicate is
+                            // not new machinery either: Clause B's drift
+                            // cross-check below already computes `row.effect ==
+                            // AttributeEffect::None` to decide which rows name a
+                            // DECLARATION-ATTACHED effect, and "declaration-
+                            // attached" is precisely "has a declared entity whose
+                            // kind can be judged".
+                            //
+                            // ★ A `none` row is EXEMPT, and must be: that verb
+                            // bundles function-only, type-only, statement-only and
+                            // elsewhere-consumed names in ONE row, so no single
+                            // kind set is correct for it. See the c-subset row's
+                            // own `$comment` for what closing that half costs (a
+                            // ROW SPLIT by applicable kind, not another key) and
+                            // for the measured bound on the residual silence.
+                            bool const kindAxisRequired =
+                                out.effect != AttributeEffect::None;
+                            if (!row.contains("appliesTo")) {
+                                if (kindAxisRequired) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/appliesTo",
+                                        std::format(
+                                            "'appliesTo' is REQUIRED on an "
+                                            "'effects' row whose effect is '{}' — "
+                                            "every verb but 'none' names an effect "
+                                            "on the DECLARED ENTITY, so the row "
+                                            "must say which entity kinds it "
+                                            "appertains to (the closed set is {}). "
+                                            "There is deliberately no permissive "
+                                            "'absent means every kind' default: a "
+                                            "row that forgot the key would read as "
+                                            "universal and stay silent on the "
+                                            "misuse the decl-kind gate exists to "
+                                            "report",
+                                            verb, closedKindSet()));
+                                }
+                            } else if (!kindAxisRequired) {
+                                // Present on a `none` row: not an error to reject
+                                // outright, but it can never be READ (the gate
+                                // skips a row with no declared kind axis only
+                                // because `none` rows have none), so accepting it
+                                // silently would be a knob that lies.
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    rowPath + "/appliesTo",
+                                    "'appliesTo' must NOT appear on an 'effects' "
+                                    "row whose effect is 'none' — that verb "
+                                    "bundles names belonging to different entity "
+                                    "kinds (and names consumed by other scans "
+                                    "entirely), so no kind set is correct for it "
+                                    "and the declared one would never be read. "
+                                    "Closing that half means SPLITTING the row by "
+                                    "applicable kind, not annotating it");
+                            } else if (!row.at("appliesTo").is_array()) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    rowPath + "/appliesTo",
+                                    std::format("'appliesTo' must be an ARRAY of "
+                                                "declaration-kind strings — the "
+                                                "closed set is {}",
+                                                closedKindSet()));
+                            } else if (row.at("appliesTo").empty()) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    rowPath + "/appliesTo",
+                                    "'appliesTo' must list at least one "
+                                    "declaration kind — an EMPTY set says the "
+                                    "attribute appertains to nothing, which would "
+                                    "make the row warn on every declaration that "
+                                    "spells it while its effect still fires "
+                                    "nowhere");
+                            } else {
+                                for (json const& kn : row.at("appliesTo")) {
+                                    if (!kn.is_string()) {
+                                        coll.emit(
+                                            DiagnosticCode::C_InvalidSemantics,
+                                            rowPath + "/appliesTo",
+                                            std::format(
+                                                "each 'appliesTo' entry must be a "
+                                                "declaration-kind STRING — the "
+                                                "closed set is {}",
+                                                closedKindSet()));
+                                        continue;
+                                    }
+                                    auto const kindName = kn.get<std::string>();
+                                    auto const k = parseKind(kindName);
+                                    if (!k) {
+                                        // Message DERIVED from the vocabulary
+                                        // table, never restated beside it (the
+                                        // drift discipline this loader's
+                                        // effect-verb closed set already follows).
+                                        coll.emit(
+                                            DiagnosticCode::C_InvalidSemantics,
+                                            rowPath + "/appliesTo",
+                                            std::format(
+                                                "unknown declaration kind '{}' in "
+                                                "'appliesTo' — the closed set is "
+                                                "{}",
+                                                kindName, closedKindSet()));
+                                        continue;
+                                    }
+                                    if (std::ranges::find(out.appliesTo, *k)
+                                        != out.appliesTo.end()) {
+                                        // A repeat adds nothing and is always a
+                                        // typo or a bad merge — and left accepted
+                                        // it trains an author to read this list as
+                                        // unchecked prose.
+                                        coll.emit(
+                                            DiagnosticCode::C_InvalidSemantics,
+                                            rowPath + "/appliesTo",
+                                            std::format(
+                                                "declaration kind '{}' is listed "
+                                                "twice in 'appliesTo' — the list "
+                                                "is a SET, so a repeat changes "
+                                                "nothing and is a typo or a "
+                                                "botched merge",
+                                                kindName));
+                                        continue;
+                                    }
+                                    out.appliesTo.push_back(*k);
+                                }
+                            }
                             // ★ A name may be bound ONCE. Two rows claiming the
                             // same name load cleanly today and leave WHICH ONE
                             // WINS to consumer iteration order — and with `align`
@@ -10788,8 +10959,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
                 // ── Clause B: a DECLARATION-ATTACHED effect must be WRITABLE ──
                 // Every verb except `None` names an effect on the DECLARED entity
-                // (suppress-unused / warn-on-use / warn-on-discard / align), so
-                // such an attribute must be spellable in a declaration's specifier
+                // (suppress-unused / warn-on-use / warn-on-discard / align /
+                // no-inline / always-inline / no-sanitize-thread — TF-C93 refreshed
+                // this list, which had gone STALE at four when the three
+                // per-function verbs landed across TF-C78/C81/C92; a comment that
+                // enumerates a closed set has to be re-read whenever the set grows,
+                // which is why the CODE below reads `row.effect` instead), so such
+                // an attribute must be spellable in a declaration's specifier
                 // prefix. On a row whose strict linkage scan runs (`linkageSpecifiers`
                 // non-empty), a name that is neither ignored nor a recognized
                 // linkage specifier fails H_UnknownLinkageSpecifier on legal

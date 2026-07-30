@@ -3172,14 +3172,19 @@ TEST(HirLoweringCSubset, AbiNeutralHintAttributeNamesLowerClean) {
 }
 
 namespace {
-// The declared binding for the module decl whose bound symbol is `name`, read
-// from the SPARSE linkage side-table: absent ⇒ the implicit `Global` state (that
-// is exactly what `recordLinkage` means by storing nothing), so this reports the
-// APPLIED binding for every node, annotated or not. `std::nullopt` means no such
-// module decl exists at all — a distinct answer from "exists with Global
+// The declared LINKAGE for the module decl whose bound symbol is `name`, read
+// from the SPARSE linkage side-table: absent ⇒ the implicit (`Global`,
+// `Default`) state — that is exactly what `recordLinkage` means by storing
+// nothing, and a default-constructed `LinkageAttr` spells it — so this reports
+// the APPLIED linkage for every node, annotated or not. `std::nullopt` means no
+// such module decl exists at all, a distinct answer from "exists with Global
 // binding", and telling those two apart is the whole point at a synthesis gate.
-[[nodiscard]] std::optional<SymbolBinding>
-declaredBinding(CstToHirResult const& res, SemanticModel const& model,
+//
+// TF-C93: this was `declaredBinding` alone; the axis-specific readers below are
+// now thin projections of it so the two axes can never drift in HOW they read
+// the sparse table (the absent ⇒ implicit-default rule is stated once).
+[[nodiscard]] std::optional<LinkageAttr>
+declaredLinkage(CstToHirResult const& res, SemanticModel const& model,
                 std::string_view name) {
     for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
         SymbolId sym{};
@@ -3192,10 +3197,31 @@ declaredBinding(CstToHirResult const& res, SemanticModel const& model,
         }
         auto const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
         if (rec == nullptr || rec->name != name) continue;
-        return res.linkageMap.has(d) ? res.linkageMap.get(d).binding
-                                     : SymbolBinding::Global;
+        return res.linkageMap.has(d) ? res.linkageMap.get(d) : LinkageAttr{};
     }
     return std::nullopt;
+}
+
+[[nodiscard]] std::optional<SymbolBinding>
+declaredBinding(CstToHirResult const& res, SemanticModel const& model,
+                std::string_view name) {
+    auto const a = declaredLinkage(res, model, name);
+    if (!a.has_value()) return std::nullopt;
+    return a->binding;
+}
+
+// TF-C93 (D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS, visibility
+// half): the `declaredBinding` twin, and it is REQUIRED rather than convenient.
+// Without it the conflict pins below could only match a message SUBSTRING — and
+// a message-only assertion CANNOT SEE A WRONG RESIDUE, which is the precise bug
+// the binding half's first cut was caught on (it emitted the right diagnostic
+// and left the declaration marked as escaping the TU).
+[[nodiscard]] std::optional<SymbolVisibility>
+declaredVisibility(CstToHirResult const& res, SemanticModel const& model,
+                   std::string_view name) {
+    auto const a = declaredLinkage(res, model, name);
+    if (!a.has_value()) return std::nullopt;
+    return a->visibility;
 }
 }  // namespace
 
@@ -3418,6 +3444,360 @@ TEST(HirLoweringCSubset, AxisFreeTrailingAttributeLeavesStaticBindingIntact) {
     EXPECT_EQ(globalAlignment(*res, model, "sa"), 32u)
         << "and the alignment must still APPLY — a guard that rejected the "
            "clause would also have dropped its effect";
+}
+
+// ★★ TF-C93 REGRESSION PIN — TWO CONFLICTING `visibility` VALUES ON ONE
+// DECLARATION IS A CONFLICT, NOT LAST-WINS. Closes the VISIBILITY half of
+// D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS; the BINDING half above
+// (TF-C73) is the precedent, down to reusing H_UnknownLinkageSpecifier.
+//
+// MEASURED at HEAD 199fe7d, `--target arm64:macho64-arm64-darwin-dylib`, and the
+// defect is BYTE-OBSERVABLE rather than merely theoretical — RC=0 and ZERO
+// diagnostics in BOTH orders, while the shipped image's dynamic export table
+// FLIPS on source order:
+//   `visibility("hidden")` then `visibility("default")` on `int dv4`
+//       → `dyld_info -exports` lists `_dv4`  (EXPORTED)
+//   the same two specifiers SWAPPED
+//       → `_dv4` absent from the export trie (HIDDEN)
+// (`nm -m` on that dylib shows only `_main`; the DATA symbol is visible in the
+// export trie, so `dyld_info -exports` is the tool that sees this — noted because
+// an earlier write-up cited `nm -m` and it does not show it.)
+//
+// GROUND TRUTH IS REAL CLANG on this Mac, which HARD-ERRORS BOTH orders with
+// `error: visibility does not match previous declaration` and emits no object.
+// GCC is documented to warn and keep the EARLIER value. Plain last-wins is
+// NEITHER behaviour, so failing loud follows the stricter reference.
+//
+// ★★★ THE LOOP IS OVER BOTH ORDERS × FIVE SYNTACTIC POSITIONS, AND THE ORDER
+// SYMMETRY IS THE POINT. The binding guard's trick — `attr.binding != Global`
+// meaning "already specified" — does NOT transfer: `SymbolVisibility::Default`
+// is BOTH the unspecified sentinel AND a writable config value (TF-C92 added
+// `visibility:default`). A naive `!= Default` mirror fires on `hidden`→`default`
+// and SILENTLY FOLDS `default`→`hidden`, so the `default`-FIRST arms are the ones
+// that actually pin the explicit `visibilitySpecified` bit.
+//
+// ★ EACH ARM ASSERTS THE RESIDUE VIA `declaredVisibility` BESIDE THE MESSAGE.
+// A message-only assertion cannot see a wrong residue — exactly the bug the
+// binding half's first cut was caught on. The residue is `Hidden` in every arm
+// (the CONFINING value, derived from the shipped `isExternallyVisible`
+// predicate), which is what makes the rule symmetric in VALUE and not only in
+// when it fires.
+//
+// ★ NO COUNT ASSERTION HERE (see the binding pin's note): `linkageFrom` has
+// several H_UnknownLinkageSpecifier producers, so a count says nothing about
+// WHICH fired. The arm-specific `'<second>' specifies '` substring identifies the
+// producer AND the arm; `conflicts with` separates it from the generic
+// unrecognized-key fall-through. The count-of-one property has its own test.
+//
+// ★ NO DUNDER SPELLINGS. MEASURED: the strict lookup uses RAW token text, and
+// `stripDunder` applies only to the ignored-NAMES check, so
+// `__attribute__((__visibility__("hidden")))` reports `'__visibility__:hidden' is
+// not a recognized linkage specifier`. A dunder arm would be red for the wrong
+// reason (that loud rejection of legal GNU C is a separate, separately-anchored
+// gap — deliberately NOT fixed here).
+//
+// RED-ON-DISABLE — THREE variants, each BUILT AND RUN, results as OBSERVED (not
+// predicted; the second prediction below was wrong and is corrected here):
+//
+//   (i) restore the bare `attr.visibility = *it->second.visibility;` → all 8
+//       arms report an EMPTY message, and the 4 `hidden`-FIRST arms ALSO read the
+//       wrong residue (`Default`, i.e. still marked EXPORTED). The
+//       `default`-FIRST arms keep residue `Hidden` by last-wins COINCIDENCE —
+//       which is exactly why this pin asserts the MESSAGE as well as the residue.
+//
+//  (ii) delete ONLY the `attr.visibilitySpecified = true;` write → ALL 8 arms go
+//       silent. ★ THIS IS NOT THE ASYMMETRY DEMO, and an earlier write-up
+//       predicted that it was. With the write gone the flag is never true, so the
+//       guard never fires at all — a strict subset of (i). Recorded because the
+//       wrong prediction is easy to re-derive.
+//
+// (iii) ★★ THE ASYMMETRY DEMO, and the one that justifies the design. Keep
+//       everything and swap ONLY the guard KEY to the naive mirror of the binding
+//       half, `attr.visibility != SymbolVisibility::Default` → all four
+//       `hidden`→`default` arms STILL FIRE and PASS, while all four
+//       `default`→`hidden` arms go SILENT (`two specifiers`, `one clause list`,
+//       `prefix + after-declarator`, and `extern`). `...ReportsExactlyOnce` and
+//       the negative-control test both stay GREEN under it, because their
+//       conflicts are `hidden`-first. So ONLY a both-orders loop can see this
+//       half-fix — and the half it leaves silent is the half that REMOVES a
+//       symbol from the export table.
+TEST(HirLoweringCSubset, VisibilityConflictFailsLoudAndKeepsConfiningVisibility) {
+    // `second` is the composite KEY of the later-folded specifier, so the two
+    // orders report different (both correct) texts and neither arm can pass on
+    // the other's message.
+    struct Case { char const* what; char const* decl; char const* second; };
+    for (Case const c : {
+             // (1) two separate `__attribute__` specifiers, file scope.
+             Case{"two specifiers, hidden→default",
+                  "__attribute__((visibility(\"hidden\")))"
+                  " __attribute__((visibility(\"default\"))) int x = 7;\n",
+                  "visibility:default"},
+             Case{"two specifiers, default→hidden",
+                  "__attribute__((visibility(\"default\")))"
+                  " __attribute__((visibility(\"hidden\"))) int x = 7;\n",
+                  "visibility:hidden"},
+             // (2) ONE clause LIST inside ONE `__attribute__`. This form is NOT
+             // vacuous: `linkageFrom` DOES walk clause 2 and DOES form its
+             // composite key from there — MEASURED three ways at HEAD
+             // (`visibility("hidden"),bogus_xyz` → H000C on `bogus_xyz`;
+             // `visibility("hidden"),visibility("protected")` → H000C
+             // `'visibility:protected'`; and the shipped BINDING guard already
+             // fires from this exact position via
+             // `static int q __attribute__((visibility("hidden"),weak))`).
+             Case{"one clause list, hidden→default",
+                  "__attribute__((visibility(\"hidden\"),"
+                  "visibility(\"default\"))) int x = 7;\n",
+                  "visibility:default"},
+             Case{"one clause list, default→hidden",
+                  "__attribute__((visibility(\"default\"),"
+                  "visibility(\"hidden\"))) int x = 7;\n",
+                  "visibility:hidden"},
+             // (3) THE CROSS-SEED PATH — prefix specifier + after-declarator
+             // specifier on the SAME declarator. This is what justifies
+             // `visibilitySpecified` being a `LinkageAttr` FIELD rather than a
+             // local: `declaratorLinkage` seeds the trailing fold with the
+             // prefix's already-folded attribute, so the bit must survive that
+             // boundary. Without these two arms the field's necessity is
+             // untested.
+             Case{"prefix + after-declarator, hidden→default",
+                  "__attribute__((visibility(\"hidden\"))) int x"
+                  " __attribute__((visibility(\"default\"))) = 7;\n",
+                  "visibility:default"},
+             Case{"prefix + after-declarator, default→hidden",
+                  "__attribute__((visibility(\"default\"))) int x"
+                  " __attribute__((visibility(\"hidden\"))) = 7;\n",
+                  "visibility:hidden"}}) {
+        std::string const src = std::string(c.decl)
+                              + "int *px = &x;\n"
+                                "int main(void){ return *px; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find(std::string{"'"} + c.second + "' specifies '"),
+                  std::string::npos)
+            << c.what << " — got: \"" << msg << "\"; an EMPTY message means the "
+                         "conflict went back to last-wins, which is the "
+                         "silent export-table flip this closes";
+        EXPECT_NE(msg.find("conflicts with"), std::string::npos)
+            << c.what << " — got: \"" << msg << "\"; must be the CONFLICT "
+                         "diagnostic, not the generic unrecognized-key "
+                         "fall-through";
+        EXPECT_EQ(declaredVisibility(*res, model, "x"),
+                  std::optional{SymbolVisibility::Hidden})
+            << c.what << " — the CONFINING visibility must be the residue in "
+                         "BOTH orders: `Default` here means the rejected "
+                         "declaration is still marked EXPORTED (measured as "
+                         "`_dv4` present in the Mach-O export trie)";
+    }
+}
+
+// The `externDecl` position of the same conflict — a SEPARATE row in
+// `c-subset.lang.json` with its own `linkageSpecifiers` map (TF-C92 added
+// `visibility:default` to BOTH rows, so BOTH became silently last-wins). One row
+// is not evidence for the other: they are independent config, and the `extern`
+// row is the one tcl.h actually reaches (`#define EXTERN extern
+// TCL_STORAGE_CLASS` puts the attribute after `extern`, into `externSpecifiers`).
+// MEASURED silent (RC=0) at HEAD in both orders.
+TEST(HirLoweringCSubset, ExternDeclVisibilityConflictFailsLoudBothOrders) {
+    struct Case { char const* what; char const* decl; char const* second; };
+    for (Case const c : {
+             Case{"extern, hidden→default",
+                  "extern int e __attribute__((visibility(\"hidden\")))"
+                  " __attribute__((visibility(\"default\")));\n",
+                  "visibility:default"},
+             Case{"extern, default→hidden",
+                  "extern int e __attribute__((visibility(\"default\")))"
+                  " __attribute__((visibility(\"hidden\")));\n",
+                  "visibility:hidden"}}) {
+        std::string const src = std::string(c.decl)
+                              + "int *pe = &e;\n"
+                                "int main(void){ return *pe; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find(std::string{"'"} + c.second + "' specifies '"),
+                  std::string::npos)
+            << c.what << " — got: \"" << msg << "\"";
+        EXPECT_NE(msg.find("conflicts with"), std::string::npos)
+            << c.what << " — got: \"" << msg << "\"";
+        EXPECT_EQ(declaredVisibility(*res, model, "e"),
+                  std::optional{SymbolVisibility::Hidden})
+            << c.what << " — the confining residue must hold on the extern row "
+                         "too; nullopt would mean no ExternGlobal node exists "
+                         "at all, so there is nothing carrying the linkage";
+    }
+}
+
+// ★ THE ONE PLACE A COUNT *IS* THE PROPERTY. `linkageFrom` folds the shared
+// declaration PREFIX once and each declarator's TRAILING run separately — a
+// design whose stated purpose is that one typo in
+// `__attribute__((frobnicate)) int a, b, c;` reports ONCE, not three times. The
+// conflict guard must not break that: the prefix `hidden` is seeded into EVERY
+// declarator's fold, so a guard that re-emitted per declarator would report the
+// conflict on `a` (which carries no trailing attribute at all) as well as on `b`.
+// EXACTLY ONE diagnostic, and it must name the declarator that really conflicts.
+TEST(HirLoweringCSubset, VisibilityConflictOnSecondDeclaratorReportsExactlyOnce) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((visibility(\"hidden\"))) int a = 1,"
+        " b __attribute__((visibility(\"default\"))) = 2;\n"
+        "int *pa = &a; int *pb = &b;\n"
+        "int main(void){ return *pa + *pb; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "the conflict lives on the SECOND declarator only — the prefix fold "
+           "is shared, so a per-declarator re-emission would report it on `a` "
+           "too; got: \""
+        << firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier) << "\"";
+    EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
+                  .find("'visibility:default' specifies '"),
+              std::string::npos);
+    EXPECT_EQ(declaredVisibility(*res, model, "a"),
+              std::optional{SymbolVisibility::Hidden})
+        << "`a` takes the prefix `hidden` cleanly — it is not part of the "
+           "conflict and must not be collateral";
+    EXPECT_EQ(declaredVisibility(*res, model, "b"),
+              std::optional{SymbolVisibility::Hidden})
+        << "`b`'s rejected `default` leaves the confining `hidden` standing";
+}
+
+// ★★ TF-C93 — THE `static` ARM, AND THE ONLY THING THAT PINS THE
+// `SymbolBinding::Global` ARGUMENT.
+//
+// The residue rule asks the SHIPPED `isExternallyVisible` predicate which of two
+// conflicting candidates is CONFINING, and it deliberately passes
+// `SymbolBinding::Global` rather than `attr.binding`. The reasoning lives beside the
+// call in `cst_to_hir.cpp`: the predicate SHORT-CIRCUITS to false on `Local`, so
+// under a co-present `static` the REAL binding makes both candidates compare EQUAL,
+// which collapses the rule to "keep the incumbent" — and the incumbent is whichever
+// specifier happened to be folded FIRST. That is order dependence reintroduced
+// through an axis (storage class) that has nothing to do with visibility, inside the
+// one guard whose whole purpose is order SYMMETRY.
+//
+// ⚠ EVERY OTHER ARM IN THIS FILE IS BLIND TO IT, WHICH IS WHY THIS TEST EXISTS. All
+// nine arms of the three pins above declare NO storage class, so `attr.binding` is
+// already `Global` there and the literal is indistinguishable from the field.
+// MEASURED: swapping the literal to `attr.binding` leaves all nine GREEN.
+//
+// ★ THE DIAGNOSTIC FIRES IN BOTH ORDERS EITHER WAY (MEASURED), so a message-only
+// assertion is blind here too — the error is emitted BEFORE the residue is computed.
+// Only `declaredVisibility` discriminates; the message and binding checks are here to
+// stop the arm passing vacuously (wrong producer, or a `static` that never applied).
+//
+// RED-ON-DISABLE, BUILT AND RUN: swap both `SymbolBinding::Global` literals to
+// `attr.binding` → the `default`→`hidden` arm reads residue `Default` (both
+// candidates non-exporting under `Local` ⇒ keep the incumbent ⇒ keep `default`,
+// i.e. still marked EXPORTED) while the `hidden`→`default` arm stays GREEN by
+// coincidence. Half-green under the wrong argument is exactly why this needs BOTH
+// orders and not one probe.
+TEST(HirLoweringCSubset, StaticVisibilityConflictResidueIsBindingIndependent) {
+    struct Case { char const* what; char const* decl; char const* second; };
+    for (Case const c : {
+             Case{"static, hidden→default",
+                  "static __attribute__((visibility(\"hidden\")))"
+                  " __attribute__((visibility(\"default\"))) int x = 7;\n",
+                  "visibility:default"},
+             Case{"static, default→hidden",
+                  "static __attribute__((visibility(\"default\")))"
+                  " __attribute__((visibility(\"hidden\"))) int x = 7;\n",
+                  "visibility:hidden"}}) {
+        SCOPED_TRACE(c.what);
+        std::string const src = std::string(c.decl)
+                              + "int *px = &x;\n"
+                                "int main(void){ return *px; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find(std::string{"'"} + c.second + "' specifies '"),
+                  std::string::npos)
+            << c.what << " — got: \"" << msg << "\"; the conflict must still be "
+                         "REPORTED under a co-present storage class, or this arm "
+                         "is measuring a different code path than its siblings";
+        EXPECT_EQ(declaredBinding(*res, model, "x"),
+                  std::optional{SymbolBinding::Local})
+            << c.what << " — the `static` must actually have taken effect; without "
+                         "`Local` on the record this arm is vacuous and pins "
+                         "nothing about the predicate's short-circuit";
+        EXPECT_EQ(declaredVisibility(*res, model, "x"),
+                  std::optional{SymbolVisibility::Hidden})
+            << c.what << " — ★ THE ASSERTION THIS TEST EXISTS FOR. `Default` here "
+                         "means the residue rule consulted the REAL binding, "
+                         "short-circuited on `Local`, found both candidates equal, "
+                         "and kept whichever specifier came first — order "
+                         "dependence through the storage-class axis";
+    }
+}
+
+// NEGATIVE CONTROLS — the guard must be IDEMPOTENT and PER-AXIS, or it turns
+// legal C loud. Both shapes below are accepted by real clang with zero warnings
+// under -Wall -Wextra, and both were MEASURED silent at HEAD (so a regression
+// here is caused by the fix, never inherited).
+//
+//   • the SAME visibility twice is a re-fold, not a conflict — this is the arm
+//     that forbids keying the guard on "a trailing run was folded at all";
+//   • `visibility("hidden")` + `weak` touch DIFFERENT axes, so the visibility
+//     guard must stay silent while the binding is applied. Asserting the applied
+//     `Weak` beside the silence is what distinguishes "per-axis" from "the whole
+//     attribute was quietly dropped".
+TEST(HirLoweringCSubset, RepeatedAndCrossAxisVisibilitySpecifiersStaySilent) {
+    struct Case { char const* what; char const* decl; };
+    for (Case const c : {
+             Case{"hidden twice",
+                  "__attribute__((visibility(\"hidden\")))"
+                  " __attribute__((visibility(\"hidden\"))) int x = 7;\n"},
+             Case{"default twice",
+                  "__attribute__((visibility(\"default\")))"
+                  " __attribute__((visibility(\"default\"))) int x = 7;\n"}}) {
+        std::string const src = std::string(c.decl)
+                              + "int *px = &x;\n"
+                                "int main(void){ return *px; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                  std::string{})
+            << c.what << " — re-folding the SAME value is idempotent, not a "
+                         "conflict";
+    }
+    // Per-axis: one visibility + one binding on one declaration.
+    for (char const* decl : {
+             "__attribute__((visibility(\"hidden\")))"
+             " __attribute__((weak)) int x = 7;\n",
+             "__attribute__((weak))"
+             " __attribute__((visibility(\"hidden\"))) int x = 7;\n"}) {
+        std::string const src = std::string(decl)
+                              + "int *px = &x;\n"
+                                "int main(void){ return *px; }\n";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                  std::string{})
+            << decl << " — `visibility` and `weak` are different axes; a guard "
+                       "that fired here would reject legal C";
+        EXPECT_EQ(declaredVisibility(*res, model, "x"),
+                  std::optional{SymbolVisibility::Hidden}) << decl;
+        EXPECT_EQ(declaredBinding(*res, model, "x"),
+                  std::optional{SymbolBinding::Weak})
+            << decl << " — the silence must come from the axes being "
+                       "independent, NOT from the attribute being dropped";
+    }
 }
 
 // ── FC5: goto / labels ──────────────────────────────────────────────────────

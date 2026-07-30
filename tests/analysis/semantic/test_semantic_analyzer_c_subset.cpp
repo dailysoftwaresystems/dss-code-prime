@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -6385,42 +6386,647 @@ TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOrMergesAcrossPrototypeAndDefiniti
     }
 }
 
-// TF-C92: the FnSig GATE at the record. `__attribute__((no_sanitize_thread))` on a
-// DATA object is ACCEPTED but records nothing — the flag feeds a per-FUNCTION
-// decision, so a symbol whose kind could never honor it must not carry it. This test
-// asserts the CURRENT behaviour, which is acceptance plus total silence.
+// ★★★ TF-C92 → **FLIPPED BY TF-C93**
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). This test was written to PIN
+// THE SILENCE while naming it wrong, with in-code instructions to flip rather than
+// delete it. That is what happened: the fixture is byte-identical, the
+// records-nothing loop is VERBATIM, and only the diagnostic expectation moved from
+// "nothing at all" to "exactly one `S_AttributeIgnoredForDeclarationKind` Warning".
 //
-// ★★ THE SILENCE IS A TRACKED **DIVERGENCE FROM CLANG**, NOT THE INTENDED CONTRACT.
-// clang accepts the same declaration and WARNS (`-Wignored-attributes` class); DSS
-// accepts it and emits nothing, so an author who attached the attribute to the wrong
-// kind of entity is told nothing. Registered as
-// [[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]] — read the
-// `EXPECT_FALSE(hasErrors)` below as "this is what DSS does today", never as "no
-// diagnostic belongs here".
+// ★★ THE FLIP HAD TO BE ASSERTED POSITIVELY, AND THAT IS THE POINT OF THE TEST —
+// MEASURED. The new diagnostic is a WARNING, so `EXPECT_FALSE(model.hasErrors())`
+// still passes with it present: this test STAYED GREEN through the entire engine
+// change. A "flip" that only relaxed the old assertion would have shipped looking
+// verified while proving nothing. Hence the exact-code assertion below, and hence
+// the severity assertion beside it: a count-only check would also pass if
+// `S_UnknownAttribute` or `S_InlineNonFunction` fired instead, and a code-only check
+// would pass if a later cycle quietly promoted the code to an Error.
 //
-// ★ A FUTURE CYCLE FLIPS THIS TEST RATHER THAN DELETING IT: when that row is closed,
-// the same fixture must expect `S_AttributeIgnoredForDeclarationKind` and the
-// records-nothing loop below stays untouched (the gate still has to hold — a
-// diagnostic that ALSO recorded the flag would be a worse bug than the silence).
+// ★ THE `EXPECT_FALSE(isNoSanitizeThread)` LOOP IS KEPT VERBATIM ON PURPOSE. The
+// gate REPORTS; the `isFnSig &&` guard in the apply still REFUSES. A diagnostic that
+// ALSO recorded the flag would be a WORSE bug than the silence — a data-object
+// symbol carrying a codegen directive no consumer can honor — so both halves are
+// asserted together, in one test, and neither can be satisfied by breaking the
+// other.
 //
-// WHAT BREAKS THIS: dropping the `isFnSig &&` guard from the apply in
-// semantic_analyzer.cpp. Nothing else in the suite moves — the program still
-// compiles clean — which is why the gate needs its own assertion.
-TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOnDataObjectRecordsNothing) {
+// WHAT BREAKS THIS: deleting `appliesTo` from the `no_sanitize_thread` effects row
+// (the LOADER refuses the config, so the whole suite goes red — the coupling is
+// mechanical); deleting the decl-kind gate loop in semantic_analyzer.cpp (the
+// diagnostic count drops to 0 while the loop below stays green); dropping the
+// `isFnSig &&` guard from the apply (the loop below goes red while the diagnostic
+// stays).
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOnDataObjectWarnsAndRecordsNothing) {
     auto model = analyzeShipped(
         "c-subset",
         {"__attribute__((no_sanitize_thread)) int gv = 7;\n"
          "int main(void){return gv;}\n"});
     EXPECT_FALSE(model.hasErrors())
-        << "CURRENT behaviour, and a tracked divergence from clang (which warns) "
-           "rather than the contract — see "
-           "D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT: "
+        << "the decl-kind gate is a WARNING, not an error — clang treats the "
+           "sibling axes as -Wignored-attributes warnings and "
+           "--warnings-as-errors is the strict posture: "
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "exactly ONE ignored-for-kind diagnostic, asserted BY CODE — a bare "
+           "count would also pass if S_UnknownAttribute or S_InlineNonFunction "
+           "fired instead, and `hasErrors()` cannot see a Warning at all";
+    std::size_t warnings = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+            continue;
+        if (d.severity == DiagnosticSeverity::Warning) ++warnings;
+        EXPECT_NE(d.actual.find("no_sanitize_thread"), std::string::npos)
+            << "the message must NAME the attribute the author has to move: "
+            << d.actual;
+        EXPECT_NE(d.actual.find("variable"), std::string::npos)
+            << "…and the KIND it was found on, so the author can see why: "
+            << d.actual;
+    }
+    EXPECT_EQ(warnings, 1u)
+        << "the severity is part of the contract, not incidental — see the "
+           "measured grounds on S_AttributeIgnoredForDeclarationKind";
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         EXPECT_FALSE(model.symbols()[i].isNoSanitizeThread)
             << "no symbol may carry the flag when the only annotated declaration "
                "is a data object — symbol '" << model.symbols()[i].name << "'";
+    }
+}
+
+// ── ★★★ TF-C93: THE DECL-KIND MATRIX — ALL FOUR AXES × EVERY ENTITY KIND ──────
+//
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT.) The registry row called this
+// a SYSTEMIC class and asked for ONE shared gate rather than a per-attribute fix, so
+// the evidence has to be a MATRIX rather than one probe per cycle: a table-driven
+// sweep is the only shape in which "we forgot an axis" is visible.
+//
+// ★ THE SQLITE CORPUS PROVES NOTHING HERE — MEASURED, ZERO corpus impact (the
+// attribute appears in sqlite only in the FUNCTION position, which is exactly the
+// position that must stay silent). These tests are the sole evidence.
+//
+// ★★ THE CLASS MEMBERSHIP IS **FOUR** AXES ACROSS **FIVE** CONFIG ROWS, AND NOT THE
+// FOUR THE REGISTRY ROW FIRST NAMED. Among the attribute-EFFECT verbs, exactly
+// `noInline`, `alwaysInline` and `noSanitizeThread` discard on `isFnSig &&` (that
+// grep also finds `isFnSig` gates for `noreturn`, `inline` and `isNoOptimize`, which
+// are SPECIFIER scans, not rows of this table — membership is decided per axis by
+// whether the row's own sink discards on kind, never by counting grep hits).
+// `aligned` is NOT a member — no such gate, its sink discriminates by kind itself,
+// and it is the NEGATIVE CONTROL here. The `warnOnDiscard` axis IS a member and was
+// missed: MEASURED at HEAD 199fe7d, `int gw1 __attribute__((warn_unused_result)) = 1;`
+// compiled clean with ZERO diagnostics where clang warns, because the apply has no
+// kind gate at all and the flag landed on an object `checkCall` can never consult.
+//
+// ★ THAT AXIS IS **TWO ROWS**, WHICH IS WHY THE ROW COUNT EXCEEDS THE AXIS COUNT.
+// `nodiscard` and `warn_unused_result` share the verb but NOT the applicable-kind
+// set — the standard spelling is function-only per C23 6.7.13.3, the GNU spelling
+// also applies to typedefs per clang's own applicability text. Collapsing them into
+// one row is what produced this cycle's false positive; see `kDeclKindAxes`.
+namespace {
+// ★★ ONE ROW OF THE MATRIX — AND IT DECLARES THE **KIND SET**, NOT A PER-TEST
+// VERDICT. Each position test below DERIVES its expectation from this set: the
+// shared gate warns exactly when the position's `DeclarationKind` is ABSENT from the
+// row's `appliesTo`. One per-axis fact therefore drives all three position tests,
+// every column is READ, and a config change that is not mirrored here goes RED.
+//
+// ⚠ THIS SHAPE IS A CORRECTION, AND THE SHAPE IT REPLACES BENT THE CONFIG — recorded
+// because a test that manufactures the fact it checks is the failure mode this whole
+// file exists to prevent. The first draft carried a single `bool appliesToFn`, set on
+// all nine rows and NEVER READ, while the typedef pin below (then named
+// `…MatrixTypedefWarns`, renamed `…MatrixTypedefWarnsPerAxis` because the old name
+// asserted the fiction) demanded a warning from ALL NINE axes — i.e. UNIFORMITY
+// instead of truth per axis. `appliesTo` for `warn_unused_result` was then narrowed
+// to `["function"]` to satisfy it, and DSS began emitting `warning[S005F]` on
+// `typedef __attribute__((warn_unused_result)) int T;` — MEASURED clang-clean. A
+// matrix may assert uniformity ONLY where the axes are genuinely uniform; everywhere
+// else the expectation has to travel with the row.
+struct DeclKindAxis {
+    char const* attr;          // the spelling written into the fixture
+    bool        appliesToVar;  // is `variable` in this row's `appliesTo`?
+    bool        appliesToFn;   // …`function`?
+    bool        appliesToType; // …`type`?
+};
+
+// The four axes, in BOTH the bare and the dunder spelling. The effects table is
+// dunder-normalized (ONE row covers both), and that is asserted rather than assumed
+// — a future revision that keyed on raw text would silently lose every `__x__` form.
+//
+// ★ `warn_unused_result` IS THE ONE AXIS THAT DIFFERS, AND IT DIFFERS FROM ITS OWN
+// C23 SIBLING. clang's applicability text ENUMERATES typedefs among the valid
+// positions for the GNU spelling (MEASURED: zero diagnostics on all three typedef
+// forms), while C23 6.7.13.3 confines `nodiscard` to a function / struct / union /
+// enum declaration and clang refuses the object form for both. Two names, ONE
+// effect, TWO applicability sets — which is why the shipped config gives them
+// SEPARATE rows and why this column has to exist.
+constexpr DeclKindAxis kDeclKindAxes[] = {
+    //  spelling                    var    fn    type
+    {"noinline",                   false, true, false},
+    {"__noinline__",               false, true, false},
+    {"always_inline",              false, true, false},
+    {"__always_inline__",          false, true, false},
+    {"no_sanitize_thread",         false, true, false},
+    {"__no_sanitize_thread__",     false, true, false},
+    {"warn_unused_result",         false, true, true },
+    {"__warn_unused_result__",     false, true, true },
+    {"nodiscard",                  false, true, false},
+};
+
+// Exactly-one-warning-of-this-code, with the severity checked. Returns the count so
+// the caller can `EXPECT_EQ` — no `ASSERT_*` in a non-void helper (CI hazard).
+[[nodiscard]] std::size_t ignoredForKindWarnings(SemanticModel const& m) {
+    std::size_t n = 0;
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_AttributeIgnoredForDeclarationKind
+            && d.severity == DiagnosticSeverity::Warning) {
+            ++n;
+        }
+    }
+    return n;
+}
+} // namespace
+
+// AXIS × FUNCTION — every one of the four must stay SILENT where the attribute
+// genuinely applies. This is the anti-over-broad half, and it is what a gate written
+// as "warn whenever the flag is dropped" would fail: the function position is the one
+// sqlite actually uses (`wal.c:942`, `:2590`).
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixFunctionPositionStaysSilent) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        // Definition AND prototype: the two function shapes reach the gate by
+        // different routes (`isFunctionForm` vs `isFnSig`), and the extracted
+        // effective-kind predicate has to answer `Function` for both.
+        for (auto const* shape : {"static __attribute__(({})) int f(int x)"
+                                  "{{return x+1;}}\nint main(void){{return f(1);}}\n",
+                                  "__attribute__(({})) int f(int);\n"
+                                  "int f(int x){{return x+1;}}\n"
+                                  "int main(void){{return f(1);}}\n"}) {
+            auto const src = std::vformat(
+                shape, std::make_format_args(ax.attr));
+            SCOPED_TRACE(src);
+            auto m = analyzeShipped("c-subset", {src});
+            EXPECT_FALSE(m.hasErrors())
+                << (m.diagnostics().all().empty()
+                        ? "" : m.diagnostics().all()[0].actual);
+            EXPECT_EQ(ignoredForKindWarnings(m),
+                      ax.appliesToFn ? 0u : 1u)
+                << "the FUNCTION position is where these attributes BELONG — a "
+                   "gate that fires here refuses valid C (and, for the three "
+                   "FnSig-gated verbs, the exact shape sqlite writes). Derived "
+                   "from the row's declared kind set, so this stays honest if a "
+                   "future axis is NOT function-applicable";
+        }
+    }
+}
+
+// AXIS × DATA OBJECT — the defect. Every axis must WARN, exactly once, and the flag
+// must still NOT be recorded (report-and-refuse, never report-and-accept).
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixDataObjectWarns) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        auto const src = std::vformat(
+            "__attribute__(({})) int gv = 7;\nint main(void){{return gv;}}\n",
+            std::make_format_args(ax.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << "a WARNING, so no program that compiled before stops compiling: "
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m),
+                  ax.appliesToVar ? 0u : 1u)
+            << "MEASURED silent at HEAD 199fe7d — exactly one warning now. NO axis "
+               "declares `variable`, so every row is expected loud here; the "
+               "expectation is still DERIVED so that adding an object-applicable "
+               "axis cannot silently turn this into a false positive";
+        for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+            EXPECT_FALSE(m.symbols()[i].isNoInline)
+                << "the report must not also RECORD the flag: " << ax.attr;
+            EXPECT_FALSE(m.symbols()[i].isAlwaysInline) << ax.attr;
+            EXPECT_FALSE(m.symbols()[i].isNoSanitizeThread) << ax.attr;
+        }
+    }
+}
+
+// AXIS × TYPEDEF — the position `linkageFrom` never reached (a `typedefDecl`
+// declares no `linkageSpecifiers`, so the loud linkage gate early-returns), which is
+// why it was silent for every axis and is asserted separately from the object case.
+//
+// ★★ THIS IS THE TEST THAT USED TO ASSERT A FICTION, AND THE SPLIT IS WHAT IT
+// MEASURES NOW. It previously demanded a warning from ALL NINE axes; that uniformity
+// is FALSE, and satisfying it is what narrowed `warn_unused_result`'s `appliesTo`
+// until DSS diagnosed clang-clean C. The expectation is now DERIVED per axis:
+//   • the six FnSig-gated spellings + `nodiscard`  → LOUD (typedef is out of bounds)
+//   • `warn_unused_result` / `__warn_unused_result__` → SILENT, because clang's own
+//     applicability list names typedefs and MEASURED emits nothing there.
+// The silent arm is the load-bearing one: re-narrow that row and this test goes RED
+// rather than quietly re-blessing the false positive.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixTypedefWarnsPerAxis) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        auto const src = std::vformat(
+            "typedef __attribute__(({})) int T;\n"
+            "int main(void){{T x = 0; return x;}}\n",
+            std::make_format_args(ax.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        std::size_t const want = ax.appliesToType ? 0u : 1u;
+        EXPECT_EQ(ignoredForKindWarnings(m), want)
+            << (ax.appliesToType
+                    ? "this spelling IS typedef-applicable (clang enumerates "
+                      "typedefs and MEASURED emits nothing) — a warning here is "
+                      "the FALSE POSITIVE this row's split exists to remove"
+                    : "the typedef position must warn for this spelling — the gate "
+                      "reads the effective DeclarationKind (Type here), not just "
+                      "'is it a FnSig'");
+        if (want == 0u) continue;
+        for (auto const& d : m.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+                continue;
+            EXPECT_NE(d.actual.find("type"), std::string::npos)
+                << "and it must SAY 'type', so the author is not left guessing "
+                   "which entity the compiler thinks it saw: " << d.actual;
+        }
+    }
+}
+
+// ★★ THE TYPEDEF SILENCE IS **NOT** VACUOUS — the two spellings must diverge on the
+// SAME declaration shape, or the arm above could pass because the gate stopped
+// working for typedefs altogether. This pins the DIVERGENCE itself: one row's name
+// silent, the other's loud, same position, same fixture shape. It is also the
+// red-on-disable witness for the row split — merge the two rows back under either
+// `appliesTo` and exactly one of these two expectations fails.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindTypedefSplitsTheTwoDiscardSpellings) {
+    struct Case { char const* attr; std::size_t want; char const* why; };
+    for (Case const c : {
+             Case{"warn_unused_result", 0u,
+                  "the GNU spelling applies to a typedef (clang: zero diagnostics "
+                  "on all three typedef forms, MEASURED)"},
+             Case{"nodiscard", 1u,
+                  "C23 6.7.13.3 confines the standard spelling to a function / "
+                  "struct / union / enum declaration, so a typedef is out of "
+                  "bounds and must stay loud"}}) {
+        SCOPED_TRACE(c.attr);
+        auto const src = std::vformat(
+            "typedef __attribute__(({})) int T;\n"
+            "int main(void){{T x = 0; return x;}}\n",
+            std::make_format_args(c.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), c.want) << c.why;
+    }
+    // …and the OBJECT position stays loud for BOTH, so the split narrowed exactly
+    // one position and did not quietly disarm the axis it was meant to keep.
+    for (auto const* attr : {"warn_unused_result", "nodiscard"}) {
+        SCOPED_TRACE(attr);
+        auto const src = std::vformat(
+            "int gw __attribute__(({})) = 1;\nint main(void){{return gw;}}\n",
+            std::make_format_args(attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "clang warns -Wignored-attributes on the object form for BOTH "
+               "spellings (MEASURED) — widening either row to `variable` would "
+               "silence a real misuse";
+    }
+}
+
+// ★★ THE NEGATIVE CONTROL — `aligned(16)`. It is NOT a member of the class and the
+// shared gate must stay SILENT for it in every position, because its own sink is the
+// SOLE authority on that axis and already discriminates by kind:
+//   * FUNCTION  → already LOUD, `error[S002F]` (S_AlignasInvalidContext, and that
+//                 code is UNSUPPRESSABLE). If `appliesTo` omitted "function" the one
+//                 mistake would DOUBLE-REPORT: this cycle's warning PLUS that error.
+//   * OBJECT    → SILENT and HONORED (`explicitAlignment` is set) — correct C, and
+//                 the case that proves the gate is not a blanket "attribute on an
+//                 object" warning.
+//   * TYPEDEF   → a GRADED judgement, unchanged by this cycle.
+// Its `appliesTo` therefore lists every kind its sink judges, which is a deliberate
+// statement about the SINK, not about the attribute's C semantics.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixAlignedIsTheNegativeControl) {
+    {   // OBJECT: silent, honored.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((aligned(16))) int ga = 7;\n"
+             "int main(void){return ga;}\n"});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "`aligned` on an object is CORRECT C and is honored — a warning "
+               "here means the gate widened into 'any attribute on an object'";
+        bool honored = false;
+        for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+            if (m.symbols()[i].name == "ga"
+                && m.symbols()[i].explicitAlignment.has_value()
+                && *m.symbols()[i].explicitAlignment == 16u) {
+                honored = true;
+            }
+        }
+        EXPECT_TRUE(honored)
+            << "and the value must still REACH the symbol — the negative control "
+               "is worthless if the attribute stopped working";
+    }
+    {   // FUNCTION: the shipped unsuppressable error, and ONLY it.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((aligned(16))) int fa(void);\n"
+             "int main(void){return fa();}\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_AlignasInvalidContext), 1u)
+            << "the shipped S002F refusal is the sole authority on this axis";
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "and it must not be JOINED by the shared warning — one mistake, "
+               "one diagnostic. This is what `appliesTo` listing 'function' buys";
+    }
+    {   // EXTERN position: MEASURED reachable, same single-diagnostic property.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"extern int fe1(void) __attribute__((aligned(16)));\n"
+             "int main(void){return 0;}\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_AlignasInvalidContext), 1u)
+            << "the externDecl row is REACHABLE for this axis (MEASURED) — it is "
+               "not a position the gate may quietly skip";
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u);
+    }
+}
+
+// ★★ A FUNCTION-POINTER OBJECT — `dk == Variable` while `isFnSig == false`, because
+// the declared type is `Ptr<FnSig>` and not `FnSig`. This is the exact distinction
+// D-CSUBSET-NORETURN's F1 pin exists for, and it is the case where a gate written as
+// "warn when `!isFnSig`" and a gate written as "warn when the effective kind is not
+// in `appliesTo`" happen to agree — so it is pinned to keep them agreeing after the
+// next reshape of the effective-kind predicate.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindFunctionPointerObjectWarns) {
+    auto m = analyzeShipped(
+        "c-subset",
+        {"typedef int(*fp)(int);\n"
+         "__attribute__((no_sanitize_thread)) fp g = 0;\n"
+         "int main(void){return g == 0;}\n"});
+    EXPECT_FALSE(m.hasErrors())
+        << (m.diagnostics().all().empty()
+                ? "" : m.diagnostics().all()[0].actual);
+    EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+        << "a POINTER to function is an OBJECT — the attribute cannot apply to it, "
+           "and `Ptr<FnSig>` is not `FnSig`";
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+            continue;
+        EXPECT_NE(d.actual.find("variable"), std::string::npos) << d.actual;
+    }
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        EXPECT_FALSE(m.symbols()[i].isNoSanitizeThread)
+            << "…and nothing records the flag";
+}
+
+// ★★ THE SAME `Ptr<FnSig>` SHAPE, THE `warn_unused_result` SPELLING — AND HERE THE
+// WARNING IS A **FALSE POSITIVE**. This test PINS A KNOWN DIVERGENCE FROM CLANG; it
+// is NOT an assertion that the behaviour is correct.
+//
+//   [[D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT]]
+//
+// ⚠ READ THE CONTRAST WITH THE TEST DIRECTLY ABOVE BEFORE TOUCHING EITHER. Both feed
+// a function-POINTER OBJECT (`dk == Variable`, `isFnSig == false`). They differ in the
+// REFERENCE behaviour, MEASURED with `/usr/bin/clang -std=c23 -Wall -Wextra`:
+//   * `no_sanitize_thread` on that shape → clang HARD-ERRORS ("'no_sanitize_thread'
+//     attribute only applies to functions"), so the test above asserts a warning DSS
+//     is RIGHT to emit;
+//   * `warn_unused_result` on that shape → clang is **SILENT**, and it does not merely
+//     tolerate the attribute, it HONORS it: through a call on such a pointer clang
+//     warns `-Wunused-result` while DSS says nothing at the call. clang's own
+//     applicability text — quoted verbatim in the shipped row — lists "function
+//     pointers" among the valid positions.
+// So DSS is wrong in BOTH directions on this one shape: a false positive at the
+// declaration AND a false negative at the call. Both halves are pinned below.
+//
+// ⚠⚠ NOT FIXABLE BY WIDENING `appliesTo`, WHICH IS WHY THIS IS A PIN AND NOT A FIX.
+// A function-pointer object is `DeclarationKind::Variable` — the SAME kind as the
+// plain `int gw1 __attribute__((warn_unused_result)) = 1;` that clang genuinely DOES
+// warn about (MEASURED, `-Wignored-attributes`). Adding `variable` to the row would
+// silence the CORRECT case along with the incorrect one, so the 4-value
+// `DeclarationKind` vocabulary cannot express clang's rule at all; closing it needs a
+// 5th spelling (e.g. `functionPointer`). Asserting BOTH cases side by side in one test
+// is what makes that inexpressibility OBSERVABLE rather than merely argued.
+//
+// ★ WHEN THE REGISTRY ROW CLOSES, **FLIP** THESE EXPECTATIONS — do not delete the
+// test. A silent fix is as bad as a silent regression here: the whole point of the pin
+// is that today's answer cannot change without a test turning red.
+TEST(SemanticAnalyzerCSubset,
+     AttributeDeclKindFunctionPointerObjectWarnUnusedResultIsAKnownDivergence) {
+    // The three spellings, each MEASURED clang-SILENT and DSS-loud.
+    for (auto const* src : {
+             "extern __attribute__((warn_unused_result)) int (*fp)(void);\n"
+             "int main(void){ return 0; }\n",
+             "extern int (*fp)(void) __attribute__((warn_unused_result));\n"
+             "int main(void){ return 0; }\n",
+             "extern __attribute__((__warn_unused_result__)) int (*fp)(void);\n"
+             "int main(void){ return 0; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "TODAY'S BEHAVIOUR, pinned as a KNOWN DIVERGENCE — clang compiles "
+               "this silently AND honors the attribute. If this now reads 0 the "
+               "divergence was CLOSED: update "
+               "D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT and flip "
+               "this expectation deliberately, rather than deleting the pin";
+        for (auto const& d : m.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+                continue;
+            EXPECT_NE(d.actual.find("variable"), std::string::npos) << d.actual;
+        }
+    }
+    {   // THE FALSE-NEGATIVE HALF — clang warns AT THE CALL, DSS does not.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"extern __attribute__((warn_unused_result)) int (*fp)(void);\n"
+             "int main(void){ fp(); return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "TODAY'S BEHAVIOUR: the flag landed on a VARIABLE's SymbolRecord "
+               "while `checkCall`'s discard check consults the CALLEE's, so the "
+               "discarded result goes unreported — where clang warns "
+               "-Wunused-result (MEASURED). Same root as the typedef miss below";
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "…and the declaration still carries the false positive, so the two "
+               "halves of this divergence are independent and both must be flipped";
+    }
+    {   // THE CASE THAT MAKES WIDENING THE ROW IMPOSSIBLE: a PLAIN data object is
+        // the SAME DeclarationKind, and there the warning is CORRECT.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"int gw1 __attribute__((warn_unused_result)) = 1;\n"
+             "int main(void){ return gw1; }\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "clang warns -Wignored-attributes here (MEASURED), so THIS warning "
+               "is right — and it is `DeclarationKind::Variable`, exactly like the "
+               "function-pointer object above. That is the inexpressibility: one "
+               "kind, two required answers, so no `appliesTo` value can be correct";
+    }
+}
+
+// ★★ THE SECOND MISS ON THE SAME ROOT — `warn_unused_result` ON A TYPEDEF IS NOT
+// PROPAGATED TO THE CALL SITE. Also a PIN ON A KNOWN DIVERGENCE, not an endorsement.
+//
+//   [[D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT]] (second miss)
+//
+// The shipped row declares `type` in its `appliesTo`, which correctly STOPS the
+// decl-kind gate from firing on a typedef — clang accepts every typedef shape at the
+// DECLARATION. But `appliesTo` only silences the gate; it does not ROUTE the fact.
+// RE-MEASURED 2026-07-30, `/usr/bin/clang -std=c23 -Wall -Wextra` against the shipped
+// CLI, a DISCARDED call in each of the four shapes — and it is a 3-of-4 agreement, NOT
+// the 4-of-4 the shipped row's own comment claimed until this cycle corrected it:
+//   (1) `typedef __attribute__((warn_unused_result)) int T;` + `T g(void)` + `g();`
+//       → clang WARNS ("ignoring return value of type 'T' …" [-Wunused-value]) while
+//         DSS emits NOTHING.  ← THE DIVERGENCE
+//   (2) leading fn-pointer typedef   → clang silent, DSS silent.  AGREEMENT
+//   (3) trailing fn-pointer typedef  → clang silent, DSS silent.  AGREEMENT
+//   (4) function-type typedef        → clang silent, DSS silent.  AGREEMENT
+// Shape (1) is the one where the typedef names the RETURN TYPE rather than the callee:
+// clang propagates the attribute from the return type onto the call expression, DSS
+// does not, because the flag lands on the TYPE's record while `checkCall` reads the
+// CALLEE's. Same root as the function-pointer-object miss above.
+//
+// ★ THE CONTROL IS WHAT MAKES THIS NON-VACUOUS. The DIRECT function form DOES warn
+// (`warning[S003E]` S_NodiscardResultDiscarded, MEASURED, matching clang), so the
+// discard checker is demonstrably ALIVE and shape (1)'s silence is specifically a
+// missing ALIAS propagation — not a dead check that would make every `0u` below pass
+// for the wrong reason.
+//
+// ★ WHEN THIS CLOSES, FLIP shape (1) to 1u; the three AGREEMENT shapes must STAY 0u,
+// or the fix over-fired into C that every real toolchain compiles clean.
+TEST(SemanticAnalyzerCSubset,
+     AttributeDeclKindTypedefReturnTypePropagationIsAKnownDivergence) {
+    {   // THE CONTROL — the direct function form, where DSS and clang agree.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((warn_unused_result)) int g(void){return 1;}\n"
+             "int main(void){ g(); return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 1u)
+            << "the discard checker must be ALIVE, or every 0u below passes for the "
+               "wrong reason and this whole test becomes decoration";
+    }
+    {   // SHAPE (1) — the divergence.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"typedef __attribute__((warn_unused_result)) int T;\n"
+             "T g(void){return 1;}\n"
+             "int main(void){ g(); return 0; }\n"});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "the DECLARATION is correctly silent — clang accepts the typedef "
+               "position for the GNU spelling, which is exactly what `type` in "
+               "`appliesTo` buys";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "TODAY'S BEHAVIOUR, pinned as a KNOWN DIVERGENCE: clang WARNS here "
+               "('ignoring return value of type T', MEASURED) and DSS does not — it "
+               "does not propagate the attribute through the alias. If this now "
+               "reads 1 the miss was CLOSED: update the registry row and flip this";
+    }
+    // SHAPES (2)–(4) — clang-SILENT and DSS-silent. Pinned as AGREEMENT so a future
+    // propagation fix cannot over-fire into C every real toolchain accepts.
+    for (auto const* src : {
+             "typedef __attribute__((warn_unused_result)) int (*FP)(void);\n"
+             "extern FP fp;\nint main(void){ fp(); return 0; }\n",
+             "typedef int (*FP)(void) __attribute__((warn_unused_result));\n"
+             "extern FP fp;\nint main(void){ fp(); return 0; }\n",
+             "typedef int FT(void) __attribute__((warn_unused_result));\n"
+             "extern FT g;\nint main(void){ g(); return 0; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "clang accepts these typedef shapes silently (MEASURED) — a warning "
+               "here is the false positive the row split exists to prevent";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "and clang does NOT warn at the call in these three, so DSS's "
+               "silence is AGREEMENT — a propagation fix must not fire here";
+    }
+}
+
+// ★★ ONE DIAGNOSTIC PER OFFENDING SPELLING, not one per DECLARATOR — AND READ THE
+// CAVEAT, because half of this test is NOT a pin on the gate's latch.
+//
+// The gate sits inside the per-declarator loop while the declaration-level attribute
+// facts are folded ONCE and COPIED into every declarator, so `int a, b, c;` reaches
+// `report()` three times and the gate carries a clause-node latch for it.
+//
+// ⚠ MEASURED, AND IT REFUTES THE OBVIOUS RED-ON-DISABLE: deleting that latch leaves
+// the FIRST case below GREEN. `DiagnosticReporter`'s `dedupWindow` (default 4) drops
+// a report whose (code, buffer, span, ruleContext, `actual`) matches a recent one,
+// and all three repeats match exactly. So case 1 pins the OBSERVABLE property —
+// which is what a user experiences, and what a future change to either mechanism
+// must preserve — not the latch specifically.
+//
+// ★ AND THE WINDOW IS **ALWAYS** 4 ON THIS PATH — do not reach for the "some driver
+// sets `dedupWindow = 0`" argument, which an earlier write-up used and which is
+// FALSE for this diagnostic: it reports into `EngineState::reporter`, a
+// default-constructed reporter that `analyzeImpl` never reconfigures and then moves
+// whole into the `SemanticModel`. The latch is kept for the OTHER reason — the dedup
+// key includes `actual`, so the day this message names the declarator the window
+// stops collapsing the repeats. See the gate's own comment.
+//
+// ★ CASE 2 **DOES** DISCRIMINATE, and it is what rules out the cheaper fix: a bare
+// bool latch would collapse TWO DIFFERENT misplaced attributes on one declaration
+// into one diagnostic — a fresh silent drop in the cycle whose whole purpose is to
+// remove one — and the reporter's dedup would NOT have masked it (differing `actual`
+// ⇒ differing key). Keying on the clause node is what makes both cases hold at once.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindWarnsOncePerSpellingNotPerDeclarator) {
+    {   // THREE declarators, ONE spelling ⇒ ONE diagnostic.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((noinline)) int a, b, c;\n"
+             "int main(void){return a+b+c;}\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "one erroneous specifier is one mistake — three declarators must "
+               "not mean three diagnostics. (Held by the gate's clause-node latch "
+               "AND, independently, by the reporter's dedup window — see the "
+               "measured caveat above; this asserts the OBSERVABLE property)";
+    }
+    {   // ONE declarator, TWO distinct spellings ⇒ TWO diagnostics.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((noinline)) __attribute__((warn_unused_result)) "
+             "int gv = 1;\nint main(void){return gv;}\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 2u)
+            << "two DIFFERENT misplaced attributes are two mistakes — a bare "
+               "bool latch would swallow the second, which is exactly the silent "
+               "drop this cycle exists to remove";
+    }
+}
+
+// ★★ POSITIONS THE GATE COVERS THAT THE PLAN EXPECTED IT TO MISS — STATED BECAUSE
+// SILENTLY EXCEEDING A SPEC IS AS HARD TO REVIEW AS SILENTLY MISSING IT.
+//
+// The plan listed block-scope locals as out of scope, on the reading that `varDecl`
+// ignores `attrSpec`/`stdAttr` wholesale. MEASURED with the shipped CLI: that
+// wholesale ignore belongs to the LINKAGE scan (`linkageSpecifierIgnoredRules`)
+// only — the SEMANTIC attribute scan runs on block-scope declarations in BOTH the
+// leading and the mid positions, so both WARN. That is strictly more fail-loud than
+// planned and is pinned here so it cannot regress into the predicted silence
+// unnoticed.
+//
+// STILL out of scope, and genuinely so: a struct member in the LEADING attribute
+// position does not PARSE (P0009), so there is no declaration for the gate to judge.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindBlockScopeLocalAlsoWarns) {
+    for (auto const* src : {
+             "int main(void){ __attribute__((noinline)) int x = 1; return x; }\n",
+             "int main(void){ int __attribute__((noinline)) x = 1; return x; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "MEASURED: block scope reaches the semantic attribute scan in both "
+               "positions, so both warn — the plan predicted silence here";
     }
 }
 

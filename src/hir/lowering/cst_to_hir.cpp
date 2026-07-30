@@ -1690,7 +1690,142 @@ struct Lowerer {
                     }
                     attr.binding = *it->second.binding;
                 }
-                if (it->second.visibility) attr.visibility = *it->second.visibility;
+                if (it->second.visibility) {
+                    // ★★ THE VISIBILITY AXIS IS NOT LAST-WINS EITHER — TF-C93,
+                    // closing the VISIBILITY half of
+                    // D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS
+                    // (the BINDING half above closed at TF-C73 and is the
+                    // precedent this mirrors).
+                    //
+                    // MEASURED at HEAD 199fe7d, `--target
+                    // arm64:macho64-arm64-darwin-dylib`, both orders, ZERO
+                    // diagnostics and RC=0 in each:
+                    //   `__attribute__((visibility("hidden")))
+                    //    __attribute__((visibility("default"))) int dv4 = 1;`
+                    //     → `dyld_info -exports` lists `_dv4` (EXPORTED)
+                    //   the same two specifiers SWAPPED
+                    //     → `_dv4` absent from the export trie (HIDDEN)
+                    // The dynamic export table of the shipped image flips on
+                    // SOURCE ORDER while the user is told nothing. GROUND TRUTH
+                    // is real clang on this Mac, which HARD-ERRORS both orders
+                    // with `visibility does not match previous declaration` and
+                    // emits no object; GCC is documented to warn and keep the
+                    // EARLIER value. Plain last-wins is NEITHER behaviour.
+                    //
+                    // ★★★ KEYED ON AN EXPLICIT `visibilitySpecified` BIT, NOT ON
+                    // `attr.visibility != Default`, AND THAT IS THE WHOLE
+                    // CORRECTION. Copying the binding guard's shape verbatim
+                    // would ship an ORDER-ASYMMETRIC guard: the binding trick
+                    // works only because `SymbolBinding::Global` is UNWRITABLE
+                    // from config (MEASURED: zero `"binding": "global"` rows), so
+                    // `!= Global` really does mean "already specified".
+                    // `SymbolVisibility::Default = 0` is BOTH the unspecified
+                    // sentinel AND a writable value (`visibility:default`, added
+                    // TF-C92 for tcl.h's `DLLEXPORT`), so a `!= Default` mirror
+                    // fires on `hidden`→`default` and SILENTLY FOLDS
+                    // `default`→`hidden` to Hidden — half a fix, and the half it
+                    // keeps silent is the one that REMOVES a symbol from the
+                    // export table. ★ NOT a hypothetical: MEASURED by BUILDING
+                    // that exact mirror and running the pins — all four
+                    // `hidden`-first arms passed while all four `default`-first
+                    // arms (two-specifier, one-clause-list, cross-seed, and
+                    // `externDecl`) went SILENT, and the count pin plus the
+                    // negative controls stayed GREEN throughout, so only a
+                    // both-orders loop can see it. See
+                    // `LinkageAttr::visibilitySpecified` and the
+                    // `VisibilityConflictFailsLoudAndKeepsConfiningVisibility`
+                    // pin's RED-ON-DISABLE note (variant iii).
+                    //
+                    // Re-folding the SAME value stays silent (idempotent
+                    // `hidden`,`hidden`), and the two axes are independent:
+                    // `visibility("hidden")` + `weak` touches two different axes
+                    // and produces no visibility diagnostic. Source-agnostic: no
+                    // specifier NAME is hardcoded — the conflict is between two
+                    // config-declared visibility VALUES, so any language whose
+                    // `linkageSpecifiers` table can express two visibilities gets
+                    // the same protection for free.
+                    //
+                    // ★ H000C's MESSAGE-SHAPE COUNT IS NOW **FIVE**, and that
+                    // cost is accepted deliberately rather than overlooked:
+                    // adjacent-concat (`:1601`), malformed-string (`:1614`),
+                    // binding conflict (`:1659`), unrecognized key (`:1697`), and
+                    // this one. Only the fourth is literally "unknown specifier".
+                    // A DEDICATED code for the visibility half was REJECTED
+                    // because the binding half already reuses this code for
+                    // exactly this purpose, so a new row would make the two
+                    // halves of ONE anchor diverge in how they report — and the
+                    // corpus cost of ERROR severity was MEASURED at zero.
+                    if (attr.visibilitySpecified
+                        && *it->second.visibility != attr.visibility) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              std::format(
+                                  "'{}' specifies '{}' visibility, which "
+                                  "conflicts with the '{}' visibility already "
+                                  "specified for this declaration",
+                                  key,
+                                  symbolVisibilityName(*it->second.visibility),
+                                  symbolVisibilityName(attr.visibility)));
+                        // ★ THE RESIDUE IS THE CONFINING VISIBILITY — the
+                        // REASONING of the binding half above (keep `Local`),
+                        // NOT its literal. A flat `Hidden` would be WRONG:
+                        // `SymbolVisibility` is 4-valued and restrictiveness is
+                        // NOT numeric order — `Protected(2)` IS externally
+                        // visible while `Hidden(1)` is not. So the confining
+                        // candidate is derived from the SHIPPED predicate
+                        // `isExternallyVisible` (symbol_attrs.hpp), the same
+                        // source of truth DCE and all three object emitters
+                        // consult: keep whichever candidate that predicate calls
+                        // NOT externally visible.
+                        //
+                        // ★★ `SymbolBinding::Global` IS PASSED DELIBERATELY, NOT
+                        // `attr.binding`, and this is load-bearing. The predicate
+                        // SHORT-CIRCUITS to false on `Local`, so feeding it the
+                        // real binding would make both candidates compare equal
+                        // under a co-present `static` and collapse the rule to
+                        // "keep the incumbent" — whose answer then depends on
+                        // whether `static` was folded BEFORE or AFTER the
+                        // visibility pair, i.e. it would reintroduce order
+                        // dependence through an UNRELATED axis. `Global` isolates
+                        // the visibility question: it makes the call a pure
+                        // function of visibility ({Hidden, Internal} confine;
+                        // {Default, Protected} export).
+                        //
+                        // ★ PINNED BY EXACTLY ONE TEST, AND IT HAD TO BE WRITTEN
+                        // FOR IT (TF-C93). Every arm of the three position pins
+                        // declares no storage class, so `attr.binding` is already
+                        // `Global` there and the literal is indistinguishable from
+                        // the field — MEASURED: swapping it leaves all NINE of them
+                        // GREEN. `StaticVisibilityConflictResidueIsBindingIndependent`
+                        // adds `static` + a conflicting visibility pair in BOTH
+                        // orders; RED-ON-DISABLE, BUILT AND RUN: under
+                        // `attr.binding` its `default`→`hidden` arm reads residue
+                        // `Default` (both candidates non-exporting ⇒ keep the
+                        // incumbent) while its `hidden`→`default` arm still passes,
+                        // which is why that pin loops both orders.
+                        //
+                        // When both candidates agree under the predicate
+                        // (Hidden vs Internal, Default vs Protected) the
+                        // incumbent stands: the diagnostic already fails the
+                        // build, so no artifact is produced from either order,
+                        // and there is no confining choice to make.
+                        bool const incumbentExports = isExternallyVisible(
+                            SymbolBinding::Global, attr.visibility);
+                        bool const candidateExports = isExternallyVisible(
+                            SymbolBinding::Global, *it->second.visibility);
+                        if (!candidateExports && incumbentExports)
+                            attr.visibility = *it->second.visibility;
+                    } else {
+                        attr.visibility          = *it->second.visibility;
+                        attr.visibilitySpecified = true;
+                    }
+                    // ★ NO `continue` HERE (unlike the binding guard). A
+                    // rejected visibility must not also DROP an orthogonal axis
+                    // the same key might carry: no shipped row pairs
+                    // `visibility` with `staticStorage` today, so this is inert
+                    // in c-subset, but a `continue` would make a future pairing
+                    // silently lose the storage fact — the exact class this
+                    // anchor exists to close.
+                }
                 if (it->second.staticStorage && staticStorageOut != nullptr)
                     *staticStorageOut = true;
             } else {

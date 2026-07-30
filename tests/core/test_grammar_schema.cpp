@@ -1896,7 +1896,8 @@ namespace {
           "attrSpecRule":      "attrSpec",
           "stdAttrRule":       "stdAttr",
           "bareStatementRule": "bare",
-          "effects": [ { "names": ["maybe_unused"], "effect": "suppressUnused" } ]
+          "effects": [ { "names": ["maybe_unused"], "appliesTo": ["variable"],
+                         "effect": "suppressUnused" } ]
         }
       })JSON";
     auto const pos = body.find("%EXTRA%");
@@ -2113,7 +2114,8 @@ namespace {
 // The reference vocabulary: `deprecated` carries a declaration-attached effect
 // and IS linkage-ignored; `fallthrough` is inert and deliberately is NOT.
 constexpr std::string_view kConsistentEffects =
-    R"([ { "names": ["deprecated"],  "effect": "warnOnUse" },
+    R"([ { "names": ["deprecated"],  "appliesTo": ["variable"],
+           "effect": "warnOnUse" },
          { "names": ["fallthrough"], "effect": "none"      } ])";
 constexpr std::string_view kIgnoresDeprecated =
     R"("linkageSpecifierIgnoredNames": ["deprecated"],)";
@@ -2126,7 +2128,8 @@ constexpr std::string_view kIgnoresDeprecated =
 // `aligned` attribute could never be declared at all.
 TEST(GrammarSchema, AttributeEffectAlignLoads) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["aligned"], "effect": "align" } ])",
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" } ])",
         R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value())
@@ -2180,9 +2183,19 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
         // Direction 1 — every verb the LOADER ACCEPTS must be LISTED. A verb
         // the loader takes but the message omits sends an author who is
         // already confused to fix the wrong thing.
+        //
+        // ★ TF-C93: the probe row now has to respect the `appliesTo` split, and
+        // this branch IS the split, stated once: every verb but `none` REQUIRES
+        // the key, `none` REFUSES it. Writing one shape for both would make the
+        // loop fail for a reason that has nothing to do with the verb vocabulary
+        // it is here to check.
         auto const good = attrVocabSchema(
-            std::format(R"([ {{ "names": ["aligned"], "effect": "{}" }} ])",
-                        verb),
+            verb == "none"
+                ? std::string{R"([ { "names": ["aligned"], "effect": "none" } ])"}
+                : std::format(R"([ {{ "names": ["aligned"],
+                                      "appliesTo": ["variable"],
+                                      "effect": "{}" }} ])",
+                              verb),
             R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
         auto const ok = GrammarSchema::loadFromText(good);
         ASSERT_TRUE(ok.has_value())
@@ -2221,7 +2234,8 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
 // below is exactly that demotion, admitted by the loader.
 TEST(GrammarSchema, AttributeEffectDuplicateNameAcrossRowsReportsInvalid) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["aligned"], "effect": "align" },
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" },
              { "names": ["aligned"], "effect": "none"  } ])",
         R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
@@ -2247,7 +2261,8 @@ TEST(GrammarSchema, AttributeEffectDuplicateNameAcrossRowsReportsInvalid) {
 // this the conflicting pair is spelled around in one character.
 TEST(GrammarSchema, AttributeEffectDuplicateNameIsDunderNormalized) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["aligned"],     "effect": "align" },
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" },
              { "names": ["__aligned__"], "effect": "none"  } ])",
         R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
@@ -2262,7 +2277,8 @@ TEST(GrammarSchema, AttributeEffectDuplicateNameIsDunderNormalized) {
 // is over the table, not over row boundaries.
 TEST(GrammarSchema, AttributeEffectDuplicateNameWithinOneRowReportsInvalid) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["deprecated", "deprecated"], "effect": "warnOnUse" } ])",
+        R"([ { "names": ["deprecated", "deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
         kIgnoresDeprecated, "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value())
@@ -2275,8 +2291,10 @@ TEST(GrammarSchema, AttributeEffectDuplicateNameWithinOneRowReportsInvalid) {
 // verb or the row count.
 TEST(GrammarSchema, AttributeEffectDistinctNamesAcrossRowsStillLoad) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["deprecated"],          "effect": "warnOnUse" },
-             { "names": ["aligned"],             "effect": "align"     },
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
+             { "names": ["aligned"],    "appliesTo": ["variable"],
+               "effect": "align"     },
              { "names": ["likely", "unlikely"],  "effect": "none"      } ])",
         R"("linkageSpecifierIgnoredNames": ["deprecated", "aligned"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
@@ -2293,8 +2311,8 @@ TEST(GrammarSchema, AttributeEffectDistinctNamesAcrossRowsStillLoad) {
 // takes.
 TEST(GrammarSchema, AttributeEffectRowUnknownKeyReportsInvalid) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["deprecated"], "effect": "warnOnUse",
-               "efect": "align" } ])",
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse", "efect": "align" } ])",
         kIgnoresDeprecated, "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value())
@@ -2307,7 +2325,8 @@ TEST(GrammarSchema, AttributeEffectRowUnknownKeyReportsInvalid) {
 TEST(GrammarSchema, AttributeEffectRowDollarPrefixedKeyIsExempt) {
     auto const cfg = attrVocabSchema(
         R"([ { "$comment": "deprecated warns at every use",
-               "names": ["deprecated"], "effect": "warnOnUse" } ])",
+               "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
         kIgnoresDeprecated, "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value())
@@ -2320,7 +2339,8 @@ TEST(GrammarSchema, AttributeEffectRowDollarPrefixedKeyIsExempt) {
 // configured.
 TEST(GrammarSchema, AttributeEffectEmptyNamesArrayReportsInvalid) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": [], "effect": "warnOnUse" } ])", kIgnoresDeprecated, "");
+        R"([ { "names": [], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])", kIgnoresDeprecated, "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value())
         << "an effects row with no names can never fire and must fail the load";
@@ -2336,6 +2356,262 @@ TEST(GrammarSchema, AttributeEffectEmptyNameStringReportsInvalid) {
     ASSERT_FALSE(r.has_value())
         << "an empty attribute name could never match and must fail the load";
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── ★★★ TF-C93: the `appliesTo` KIND-SET key
+//    (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) ─────────────────────
+//
+// `appliesTo` names the entity kinds an attribute may appertain to, and the
+// semantic tier's ONE shared decl-kind gate walks it. Its VALUE therefore needs
+// real validation — `DSS_CHECK_KEY_VOCABULARY` does NOT provide any: MEASURED at
+// `config_key_vocabulary.hpp:92-97`, it is a `static_assert` on array
+// WELL-FORMEDNESS only (no empty/duplicate KEY NAMES) and says nothing about a
+// key's contents. Growing `kEffectRowKeys` 2 → 3 correctly extends the
+// unknown-KEY loop; everything below is about the VALUE.
+
+// ★★ THE REQUIREMENT ITSELF — the design's blocking correction. A row with a
+// declaration-attached effect and NO `appliesTo` must fail the LOAD.
+//
+// ★ WHY REQUIRED RATHER THAN OPTIONAL-WITH-A-DEFAULT, pinned because the cheap
+// alternative is so tempting: "absent ⇒ applies to every kind" makes a row that
+// merely FORGOT the key read as a deliberate universal claim, and the gate then
+// goes silent on exactly the misuse it exists to report. That is
+// [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] one cycle after that row was
+// written. A required key cannot be forgotten quietly.
+TEST(GrammarSchema, AttributeEffectAppliesToMissingOnDeclAttachedRowReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a row whose effect acts on the DECLARED ENTITY must say which entity "
+           "kinds it appertains to — an absent key must NOT degrade to a "
+           "permissive 'every kind' default";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool rightDiag = false;
+    for (auto const& d : r.error()) {
+        if (d.code == DiagnosticCode::C_InvalidSemantics
+            && d.path == "/semantics/attributeSemantics/effects/0/appliesTo"
+            && d.message.find("REQUIRED") != std::string::npos
+            && d.message.find("warnOnUse") != std::string::npos) {
+            rightDiag = true;
+        }
+    }
+    EXPECT_TRUE(rightDiag)
+        << "the diagnostic must be AT the missing key's path and NAME the verb "
+           "that made it required — 'something is invalid' does not tell the "
+           "author which row to edit: "
+        << errorDiags(r.error());
+}
+
+// THE EXEMPTION, asserted in the same file as the requirement so neither can
+// drift. A `none`-verb row bundles function-only, type-only, statement-only and
+// elsewhere-consumed names in ONE list, so no single kind set is correct for it
+// — and the loader must not demand one.
+TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["fallthrough", "likely"], "effect": "none" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a 'none' row must stay exempt — demanding a kind set from a row that "
+           "mixes statement-, type- and function-attached names would force the "
+           "author to invent a wrong answer: "
+        << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_TRUE((*r)->semantics().attributeEffects[0].appliesTo.empty())
+        << "and it must reach SemanticConfig with an EMPTY set — that emptiness "
+           "IS the exemption the engine's gate reads (it tests the config, never "
+           "the verb)";
+}
+
+// …and the key is REFUSED on a `none` row, not silently accepted. The gate can
+// never read it there (an empty set is what marks the exemption), so accepting
+// it would be a knob that lies — the same defect class as every unknown-key
+// check in this loader.
+TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["fallthrough"], "appliesTo": ["variable"],
+               "effect": "none" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "'appliesTo' on a 'none' row could never be read — accepting it would "
+           "let an author believe a kind restriction is in force when none is";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An UNKNOWN kind string. The rejection must ENUMERATE the closed set, and the
+// enumeration must be DERIVED from the vocabulary table rather than restated
+// beside it — the drift discipline this loader already applies to the effect-verb
+// closed set, where a hand-written literal was MEASURED to keep advertising a
+// verb the loader had stopped accepting.
+TEST(GrammarSchema, AttributeEffectAppliesToUnknownKindEnumeratesTheClosedSet) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["varaible"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled declaration kind must fail the load — silently dropping "
+           "it would shrink the declared set and make the gate fire on correct C";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    std::string msg;
+    for (auto const& d : r.error()) {
+        if (d.message.find("unknown declaration kind") != std::string::npos
+            && d.message.find("appliesTo") != std::string::npos) {
+            msg = d.message;
+        }
+    }
+    ASSERT_FALSE(msg.empty())
+        << "the unknown-kind rejection was not emitted at all: "
+        << errorDiags(r.error());
+    EXPECT_NE(msg.find("varaible"), std::string::npos)
+        << "it must quote what the author WROTE: " << msg;
+    // Every kind the loader ACCEPTS must appear in the message — probed against
+    // the real loader, so the sentence cannot drift from the vocabulary.
+    for (auto const* kind : {"variable", "function", "table", "type"}) {
+        auto const good = attrVocabSchema(
+            std::format(R"([ {{ "names": ["deprecated"], "appliesTo": ["{}"],
+                                "effect": "warnOnUse" }} ])", kind),
+            kIgnoresDeprecated, "");
+        auto const ok = GrammarSchema::loadFromText(good);
+        ASSERT_TRUE(ok.has_value())
+            << "'" << kind << "' must be an accepted declaration kind: "
+            << errorDiags(ok.error());
+        EXPECT_NE(msg.find(kind), std::string::npos)
+            << "the loader accepts kind '" << kind << "' but the closed-set "
+               "message omits it — the message must be DERIVED from the "
+               "vocabulary table, not restated beside it. Message was: " << msg;
+    }
+}
+
+// An EMPTY `appliesTo`. "Appertains to nothing" is not a coherent claim: the
+// row's effect would still fire nowhere while every declaration spelling the
+// attribute warned. Rejected rather than treated as a silent disable.
+TEST(GrammarSchema, AttributeEffectAppliesToEmptyArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": [],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an empty kind set must fail the load — it is also indistinguishable "
+           "from the 'none'-row exemption the engine's gate reads";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A DUPLICATE kind. The list is a SET; a repeat changes nothing and is always a
+// typo or a botched merge. Left accepted it trains an author to read the list as
+// unchecked prose.
+TEST(GrammarSchema, AttributeEffectAppliesToDuplicateKindReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable", "variable"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a declaration kind listed twice must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesTheKind = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("listed twice") != std::string::npos
+            && d.message.find("variable") != std::string::npos) {
+            namesTheKind = true;
+        }
+    }
+    EXPECT_TRUE(namesTheKind)
+        << "and it must name WHICH kind repeats: " << errorDiags(r.error());
+}
+
+// NOT AN ARRAY — the shape mistake a hand-edited config makes first
+// (`"appliesTo": "function"`). Rejected with the closed set, so the author can
+// fix both the shape and the value from one message.
+TEST(GrammarSchema, AttributeEffectAppliesToNotAnArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": "variable",
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a bare string must not be silently accepted as a one-element set";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A NON-STRING ELEMENT. `["variable", 3]` must not load with the good element
+// kept and the bad one dropped — a partially-parsed kind set is a SHRUNKEN one,
+// which makes the gate warn on correct C.
+TEST(GrammarSchema, AttributeEffectAppliesToNonStringElementReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable", 3],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a non-string entry must fail the load, not be skipped — the "
+           "surviving set would be silently narrower than the author wrote";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// POSITIVE: a well-formed multi-kind set REACHES `SemanticConfig` in order. This
+// is the pin that keeps every negative above from passing for the wrong reason,
+// and it is the shape the shipped `aligned` row uses (the negative control whose
+// own sink judges all three kinds).
+TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["variable", "function", "type"],
+               "effect": "align" } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
+    ASSERT_EQ(applies.size(), 3u);
+    EXPECT_EQ(applies[0], DeclarationKind::Variable);
+    EXPECT_EQ(applies[1], DeclarationKind::Function);
+    EXPECT_EQ(applies[2], DeclarationKind::Type);
+}
+
+// ★ THE SHIPPED CONFIG ITSELF loads with every non-`none` row carrying a
+// non-empty `appliesTo`. This is the pin that catches a half-landed config edit
+// (a new verb added to `effects` without its kind set) at the tier where it is
+// cheapest to see — and it asserts the PROPERTY over the whole table rather than
+// naming the eight rows individually, so it keeps holding as the table grows.
+//
+// ⚠ ROWS ≠ VERBS, and the distinction is why the count below is a `_GE` on ROWS.
+// c-subset ships EIGHT declaration-attached rows carrying SEVEN distinct effect
+// verbs: `warnOnDiscard` is spelled by TWO rows (`nodiscard` and its GNU twin
+// `warn_unused_result`), because the two names share one effect but have DIFFERENT
+// applicability sets — `nodiscard` is function-only per C23 6.7.13.3 while clang
+// enumerates typedefs among the valid positions for the GNU spelling. That split
+// is the whole reason a row-count and a verb-count diverge here, so counting verbs
+// would under-count the table by one and hide a lost row.
+TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
+    auto r = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(r.has_value())
+        << "the shipped c-subset config must satisfy its own `appliesTo` rule";
+    std::size_t declAttached = 0;
+    for (auto const& row : (*r)->semantics().attributeEffects) {
+        if (row.effect == AttributeEffect::None) {
+            EXPECT_TRUE(row.appliesTo.empty())
+                << "a 'none' row must carry NO kind set — an empty set is what "
+                   "marks the exemption the engine's gate reads";
+            continue;
+        }
+        ++declAttached;
+        EXPECT_FALSE(row.appliesTo.empty())
+            << "every declaration-attached row must declare its kinds; row "
+               "naming '"
+            << (row.names.empty() ? "<none>" : row.names[0]) << "' does not";
+    }
+    EXPECT_GE(declAttached, 8u)
+        << "c-subset ships EIGHT declaration-attached effect ROWS carrying SEVEN "
+           "distinct effect VERBS — suppressUnused / warnOnUse / warnOnDiscard "
+           "(TWO rows: `nodiscard` and the GNU `warn_unused_result`, one verb but "
+           "two applicability sets) / align / noInline / alwaysInline / "
+           "noSanitizeThread. A lower count means a row was lost, demoted to "
+           "'none', or merged back into a sibling — each of which is how a sink "
+           "goes silent, and the middle two are invisible to a verb-count";
 }
 
 // ── the drift cross-check ─────────────────────────────────────────────────
@@ -2389,7 +2665,8 @@ TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
 // `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
 TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["deprecated"], "effect": "warnOnUse" },
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
              { "names": ["likely", "unlikely"], "effect": "none" } ])",
         kIgnoresDeprecated, "");
     auto r = GrammarSchema::loadFromText(cfg);
@@ -2465,7 +2742,8 @@ TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid
 // configuration too would be indistinguishable from a working one here.
 TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
     constexpr std::string_view kEffects =
-        R"([ { "names": ["no_sanitize_thread"], "effect": "noSanitizeThread" } ])";
+        R"([ { "names": ["no_sanitize_thread"], "appliesTo": ["function"],
+               "effect": "noSanitizeThread" } ])";
 
     // (a) the effect row alone — the half-landed config edit.
     auto const missing = attrVocabSchema(
@@ -2601,7 +2879,8 @@ TEST(GrammarSchema, AttributeVocabularyDriftedPackedNameReportsInvalid) {
 // runtime scans use, or it would fire on config that works perfectly.
 TEST(GrammarSchema, AttributeVocabularyDedicatedNameMatchesDunderNormalized) {
     auto const cfg = attrVocabSchema(
-        R"([ { "names": ["deprecated"], "effect": "warnOnUse" },
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
              { "names": ["packed"],     "effect": "none"      } ])",
         kIgnoresDeprecated,
         R"("packed": { "listRule": "attrSpec",

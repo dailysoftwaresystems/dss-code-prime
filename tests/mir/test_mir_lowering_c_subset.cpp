@@ -21,6 +21,7 @@
 #include "opt/passes/dce.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
+#include "diagnostic_count.hpp"                // dss::test_support::countCode (TF-C93)
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
@@ -3027,37 +3028,44 @@ TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasNoSanitizeThreadClear) {
         << "no keyword may appear for an un-annotated program:\n" << text;
 }
 
-// TF-C92: the FnSig GATE. `__attribute__((no_sanitize_thread))` on a DATA object is
-// INERT — the flag feeds a (future) per-FUNCTION instrumentation decision, so a
-// symbol whose kind could never honor it must not carry it. This test asserts the
-// CURRENT behaviour: the declaration is ACCEPTED and records nothing.
+// ★★★ TF-C92 → **FLIPPED BY TF-C93**
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). The test was written to pin
+// the CURRENT silence with in-code instructions to flip rather than delete it; this
+// is that flip. Fixture unchanged, the `funcNoSanitizeThread` loop and the
+// `countSubstr(text, "nosanitizethread") == 0` assertion kept VERBATIM, and a
+// POSITIVE assertion added that the warning actually fired.
 //
-// ★★ AND THE CURRENT BEHAVIOUR IS A TRACKED **DIVERGENCE FROM CLANG**, NOT THE
-// CONTRACT — SAID HERE BECAUSE A TEST THAT ONLY ASSERTED THE SILENCE WOULD READ AS
-// "SILENCE IS CORRECT". clang does NOT go quiet on this: it accepts the declaration
-// and WARNS (`-Wignored-attributes` class), telling the author the attribute was
-// discarded. DSS accepts it and says NOTHING, so an author who wrote the attribute
-// on the wrong entity gets no signal at all. That gap is registered as
-// [[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]].
+// ★★ `ASSERT_FALSE(hasErrors)` STILL HOLDS, AND THAT IS EXACTLY WHY THE POSITIVE
+// ASSERTION IS THE WHOLE POINT — MEASURED. The new diagnostic is a WARNING, so this
+// test stayed GREEN across the engine change: a "flip" that merely relaxed the old
+// expectation would have shipped looking verified while proving nothing about the
+// new behaviour. The code-specific `countCode` below is the assertion that can
+// actually go red, and it is by CODE rather than by count because a bare count would
+// also be satisfied by an unrelated `S_UnknownAttribute`.
 //
-// ★ WHAT A FUTURE CYCLE DOES WITH THIS TEST: it FLIPS it, it does not delete it.
-// When the registry row is closed, the same fixture must expect a
-// `S_AttributeIgnoredForDeclarationKind` diagnostic — the `ASSERT_FALSE(hasErrors)`
-// becomes an assertion ON the diagnostic — while the "no function carries the flag"
-// half stays exactly as it is. Deleting the test instead would drop the FnSig gate's
-// only MIR-tier pin along with the divergence marker.
+// ★ WHY THE INERTNESS HALF SURVIVES THE FLIP UNTOUCHED: the gate REPORTS while the
+// `isFnSig &&` guard in the apply still REFUSES. This is the only MIR-tier pin on
+// that guard, so a diagnostic that ALSO recorded the flag — the worse bug — is
+// caught right here, at the tier where the flag would become an emitted function
+// attribute.
 //
-// WHAT BREAKS THIS: dropping the `isFnSig &&` guard from the apply in
-// semantic_analyzer.cpp. The program still compiles, so no other assertion in the
-// suite moves — only the keyword count below, which is why this test exists
-// separately from the form suite rather than as another case in it.
-TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadOnDataObjectIsInert) {
+// WHAT BREAKS THIS: deleting the decl-kind gate loop in semantic_analyzer.cpp (the
+// `countCode` drops to 0, everything else stays green); dropping the `isFnSig &&`
+// guard (the loop and the keyword count go red while `countCode` stays 1); deleting
+// `appliesTo` from the effects row (the LOADER refuses the shipped config).
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadOnDataObjectWarnsAndStaysInert) {
     auto L = lowerCSubset(
         "__attribute__((no_sanitize_thread)) int gv = 7;\n"
         "int main() { return gv; }\n");
     ASSERT_FALSE(L.model.hasErrors())
         << (L.model.diagnostics().all().empty()
                 ? "" : L.model.diagnostics().all()[0].actual);
+    EXPECT_EQ(dss::test_support::countCode(
+                  L.model.diagnostics(),
+                  DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "the attribute on a data object must be LOUD (a Warning) — this is the "
+           "assertion the flip exists for: `hasErrors()` above cannot see it, so "
+           "without this line the test proves only that nothing became an error";
     ASSERT_TRUE(L.mir.ok);
     Mir const& m = L.mir.mir;
     for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
