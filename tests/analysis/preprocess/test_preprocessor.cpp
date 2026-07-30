@@ -31,20 +31,66 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>   // TF-C91: the cSubset() return-shape static_assert
 #include <vector>
 
 namespace {
 
 using namespace dss;
 
-[[nodiscard]] std::shared_ptr<GrammarSchema const> cSubset() {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded.has_value()) {
-        ADD_FAILURE() << "loadShipped(c-subset) failed";
-        std::abort();
-    }
-    return *loaded;
+// Shared schema fixture: load once per test binary process, and hand back a
+// REFERENCE to the cached owner. Same shape as `x86Schema()` in
+// tests/lir/test_lir.cpp:36.
+//
+// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
+// While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
+// call built a fresh schema owned solely by the returned temporary, so the
+// one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
+// object destroyed at the end of that full-expression. `GrammarSchema`'s
+// accessors (`preprocess()`, src/core/types/grammar_schema.hpp:665) return
+// references INTO the schema, so that is a heap-use-after-free — MEASURED with
+// ASan as a 40/40 deterministic `heap-use-after-free`, and reported from
+// Windows/g++/libstdc++ as a non-deterministic 0xC0000005 that a full-suite run
+// could not see. Returning a reference to a function-local static makes the
+// pointee outlive every expression, so NO accessor on this helper can dangle at
+// any call site, present or future: the defect class is unrepresentable here
+// rather than merely absent.
+//
+// Safe to cache (MEASURED over this file, not assumed): the pointee is
+// `GrammarSchema const` so mutation is ill-formed; no test asserts on pointer
+// identity, `use_count()`, or freshness; nothing here writes to
+// `src/dss-config/`, so the shipped config cannot change mid-process; and
+// `reboundCSubset()` — the one helper that DOES need a per-call variant — builds
+// its own schema via `loadFromText` and never calls this function.
+//
+// The 34 `auto schema = cSubset();` call sites are unaffected: `auto` deduces
+// `shared_ptr` BY VALUE from a `const&`, i.e. a refcount bump.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubset() {
+    static std::shared_ptr<GrammarSchema const> const schema = [] {
+        auto loaded = GrammarSchema::loadShipped("c-subset");
+        if (!loaded.has_value()) {
+            ADD_FAILURE() << "loadShipped(c-subset) failed";
+            std::abort();
+        }
+        return *loaded;
+    }();
+    return schema;
 }
+
+// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — the DURABLE guard, and the only
+// kind available here. Once `cSubset()` hands back a reference to a static the
+// dangling read becomes IMPOSSIBLE, which retires the crash test that proved it:
+// a runtime red-on-disable cannot survive its own fix. So the property is pinned
+// at COMPILE time instead. Restoring the by-value return re-admits the entire
+// defect class at all 36 call sites, so that regression must not be silent.
+// RED-ON-DISABLE (MEASURED): change the return type back to
+// `std::shared_ptr<GrammarSchema const>` and this fails to compile.
+static_assert(std::is_reference_v<decltype(cSubset())>,
+              "cSubset() must return a REFERENCE to a cached owner. A by-value "
+              "return re-admits D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: "
+              "`helper()->accessor()` would again bind a reference into a schema "
+              "owned only by the temporary, which dies at the end of the "
+              "full-expression (heap-use-after-free).");
 
 // Run the preprocessor over `text` (no include dirs) and return the NON-trivia
 // token lexemes (sliced from the synth buffer), in order. Directives removed +
@@ -3427,7 +3473,6 @@ TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
 // fixture MUST actually reach them on the pe leg and MUST NOT on the others.
 // Without this, deleting the fixture's whole body would leave the guard green.
 TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) {
-    namespace fs = std::filesystem;
     auto const text = test_support::readFile(
         test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c");
     ASSERT_FALSE(text.empty());
@@ -7711,7 +7756,12 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
 // engine's own notion of the set.
 namespace {
 [[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
-    auto const& pp = cSubset()->preprocess();
+    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: NAME the owning handle. The
+    // one-liner `auto const& pp = cSubset()->preprocess();` binds a reference
+    // INTO a schema owned only by a temporary `shared_ptr`, which dies at the
+    // end of that full-expression -> `pp` dangles for every read below.
+    auto schema = cSubset();
+    auto const& pp = schema->preprocess();
     std::vector<std::string> names;
     for (std::string const* s : {&pp.hasIncludeOperator, &pp.hasEmbedOperator,
                                  &pp.hasCAttributeOperator}) {
@@ -7810,7 +7860,10 @@ TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
 // reds. Without this test an over-broad predicate would pass every assertion
 // above while quietly changing what `#ifdef defined` means.
 TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
-    auto const& pp = cSubset()->preprocess();
+    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: see the note in
+    // `tfc86DeclaredOperators` — the owning handle must outlive `pp`.
+    auto schema = cSubset();
+    auto const& pp = schema->preprocess();
     ASSERT_FALSE(pp.definedOperator.empty());
     PreprocessResult r;
     auto lexs = ppLexemes(
