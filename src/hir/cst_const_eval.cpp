@@ -127,6 +127,16 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
         if (bf.ok) return ok(std::move(bf.value));
         return fail(bf.failure, expr);
     }
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — the CRIT-3 belt, CST side. The HIR
+    // walker's twin keys on the RESULT TypeId; this engine is interner-free, so it
+    // keys on the OPERANDS instead: if either is 128-bit-cored and the bignum
+    // above declined, the int64 path below would fold it mod 2^64 — silently. The
+    // widened `foldBitIntBinary` entry should make this unreachable; the belt is
+    // what converts a FUTURE routing miss into a loud failure rather than a wrong
+    // constant that no test would notice.
+    if (detail::isInt128Kind(a.value->core) || detail::isInt128Kind(b.value->core)) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
     bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
     if (eitherFloat) {
         if (!options.allowFloat) {
@@ -196,6 +206,10 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
     if (auto uf = detail::foldBitIntUnary(*opK, *inner.value); uf.applies) {
         if (uf.ok) return ok(std::move(uf.value));
         return fail(uf.failure, expr);
+    }
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the unary twin of the binary belt above.
+    if (detail::isInt128Kind(inner.value->core)) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     if (isFloatValue(*inner.value)) {
         if (!options.allowFloat) {
@@ -619,6 +633,43 @@ evalNode(NodeId                              expr,
                                                       tgt->pointeeType}));
             }
             return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
+        }
+        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast to a 128-bit integer routes
+        // through the bignum, exactly like the `_BitInt` arm above — checked
+        // BEFORE the generic `isInteger` arm, which would otherwise narrow the
+        // value through `narrowIntToBits` into an int64 and tag it I64/U64. That
+        // is the silent 64-bit wrap: `(__uint128_t)x` would claim a 128-bit type
+        // while carrying 64 bits of value. The result keeps a STANDARD I128/U128
+        // core — a `__int128` is not bit-precise, so tagging it `TypeKind::BitInt`
+        // here would silently change the expression's type mid-fold.
+        //
+        // ★ PROVENANCE — this arm shipped DEAD and was revived by a self-audit.
+        // As first written it could never fire: `semantic_analyzer.cpp`'s
+        // `resolveCastTarget` had no I128/U128 row, so a 128-bit cast target fell to
+        // its `default: return nullopt` and the whole cast was non-foldable. The
+        // MEASURED symptom was that EVERY 128-bit integer constant expression
+        // refused — `_Static_assert((__uint128_t)5 == 5, "")` included — while the
+        // `_BitInt(128)` twin was clean. The resolver rows are now present and this
+        // is the reachable 128-bit shape; the descriptor's own `intBits` is the
+        // width because this engine is interner-free.
+        //
+        // ★ WHY THE WIDE RESULT CANNOT TRUNCATE DOWNSTREAM (measured, and the reason
+        // reviving this arm is safe): the value it produces rides a 128-bit
+        // `BitIntValue`, and `asInt64` nullopts for `width() > 64`. So the two
+        // 64-bit ICE slots — `asInt64Bridge` (array dimension / static-assert /
+        // enumerator) and the `isInteger` narrowing arm just below — REFUSE a wide
+        // value instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
+        // with S_NonConstantArrayLength; it never becomes a truncated bound.
+        if (tgt->isInteger && tgt->intBits == 128) {
+            auto bv = detail::asBitIntValue(*inner.value);
+            if (!bv.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            bv->convertTo(128u, tgt->intSigned);
+            HirLiteralValue v;
+            v.core  = tgt->intSigned ? TypeKind::I128 : TypeKind::U128;
+            v.value = std::move(*bv);
+            return ok(std::move(v));
         }
         if (tgt->isInteger) {
             if (auto const* a = asAddress(*inner.value)) {

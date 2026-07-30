@@ -566,10 +566,21 @@ primitiveByteSize(TypeKind k) noexcept {
 }
 
 // Little-endian encode `value` into `bytes` (appended). Width=`width`
-// bytes. Trailing zeros are appended verbatim — the integer's high
-// bytes are dropped silently when `value` exceeds the type's range
-// (caller invariant: HIR/MIR const-eval clamps to the type's range
-// before reaching the literal pool).
+// bytes. The integer's high bytes are dropped silently when `value`
+// exceeds the type's range (caller invariant: HIR/MIR const-eval clamps
+// to the type's range before reaching the literal pool).
+//
+// ⚠ CALLER INVARIANT: `width` MUST be ≤ 8. `value` is a `std::uint64_t`, so
+// `value >> (j*8)` is UNDEFINED BEHAVIOUR for j ≥ 8 — it is NOT a zero fill.
+// (A previous version of this comment claimed "trailing zeros are appended
+// verbatim", which is false for width > 8 and was actively misleading: on both
+// shipped host arches the masked shift count REPEATS the low 8 bytes into the
+// high 8, so an over-wide call writes plausible-looking WRONG bytes rather
+// than crashing. Corrected in TF-C94 — D-CSUBSET-INT128-DATA-GLOBAL.)
+// Every 16-byte scalar kind is walled BEFORE reaching here: F80/F128 have
+// dedicated widen+append paths (appendF80Extended / the binary128 arm) and
+// I128/U128 fail loud at the kind-keyed 128-bit gate, so the only widths that
+// arrive are the 1/2/4/8-byte ones this loop can encode.
 void appendLE(std::vector<std::uint8_t>& bytes,
               std::uint64_t value,
               std::size_t width) noexcept {
@@ -755,6 +766,30 @@ void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const&
 // 16-byte leaf cannot pass through this u64 chokepoint).
 [[nodiscard]] std::optional<std::uint64_t>
 decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
+    // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer is 16 bytes —
+    // WIDER than the u64 this chokepoint returns — so it cannot pass through,
+    // exactly like F80/F128. Checked FIRST, before the integer arms, because a
+    // 128-bit value's folded literal IS a plain u64/i64 arm (it is the CONTAINER
+    // that is too narrow, not the variant that is wrong): without this the u64
+    // arm below would happily return the low 8 bytes and the aggregate-leaf
+    // recursion would write them as if they were the whole value. Returning
+    // nullopt makes a `struct { __uint128_t x; }` global fail loud at that
+    // recursion; the scalar top-level global is walled by the dedicated
+    // kind-keyed arm in `lowerMirGlobalsToDataItems`.
+    if (k == TypeKind::I128 || k == TypeKind::U128) return std::nullopt;
+    // Same argument for the >64-bit FLOAT kinds, and it closes a real mismatch
+    // between this function's contract and its code: the header above has always
+    // promised nullopt for F16/F80/F128, but that promise was honoured only on
+    // the `double` arm below. A u64/i64/bool-variant literal carrying an F80/F128
+    // kind — the "malformed pool entry" the two F80/F128 arms in
+    // `lowerMirGlobalsToDataItems` say falls through to "the decode chokepoint's
+    // fail-loud" — actually returned a VALUE, and then `appendLE` was called with
+    // width 16 on a u64: the same >>64 UB described there. Not a live miscompile
+    // (an int literal assigned to a long double routes through the cast fold into
+    // the `WideFloatValue` arm, so the audit could not reach it), but the two
+    // comments described a wall that did not exist. Now it does.
+    if (k == TypeKind::F16 || k == TypeKind::F80 || k == TypeKind::F128)
+        return std::nullopt;
     if (std::holds_alternative<std::uint64_t>(v.value))
         return std::get<std::uint64_t>(v.value);
     if (std::holds_alternative<std::int64_t>(v.value))
@@ -1375,6 +1410,39 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
+        // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer DATA-global is
+        // a DEFERRAL boundary — its on-disk byte layout is not yet emitted. This
+        // gate keys on the TYPE KIND, deliberately NOT on the value's variant arm,
+        // and that distinction is the whole point: the neighbouring `_BitInt` wall
+        // above keys on `holds_alternative<BitIntValue>`, and MIRRORING it here
+        // would MISS the common case. For `__uint128_t g = 5;` the folded value is
+        // a plain `std::uint64_t`, so a variant-keyed gate never fires and control
+        // reaches `appendLE(d.bytes, *bits, *widthOpt)` below with width 16 — and
+        // `appendLE` computes `(value >> (j*8))` on a `std::uint64_t` for
+        // j ∈ [0,16), so every j ≥ 8 is a shift of 64..120 bits: UNDEFINED
+        // BEHAVIOUR, which on both shipped host arches masks the shift count and
+        // REPEATS the low 8 bytes into the high 8. Wrong bytes, silently.
+        // Placed BEFORE the `widthOpt` unwrap so the wall stands whatever
+        // `scalarByteSize` reports, and BEFORE the `_BitInt` VARIANT arm below so
+        // the message matches the declared TYPE: once a >64-bit 128-bit fold
+        // lands in the `BitIntValue` pool arm (it is the only arm wide enough to
+        // carry one), a variant-keyed dispatch would claim a `__uint128_t` global
+        // is a `_BitInt` one. Keying on `k` — the global's declared kind — and
+        // going first keeps the two deferrals honestly labelled.
+        // `decodeScalarLiteralBits` returns nullopt for
+        // these kinds too, so a `struct { __uint128_t x; }` global walls at the
+        // aggregate-leaf recursion rather than slipping through this scalar path.
+        if (k == TypeKind::I128 || k == TypeKind::U128) {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} has "
+                             "a 128-bit integer initializer (TypeKind={}) — 128-bit "
+                             "integer DATA-globals are not yet emitted "
+                             "(D-CSUBSET-INT128-DATA-GLOBAL); the u64 literal-pool "
+                             "arm carries only the low 8 bytes, so emitting would "
+                             "write a wrong 16-byte image.",
+                             sym.v, static_cast<int>(k)));
+            continue;
+        }
         // C4b (I5, D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` value
         // reaching a DATA-global initializer is a DEFERRAL boundary — the on-disk
         // byte layout of a `_BitInt` global (wide multi-limb, and a narrow one for
@@ -1464,7 +1532,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 continue;
             }
             // A non-`double`, non-`WideFloatValue` F80 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud below.
+            // pool entry — fall through to the decode chokepoint's fail-loud
+            // below. (TF-C94: that fail-loud is now REAL. This comment used to
+            // describe a wall the chokepoint did not provide — its u64/i64/bool
+            // arms returned a value regardless of `k`, so a malformed F80 entry
+            // reached `appendLE` with width 16 on a u64 and hit the >>64 UB.
+            // `decodeScalarLiteralBits` now returns nullopt for F16/F80/F128 by
+            // KIND, honouring the contract its own header always stated.)
         }
         // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE binary128 `long
         // double` global — the widened quad value is 16 bytes, WIDER than the
@@ -1513,7 +1587,10 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 continue;
             }
             // A non-`double`, non-`WideFloatValue` F128 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud below.
+            // pool entry — fall through to the decode chokepoint's fail-loud
+            // below. (TF-C94: real as of this cycle — see the F80 arm's note;
+            // `decodeScalarLiteralBits` walls F16/F80/F128 by KIND now, not only
+            // on its `double` arm.)
         }
         // Decode the scalar value through the shared chokepoint (the SAME
         // int/float semantics the aggregate-leaf recursion uses, incl. the

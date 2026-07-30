@@ -1204,6 +1204,89 @@ TEST(AsmDataSection, BitIntGlobalFailsLoud) {
         << "the narrow arm emits the SAME explicit deferral diagnostic";
 }
 
+// ── TF-C94 (D-CSUBSET-INT128-DATA-GLOBAL): a 128-bit integer global fails loud ──
+// The sibling `_BitInt` wall above keys on the VALUE's variant arm
+// (`holds_alternative<BitIntValue>`). Mirroring that here would be a SILENT MISS:
+// a 128-bit integer whose initializer FITS IN 64 BITS folds to a plain
+// `std::uint64_t` pool arm, so a variant-keyed gate never fires and control
+// reaches `appendLE(bytes, *bits, 16)` — `(value >> (j*8))` on a `std::uint64_t`
+// for j ∈ [0,16), i.e. shifts of 64..120 bits: UB that on both shipped host
+// arches masks the count and REPEATS the low 8 bytes into the high 8. Sixteen
+// plausible-looking WRONG bytes, no diagnostic. Hence this gate keys on the
+// TYPE KIND, and the fits-in-64 case below is the load-bearing pin: it is the one
+// a naive variant-keyed implementation misses while still looking green on the
+// wide case. Both cases pin the ANCHOR NAME, not just the error count — the
+// generic fallbacks share the same `DiagnosticCode` (the `_BitInt` sibling's
+// established red-on-disable discipline).
+TEST(AsmDataSection, Int128GlobalFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+
+    // (1) FITS IN 64 BITS — `__uint128_t g = 5;`. The folded value is a plain
+    // u64 arm, NOT a BitIntValue: the case a mirrored variant-keyed gate misses.
+    MirLiteralValue fits;
+    fits.core  = TypeKind::U128;
+    fits.value = std::uint64_t{5};
+    auto const rf = lowerOneAggGlobal(ti, ti.primitive(TypeKind::U128),
+                                      std::move(fits), kNatural16, DataModel::Lp64);
+    EXPECT_GE(rf.errors, 1u)
+        << "a u128 data-global whose initializer fits in 64 bits must STILL fail "
+           "loud — the value arm is a plain u64, so only a KIND-keyed gate sees it";
+    EXPECT_TRUE(rf.items.empty())
+        << "no bytes for a deferred 128-bit global — emitting would run appendLE "
+           "with width 16 over a u64 (the >>64 UB)";
+    EXPECT_NE(rf.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
+        << "red-on-disable: delete the kind-keyed 128-bit gate and this case emits "
+           "16 bytes with ZERO errors — the generic scalar path encodes it happily";
+
+    // (2) WIDER THAN 64 BITS — the value can only ride the `BitIntValue` pool arm
+    // (the sole arm wide enough). The 128-bit gate must win over the neighbouring
+    // `_BitInt` variant arm, or a `__uint128_t` global is reported as a `_BitInt`.
+    MirLiteralValue wide;
+    wide.core  = TypeKind::U128;
+    wide.value = BitIntValue::fromU64(7, 128, /*isSigned=*/false);
+    auto const rw = lowerOneAggGlobal(ti, ti.primitive(TypeKind::U128),
+                                      std::move(wide), kNatural16, DataModel::Lp64);
+    EXPECT_GE(rw.errors, 1u) << "a >64-bit 128-bit data-global must fail loud too";
+    EXPECT_TRUE(rw.items.empty()) << "no bytes for a deferred 128-bit global";
+    EXPECT_NE(rw.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
+        << "the 128-bit anchor, NOT the _BitInt one — red-on-disable: order this "
+           "gate after the BitIntValue arm and the message misnames the type";
+    EXPECT_EQ(rw.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
+        << "a __uint128_t global must never be reported as a `_BitInt` deferral";
+
+    // (3) SIGNED twin — the gate is signedness-blind (both kinds are 16 bytes).
+    MirLiteralValue sig;
+    sig.core  = TypeKind::I128;
+    sig.value = std::int64_t{-3};
+    auto const rs = lowerOneAggGlobal(ti, ti.primitive(TypeKind::I128),
+                                      std::move(sig), kNatural16, DataModel::Lp64);
+    EXPECT_GE(rs.errors, 1u) << "an i128 data-global must fail loud as well";
+    EXPECT_NE(rs.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
+        << "the same anchor for the signed kind";
+}
+
+// ── TF-C94: the 128-bit wall holds at the AGGREGATE-LEAF recursion too ──
+// A `struct { __uint128_t x; }` global does NOT reach the scalar arm above — it
+// routes through the aggregate-leaf recursion, whose sole scalar encoder is
+// `decodeScalarLiteralBits`. That chokepoint must return nullopt for I128/U128
+// (the 16-byte value cannot pass through a u64), exactly as it does for F80/F128.
+// Without it the leaf writes the low 8 bytes as though they were the whole value.
+TEST(AsmDataSection, Int128AggregateMemberFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::array<TypeId, 1> const f{ti.primitive(TypeKind::U128)};
+    TypeId const st = ti.structType("S128", f);
+    auto const r = lowerOneAggGlobal(
+        ti, st, aggOf({intField(9, TypeKind::U128)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    EXPECT_GE(r.errors, 1u)
+        << "a struct with a 128-bit integer member must fail loud at the "
+           "aggregate-leaf recursion (D-CSUBSET-INT128-DATA-GLOBAL)";
+    EXPECT_TRUE(r.items.empty())
+        << "red-on-disable: drop the I128/U128 arm from decodeScalarLiteralBits "
+           "and this emits a struct whose 16-byte member holds 8 value bytes "
+           "plus 8 bytes of whatever the encoder produced";
+}
+
 // ── LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): folded F80/F128 global
 // bytes. A const-folded `long double` global carries a `WideFloatValue` pool arm;
 // the globals emitter routes it through `appendWideFloatBits` (checked BEFORE the

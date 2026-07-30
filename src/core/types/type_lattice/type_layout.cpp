@@ -3,11 +3,28 @@
 #include "core/types/type_lattice/core_type.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <span>
 
 namespace dss {
 
 namespace {
+
+// D-CSUBSET-UINT128-TYPE (TF-C94): the wide-integer accessors' fail-loud exit —
+// a byte-for-byte mirror of `latticeFatal` (type_lattice.cpp:36), which is the
+// backstop `TypeInterner::bitIntWidth`/`bitIntIsSigned` already use for the same
+// precondition class. Reaching here means a caller asked for the width/signedness
+// of a type that is NOT multi-limb, i.e. a facade site that skipped its `isWideInt`
+// gate — an engine invariant break, never user input. Abort rather than return a
+// guessed 64/128: a wrong width sizes the limb loop wrong and writes past (or short
+// of) the slot, which is silent memory corruption, the one outcome worse than a crash.
+[[noreturn]] void wideIntFatal(char const* what) {
+    std::fputs("dss::type_layout fatal: ", stderr);
+    std::fputs(what, stderr);
+    std::fputc('\n', stderr);
+    std::abort();
+}
 
 // Pointer byte width under a data model (the one OS-dependent layout dimension —
 // every other scalar's width is already baked into its TypeKind by FC3).
@@ -350,9 +367,68 @@ sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noex
     return ((bits + 63) / 64) * 8;
 }
 
-bool isWideBitInt(TypeInterner const& interner, TypeId id) noexcept {
-    return id.valid() && interner.kind(id) == TypeKind::BitInt
-        && interner.bitIntWidth(id) > 64;
+// ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
+// The ONE place that knows WHICH kinds are multi-limb. TF-C94 generalized this from
+// the BitInt-only `isWideBitInt`: I128/U128 are exactly 2 limbs, so they ride the
+// shipped limb emitters unchanged once width + signedness come from the two
+// accessors below rather than the BitInt-only interner ones (which abort on them —
+// deliberately: that abort is the backstop for a facade site this sweep missed).
+bool isWideInt(TypeInterner const& interner, TypeId id) noexcept {
+    if (!id.valid()) return false;
+    switch (interner.kind(id)) {
+        // __int128 / unsigned __int128 (D-CSUBSET-UINT128-TYPE): 128 bits has no
+        // native container on either shipped CPU — 2 limbs, memory-resident, exactly
+        // like `_BitInt(128)`. They join by SHAPE; the standard-rank vs bit-precise
+        // distinction is a SEMANTIC one (type_rules.hpp `kindAtRank`) and does not
+        // belong here. ⚠ `_BitInt(128)` (align 8) and U128 (align 16) remain
+        // INDEPENDENT layouts — see computeLayout's BitInt arm vs scalarByteSize.
+        case TypeKind::I128:
+        case TypeKind::U128:
+            return true;
+        case TypeKind::BitInt:
+            return interner.bitIntWidth(id) > 64;   // C1 (N≤64) is single-container
+        default:
+            return false;
+    }
+}
+
+std::int64_t wideIntWidthBits(TypeInterner const& interner, TypeId id) {
+    if (id.valid()) {
+        switch (interner.kind(id)) {
+            case TypeKind::I128:
+            case TypeKind::U128:
+                return 128;
+            case TypeKind::BitInt: {
+                std::int64_t const n = interner.bitIntWidth(id);
+                if (n > 64) return n;
+                break;   // a NARROW _BitInt is not multi-limb — fall to fail-loud
+            }
+            default:
+                break;
+        }
+    }
+    wideIntFatal("wideIntWidthBits: TypeId is not a WIDE integer — only a "
+                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb "
+                 "(D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE); the caller "
+                 "skipped its isWideInt gate");
+}
+
+bool wideIntIsSigned(TypeInterner const& interner, TypeId id) {
+    if (id.valid()) {
+        switch (interner.kind(id)) {
+            case TypeKind::I128: return true;    // __int128 is signed by definition
+            case TypeKind::U128: return false;   // unsigned __int128
+            case TypeKind::BitInt:
+                if (interner.bitIntWidth(id) > 64) return interner.bitIntIsSigned(id);
+                break;   // a NARROW _BitInt is not multi-limb — fall to fail-loud
+            default:
+                break;
+        }
+    }
+    wideIntFatal("wideIntIsSigned: TypeId is not a WIDE integer — only a "
+                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb "
+                 "(D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE); the caller "
+                 "skipped its isWideInt gate");
 }
 
 bool isComplex(TypeInterner const& interner, TypeId id) noexcept {
@@ -369,6 +445,15 @@ bool isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept {
         // aggregate {re, im} reached by ADDRESS, mirroring a wide `_BitInt` exactly
         // — it has no bare-SSA aggregate value.
         case TypeKind::Complex:
+        // D-CSUBSET-UINT128-TYPE (TF-C94): `__int128`/`unsigned __int128` are
+        // MEMORY-RESIDENT for the same reason a wide `_BitInt` is — 128 bits has no
+        // native register/ALU width on either shipped CPU (MEASURED: mir_to_lir.cpp
+        // `requireNativeIntWidth` gates I128/U128 alongside the sub-32 kinds), so a
+        // 128-bit value has no SSA form and must be reached by ADDRESS. THIS is the
+        // arm that routes 128-bit values into the multi-limb emitters; without it
+        // they fall to a bare-SSA scalar path that carries only the low 8 bytes.
+        case TypeKind::I128:
+        case TypeKind::U128:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // wide _BitInt is multi-limb
@@ -386,6 +471,13 @@ bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
         // like a struct{re, im} (the by-address call/return/init/assign gates funnel
         // here). NOT Array — a complex does not decay.
         case TypeKind::Complex:
+        // D-CSUBSET-UINT128-TYPE (TF-C94): a 128-bit integer is passed / returned /
+        // copy-assigned BY VALUE like a wide `_BitInt` — the calling-convention gates
+        // hand it to classifyAggregate (2 eightbytes) instead of a single GPR, and
+        // the copy sites move all 16 bytes instead of a low-8 scalar Load+Store. NOT
+        // Array (it does not decay), which is why this list differs from the sibling.
+        case TypeKind::I128:
+        case TypeKind::U128:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // ARRAY excluded (it decays)

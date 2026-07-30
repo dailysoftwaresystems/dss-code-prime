@@ -83,38 +83,83 @@ scalarByteSize(TypeKind kind, DataModel dm) noexcept;
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept;
 
-// C23 _BitInt(N) (D-CSUBSET-BITINT-C2-WIDE): a `_BitInt(N)` whose width EXCEEDS 64
-// bits — a C2 MULTI-LIMB value (ceil(N/64) little-endian i64 limbs). A pure
-// type-shape query (no target/format/arch identity): `true` iff `id` is a BitInt
-// with width > 64. A `_BitInt(N≤64)` stays a single native container (C1) — false.
+// ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
+//
+// A WIDE integer is one with NO single native container — a MULTI-LIMB value
+// (ceil(N/64) little-endian i64 limbs) that is memory-resident and reached by
+// ADDRESS. Three kinds qualify: a C23 `_BitInt(N>64)` (the C2 arm), and the
+// 128-bit standard-rank integers `I128`/`U128` (`__int128` / `unsigned __int128`).
+// The 128-bit kinds join by SHAPE, not by identity: they are exactly 2 limbs, so
+// every shipped multi-limb emitter (`emitWideAddSub`/`emitWideMul`/`emitWideDivMod`/
+// … in hir_to_mir) drives them unchanged once width + signedness come from here
+// instead of from the BitInt-only interner accessors. This facade is the ONE place
+// that knows the membership — a caller asking "is this multi-limb?" must ask here,
+// never re-derive it from a TypeKind test, so a fourth wide kind is one edit.
+//
+// TF-C94 MEASURED: generalizing this predicate is what makes `isMemoryResidentType`
+// / `isByValueClass` return true for I128/U128 and therefore what routes 128-bit
+// values through the limb emitters instead of a bare SSA scalar (which would carry
+// only the low 8 bytes). NOT a target/format/language branch — pure type shape.
+//
+// ⚠ `_BitInt(128)` and `U128` are INDEPENDENT types here and MUST stay so: both are
+// 16 bytes, but `_BitInt(128)` has align 8 (x86-64 psABI, `computeLayout`'s BitInt
+// arm) while `U128` has align 16 (`scalarByteSize` + the natural-alignment rule).
+// Sharing a limb COUNT is not sharing a LAYOUT — do not unify them.
+//
+// `true` iff `id` is a wide integer. A `_BitInt(N≤64)` stays a single native
+// container (C1) — false; so is every non-integer kind and the invalid TypeId.
 [[nodiscard]] DSS_EXPORT bool
-isWideBitInt(TypeInterner const& interner, TypeId id) noexcept;
+isWideInt(TypeInterner const& interner, TypeId id) noexcept;
+
+// The width in bits of a WIDE integer: the interned width for a `_BitInt(N>64)`,
+// 128 for I128/U128. FAILS LOUD (abort) for anything else — every call site is
+// downstream of an `isWideInt` gate, so a non-wide argument is a broken invariant,
+// never user input. This mirrors `TypeInterner::bitIntWidth` (type_lattice.cpp:832)
+// exactly, which is the point: a facade site the TF-C94 sweep MISSED still aborts
+// on a 128-bit value rather than silently sizing a limb loop from a guess.
+[[nodiscard]] DSS_EXPORT std::int64_t
+wideIntWidthBits(TypeInterner const& interner, TypeId id);
+
+// The signedness of a WIDE integer: the interned flag for a `_BitInt(N>64)`, `true`
+// for I128, `false` for U128. FAILS LOUD (abort) for anything else — same contract
+// and same reasoning as `wideIntWidthBits`, mirroring `TypeInterner::bitIntIsSigned`
+// (type_lattice.cpp:839). Signedness drives every limb sign-fill, the top-limb mask,
+// and the ordered-compare's top-limb arm, so a guessed answer is wrong BYTES.
+[[nodiscard]] DSS_EXPORT bool
+wideIntIsSigned(TypeInterner const& interner, TypeId id);
 
 // C99 _Complex (D-CSUBSET-COMPLEX): a pure type-shape query — `true` iff `id` is a
 // Complex kind. The dedicated helper the by-address contract funnels through: the
 // hir_to_mir request value->address FLIP, the lowerLvalueAddressNode materialize
 // dispatch, and the combineBinaryOp/combineCast misroute guards all key on it
-// (mirroring `isWideBitInt`). No target/format/language identity — Complex only
+// (mirroring `isWideInt`). No target/format/language identity — Complex only
 // ever appears in a `_Complex`-declaring schema, so this is inert elsewhere.
 [[nodiscard]] DSS_EXPORT bool
 isComplex(TypeInterner const& interner, TypeId id) noexcept;
 
-// C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): the by-construction STORAGE/GUARD
-// predicate. A wide `_BitInt` is MEMORY-RESIDENT — like an aggregate it has NO SSA
-// register value and is always reached by ADDRESS. `true` for Struct/Union/Array
-// AND a wide `_BitInt(N>64)`. The alloca-sizing site + the anti-resurrection guards
-// (an aggregate/wide-BitInt reaching a bare-SSA position) funnel through here so
-// coverage is BY CONSTRUCTION (§A.5), not by enumerating edits. A pure type-shape
+// C23 _BitInt(N>64) + __int128 (D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE):
+// the by-construction STORAGE/GUARD predicate. A wide integer is MEMORY-RESIDENT —
+// like an aggregate it has NO SSA register value and is always reached by ADDRESS.
+// `true` for Struct/Union/Array/Complex AND any `isWideInt` kind (a wide
+// `_BitInt(N>64)`, I128, U128). The alloca-sizing site + the anti-resurrection
+// guards (an aggregate/wide value reaching a bare-SSA position) funnel through here
+// so coverage is BY CONSTRUCTION (§A.5), not by enumerating edits. A pure type-shape
 // query — no target/format/language identity (the agnostic bar).
+// ⚠ TF-C94: this function has a `default:` arm and this TU is NOT under
+// `-Werror=switch` (MEASURED: in src/core only types/parse_diagnostic.cpp is —
+// src/core/CMakeLists.txt:98-104) — a missed kind is a SILENT `return false`, not a
+// build error. Any new memory-resident kind must be added here BY HAND.
 [[nodiscard]] DSS_EXPORT bool
 isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept;
 
-// C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): the by-VALUE-CLASS twin of
-// `isMemoryResidentType` with ARRAY EXCLUDED — `true` for Struct/Union AND a wide
-// `_BitInt(N>64)`, but NOT Array (an array is never passed / returned / copy-
-// assigned BY VALUE in C — it decays to a pointer). The calling-convention gates
-// (call arg/return, param reception, ReturnStmt, the call-consumer arm) + the
-// aggregate copy-init/assign sites funnel here. A pure type-shape query.
+// C23 _BitInt(N>64) + __int128 (D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE):
+// the by-VALUE-CLASS twin of `isMemoryResidentType` with ARRAY EXCLUDED — `true` for
+// Struct/Union/Complex AND any `isWideInt` kind, but NOT Array (an array is never
+// passed / returned / copy-assigned BY VALUE in C — it decays to a pointer). The
+// calling-convention gates (call arg/return, param reception, ReturnStmt, the
+// call-consumer arm) + the aggregate copy-init/assign sites funnel here. A pure
+// type-shape query.
+// ⚠ TF-C94: same `default:`-arm / no-`-Werror=switch` caveat as the sibling above.
 [[nodiscard]] DSS_EXPORT bool
 isByValueClass(TypeInterner const& interner, TypeId id) noexcept;
 

@@ -1465,45 +1465,156 @@ TEST(TypeLayout, SizeOfScalarOrBitIntShim) {
     EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.primitive(TypeKind::I32), DataModel::Lp64), 4u);
 }
 
-// D-CSUBSET-BITINT-C2-WIDE: the memory-resident / by-value-class type-shape predicates
-// over EVERY form. A wide `_BitInt(N>64)` is BOTH (multi-limb, reached by ADDRESS); a
-// narrow `_BitInt(N<=64)` is NEITHER (a single native container — a scalar). Array is
-// memory-resident but NOT by-value-class (it decays); struct/union are both; a plain
-// scalar and the invalid TypeId are neither. `isWideBitInt` is the exact N>64 line.
+// D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE: the memory-resident / by-value-
+// class type-shape predicates over EVERY form. A WIDE integer — a `_BitInt(N>64)` or
+// a 128-bit standard-rank integer (I128/U128) — is BOTH (multi-limb, reached by
+// ADDRESS); a narrow `_BitInt(N<=64)` is NEITHER (a single native container — a
+// scalar). Array is memory-resident but NOT by-value-class (it decays); struct/union
+// are both; a plain scalar and the invalid TypeId are neither. `isWideInt` is the
+// membership line: the exact N>64 boundary for BitInt, plus the two 128-bit kinds.
 TEST(TypeLayout, WideBitIntTypeShapePredicates) {
     auto ti = makeInterner(72);
     TypeId const wide   = ti.bitInt(128, true);
     TypeId const wide2  = ti.bitInt(65, false);   // the smallest wide width
     TypeId const narrow = ti.bitInt(64, true);    // the widest single-container width
     TypeId const i32    = ti.primitive(TypeKind::I32);
+    TypeId const i64    = ti.primitive(TypeKind::I64);
+    TypeId const i128   = ti.primitive(TypeKind::I128);
+    TypeId const u128   = ti.primitive(TypeKind::U128);
     std::array<TypeId, 1> const sfields{i32};
     TypeId const st     = ti.structType("S", sfields);
     TypeId const arr    = ti.array(i32, 4);
 
-    // isWideBitInt — the exact N>64 boundary (64 is narrow, 65 is wide).
-    EXPECT_TRUE(isWideBitInt(ti, wide));
-    EXPECT_TRUE(isWideBitInt(ti, wide2));
-    EXPECT_FALSE(isWideBitInt(ti, narrow));
-    EXPECT_FALSE(isWideBitInt(ti, i32));
-    EXPECT_FALSE(isWideBitInt(ti, st));
-    EXPECT_FALSE(isWideBitInt(ti, TypeId{}));
+    // isWideInt — the exact N>64 boundary (64 is narrow, 65 is wide), PLUS the two
+    // 128-bit standard-rank kinds. I64 pins the "64 bits is still native" line for a
+    // non-BitInt kind, mirroring `narrow` on the BitInt side.
+    EXPECT_TRUE(isWideInt(ti, wide));
+    EXPECT_TRUE(isWideInt(ti, wide2));
+    EXPECT_TRUE(isWideInt(ti, i128));
+    EXPECT_TRUE(isWideInt(ti, u128));
+    EXPECT_FALSE(isWideInt(ti, narrow));
+    EXPECT_FALSE(isWideInt(ti, i32));
+    EXPECT_FALSE(isWideInt(ti, i64));
+    EXPECT_FALSE(isWideInt(ti, st));
+    EXPECT_FALSE(isWideInt(ti, TypeId{}));
 
-    // isMemoryResidentType — struct/union/array + wide _BitInt; NOT narrow/scalar/invalid.
+    // The width/signedness accessors over every wide form. BitInt reads the interned
+    // pair; the 128-bit kinds answer from the KIND alone (I128 signed, U128 not).
+    EXPECT_EQ(wideIntWidthBits(ti, wide), 128);
+    EXPECT_EQ(wideIntWidthBits(ti, wide2), 65);
+    EXPECT_EQ(wideIntWidthBits(ti, i128), 128);
+    EXPECT_EQ(wideIntWidthBits(ti, u128), 128);
+    EXPECT_TRUE(wideIntIsSigned(ti, wide));
+    EXPECT_FALSE(wideIntIsSigned(ti, wide2));
+    EXPECT_TRUE(wideIntIsSigned(ti, i128));
+    EXPECT_FALSE(wideIntIsSigned(ti, u128));
+
+    // isMemoryResidentType — struct/union/array + EVERY wide integer; NOT narrow/
+    // scalar/invalid. The I128/U128 rows are what route a 128-bit value through the
+    // multi-limb emitters instead of a bare-SSA scalar carrying only the low 8 bytes.
     EXPECT_TRUE(isMemoryResidentType(ti, wide));
+    EXPECT_TRUE(isMemoryResidentType(ti, i128));
+    EXPECT_TRUE(isMemoryResidentType(ti, u128));
     EXPECT_TRUE(isMemoryResidentType(ti, st));
     EXPECT_TRUE(isMemoryResidentType(ti, arr));
     EXPECT_FALSE(isMemoryResidentType(ti, narrow));
     EXPECT_FALSE(isMemoryResidentType(ti, i32));
+    EXPECT_FALSE(isMemoryResidentType(ti, i64));
     EXPECT_FALSE(isMemoryResidentType(ti, TypeId{}));
 
-    // isByValueClass — struct/union + wide _BitInt; ARRAY EXCLUDED (decays), NOT narrow/
-    // scalar/invalid. This is the ONLY difference from isMemoryResidentType: the array.
+    // isByValueClass — struct/union + EVERY wide integer; ARRAY EXCLUDED (decays), NOT
+    // narrow/scalar/invalid. This is the ONLY difference from isMemoryResidentType:
+    // the array. The two predicates must agree on I128/U128 (neither decays).
     EXPECT_TRUE(isByValueClass(ti, wide));
+    EXPECT_TRUE(isByValueClass(ti, i128));
+    EXPECT_TRUE(isByValueClass(ti, u128));
     EXPECT_TRUE(isByValueClass(ti, st));
     EXPECT_FALSE(isByValueClass(ti, arr));       // the array/by-value distinction
     EXPECT_FALSE(isByValueClass(ti, narrow));
     EXPECT_FALSE(isByValueClass(ti, i32));
+    EXPECT_FALSE(isByValueClass(ti, i64));
     EXPECT_FALSE(isByValueClass(ti, TypeId{}));
+}
+
+// ★ D-CSUBSET-UINT128-TYPE: `_BitInt(128)` and `unsigned __int128` share a limb COUNT
+// and a SIZE but NOT a LAYOUT, and the whole 128-bit design depends on those two facts
+// staying independent. `_BitInt(128)` is 16/8 — size 16, align EIGHT — because the
+// x86-64 psABI aligns a bit-precise type to its limb, not its size (computeLayout's
+// BitInt arm hardcodes alignBytes=8 for N>64, and examples/c-subset/c23_bitint_wide
+// pins it from real C). U128 is 16/16 — the ordinary natural-alignment rule applied to
+// a 16-byte scalar via scalarByteSize. MEASURED against the shipped consumer: the pe/
+// x86_64 `jmp_buf` is `arr<u128,16>` (shippedLibs/setjmp.json), sizeof 256, _Alignof 16
+// — which is exactly `_setjmp`'s movaps requirement and would BREAK at align 8.
+// Asserting both in ONE test is the point: a future "unify the 128-bit types" edit
+// cannot make one follow the other without turning this red.
+TEST(TypeLayout, Int128AndBitInt128AreIndependentLayouts) {
+    auto ti = makeInterner(74);
+
+    auto const lb = layoutOf(ti.bitInt(128, true), ti);
+    EXPECT_EQ(lb.size, 16u);
+    EXPECT_EQ(lb.align.bytes(), 8u) << "_Alignof(_BitInt(128)) must stay 8 (psABI)";
+
+    auto const li = layoutOf(ti.primitive(TypeKind::I128), ti);
+    EXPECT_EQ(li.size, 16u);
+    EXPECT_EQ(li.align.bytes(), 16u) << "_Alignof(__int128) must stay 16";
+
+    auto const lu = layoutOf(ti.primitive(TypeKind::U128), ti);
+    EXPECT_EQ(lu.size, 16u);
+    EXPECT_EQ(lu.align.bytes(), 16u) << "_Alignof(unsigned __int128) must stay 16";
+
+    // Same size, DIFFERENT alignment — stated as a relation so the divergence itself
+    // is the assertion, not just two coincidental constants.
+    EXPECT_EQ(lb.size, lu.size);
+    EXPECT_NE(lb.align.bytes(), lu.align.bytes());
+
+    // The shipped consumer: `arr<u128,16>` is the pe/x86_64 jmp_buf — 256 bytes,
+    // 16-aligned. Element alignment propagates to the array (setjmp_longjmp depends
+    // on it: a wrong alignment crashes `_setjmp`'s movaps xmm saves).
+    auto const lj = layoutOf(ti.array(ti.primitive(TypeKind::U128), 16), ti);
+    EXPECT_EQ(lj.size, 256u);
+    EXPECT_EQ(lj.align.bytes(), 16u);
+}
+
+// ★ D-CSUBSET-UINT128-TYPE: the align-16 fact PROPAGATED THROUGH A REAL AGGREGATE, and
+// the C++ twin of the `_Static_assert(sizeof(struct N) == 528)` in
+// examples/c-subset/c_int128_arith/main.c. Two reasons this lives here as well:
+//
+//  1. UN-MASKABLE. A failed `_Static_assert` ABORTS translation, so if the example's
+//     compile-time block ever turns red it takes every runtime pin in that file with
+//     it. This test cannot be masked that way — it is the belt for the example's braces.
+//  2. NON-VACUOUS BY MEASUREMENT. `struct { u128 v[32]; unsigned f1, f2; }` is 528, and
+//     the `_BitInt(128)` twin of the SAME struct is 520. The 8-byte difference is the
+//     tail round-up: 32*16 = 512 bytes of array + 8 bytes of `unsigned` pair = 520,
+//     rounded UP to the struct alignment — 16 for U128 (⇒ 528), 8 for `_BitInt(128)`
+//     (⇒ 520, a no-op round). Asserting BOTH numbers in one test is the point: it is
+//     the aggregate-level statement of the same independence
+//     `Int128AndBitInt128AreIndependentLayouts` asserts on the bare scalars, and a
+//     future "unify the 128-bit types" edit cannot satisfy both.
+//
+// The `unsigned` pair is load-bearing — a struct of ONLY the array would be 512 either
+// way and the two layouts would agree, which is exactly the vacuous shape to avoid.
+TEST(TypeLayout, Int128AggregateLayoutVsBitInt128) {
+    auto ti = makeInterner(75);
+    TypeId const u32Ty = ti.primitive(TypeKind::U32);
+
+    std::array<TypeId, 3> const uFields{
+        ti.array(ti.primitive(TypeKind::U128), 32), u32Ty, u32Ty};
+    auto const lu = layoutOf(ti.structType("NU128", uFields), ti);
+    EXPECT_EQ(lu.size, 528u)
+        << "512B of u128[32] + 8B of unsigned pair, rounded UP to align 16";
+    EXPECT_EQ(lu.align.bytes(), 16u) << "the member's align 16 propagates to the struct";
+
+    std::array<TypeId, 3> const bFields{
+        ti.array(ti.bitInt(128, false), 32), u32Ty, u32Ty};
+    auto const lb = layoutOf(ti.structType("NBitInt128", bFields), ti);
+    EXPECT_EQ(lb.size, 520u)
+        << "the _BitInt(128) twin: same 520 bytes of payload, but align 8 makes the "
+           "tail round-up a NO-OP — this is what makes the 528 above non-vacuous";
+    EXPECT_EQ(lb.align.bytes(), 8u) << "_Alignof(_BitInt(128)) must stay 8 (psABI)";
+
+    // Stated as a relation, so the DIVERGENCE itself is the assertion.
+    EXPECT_NE(lu.size, lb.size);
+    EXPECT_NE(lu.align.bytes(), lb.align.bytes());
 }
 
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5p13): a complex lays out as {re@0, im@es},
@@ -1534,7 +1645,7 @@ TEST(TypeLayout, ComplexLayoutAndShapePredicates) {
     // it does NOT decay). NOT a wide _BitInt.
     EXPECT_TRUE(isMemoryResidentType(ti, cd));
     EXPECT_TRUE(isByValueClass(ti, cd));
-    EXPECT_FALSE(isWideBitInt(ti, cd));
+    EXPECT_FALSE(isWideInt(ti, cd));
 
     // IMPORTANT-5 (red-on-disable): a Complex takes the GPR default reg class — NEVER
     // the FPR arm. requireEncodedFloatWidth no-ops on non-FPR, so the aggregate never

@@ -10922,6 +10922,321 @@ TEST(MirLoweringCSubset, WideBitIntEasyOpsLowerGreen) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
+// ★★ D-CSUBSET-UINT128-TYPE (TF-C94) — a WIDE integer narrowed to a scalar must carry
+// the DESTINATION's DECLARED TypeId, never the canonical `interner.primitive(kind)` row
+// for its TypeKind.
+//
+// THE PREMISE, and why sub-64-bit coverage cannot substitute for this test: a TypeKind
+// does NOT determine a TypeId. C spells FOUR distinct 64-bit integer type names over
+// only TWO kinds — `long` and `long long` both I64, `unsigned long` and `unsigned long
+// long` both U64 — so the interner necessarily mints a SEPARATE TypeId per spelling and
+// the canonical primitive row is none of them. Every sub-64-bit integer kind has exactly
+// ONE C spelling, so its declared TypeId happens to BE the canonical primitive: a
+// `(int)` / `(short)` / `(unsigned)` narrowing passes even while all four 64-bit
+// spellings are broken. The test asserts that premise FIRST (the two I64 spellings
+// resolve to different TypeIds, likewise the two U64 ones) so it can never silently
+// decay into a vacuous check if the vocabulary ever collapses.
+//
+// MEASURED, before the fix: `emitScalarFromWide` typed its result from the KIND, so
+// `static unsigned long long f(...){ __uint128_t r = ...; return (unsigned long long)
+// (r>>64); }` produced a value carrying the canonical U64 row and the MIR verifier's
+// strict `vt.v != returnTy.v` identity test walled it with I_TerminatorTypeMismatch.
+// This reproduced on all four 64-bit spellings and on an `enum` target (whose declared
+// type is the nominal Enum TypeId while its kind is the underlying integer), and it was
+// NOT specific to `__int128` — the identical wall reproduced with an `unsigned
+// _BitInt(128)` and an `unsigned _BitInt(200)` source, so it had been latent since
+// D-CSUBSET-BITINT-C2-WIDE.
+//
+// RED-ON-DISABLE (run, then restored): revert `emitScalarFromWide` to type its result
+// `interner.primitive(targetKind)` and every one of the six rows below fails — four with
+// a MirVerifier I_TerminatorTypeMismatch and a declared-vs-actual TypeId mismatch, plus
+// the enum row and the `_BitInt` row. The STORE-shaped contexts (assignment, initializer,
+// compound-assign, array element, struct member, global, call argument, `*p = (u64)r`)
+// carried the SAME wrong TypeId but were NOT caught — the verifier does not identity-
+// check Store or call-argument operands — which is precisely why the return position is
+// the one pinned here.
+TEST(MirLoweringCSubset, WideIntNarrowingCarriesDeclaredTypeId) {
+    // All four 64-bit spellings in ONE unit, so the two same-kind pairs can be compared
+    // against each other. `main` returns `int`, which never collides with I64/U64.
+    Lowered L = lowerCSubset(
+        "unsigned long long fUll(__uint128_t r) { return (unsigned long long)(r >> 64); }\n"
+        "unsigned long      fUl (__uint128_t r) { return (unsigned long)(r >> 64); }\n"
+        "long long          fLl (__int128 r)    { return (long long)(r >> 64); }\n"
+        "long               fL  (__int128 r)    { return (long)(r >> 64); }\n"
+        "int main(void) {\n"
+        "  __uint128_t u = 3; __int128 s = 5;\n"
+        "  return (int)fUll(u) + (int)fUl(u) + (int)fLl(s) + (int)fL(s);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // The verifier is the fail-loud gate that blocked sqlite: interner-gated, so it
+    // must be constructed WITH the interner or the return-type rule is skipped entirely.
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(v.verify(vrep))
+        << "\na wide->64-bit narrowing in a RETURN must be verifier-clean — "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+
+    Mir const&          m  = L.mir.mir;
+    TypeInterner const& ti = L.model.lattice().interner();
+
+    // Per function: the Return operand's TypeId must EQUAL the FnSig's declared return
+    // TypeId. Collect the I64/U64-kinded ones so the premise can be asserted after.
+    std::vector<TypeId> i64Rets;
+    std::vector<TypeId> u64Rets;
+    // `moduleFuncCount()`, NOT `funcCount()` — the latter counts the arena's slot-0
+    // sentinel too, and `funcAt(moduleFuncCount())` hard-traps.
+    for (std::uint32_t fi = 0;
+         fi < static_cast<std::uint32_t>(m.moduleFuncCount()); ++fi) {
+        TypeId const sig = m.funcSignature(m.funcAt(fi));
+        if (!sig.valid()) continue;
+        auto const sigOps = ti.operands(sig);
+        if (sigOps.empty() || !sigOps[0].valid()) continue;
+        TypeId   const retTy = sigOps[0];
+        TypeKind const rk    = ti.kind(retTy);
+        if (rk != TypeKind::I64 && rk != TypeKind::U64) continue;
+
+        // Scan EVERY block, not just the entry one: a wide `>> 64` emits a limb LOOP,
+        // so the Return lands in a later block (`entryReturn` would miss it and the
+        // test would silently check nothing).
+        MirInstId ret = InvalidMirInst;
+        for (std::uint32_t bi = 0;
+             bi < m.funcBlockCount(m.funcAt(fi)) && !ret.valid(); ++bi) {
+            MirBlockId const b = m.funcBlockAt(m.funcAt(fi), bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const ix = m.blockInstAt(b, ii);
+                if (m.instOpcode(ix) == MirOpcode::Return) { ret = ix; break; }
+            }
+        }
+        ASSERT_TRUE(ret.valid()) << "the narrowing helper's Return was not found";
+        auto const retOps = m.instOperands(ret);
+        ASSERT_EQ(retOps.size(), 1u) << "a scalar return carries exactly one value";
+        EXPECT_EQ(m.instType(retOps[0]).v, retTy.v)
+            << "\nthe wide->narrow result must carry the function's DECLARED return "
+               "TypeId (" << retTy.v << "), not another row of the same TypeKind ("
+            << m.instType(retOps[0]).v << ")";
+
+        (rk == TypeKind::I64 ? i64Rets : u64Rets).push_back(retTy);
+    }
+
+    // THE PREMISE — two spellings, one kind, DIFFERENT TypeIds. Asserted last so a
+    // failure reads as "this test just went vacuous", not as a narrowing bug.
+    ASSERT_EQ(i64Rets.size(), 2u) << "`long` and `long long` are the two I64 helpers";
+    ASSERT_EQ(u64Rets.size(), 2u) << "`unsigned long`/`unsigned long long` are the U64 pair";
+    EXPECT_NE(i64Rets[0].v, i64Rets[1].v)
+        << "`long` and `long long` share TypeKind I64 but must be DISTINCT TypeIds — "
+           "if they ever collapse, this whole test stops discriminating";
+    EXPECT_NE(u64Rets[0].v, u64Rets[1].v)
+        << "`unsigned long` and `unsigned long long` share U64 but must be DISTINCT";
+}
+
+// D-CSUBSET-UINT128-TYPE (TF-C94), the two remaining broken narrowing targets, kept
+// apart from the four-spelling test because each fails for its OWN reason:
+//  - an ENUM target: the declared type is the NOMINAL Enum TypeId while the cast's kind
+//    is the enum's UNDERLYING integer, so typing from the kind can never produce the
+//    declared row (MEASURED: value type 1 vs declared 55). The non-wide `int -> enum`
+//    cast was always correct — `combineCast`'s ordinary tail already emits with `t` —
+//    which is what makes this a wide-path-only defect.
+//  - a `_BitInt(N>64)` SOURCE: proves the defect was never `__int128`-specific. The same
+//    `unsigned long long` return walled with an `unsigned _BitInt(128)` and an
+//    `unsigned _BitInt(200)` source, i.e. it had been latent since C2.
+TEST(MirLoweringCSubset, WideIntNarrowingToEnumAndFromBitIntCarriesDeclaredTypeId) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"enum E { A = 1, B = 2 };\n"
+                 "enum E toEnum(__uint128_t r) { return (enum E)r; }\n"
+                 "int main(void) { __uint128_t r = 1; return (int)toEnum(r); }\n",
+                 "wide -> enum (declared type is the nominal Enum row)"},
+             Row{"unsigned long long hi128(unsigned _BitInt(128) r)"
+                 " { return (unsigned long long)(r >> 64); }\n"
+                 "int main(void) { unsigned _BitInt(128) r = 3; return (int)hi128(r); }\n",
+                 "_BitInt(128) source -> unsigned long long (NOT __int128-specific)"},
+             Row{"unsigned long long hi200(unsigned _BitInt(200) r)"
+                 " { return (unsigned long long)(r >> 64); }\n"
+                 "int main(void) { unsigned _BitInt(200) r = 3; return (int)hi200(r); }\n",
+                 "_BitInt(200) source -> unsigned long long (4-limb, same chokepoint)"}}) {
+        Lowered L = lowerCSubset(std::string{r.src});
+        ASSERT_FALSE(L.model.hasErrors())
+            << "\n" << r.what << "\n"
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << "\n" << r.what << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << "\n" << r.what << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        DiagnosticReporter vrep;
+        MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+        EXPECT_TRUE(v.verify(vrep))
+            << "\n" << r.what
+            << ": the wide->narrow result must carry the DECLARED TypeId — "
+            << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    }
+}
+
+// ★★ D-CSUBSET-UINT128-TYPE (TF-C94) — `++` / `--` on a 128-bit integer.
+//
+// THE DEFECT THIS PINS, and why it was not a deferral. `materializeWideLiteral`'s
+// 64-bit-payload arm rejected everything that was not `std::int64_t`, and a KIND gate
+// added below that rejection refused every non-`_BitInt` wide type outright. Which arm
+// a synthetic `1` lands on is decided by `synthOne` (cst_to_hir.cpp) from the type's
+// CORE via `isSignedCore`: a SIGNED core gets `std::int64_t{1}`, an UNSIGNED one gets
+// `std::uint64_t{1}`. `isSignedCore(BitInt)` is `true` for BOTH `_BitInt` signednesses
+// (the core carries no sign), so every `_BitInt` synthetic `1` rode the int64 arm and
+// `_BitInt(128) x; x++;` always worked, while `U128` rode the uint64 arm.
+//
+// MEASURED before the fix (arm64:macho64-arm64-darwin-exec, one file per row):
+//     `__uint128_t x = 41; x++;` → H_UnsupportedLoweringForKind, "a wide _BitInt
+//         literal must be a bit-precise value or a 64-bit integer constant" — a type
+//         the source never mentions, and NO anchor at all;
+//     `__int128 x = 41; x++;`    → the anchored 128-bit-literal refusal (it cleared the
+//         int64 check, then hit the kind gate);
+//     `_BitInt(128)` and `unsigned _BitInt(128)` → clean.
+// So the two 128-bit spellings failed for DIFFERENT reasons and one of them was
+// unanchored — three symptoms of one misplaced gate.
+//
+// WHY THE REFUSAL WAS UNNECESSARY (not a relaxation of a real wall): the gate now
+// checks the PAYLOAD VARIANT, not the type. Reaching it means the value is held in a
+// 64-bit host scalar, which structurally cannot carry more than 64 bits of magnitude,
+// so "limb 0 = the value, higher limbs = the sign fill" is EXACT. A genuinely wide
+// literal never arrives here — it comes as a `BitIntValue` and is filled limb-by-limb
+// by the arm above.
+//
+// RUNTIME, MEASURED end-to-end on arm64:macho64-arm64-darwin-exec, exit 42: `__uint128_t
+// u = (__uint128_t)0xFFFFFFFFFFFFFFFFull; u++;` CARRIES into the high limb (high word 1,
+// low word 0) and `u--` BORROWS back out of it; the signed `__int128` twin does the same
+// across `-(2^64)`. The corpus example owns the exit-code form; this test owns the
+// lowering-tier pin.
+//
+// RED-ON-DISABLE (run, then restored): put the kind gate back below the int64 check —
+// i.e. reject anything that is not `std::int64_t`, then reject a non-`BitInt` kind — and
+// the four `__int128`/`__uint128_t` rows fail at `L.mir.ok` while the two `_BitInt` rows
+// stay green, reproducing the exact asymmetry above.
+TEST(MirLoweringCSubset, IncDecOnWideIntegerLowersGreenForEverySpelling) {
+    struct Row { char const* decl; char const* what; };
+    for (Row const r : {
+             Row{"__uint128_t",           "the UNSIGNED 128-bit standard kind — its "
+                                          "synthetic 1 rides the uint64 arm"},
+             Row{"__int128",              "the SIGNED 128-bit standard kind — int64 arm, "
+                                          "was blocked by the kind gate"},
+             Row{"unsigned _BitInt(128)", "the bit-precise twin — must STAY green"},
+             Row{"_BitInt(128)",          "signed bit-precise — must STAY green"},
+             Row{"unsigned _BitInt(200)", "a 4-limb width, to keep the fix from being "
+                                          "accidentally 2-limb-specific"}}) {
+        // All four ++/-- forms in one unit: post-inc, pre-inc, post-dec, pre-dec.
+        std::string const src =
+            std::string{"int main(void) { "} + r.decl + " x = 41; "
+            "x++; ++x; x--; --x; return (int)x; }\n";
+        Lowered L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors())
+            << "\n" << r.what << "\n" << src << "\n"
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << "\n" << r.what << "\n" << src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << "\n" << r.what << "\n" << src
+            << "\n++/-- on a 128-bit integer must lower — the synthetic `1` fits in 64 "
+               "bits by construction, so there is nothing here to defer\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        DiagnosticReporter vrep;
+        MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+        EXPECT_TRUE(v.verify(vrep))
+            << "\n" << r.what << "\n" << src << "\n"
+            << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    }
+}
+
+// The SUBSTANCE pin for the test above: green lowering alone would also be satisfied by
+// an arm that quietly wrote ONE limb and left the other undefined, or that sign-filled
+// where it must zero-fill. What is pinned here is the SIGN-FILL discipline —
+// `emitWideFromScalar` picks the limb fill from the source kind: an UNSIGNED wide type
+// zero-fills the limbs above the first (a `Const 0`), a SIGNED one sign-fills them (an
+// `AShr` by 63). That signedness now comes from the `wideIntIsSigned` FACADE, replacing
+// the BitInt-only `interner.bitIntIsSigned` — which ABORTED on I128/U128 and is the
+// entire reason the kind gate existed.
+//
+// ★ THE TEST SHAPE IS ITSELF A CORRECTION. The first version of this test compared
+// `__uint128_t` against `unsigned _BitInt(128)` and asserted their opcode censuses were
+// EQUAL. That was VACUOUS and was MEASURED so: hard-coding the fill signedness to
+// `TypeKind::I64` — the exact regression it was meant to catch — left the test GREEN,
+// because a uniform signedness error moves BOTH sides of an equality identically. A
+// same-vs-same comparison cannot see a same-vs-same error.
+//
+// The discriminating quantity is the SIGNED-minus-UNSIGNED delta WITHIN one family: the
+// two spellings differ by exactly the one sign-fill `AShr` that the synthetic `1`
+// contributes. The `= 41` initializer casts from a SIGNED I32 in all four rows and so
+// contributes the same AShr to each, cancelling out of every delta. Cross-family
+// equality is kept as a secondary check (the revived U128 arm must behave like the
+// shipped `_BitInt` one), but it is no longer what carries the test.
+//
+// RED-ON-DISABLE (run, then restored): replace `wideIntIsSigned(interner, t) ?
+// TypeKind::I64 : TypeKind::U64` with a hard-coded `TypeKind::I64` and both deltas
+// collapse to 0 — the unsigned rows grow the sign-fill AShr they must not have. Under
+// the vacuous first version this same edit stayed green.
+TEST(MirLoweringCSubset, IncDecOnUnsignedWideIntegerZeroFillsItsUpperLimbs) {
+    auto census = [](Lowered const& L) {
+        Mir const& m = L.mir.mir;
+        std::size_t stores = 0, ashrs = 0, total = 0;
+        for (std::uint32_t fi = 0;
+             fi < static_cast<std::uint32_t>(m.moduleFuncCount()); ++fi) {
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(m.funcAt(fi)); ++bi) {
+                MirBlockId const b = m.funcBlockAt(m.funcAt(fi), bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    ++total;
+                    switch (m.instOpcode(m.blockInstAt(b, ii))) {
+                        case MirOpcode::Store: ++stores; break;
+                        case MirOpcode::AShr:  ++ashrs;  break;
+                        default: break;
+                    }
+                }
+            }
+        }
+        return std::array<std::size_t, 3>{stores, ashrs, total};
+    };
+    // Four bodies identical but for the local's declared type. Both families are
+    // 2-limb, so every difference below is a SIGNEDNESS difference.
+    auto build = [&](char const* decl) {
+        return lowerCSubset(std::string{"int main(void) { "} + decl
+                            + " x = 41; x++; return (int)x; }\n");
+    };
+    Lowered uStd = build("__uint128_t");
+    Lowered sStd = build("__int128");
+    Lowered uBit = build("unsigned _BitInt(128)");
+    Lowered sBit = build("_BitInt(128)");
+    for (Lowered const* L : {&uStd, &sStd, &uBit, &sBit}) {
+        ASSERT_TRUE(L->mir.ok)
+            << (L->mirReporter.all().empty() ? "" : L->mirReporter.all()[0].actual);
+    }
+    auto const cUStd = census(uStd);
+    auto const cSStd = census(sStd);
+    auto const cUBit = census(uBit);
+    auto const cSBit = census(sBit);
+    // Asserted first, so a failure below reads as a real defect and not as a test that
+    // has quietly stopped measuring: the signed rows must actually contain sign-fills.
+    ASSERT_GT(cSBit[1], 0u) << "the signed _BitInt(128) reference emits no AShr at all — "
+                               "this test has stopped measuring the sign fill";
+    ASSERT_GT(cUBit[0], 0u) << "the reference emits no Store — no limbs are being filled";
+    // ★ THE DISCRIMINATOR. Signed minus unsigned, within each family, is the ONE
+    // sign-fill AShr the synthetic `1` adds. A hard-coded signedness makes both zero.
+    EXPECT_EQ(cSBit[1] - cUBit[1], 1u)
+        << "signed _BitInt(128) must emit exactly ONE more sign-fill AShr than its "
+           "unsigned twin (this is the shipped reference behaviour)";
+    EXPECT_EQ(cSStd[1] - cUStd[1], 1u)
+        << "__int128 must emit exactly ONE more sign-fill AShr than __uint128_t — an "
+           "equal count means the fill signedness is not being read from the type";
+    // Secondary: the revived 128-bit arm must otherwise behave like the shipped one.
+    EXPECT_EQ(cUStd[0], cUBit[0]) << "unsigned limb Store count must match its twin";
+    EXPECT_EQ(cUStd[2], cUBit[2]) << "unsigned total instruction count must match";
+    EXPECT_EQ(cSStd[0], cSBit[0]) << "signed limb Store count must match its twin";
+    EXPECT_EQ(cSStd[2], cSBit[2]) << "signed total instruction count must match";
+}
+
 // ── VLA C1a (D-CSUBSET-VLA): the front-end + IR pin ──────────────────────────
 //
 // A block-scope `int a[n]` lowers to a `vlaArray(int)`-typed local whose MIR

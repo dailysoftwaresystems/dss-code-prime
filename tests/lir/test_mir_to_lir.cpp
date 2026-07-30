@@ -6859,3 +6859,67 @@ TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
     EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
         << "the SWAR popcount's x -= (x>>1)&m1 step";
 }
+
+// ── TF-C94 (D-CSUBSET-INT128-LIR-WIDTH): a 128-bit MEMORY access fails loud ──
+//
+// MEASURED at HEAD 57eae7b, before this gate: `reprKind` was IDENTITY for
+// I128/U128, so `widthFlagsForType` and `memAccessWidthFlags` both fell to their
+// `default: return 0` — the 64-bit width. A Store of a 128-bit value therefore
+// emitted an 8-BYTE write of a 16-BYTE value with ZERO diagnostics. The end-to-end
+// witness was a `jmp_buf` element access (shippedLibs/setjmp.json declares
+// `jmp_buf` as `arr<u128,16>` on the pe leg), which compiled clean and produced a
+// 3072-byte .exe whose every access touched half the element.
+//
+// The COMPUTE tier (Add/ICmp/…) was already gated and already loud. The gap was
+// the MEMORY/PLUMBING tier — Load, Store, Const, Bitcast — which this pins.
+TEST(MirToLir, Int128MemoryAccessFailsLoud) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const u128  = interner.primitive(::dss::TypeKind::U128);
+    auto const pU128 = interner.pointer(u128);
+    auto const fnSig =
+        interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    // A 128-bit slot, and a 128-bit STORE into it — the exact shape `env[0] = 1`
+    // lowers to. Neither the Const nor the Store is an ALU op, so the pre-existing
+    // compute gate never saw them.
+    ::dss::MirInstId const slot = mb.addInst(::dss::MirOpcode::Alloca, {}, pU128);
+    ::dss::MirLiteralValue lv;
+    lv.value = static_cast<std::int64_t>(1);
+    lv.core  = ::dss::TypeKind::U128;
+    ::dss::MirInstId const val = mb.addConst(lv, u128);
+    std::array<::dss::MirInstId, 2> stOps{val, slot};
+    mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero;
+    zero.value = static_cast<std::int64_t>(0);
+    zero.core  = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "red-on-disable: remove the 128-bit memory arms from "
+           "requireNativeIntWidth (and reprKind's wall) and this lowers CLEAN — "
+           "an 8-byte access of a 16-byte value, exactly the measured HEAD bug";
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-CSUBSET-INT128-LIR-WIDTH") != std::string::npos) {
+            sawAnchor = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "the 128-bit width refusal must carry its OWN anchor — the generic "
+           "32-bit-ALU-forms message shares the same DiagnosticCode, so an "
+           "error-count assertion alone would not be red-on-disable";
+}

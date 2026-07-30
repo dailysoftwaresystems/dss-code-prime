@@ -599,6 +599,14 @@ struct Lowerer {
     DiagnosticReporter& reporter;
     LirBuilder          lir;
 
+    // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): one-shot latch for `reprKind`'s
+    // 128-bit width-tier wall. `reprKind` is a `const` query called from every
+    // width site, so the latch is `mutable`; without it a single leaked value
+    // would report once per width query instead of once per lowering. The
+    // per-opcode gate (`requireNativeIntWidth`) owns the precise, poisoning
+    // message for the paths a user can reach — this latch guards the backstop.
+    mutable bool reportedWideIntWidthLeak = false;
+
     // Single table of cached opcode ids. `kMnemonics[i].mnemonic` is the
     // JSON-side name, `cache_[i].id` is the resolved numeric opcode (or
     // nullopt when the target schema omits it), `cache_[i].missingReported`
@@ -1275,7 +1283,32 @@ struct Lowerer {
                     "integer encodings compute 64- or 32-bit-wide, which "
                     "would silently violate the type's defined wraparound/"
                     "comparison semantics (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(reprKind(ty)),
+                    what, static_cast<unsigned>(classifyKind(ty)),
+                    target.name()));
+            poisonValue(id);
+            return false;
+        };
+        // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): a 128-bit integer has no native
+        // single-register container on either shipped arch — it is MULTI-LIMB
+        // memory, reached by ADDRESS, exactly like `_BitInt(N>64)`. Kept separate
+        // from `gatedKind` (which means "no native-width ALU FORM this cycle" — a
+        // missing ENCODING) because this is a stronger claim about the TYPE, and it
+        // gates the memory/plumbing arms below, not just compute.
+        auto const wideIntKind = [](TypeKind k) noexcept {
+            return k == TypeKind::I128 || k == TypeKind::U128;
+        };
+        auto const failWideInt = [&](TypeId ty, std::string_view what) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: 128-bit integer TypeKind ordinal {} has no native "
+                    "single-register container on target '{}' — a 128-bit "
+                    "integer is multi-limb memory (reached by ADDRESS, exactly "
+                    "like _BitInt(N>64)), so this access would silently select "
+                    "the 64-bit width form and touch 8 bytes of a 16-byte value "
+                    "(D-CSUBSET-INT128-LIR-WIDTH)",
+                    what, static_cast<unsigned>(classifyKind(ty)),
                     target.name()));
             poisonValue(id);
             return false;
@@ -1292,7 +1325,7 @@ struct Lowerer {
                     "form on target '{}' this cycle — only {} is realized; "
                     "first-match would otherwise pick a wrong-width "
                     "encoding (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(reprKind(ty)),
+                    what, static_cast<unsigned>(classifyKind(ty)),
                     target.name(), realized));
             poisonValue(id);
             return false;
@@ -1316,8 +1349,8 @@ struct Lowerer {
                 TypeId const ty = mir.instType(id);
                 // Bool ALU compute is gated too (unreachable post-
                 // promotion; reaching it = sub-int compute).
-                if (ty.valid() && (gatedKind(reprKind(ty))
-                                   || reprKind(ty) == TypeKind::Bool)) {
+                if (ty.valid() && (gatedKind(classifyKind(ty))
+                                   || classifyKind(ty) == TypeKind::Bool)) {
                     return fail(ty, mirOpcodeName(op));
                 }
                 return true;
@@ -1329,7 +1362,7 @@ struct Lowerer {
             case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge: {
                 for (MirInstId const operand : mir.instOperands(id)) {
                     TypeId const ty = mir.instType(operand);
-                    if (ty.valid() && gatedKind(reprKind(ty))) {
+                    if (ty.valid() && gatedKind(classifyKind(ty))) {
                         return fail(ty, "ICmp operand");
                     }
                 }
@@ -1350,7 +1383,7 @@ struct Lowerer {
                 // narrowing story this cycle — fail loud, never a silent narrow).
                 TypeId const ty = mir.instType(id);
                 if (ty.valid()) {
-                    TypeKind const k = reprKind(ty);
+                    TypeKind const k = classifyKind(ty);
                     // D-CSUBSET-SUBNATIVE-ALU-FORMS: a sub-native Trunc result
                     // (I8/U8/I16/U16, joining Char) routes through
                     // registerOpWidthFlags → the promoted width-32 `mov` (low bits
@@ -1378,10 +1411,10 @@ struct Lowerer {
                     // source → movsx r/m16 / SXTH; an I8 source → the byte form
                     // (movsx r/m8 / SXTB, shared with Char). I32 → movsxd / SXTW.
                     if (ty.valid()
-                        && reprKind(ty) != TypeKind::I32
-                        && reprKind(ty) != TypeKind::Char
-                        && reprKind(ty) != TypeKind::I8
-                        && reprKind(ty) != TypeKind::I16) {
+                        && classifyKind(ty) != TypeKind::I32
+                        && classifyKind(ty) != TypeKind::Char
+                        && classifyKind(ty) != TypeKind::I8
+                        && classifyKind(ty) != TypeKind::I16) {
                         return failConv(ty, "SExt source",
                                         "the I32-, I16-, and byte-source forms");
                     }
@@ -1416,14 +1449,75 @@ struct Lowerer {
                     // reuses the SAME byte widener (movzx r/m8 / uxtb). The SExt
                     // gate already accepts Char (signed-char targets, unchanged).
                     if (ty.valid()
-                        && reprKind(ty) != TypeKind::Bool
-                        && reprKind(ty) != TypeKind::U32
-                        && reprKind(ty) != TypeKind::U8
-                        && reprKind(ty) != TypeKind::U16
-                        && reprKind(ty) != TypeKind::Char) {
+                        && classifyKind(ty) != TypeKind::Bool
+                        && classifyKind(ty) != TypeKind::U32
+                        && classifyKind(ty) != TypeKind::U8
+                        && classifyKind(ty) != TypeKind::U16
+                        && classifyKind(ty) != TypeKind::Char) {
                         return failConv(ty, "ZExt source",
                                         "the Bool-, U32-, U16-, U8-, and "
                                         "Char-source forms");
+                    }
+                }
+                return true;
+            }
+            // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): the MEMORY / PLUMBING tier.
+            // Everything above gates COMPUTE (ALU, ICmp, the conversions); Load,
+            // Store, Const and Bitcast were measured UNGATED at HEAD 57eae7b, and
+            // that — combined with `reprKind` being identity for I128/U128 — is what
+            // let the `jmp_buf` probe in `reprKind`'s comment compile with ZERO
+            // diagnostics and emit an 8-byte access of each 16-byte element.
+            //
+            // ★ THESE ARMS ARE A BACKSTOP, NOT A USER-FACING PATH — corrected from
+            // the opposite claim, which a self-audit MEASURED FALSE on this tree.
+            // The earlier wording said these arms cover "the paths a USER can
+            // actually reach" and that "only a DIRECT 128-bit element access
+            // (`env[0] = 1`) mints" a 128-bit-typed Load/Store/Const. Both are wrong:
+            // the ROUTING keeps every 128-bit value multi-limb and by-ADDRESS, so a
+            // direct element access mints i64 LIMB accesses, not a U128-typed one.
+            // MEASURED on this working tree:
+            //   * `x86_64:pe64-x86_64-windows-exec`, the VERBATIM probe from
+            //     `reprKind`'s comment (`jmp_buf env; env[0]=1; env[1]=env[0];`) —
+            //     compiles with ZERO diagnostics, rc=0. These arms never fire.
+            //   * `arm64:macho64-arm64-darwin-exec`, the same shape with a SPELLED
+            //     `unsigned __int128 env[16]` and a NON-ZERO high word
+            //     (`env[0] = ((unsigned __int128)7 << 64) | 5u; env[1] = env[0];`) —
+            //     compiles clean AND RUNS CORRECTLY, exit 42, both words of the
+            //     16-byte element round-tripping. So the 8-byte-access defect is
+            //     fixed by the by-address routing, not by this gate.
+            // No user source reaches these arms today. That is exactly why they are
+            // worth keeping and exactly why they must not be described as a live
+            // wall: they convert a FUTURE routing miss into a precise, POISONING
+            // per-opcode message instead of a silent half-element access, and
+            // `reprKind`'s latch is the coarser backstop underneath them. A test
+            // that "proves" them by asserting a user program is refused would be
+            // asserting the opposite of the measurement — the MIR-tier unit test
+            // (tests/lir/test_mir_to_lir.cpp) drives them directly instead.
+            // Verified end-to-end on the pe leg by examples/c-subset/setjmp_longjmp,
+            // which still builds and runs.
+            case MirOpcode::Load: case MirOpcode::Const:
+            case MirOpcode::Bitcast: {
+                TypeId const ty = mir.instType(id);
+                if (ty.valid() && wideIntKind(classifyKind(ty))) {
+                    // `mirOpcodeName` only names the ALU/ICmp tier (everything
+                    // else is its `default: "<deferred>"`), so these three carry
+                    // explicit labels — a diagnostic that says "<deferred>" tells
+                    // the reader nothing about which access was refused.
+                    return failWideInt(ty,
+                        op == MirOpcode::Load    ? "Load result"
+                      : op == MirOpcode::Const   ? "Const value"
+                                                 : "Bitcast result");
+                }
+                return true;
+            }
+            case MirOpcode::Store: {
+                // Operand 0 is the stored VALUE (the Store itself has no result
+                // type) — that is the type whose width the emitter reads.
+                auto const operands = mir.instOperands(id);
+                if (!operands.empty()) {
+                    TypeId const ty = mir.instType(operands[0]);
+                    if (ty.valid() && wideIntKind(classifyKind(ty))) {
+                        return failWideInt(ty, "Store value");
                     }
                 }
                 return true;
@@ -1464,19 +1558,36 @@ struct Lowerer {
     // sits in its own ≥8-byte slot, so it MASKS this — caught in the FC8
     // enum review). This is the single enum→underlying resolve point for the
     // width tier: `widthFlagsForType` + `memAccessWidthFlags` (and, via the
-    // former, `registerOpWidthFlags`) all switch on `reprKind(ty)`, so the
+    // former, `registerOpWidthFlags`) all switch on `classifyKind(ty)`, so the
     // projection is by-construction at every width site. `regClassForType`
     // needs no change — `regClassForCoreType` already maps Enum → GPR; and the
     // layout authority (`computeLayout`) already sizes an enum as its
     // underlying, so field offsets and this access width can never disagree.
     // Aggregates (Struct/Union/Array) keep their own kind — they are not
     // scalars and route through the multi-leaf memory path, not these switches.
-    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
+    // The NON-FAILING classification projection. Answers "which kind does this
+    // type BEHAVE as, for a classification/detection test?" — enum → underlying
+    // scalar, `_BitInt(N≤64)` → its native container. It deliberately does NOT
+    // judge whether the result is REPRESENTABLE at the width tier, so a GATE may
+    // detect a non-representable kind (I128/U128) and report a precise, poisoning
+    // diagnostic instead of tripping `reprKind`'s wall while formatting it
+    // (D-CSUBSET-INT128-LIR-WIDTH, TF-C94 — measured: routing the gate's own
+    // `gatedKind`/`fail` sites through the walling query turned two CLEAN
+    // `L_UnsupportedLoweringForOpcode` diagnostics for a u128 Add/ICmp into a
+    // hard failure, i.e. the wall would have eaten the very message it exists to
+    // protect). `bitIntContainerKind` is left exactly as-is here: a wide `_BitInt`
+    // still fails loud through it, unchanged by this split.
+    [[nodiscard]] TypeKind classifyKind(TypeId ty) const {
         TypeKind const k = interner.kind(ty);
         if (k == TypeKind::Enum) {
             auto const sc = interner.scalars(ty);
             if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
         }
+        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
+        return k;
+    }
+
+    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
         // C23 _BitInt(N) (D-CSUBSET-BITINT, M-4): project to the signed/unsigned
         // native CONTAINER kind (N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64)
         // — the enum→underlying precedent above. This is what makes every width-tier
@@ -1488,7 +1599,55 @@ struct Lowerer {
         // i64 LIMB or a pointer, never the whole wide type as a scalar. If a wide value
         // leaked to the scalar path, `bitIntContainerKind` FAILS LOUD (M1) rather than
         // returning a garbage width. `reprKind` is identity for every other kind.
-        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
+        TypeKind const k = classifyKind(ty);
+        // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): I128/U128 have NO native single-
+        // register container on either shipped arch — exactly the `_BitInt(N>64)`
+        // situation, and they must obey the SAME discipline. Before this arm
+        // `reprKind` was IDENTITY for them, so `widthFlagsForType` and
+        // `memAccessWidthFlags` both fell to their `default: return 0` = the
+        // 64-bit width: an 8-BYTE access of a 16-BYTE value, with NO diagnostic.
+        // MEASURED at HEAD 57eae7b, no code change, on
+        // `x86_64:pe64-x86_64-windows-exec` (u128 is reachable because
+        // shippedLibs/setjmp.json declares `jmp_buf` as `arr<u128,16>`):
+        //     #include <setjmp.h>
+        //     int main(void){ jmp_buf env; env[0]=1; env[1]=env[0]; return (int)env[1]+41; }
+        // compiled with ZERO diagnostics and emitted a 3072-byte .exe whose every
+        // `env` access touched half the element. This is THE chokepoint — all three
+        // width functions route through it — so one wall closes Load, Store, Const,
+        // Bitcast, call-arg and every future width consumer at once.
+        //
+        // The wall REPORTS rather than aborts. `bitIntContainerKind`'s abort is
+        // justified because the C2 by-address diverts make a wide `_BitInt` scalar
+        // query a pure compiler-internal leak; a u128 element access, by contrast,
+        // is reachable from ORDINARY user source today (the `jmp_buf` probe above),
+        // and crashing the compiler on user source is not a diagnostic. An Error
+        // means the compile fails and NO artifact is emitted — the fail-loud
+        // contract — while the per-opcode gate below still produces the precise,
+        // poisoning message. ⚠ MEASURED (TF-C94 self-audit): this is a BACKSTOP,
+        // not the user-facing path -- the ROUTING diverts 128-bit values by
+        // address before they reach here, so no ordinary C source mints one.
+        // An earlier wording claimed it covered "every path a user can
+        // actually reach"; that was false and is corrected here and at the
+        // sibling comment above. Latched to
+        // one report per lowering so a leak surfaces once, not once per width query.
+        if (k == TypeKind::I128 || k == TypeKind::U128) {
+            if (!reportedWideIntWidthLeak) {
+                reportedWideIntWidthLeak = true;
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "128-bit integer TypeKind ordinal {} reached the LIR "
+                        "width tier on target '{}' — a 128-bit integer has no "
+                        "native single-register container (it is multi-limb "
+                        "memory, reached by ADDRESS, exactly like _BitInt(N>64)), "
+                        "so every width query for it would silently select the "
+                        "64-bit form and emit an 8-byte access of a 16-byte value "
+                        "(D-CSUBSET-INT128-LIR-WIDTH)",
+                        static_cast<unsigned>(k), target.name()));
+            }
+            return k;
+        }
         return k;
     }
 

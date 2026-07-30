@@ -5110,6 +5110,187 @@ TEST(SemanticAnalyzerCSubset, AtomicOnScalarNotRejectedNonLockFree) {
         << "a lock-free scalar _Atomic must be accepted (the supported case)";
 }
 
+// ★ D-CSUBSET-UINT128-TYPE (TF-C94): `_Atomic __int128` / `_Atomic unsigned __int128`
+// must FAIL LOUD with the SAME S_AtomicNonLockFree the aggregate sibling above emits.
+// This is not a new rule — it is the generalization of `isByValueClass` reaching the
+// 128-bit kinds. A 128-bit integer is MEMORY-RESIDENT (multi-limb, reached by ADDRESS),
+// so `_Atomic` on one has exactly the aggregate's problem: the qualifier is a
+// TRANSPARENT skin, the wrapped value reaches codegen, the limb emitters decompose it
+// into per-limb Load/Store, and the result is a SILENT non-atomic access that no
+// type-based belt can see. `_BitInt(128)` is included as the third row — the SAME
+// predicate decides all three, so if one is admitted they all are.
+//
+// ★ THE MEASURED ASYMMETRY, recorded because it looks like a hole and is not:
+// `_Atomic long double` compiles with ZERO diagnostics on this same build. That is
+// CORRECT under the current predicate, not an oversight — `isByValueClass` is the gate,
+// and F80/F128 are NOT `isByValueClass` (they are scalars in one FPR/x87 slot, not
+// multi-limb memory-resident values), so a `long double` never reaches the reject.
+// MEASURED, arm64:macho64-arm64-darwin-exec, one file per row:
+//     `_Atomic __int128 x;`               → 1 × S0055 (S_AtomicNonLockFree)
+//     `_Atomic unsigned __int128 y;`      → 1 × S0055
+//     `_Atomic unsigned _BitInt(128) w;`  → 1 × S0055
+//     `_Atomic long double z;`            → 0 diagnostics
+//     `_Atomic long long q;`              → 0 diagnostics
+// Whether a 16-byte `long double` genuinely IS lock-free is a separate question owned by
+// the long-double arc (D-CSUBSET-LONG-DOUBLE); it is NOT silently in scope here, and
+// changing it must be a deliberate edit to `isByValueClass`'s membership, not a
+// side-effect. Recorded so a future reader does not "fix" the asymmetry by accident.
+TEST(SemanticAnalyzerCSubset, AtomicOnWideIntegerFailsLoudNonLockFree) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"_Atomic __int128 x;\n",              "_Atomic __int128"},
+             Row{"_Atomic unsigned __int128 y;\n",     "_Atomic unsigned __int128"},
+             Row{"_Atomic unsigned _BitInt(128) w;\n", "_Atomic unsigned _BitInt(128)"}}) {
+        auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AtomicNonLockFree), 1u)
+            << "\n" << r.what << " is memory-resident (multi-limb) — _Atomic on it must "
+               "fail loud, exactly as _Atomic on an aggregate does";
+    }
+}
+
+// The NEGATIVE control that pins the MEASURED asymmetry above as a deliberate boundary
+// rather than an accident: a 16-byte `long double` is NOT `isByValueClass`, so it does
+// NOT trip the wide-integer reject. If a future edit broadened the gate from
+// "by-value class" to "bigger than a register", THIS is what would turn red first —
+// and it should, because that would be a real scope change to the long-double arc.
+TEST(SemanticAnalyzerCSubset, AtomicOnLongDoubleNotRejectedNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic long double z;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 0u)
+        << "MEASURED: _Atomic long double compiles with ZERO diagnostics — F80/F128 are "
+           "not isByValueClass, so the wide-integer reject must NOT reach them";
+}
+
+// ★★ D-CSUBSET-INT128-CONSTFOLD (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
+//
+// THE DEFECT THIS PINS. `cst_const_eval.cpp`'s Cast fold gained a 128-bit arm that
+// routes `(__int128)`/`(__uint128_t)` casts through the bignum instead of narrowing
+// them into an int64. It shipped DEAD: `semantic_analyzer.cpp`'s `resolveCastTarget`
+// had no I128/U128 row, so a 128-bit cast target fell to its `default: nullopt`, the
+// whole cast was non-foldable, and EVERY 128-bit integer constant expression refused —
+// not merely the wide ones. MEASURED before the fix (arm64:macho64-arm64-darwin-exec,
+// one file per row), each S0029 "static assertion condition is not an integer constant
+// expression":  `(__uint128_t)5 == 5`, `((__uint128_t)5 + 1) == 6`,
+// `(int)((__uint128_t)5) == 5`. Plain `5 == 5` was clean, and the `_BitInt(128)` twin
+// of the first row was ALREADY clean — that asymmetry is the whole bug.
+//
+// ★★ WHY THE DEFECT SHIPPED, and what this test does about it — THE TEST-DESIGN
+// LESSON, not a footnote. `_Static_assert` reports BOTH of its failure modes under the
+// SAME code, `S_StaticAssertFailed` (S0029): a FALSE assertion and a NON-CONSTANT
+// condition differ only in the message text. So a positive/negative `_Static_assert`
+// pair produces the IDENTICAL code in both arms, and identical outcomes were read as
+// proof that the fold worked when in fact NOTHING folded. This test therefore never
+// discriminates on S0029 alone. Its three arms have three DIFFERENT outcomes:
+//     positive  → ZERO diagnostics of any code;
+//     false     → S_StaticAssertFailed whose message says "static assertion failed"
+//                 and, asserted explicitly, does NOT say "not an integer constant
+//                 expression";
+//     truncation→ S_NonConstantArrayLength — a DIFFERENT diagnostic code entirely.
+//
+// RED-ON-DISABLE (run, then restored): delete the `case TypeKind::I128:` /
+// `case TypeKind::U128:` rows from `resolveCastTarget` and this test fails with 4
+// unexpected S_StaticAssertFailed — while `Int128WideConstantNeverTruncates...` below
+// STAYS GREEN, because a fold that never happens also never truncates. Neither test
+// alone is sufficient; that is why both exist.
+TEST(SemanticAnalyzerCSubset, Int128ConstantExpressionFolds) {
+    // Every row is TRUE, so a correct build emits nothing at all. The `__int128` rows
+    // are present because signedness is a separate resolver field (`intSigned`) from
+    // width, and a row that set the width but not the sign would still pass the
+    // unsigned rows.
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert((__uint128_t)5 == 5, \"cast to unsigned __int128\");\n"
+        "_Static_assert(((__uint128_t)5 + 1) == 6, \"arithmetic on the folded value\");\n"
+        "_Static_assert((__int128)-1 < 0, \"a signed __int128 compares SIGNED\");\n"
+        "_Static_assert(!((__uint128_t)-1 < 0), \"an unsigned one compares UNSIGNED\");\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a 128-bit integer constant expression must fold — the `_BitInt(128)` twin "
+           "of the first row already did, and the two must not disagree";
+}
+
+// The NEGATIVE control for the test above, and the reason it cannot be vacuous: a
+// 128-bit assertion that is FALSE must still FAIL, and must fail as a false assertion
+// rather than as a non-constant one. Without this row, "fold everything to true" would
+// pass the positive test.
+//
+// The message check is load-bearing, NOT decoration: both failure modes carry
+// S_StaticAssertFailed, so the code alone cannot tell "the fold ran and the answer was
+// false" from "nothing folded". Asserting the message text is the only available
+// discriminator at this tier.
+TEST(SemanticAnalyzerCSubset, Int128FalseConstantExpressionStillFailsAsAssertion) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert((__uint128_t)5 == 6, \"deliberately false\");\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const all = model.diagnostics().all();
+    std::size_t saCount = 0;
+    std::string text;
+    for (auto const& d : all) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++saCount;
+        text = d.actual;
+    }
+    ASSERT_EQ(saCount, 1u) << "a false 128-bit assertion must fail exactly once";
+    EXPECT_NE(text.find("static assertion failed"), std::string::npos)
+        << "must report a FALSE assertion; got: " << text;
+    EXPECT_EQ(text.find("is not an integer constant expression"), std::string::npos)
+        << "the condition DID fold — reporting it as non-constant would mean the "
+           "128-bit cast arm is dead again; got: " << text;
+}
+
+// ★★ THE DISQUALIFYING CASE, pinned: a 128-bit constant WIDER THAN 64 BITS must never
+// reach a 64-bit ICE slot as a truncated value. It must FAIL LOUD instead.
+//
+// This is the property that makes activating the 128-bit cast arm safe rather than a
+// hazard. The folded value rides a 128-bit `BitIntValue`, and `asInt64` nullopts for
+// `width() > 64`, so `asInt64Bridge` — the array-dimension / static-assert / enumerator
+// bridge — refuses it. MEASURED: `int a[(__uint128_t)1 << 100];` reports
+// S_NonConstantArrayLength; it never becomes a truncated bound (mod 2^64 of 2^100 is
+// ZERO, so a truncating fold would have produced a zero-length array, silently).
+//
+// The width-3 row is deliberate and is NOT redundant: it records that the refusal is
+// keyed on the value's WIDTH, not on its magnitude, so a 128-bit constant that WOULD
+// fit in 64 bits is refused too. That is exact parity with `_BitInt(128)`, which has
+// behaved this way since C4b (MEASURED: `int a[(_BitInt(128))5];` →
+// S_NonConstantArrayLength on this same build), and matching the shipped sibling is the
+// point — the residual "clang folds `(__int128)2+1` as an array bound, we do not" gap
+// belongs to `asInt64`'s width rule and is shared by BOTH 128-bit families, not
+// introduced here.
+//
+// NOTE the code: S_NonConstantArrayLength, NOT the S_StaticAssertFailed the two tests
+// above use. Different mechanism, different code — so no arm of this trio can be
+// mistaken for another.
+TEST(SemanticAnalyzerCSubset, Int128WideConstantNeverTruncatesIntoA64BitSlot) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"int a[(__uint128_t)1 << 100];\n",
+                 "2^100 — mod 2^64 is ZERO, so a truncating fold means a silent "
+                 "zero-length array"},
+             Row{"int a[(__uint128_t)3];\n",
+                 "a 128-bit value that WOULD fit in 64 bits is still refused — the "
+                 "rule is the value's WIDTH, exactly as for _BitInt(128)"},
+             Row{"int a[(__int128)3];\n",
+                 "the signed spelling refuses identically"}}) {
+        auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_NonConstantArrayLength), 1u)
+            << "\n" << r.what;
+    }
+}
+
 // The user-named combination: `_Atomic volatile int` must set BOTH bits in the ONE
 // shared skin (cycle 1a's `qualified` merges {V}+{A}). Order-independent: the
 // reverse spelling `volatile _Atomic int` resolves to the SAME interned type.

@@ -933,9 +933,46 @@ struct Lowerer {
             || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
     }
 
-    // ceil(N/64) — the limb count of a wide `_BitInt(N)`.
-    [[nodiscard]] std::int64_t wideLimbCount(TypeId bitIntTy) const {
-        return (interner.bitIntWidth(bitIntTy) + 63) / 64;
+    // ceil(N/64) — the limb count of a WIDE integer. D-CSUBSET-UINT128-TYPE (TF-C94):
+    // sourced from the `wideIntWidthBits` facade, not `interner.bitIntWidth`, so an
+    // I128/U128 (2 limbs) drives every emitter below identically to a `_BitInt(128)`.
+    // The facade aborts on a non-wide type — same fail-loud strength as the interner
+    // accessor it replaces, and every caller here is downstream of an isWideInt gate.
+    [[nodiscard]] std::int64_t wideLimbCount(TypeId wideTy) const {
+        return (wideIntWidthBits(interner, wideTy) + 63) / 64;
+    }
+
+    // ★ D-CSUBSET-UINT128-TYPE (TF-C94): the DIAGNOSTIC noun phrase for a wide
+    // integer — "`__int128`", "`unsigned __int128`", or "a `_BitInt` wider than 64
+    // bits". DIAGNOSTIC TEXT ONLY: nothing routes, sizes, signs, or lowers off this;
+    // it exists so a refusal names the type the USER WROTE.
+    //
+    // WHY IT EXISTS — the wide-integer family gained two members this cycle, and the
+    // message-rename sweep that accompanied them was MEASURED INCOMPLETE. Three
+    // user-reachable refusals still said "`_BitInt`" for a `__int128`/`__uint128_t`
+    // source that contains no `_BitInt` anywhere, sending the reader hunting a type
+    // they never wrote:
+    //     `__int128 x = (__int128)d;`   → "…to a `_BitInt` wider than 64 bits…"
+    //     `(double)someU128`            → "…from a `_BitInt` wider than 64 bits…"
+    //     `va_arg(ap, __uint128_t)`     → "…a wide `_BitInt(N>64)` va_arg…"
+    // A FIXED string listing all three spellings would fix the accuracy but not the
+    // precision (every reader still has to work out which member applies), so the
+    // phrase is derived from the actual TypeId instead. Each call site keeps ONE
+    // format string with ONE substitution, so the closed 3-variant set is the whole
+    // surface.
+    //
+    // The `_BitInt` wording is the DEFAULT arm on purpose: this is only ever called
+    // behind an `isWideInt` gate, whose only three members are BitInt(N>64), I128 and
+    // U128, so the default IS the bit-precise case rather than a guess. The spellings
+    // are C's, matching every other wide-integer message in this file — these kinds
+    // reach lowering only from a C-family schema, and the diagnostic is prose, not a
+    // routing key, so no target / format / language decision reads it.
+    [[nodiscard]] std::string_view wideIntSpelling(TypeId wideTy) const {
+        switch (wideTy.valid() ? interner.kind(wideTy) : TypeKind::Void) {
+            case TypeKind::I128: return "`__int128`";
+            case TypeKind::U128: return "`unsigned __int128`";
+            default:             return "a `_BitInt` wider than 64 bits";
+        }
     }
     [[nodiscard]] TypeId i64Ty()  { return interner.primitive(TypeKind::I64); }
     [[nodiscard]] TypeId ptrI64() { return interner.pointer(i64Ty()); }
@@ -989,8 +1026,8 @@ struct Lowerer {
     // signed shift-by-0 is identity). Idempotent on an already-clean limb, so a
     // producer may always end here. `slot` is the result's Ptr<BitInt(N)>.
     [[nodiscard]] bool maskTopLimb(MirInstId slot, TypeId bitIntTy) {
-        std::int64_t const n  = interner.bitIntWidth(bitIntTy);
-        bool const signd      = interner.bitIntIsSigned(bitIntTy);
+        std::int64_t const n  = wideIntWidthBits(interner, bitIntTy);
+        bool const signd      = wideIntIsSigned(interner, bitIntTy);
         std::int64_t const hb = ((n - 1) % 64) + 1;   // significant bits in the top limb
         if (hb == 64) return true;                      // L1: full limb — nothing to clear
         MirInstId const topAddr = limbAddrConst(slot, wideLimbCount(bitIntTy) - 1);
@@ -1269,7 +1306,7 @@ struct Lowerer {
         std::int64_t const srcLimbs = wideLimbCount(srcTy);
         std::int64_t const dstLimbs = wideLimbCount(dstTy);
         std::int64_t const common   = std::min(srcLimbs, dstLimbs);
-        MirInstId const fill = interner.bitIntIsSigned(srcTy)
+        MirInstId const fill = wideIntIsSigned(interner, srcTy)
             ? i64bin(MirOpcode::AShr, loadLimb(limbAddrConst(srcAddr, srcLimbs - 1)), ci64(63))
             : ci64(0);
         for (std::int64_t li = 0; li < common; ++li)
@@ -1281,15 +1318,66 @@ struct Lowerer {
 
     // wide `_BitInt` → a scalar VALUE: the low bits truncated to `targetKind` (C
     // 6.3.1.3). Read limb 0 and convert (Trunc/Bitcast). Returns the scalar MirInstId.
-    [[nodiscard]] MirInstId emitScalarFromWide(MirInstId srcAddr, TypeKind targetKind) {
-        MirInstId const limb0 = loadLimb(limbAddrConst(srcAddr, 0));   // I64
-        if (targetKind == TypeKind::I64) return limb0;
+    //
+    // ★★ D-CSUBSET-UINT128-TYPE (TF-C94) — THE NARROWING CHOKEPOINT. `targetTy` is the
+    // DECLARED TypeId of the destination (the Cast node's own `hir.typeId`), and it is
+    // what the produced value MUST be typed with. It is NOT redundant with `targetKind`:
+    // a TypeKind does NOT determine a TypeId. C spells FOUR distinct 64-bit integer type
+    // names over just two kinds — `long`/`long long` both mint I64, `unsigned long`/
+    // `unsigned long long` both mint U64 — so the interner necessarily hands out a
+    // SEPARATE TypeId per spelling, and `interner.primitive(kind)` (the canonical,
+    // unnamed row) is NOT any of them. An `Enum` target is the same story: the declared
+    // type is the nominal Enum TypeId while `targetKind` is its underlying integer.
+    // Typing the result from the KIND therefore produced a value whose TypeId did not
+    // match its own declaration, and the MIR verifier's strict `vt.v != returnTy.v`
+    // identity test walled it as I_TerminatorTypeMismatch.
+    //
+    // MEASURED, before this fix, `arm64:macho64-arm64-darwin-exec`, one file per row,
+    // `static T f(...){ __uint128_t r = ...; return (T)r; }`:
+    //     T = char/signed char/short/unsigned short/int/unsigned/_Bool → clean
+    //     T = long                → I_TerminatorTypeMismatch (value 59 vs return 2)
+    //     T = unsigned long       → I_TerminatorTypeMismatch (value 23 vs return 14)
+    //     T = long long           → I_TerminatorTypeMismatch (value 59 vs return 15)
+    //     T = unsigned long long  → I_TerminatorTypeMismatch (value 23 vs return 16)
+    //     T = enum E              → I_TerminatorTypeMismatch (value  1 vs return 55)
+    // The sub-64-bit rows passed only because C gives those kinds exactly ONE spelling
+    // each, so their declared TypeId happens to BE the canonical primitive — an accident
+    // of the vocabulary, not a working code path. This is why the defect looked
+    // context-dependent (`int hi = (int)(r>>64);` clean, `return (u64)(r>>64);` walled)
+    // when it is really TARGET-TYPE-dependent, and why it is NOT new to `__int128`:
+    // MEASURED, the identical wall reproduces on `unsigned _BitInt(128)` and
+    // `unsigned _BitInt(200)` sources, so it has been latent since D-CSUBSET-BITINT-C2-WIDE.
+    //
+    // Every narrowing of a wide integer to a scalar funnels through HERE (the one
+    // `combineCast` wide-source arm + the shift-count helper), so carrying the declared
+    // TypeId at this ONE site fixes every materialization context at once — return,
+    // assignment, initializer, compound-assignment, call argument, ternary, array
+    // element, struct member, global and pointer store. The store-shaped contexts never
+    // reported the mismatch because the MIR verifier does not identity-check Store /
+    // call-argument operands against their slot type; they were carrying the SAME wrong
+    // TypeId silently, and they are fixed by the same one-line change.
+    [[nodiscard]] MirInstId emitScalarFromWide(MirInstId srcAddr, TypeKind targetKind,
+                                               TypeId targetTy) {
+        MirInstId const limb0 = loadLimb(limbAddrConst(srcAddr, 0));   // I64 (canonical)
+        // The limb Load ALREADY carries the canonical I64 TypeId, so it can be handed
+        // back as-is ONLY when that is exactly the declared type (the internal
+        // shift-count consumer, and a `long`/`long long` whose spelling did intern to
+        // the canonical row). Any other declared TypeId — including a same-KIND I64 with
+        // a distinct spelling — must be re-typed, which `mapCast(I64, I64) == Bitcast`
+        // does representation-free.
+        if (targetKind == TypeKind::I64 && targetTy.valid()
+            && targetTy.v == i64Ty().v)
+            return limb0;
         // Every other target (incl. U64 → a same-width Bitcast so the RESULT value's
         // type matches the cast's declared kind) routes through the container mapCast.
         MirOpcode const conv = mapCast(TypeKind::I64, targetKind);
         if (conv == MirOpcode::Invalid) return InvalidMirInst;
+        // A caller that lost the declared type is a broken invariant, not a defaultable
+        // condition — fail loud rather than silently re-minting the canonical primitive
+        // (the exact silent mistype this fix removes).
+        if (!targetTy.valid()) return InvalidMirInst;
         std::array<MirInstId, 1> a{limb0};
-        return mir.addInst(conv, a, interner.primitive(targetKind));
+        return mir.addInst(conv, a, targetTy);
     }
 
     // wide `_BitInt` → Bool: `(OR of all limbs) != 0` (a nonzero-test, e.g. an if-cond
@@ -1337,7 +1425,7 @@ struct Lowerer {
     // keep = !differ (cur is 0 when equal, so an OR-combine is exact).
     [[nodiscard]] MirInstId emitWideOrder(HirOpKind op, MirInstId aAddr, MirInstId bAddr,
                                           TypeId bitIntTy) {
-        bool const signd = interner.bitIntIsSigned(bitIntTy);
+        bool const signd = wideIntIsSigned(interner, bitIntTy);
         std::int64_t const limbCount = wideLimbCount(bitIntTy);
         MirInstId const ltS = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
         MirInstId const gtS = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
@@ -1412,7 +1500,7 @@ struct Lowerer {
     // Bit N-1 (the sign bit) of the wide value at `addr`, as an i64 0/1. N-1 is a
     // COMPILE-TIME position → a const limb index + shift.
     [[nodiscard]] MirInstId signBitI64(MirInstId addr, TypeId bitIntTy) {
-        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        std::int64_t const n = wideIntWidthBits(interner, bitIntTy);
         MirInstId const top = loadLimb(limbAddrConst(addr, (n - 1) / 64));
         return i64bin(MirOpcode::And,
                       i64bin(MirOpcode::LShr, top, ci64((n - 1) % 64)), ci64(1));
@@ -1521,10 +1609,18 @@ struct Lowerer {
     // Div-by-zero → a hard trap (Unreachable ⇒ ud2 / BRK #0), narrow-idiv #DE parity.
     [[nodiscard]] bool emitWideDivMod(MirInstId dst, MirInstId aAddr, MirInstId bAddr,
                                       TypeId resultTy, bool wantRem) {
-        std::int64_t const n = interner.bitIntWidth(resultTy);
+        std::int64_t const n = wideIntWidthBits(interner, resultTy);
         std::int64_t const limbCount = wideLimbCount(resultTy);
-        bool const signd = interner.bitIntIsSigned(resultTy);
-        TypeId const uType = interner.bitInt(n, /*isSigned=*/false);   // CRIT-B
+        bool const signd = wideIntIsSigned(interner, resultTy);
+        // CRIT-B. D-CSUBSET-UINT128-TYPE (TF-C94): the magnitude type is minted as an
+        // unsigned `_BitInt(n)` for EVERY wide result kind, including a 128-bit one —
+        // deliberately, and it is exact: these are internal SCRATCH slots and every
+        // helper that touches them reads only `wideLimbCount`/`maskTopLimb`, which give
+        // the identical 2-limb, hb==64 (no-op mask) answer for `_BitInt(128)` and U128
+        // alike. The one difference is the scratch slot's ALIGNMENT (8 vs U128's 16),
+        // which cannot affect correctness because every access is an 8-byte limb
+        // Load/Store. The RESULT still lands in `dst`, typed by `resultTy`.
+        TypeId const uType = interner.bitInt(n, /*isSigned=*/false);
 
         // ── divide-by-zero → hard trap (narrow idiv #DE / SIGFPE parity) ──
         MirInstId const isZero = emitBoolFromWide(bAddr, resultTy, /*zeroIsTrue=*/true);
@@ -1629,10 +1725,14 @@ struct Lowerer {
     // multi-limb word/bit split. A wide-`_BitInt` count (pathological) reads its low limb.
     [[nodiscard]] MirInstId lowerShiftCountToI64(HirNodeId countNode) {
         TypeId const ct = hir.typeId(countNode);
-        if (isWideBitInt(interner, ct)) {
+        if (isWideInt(interner, ct)) {
             MirInstId const addr = lowerLvalueAddress(countNode);
             if (!addr.valid()) return InvalidMirInst;
-            return emitScalarFromWide(addr, TypeKind::I64);
+            // D-CSUBSET-UINT128-TYPE (TF-C94): the shift COUNT's destination is this
+            // helper's own internal i64 contract (`i64Ty()`), not any C-declared type —
+            // pass it explicitly so the narrowing chokepoint stays byte-identical here
+            // (the canonical-I64 fast path returns the bare limb Load, as before).
+            return emitScalarFromWide(addr, TypeKind::I64, i64Ty());
         }
         MirInstId const cv = lowerExpr(countNode);
         if (!cv.valid()) return InvalidMirInst;
@@ -1675,7 +1775,7 @@ struct Lowerer {
             if (!kI64.valid()) return InvalidMirInst;
             bool const isLeft = (op == HirOpKind::Shl);
             ok = emitWideShift(isLeft,
-                               /*isArith=*/!isLeft && interner.bitIntIsSigned(t),
+                               /*isArith=*/!isLeft && wideIntIsSigned(interner, t),
                                dst, aAddr, kI64, t);
         } else {
             MirInstId const bAddr = lowerLvalueAddress(kids[1]);
@@ -1749,7 +1849,20 @@ struct Lowerer {
         HirLiteralValue const& src = literals.at(hir.payload(node));
         MirInstId const dst = freshAggregateTemp(t);
         if (!dst.valid()) {
-            unsupported(node, "wide _BitInt literal requires a sizeable layout");
+            // D-CSUBSET-UINT128-TYPE (TF-C94): the two failure messages in this
+            // function used to say "wide _BitInt". Both are now reachable with an
+            // I128/U128 node type (`__int128` / `unsigned __int128` became spellable
+            // from C source this cycle), where naming `_BitInt` sends the reader
+            // hunting a `_BitInt` they never wrote. BOTH are now renamed to the
+            // WIDE-INTEGER family — the set this function actually serves — with the
+            // concrete spellings listed so the message is still specific. (An audit
+            // MEASURED that the first pass renamed only THIS one and left the
+            // 64-bit-arm message below still saying "_BitInt"; that one is fixed
+            // too, and its refusal is gone entirely — see the note there.)
+            // MESSAGE TEXT ONLY: no predicate, no control flow, no type query
+            // changed at this site.
+            unsupported(node, "wide integer literal (_BitInt(N>64), __int128 or "
+                              "unsigned __int128) requires a sizeable layout");
             return InvalidMirInst;
         }
         // C4b (D-CSUBSET-BITINT-WIDE-LITERAL): an arbitrary-magnitude `wb`/`uwb`
@@ -1758,8 +1871,9 @@ struct Lowerer {
         // (width, signed) so the limb count + top-limb wrap match the slot) — a
         // COMPILE-TIME limb fill, no runtime FROM-scalar sign/zero-extension.
         if (auto const* bv = std::get_if<BitIntValue>(&src.value)) {
-            std::uint32_t const n   = static_cast<std::uint32_t>(interner.bitIntWidth(t));
-            bool const          sgn = interner.bitIntIsSigned(t);
+            std::uint32_t const n =
+                static_cast<std::uint32_t>(wideIntWidthBits(interner, t));
+            bool const          sgn = wideIntIsSigned(interner, t);
             BitIntValue const   conv = bv->withType(n, sgn);
             auto const&         limbs = conv.limbs();
             std::int64_t const  count = wideLimbCount(t);
@@ -1770,18 +1884,59 @@ struct Lowerer {
             }
             return dst;
         }
-        // Legacy path: the synthetic `1` that ++/-- desugars to (a `_BitInt(N)`-typed
-        // one) is a plain int64-arm literal. Extend per the DECLARED signedness: an
-        // unsigned wide literal zero-fills, a signed one sign-fills (a negative
-        // value's 2's-complement high limbs).
-        if (!std::holds_alternative<std::int64_t>(src.value)) {
-            unsupported(node, "a wide _BitInt literal must be a bit-precise value or a "
-                              "64-bit integer constant");
+        // The 64-BIT-PAYLOAD arm: the synthetic `1` that ++/-- desugars to, and a
+        // `wb`/`uwb` literal small enough to have been kept in a scalar variant.
+        // Extend per the WIDE TYPE's DECLARED signedness (not the payload arm's):
+        // an unsigned wide literal zero-fills the limbs above the first, a signed one
+        // sign-fills them (a negative value's 2's-complement high limbs). That rule is
+        // unchanged — only WHERE the signedness is read from is.
+        //
+        // ★ D-CSUBSET-UINT128-TYPE (TF-C94) — THIS ARM ACCEPTS BOTH 64-BIT VARIANTS,
+        // AND THAT IS WHAT MAKES `++`/`--` WORK ON A 128-BIT INTEGER. `synthOne`
+        // (cst_to_hir.cpp) picks the payload arm from the type's core via
+        // `isSignedCore`: a SIGNED core gets `std::int64_t{1}`, an UNSIGNED one gets
+        // `std::uint64_t{1}`. `isSignedCore(BitInt)` is `true` for BOTH `_BitInt`
+        // signednesses (the core carries no sign), so every `_BitInt` synthetic `1`
+        // rode the int64 arm and `_BitInt(128) x; x++;` always worked — while
+        // `__uint128_t x; x++;` rode the UINT64 arm and MEASURED as
+        // "a wide _BitInt literal must be a bit-precise value or a 64-bit integer
+        // constant": a type the user never wrote, for a case that is not a deferral.
+        //
+        // ★ WHY ACCEPTING THE UINT64 ARM CANNOT TRUNCATE — the property that makes
+        // this safe rather than a relaxation. The predicate below is a check on the
+        // PAYLOAD VARIANT, not on the type: reaching it means the value is held in a
+        // 64-bit host scalar, which structurally cannot carry more than 64 bits of
+        // magnitude, so "limb 0 = the value, higher limbs = the sign fill" is EXACT,
+        // not an approximation. The case that genuinely needs limb-exact filling —
+        // an arbitrary-magnitude wide literal — never reaches here: it arrives as a
+        // `BitIntValue` and is filled limb-by-limb by the arm above, and since
+        // TF-C94's const-fold work every folded 128-bit value rides `BitIntValue` via
+        // `packBitIntResult`. So there is no >64-bit value left for this arm to see.
+        // (The superseded gate here keyed on `interner.kind(t) != TypeKind::BitInt`
+        // and sat BELOW the int64 check, which is why it could not catch the U128
+        // synthetic `1` at all — that one failed one line earlier, unanchored.)
+        //
+        // A genuinely NON-INTEGER payload (a float / address arm on a wide-integer
+        // node) is a front-end invariant break — fail loud, never a silent fill.
+        bool const isI64Arm = std::holds_alternative<std::int64_t>(src.value);
+        bool const isU64Arm = std::holds_alternative<std::uint64_t>(src.value);
+        if (!isI64Arm && !isU64Arm) {
+            unsupported(node, "a wide integer literal (_BitInt(N>64), __int128 or "
+                              "unsigned __int128) must be a bit-precise value or a "
+                              "64-bit integer constant (D-CSUBSET-UINT128-TYPE)");
             return InvalidMirInst;
         }
+        // `wideIntIsSigned` is the WIDE-INTEGER FACADE (type_layout.hpp): the interned
+        // flag for a `_BitInt(N>64)`, `true` for I128, `false` for U128 — and an abort
+        // for a non-wide type, which cannot happen here (this whole function is behind
+        // an `isWideInt` gate). The BitInt-only `interner.bitIntIsSigned` it replaces
+        // ABORTED on I128/U128, which is why the kind gate existed at all.
+        std::int64_t const payload =
+            isI64Arm ? std::get<std::int64_t>(src.value)
+                     : static_cast<std::int64_t>(std::get<std::uint64_t>(src.value));
         TypeKind const srcK =
-            interner.bitIntIsSigned(t) ? TypeKind::I64 : TypeKind::U64;
-        return emitWideFromScalar(dst, ci64(std::get<std::int64_t>(src.value)), srcK, t)
+            wideIntIsSigned(interner, t) ? TypeKind::I64 : TypeKind::U64;
+        return emitWideFromScalar(dst, ci64(payload), srcK, t)
                    ? dst : InvalidMirInst;
     }
 
@@ -1800,10 +1955,17 @@ struct Lowerer {
         // the correct multi-limb FP->limbs conversion lands in a later cycle. NARROW
         // (N<=64) float->_BitInt is unaffected — it never reaches materializeWideCast.
         if (srcTy.valid() && isFloatingKind(interner.kind(srcTy))) {
+            // D-CSUBSET-UINT128-TYPE (TF-C94, message text only — the REFUSAL stands):
+            // `__int128 x = (__int128)d;` MEASURED as "…to a `_BitInt` wider than 64
+            // bits…", naming a type absent from the source. `wideIntSpelling` names
+            // the one the user actually wrote. The deferral itself is unchanged and
+            // covers all three wide kinds, so both anchors are cited.
             diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
-                "conversion from a floating type to a `_BitInt` wider than 64 bits is "
-                "not yet supported — the multi-limb float-to-bit-precise conversion "
-                "lands in a later cycle (D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)");
+                std::format(
+                    "conversion from a floating type to {} is not yet supported — the "
+                    "multi-limb float-to-wide-integer conversion lands in a later cycle "
+                    "(D-CSUBSET-UINT128-TYPE / D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)",
+                    wideIntSpelling(t)));
             return InvalidMirInst;
         }
         MirInstId const dst = freshAggregateTemp(t);
@@ -1812,7 +1974,7 @@ struct Lowerer {
             return InvalidMirInst;
         }
         bool ok = false;
-        if (isWideBitInt(interner, srcTy)) {
+        if (isWideInt(interner, srcTy)) {
             MirInstId const srcAddr = lowerLvalueAddress(kids[0]);
             if (!srcAddr.valid()) return InvalidMirInst;
             ok = emitWideFromWide(dst, srcAddr, srcTy, t);
@@ -3157,13 +3319,22 @@ struct Lowerer {
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
         // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): a unary op on a `_BitInt`.
-        if (tk == TypeKind::BitInt) {
+        // ★ D-CSUBSET-UINT128-TYPE (TF-C94): the gate admits any WIDE integer, not
+        // just the BitInt kind. Load-bearing, MEASURED: once `isMemoryResidentType`
+        // returns true for I128/U128, the `request` value->address flip delivers a
+        // 128-bit operand HERE as a Ptr. On a bare `tk == BitInt` gate an I128 `!x`
+        // would fall past this block into the ordinary scalar arm and emit
+        // `ICmpEq(pointer, 0)` — and it would NOT be caught downstream, because
+        // mir_to_lir's `requireNativeIntWidth` ICmp arm inspects OPERAND types and a
+        // Ptr operand is not gated. That is a silent wrong-bytes path; admitting the
+        // wide kinds here routes them to the limb emitters (or fails loud) instead.
+        if (tk == TypeKind::BitInt || isWideInt(interner, operandType)) {
             // D-CSUBSET-BITINT-C2-WIDE (Model A divert): a WIDE operand arrives as an
             // ADDRESS (request flipped it). Only logical `!` (a Bool result) stays in
             // the value path — via the MS-first-free limb-OR, NOT bitIntToCompute.
             // Neg/BitNot produce a WIDE result → materialized by ADDRESS
             // (materializeWideUnaryOp); reaching here is a misroute → fail loud.
-            if (isWideBitInt(interner, operandType)) {
+            if (isWideInt(interner, operandType)) {
                 if (op == HirOpKind::Not)
                     return emitBoolFromWide(operand, operandType, /*zeroIsTrue=*/true);
                 unsupported(node, std::format(
@@ -3367,7 +3538,16 @@ struct Lowerer {
         // comparison promotes its operands + emits the ICmp typed Bool, and an
         // arithmetic op masks its result to N (Add/Sub/Mul/Shl) or not (Div/Mod/And/
         // Or/Xor/right-shift — clean-N-extension-preserving).
-        if (tk == TypeKind::BitInt) {
+        // ★ D-CSUBSET-UINT128-TYPE (TF-C94): the gate admits any WIDE integer — the
+        // twin of the combineUnary widening above, and load-bearing for the SAME
+        // MEASURED reason: a 128-bit comparison arrives with its operands flipped to
+        // ADDRESSES, so a bare `tk == BitInt` gate would drop it into the scalar arm
+        // and emit an ICmp over two POINTERS (comparing addresses, not values) that
+        // `requireNativeIntWidth` cannot catch — it gates on operand TYPE, and the
+        // operands are Ptr. Every path inside this block returns, and the wide arm
+        // runs FIRST, so a non-BitInt wide kind never reaches the `bitIntContainerKind`
+        // query below (which is fatal for anything but a narrow `_BitInt`).
+        if (tk == TypeKind::BitInt || isWideInt(interner, operandType)) {
             // D-CSUBSET-BITINT-C2-WIDE (Model A divert): WIDE operands arrive as
             // ADDRESSES (request flipped them). Only a COMPARISON (a Bool result)
             // stays in the value path — via the limb-OR (== !=) / MS-limb-first scan
@@ -3375,7 +3555,7 @@ struct Lowerer {
             // WIDE result → materialized by ADDRESS (materializeWideBinaryOp);
             // reaching here with one is a misroute → fail loud (never a silent scalar
             // op that would truncate the value to its low limb).
-            if (isWideBitInt(interner, operandType)) {
+            if (isWideInt(interner, operandType)) {
                 switch (op) {
                     case HirOpKind::Eq: return emitWideEq(false, lhs, rhs, operandType);
                     case HirOpKind::Ne: return emitWideEq(true,  lhs, rhs, operandType);
@@ -3520,23 +3700,30 @@ struct Lowerer {
         // (nonzero-test over all limbs), a narrow `_BitInt` (limb 0 masked to its N),
         // or a plain scalar (limb 0 truncated). Placed BEFORE any `bitIntContainerKind`
         // query (fatal for N>64).
-        if (isWideBitInt(interner, t)) {
+        if (isWideInt(interner, t)) {
             unsupported(node, "internal: a cast producing a wide _BitInt must be "
                               "materialized by ADDRESS (lowerLvalueAddress), never as a "
                               "bare SSA value (D-CSUBSET-BITINT-C2-WIDE)");
             return InvalidMirInst;
         }
-        if (isWideBitInt(interner, fromTy)) {
+        if (isWideInt(interner, fromTy)) {
             // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: `wide _BitInt(N>64) -> float` is NOT
             // yet supported — emitScalarFromWide reads only limb 0, so everything above
             // 2^64 (and the true magnitude) is lost. Fail LOUD rather than silently
             // miscompile; the correct multi-limb limbs->FP conversion lands in a later
             // cycle. NARROW (N<=64) _BitInt->float rides the container and never gets here.
             if (isFloatingKind(toK)) {
+                // D-CSUBSET-UINT128-TYPE (TF-C94, message text only — the REFUSAL
+                // stands): the twin of the float→wide site in materializeWideCast.
+                // `(double)someU128` MEASURED as "…from a `_BitInt` wider than 64
+                // bits…"; the SOURCE type `fromTy` is what names it correctly.
                 diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
-                    "conversion from a `_BitInt` wider than 64 bits to a floating type is "
-                    "not yet supported — the multi-limb bit-precise-to-float conversion "
-                    "lands in a later cycle (D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)");
+                    std::format(
+                        "conversion from {} to a floating type is not yet supported — "
+                        "the multi-limb wide-integer-to-float conversion lands in a "
+                        "later cycle (D-CSUBSET-UINT128-TYPE / "
+                        "D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)",
+                        wideIntSpelling(fromTy)));
                 return InvalidMirInst;
             }
             if (toK == TypeKind::Bool)
@@ -3544,11 +3731,46 @@ struct Lowerer {
             if (toK == TypeKind::BitInt)      // wide → NARROW _BitInt: low limb, masked
                 return emitCastToBitInt(loadLimb(limbAddrConst(operand, 0)),
                                         TypeKind::I64, t);
-            MirInstId const r = emitScalarFromWide(operand, enumUnderlying(t, toK));
+            // ★ D-CSUBSET-UINT128-TYPE (TF-C94): the result carries the cast's DECLARED
+            // TypeId `t` — the same `t` this function's every OTHER arm emits with (the
+            // `mir.addInst(mop, ops, t)` tail, the `emitCastToBitInt(..., t)` arm). The
+            // KIND alone is passed only to pick the opcode; it can NOT stand in for the
+            // TypeId (`long` vs `long long` share I64, `unsigned long` vs `unsigned long
+            // long` share U64, and an Enum target's kind is its underlying integer), so
+            // typing from the kind minted the canonical primitive instead of the
+            // declared type and the MIR verifier walled the return. See the MEASURED
+            // table on `emitScalarFromWide`.
+            TypeKind const narrowK = enumUnderlying(t, toK);
+            MirInstId const r = emitScalarFromWide(operand, narrowK, t);
             if (!r.valid()) {
-                unsupported(node, std::format(
-                    "cast from a wide _BitInt to TypeKind {} has no MIR opcode",
-                    static_cast<unsigned>(toK)));
+                // N6 (TF-C94 audit): `emitScalarFromWide` fails for TWO STRUCTURALLY
+                // DIFFERENT reasons and this site used to report "has no MIR opcode"
+                // for both — a reader who hit the second one would go looking for a
+                // missing cast-table row that is not missing. Split, in the callee's
+                // own check order so the reported reason is the one that actually
+                // fired:
+                //   1. the limb-0 `I64 -> narrowK` conversion has no cast-table row —
+                //      a genuine opcode gap, keyed on the TARGET KIND;
+                //   2. the declared TypeId is invalid — an INTERNAL invariant break
+                //      (a caller lost the destination type), which the callee refuses
+                //      rather than silently re-minting `interner.primitive(kind)`.
+                //      That silent re-mint is exactly the mistype the TF-C94
+                //      narrowing-chokepoint fix removed, so it must never come back
+                //      wearing an "opcode" label.
+                if (mapCast(TypeKind::I64, narrowK) == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "narrowing a wide integer (_BitInt(N>64), __int128 or unsigned "
+                        "__int128) to TypeKind {} has no MIR cast opcode",
+                        static_cast<unsigned>(narrowK)));
+                } else {
+                    unsupported(node, std::format(
+                        "internal: narrowing a wide integer (_BitInt(N>64), __int128 or "
+                        "unsigned __int128) to TypeKind {} reached lowering without a "
+                        "valid declared TypeId — the destination type is required, "
+                        "never defaulted to the canonical primitive "
+                        "(D-CSUBSET-UINT128-TYPE)",
+                        static_cast<unsigned>(narrowK)));
+                }
                 return InvalidMirInst;
             }
             return r;
@@ -3886,7 +4108,7 @@ struct Lowerer {
             // handler), and flipping would loop through the by-address BuiltinCall arm.
             if (!wantAddr
                 && (isComplex(interner, hir.typeId(n))
-                    || isWideBitInt(interner, hir.typeId(n)))
+                    || isWideInt(interner, hir.typeId(n)))
                 && nk != HirKind::Call && nk != HirKind::IntrinsicCall
                 && nk != HirKind::BuiltinCall) {
                 wantAddr = true;
@@ -4589,12 +4811,14 @@ struct Lowerer {
                                 "tier constraint that should already have fired)");
             return InvalidMirInst;
         }
-        // A WIDE `_BitInt(N>64)` bound is a legal integer VLA size, but its
-        // multi-limb → i64 narrow is a later cycle — fail loud CLEANLY, never the
-        // fatal `bitIntContainerKind`-on-wide path.
-        if (dimTy.valid() && interner.kind(dimTy) == TypeKind::BitInt
-            && interner.bitIntWidth(dimTy) > 64) {
-            unsupported(anchor, "a wide _BitInt(N>64) variable-length array bound "
+        // A WIDE bound is a legal integer VLA size, but its multi-limb → i64 narrow is
+        // a later cycle — fail loud CLEANLY, never the fatal `bitIntContainerKind`-on-
+        // wide path. D-CSUBSET-UINT128-TYPE (TF-C94): via the facade, so a 128-bit
+        // bound takes this SAME clean deferral. Without it an I128 bound would reach
+        // `resolveScalarIntKind` → `mapCast(I128, I64)` and narrow to the low limb —
+        // a silently wrong element count, not a diagnostic.
+        if (isWideInt(interner, dimTy)) {
+            unsupported(anchor, "a variable-length array bound wider than 64 bits "
                                 "is not yet lowered (deferred — D-CSUBSET-VLA)");
             return InvalidMirInst;
         }
@@ -5395,7 +5619,7 @@ struct Lowerer {
         // operand of a compare/`!`/wide→scalar-cast is delivered as an address to the
         // combine* value arm. (A wide-BitInt lvalue Ref/Deref/Member/Index falls
         // through to the ordinary lvalue arms below.)
-        if (isWideBitInt(interner, hir.typeId(node))) {
+        if (isWideInt(interner, hir.typeId(node))) {
             if (k == HirKind::BinaryOp) return materializeWideBinaryOp(node);
             if (k == HirKind::UnaryOp)  return materializeWideUnaryOp(node);
             if (k == HirKind::Cast)     return materializeWideCast(node);
@@ -5702,16 +5926,24 @@ struct Lowerer {
             }
             // A NATIVE scalar va_arg (a <=64-bit type, incl. `_BitInt(N<=64)`) is an
             // rvalue lowered via lowerExpr — never by address — so reaching here means
-            // the type is a wide `_BitInt(N>64)`: memory-resident, so it IS requested by
+            // the type is a WIDE INTEGER: memory-resident, so it IS requested by
             // address, but its multi-limb by-address gather is a later cycle. Fail LOUD
             // either way (a genuine misroute of a native scalar, or the deferred wide
             // path) — never a silent low-limb-only read.
-            unsupported(node,
+            //
+            // D-CSUBSET-UINT128-TYPE (TF-C94, message text only — the REFUSAL stands):
+            // `va_arg(ap, __uint128_t)` MEASURED as "…a wide `_BitInt(N>64)` va_arg…",
+            // naming a type absent from the source. `wideIntSpelling(at)` names the one
+            // the user actually wrote; the deferral covers all three wide kinds, so the
+            // 128-bit anchor joins the two it already cited.
+            unsupported(node, std::format(
                 "internal: a va_arg reached lowerLvalueAddress that is neither a struct/"
                 "union nor a native scalar — a native scalar va_arg is an rvalue lowered "
-                "via lowerExpr, while a wide `_BitInt(N>64)` va_arg is memory-resident but "
-                "its multi-limb by-address gather is a later cycle "
-                "(D-FC12A-VARIADIC-CALLEE / D-CSUBSET-BITINT-C2-WIDE)");
+                "via lowerExpr, while a va_arg of {} is memory-resident but its "
+                "multi-limb by-address gather is a later cycle "
+                "(D-FC12A-VARIADIC-CALLEE / D-CSUBSET-BITINT-C2-WIDE / "
+                "D-CSUBSET-UINT128-TYPE)",
+                wideIntSpelling(at)));
             return InvalidMirInst;
         }
         // Any OTHER lvalue kind is still unsupported — fail loud (the
@@ -6383,7 +6615,7 @@ struct Lowerer {
         // object with no field list — its copy is a whole-object byte-wise copy of
         // ceil(N/64)*8 bytes (the twin of the Union/Array arm). A scalar (aggregate-
         // width) Load+Store would move only the low 8 bytes → a silent partial copy.
-        if (isWideBitInt(interner, aggTy))
+        if (isWideInt(interner, aggTy))
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         // C99 _Complex (D-CSUBSET-COMPLEX): a complex is a flat 2-component MEMORY
         // object {re, im} with no field list — its copy is a whole-object byte-wise

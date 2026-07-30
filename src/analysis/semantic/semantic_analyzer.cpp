@@ -2394,6 +2394,35 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
                 case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
                 case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
+                // ★ D-CSUBSET-INT128-CONSTFOLD (TF-C94): the two 128-bit STANDARD
+                // kinds. WITHOUT these rows they fell to `default: nullopt` and the
+                // whole cast was non-foldable — which MEASURED as *every* 128-bit
+                // integer constant expression refusing, not just wide ones:
+                // `_Static_assert((__uint128_t)5 == 5, "")` fired S_StaticAssertFailed
+                // ("not an integer constant expression"), and so did `(__uint128_t)5`,
+                // `((__uint128_t)5 + 1) == 6` and `(int)((__uint128_t)5) == 5`, while
+                // the `_BitInt(128)` twin of the first was already clean. These rows
+                // are what make the 128-bit arm in cst_const_eval.cpp's Cast fold
+                // (which routes them through the bignum, NOT through the int64
+                // `narrowIntToBits`) reachable at all.
+                //   ★ WHY `isInteger` AND NOT `isBitPrecise`: a `__int128` is a
+                // STANDARD-rank integer, not a bit-precise one. Carrying it as
+                // `isBitPrecise` would tag the folded result `TypeKind::BitInt` and a
+                // `__int128` expression would silently change type mid-fold (the exact
+                // hazard `bitIntOperandType` orders its checks against). The 128-bit
+                // Cast arm keys on `intBits == 128` and mints an I128/U128 core.
+                //   ★ NO TRUNCATION IS OPENED BY THIS — MEASURED, and this is the
+                // load-bearing safety property: the folded value rides a 128-bit
+                // `BitIntValue`, and BOTH 64-bit ICE slots reject that width rather
+                // than narrow it. `asInt64` (const_eval_arith.hpp) nullopts for
+                // `width() > 64`, so `asInt64Bridge` — the array-dimension /
+                // static-assert / enumerator bridge — fails loud, and the generic
+                // `isInteger` narrowing arm below is never reached for a wide operand
+                // for the same reason. That is byte-for-byte the behaviour
+                // `_BitInt(128)` has shipped with since C4b: `int a[(_BitInt(128))5];`
+                // MEASURED S_NonConstantArrayLength, never a truncated bound.
+                case TypeKind::I128: t.isInteger=true; t.intBits=128; t.intSigned=true;  break;
+                case TypeKind::U128: t.isInteger=true; t.intBits=128; t.intSigned=false; break;
                 // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
                 // `_BitInt(N)` folds via the wrap-aware bignum at width N (mod-2^N),
                 // for ANY N (narrow AND wide) — `(_BitInt(4))15 + 1 == 0` /

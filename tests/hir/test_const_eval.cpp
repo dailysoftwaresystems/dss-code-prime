@@ -1651,3 +1651,146 @@ TEST(ConstEval, IterativeDeepCastChainFoldsFlatAndByteIdentical) {
         EXPECT_EQ(std::get<std::int64_t>(res.value->value), 99);
     });
 }
+
+// ── TF-C94 (D-CSUBSET-INT128-CONSTFOLD): 128-bit const-folds keep 128 bits ──
+//
+// `__int128` / `__uint128_t` bind to TypeKind::I128/U128 — STANDARD integer types
+// (not `_BitInt`), but 128 bits wide, so they do not fit the engine's int64/uint64
+// literal arms. Before this cycle the bignum was entered ONLY when a `BitIntValue`
+// variant was present, and a pure 128-bit fold has none: the value rode the plain
+// u64/i64 arm and every op folded it MOD 2^64 while the type still said 128. Green
+// in every existing test, wrong in the emitted constant. These pins hold the three
+// routes that had to close together: the CAST into 128 bits, the ARITHMETIC on
+// 128-bit operands, and the BELT that makes any un-routed path loud.
+//
+// The pins are engine-level rather than `_Static_assert` source pins because
+// `valueFitsInIntTarget(v, {128,false})` is `v >= 0` — a negative 128-bit value is
+// refused in a constant expression regardless — and because the 128-bit SOURCE
+// spelling is not admitted by the parser at the time of writing.
+
+// A u64-arm literal (the `litInt` helper builds the int64 arm; 0xFFFF…FFFF needs
+// the unsigned one).
+namespace {
+HirNodeId litU64(Rig& r, std::uint64_t v, TypeId ty) {
+    HirLiteralValue lv;
+    lv.value = v;
+    lv.core  = r.interner.kind(ty);
+    return r.builder.makeLiteral(ty, r.literals.add(lv));
+}
+}  // namespace
+
+TEST(ConstEval, Int128CastKeepsTheBignumArm) {
+    Rig r;
+    TypeId const u64 = r.interner.primitive(TypeKind::U64);
+    TypeId const u128 = r.interner.primitive(TypeKind::U128);
+    // (__uint128_t)0xFFFFFFFFFFFFFFFF — every bit must survive the cast.
+    HirNodeId const c = r.cast(litU64(r, 0xFFFFFFFFFFFFFFFFull, u64), u128);
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value()) << "a cast to a 128-bit integer must fold";
+    EXPECT_EQ(res.value->core, TypeKind::U128)
+        << "the result is a STANDARD 128-bit type — never retagged `_BitInt`";
+    auto const* bv = std::get_if<BitIntValue>(&res.value->value);
+    ASSERT_NE(bv, nullptr)
+        << "red-on-disable: without the 128-bit cast arm the value stays on the "
+           "u64 arm — already truncated, merely TAGGED U128";
+    EXPECT_EQ(bv->width(), 128u);
+    EXPECT_FALSE(bv->isSigned());
+    EXPECT_EQ(bv->low64(), 0xFFFFFFFFFFFFFFFFull);
+}
+
+TEST(ConstEval, Int128MultiplyDoesNotWrapAt64) {
+    Rig r;
+    TypeId const u64  = r.interner.primitive(TypeKind::U64);
+    TypeId const u128 = r.interner.primitive(TypeKind::U128);
+    TypeId const i32  = r.intT();
+    // ((__uint128_t)0xFFFFFFFFFFFFFFFF) * 3 — the TRUE 128-bit product is
+    // 0x2_FFFFFFFF_FFFFFFFD, i.e. high limb 2, low limb 0xFFFFFFFFFFFFFFFD.
+    // A mod-2^64 fold yields 0xFFFFFFFFFFFFFFFD with a high limb of ZERO — so the
+    // HIGH limb is the whole assertion: it is the one bit of state the silent
+    // 64-bit wrap destroys.
+    HirNodeId const wide = r.cast(litU64(r, 0xFFFFFFFFFFFFFFFFull, u64), u128);
+    HirNodeId const mul  = r.binary(HirOpKind::Mul, wide, r.litInt(3, i32), u128);
+    auto res = eval(r, mul);
+    ASSERT_TRUE(res.value.has_value()) << "a 128-bit multiply must fold";
+    EXPECT_EQ(res.value->core, TypeKind::U128);
+    auto const* bv = std::get_if<BitIntValue>(&res.value->value);
+    ASSERT_NE(bv, nullptr) << "a 128-bit product cannot ride a 64-bit arm";
+    EXPECT_EQ(bv->width(), 128u);
+    EXPECT_EQ(bv->low64(), 0xFFFFFFFFFFFFFFFDull) << "low 64 bits of the product";
+    ASSERT_GE(bv->limbs().size(), 2u)
+        << "a 128-bit value must carry two limbs — one limb IS the 64-bit wrap";
+    EXPECT_EQ(bv->limbs()[1], 2ull)
+        << "red-on-disable: revert the widened foldBitIntBinary entry predicate and "
+           "this high limb becomes 0 — the silent mod-2^64 wrap this cycle closes";
+}
+
+TEST(ConstEval, Int128UnaryNegKeeps128Bits) {
+    Rig r;
+    TypeId const u64  = r.interner.primitive(TypeKind::U64);
+    TypeId const u128 = r.interner.primitive(TypeKind::U128);
+    // -(__uint128_t)1 == 2^128 - 1: EVERY limb all-ones. A 64-bit fold would leave
+    // the high limb 0 (or refuse), so the high limb is again the discriminator.
+    HirNodeId const one = r.cast(litU64(r, 1ull, u64), u128);
+    HirNodeId const neg = r.unary(HirOpKind::Neg, one, u128);
+    auto res = eval(r, neg);
+    ASSERT_TRUE(res.value.has_value()) << "a 128-bit negation must fold";
+    EXPECT_EQ(res.value->core, TypeKind::U128)
+        << "the unary fold must not retag a __uint128_t as `_BitInt`";
+    auto const* bv = std::get_if<BitIntValue>(&res.value->value);
+    ASSERT_NE(bv, nullptr);
+    EXPECT_EQ(bv->width(), 128u);
+    EXPECT_EQ(bv->low64(), 0xFFFFFFFFFFFFFFFFull);
+    ASSERT_GE(bv->limbs().size(), 2u);
+    EXPECT_EQ(bv->limbs()[1], 0xFFFFFFFFFFFFFFFFull)
+        << "red-on-disable: revert the foldBitIntUnary entry predicate and the high "
+           "limb is 0 — 2^64-1 masquerading as 2^128-1";
+}
+
+TEST(ConstEval, Int128TypedResultFromNarrowOperandsFailsLoud) {
+    Rig r;
+    TypeId const i32  = r.intT();
+    TypeId const u128 = r.interner.primitive(TypeKind::U128);
+    // A 128-bit-typed result whose OPERANDS are both plain i32 — a shape C's typing
+    // rules never produce. The bignum entry declines (neither operand is 128-bit),
+    // so without the CRIT-3 belt this would take the int64 path and fold mod 2^64
+    // under a 128-bit type. The belt must refuse instead. This is the arm that
+    // turns a FUTURE routing miss into a loud failure rather than a wrong constant.
+    HirNodeId const add =
+        r.binary(HirOpKind::Add, r.litInt(1, i32), r.litInt(2, i32), u128);
+    auto res = eval(r, add);
+    EXPECT_FALSE(res.value.has_value())
+        << "red-on-disable: drop I128/U128 from the CRIT-3 belt and this folds to 3 "
+           "on the un-wrapped int64 path — silently, under a 128-bit type";
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+TEST(ConstEval, Int128ChainedFoldKeepsItsStandardCore) {
+    Rig r;
+    TypeId const u64  = r.interner.primitive(TypeKind::U64);
+    TypeId const u128 = r.interner.primitive(TypeKind::U128);
+    TypeId const i32  = r.intT();
+    // The CHAINED shape — a folded 128-bit result fed back in as an operand. This
+    // is what makes `core` and the value's VARIANT ARM disagree: the first fold
+    // emits `core = U128` carrying a `BitIntValue` payload, and the second fold
+    // must still read that operand as a STANDARD 128-bit type. A variant-first
+    // `bitIntOperandType` reports it bit-precise instead, and `packBitIntResult`
+    // then retags the whole expression `_BitInt` — a `__uint128_t` silently
+    // changing type mid-expression, which also mis-ranks it in the usual
+    // arithmetic conversions against a real `_BitInt(128)`.
+    // ((__uint128_t)1 << 100) + 1 — value 2^100 + 1, high limb 2^36.
+    HirNodeId const one   = r.cast(litU64(r, 1ull, u64), u128);
+    HirNodeId const shl   = r.binary(HirOpKind::Shl, one, r.litInt(100, i32), u128);
+    HirNodeId const plus1 = r.binary(HirOpKind::Add, shl, r.litInt(1, i32), u128);
+    auto res = eval(r, plus1);
+    ASSERT_TRUE(res.value.has_value()) << "a chained 128-bit fold must fold";
+    EXPECT_EQ(res.value->core, TypeKind::U128)
+        << "red-on-disable: make `bitIntOperandType` read the VARIANT before "
+           "`core` and this comes back as TypeKind::BitInt — the type changed "
+           "under the expression";
+    auto const* bv = std::get_if<BitIntValue>(&res.value->value);
+    ASSERT_NE(bv, nullptr);
+    EXPECT_EQ(bv->width(), 128u);
+    EXPECT_EQ(bv->low64(), 1ull) << "the +1 lands in the low limb";
+    ASSERT_GE(bv->limbs().size(), 2u);
+    EXPECT_EQ(bv->limbs()[1], (1ull << 36)) << "2^100 = 2^36 in the high limb";
+}
