@@ -1,0 +1,12 @@
+{
+  "$comment": "TF-C90 (D-CSUBSET-SYS-TYPES-BSD-SPELLING-GROUP-ABSENT) — the BSD-ONLY half of the shipped <sys/types.h> spelling group: fixpt_t + segsz_t, macho-ONLY. MEASURED, not asserted: musl (emsdk sysroot sys/types.h), bionic (Android NDK sysroot sys/types.h) and mingw-w64 declare NEITHER; only the macOS SDK does (sys/types.h:108,128). Each is declared with a SINGLE macho `variant` and no flat `type`, so 0 matching variants on elf/pe means the typedef is simply not injected (the off64_t mechanism) — no engine identity branch. Pinned: the 4-byte width of each; the SIGNEDNESS SPLIT between them (fixpt_t is Darwin u_int32_t so (fixpt_t)-1 is positive, segsz_t is int32_t so (segsz_t)-1 stays negative — SWAPPING THE TWO WOULD KEEP EVERY WIDTH ASSERT GREEN, which is why the split is asserted); and the C spelling. ★ Signedness is asserted as a COMPARISON, deliberately NOT as `(fixpt_t)-1 == 4294967295u`, which C's usual arithmetic conversions DEFEAT (a signed -1 converts to the same unsigned value) and which would therefore have been a vacuous pin. ★ Each spelling check is ONE _Generic carrying the right answer, the plausible wrong one and a default, so 'swapped' and 'neither' are distinct failures — a pair of separate one-arm checks would have been VACUOUS because the positive one always fires first. Single arm64-macho target -> runs on the macos-latest CI leg; cross-compiles locally. exit 42 iff all hold, and every check was MEASURED reachable. RED-ON-DISABLE (all MEASURED against the final build): delete either macho variant -> S0006, no binary; SWAP the two types -> exit 4; retype fixpt_t as u16 -> exit 2; retag fixpt_t as `u32 \"wchar_t\"` -> exit 7; retag segsz_t as `i32 \"wchar_t\"` -> exit 9. The ABSENCE side is pinned by shipped_sys_types_bsd_absent_elf; the seven elf+macho members by shipped_sys_types_bsd. Unit sibling: ShippedLibDescriptor.RealSysTypesBsdSpellingGroupPerFormat. The release arm runs the optimizer over the wrap + _Generic folds.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

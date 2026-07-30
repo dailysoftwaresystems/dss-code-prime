@@ -3260,6 +3260,185 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 // the struct is not injected → the structs.size() assert fails; flatten the
 // struct back to a single field list → the macho width assert fails. The
 // runtime witness is the shipped_timeval_macho corpus on the macos-latest CI leg.
+// ── TF-C90 (D-CSUBSET-SYS-TYPES-BSD-SPELLING-GROUP-ABSENT): the <sys/types.h>
+//    BSD-COMPAT SPELLING GROUP, per OBJECT FORMAT ─────────────────────────────
+//
+// `u_char` / `u_short` / `u_int` / `u_long` / `quad_t` / `u_quad_t` / `caddr_t` /
+// `fixpt_t` / `segsz_t` — the family every unix <sys/types.h> ships together and
+// the WINDOWS one ships not at all. Each is declared with `variants` and NO flat
+// `type`, so PER-ENTRY AVAILABILITY IS WHICH VARIANTS EXIST (0 matching variants
+// ⇒ `selected == false` ⇒ the typedef is not injected — the `off64_t` mechanism).
+//
+// ✔MEASURED availability, per name, against three reference header sets rather
+// than asserted: musl (emsdk sysroot sys/types.h:63-69) and bionic (Android NDK
+// sysroot sys/types.h:54,136-139) declare the first seven; mingw-w64 x86_64
+// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h:84-128
+// declares all nine. So the split pinned here is elf+macho for the seven,
+// macho-ONLY for `fixpt_t`/`segsz_t` (absent from BOTH linux libcs), and NONE on
+// pe.
+//
+// The assertions are TWO-SIDED on every axis, because a one-sided "is it there?"
+// cannot see the defect that matters here — a name leaking onto a format that
+// does not have it:
+//   * PRESENT-side: the exact TypeKind, AND the vocabulary tag (`u_long` must be
+//     the C `unsigned long`, and must NOT carry some other spelling — a bare
+//     kind check cannot tell u64 from u64-"unsigned long long").
+//   * ABSENT-side: `fixpt_t`/`segsz_t` must be MISSING on elf, and all nine
+//     MISSING on pe.
+//   * ANTI-VACUITY POSITIVE CONTROL: on the very same pe/elf reads, `mode_t`
+//     (a flat, format-independent entry) must still be PRESENT. Without it, a
+//     descriptor that failed to load — or a `typedefs` array that silently
+//     decoded to empty — would satisfy every ABSENT assertion and the test would
+//     pass while measuring nothing.
+// RED-ON-DISABLE: add a `pe` variant to any of the nine → its pe ABSENT assert
+// fails; add an `elf` variant to `fixpt_t`/`segsz_t` → their elf ABSENT assert
+// fails; delete any elf/macho variant → that name's PRESENT assert fails;
+// retag `u_long` (or drop its tag) → the vocabulary assert fails; swap a kind
+// (u32→i32) → the kind assert fails. Runtime witnesses: the
+// shipped_sys_types_bsd (elf+macho RUN) and shipped_sys_types_bsd_macho
+// (macho RUN) corpora, plus the shipped_sys_types_bsd_absent_elf error manifest.
+//
+// ★ THIS TEST IS THE *ONLY* WITNESS FOR THE pe ABSENCE, ON PURPOSE, and the reason
+// is a measured pair of blockers in the harness rather than anything about this
+// group — recorded here because a reader will otherwise ask why the elf absence
+// has a corpus twin and the pe absence does not:
+//   (1) D-DIAG-PE-SPAN-LINE-MAPPING-SYNTHETIC-LINES — on the pe64 target a
+//       source-spanned diagnostic's reported LINE is SHIFTED.
+//       ✔MEASURED with a 4-line file (`int a; int b; nosuchtype_t c; int main…`):
+//       pe reports source line 3 as 5, and as 8 once one `#include <stdio.h>` is
+//       added, while elf and macho report 3 in both. The compiler renders the
+//       CORRECT source text at the WRONG line, so only the line MAPPING is off.
+//       Worse, the in-process examples runner and the CLI harness then disagree on
+//       the COLUMN for the same diagnostic (31:11 vs 31:1) — there is no honest
+//       line:col to put in a manifest.
+//   (2) D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING — `positioned:false`
+//       is not an escape hatch. The integrated CLI arm matches a
+//       code-only expectation by grepping for the SYMBOLIC rendering
+//       `error[S_UnknownType]`, and the CLI emits that spelling ONLY for
+//       SPAN-LESS diagnostics — a spanned one renders `error[S0006]`
+//       (D-DIAG-TWO-CODE-RENDERINGS). So `positioned:false` is today usable only
+//       for genuinely span-less codes, an undocumented coupling.
+// A pe corpus arm lands when those are fixed; until then the pe axis is pinned
+// HERE, strictly, and it does red alone (add a pe variant to any of the nine).
+TEST(ShippedLibDescriptor, RealSysTypesBsdSpellingGroupPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "types.json";
+
+    // Read the REAL descriptor for one (arch, format) and hand the caller both
+    // the interner and the decoded typedef list, so kind AND vocabulary tag can
+    // be inspected structurally (never a string compare of the JSON).
+    struct Read {
+        TypeInterner                interner{CompilationUnitId{1}};
+        TypeRegistry                typeReg;
+        DiagnosticReporter          rep;
+        std::optional<ShippedLibDescriptor> desc;
+    };
+    auto readFor = [&](std::string_view arch, ObjectFormatKind fmt,
+                       Read& out) {
+        out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg,
+                                            out.rep, DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(out.desc.has_value())
+            << "sys/types.json failed to load for arch=" << arch;
+        ASSERT_FALSE(out.rep.hasErrors())
+            << "sys/types.json emitted diagnostics for arch=" << arch;
+    };
+    auto findTypedef = [](Read const& r, std::string_view name) -> TypeId {
+        for (auto const& td : r.desc->typedefs)
+            if (td.name == name) return td.type;
+        return {};
+    };
+
+    // The seven shared names, with the kind each MUST decode to, and the
+    // vocabulary tag each MUST carry ("" = deliberately untagged).
+    struct Shared { char const* name; TypeKind kind; char const* vocab; };
+    static constexpr std::array<Shared, 7> kShared{{
+        {"u_char",   TypeKind::U8,  ""},
+        {"u_short",  TypeKind::U16, ""},
+        {"u_int",    TypeKind::U32, ""},
+        // The ONE tagged member: every reference libc spells u_long exactly
+        // `unsigned long`, and the typedef name IS that spelling.
+        {"u_long",   TypeKind::U64, "unsigned long"},
+        // UNTAGGED on purpose: glibc spells quad_t `long int` while musl and
+        // Darwin spell it `long long`, so a tag would be a one-sided claim.
+        {"quad_t",   TypeKind::I64, ""},
+        {"u_quad_t", TypeKind::U64, ""},
+        {"caddr_t",  TypeKind::Ptr, ""},
+    }};
+    // BSD-only: present on macho, ABSENT on elf.
+    struct BsdOnly { char const* name; TypeKind kind; };
+    static constexpr std::array<BsdOnly, 2> kBsdOnly{{
+        {"fixpt_t", TypeKind::U32},
+        {"segsz_t", TypeKind::I32},
+    }};
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        // ── macho: all nine PRESENT ──
+        {
+            Read m;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::MachO, m));
+            EXPECT_TRUE(findTypedef(m, "mode_t").valid())
+                << "positive control: mode_t must be present (arch=" << arch << ")";
+            for (auto const& s : kShared) {
+                TypeId const t = findTypedef(m, s.name);
+                ASSERT_TRUE(t.valid())
+                    << s.name << " must be injected on macho (arch=" << arch << ")";
+                EXPECT_EQ(m.interner.kind(t), s.kind) << s.name << " kind on macho";
+                EXPECT_EQ(m.interner.vocabularyName(t), std::string_view{s.vocab})
+                    << s.name << " vocabulary tag on macho";
+            }
+            // caddr_t is `char *`, not a bare pointer to anything.
+            TypeId const ca = findTypedef(m, "caddr_t");
+            ASSERT_TRUE(ca.valid());
+            auto const caOps = m.interner.operands(ca);
+            ASSERT_EQ(caOps.size(), 1u);
+            EXPECT_EQ(m.interner.kind(caOps[0]), TypeKind::Char)
+                << "caddr_t must be ptr<char>";
+            for (auto const& b : kBsdOnly) {
+                TypeId const t = findTypedef(m, b.name);
+                ASSERT_TRUE(t.valid())
+                    << b.name << " must be injected on macho (arch=" << arch << ")";
+                EXPECT_EQ(m.interner.kind(t), b.kind) << b.name << " kind on macho";
+            }
+        }
+        // ── elf: the seven PRESENT, the two BSD-only ABSENT ──
+        {
+            Read e;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::Elf, e));
+            EXPECT_TRUE(findTypedef(e, "mode_t").valid())
+                << "positive control: mode_t must be present (arch=" << arch << ")";
+            for (auto const& s : kShared) {
+                TypeId const t = findTypedef(e, s.name);
+                ASSERT_TRUE(t.valid())
+                    << s.name << " must be injected on elf (arch=" << arch << ")";
+                EXPECT_EQ(e.interner.kind(t), s.kind) << s.name << " kind on elf";
+                EXPECT_EQ(e.interner.vocabularyName(t), std::string_view{s.vocab})
+                    << s.name << " vocabulary tag on elf";
+            }
+            for (auto const& b : kBsdOnly)
+                EXPECT_FALSE(findTypedef(e, b.name).valid())
+                    << b.name << " is BSD-only (absent from glibc/musl/bionic) and "
+                       "must NOT be injected on elf (arch=" << arch << ")";
+        }
+        // ── pe: ALL NINE ABSENT, header itself still usable ──
+        {
+            Read p;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::Pe, p));
+            EXPECT_TRUE(findTypedef(p, "mode_t").valid())
+                << "positive control: mode_t must still be present on pe — without "
+                   "it every ABSENT assert below would pass vacuously (arch="
+                << arch << ")";
+            for (auto const& s : kShared)
+                EXPECT_FALSE(findTypedef(p, s.name).valid())
+                    << s.name << " must NOT be injected on pe (mingw-w64 "
+                       "<sys/types.h> declares none of this group) (arch=" << arch << ")";
+            for (auto const& b : kBsdOnly)
+                EXPECT_FALSE(findTypedef(p, b.name).valid())
+                    << b.name << " must NOT be injected on pe (arch=" << arch << ")";
+        }
+    }
+}
+
 TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
