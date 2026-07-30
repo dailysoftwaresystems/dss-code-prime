@@ -291,7 +291,7 @@ struct EngineState {
     // c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT): the builtin `va_list` TypeId the
     // per-CC injection minted (set alongside the builtin scope build). TWO
     // consumers: the FF11 shipped-descriptor read binds it as the `va_list`
-    // named-type alias, and `adjustArrayToPointer` EXCLUDES it — a va_list
+    // named-type alias, and `adjustParamDeclaredType` EXCLUDES it — a va_list
     // param keeps its per-CC form (SysV: the `__va_list_tag[1]` array) because
     // the va_* machinery (c63) owns va_list parameter passing END-TO-END
     // (param slot + decay-at-call + va_arg addressing, validated per-ABI);
@@ -1322,7 +1322,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray,
                    bool allowInitInferredArray = false,
-                   bool paramDecay = false);
+                   bool paramDecay = false,
+                   bool typeAliasRow = false);
 
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
@@ -2760,11 +2761,22 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
     bool const absentLength =
         !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
-    // c82: `arrayToPointer` (C 6.7.6.3p7 parameter adjustment) admits the
+    // c82: `paramAdjustments` (C 6.7.6.3p7 parameter adjustment) admits the
     // absent length through the SAME incomplete-array path — the caller's
-    // `adjustArrayToPointer` rewrites the result to Ptr<element>, so the
+    // `adjustParamDeclaredType` rewrites the result to Ptr<element>, so the
     // incomplete array never escapes as a param's final type.
-    if (absentLength && (decl.allowFlexibleArray || decl.arrayToPointer)) {
+    //
+    // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1): the legacy-facet twin —
+    // a row that declares a TYPE rather than an object may NAME an incomplete
+    // array (`typedef int T[];`). Gated on `absentLength`, exactly like its
+    // declarator-mode counterpart is placed below every present-bound arm, so a
+    // VLA typedef `typedef int R[n];` is untouched. NO shipped config row
+    // declares an `arraySuffix` facet today, so this arm is unreachable in
+    // practice; it is written anyway because the two resolvers drifting is the
+    // failure mode this pairing exists to prevent.
+    if (absentLength
+        && (decl.allowFlexibleArray || decl.paramAdjustments
+            || decl.kind == DeclarationKind::Type)) {
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
@@ -2775,13 +2787,15 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         // automatic-storage constraints are enforced by the Pass-2
         // `validateVlaDeclarator` (reading the symbol's binding scope), NOT by the
         // type-construction `fromScope` (a descendant of the file scope even for a
-        // file-scope decl). Params (`arrayToPointer`) + struct fields
+        // file-scope decl). Params (`paramAdjustments`) + struct fields
         // (`allowFlexibleArray`) already took their absent-length paths above.
         // `visibleChildren(suffix).size() > 2` mirrors the twin's `hasPresentLength`:
         // a PRESENT length (`[ expr ]`, 3 children) is a VLA; an ABSENT one (`[]`, 2)
-        // stays S_NonConstantArrayLength (defense-in-depth — the only legacy array-
-        // suffix row today is `externDecl`/allowFlexibleArray, skipped above).
-        if (!decl.allowFlexibleArray && !decl.arrayToPointer
+        // stays S_NonConstantArrayLength (defense-in-depth — MEASURED at TF-C96, NO
+        // shipped config row declares an `arraySuffix` facet at all, so this whole
+        // legacy resolver is currently unreachable; it is kept in step with its
+        // declarator-mode twin arm-for-arm precisely because nothing exercises it).
+        if (!decl.allowFlexibleArray && !decl.paramAdjustments
             && visibleChildren(tree, suffix).size() > 2) {
             TypeInterner& in = s.lattice.interner();
             // VLA C3 (D-CSUBSET-VLA): a VLA whose element is itself an array or a VLA
@@ -2792,6 +2806,16 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         }
         emit(DiagnosticCode::S_NonConstantArrayLength);
         return InvalidType;
+    }
+    // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a bound
+    // that folds to EXACTLY 0 on a row that admits a flexible array member is
+    // the SAME incomplete array the absent-length `[]` yields above — ONE
+    // mechanism, not a parallel one, so `[0]` and `[]` can never diverge on
+    // layout, on position checking, or between the two resolvers. This is the
+    // legacy-facet twin of the identical arm in `applyDeclaratorSuffix`. A `[0]`
+    // on any other row keeps the out-of-range reject below.
+    if (*len == 0 && decl.allowFlexibleArray) {
+        return s.lattice.interner().incompleteArray(base);
     }
     // C99 §6.7.5.2: array length is a positive integer constant
     // expression. Negative folds (e.g. `int a[-1]`) and zero are
@@ -4219,22 +4243,46 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        ScopeId scope, bool emitOnMiss,
                        bool allowFlexibleArray = false,
                        bool allowInitInferredArray = false,
-                       bool paramDecay = false);
+                       bool paramDecay = false,
+                       bool typeAliasRow = false);
 
-// c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): a declaration form with
-// `arrayToPointer` whose resolved declarator type is an ARRAY — sized
-// (`int a[64]`), incomplete (`int a[]`), or multi-dimensional (`int a[][5]`
-// — only the OUTERMOST dimension is the parameter's own type constructor) —
-// ADJUSTS to a POINTER to its element type. Applied at BOTH resolution
-// sites (the definitive Pass-1.5 visit that binds the symbol, and the
-// FnSig param harvest `declRowDeclaredType`), so the bound symbol, the
-// FnSig, and every call site agree by construction. The transparent
-// kind()/operands() accessors make a qualified element ride into the
-// pointee unchanged. Non-array types (and rows without the flag) pass
-// through untouched.
+// THE C 6.7.6.3 PARAMETER-TYPE ADJUSTMENTS — the ONE place a declaration
+// form flagged `paramAdjustments` rewrites a parameter's DECLARED type into
+// the type the parameter actually has. Two adjustments, both mandated by
+// the same clause and both landed here so coverage is BY CONSTRUCTION:
+//
+//   p7 (c82, D-CSUBSET-PARAM-ARRAY-ADJUSTMENT) — an ARRAY declared type,
+//      sized (`int a[64]`), incomplete (`int a[]`) or multi-dimensional
+//      (`int a[][5]` — only the OUTERMOST dimension is the parameter's own
+//      type constructor), ADJUSTS to POINTER-to-element.
+//   p8 (D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT) — a FUNCTION declared type
+//      (`void f(int g(int))`, or via one of the SDK's FUNCTION typedefs
+//      `void f(memory_reader_t r)` — `<malloc/malloc.h>`'s
+//      `memory_reader_t` / `vm_range_recorder_t` / `print_task_printer_t`
+//      are function, NOT function-pointer, typedefs) ADJUSTS to
+//      POINTER-to-function.
+//
+// ★ WHY p8 BELONGS HERE AND NOT AT THE REJECT SITE. Before this, a
+// function-typed parameter reached the FnSig-typed-Variable arm of the
+// Pass-1.5 bind and fired S_InvalidFunctionDeclarator ("function prototype
+// declarations are not supported here"). SUPPRESSING that reject would have
+// left the symbol typed `FnSig` — a function VALUE in a parameter slot,
+// which is not a thing that exists at runtime: a silent miscompile. The
+// adjustment is the actual C rule, and doing it here means every parameter
+// resolution path gets it, because they ALL funnel through this helper:
+// the definitive Pass-1.5 visit that binds the symbol, and the three
+// `declRowDeclaredType` arms (named declarator, ABSTRACT/type-only, legacy
+// typeChild row) that `collectParamTypes` routes every parameter through
+// to build the FnSig. Bound symbol, FnSig and call site therefore agree by
+// construction — no prototype-vs-definition asymmetry is expressible.
+//
+// c82: the CC's `va_list` is EXCLUDED — see the guard's own comment.
+// Non-array, non-function types (and rows without the flag) pass through
+// untouched. The transparent kind()/operands() accessors make a qualified
+// array element ride into the pointee unchanged.
 [[nodiscard]] TypeId
-adjustArrayToPointer(EngineState& s, DeclarationRule const& decl, TypeId t) {
-    if (!decl.arrayToPointer || !t.valid()) return t;
+adjustParamDeclaredType(EngineState& s, DeclarationRule const& decl, TypeId t) {
+    if (!decl.paramAdjustments || !t.valid()) return t;
     // c82: the CC's `va_list` is EXCLUDED — the per-CC va_* machinery (c63)
     // owns va_list parameter passing end-to-end (param slot, decay-at-call,
     // va_arg addressing), and C 7.16 makes a va_list observable only through
@@ -4244,6 +4292,11 @@ adjustArrayToPointer(EngineState& s, DeclarationRule const& decl, TypeId t) {
     // helper, so prototype/definition FnSigs stay structurally equal.
     if (s.vaListType.has_value() && t == *s.vaListType) return t;
     auto& in = s.lattice.interner();
+    // C 6.7.6.3p8: "A declaration of a parameter as 'function returning
+    // type' shall be adjusted to 'pointer to function returning type'."
+    // Ptr<FnSig> is ALREADY the adjusted form (isFnSig false) and is left
+    // alone — adjusting it again would build a pointer-to-pointer.
+    if (in.kind(t) == TypeKind::FnSig) return in.pointer(t);
     if (in.kind(t) != TypeKind::Array) return t;
     auto const elems = in.operands(t);
     if (elems.empty() || !elems[0].valid()) return t;  // interner invariant —
@@ -4275,7 +4328,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
                 // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA, FIX-2): an
-                // `arrayToPointer` row is a C PARAMETER — route its array-decay
+                // `paramAdjustments` row is a C PARAMETER — route its array-decay
                 // through the DISTINCT `paramDecay` signal (NOT the struct-field FAM
                 // `allowFlexibleArray`, which stays false here). paramDecay admits the
                 // absent-length `T x[]` AND builds a `vlaArray` for a non-outermost
@@ -4287,19 +4340,22 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     emitOnMiss,
                     /*allowFlexibleArray=*/false,
                     /*allowInitInferredArray=*/false,
-                    /*paramDecay=*/decl.arrayToPointer);
-                return adjustArrayToPointer(s, decl, t);
+                    /*paramDecay=*/decl.paramAdjustments,
+                    /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
+                return adjustParamDeclaredType(s, decl, t);
             }
             // Declarator structurally absent — a TYPE-ONLY (abstract) param.
-            // C 6.7.6.3p7 adjusts the declared type REGARDLESS of a name:
+            // C 6.7.6.3p7/p8 adjust the declared type REGARDLESS of a name:
             // `int f(const int[4]);` and `int f(const int a[4]);` are the
-            // SAME signature. Both the named path (above) and this abstract
-            // path run the ONE shared helper, so a prototype and its
-            // definition can never drift into an S0022/S0003 asymmetry —
-            // the exact mid-c82 shell.c failure (`sqlite3_vmprintf(const
-            // char*, va_list)` abstract vs the named caller param; va_list
-            // itself is EXCLUDED inside the helper, see its comment).
-            return adjustArrayToPointer(s, decl, head);
+            // SAME signature, and so are `void f(Fn);` and `void f(Fn g);`
+            // for a FUNCTION typedef `Fn`. Both the named path (above) and
+            // this abstract path run the ONE shared helper, so a prototype
+            // and its definition can never drift into an S0022/S0003
+            // asymmetry — the exact mid-c82 shell.c failure
+            // (`sqlite3_vmprintf(const char*, va_list)` abstract vs the
+            // named caller param; va_list itself is EXCLUDED inside the
+            // helper, see its comment).
+            return adjustParamDeclaredType(s, decl, head);
         }
         return InvalidType;   // a LIST row has no single param type
     }
@@ -4309,7 +4365,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         pty = applyArraySuffix(s, tree, decl, declNode, pty, scope, &cfg);
         // c82: the legacy-row twin of the declarator-mode adjustment above —
         // the two param-resolution shapes must not drift.
-        return adjustArrayToPointer(s, decl, pty);
+        return adjustParamDeclaredType(s, decl, pty);
     }
     return InvalidType;
 }
@@ -4321,7 +4377,9 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId suffix, TypeId inner,
                       ScopeId scope, bool emitOnMiss,
                       bool allowFlexibleArray = false,
-                      bool paramDecay = false) {
+                      bool paramDecay = false,
+                      bool allowInitInferredArray = false,
+                      bool typeAliasRow = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
     if (isFnSuffixRule(r, dc)) {
@@ -4383,7 +4441,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // ONLY inside a function-parameter declarator (C 6.7.6.3p7 adjusts it to
         // a pointer). For a PARAMETER (`paramDecay`) it is an UNSPECIFIED-size
         // (absent-length) array — IDENTICAL to a bare `[]` — that
-        // `adjustArrayToPointer` then strips to `Ptr<element>`; the `*` carries
+        // `adjustParamDeclaredType` then strips to `Ptr<element>`; the `*` carries
         // no runtime bound (unlike `[static n]`, so NEVER a vlaArray). A
         // NON-parameter `[*]` is a constraint violation — the SAME paramDecay
         // gate + diagnostic (S_ArrayParamQualifierNonParameter, 0xE054) a
@@ -4456,13 +4514,13 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
                     .has_value();
             // VLA C4a-param (D-CSUBSET-VLA, Option B): a C PARAMETER declarator
-            // (`arrayToPointer` row — a DISTINCT signal threaded as `paramDecay`, NEVER
+            // (`paramAdjustments` row — a DISTINCT signal threaded as `paramDecay`, NEVER
             // the struct-field FAM `allowFlexibleArray`). C 6.7.6.3p7 adjusts a param's
             // OUTERMOST array to a pointer, but a NON-outermost VLA suffix survives in
             // the pointee (`int (*p)[n]` → `int (*)[n]`; `int a[][n]` → same after the
             // decayed outer `[]`). Build the vlaArray for a PRESENT length so the
             // pointee carries the runtime row shape; an ABSENT `[]` is the (possibly
-            // outermost) decaying dim → incompleteArray, which `adjustArrayToPointer`
+            // outermost) decaying dim → incompleteArray, which `adjustParamDeclaredType`
             // then strips to `Ptr<element>`. Checked FIRST + kept off the FAM bool so
             // the struct-field FAM path (below) stays BYTE-IDENTICAL — a param never
             // reaches the FAM branch, a field never reaches here.
@@ -4492,8 +4550,52 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // already produced `inner` as the element; HIR→MIR sizes the runtime stride.
             if (hasPresentLength)
                 return s.lattice.interner().vlaArray(inner);
+            // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1: "If the size is not
+            // present, the array type is an incomplete type"): the bound is ABSENT
+            // (every present-bound arm returned above) and this declaration declares
+            // a TYPE, not an object — `typedef int T[];`. MEASURED as sqlite's
+            // blocker: `$SDK/usr/include/mach/vm_region.h:355` defines
+            // `VM_PAGE_INFO_MAX` as an EMPTY object-like macro, so `:357` expands to
+            // `typedef int vm_page_info_data_t[];`.
+            //   ★ WHY `typeAliasRow` AND NOT `allowFlexibleArray`. Reusing the FAM
+            // flag was tried and MEASURED WRONG: it is tested ABOVE the VLA arm (a
+            // struct field's `int a[n]` is deliberately a FAM, not a VLA member), so
+            // a typedef carrying it made `typedef int R[n];` stop building a vlaArray
+            // and silently become an incomplete array instead. The two are different
+            // rules. C's own distinction is TYPE-vs-OBJECT — 6.7.6.2p1 lets a type be
+            // incomplete, 6.7p7 forbids an object from being — so the signal is the
+            // row's config-declared `kind`, and placing the arm HERE (below every
+            // present-bound return) makes the VLA path untouchable by construction.
+            //   The incompleteness does NOT leak: an OBJECT of the alias fails loud
+            // S_IncompleteTypeObject, `sizeof` refuses (computeLayout nullopts), and
+            // a non-last / sole member keeps S_FlexibleArrayNotLast / SoleMember.
+            if (typeAliasRow)
+                return s.lattice.interner().incompleteArray(inner);
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
+        }
+        // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
+        // TRAILING `uint64_t ns_threadids[0];` member — MEASURED at
+        // $SDK/usr/include/sys/mount.h:366 (`struct netfs_status`, which sqlite
+        // reaches) — is the GNU spelling of a flexible array member, and that is
+        // exactly how it is admitted: a bound folding to EXACTLY 0 on a row that
+        // admits a FAM routes into the SAME `incompleteArray` the absent-length
+        // `[]` branch above builds. ONE mechanism, per the registry row's
+        // instruction to find the shared chokepoint before adding a second: `[0]`
+        // and `[]` therefore agree by construction on layout (0 bytes, element
+        // alignment, `sizeof` of the containing struct unchanged — MEASURED
+        // identical to /usr/bin/clang) and on POSITION (a non-trailing `[0]` is
+        // S_FlexibleArrayNotLast, a sole one S_FlexibleArraySoleMember — both from
+        // the shared composite-composition guard, neither special-cased here).
+        //   `allowInitInferredArray` EXCLUDES the init-inference relaxation. That
+        // bool is why the flag reaching this function is `decl.allowFlexibleArray
+        // || initNode.valid()`: without the exclusion `int a[0] = {1};` would stop
+        // being S_ArrayLengthOutOfRange and get SILENTLY re-sized to `int[1]` by
+        // the initializer backfill — a written bound overwritten without a word.
+        //   A `[0]` on any other row (a plain local/global object, a parameter)
+        // keeps the out-of-range reject below.
+        if (*len == 0 && allowFlexibleArray && !allowInitInferredArray) {
+            return s.lattice.interner().incompleteArray(inner);
         }
         if (*len <= 0) {
             emit(DiagnosticCode::S_ArrayLengthOutOfRange);
@@ -4531,7 +4633,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray, bool allowInitInferredArray,
-                   bool paramDecay) {
+                   bool paramDecay, bool typeAliasRow) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!direct.valid() || !base.valid()) return InvalidType;
@@ -4578,7 +4680,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss, allowFlexibleArray, paramDecay);
+                                  emitOnMiss, allowFlexibleArray, paramDecay,
+                                  allowInitInferredArray, typeAliasRow);
         if (!t.valid()) return InvalidType;
     }
 
@@ -4607,7 +4710,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
                                       /*allowFlexibleArray=*/allowInitInferredArray,
                                       /*allowInitInferredArray=*/allowInitInferredArray,
-                                      /*paramDecay=*/false);
+                                      /*paramDecay=*/false,
+                                      /*typeAliasRow=*/typeAliasRow);
     }
     return t;   // abstract direct — the type itself
 }
@@ -4616,7 +4720,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
                               bool allowFlexibleArray, bool allowInitInferredArray,
-                              bool paramDecay) {
+                              bool paramDecay, bool typeAliasRow) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -4630,7 +4734,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         // signal belongs to the wrapped declarator, not this init-declarator shell).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay);
+                                      allowInitInferredArray, paramDecay,
+                                      typeAliasRow);
     }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
     // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
@@ -4654,7 +4759,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         // slot; paramDecay is false here in practice, but stay signal-preserving).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay);
+                                      allowInitInferredArray, paramDecay,
+                                      typeAliasRow);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -4703,7 +4809,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // depth from the loop above.
     return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
                               allowFlexibleArray, allowInitInferredArray,
-                              paramDecay);
+                              paramDecay, typeAliasRow);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -5470,8 +5576,38 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // is NOT one (its suffix sits on the outer declarator).
                         // Computed BEFORE the bind scope is chosen because a
                         // prototype re-homes onto the file scope (below).
+                        //
+                        // ★ A PARAMETER IS NEVER A PROTOTYPE (C 6.7.6.3p8 —
+                        // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT). The INLINE
+                        // function-typed parameter `int f(int g(int))` writes the
+                        // very same syntax a prototype does — a name carrying a
+                        // `()` suffix — so this purely SYNTACTIC test used to call
+                        // it one, and the damage was two-fold and MEASURED:
+                        //   (1) the bind scope below re-homed the parameter onto
+                        //       the FILE scope, so two functions whose parameters
+                        //       merely SHARE a name (`int a(int g(int))` and
+                        //       `int b(long g(long))`) collided as incompatible
+                        //       redeclarations (S0022) — a parameter name has no
+                        //       linkage and is scoped to its own declarator
+                        //       (C 6.2.1p4), so legal C was rejected;
+                        //   (2) `isProtoDeclaration` rode the SymbolRecord into
+                        //       CST→HIR, whose D-CSUBSET-FN-PROTOTYPE gate emits
+                        //       NO VarDecl for a prototype — the parameter slot
+                        //       silently vanished and the Function's param count
+                        //       fell BELOW its FnSig's (H_UnsupportedLoweringForKind
+                        //       at HIR→MIR: "param count 1 mismatches ... 2").
+                        // p8 makes the declared type of such a parameter a POINTER,
+                        // not a function, so `paramAdjustments` — the row flag that
+                        // declares "this row is a C PARAMETER, apply the 6.7.6.3
+                        // adjustments" and drives `adjustParamDeclaredType` — is
+                        // exactly the signal that no declarator on this row can be a
+                        // prototype. Config-driven, no rule-name identity. The
+                        // TYPEDEF spelling (`void f(Fn g)`) never reached here (its
+                        // declarator carries no `()` suffix), which is precisely why
+                        // it worked while the inline twin did not.
                         bool const isProto =
                             (effectiveKind == DeclarationKind::Variable)
+                            && !decl.paramAdjustments
                             && nameNode.valid()
                             && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
                         // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function
@@ -6781,7 +6917,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
                         // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA,
-                        // FIX-2): an `arrayToPointer` row (a C parameter) routes
+                        // FIX-2): an `paramAdjustments` row (a C parameter) routes
                         // its array-decay through the DISTINCT `paramDecay`
                         // signal, NOT `allowIncomplete` (the struct-field FAM /
                         // init-inference bool) — so a param's present-length
@@ -6793,11 +6929,18 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // as the bound type.
                         bool const allowIncomplete =
                             decl.allowFlexibleArray || initNode.valid();
+                        // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
+                        // TYPE rather than an object may name an INCOMPLETE array
+                        // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
+                        // this row's own `kind`, so no new vocabulary and no rule
+                        // spelling; the resolver applies it BELOW its VLA arm, so a
+                        // `typedef int R[n];` still builds a vlaArray.
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, allowIncomplete,
                             /*allowInitInferredArray=*/initNode.valid(),
-                            /*paramDecay=*/decl.arrayToPointer);
+                            /*paramDecay=*/decl.paramAdjustments,
+                            /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
@@ -6806,12 +6949,17 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (!decl.allowFlexibleArray)
                             declTy = completeIncompleteArrayFromInit(
                                 s, s.idx(), tree, initNode, declTy);
-                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT: the definitive
-                        // adjustment — the bound param symbol carries the
-                        // POINTER (sizeof(param)==pointer-size, body indexing
-                        // reads through it), mirroring the harvest site in
-                        // `declRowDeclaredType` so the FnSig agrees.
-                        declTy = adjustArrayToPointer(s, decl, declTy);
+                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (p7) +
+                        // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (p8): the
+                        // definitive adjustment — the bound param symbol
+                        // carries the POINTER (sizeof(param)==pointer-size,
+                        // body indexing / calls read THROUGH it), mirroring
+                        // the harvest site in `declRowDeclaredType` so the
+                        // FnSig agrees. p8 running HERE is also what keeps
+                        // the FnSig-typed-Variable reject below unreachable
+                        // for parameters: the param's type is Ptr<FnSig>
+                        // (isFnSig false) by the time that arm is tested.
+                        declTy = adjustParamDeclaredType(s, decl, declTy);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -6921,12 +7069,33 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // (never an incomplete composite) and is correctly NOT
                             // flagged; an `extern` declaration (completed elsewhere)
                             // is excluded. Mirrors S_IncompleteTypeMember.
+                            //
+                            // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: the incomplete
+                            // ARRAY twin, and THE reason admitting `typedef int
+                            // T[];` is safe. An incomplete array reaching an
+                            // object declarator can only have arrived through a
+                            // TYPEDEF NAME (a written `[]` on a row without
+                            // `allowFlexibleArray` is already S_NonConstant-
+                            // ArrayLength, and an init-inferred `[]` was COMPLETED
+                            // above), and `computeLayout` returns nullopt for it —
+                            // so without this arm `T x;` would reach codegen as an
+                            // object whose size nobody can state, i.e. silently 0.
+                            // The C rule is the same one the composite arm cites
+                            // (6.7p7: an object shall have a complete type by the
+                            // end of its declarator). The FAM position is NOT
+                            // affected: a struct field row carries no
+                            // `requireNamedDeclarators`, so a last-and-non-sole
+                            // `T` member still lays out as a flexible array
+                            // member, and the non-last / sole positions keep their
+                            // own loud S_FlexibleArrayNotLast / SoleMember.
                             if (s.symbols.at(sym).kind
                                         == DeclarationKind::Variable
                                 && decl.requireNamedDeclarators
                                 && !s.symbols.at(sym).isExternDeclaration
-                                && s.lattice.interner()
-                                       .isIncompleteComposite(declTy)) {
+                                && (s.lattice.interner()
+                                        .isIncompleteComposite(declTy)
+                                    || s.lattice.interner()
+                                           .isIncompleteArray(declTy))) {
                                 ParseDiagnostic d;
                                 d.code     = DiagnosticCode::S_IncompleteTypeObject;
                                 d.severity = DiagnosticSeverity::Error;
@@ -7615,6 +7784,21 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // STRUCT FIELD (`struct S { Fn f; };`, which Pass 1 does
                             // not flag) — still fails loud: a function-typed member
                             // is not a prototype and would otherwise miscompile.
+                            //
+                            // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT: this arm is
+                            // UNREACHABLE FOR PARAMETERS. A function-typed
+                            // PARAMETER used to land here (`void f(int g(int))`,
+                            // and the SDK's function-typedef spellings
+                            // `void f(memory_reader_t r)`) and got the reject
+                            // below — the wrong answer twice over, since C
+                            // 6.7.6.3p8 says the parameter simply IS a pointer.
+                            // `adjustParamDeclaredType` now performs that
+                            // adjustment at the row's own resolution, so an
+                            // `paramAdjustments` row's declTy is Ptr<FnSig> here
+                            // and `isFnSig` is false. Suppressing the reject
+                            // instead of adjusting the type would have left the
+                            // symbol typed FnSig — a function VALUE in a
+                            // parameter slot, i.e. a silent miscompile.
                             auto& symRec = s.symbols.at(sym);
                             if (symRec.isProtoDeclaration
                                 || symRec.maybeFnTypedefProto) {
@@ -8954,6 +9138,85 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
     }
 }
 
+// D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC: the FOLDED OPERANDS of a failing
+// static assertion's condition, rendered as a suffix for its diagnostic — or an
+// EMPTY string when the condition is not a binary comparison (degrade, never
+// crash, never guess).
+//
+// ★ WHY THE VALUES AND NOT THE SOURCE TEXT. MEASURED on sqlite's `src/mem1.c`:
+// its three S0029 come from ONE macro (`xnu_static_assert_struct_size`,
+// $SDK/usr/include/mach/port.h:100, `_Static_assert(sizeof(name) ==
+// expected_size, "struct changed size unexpectedly")`) instantiated ~25× in
+// `mach/message.h`. All three therefore share ONE span, ONE condition source
+// text and ONE author string — appending the condition's TEXT would have
+// produced three byte-identical messages, i.e. no instrument at all. The folded
+// VALUES are the only channel that discriminates them.
+//
+// ★ AGNOSTICISM. Nothing here knows the spelling `==`, `<`, or the rule name
+// `binaryExpr`. The binary-expression RULE comes from `hirLowering.binaryExprRule`
+// and the operator VERB from the config-declared `hirLowering.binaryOps`
+// token→verb table (the same table `cst_to_hir` and `cst_const_eval` dispatch on),
+// so a language whose comparison is spelled `.EQ.` reports its own verb with no
+// engine change, and a token absent from the table yields no suffix rather than a
+// guess. Operands are located the way every other consumer of this rule locates
+// them (`cst_const_eval.cpp`'s binary arm, `subtreeType`'s Binary frame): the
+// visible children are [lhs Internal, OP token, rhs Internal].
+//
+// The condition child is an `assignmentExpr`-shaped wrapper, so a BOUNDED
+// transparent descent (single-Internal-child layers — wrappers and parens) runs
+// first. Each operand is re-folded through `constIntExpr`, the SAME evaluator that
+// folded the whole condition; it is re-callable on any sub-node and emits nothing
+// (its resolvers all run with emitOnMiss=false), so this instrument can never add
+// a diagnostic of its own. A side that does not fold (a short-circuited
+// `LogicalOr` rhs, a non-ICE operand) renders as `<non-constant>` — still
+// discriminating, still honest.
+[[nodiscard]] std::string
+foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
+                        Tree const& tree, NodeId condNode, ScopeId here) {
+    if (!condNode.valid()) return {};
+    auto const& hirCfg = tree.schema().hirLowering();
+    if (!hirCfg.binaryExprRule.valid()) return {};   // no binary surface
+    // Bounded transparent descent to the binary node (assignmentExpr wrapper,
+    // parenthesized operand, …). Stops at the first non-transparent layer.
+    NodeId bin = condNode;
+    for (int guard = 0; guard < 64; ++guard) {
+        if (tree.kind(bin) != NodeKind::Internal) return {};
+        if (tree.rule(bin).v == hirCfg.binaryExprRule.v) break;
+        NodeId only{};
+        int internals = 0;
+        for (NodeId c : visibleChildren(tree, bin)) {
+            if (tree.kind(c) == NodeKind::Internal) { ++internals; only = c; }
+        }
+        if (internals != 1) return {};   // a leaf / a non-binary composite
+        bin = only;
+    }
+    if (tree.kind(bin) != NodeKind::Internal
+        || tree.rule(bin).v != hirCfg.binaryExprRule.v) {
+        return {};
+    }
+    NodeId lhsN{}, rhsN{}, opTok{};
+    for (NodeId c : visibleChildren(tree, bin)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (!opTok.valid()) opTok = c;
+        } else if (!lhsN.valid()) lhsN = c;
+        else if (!rhsN.valid()) rhsN = c;
+    }
+    if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return {};
+    HirOperatorEntry const* entry = nullptr;
+    std::uint32_t const tk = tree.tokenKind(opTok).v;
+    for (auto const& e : hirCfg.binaryOps) {
+        if (e.token.v == tk) { entry = &e; break; }
+    }
+    if (entry == nullptr) return {};   // an operator this language does not declare
+    auto const side = [&](NodeId n) -> std::string {
+        auto const v = constIntExpr(s, tree, n, here, &cfg);
+        return v.has_value() ? std::to_string(*v)
+                             : std::string{"<non-constant>"};
+    };
+    return " (folded: " + side(lhsN) + " " + entry->target + " " + side(rhsN)
+           + ")";
+}
+
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
@@ -10087,6 +10350,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                ? std::string{"static assertion failed"}
                                : "static assertion failed: \"" + message + "\"";
             }
+            d.actual += foldedConditionOperands(s, cfg, tree, condNode, here);
             s.reporter.report(std::move(d));
         }
     }

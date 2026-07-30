@@ -1869,6 +1869,80 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // silent wrong layout). EAGER: EVERY variant's field list is decoded regardless
     // of which is active, so a malformed INACTIVE variant fails the read on EVERY
     // target (anti-lurking, mirrors `signatureByDataModel`).
+    //
+    // (6.5.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
+    // injected struct's tag name into `mergedNamedTypes` (the typedef/union
+    // Option C mirror), so a LATER entry may spell an EARLIER one as a field type
+    // BY NAME — `{"name":"it_interval","type":"timeval"}` — instead of restating
+    // the inner body once per format (the layout-disagreement failure class).
+    // But an earlier entry carrying per-target `variants` is NOT published when
+    // ZERO of them match: `struct timeval` genuinely does not exist on a
+    // pe/unknown-format read, so neither can a struct that embeds one. Skipping
+    // the DEPENDENT — exactly as `matchCount == 0` skips the dependency — is the
+    // honest answer. Letting the EAGER field decode fail instead would take the
+    // WHOLE descriptor down on every target lacking the inner struct (both
+    // all-descriptor sweeps read every shipped file on every format, and the
+    // nullopt direct-API/LSP read selects no variant at all).
+    //
+    // SOURCE-ORDER-EXACT, so fail-loud survives intact: only a name this
+    // descriptor declared BEFORE the referring entry can suppress it. A FORWARD
+    // name (declared later), a SELF reference, and a TYPO (declared nowhere) all
+    // fall through to the ordinary decode, where `parseTypeFromText` reports
+    // `unknown type '<name>'` and `decodeStructFieldList` adds
+    // F_ShippedLibUnsupportedType — two loud diagnostics, never a silent empty
+    // type. Content-blind: a membership test over the descriptor's OWN declared
+    // vocabulary, never an `if (name == "timeval")`.
+    // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+    auto declaredNamesOf = [&](char const* key) {
+        std::vector<std::string> names;
+        if (doc.contains(key) && doc.at(key).is_array()) {
+            for (auto const& e : doc.at(key)) {
+                if (e.is_object() && e.contains("name") && e.at("name").is_string())
+                    names.push_back(e.at("name").get<std::string>());
+            }
+        }
+        return names;
+    };
+    // Declared before the loop starts: every `typedefs` + `unions` name (both
+    // surfaces decode ABOVE). Struct names join as the loop walks past them.
+    std::vector<std::string> declaredEarlier = declaredNamesOf("typedefs");
+    {
+        auto un = declaredNamesOf("unions");
+        declaredEarlier.insert(declaredEarlier.end(), un.begin(), un.end());
+    }
+    auto publishedByName = [&](std::string const& n) {
+        return std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
+                           [&](NamedTypeBinding const& nb) { return nb.name == n; });
+    };
+    // Does this entry name an EARLIER-declared type that is NOT published for the
+    // active target? Scans the flat `fields` AND every variant's `fields` — the
+    // eager decode covers them all, so ONE unavailable reference anywhere in the
+    // entry makes the whole entry unavailable here. The test is on the WHOLE
+    // `type` text (the by-name spelling); a compound spelling that merely embeds
+    // an unavailable name (`ptr<timeval>`) is NOT admitted and still fails loud —
+    // the gate accepts only what it can prove.
+    auto referencesUnavailable = [&](json const& sdef) {
+        auto scan = [&](json const& fields) {
+            if (!fields.is_array()) return false;
+            for (auto const& f : fields) {
+                if (!f.is_object() || !f.contains("type") || !f.at("type").is_string())
+                    continue;
+                std::string const t = f.at("type").get<std::string>();
+                if (std::find(declaredEarlier.begin(), declaredEarlier.end(), t)
+                        != declaredEarlier.end()
+                    && !publishedByName(t))
+                    return true;
+            }
+            return false;
+        };
+        if (sdef.contains("fields") && scan(sdef.at("fields"))) return true;
+        if (sdef.contains("variants") && sdef.at("variants").is_array()) {
+            for (auto const& v : sdef.at("variants"))
+                if (v.is_object() && v.contains("fields") && scan(v.at("fields")))
+                    return true;
+        }
+        return false;
+    };
     if (doc.contains("structs")) {
         if (!doc.at("structs").is_array()) {
             emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
@@ -1893,6 +1967,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     continue;
                 }
                 std::string const sname = sdef.at("name").get<std::string>();
+
+                // (6.5.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
+                // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
+                // SELF reference is a forward name and still fails loud; recorded
+                // right after, so every entry BELOW may name this one.
+                bool const dependencyUnavailable = referencesUnavailable(sdef);
+                declaredEarlier.push_back(sname);
+                if (dependencyUnavailable) continue;   // unavailable here → inject nothing
 
                 // Exactly ONE of `fields` (flat, single layout) or `variants`
                 // (per-target). Both, or neither, is a malformed entry — fail loud
@@ -2050,6 +2132,20 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 } else {
                     sst.typeId = interner.structType(sname, fieldTypes);
                 }
+                // Option C: publish this struct's TAG name so a LATER surface —
+                // above all another struct's FIELD — can spell it BY NAME
+                // (`{"name":"it_value","type":"timeval"}`), which is what keeps an
+                // inner struct's per-format widths in ONE place instead of being
+                // restated inside every outer struct. Byte-identical to the
+                // typedef/union publications (address-stable `typedefNameStore`
+                // backing, appended only for a SELECTED entry so an unselected
+                // struct stays unnameable). Publication is strictly ADDITIVE: the
+                // scan is first-match, structs are published LAST, so no name that
+                // already resolved changes meaning.
+                // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+                typedefNameStore.push_back(sname);
+                mergedNamedTypes.push_back(
+                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, sst.typeId});
                 out.structs.push_back(std::move(sst));
             }
         }

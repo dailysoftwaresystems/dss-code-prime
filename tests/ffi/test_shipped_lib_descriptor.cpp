@@ -1054,6 +1054,134 @@ TEST(ShippedLibDescriptor, UnionReferencedByNameInStructField) {
     EXPECT_EQ(interner.kind(desc->structs[0].fields[1].type), TypeKind::Union);
 }
 
+// ── BY-NAME composite struct FIELDS (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME) ────
+//
+// The `structs` loop PUBLISHES each injected struct's tag name (the typedef /
+// union Option-C mirror), so a LATER entry may spell an EARLIER one as a field
+// type BY NAME instead of restating its body — the whole point being that an
+// inner struct's per-format widths then live in exactly ONE place.
+
+// IDENTITY, not merely same-shape: the by-name field must resolve to the very
+// TypeId the referenced entry interned, because injection is first-wins BY NAME
+// and only the winner carries a member field scope — a second, equal-looking
+// type would strand `outer.inner.member`.
+// RED-ON-DISABLE: delete the `mergedNamedTypes` publish in the structs decode →
+// `Inner` no longer resolves as a field type → F_ShippedLibUnsupportedType.
+TEST(ShippedLibDescriptor, StructReferencedByNameInLaterStructField) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sref.json", R"JSON({
+        "header": "sr.h",
+        "structs": [
+            { "name": "Inner", "fields": [
+                { "name": "a", "type": "i64" },
+                { "name": "b", "type": "i32" } ] },
+            { "name": "Outer", "fields": [
+                { "name": "first",  "type": "Inner" },
+                { "name": "second", "type": "Inner" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->structs.size(), 2u);
+    EXPECT_EQ(desc->structs[0].name, "Inner");
+    EXPECT_EQ(desc->structs[1].name, "Outer");
+    ASSERT_EQ(desc->structs[1].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[1].fields[0].type, desc->structs[0].typeId)
+        << "the by-name struct field must be the IDENTICAL interned TypeId";
+    EXPECT_EQ(desc->structs[1].fields[1].type, desc->structs[0].typeId);
+    EXPECT_EQ(interner.kind(desc->structs[1].fields[0].type), TypeKind::Struct);
+    // And the embedded composite lays out by value (16 = i64 + i32 + tail pad).
+    auto inner = computeLayout(desc->structs[0].typeId, interner,
+                               AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                               DataModel::Lp64);
+    auto outer = computeLayout(desc->structs[1].typeId, interner,
+                               AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                               DataModel::Lp64);
+    ASSERT_TRUE(inner.has_value());
+    ASSERT_TRUE(outer.has_value());
+    EXPECT_EQ(inner->size, 16u);
+    EXPECT_EQ(outer->size, 32u);
+    ASSERT_EQ(outer->fieldOffsets.size(), 2u);
+    EXPECT_EQ(outer->fieldOffsets[0], 0u);
+    EXPECT_EQ(outer->fieldOffsets[1], 16u);
+}
+
+// SOURCE ORDER IS THE DEPENDENCY ORDER, and a violation is LOUD. `Outer` names
+// `Inner` BEFORE `Inner` is declared: publication happens as the loop walks, so
+// the name is unresolved there and the read FAILS — never a silently empty or
+// half-built composite. The same path catches a plain typo (a name declared
+// nowhere), which is why the message must quote the offending name.
+TEST(ShippedLibDescriptor, ForwardStructNameInStructFieldFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "fwd.json", R"JSON({
+        "header": "fw.h",
+        "structs": [
+            { "name": "Outer", "fields": [ { "name": "first", "type": "Inner" } ] },
+            { "name": "Inner", "fields": [ { "name": "a", "type": "i64" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+    EXPECT_TRUE(anyDiagMentions(rep, "unknown type 'Inner'"))
+        << "the type decoder must NAME the unresolved type";
+    EXPECT_TRUE(anyDiagMentions(rep, "field type 'Inner' failed to decode"))
+        << "and the descriptor reader must say WHICH field carried it";
+}
+
+// The DEPENDENCY GATE. `Inner` carries elf-only `variants`, so on any other
+// target ZERO match and it is not injected — and `Outer`, which embeds one BY
+// NAME, cannot exist there either. The reader SKIPS the dependent exactly as it
+// skips the dependency; it must NOT fail the read, because every shipped
+// descriptor is read on EVERY format (the all-descriptor sweeps + the nullopt
+// direct-API/LSP path), and one unavailable inner struct would otherwise take a
+// whole header down. Fail-loud is untouched: only a name declared EARLIER in
+// THIS descriptor can suppress an entry (the forward/typo pin above still red).
+TEST(ShippedLibDescriptor, StructByNameUnselectedDependencySkipsDependent) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "dep.json", R"JSON({
+        "header": "dp.h",
+        "structs": [
+            { "name": "Inner", "variants": [
+                { "when": { "format": "elf" },
+                  "fields": [ { "name": "a", "type": "i64" } ] } ] },
+            { "name": "Outer", "fields": [ { "name": "first", "type": "Inner" } ] }
+        ]
+    })JSON");
+
+    auto readFor = [&](std::optional<ObjectFormatKind> fmt) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        std::vector<std::string> names;
+        if (desc)
+            for (auto const& s : desc->structs) names.push_back(s.name);
+        return names;
+    };
+
+    EXPECT_EQ(readFor(ObjectFormatKind::Elf),
+              (std::vector<std::string>{"Inner", "Outer"}))
+        << "elf selects Inner's variant, so the by-name dependent lands too";
+    EXPECT_TRUE(readFor(ObjectFormatKind::Pe).empty())
+        << "no Inner variant matches pe → Outer is unavailable there, and the "
+           "read must still be CLEAN (not a hard error)";
+    EXPECT_TRUE(readFor(std::nullopt).empty())
+        << "the unknown-format read selects no variant at all — same verdict";
+}
+
 // ── per-target struct VARIANTS (per-target byte layout; plan 25) ─────────────
 //
 // A `structs` entry may declare per-target `variants` (each `when:{arch?,format?}`
@@ -3453,10 +3581,15 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
                                              DataModel::Lp64, arch, fmt);
         ASSERT_TRUE(desc.has_value()) << "arch=" << arch;
         EXPECT_FALSE(rep.hasErrors()) << "arch=" << arch;
-        ASSERT_EQ(desc->structs.size(), 1u)
-            << "timeval variant not injected for arch=" << arch;
+        // TWO structs since itimerval landed (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME):
+        // timeval FIRST (source order is the dependency order — itimerval names it),
+        // itimerval second. Still an exact count, not a floor: an entry that
+        // silently stopped being injected must stay red here.
+        ASSERT_EQ(desc->structs.size(), 2u)
+            << "timeval/itimerval not both injected for arch=" << arch;
         auto const& tv = desc->structs[0];
         EXPECT_EQ(tv.name, "timeval");
+        EXPECT_EQ(desc->structs[1].name, "itimerval");
         ASSERT_EQ(tv.fields.size(), 2u) << "arch=" << arch;
         EXPECT_EQ(tv.fields[0].name, "tv_sec");
         EXPECT_EQ(tv.fields[1].name, "tv_usec");
@@ -3475,6 +3608,247 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     for (std::string_view arch : {"x86_64", "arm64"}) {
         checkFor(arch, ObjectFormatKind::Elf,   TypeKind::I64);
         checkFor(arch, ObjectFormatKind::MachO, TypeKind::I32);
+    }
+}
+
+// REAL <sys/time.h> `struct itimerval` — the FIRST by-name composite consumer
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). xnu sys/proc.h's `struct extern_proc`
+// embeds one BY VALUE, so while itimerval was missing DSS left extern_proc
+// incomplete, which left kinfo_proc's kp_proc incomplete: 4 S0026 across sqlite
+// test1.c + mem1.c from this ONE hole.
+//
+// The load-bearing assertion is IDENTITY: each member's type must be the very
+// TypeId the `timeval` entry interned FOR THIS FORMAT, which is what makes the
+// tv_usec width single-sourced — itimerval declares no `variants` and still
+// comes out right on both. Layout is MEASURED natively (arm64 Darwin, offsetof):
+// sizeof 32, it_interval@0, it_value@16; glibc LP64 agrees at 32/0/16 with a
+// WIDER inner tv_usec, so a restated body would have had to get both right.
+// RED-ON-DISABLE: drop the structs-loop name publish → `"type": "timeval"` stops
+// resolving → sys/time.json fails to read at all.
+TEST(ShippedLibDescriptor, RealSysTimeItimervalByNameComposite) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    auto checkFor = [&](std::string_view arch, ObjectFormatKind fmt) {
+        SCOPED_TRACE(std::string{arch} + "/" + std::string{objectFormatKindName(fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->structs.size(), 2u);
+        auto const& tv = desc->structs[0];
+        auto const& it = desc->structs[1];
+        ASSERT_EQ(tv.name, "timeval");
+        ASSERT_EQ(it.name, "itimerval");
+        ASSERT_EQ(it.fields.size(), 2u);
+        EXPECT_EQ(it.fields[0].name, "it_interval");
+        EXPECT_EQ(it.fields[1].name, "it_value");
+        // IDENTITY with the timeval entry of the SAME read — not just same shape.
+        EXPECT_EQ(it.fields[0].type, tv.typeId)
+            << "it_interval must BE the shipped timeval, not a look-alike";
+        EXPECT_EQ(it.fields[1].type, tv.typeId);
+        EXPECT_EQ(interner.kind(it.fields[0].type), TypeKind::Struct);
+        auto layout = computeLayout(it.typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 32u);            // MEASURED: sizeof(struct itimerval)
+        ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u);  // it_interval @ 0
+        EXPECT_EQ(layout->fieldOffsets[1], 16u); // it_value    @ 16
+    };
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        checkFor(arch, ObjectFormatKind::Elf);
+        checkFor(arch, ObjectFormatKind::MachO);
+    }
+}
+
+// REAL <sys/stat.h> macho `st_mtimespec` — the second by-name consumer
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c:7731 assigns the WHOLE
+// member (`conchModTime = buf.st_mtimespec;`), so it must be a by-value composite,
+// and it OVERLAYS the flat st_mtim_sec/st_mtim_nsec pair the st_mtime macro still
+// maps onto — hence the c107 explicit-offset channel for this variant.
+//
+// The invariant that matters most: NOTHING MOVED. Every offset asserted here is
+// the value natural derivation produced before the overlay landed, MEASURED
+// natively (arm64 Darwin, offsetof) — and the total is still 144, the number the
+// shipped_stat_macho corpus and libSystem's own fstat() agree on.
+// The invariant that is NOT free: with all 25 offsets stated explicitly the
+// variant stops DERIVING its layout, so a wrong field WIDTH moves no offset and
+// changes no total — offsets and size alone are vacuous against it (MEASURED,
+// see the width block). Hence the per-field width table below.
+// RED-ON-DISABLE: drop st_mtimespec → the member lookup fails; mistype ONE
+// offset → that assert (or the size) goes red; narrow ONE field's type →
+// its kind/width assert goes red (MEASURED with st_uid u32 → u16, which is
+// green against offsets+size alone).
+TEST(ShippedLibDescriptor, RealSysStatMachoMtimespecOverlay) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const statPath = root / "sys" / "stat.json";
+
+    // Index of a named field in a named struct, or npos-ish failure.
+    auto indexOf = [](ShippedStruct const& s, std::string_view fname) -> std::size_t {
+        for (std::size_t i = 0; i < s.fields.size(); ++i)
+            if (s.fields[i].name == fname) return i;
+        return static_cast<std::size_t>(-1);
+    };
+    auto structNamed = [](ShippedLibDescriptor const& d,
+                          std::string_view sname) -> ShippedStruct const* {
+        for (auto const& s : d.structs)
+            if (s.name == sname) return &s;
+        return nullptr;
+    };
+    auto readFor = [&](TypeInterner& interner, TypeRegistry& typeReg,
+                       ObjectFormatKind fmt) {
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(statPath, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        return desc;
+    };
+
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = readFor(interner, typeReg, ObjectFormatKind::MachO);
+        ASSERT_TRUE(desc.has_value());
+        auto const* ts = structNamed(*desc, "timespec");
+        auto const* st = structNamed(*desc, "stat");
+        ASSERT_NE(ts, nullptr) << "sys/stat.json must declare timespec BEFORE stat";
+        ASSERT_NE(st, nullptr);
+        std::size_t const iSpec = indexOf(*st, "st_mtimespec");
+        ASSERT_NE(iSpec, static_cast<std::size_t>(-1))
+            << "the macho variant must carry st_mtimespec";
+        // BY-NAME IDENTITY: the member IS the shipped timespec, so a whole-struct
+        // assignment from `struct timespec` type-checks.
+        EXPECT_EQ(st->fields[iSpec].type, ts->typeId);
+        EXPECT_EQ(interner.kind(st->fields[iSpec].type), TypeKind::Struct);
+        auto specLayout = computeLayout(ts->typeId, interner, kNatural16,
+                                        DataModel::Lp64);
+        ASSERT_TRUE(specLayout.has_value());
+        EXPECT_EQ(specLayout->size, 16u);   // {tv_sec i64, tv_nsec i64}
+
+        auto layout = computeLayout(st->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 144u) << "Darwin struct stat is 144 bytes — UNCHANGED";
+        auto offOf = [&](std::string_view fname) -> std::uint64_t {
+            std::size_t const i = indexOf(*st, fname);
+            EXPECT_NE(i, static_cast<std::size_t>(-1)) << fname;
+            if (i == static_cast<std::size_t>(-1) || i >= layout->fieldOffsets.size())
+                return static_cast<std::uint64_t>(-1);
+            return layout->fieldOffsets[i];
+        };
+        // THE OVERLAY: three members, the same 16 bytes (Darwin's own
+        // `#define st_mtime st_mtimespec.tv_sec`, modeled honestly).
+        EXPECT_EQ(offOf("st_mtimespec"), 48u);
+        EXPECT_EQ(offOf("st_mtim_sec"),  48u);
+        EXPECT_EQ(offOf("st_mtim_nsec"), 56u);
+        // NOTHING MOVED — the pre-existing offsets, both sides of the overlay.
+        EXPECT_EQ(offOf("st_dev"), 0u);
+        EXPECT_EQ(offOf("st_mode"), 4u);
+        EXPECT_EQ(offOf("st_nlink"), 6u);
+        EXPECT_EQ(offOf("st_ino"), 8u);
+        EXPECT_EQ(offOf("st_uid"), 16u);
+        EXPECT_EQ(offOf("st_gid"), 20u);
+        EXPECT_EQ(offOf("st_rdev"), 24u);
+        EXPECT_EQ(offOf("st_atim_sec"), 32u);
+        EXPECT_EQ(offOf("st_ctim_sec"), 64u);
+        EXPECT_EQ(offOf("st_birthtim_sec"), 80u);
+        EXPECT_EQ(offOf("st_size"), 96u);        // the corpus's own witness
+        EXPECT_EQ(offOf("st_blocks"), 104u);
+        EXPECT_EQ(offOf("st_blksize"), 112u);
+        EXPECT_EQ(offOf("st_qspare1"), 136u);
+
+        // ★★ WIDTHS — EVERY FIELD, because the EXPLICIT-OFFSET channel makes the
+        // offset pins above BLIND to a width slip. MEASURED, not inferred: with
+        // `st_uid` narrowed u32 → u16 in a copy of this descriptor, every
+        // assertion above stayed GREEN. It has to: the offsets are read verbatim
+        // from the config so nothing moves, and the explicit arm's size is
+        // `align.alignUp(max field extent)` = alignUp(136 + 8) = 144 no matter
+        // what the other 24 fields are — narrowing even the LAST field keeps 144
+        // (alignUp(136 + 2) is still 144). A derived-offset variant self-corrects
+        // and the offset pins catch it; this one does not, so the width is only
+        // pinned where it is written down. Pinned by TypeKind, which fixes
+        // SIGNEDNESS too — a u32 → i32 swap is a different miscompile at the same
+        // 4 bytes — AND by the laid-out byte size, which is what the composite
+        // overlay member needs (`st_mtimespec` is a struct, not a scalar kind).
+        // Every width MEASURED natively (arm64 Darwin, `sizeof(((struct stat*)0)
+        // ->f)`, EVERY row): 4/2/2/8/4/4/4 then the four 16-byte timespecs, then
+        // 8/8/4/4/4/4 and the 16-byte `st_qspare` — which is Darwin's
+        // `int64_t[2]`, modeled here as the two i64 rows qspare0/qspare1.
+        struct FieldWidth { char const* name; TypeKind kind; std::uint64_t bytes; };
+        static constexpr std::array<FieldWidth, 25> kMachoStatWidths{{
+            {"st_dev",           TypeKind::I32,    4},
+            {"st_mode",          TypeKind::U16,    2},
+            {"st_nlink",         TypeKind::U16,    2},
+            {"st_ino",           TypeKind::U64,    8},
+            {"st_uid",           TypeKind::U32,    4},
+            {"st_gid",           TypeKind::U32,    4},
+            {"st_rdev",          TypeKind::I32,    4},
+            {"__pad0",           TypeKind::I32,    4},
+            {"st_atim_sec",      TypeKind::I64,    8},
+            {"st_atim_nsec",     TypeKind::I64,    8},
+            // THE OVERLAY TRIO: the whole `struct timespec` and the two flat i64
+            // halves it overlays must keep the SAME total 16 bytes at 48 — a
+            // narrowed half would leave the composite reading bytes no flat
+            // member names, which is exactly the by-name/flat divergence
+            // D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME exists to keep honest.
+            {"st_mtim_sec",      TypeKind::I64,    8},
+            {"st_mtim_nsec",     TypeKind::I64,    8},
+            {"st_mtimespec",     TypeKind::Struct, 16},
+            {"st_ctim_sec",      TypeKind::I64,    8},
+            {"st_ctim_nsec",     TypeKind::I64,    8},
+            {"st_birthtim_sec",  TypeKind::I64,    8},
+            {"st_birthtim_nsec", TypeKind::I64,    8},
+            {"st_size",          TypeKind::I64,    8},
+            {"st_blocks",        TypeKind::I64,    8},
+            {"st_blksize",       TypeKind::I32,    4},
+            {"st_flags",         TypeKind::U32,    4},
+            {"st_gen",           TypeKind::U32,    4},
+            {"st_lspare",        TypeKind::I32,    4},
+            {"st_qspare0",       TypeKind::I64,    8},
+            {"st_qspare1",       TypeKind::I64,    8},
+        }};
+        // EXHAUSTIVE by construction: the table covers the variant field-for-field,
+        // so a field ADDED to this explicit-offset variant without a width pin (and
+        // without the offset every field here must state) fails HERE rather than
+        // slipping in unpinned.
+        EXPECT_EQ(st->fields.size(), kMachoStatWidths.size())
+            << "the macho struct stat variant has 25 explicitly-offset fields; a "
+               "new one needs its offset AND its width pinned in this table";
+        for (auto const& w : kMachoStatWidths) {
+            std::size_t const i = indexOf(*st, w.name);
+            ASSERT_NE(i, static_cast<std::size_t>(-1)) << w.name << " is missing";
+            TypeId const ft = st->fields[i].type;
+            ASSERT_TRUE(ft.valid()) << w.name;
+            EXPECT_EQ(interner.kind(ft), w.kind) << w.name << " kind/signedness";
+            auto const fl = computeLayout(ft, interner, kNatural16, DataModel::Lp64);
+            ASSERT_TRUE(fl.has_value()) << w.name;
+            EXPECT_EQ(fl->size, w.bytes) << w.name << " WIDTH — an explicit-offset "
+                                            "variant cannot self-correct this";
+        }
+    }
+    // ABSENT elsewhere: st_mtimespec is a Darwin member. elf keeps the glibc
+    // flattening, pe the MSVC record — neither may grow it.
+    for (ObjectFormatKind const fmt : {ObjectFormatKind::Elf, ObjectFormatKind::Pe}) {
+        SCOPED_TRACE(std::string{objectFormatKindName(fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = readFor(interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        auto const* st = structNamed(*desc, "stat");
+        ASSERT_NE(st, nullptr) << "struct stat must still be injected here";
+        EXPECT_EQ(indexOf(*st, "st_mtimespec"), static_cast<std::size_t>(-1))
+            << "st_mtimespec must stay macho-only";
+        // The timespec row is FLAT on purpose: a format-gated dependency would
+        // make the whole `stat` entry unavailable here (the gate skips a
+        // dependent whose by-name referent is not selected).
+        EXPECT_NE(structNamed(*desc, "timespec"), nullptr);
     }
 }
 

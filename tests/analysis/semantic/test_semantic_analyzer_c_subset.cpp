@@ -11297,7 +11297,7 @@ TEST(SemanticAnalyzerCSubset, PlainVlaArrayParamStillDecaysToPointer) {
 // n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
 // array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
 // that a struct field NEVER carries (its config row has allowFlexibleArray, not
-// arrayToPointer), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
+// paramAdjustments), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
 // routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
 // an incompleteArray and this diagnostic vanishes.
 TEST(SemanticAnalyzerCSubset, StructFieldVlaSoleMemberStillFailsLoud) {
@@ -13376,4 +13376,826 @@ TEST(SemanticAnalyzerCSubset, TFC89UnresolvableTypeNameStillFailsLoud) {
     EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
         << "an unresolvable type name must still fail loud after the walk "
            "runs off the end of the scope chain";
+}
+
+// ── D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8) ─────────────────────────
+//
+// "A declaration of a parameter as 'function returning type' shall be adjusted
+// to 'pointer to function returning type'." Before this, such a parameter was
+// bound with a FnSig type and fell into the FnSig-typed-Variable arm of the
+// Pass-1.5 bind → S0018 S_InvalidFunctionDeclarator ("function prototype
+// declarations are not supported here"). MEASURED as 6 of sqlite's arm64/macho
+// residuals, all in `src/mem1.c`, all through Darwin's FUNCTION typedefs
+// ($SDK/usr/include/malloc/malloc.h:537,546,550 — `memory_reader_t`,
+// `vm_range_recorder_t`, `print_task_printer_t` are function, NOT
+// function-pointer, typedefs, used bare as parameters).
+//
+// ★ THE FIX IS THE ADJUSTMENT, NOT THE SUPPRESSION. Silencing S0018 at the
+// reject site would leave the symbol typed FnSig — a function VALUE in a
+// parameter slot, i.e. a silent miscompile. The rule lives in
+// `adjustParamDeclaredType`, the ONE chokepoint every parameter resolution
+// funnels through (the definitive Pass-1.5 bind and all three
+// `declRowDeclaredType` arms that `collectParamTypes` uses to build a FnSig).
+//
+// ★ THIS IS A MULTI-SITE CONTRACT AND THE SITES ARE COVERED SEPARATELY. The
+// p7 array twin's corpus exercises only named params in definitions; that
+// weakness is deliberately NOT reproduced. Every form below is its own test:
+// inline, via typedef, prototype-vs-definition equality, ABSTRACT/type-only,
+// nested inside a fn-pointer declarator (the real SDK shape), and a CALL that
+// actually dispatches through the adjusted parameter.
+//
+// RED-ON-DISABLE, shared by every test in this block: delete the FnSig arm of
+// `adjustParamDeclaredType` and each `S_InvalidFunctionDeclarator == 0` pin
+// goes red (S0018 returns), plus every Ptr/FnSig structural pin flips to a bare
+// FnSig.
+
+namespace {
+// The pointee FnSig of a parameter that C 6.7.6.3p8 adjusted, or InvalidType.
+// ASSERTing through this keeps each pin one line and makes a bare-FnSig
+// regression (the un-adjusted state) impossible to pass by accident.
+[[nodiscard]] TypeId adjustedFnParamPointee(SemanticModel const& m, TypeId t) {
+    TypeInterner const& in = m.lattice().interner();
+    if (!t.valid() || in.kind(t) != TypeKind::Ptr) return InvalidType;
+    auto const ops = in.operands(t);
+    if (ops.empty() || in.kind(ops[0]) != TypeKind::FnSig) return InvalidType;
+    return ops[0];
+}
+}  // namespace
+
+// FORM (1) — a DEFINITION with a NAMED, INLINE function-typed parameter.
+// `int g(int)` in parameter position is a function type, adjusted to
+// `int (*)(int)`. Also the SIZE pin: the parameter IS a pointer, so its layout
+// is pointer-sized (a FnSig has no layout at all — computeLayout nullopts —
+// so this pin is only satisfiable by the adjusted type).
+TEST(SemanticAnalyzerCSubset, InlineFunctionTypedParamAdjustsToPointerToFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "a function-typed PARAMETER is not a prototype — C 6.7.6.3p8 adjusts "
+           "it to a pointer; S0018 here is the un-adjusted regression";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr) << "the parameter symbol must still be bound";
+    TypeId const pointee = adjustedFnParamPointee(model, g->type);
+    ASSERT_TRUE(pointee.valid())
+        << "the bound parameter must be Ptr<FnSig>, never a bare FnSig (a "
+           "function VALUE in a parameter slot is the silent miscompile)";
+    TypeInterner const& in = model.lattice().interner();
+    auto const params = in.fnParams(pointee);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(in.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(in.kind(in.fnResult(pointee)), TypeKind::I32);
+    auto const layout = computeLayout(g->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value())
+        << "an un-adjusted FnSig parameter has NO layout — computeLayout nullopts";
+    EXPECT_EQ(layout->size, 8u)  << "sizeof(param) is POINTER size (C: it IS a pointer)";
+    EXPECT_EQ(layout->align.bytes(), 8u);
+}
+
+// FORM (2) — a DEFINITION with a NAMED parameter whose function-ness arrives
+// through a FUNCTION TYPEDEF. THE SDK SHAPE: `typedef kern_return_t
+// memory_reader_t(task_t, vm_address_t, vm_size_t, void **);` then
+// `… (task_t, memory_reader_t reader, …)`. Distinct from form (1) because the
+// declarator here carries NO `()` suffix at all — the FnSig comes from the
+// head type, so a fix that keyed on the declarator's syntax would miss it.
+TEST(SemanticAnalyzerCSubset, FunctionTypedefParamAdjustsToPointerToFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int Fn(int);\n"
+        "int f(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "the SDK's function-TYPEDEF parameter spelling must adjust, not reject";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(adjustedFnParamPointee(model, g->type).valid())
+        << "a parameter typed by a FUNCTION typedef is Ptr<FnSig>";
+    // The typedef ITSELF stays a function type — the adjustment is scoped to the
+    // PARAMETER, it does not rewrite the alias (else `Fn *p;` would become a
+    // pointer-to-pointer and every other use of the alias would shift).
+    auto const* fnAlias = findSym(model, "Fn");
+    ASSERT_NE(fnAlias, nullptr);
+    EXPECT_EQ(model.lattice().interner().kind(fnAlias->type), TypeKind::FnSig)
+        << "the alias is still a FUNCTION type; only the PARAMETER adjusts";
+}
+
+// FORM (3) — a separate PROTOTYPE and DEFINITION of the SAME function. This is
+// the FnSig-EQUALITY pin: the prototype's signature is built by the param
+// HARVEST (`declRowDeclaredType`) and the definition's by the definitive
+// Pass-1.5 bind. If only one of the two applied p8, the two FnSigs would be
+// structurally different interned types and the merge would fail loud
+// (S0022 S_IncompatibleRedeclaration) or the call would (S0003 S_TypeMismatch).
+// Zero of both, with the call still dispatching, is the equality proof.
+TEST(SemanticAnalyzerCSubset, FunctionTypedefParamPrototypeAndDefinitionAgree) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int apply(Fn g, int v);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "prototype and definition must build the SAME FnSig — an asymmetric "
+           "p8 (applied at one resolution site only) shows up exactly here";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "and the call site must agree with both";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// FORM (4) — an ABSTRACT (type-only) parameter, `int apply(Fn, int);`. C
+// 6.7.6.3p8 adjusts regardless of whether the parameter is named, so the
+// abstract prototype and the NAMED definition below it must still merge. The
+// abstract arm of `declRowDeclaredType` is a physically different return
+// statement from the named arm — this is the test that keeps them in step.
+TEST(SemanticAnalyzerCSubset, AbstractFunctionTypedefParamAdjustsAndMergesWithNamedDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int apply(Fn, int);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "`int apply(Fn, int);` and `int apply(Fn g, int v){…}` are the SAME "
+           "signature — the ABSTRACT arm must adjust exactly like the named one";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors());
+    // And the harvested FnSig itself carries the ADJUSTED parameter type.
+    auto const* apply = findSym(model, "apply");
+    ASSERT_NE(apply, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(apply->type), TypeKind::FnSig);
+    auto const params = in.fnParams(apply->type);
+    ASSERT_EQ(params.size(), 2u);
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[0]).valid())
+        << "the FnSig's first parameter must be Ptr<FnSig>, not FnSig";
+}
+
+// FORM (5) — the parameter sits inside a NESTED fn-pointer declarator, which is
+// the shape the SDK actually writes: `malloc_introspection_t`'s `enumerator`
+// member is `kern_return_t (*enumerator)(task_t, …, memory_reader_t reader,
+// vm_range_recorder_t recorder)`. The inner parameter list is harvested by a
+// DIFFERENT walk (the fn-suffix param harvest) from a top-level definition's,
+// so this is not covered by forms (1)/(2).
+TEST(SemanticAnalyzerCSubset, NestedFnPtrDeclaratorFunctionTypedefParamAdjusts) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Reader(int, int);\n"
+        "typedef void Recorder(int);\n"
+        "int enumerate(int task, Reader reader, Recorder recorder);\n"
+        "int (*ep)(int task, Reader reader, Recorder recorder);\n"
+        "int main(void) { ep = enumerate; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "function-typed params inside a nested fn-POINTER declarator must "
+           "adjust too — this is the shipped malloc_introspection_t shape";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`ep = enumerate` type-checks ONLY if the fn-pointer's harvested "
+           "params and the function's own params adjusted identically";
+    EXPECT_FALSE(model.hasErrors());
+    // Structural pin on the fn-POINTER's pointee signature (the harvest path).
+    auto const* ep = findSym(model, "ep");
+    ASSERT_NE(ep, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(ep->type), TypeKind::Ptr);
+    TypeId const sig = in.operands(ep->type)[0];
+    ASSERT_EQ(in.kind(sig), TypeKind::FnSig);
+    auto const params = in.fnParams(sig);
+    ASSERT_EQ(params.size(), 3u);
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[1]).valid())
+        << "the nested `Reader reader` parameter must be Ptr<FnSig>";
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[2]).valid())
+        << "the nested `Recorder recorder` parameter must be Ptr<FnSig>";
+}
+
+// FORM (6) — a CALL THROUGH the adjusted parameter that actually DISPATCHES,
+// plus the `&param` pin. `g(v)` inside the body is a call through a
+// pointer-to-function; `Fn **pp = &g;` is only well-typed if the parameter is
+// itself a pointer (so its address is a pointer-to-pointer-to-function — both
+// facts correct per C precisely BECAUSE the parameter IS a pointer). A bare
+// FnSig parameter would make `&g` a pointer-to-function and this mismatch.
+TEST(SemanticAnalyzerCSubset, CallAndAddressOfAdjustedFunctionTypeParamAreWellTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) {\n"
+        "  Fn **pp = &g;\n"
+        "  (void)pp;\n"
+        "  return g(v);\n"
+        "}\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`&g` is pointer-to-pointer-to-function — the parameter IS a pointer";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the call THROUGH the adjusted parameter must dispatch cleanly";
+}
+
+// ★ THE ANTI-VACUITY CONTROL. p8 is a PARAMETER rule and nothing else. A
+// function-typed STRUCT FIELD (`struct S { Fn f; };`) is NOT a parameter, has
+// no meaningful runtime form, and must STAY loud. Its row carries no
+// `paramAdjustments`, so `adjustParamDeclaredType` returns it untouched and it
+// still reaches the FnSig-typed-Variable reject. Without this test, a blanket
+// "FnSig anywhere becomes a pointer" implementation would pass every pin above.
+TEST(SemanticAnalyzerCSubset, FunctionTypedStructFieldStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "struct S { Fn f; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u)
+        << "a function-typed struct MEMBER is not a parameter and must still "
+           "fail loud — the adjustment is scoped to `paramAdjustments` rows";
+}
+
+// FORM (7) — the SYMBOL-CLASSIFICATION half of p8, which the type pins above
+// cannot see. The INLINE spelling `int g(int)` writes the SAME syntax a function
+// prototype writes — a name carrying a `()` suffix — and Pass 1's `isProto` test
+// is purely syntactic, so it classified the parameter a PROTOTYPE even though
+// p8 had already made its declared type a pointer. Every FORM (1) assertion
+// stayed green throughout: the TYPE was right, the KIND was not. The flag then
+// did real damage one tier down — a prototype re-homes onto the FILE scope, and
+// CST→HIR emits no VarDecl for one — so it is pinned HERE, where it is decided.
+// (`decl.paramAdjustments` suppresses `isProto`; see the derivation's comment.)
+TEST(SemanticAnalyzerCSubset, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "int twice(int x) { return x + x; }\n"
+        "int apply(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    EXPECT_FALSE(g->isProtoDeclaration)
+        << "a PARAMETER is never a function prototype — C 6.7.6.3p8 makes its "
+           "declared type a pointer, so it declares an OBJECT";
+    EXPECT_EQ(g->kind, DeclarationKind::Variable)
+        << "and Pass 1.5 must not upgrade it to Function (that upgrade is what "
+           "makes a bare `int f(int);` callable — a parameter is not that)";
+}
+
+// FORM (8) — C 6.2.1p4: a parameter name is scoped to its own declarator and
+// has NO linkage, so two functions may reuse one. The prototype
+// misclassification ALSO re-homed the parameter onto the FILE scope (that is
+// what D-CSUBSET-BLOCK-SCOPE-PROTOTYPE does for a real prototype), where two
+// same-named parameters met as ONE symbol: MEASURED as S0022 on `g`, pointing
+// at the OTHER function's parameter. Distinct symbols in distinct scopes is the
+// only shape in which that cannot recur.
+TEST(SemanticAnalyzerCSubset, SameNamedInlineFunctionTypedParamsDoNotCollide) {
+    auto model = analyzeShipped("c-subset", {
+        "int  twice(int x)   { return x * 2; }\n"
+        "long addOne(long x) { return x + 1; }\n"
+        "int a(int  g(int),  int  v) { return g(v); }\n"
+        "int b(long g(long), long v) { return (int)g(v); }\n"
+        "int main(void) { return a(twice, 20) + b(addOne, 1); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "two functions' parameters merely SHARE a name — a parameter has no "
+           "linkage (C 6.2.1p4) and must never merge across functions";
+    EXPECT_FALSE(model.hasErrors());
+    // TWO symbols named `g`, in DIFFERENT scopes, with DIFFERENT pointees. A
+    // re-homed pair collapses to one symbol, which fails the count first.
+    std::vector<SymbolRecord const*> gs;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "g") gs.push_back(&model.symbols()[i]);
+    ASSERT_EQ(gs.size(), 2u) << "each function owns its OWN `g`";
+    EXPECT_NE(gs[0]->scope.v, gs[1]->scope.v)
+        << "and they live in DIFFERENT scopes — neither is at file scope";
+    TypeInterner const& in = model.lattice().interner();
+    TypeId const p0 = adjustedFnParamPointee(model, gs[0]->type);
+    TypeId const p1 = adjustedFnParamPointee(model, gs[1]->type);
+    ASSERT_TRUE(p0.valid() && p1.valid());
+    EXPECT_EQ(in.kind(in.fnResult(p0)), TypeKind::I32);   // `int  g(int)`
+    EXPECT_EQ(in.kind(in.fnResult(p1)), TypeKind::I64);   // `long g(long)`
+}
+
+// ── D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC ───────────────────────────────
+//
+// THE INSTRUMENT, not a feature: S0029 used to print the author's string and
+// nothing else. MEASURED on sqlite's `src/mem1.c`, its three S0029 all come
+// from ONE macro (`xnu_static_assert_struct_size`, $SDK/usr/include/mach/
+// port.h:100) instantiated ~25× in `mach/message.h`, so all three shared one
+// span, one condition source text and one author string — three literally
+// indistinguishable errors. Appending the condition's SOURCE TEXT would have
+// produced three byte-identical strings; only the FOLDED VALUES discriminate.
+//
+// AGNOSTICISM: the operator verb is read from the config-declared
+// `hirLowering.binaryOps` token→verb table, never from a hardcoded `==`/`<`
+// spelling or a rule name. Two different verbs are pinned below for exactly
+// that reason.
+//
+// ⚠ The suffix APPENDS. `Int128FalseConstantExpressionStillFailsAsAssertion`
+// (above) substring-matches "static assertion failed"; that prefix is
+// deliberately unchanged.
+
+// The `==` case, with real folded values on both sides.
+TEST(SemanticAnalyzerCSubset, StaticAssertFailureAppendsFoldedOperandsForEquality) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 8, \"struct changed size unexpectedly\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    std::size_t n = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++n; text = d.actual;
+    }
+    ASSERT_EQ(n, 1u);
+    EXPECT_NE(text.find("static assertion failed"), std::string::npos)
+        << "the existing prefix must be UNCHANGED (it is substring-matched "
+           "elsewhere); got: " << text;
+    EXPECT_NE(text.find("(folded: 4 Eq 8)"), std::string::npos)
+        << "BOTH folded operands and the config-declared verb must be reported "
+           "— that is the entire point of the instrument; got: " << text;
+}
+
+// The SECOND VERB. `<` proves the suffix reads `hirLowering.binaryOps` rather
+// than hardcoding equality: nothing in the engine names `LtOp` or `Lt`, so a
+// verb-specific implementation reds here while passing the `==` pin above.
+TEST(SemanticAnalyzerCSubset, StaticAssertFoldedOperandSuffixIsVerbAgnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(4 < 3, \"four is not less than three\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
+    EXPECT_NE(text.find("(folded: 4 Lt 3)"), std::string::npos)
+        << "a NON-equality comparison must report its own config verb; got: "
+        << text;
+}
+
+// ★ THE PROPERTY THE INSTRUMENT EXISTS FOR: two failing assertions that share
+// the SAME author message must produce DIFFERENT diagnostic text. This is the
+// `mem1.c` situation reduced to two lines — before the widening both messages
+// were byte-identical and the census collapsed them.
+TEST(SemanticAnalyzerCSubset, StaticAssertFailuresSharingOneMessageAreDistinguishable) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 8, \"struct changed size unexpectedly\");\n"
+        "_Static_assert(sizeof(long) == 4, \"struct changed size unexpectedly\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::vector<std::string> texts;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed)
+            texts.push_back(d.actual);
+    ASSERT_EQ(texts.size(), 2u) << "both assertions must fail loud";
+    EXPECT_NE(texts[0], texts[1])
+        << "two failures sharing one author string must be TELLABLE APART — "
+           "this is the whole instrument; got both as: " << texts[0];
+    EXPECT_NE(texts[0].find("(folded: 4 Eq 8)"), std::string::npos) << texts[0];
+    EXPECT_NE(texts[1].find("(folded: 8 Eq 4)"), std::string::npos) << texts[1];
+}
+
+// DEGRADE CLEANLY: a NON-binary condition still emits, still carries the author
+// string, and appends nothing. No crash, no guessed operands.
+TEST(SemanticAnalyzerCSubset, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(0, \"plain zero\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    std::size_t n = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++n; text = d.actual;
+    }
+    ASSERT_EQ(n, 1u) << "a non-binary condition must STILL fail loud";
+    EXPECT_NE(text.find("static assertion failed: \"plain zero\""),
+              std::string::npos) << text;
+    EXPECT_EQ(text.find("(folded:"), std::string::npos)
+        << "there are no binary operands to report — append nothing rather "
+           "than guess; got: " << text;
+}
+
+// The NON-CONSTANT branch also degrades cleanly: `sizeof` of an incomplete
+// array does not fold, so the LHS renders as `<non-constant>` while the RHS
+// still folds. The message keeps its own "is not an integer constant
+// expression" wording (the two failure modes stay distinguishable on one code).
+TEST(SemanticAnalyzerCSubset, StaticAssertNonConstantOperandRendersAsNonConstant) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "_Static_assert(sizeof(T) == 4, \"incomplete has no size\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
+    EXPECT_NE(text.find("is not an integer constant expression"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("(folded: <non-constant> Eq 4)"), std::string::npos)
+        << "a side that does not fold must say so, not be omitted or guessed; "
+           "got: " << text;
+}
+
+// ── D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1) ─────────────────────────
+//
+// "If the size is not present, the array type is an incomplete type." A typedef
+// may therefore NAME one. MEASURED as sqlite's blocker:
+// $SDK/usr/include/mach/vm_region.h:355 `#define VM_PAGE_INFO_MAX` is an EMPTY
+// object-like macro, so `:357` `typedef int vm_page_info_data_t[VM_PAGE_INFO_MAX];`
+// expands to `typedef int vm_page_info_data_t[];` and was S000B.
+//
+// THE ADMISSION IS THE `typeAliasRow` SIGNAL — deliberately NOT
+// `allowFlexibleArray`, which the `typedefDecl` row does not carry and MUST
+// NOT be given (the interaction guard at the foot of the NEXT block states why,
+// and is the pin that killed that first attempt). `typeAliasRow` is DERIVED
+// from the row's already config-declared `kind: type` — literally
+// `typeAliasRow = decl.kind == DeclarationKind::Type` at both declarator-mode
+// minting sites in semantic_analyzer.cpp — and threaded unchanged through
+// `declaratorDeclaredType` → `directDeclaredType` → `applyDeclaratorSuffix`,
+// where its arm sits BELOW every present-bound return. So a present-but-non-
+// constant bound (a VLA typedef) is out of the arm's reach BY CONSTRUCTION,
+// not by ordering luck. The legacy `applyArraySuffix` twin carries the same
+// `decl.kind == DeclarationKind::Type` disjunct under the same absent-length
+// gate — it is unreachable today (no shipped row declares an `arraySuffix`
+// facet) and is kept arm-for-arm in step anyway, which is why the two
+// resolvers cannot drift.
+//
+// ★★ THE FAIL-LOUD HALF IS WHAT MAKES THE ADMISSION SAFE and it is pinned
+// case by case below: an incomplete array silently sized 0 at a use site is
+// precisely the silent-miscompile class the bar forbids.
+
+// ADMIT: the typedef itself resolves, and to an INCOMPLETE array — not to a
+// zero-length one and not to the element type. RED-ON-DISABLE: delete the
+// `if (typeAliasRow) return …incompleteArray(inner);` arm from
+// `applyDeclaratorSuffix` (semantic_analyzer.cpp) — the absent bound then falls
+// straight into the `emit(S_NonConstantArrayLength)` below it and this is S000B
+// again.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefIsAdmittedAsIncompleteArray) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "`typedef int T[];` is legal C — the absent bound names an "
+           "INCOMPLETE array type (C 6.7.6.2p1)";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* t = findSym(model, "T");
+    ASSERT_NE(t, nullptr);
+    ASSERT_TRUE(t->type.valid());
+    TypeInterner const& in = model.lattice().interner();
+    EXPECT_EQ(in.kind(t->type), TypeKind::Array);
+    EXPECT_TRUE(in.isIncompleteArray(t->type))
+        << "it must be the INCOMPLETE array — a silently 0-sized array here is "
+           "the miscompile this whole block guards against";
+}
+
+// The MACRO-EXPANDED spelling, byte-for-byte the SDK's: an EMPTY object-like
+// macro in the bound position. Pinned separately from the bare `[]` because it
+// is the form that actually ships and it exercises the preprocessor→parser
+// hand-off, not just the semantic tier.
+TEST(SemanticAnalyzerCSubset, EmptyMacroArrayBoundTypedefMatchesTheSdkSpelling) {
+    auto model = analyzeShipped("c-subset", {
+        "#define VM_PAGE_INFO_MAX\n"
+        "typedef int vm_page_info_data_t[VM_PAGE_INFO_MAX];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "the shipped mach/vm_region.h:357 spelling must compile";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* t = findSym(model, "vm_page_info_data_t");
+    ASSERT_NE(t, nullptr);
+    EXPECT_TRUE(model.lattice().interner().isIncompleteArray(t->type));
+}
+
+// FAIL LOUD (1): a file-scope OBJECT of the incomplete type. C 6.7p7 — an
+// object shall have a complete type. Silently sizing it 0 is the exact defect
+// class; S0028 S_IncompleteTypeObject is the guard (widened from
+// incomplete-COMPOSITE to also cover incomplete ARRAY in the same commit).
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefFileScopeObjectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "T x;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "an OBJECT of incomplete-array type must fail loud, never be sized 0";
+}
+
+// FAIL LOUD (2): the same at BLOCK scope — a different declaration row
+// (varDecl, not topLevelDecl), so it is a genuinely separate site.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefLocalObjectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "int main(void) { T x; (void)x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a block-scope object of incomplete-array type must fail loud too";
+}
+
+// FAIL LOUD (3): `sizeof(T)`. computeLayout has no size for a bare incomplete
+// array, so a const-expr use refuses — it never folds to 0.
+TEST(SemanticAnalyzerCSubset, SizeofIncompleteArrayTypedefFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "int probe[sizeof(T)];\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "`sizeof(T)` on an incomplete array must REFUSE — folding it to 0 "
+           "would silently declare `int probe[0]`";
+}
+
+// FAIL LOUD (4): a NON-LAST member of that type. The shared composite guard
+// owns this; no special case was added for typedef-sourced incompleteness.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefNonLastMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "struct S { T a; int b; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayNotLast), 1u)
+        << "a non-last incomplete-array member would overlay the fields after "
+           "it — loud, never laid out";
+}
+
+// FAIL LOUD (5): the SOLE member (C99 6.7.2.1 requires at least one other).
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefSoleMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "struct S { T a; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArraySoleMember), 1u);
+}
+
+// THE ONE ADMITTED POSITION, stated explicitly so the fail-loud set above is
+// read as exhaustive rather than as "members are rejected": last AND non-sole
+// is a flexible array member and lays out as one — 0 bytes, element alignment,
+// `sizeof` of the struct unchanged. MEASURED against /usr/bin/clang on
+// arm64-darwin: sizeof 8, offsetof(a) 8, _Alignof 4.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefTrailingMemberIsAFlexibleArrayMember) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "struct S { int a; int b; T t; };\n"
+        "struct S v;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    auto const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    auto const layout = computeLayout(v->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 8u)  << "clang: sizeof == 8 — the FAM adds nothing";
+    EXPECT_EQ(layout->align.bytes(), 4u);
+    ASSERT_EQ(layout->fieldOffsets.size(), 3u);
+    EXPECT_EQ(layout->fieldOffsets[2], 8u) << "clang: offsetof(t) == 8";
+}
+
+// `extern T x;` stays legal — an extern object is completed in another TU,
+// exactly as `extern char v[];` already is. The fail-loud guard must not have
+// widened into this.
+TEST(SemanticAnalyzerCSubset, ExternIncompleteArrayTypedefObjectStaysLegal) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "extern T x;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 0u)
+        << "an EXTERN incomplete-array object is legal C (completed elsewhere)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ── D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18) ────────────────────────────
+//
+// MEASURED: `uint64_t ns_threadids[0];` — the last member of `struct
+// netfs_status`, $SDK/usr/include/sys/mount.h:366, reached by sqlite — was
+// S000C S_ArrayLengthOutOfRange from the `*len <= 0` reject.
+//
+// ★ ONE MECHANISM, per the registry row's instruction to look for the shared
+// chokepoint first: a bound folding to exactly 0 on a row that admits a
+// flexible array member routes into the SAME `incompleteArray` the absent-bound
+// `[]` builds, in BOTH array-length resolvers. `[0]` and `[]` therefore cannot
+// diverge on layout or on position — which is what the two pins below prove by
+// comparing them field-for-field rather than by asserting each separately.
+
+// LAYOUT: adding a trailing `[0]` member changes NOTHING about the struct's
+// size. Exact pins, MEASURED against /usr/bin/clang -std=c17 on arm64-darwin:
+// `struct P{int a;int b;}` and `struct Z{int a;int b;int t[0];}` are both
+// sizeof 8 / _Alignof 4, and offsetof(Z.t) == 8.
+// RED-ON-DISABLE: without the `*len == 0` arm the member is S000C and `Z` never
+// composes, so every pin below reds.
+TEST(SemanticAnalyzerCSubset, TrailingZeroLengthArrayMemberLeavesStructSizeUnchanged) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct P { int a; int b; };\n"
+        "struct Z { int a; int b; int t[0]; };\n"
+        "struct P p; struct Z z;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
+        << "a TRAILING `int t[0];` member is the GNU zero-length array — admit "
+           "it, do not reject the bound";
+    EXPECT_FALSE(model.hasErrors());
+    TypeInterner const& in = model.lattice().interner();
+    auto const* p = findSym(model, "p");
+    auto const* z = findSym(model, "z");
+    ASSERT_NE(p, nullptr); ASSERT_NE(z, nullptr);
+    auto const pl = computeLayout(p->type, in, kAlignasLayout, DataModel::Lp64);
+    auto const zl = computeLayout(z->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(pl.has_value()); ASSERT_TRUE(zl.has_value());
+    EXPECT_EQ(pl->size, 8u)  << "clang: sizeof(struct P) == 8";
+    EXPECT_EQ(zl->size, 8u)  << "clang: sizeof(struct Z) == 8 — the `[0]` member "
+                                "contributes ZERO bytes";
+    EXPECT_EQ(zl->size, pl->size)
+        << "adding a trailing zero-length member must not change sizeof";
+    EXPECT_EQ(zl->align.bytes(), 4u) << "clang: _Alignof(struct Z) == 4";
+    ASSERT_EQ(zl->fieldOffsets.size(), 3u);
+    EXPECT_EQ(zl->fieldOffsets[2], 8u) << "clang: offsetof(struct Z, t) == 8";
+}
+
+// ONE MECHANISM, pinned directly: `int t[0];` and `int t[];` must produce the
+// SAME layout. A parallel implementation of zero-length arrays would drift here
+// (different element handling, a real 0-length Array rather than the incomplete
+// one, a struct that reports `hasFlexibleArrayMember` for only one of the two).
+TEST(SemanticAnalyzerCSubset, ZeroLengthAndAbsentBoundMembersLayOutIdentically) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct Z { int a; int b; int t[0]; };\n"
+        "struct F { int a; int b; int t[]; };\n"
+        "struct Z z; struct F f;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    TypeInterner const& in = model.lattice().interner();
+    auto const* z = findSym(model, "z");
+    auto const* f = findSym(model, "f");
+    ASSERT_NE(z, nullptr); ASSERT_NE(f, nullptr);
+    auto const zl = computeLayout(z->type, in, kAlignasLayout, DataModel::Lp64);
+    auto const fl = computeLayout(f->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(zl.has_value()); ASSERT_TRUE(fl.has_value());
+    EXPECT_EQ(zl->size, fl->size);
+    EXPECT_EQ(zl->align.bytes(), fl->align.bytes());
+    ASSERT_EQ(zl->fieldOffsets.size(), fl->fieldOffsets.size());
+    EXPECT_EQ(zl->fieldOffsets[2], fl->fieldOffsets[2]);
+    EXPECT_TRUE(zl->hasFlexibleArrayMember)
+        << "`[0]` IS the GNU spelling of a flexible array member — one "
+           "mechanism, not a parallel one";
+    EXPECT_EQ(zl->hasFlexibleArrayMember, fl->hasFlexibleArrayMember);
+}
+
+// FAIL LOUD: a NON-TRAILING `[0]` member. It would overlay the members that
+// follow it; the shared composite guard rejects it with no special case here.
+TEST(SemanticAnalyzerCSubset, NonTrailingZeroLengthArrayMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int t[0]; int b; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayNotLast), 1u)
+        << "only a TRAILING zero-length member is admitted";
+}
+
+// FAIL LOUD: the SOLE member.
+TEST(SemanticAnalyzerCSubset, SoleZeroLengthArrayMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int t[0]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArraySoleMember), 1u);
+}
+
+// FAIL LOUD: `[0]` OUTSIDE a struct member — a file-scope object, a block-scope
+// object and a parameter. None of those rows admits a flexible array member, so
+// none admits `[0]`: the out-of-range reject is untouched for them. This is the
+// scoping pin — without it the change would read as "zero-length arrays are
+// now legal everywhere".
+TEST(SemanticAnalyzerCSubset, ZeroLengthArrayOutsideAStructMemberStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int g[0];\n"
+        "int take(int p[0]);\n"
+        "int main(void) { int l[0]; (void)l; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 3u)
+        << "a global, a local and a parameter `[0]` each stay S000C — the "
+           "admission is scoped to rows that admit a flexible array member";
+}
+
+// FAIL LOUD: `int a[0] = {1};`. THE `allowInitInferredArray` EXCLUSION. The
+// flag reaching the resolver is `decl.allowFlexibleArray || initNode.valid()`,
+// so without the exclusion an initialized `[0]` would stop being S000C and get
+// SILENTLY re-sized to `int[1]` by the initializer backfill — a written bound
+// overwritten without a word. RED-ON-DISABLE: drop `&& !allowInitInferredArray`
+// and this count drops to 0.
+TEST(SemanticAnalyzerCSubset, ZeroLengthArrayWithInitializerStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int a[0] = {1};\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "an initialized `[0]` must stay loud — never silently re-sized from "
+           "its initializer";
+}
+
+// The NEGATIVE bound is untouched: `[-1]` is out of range in every position,
+// including a struct member. Only EXACTLY 0 routes to the flexible-array path.
+TEST(SemanticAnalyzerCSubset, NegativeArrayBoundStillFailsLoudEvenInAStructMember) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a; int t[-1]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "only a bound of EXACTLY 0 is the GNU zero-length array; a negative "
+           "one stays out of range";
+}
+
+// ★★ THE INTERACTION GUARD FOR D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF, and it is
+// here because the first implementation FAILED IT. Admitting the absent bound
+// by giving the typedefDecl row `allowFlexibleArray` looks equivalent and is
+// not: that flag is tested ABOVE the VLA arm (a struct field's `int a[n]` is
+// deliberately a FAM, not a VLA member), so a VLA TYPEDEF stopped building a
+// vlaArray and silently became an INCOMPLETE array — a wrong type, not a
+// diagnostic. The shipped signal is `typeAliasRow`, derived from the row's
+// `kind: type`, and its arm sits BELOW every present-bound return, so a
+// present-but-non-constant bound is structurally out of its reach — which is
+// the whole reason the two are not one flag.
+// (`VlaTypedefObjectAcceptsAndRecordsOrigin`
+// above is the pin that caught it; this is the same property stated against
+// THIS anchor so the coupling is not rediscovered by accident.)
+TEST(SemanticAnalyzerCSubset, VlaTypedefStaysAVlaAfterIncompleteArrayTypedefAdmission) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int s = 4;\n"
+        "  int n = s;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* r = findSym(model, "R");
+    ASSERT_NE(r, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    EXPECT_TRUE(in.isVlaArray(r->type))
+        << "a PRESENT-but-non-constant bound in a typedef is a VLA — the "
+           "incomplete-array admission must not swallow it";
+    EXPECT_FALSE(in.isIncompleteArray(r->type))
+        << "and it must NOT have become the incomplete array (the silently "
+           "wrong type the first implementation produced)";
+}
+
+// SCOPING, stated as a pin so the two anchors are not read as one rule:
+// D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER is keyed on `allowFlexibleArray`, which
+// the typedef row does not carry, so `typedef int T[0];` is NOT admitted. Only
+// the ABSENT bound is a typedef-nameable incomplete type.
+TEST(SemanticAnalyzerCSubset, ZeroLengthBoundInATypedefStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[0];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "the zero-length-array extension is a struct-MEMBER rule; a typedef "
+           "gets the absent-bound rule only";
 }

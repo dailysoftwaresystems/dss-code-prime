@@ -807,7 +807,7 @@ struct DSS_EXPORT DeclarationRule {
     // engine never hard-codes "parameter". Inner array dimensions are untouched
     // (`int a[][5]` → Ptr<Array<int,5>>), and an inner ABSENT dimension still
     // fails loud via the incomplete-element-in-aggregate guard.
-    bool arrayToPointer = false;
+    bool paramAdjustments = false;
     // D5.1: optional composite-type collection. When set, Pass 1.5 composes the
     // declaration's `kind: type` symbol's TypeId via `interner.structType(name,
     // fieldTypes)` from the field-symbols minted in this declaration's scope.

@@ -12842,3 +12842,64 @@ TEST(MirLoweringCSubset, SameRepresentationIntegerReturnEmitsNoCast) {
     MirVerifier verifier{L.mir.mir, &L.model.lattice().interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "errorCount=" << rep.errorCount();
 }
+
+// ── D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8) — the ARG-SLOT pin ──────
+//
+// THE TIER THAT REPORTED THE DEFECT. `lowerFunction` compares the HIR Function's
+// param NODES against its FnSig's param TYPES and fails loud on a mismatch:
+// MEASURED, on the INLINE spelling `int g(int)`, "Function param count 1
+// mismatches FnSig param count 2" — the parameter had been classified a function
+// PROTOTYPE (its name carries a `()` suffix, the same syntax a prototype writes)
+// and CST→HIR's prototype gate emits no VarDecl, so the slot vanished. Counting
+// the emitted `Arg`s is what proves the slot survived all the way to MIR, where
+// an `Arg` IS the argument register.
+//
+// RED-ON-DISABLE: drop `&& !decl.paramAdjustments` from the `isProto` derivation
+// in semantic_analyzer.cpp's Pass-1 declarator mint → `L.mir.ok` goes false with
+// exactly that H_UnsupportedLoweringForKind.
+TEST(MirLoweringCSubset, InlineFunctionTypedParamKeepsItsArgSlot) {
+    auto L = lowerCSubset(
+        "int twice(int x) { return x + x; }\n"
+        "int apply(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(dss::test_support::countCode(
+                  L.mirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 0u)
+        << "a function-typed parameter is a supported construct — C 6.7.6.3p8 "
+           "makes it an ordinary pointer parameter";
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    bool sawApply = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        auto const* rec = L.model.recordFor(m.funcSymbol(f));
+        if (rec == nullptr || rec->name != "apply") continue;
+        sawApply = true;
+        // Both parameters reach MIR as `Arg`s, in source order, and arg 0 is a
+        // POINTER (the adjusted function type) — a bare FnSig here would be a
+        // function value in a register, which no ABI can pass.
+        std::vector<MirInstId> args;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == MirOpcode::Arg) args.push_back(id);
+            }
+        }
+        ASSERT_EQ(args.size(), 2u)
+            << "`apply` takes TWO arguments — a dropped param slot reports 1";
+        EXPECT_EQ(m.argIndex(args[0]), 0u);
+        EXPECT_EQ(m.argIndex(args[1]), 1u);
+        EXPECT_EQ(in.kind(m.instType(args[0])), TypeKind::Ptr)
+            << "arg 0 is `int (*)(int)` — the p8-adjusted parameter";
+        EXPECT_EQ(in.kind(m.instType(args[1])), TypeKind::I32);
+    }
+    EXPECT_TRUE(sawApply) << "`apply` must be lowered";
+}

@@ -8101,3 +8101,146 @@ TEST(HirLoweringCSubset, TypedefMultiDeclaratorEmitsOneTypeDeclPerAlias) {
               static_cast<std::ptrdiff_t>(4))
         << "the four TypeDecls must name four DIFFERENT symbols";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8) — the HIR PARAM-SLOT pins.
+//
+// ★ THESE TESTS EXIST BECAUSE THE SEMANTIC TESTS CANNOT SEE THE DEFECT THEY
+// GUARD. p8 is implemented as a TYPE adjustment, and every semantic pin reads
+// the adjusted TYPE — which was already correct (Ptr<FnSig>) while the bug was
+// live. What was wrong was the symbol's PROTOTYPE flag: the INLINE spelling
+// `int g(int)` writes a name carrying a `()` suffix, the same syntax a function
+// prototype writes, so Pass 1's purely syntactic `isProto` test called the
+// parameter a prototype. CST→HIR's D-CSUBSET-FN-PROTOTYPE gate emits NO VarDecl
+// for a prototype, so the parameter SLOT silently vanished while its FnSig kept
+// the entry — MEASURED as `H_UnsupportedLoweringForKind: Function param count 1
+// mismatches FnSig param count 2` at HIR→MIR, on a program whose semantic tier
+// was entirely clean. Counting the emitted param NODES is the only place the
+// drop is observable, which is exactly why it lives here and not one tier up.
+//
+// The TYPEDEF spelling (`void f(Fn g)`) never had the defect — its declarator
+// carries no `()` suffix at all — so a fixture must use the INLINE form to see it.
+//
+// RED-ON-DISABLE (both tests): drop `&& !decl.paramAdjustments` from the
+// `isProto` derivation in semantic_analyzer.cpp's Pass-1 declarator mint. The
+// first test then reports 1 param instead of 2; the second fails its
+// `hasErrors()` assert with S0022 (the two parameters re-home onto the FILE
+// scope and collide as incompatible redeclarations).
+namespace {
+// The pointee FnSig of a param slot that C 6.7.6.3p8 adjusted, or InvalidType.
+// Reading THROUGH this makes a bare-FnSig (un-adjusted) slot impossible to pass
+// by accident, and keeps each structural pin one line.
+[[nodiscard]] TypeId adjustedParamPointee(SemanticModel const& m, TypeId t) {
+    TypeInterner const& in = m.lattice().interner();
+    if (!t.valid() || in.kind(t) != TypeKind::Ptr) return InvalidType;
+    auto const ops = in.operands(t);
+    if (ops.empty() || in.kind(ops[0]) != TypeKind::FnSig) return InvalidType;
+    return ops[0];
+}
+}  // namespace
+
+// PIN 1 — the param slot EXISTS, in the right POSITION, with the adjusted TYPE.
+// Every one of the three facts is load-bearing: HIR→MIR reads the Function's
+// param NODES to emit `Arg` instructions and its FnSig for their types, so a
+// count mismatch is a hard error and an order/type mismatch would be a silent
+// wrong-register miscompile.
+TEST(HirLoweringCSubset, InlineFunctionTypedParamEmitsItsOwnParamSlot) {
+    SemanticModel model = analyzeCSubset(
+        "int twice(int x) { return x + x; }\n"
+        "int apply(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId apply{};
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Function) continue;
+        auto const* rec = model.recordFor(res->hir.functionSymbol(d));
+        if (rec != nullptr && rec->name == "apply") { apply = d; break; }
+    }
+    ASSERT_TRUE(apply.valid());
+
+    auto const params = res->hir.functionParams(apply);
+    ASSERT_EQ(params.size(), 2u)
+        << "the INLINE function-typed parameter must emit its OWN slot — a "
+           "prototype-classified parameter emits none and this reports 1";
+
+    TypeInterner const& in = model.lattice().interner();
+    // The Function's own FnSig is the OTHER half of the equality HIR→MIR
+    // checks; pinning both here is what makes the two provably agree.
+    auto const sigParams = in.fnParams(res->hir.functionSignature(apply));
+    ASSERT_EQ(sigParams.size(), 2u);
+
+    // Slot 0 — `int g(int)` adjusted to `int (*)(int)`.
+    ASSERT_EQ(res->hir.kind(params[0]), HirKind::VarDecl);
+    TypeId const slot0 = res->hir.varDeclType(params[0]);
+    TypeId const pointee = adjustedParamPointee(model, slot0);
+    ASSERT_TRUE(pointee.valid())
+        << "slot 0 must be Ptr<FnSig> — a bare FnSig is a function VALUE in a "
+           "parameter slot, the silent miscompile p8 exists to prevent";
+    auto const inner = in.fnParams(pointee);
+    ASSERT_EQ(inner.size(), 1u);
+    EXPECT_EQ(in.kind(inner[0]), TypeKind::I32);
+    EXPECT_EQ(in.kind(in.fnResult(pointee)), TypeKind::I32);
+    EXPECT_EQ(slot0, sigParams[0])
+        << "the emitted slot's type and the FnSig's entry must be the SAME "
+           "interned type — a drift here is a wrong-width argument";
+
+    // Slot 1 — the ordinary `int v` that followed it. Pinned because a dropped
+    // slot 0 would silently SHIFT this parameter into argument register 0.
+    ASSERT_EQ(res->hir.kind(params[1]), HirKind::VarDecl);
+    EXPECT_EQ(in.kind(res->hir.varDeclType(params[1])), TypeKind::I32);
+    EXPECT_EQ(res->hir.varDeclType(params[1]), sigParams[1]);
+}
+
+// PIN 2 — C 6.2.1p4: a parameter name is scoped to its own declarator and has
+// NO linkage, so two functions may reuse one freely. Classifying the inline
+// spelling as a prototype ALSO re-homed the parameter symbol onto the FILE
+// scope (that is what the prototype path does, per D-CSUBSET-BLOCK-SCOPE-
+// PROTOTYPE), where two same-named parameters met as one symbol. MEASURED
+// before the fix: S0022 S_IncompatibleRedeclaration on `g`, pointing at the
+// OTHER function's parameter — legal C rejected outright.
+TEST(HirLoweringCSubset, SameNamedInlineFunctionTypedParamsStayFunctionLocal) {
+    SemanticModel model = analyzeCSubset(
+        "int  twice(int x)   { return x * 2; }\n"
+        "long addOne(long x) { return x + 1; }\n"
+        "int a(int  g(int),  int  v) { return g(v); }\n"
+        "int b(long g(long), long v) { return (int)g(v); }\n"
+        "int main(void) { return a(twice, 20) + b(addOne, 1); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "two functions whose parameters merely share a NAME must not "
+           "collide — the parameter has no linkage (C 6.2.1p4): "
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    TypeInterner const& in = model.lattice().interner();
+    // Each function keeps two slots, and each `g` keeps its OWN signature —
+    // a merged symbol would give both the same type (whichever won the bind).
+    std::size_t checked = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Function) continue;
+        auto const* rec = model.recordFor(res->hir.functionSymbol(d));
+        if (rec == nullptr || (rec->name != "a" && rec->name != "b")) continue;
+        auto const params = res->hir.functionParams(d);
+        ASSERT_EQ(params.size(), 2u) << "in function " << rec->name;
+        TypeId const pointee =
+            adjustedParamPointee(model, res->hir.varDeclType(params[0]));
+        ASSERT_TRUE(pointee.valid()) << "in function " << rec->name;
+        auto const inner = in.fnParams(pointee);
+        ASSERT_EQ(inner.size(), 1u) << "in function " << rec->name;
+        TypeKind const want = (rec->name == "a") ? TypeKind::I32 : TypeKind::I64;
+        EXPECT_EQ(in.kind(inner[0]), want)
+            << "`g` in function " << rec->name << " must keep ITS OWN "
+               "signature — a shared file-scope symbol gives both the same one";
+        EXPECT_EQ(in.kind(in.fnResult(pointee)), want);
+        ++checked;
+    }
+    EXPECT_EQ(checked, 2u) << "both functions must be present and checked";
+}

@@ -5247,7 +5247,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "params", "head", "declarator",
                                 "declaratorList", "kind", "nameMatch",
                                 // type-source / declarator-walk switches
-                                "inferTypeFromInitializer", "arrayToPointer",
+                                "inferTypeFromInitializer", "paramAdjustments",
                                 "anonymousNameAllowed",
                                 "requireNamedDeclarators",
                                 "nonDefiningDeclaration", "definesWhenChild",
@@ -6024,18 +6024,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
 
                         // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7):
-                        // optional `arrayToPointer` — when true, a declarator
+                        // optional `paramAdjustments` — when true, a declarator
                         // whose resolved type is an array (sized or unsized)
                         // adjusts to a pointer to its element type. Set on
                         // declaration forms with C parameter semantics.
-                        if (entry.contains("arrayToPointer")) {
-                            json const& ap = entry.at("arrayToPointer");
+                        if (entry.contains("paramAdjustments")) {
+                            json const& ap = entry.at("paramAdjustments");
                             if (!ap.is_boolean()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/arrayToPointer",
-                                          "'arrayToPointer' must be a boolean");
+                                          path + "/paramAdjustments",
+                                          "'paramAdjustments' must be a boolean");
                             } else {
-                                rule.arrayToPointer = ap.get<bool>();
+                                rule.paramAdjustments = ap.get<bool>();
                             }
                         }
 
