@@ -23,6 +23,10 @@
 #      the reference build compiles), the -D defines, and the sqlite -I dirs.
 #      DSS compiles the WHOLE source set (it cannot consume gcc's libsqlite3.a),
 #      so the core sources inside that .a are recovered via `ar t`.
+#      The reference fixture built along the way is KEPT, as the ATTRIBUTION
+#      ORACLE, at <OUT_DIR>/reference-testfixture — copied out of the build tree
+#      because deriving the recipe requires DELETING the make target. Step 9
+#      prints its path, or says ABSENT when this run produced none.
 #   5. build dss-code-prime              (its default CMake-4 Release build)
 #   6. stage the third-party HEADERS DSS parses agnostically (the host's REAL tcl
 #      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
@@ -666,6 +670,112 @@ tcl_h_version() {               # tcl_h_version <path/to/tcl.h> -> "8.6" | "9.0"
 }
 TCL_CFGS="$(tcl_configs)"
 
+# ── the -L that TCL_LIBS needs but does not carry (Tcl 9 externalised tommath) ─
+# WHY THIS EXISTS — do NOT "simplify" the -L away:
+# Tcl 8.6 BUNDLED libtommath inside libtcl. Tcl 9 does NOT, so a Tcl-9
+# tclConfig.sh declares it as an EXTERNAL dependency in TCL_LIBS
+# (`TCL_LIBS=' -lz  -lpthread -framework CoreFoundation  -ltommath'`), and
+# main.mk's testfixture rule passes `$$TCL_LIBS` through VERBATIM — with no `-L`
+# to go with it. On macOS the Homebrew lib dir is NOT a default linker search
+# path, so the moment the host's default Tcl became 9.x the REFERENCE fixture
+# stopped linking (`ld: library 'tommath' not found`) while every .o still
+# compiled fine — i.e. the ATTRIBUTION ORACLE silently disappeared
+# (D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE; its absence stalled walsetlk_recover).
+#
+# Written GENERICALLY — it repairs whatever `-l` TCL_LIBS names, not `tommath` by
+# name — and PROBE-GATED, so it is a strict NO-OP wherever the toolchain already
+# resolves the library. On every Linux host today Debian's libtommath.so sits in
+# a default multiarch dir, every probe passes, NOTHING is added, and both the
+# configure invocation and the link line stay byte-identical to their pre-macOS
+# form.
+#   · the PROBE links with the SAME compiler the sqlite Makefile links with
+#     (Step 4 reads it out of the generated Makefile's own `CC =`), NEVER a bare
+#     `clang`: on a host carrying the Android NDK ahead of /usr/bin on PATH,
+#     `clang` IS the NDK's and dies on `-lSystem`, which would make every probe
+#     lie. The probe's exit status is captured DIRECTLY off the compiler.
+#   · the DIRECTORY is DERIVED, never hardcoded — Homebrew's prefix is
+#     /usr/local on Intel and /opt/homebrew on Apple Silicon, and CI/Linux differ
+#     again. Precedence: pkg-config's own `libdir` (the library's authoritative
+#     self-description) → the Homebrew keg for lib<name>/<name> → the LIB_ROOTS
+#     this harness already discovers (which carry both Homebrew layouts).
+declare -a PROBE_CC=("${CC:-cc}")   # Step 4 replaces this with the Makefile's CC
+probe_link_l() {                # probe_link_l <-L…/-l… args> -> 0 iff the LINK succeeds
+  local tmp rc
+  tmp="$(mktemp -d)" || return 1
+  printf 'int main(void){return 0;}\n' > "$tmp/probe.c"
+  # status taken DIRECTLY off the compiler — never through a pipe, which would
+  # report the pipe's status instead. The if/else keeps `set -e` out of it.
+  if "${PROBE_CC[@]}" "$tmp/probe.c" "$@" -o "$tmp/probe.bin" >/dev/null 2>&1
+  then rc=0; else rc=$?; fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+pkgcfg_libdir() {               # pkgcfg_libdir <module> -> its libdir (or "")
+  command -v pkg-config >/dev/null 2>&1 && pkg-config --variable=libdir "$1" 2>/dev/null || true
+}
+dir_holds_lib() {               # dir_holds_lib <dir> <name> -> 0 iff lib<name>.* is there
+  local d="$1" n="$2" f
+  [[ -n "$d" && -d "$d" ]] || return 1
+  # an unmatched glob stays LITERAL and `-e` then rejects it — no nullglob needed.
+  for f in "$d/lib$n".dylib "$d/lib$n".so "$d/lib$n".so.* "$d/lib$n".tbd "$d/lib$n".a; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
+}
+libdir_for() {                  # libdir_for <name> -> a dir holding lib<name>.* (or "")
+  local n="$1" d p
+  for d in "$(pkgcfg_libdir "lib$n")" "$(pkgcfg_libdir "$n")"; do
+    dir_holds_lib "$d" "$n" && { printf '%s' "$d"; return; }
+  done
+  # `brew --prefix <f>` prints the WOULD-BE prefix even when <f> is absent, and
+  # prints NOTHING when the formula does not exist — hence the emptiness guard.
+  for p in "$(brew_prefix "lib$n")" "$(brew_prefix "$n")"; do
+    [[ -n "$p" ]] || continue
+    dir_holds_lib "$p/lib" "$n" && { printf '%s' "$p/lib"; return; }
+  done
+  for d in "${LIB_ROOTS[@]}"; do
+    dir_holds_lib "$d" "$n" && { printf '%s' "$d"; return; }
+  done
+  return 0
+}
+mk_var() {                      # mk_var <makefile> <NAME> -> its value (first defn, trimmed)
+  # `NAME = value`, as configure writes it. POSIX BRE only — no `-r`, no `\+`,
+  # no `-i`: byte-identical under BSD /usr/bin/sed and GNU sed.
+  sed -n "s/^$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null \
+    | sed 's/[[:space:]]*$//' | sed -n '1p' || true
+}
+tcl_libs_ldflags() {            # tcl_libs_ldflags <tclConfig.sh> -> "-Ldir …" | ""
+  local cfg="$1" libs tok name dir out=""
+  local -a toks=()
+  [[ -n "$cfg" && -f "$cfg" ]] || return 0
+  libs="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_LIBS:-}" )" || return 0
+  # `read -ra` splits on IFS and does NOT glob — safer than `for tok in $libs`.
+  read -r -a toks <<< "$libs" || true
+  [[ ${#toks[@]} -gt 0 ]] || return 0
+  for tok in "${toks[@]}"; do
+    case "$tok" in -l?*) name="${tok#-l}" ;; *) continue ;; esac   # skips -framework X etc.
+    probe_link_l -l"$name" && continue        # already resolvable → add NOTHING
+    dir="$(libdir_for "$name")"
+    # ★ every diagnostic here goes to STDERR: stdout IS this function's return
+    #   value, and a `info`/`warn` line leaking into it would be spliced onto the
+    #   front of REF_LDFLAGS and handed to configure as part of the flag.
+    if [[ -z "$dir" ]]; then
+      warn "reference link: tclConfig.sh declares -l$name in TCL_LIBS, which ${PROBE_CC[*]} cannot" >&2
+      warn "      resolve and neither pkg-config, brew, nor ${#LIB_ROOTS[@]} library roots can locate." >&2
+      warn "      The reference testfixture — the ATTRIBUTION ORACLE — will NOT link. Install lib$name." >&2
+      continue
+    fi
+    if probe_link_l -L"$dir" -l"$name"; then
+      case " $out " in *" -L$dir "*) ;; *) out="${out:+$out }-L$dir" ;; esac
+      info "reference link: -l$name is not on a default search path — adding -L$dir" >&2
+    else
+      warn "reference link: lib$name was found under $dir, yet ${PROBE_CC[*]} still cannot link" >&2
+      warn "      -l$name against it (wrong architecture?). The reference testfixture will NOT link." >&2
+    fi
+  done
+  printf '%s' "$out"
+}
+
 # ── Step 4 — configure + derive the full-source testfixture recipe ───────────
 step "4/9  Derive the full-source testfixture recipe (make -n testfixture)"
 # mksqlite3c.tcl + the fixture link need tclsh 8.6+ and the Tcl dev files
@@ -823,6 +933,47 @@ else
   ( cd "$BLD" && "$SQLITE_DIR/configure" >/dev/null )
 fi
 printf '%s\n' "$TCL_STAMP_NOW" > "$TCL_STAMP"
+# ── repair the reference link line: the -L that TCL_LIBS omits ───────────────
+# WHICH tclConfig.sh matters, and only configure knows: it is the one configure
+# just wrote into the Makefile as TCL_CONFIG_SH — literally the file the link's
+# `.tclenv.sh` sources. So DERIVE IT AFTER configure, off the Makefile itself,
+# rather than re-guessing the selection here and risking a different answer.
+# Same reason PROBE_CC comes from the Makefile's own `CC =`: the probe must be
+# the compiler that will actually do the link, never a bare `clang` off PATH.
+_mk_cc="$(mk_var "$BLD/Makefile" CC)"
+[[ -n "$_mk_cc" ]] && read -r -a PROBE_CC <<< "$_mk_cc"      # handles `ccache gcc`
+REF_LDFLAGS="$(tcl_libs_ldflags "$(mk_var "$BLD/Makefile" TCL_CONFIG_SH)")"
+if [[ -n "$REF_LDFLAGS" ]]; then
+  # The mechanism is sqlite's OWN documented client knob: `LDFLAGS=…` handed to
+  # configure lands in the Makefile as `LDFLAGS.configure` (Makefile.in:
+  # `LDFLAGS.configure = @LDFLAGS@`), which main.mk folds into
+  # $(LDFLAGS.libsqlite3) and therefore onto the testfixture link line
+  # (main.mk: `testfixture$(T.exe): … $(LDFLAGS.libsqlite3)`).
+  # Chosen over exporting LIBRARY_PATH for one `make` — both link, MEASURED —
+  # because it BAKES THE FIX INTO THE TREE: the oracle exists to be USED, and a
+  # human re-running `make testfixture` by hand in $BLD to attribute a failure
+  # must get a link too, not just this script. Also chosen over passing
+  # `LDFLAGS.configure=…` to make, which main.mk explicitly says not to rely on.
+  # The re-configure happens ONLY when a -L is genuinely missing, so a host that
+  # needs none — every Linux host today — still configures EXACTLY ONCE.
+  info "configure: reference link needs $REF_LDFLAGS — re-running configure with LDFLAGS"
+  # Appended AFTER the Tcl identity stamp is written, deliberately: the stamp
+  # guards against a stale .o compiled under a DIFFERENT Tcl's headers, and a
+  # library SEARCH PATH cannot affect a .o. Folding it into the stamp would
+  # false-alarm ("the Tcl behind $BLD CHANGED") on every existing tree.
+  CONFIGURE_ARGS+=("LDFLAGS=$REF_LDFLAGS")
+  ( cd "$BLD" && "$SQLITE_DIR/configure" "${CONFIGURE_ARGS[@]}" >/dev/null )
+  # FAIL LOUD if it did not land. A silent miss — say sqlite reshapes the
+  # @LDFLAGS@ substitution upstream — would put us straight back to an oracle
+  # that quietly is not there, which is the exact failure mode this repairs.
+  if grep -qF -- "$REF_LDFLAGS" "$BLD/Makefile"; then
+    info "configure: LDFLAGS.configure now carries $REF_LDFLAGS"
+  else
+    warn "configure did NOT carry LDFLAGS='$REF_LDFLAGS' into $BLD/Makefile."
+    warn "      The reference testfixture will almost certainly fail to link — sqlite's"
+    warn "      LDFLAGS.configure / @LDFLAGS@ substitution may have changed shape upstream."
+  fi
+fi
 # Build the reference fixture. It generates every derived .c
 # (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a, which the DSS
 # TU set needs — AND, when it links, it is the ORACLE that decides whether a corpus
@@ -833,17 +984,66 @@ printf '%s\n' "$TCL_STAMP_NOW" > "$TCL_STAMP"
 # (D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE).
 info "building the reference testfixture (generates derived sources + libsqlite3.a)"
 REF_BUILD_LOG="$BLD/reference-build.log"
+# ── the PRESERVED oracle — why the copy exists AND why the `rm` below must stay ─
+# These two lines are a PAIR. Deleting either one re-creates a defect the other
+# repairs, so do NOT "simplify" one away without the other:
+#
+#   · the `rm -f "$BLD/testfixture"` further down is LOAD-BEARING. `make -n` only
+#     PRINTS a target's recipe when the target is MISSING — against an up-to-date
+#     tree it prints nothing harvestable. Harvesting that one cc/link line is the
+#     ENTIRE reason Step 4 exists (it is where the TU list, the -D defines and the
+#     -I dirs come from), so removing the `rm` empties $RECIPE and Step 4 dies on
+#     its own <150-TU / <18-define floor.
+#
+#   · but that same linked binary is the ATTRIBUTION ORACLE — the reference build
+#     that decides whether a corpus failure is DSS's fault or upstream's. The
+#     harness used to build it, ANNOUNCE it as an oracle, and then delete it ten
+#     lines later; $REF_FIXTURE was never read again ANYWHERE in the script, so
+#     after a full run the oracle did not exist on disk at all. (Second half of
+#     D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE: the Tcl-9 `-L` repair above made
+#     the oracle LINK again, this makes it SURVIVE. Both are needed to have one.)
+#
+# So the binary is copied OUT of the make target's path BEFORE the target is
+# deleted. The copy is not a make target and not a prerequisite of one, so
+# `make -n` still sees `testfixture` missing and still prints the recipe.
+# It lands in $OUT_DIR — this harness's OWN output tree, NOT the sqlite checkout —
+# so sqlite's `make clean`/`distclean` can never take it, and Step 9 prints the
+# path so a human triaging a failure knows the oracle is there and where.
+REF_FIXTURE_KEEP="$OUT_DIR/reference-testfixture"
+mkdir -p "$OUT_DIR"
+# Clear any copy from a PREVIOUS run BEFORE building: sqlite is pulled/updated on
+# every run, so a stale oracle would attribute against sources that are no longer
+# the ones under test — strictly worse than no oracle at all. Past this line the
+# preserved path holds THIS run's binary or nothing.
+rm -f "$REF_FIXTURE_KEEP"
 if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$JOBS" ) > "$REF_BUILD_LOG" 2>&1; then
-  REF_FIXTURE="$BLD/testfixture"
-  info "reference gcc testfixture built -> $REF_FIXTURE  (usable as an ATTRIBUTION ORACLE)"
+  # `cp -p` — POSIX, not a GNU-only long option; -p keeps the exec bit so the
+  # copy is runnable. FAIL LOUD on a copy miss: announcing an oracle that the
+  # very next line deletes is the exact failure mode this block exists to end.
+  if cp -p "$BLD/testfixture" "$REF_FIXTURE_KEEP"; then
+    REF_FIXTURE="$REF_FIXTURE_KEEP"
+    info "reference gcc testfixture built + preserved -> $REF_FIXTURE  (usable as an ATTRIBUTION ORACLE)"
+  else
+    REF_FIXTURE=""
+    warn "reference testfixture LINKED but could NOT be preserved to $REF_FIXTURE_KEEP —"
+    warn "      it is about to be deleted to expose the recipe, so no oracle will survive this"
+    warn "      run. Check permissions / free space on $OUT_DIR."
+  fi
 else
   REF_FIXTURE=""
   warn "reference gcc testfixture did not fully link (tolerated — harvesting generated sources + recipe)"
   warn "      log kept: $REF_BUILD_LOG — READ IT. A working reference is what lets a corpus"
   warn "      failure be ATTRIBUTED instead of argued about; its absence stalled walsetlk_recover."
+  [[ -n "$REF_LDFLAGS" ]] && \
+  warn "      link-path repair WAS in effect (LDFLAGS=$REF_LDFLAGS) — so this is a DIFFERENT miss."
 fi
 # Emit the recipe: with testfixture removed but its prereqs built, `make -n` prints
 # the single testfixture cc/link command (the source of TUs + defines + -I dirs).
+# ★ THIS `rm` IS LOAD-BEARING — see "the PRESERVED oracle" above. The binary was
+#   copied to $REF_FIXTURE_KEEP a few lines up *precisely so* this delete can
+#   happen without destroying the attribution oracle. If you want to keep the
+#   fixture around, copy it (as above); do NOT drop this line — without a MISSING
+#   target `make -n` prints no recipe and Step 4 has nothing to harvest.
 rm -f "$BLD/testfixture"
 RECIPE="$OUT_DIR/testfixture-recipe.txt"
 mkdir -p "$OUT_DIR"
@@ -2069,6 +2269,20 @@ step "9/9  Results"
 printf '   compiler : %s @ %s\n' "$DSS_BIN" "$(git -C "$SRC_DIR" rev-parse --short HEAD)"
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
+# The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will see it.
+# Its ABSENCE is printed too, and loudly: a missing oracle is the difference
+# between attributing a corpus failure and arguing about it (it is what stalled
+# walsetlk_recover), so it must never be silent. Step 4 preserves this copy out of
+# the make target's path — see "the PRESERVED oracle" there.
+# `-f` as well as `-x`: a DIRECTORY passes `-x`, so `-x` alone could report an
+# "oracle" that is not a runnable file. The test asserts what is actually claimed.
+if [[ -n "${REF_FIXTURE:-}" && -f "${REF_FIXTURE:-}" && -x "${REF_FIXTURE:-}" ]]; then
+  printf '   oracle   : %s\n' "$REF_FIXTURE"
+  printf '              reference cc testfixture — run it on the same .test to ATTRIBUTE a failure\n'
+else
+  printf '   oracle   : %sABSENT%s — no reference fixture survived this run, so a corpus failure\n' "$C_YLW" "$C_RST"
+  printf '              CANNOT be attributed to DSS vs upstream. Log: %s\n' "${REF_BUILD_LOG:-$BLD/reference-build.log}"
+fi
 printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
 if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
   printf '   excluded : %s   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every $allquicktests-derived permutation, still run under '\''full'\'')\n' "${EXCLUDE_PATTERNS[*]}"

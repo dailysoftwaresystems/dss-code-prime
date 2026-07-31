@@ -21,6 +21,10 @@
 #      HEADERS onto a Windows path, and emit the recipe in Windows paths.
 #      (SQLite's build is autotools + tclsh — inherently Unix; the sources are
 #      portable C, so the pe64 compile reuses the SAME TU set.)
+#      The reference gcc build that produces those derived sources is also
+#      PRESERVED, as a ONE-SIDED attribution oracle: it is a Linux ELF, so it can
+#      EXONERATE a corpus failure (it fails too => upstream) but never convict
+#      (it passes => inconclusive on a Windows/CRT difference). Step 9 prints it.
 #   5. locate (or build) a Windows dss-code-prime.exe (Release preferred)
 #   6. resolve the pe64 tcl + zlib LIBRARIES the fixture links against: for pe64
 #      `--resolve-library` reads a DLL's EXPORT table (`.edata`) — so this points
@@ -391,10 +395,219 @@ fi
 [ -x "$DIR/configure" ] || { echo "no ./configure in $DIR — not a SQLite checkout" >&2; exit 1; }
 BLD="$DIR/bld-dss"; mkdir -p "$BLD"
 ( cd "$BLD" && "$DIR/configure" >/dev/null 2>&1 )
-# best-effort reference build → generates every derived .c (parse.c/opcodes.c/
-# ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a (a Tcl-link miss is tolerated —
-# we only harvest byproducts + the recipe, not gcc's binary).
-( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$(nproc 2>/dev/null || echo 4)" >/dev/null 2>&1 ) || true
+
+# ── the -L that TCL_LIBS needs but does not carry (Tcl 9 externalised tommath) ─
+# WHY THIS EXISTS — do NOT "simplify" the -L away:
+# Tcl 8.6 BUNDLED libtommath inside libtcl. Tcl 9 does NOT, so a Tcl-9
+# tclConfig.sh declares it as an EXTERNAL dependency in TCL_LIBS (MEASURED on the
+# macOS leg this cycle: TCL_LIBS=' -lz -lpthread -framework CoreFoundation
+# -ltommath'), and main.mk's testfixture rule passes $TCL_LIBS through VERBATIM —
+# with no `-L` to go with it. The reference build then dies with
+# `ld: library 'tommath' not found` while every .o still compiles fine, i.e. the
+# ATTRIBUTION ORACLE silently disappears (D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE).
+#
+# ★ ON THIS DRIVER THE DEFECT IS LATENT, NOT LIVE — and that is precisely why it is
+#   repaired here rather than "when it bites". The WSL distro this harness pins is
+#   Debian/Ubuntu with Tcl 8.6, where libtommath is bundled and nothing is missing.
+#   The day that distro's default Tcl becomes 9.x the reference build stops linking
+#   WITH NO WARNING — a `do-release-upgrade` is the entire trigger. A defect whose
+#   activation condition is someone else's release schedule is still a defect.
+#
+# Mirrors build-and-test.sh's DESIGN, not its syntax:
+#   · PROBE-GATED. Every `-l<name>` in TCL_LIBS is LINK-PROBED first; only an
+#     UNRESOLVABLE one earns a `-L`. On every WSL distro today every probe passes,
+#     NOTHING is added, and both the configure invocation and the link line stay
+#     byte-identical to their pre-change form. It is a strict NO-OP on Tcl 8.6.
+#   · the probe uses the MAKEFILE'S OWN `CC`, read back out of the Makefile
+#     configure just wrote — never a bare `gcc` off PATH. The probe must be the
+#     compiler that will actually perform the link, or it lies about what links.
+#   · WHICH tclConfig.sh matters, and only configure knows: it is the one configure
+#     recorded as TCL_CONFIG_SH — literally the file the link's `.tclenv.sh`
+#     sources. So DERIVE IT AFTER configure, off the Makefile, instead of
+#     re-guessing the selection and risking a different answer.
+#   · the DIRECTORY is DERIVED, never hardcoded. The .sh's chain is
+#     pkg-config → `brew --prefix` → its LIB_ROOTS because it also runs on macOS.
+#     This is the LINUX chain, the same design against the authorities that exist
+#     inside a WSL rootfs: pkg-config's own libdir (the library's authoritative
+#     self-description) → ldconfig's cache (the dynamic linker's OWN answer, which
+#     is what makes a multiarch dir like /usr/lib/x86_64-linux-gnu findable at all)
+#     → the compiler's own `-print-search-dirs` library list. `brew --prefix` is
+#     deliberately NOT ported: it exists for the macOS keg layout, has no bearing
+#     on a Debian/Ubuntu rootfs, and would be machinery that can never fire.
+mk_var() {                      # mk_var <makefile> <NAME> -> its value (first defn, trimmed)
+  sed -n "s/^$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null \
+    | sed 's/[[:space:]]*$//' | sed -n '1p' || true
+}
+PROBE_CC=(cc)                   # replaced with the Makefile's own CC a few lines down
+probe_link_l() {                # probe_link_l <-L…/-l… args> -> 0 iff the LINK succeeds
+  local tmp rc
+  tmp="$(mktemp -d)" || return 1
+  printf 'int main(void){return 0;}\n' > "$tmp/probe.c"
+  # status taken DIRECTLY off the compiler — never through a pipe, which would
+  # report the pipe's status instead. The if/else keeps `set -e` out of it.
+  if "${PROBE_CC[@]}" "$tmp/probe.c" "$@" -o "$tmp/probe.bin" >/dev/null 2>&1
+  then rc=0; else rc=$?; fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+dir_holds_lib() {               # dir_holds_lib <dir> <name> -> 0 iff lib<name>.* is there
+  local d="$1" n="$2" f
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  # an unmatched glob stays LITERAL and `-e` then rejects it — no nullglob needed.
+  for f in "$d/lib$n".so "$d/lib$n".so.* "$d/lib$n".a; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
+}
+ldconfig_bin() {                # ldconfig lives in /sbin, which Debian leaves OFF a non-root PATH
+  local c
+  for c in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 0
+}
+libdir_for() {                  # libdir_for <name> -> a dir holding lib<name>.* (or "")
+  local n="$1" d ldc
+  if command -v pkg-config >/dev/null 2>&1; then
+    for d in "$(pkg-config --variable=libdir "lib$n" 2>/dev/null || true)" \
+             "$(pkg-config --variable=libdir "$n"    2>/dev/null || true)"; do
+      dir_holds_lib "$d" "$n" && { printf '%s' "$d"; return 0; }
+    done
+  fi
+  ldc="$(ldconfig_bin)"
+  if [ -n "$ldc" ]; then
+    while IFS= read -r d; do
+      dir_holds_lib "$d" "$n" && { printf '%s' "$d"; return 0; }
+    done < <("$ldc" -p 2>/dev/null | sed -n "s|.*=> \(/.*\)/lib$n\.so.*|\1|p" | sort -u)
+  fi
+  while IFS= read -r d; do
+    dir_holds_lib "$d" "$n" && { printf '%s' "$d"; return 0; }
+  done < <( { "${PROBE_CC[@]}" -print-search-dirs 2>/dev/null || true; } \
+            | sed -n 's/^libraries: *=*//p' | tr ':' '\n' | sed 's|//*$||' | sort -u )
+  return 0
+}
+# ★ every diagnostic below goes to STDERR under a MARKER prefix. Both halves are
+#   load-bearing, for DIFFERENT reasons:
+#     (a) stdout IS tcl_libs_ldflags's return value — an info line leaking into it
+#         would be spliced onto the front of REF_LDFLAGS and handed to configure
+#         as part of the flag;
+#     (b) the PowerShell side only PRINTS $deriveOut when the derivation FAILS, so
+#         on a SUCCESSFUL run an unmarked note is swallowed whole. The marker is
+#         what lets the .ps1 re-emit these as Info/Warn — see the REF-LINK-* loop
+#         there. Rename one end and the operator silently stops being told.
+ref_note() { echo "REF-LINK-NOTE=$*" >&2; }
+ref_warn() { echo "REF-LINK-WARN=$*" >&2; }
+tcl_libs_ldflags() {            # tcl_libs_ldflags <tclConfig.sh> -> "-Ldir …" | ""
+  local cfg="$1" libs tok name dir out=""
+  local -a toks=()
+  [ -n "$cfg" ] && [ -f "$cfg" ] || return 0
+  libs="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${TCL_LIBS:-}" )" || return 0
+  # `read -ra` splits on IFS and does NOT glob — safer than `for tok in $libs`.
+  read -r -a toks <<< "$libs" || true
+  [ ${#toks[@]} -gt 0 ] || return 0
+  for tok in "${toks[@]}"; do
+    case "$tok" in -l?*) name="${tok#-l}" ;; *) continue ;; esac   # skips -framework X etc.
+    probe_link_l -l"$name" && continue        # already resolvable → add NOTHING
+    dir="$(libdir_for "$name")"
+    if [ -z "$dir" ]; then
+      ref_warn "tclConfig.sh declares -l$name in TCL_LIBS, which ${PROBE_CC[*]} cannot resolve and neither pkg-config, ldconfig, nor the compiler's own search dirs can locate. The reference testfixture -- the ATTRIBUTION ORACLE -- will NOT link. Install lib$name-dev inside the WSL distro."
+      continue
+    fi
+    if probe_link_l -L"$dir" -l"$name"; then
+      case " $out " in *" -L$dir "*) ;; *) out="${out:+$out }-L$dir" ;; esac
+      ref_note "-l$name is not on a default search path -- adding -L$dir"
+    else
+      ref_warn "lib$name was found under $dir, yet ${PROBE_CC[*]} still cannot link -l$name against it (wrong architecture?). The reference testfixture will NOT link."
+    fi
+  done
+  printf '%s' "$out"
+}
+_mk_cc="$(mk_var "$BLD/Makefile" CC)"
+[ -n "$_mk_cc" ] && read -r -a PROBE_CC <<< "$_mk_cc"      # handles `ccache gcc`
+REF_LDFLAGS="$(tcl_libs_ldflags "$(mk_var "$BLD/Makefile" TCL_CONFIG_SH)")"
+if [ -n "$REF_LDFLAGS" ]; then
+  # The mechanism is sqlite's OWN documented client knob: `LDFLAGS=…` handed to
+  # CONFIGURE (not to make) lands in the Makefile as `LDFLAGS.configure`
+  # (Makefile.in: `LDFLAGS.configure = @LDFLAGS@`), which main.mk folds into
+  # $(LDFLAGS.libsqlite3) and therefore onto the testfixture link line. Chosen over
+  # exporting LIBRARY_PATH for one `make` because it BAKES THE FIX INTO THE TREE:
+  # the oracle exists to be USED, and a human re-running `make testfixture` by hand
+  # inside the WSL clone to attribute a failure must get a link too, not just this
+  # script. Also chosen over passing `LDFLAGS.configure=…` to make, which main.mk
+  # explicitly says not to rely on.
+  # The re-configure fires ONLY when a -L is genuinely missing, so a host that needs
+  # none — every WSL distro today — still configures EXACTLY ONCE.
+  # (no "reference link" prefix in the text — the PowerShell side already adds one)
+  ref_note "re-running configure with LDFLAGS=$REF_LDFLAGS to supply the missing search path"
+  ( cd "$BLD" && "$DIR/configure" "LDFLAGS=$REF_LDFLAGS" >/dev/null 2>&1 )
+  # FAIL LOUD if it did not land. A silent miss — say sqlite reshapes the @LDFLAGS@
+  # substitution upstream — would put us straight back to an oracle that quietly is
+  # not there, which is the exact failure mode this block repairs.
+  if grep -qF -- "$REF_LDFLAGS" "$BLD/Makefile"; then
+    ref_note "LDFLAGS.configure now carries $REF_LDFLAGS"
+  else
+    ref_warn "configure did NOT carry LDFLAGS='$REF_LDFLAGS' into $BLD/Makefile -- the reference testfixture will almost certainly fail to link; sqlite's LDFLAGS.configure / @LDFLAGS@ substitution may have changed shape upstream."
+  fi
+fi
+
+# ── the reference build, and the PRESERVED oracle ────────────────────────────
+# The build generates every derived .c (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/
+# fts5.c…) + libsqlite3.a, which the DSS TU set needs — AND, when it links, it
+# produces the ATTRIBUTION ORACLE. A link miss stays TOLERATED exactly as before
+# (the byproducts are still harvested and the run continues); what changes is that
+# the binary is no longer thrown away and the log is no longer sent to /dev/null.
+#
+# ★ THE `rm -f "$BLD/testfixture"` BELOW IS LOAD-BEARING — `make -n` only PRINTS a
+#   target's recipe when the target is MISSING. Harvesting that one cc/link line is
+#   the ENTIRE reason this step exists (TU list + -D defines + -I dirs), so dropping
+#   the `rm` empties $RECIPE and the <150-TU / <18-define floor below kills the run.
+#   The copy and the `rm` are a PAIR: the binary is moved OUT of the make target's
+#   path *precisely so* the delete can happen without destroying the oracle. The
+#   copy is not a make target and not a prerequisite of one, so `make -n` still sees
+#   `testfixture` missing and still prints the recipe.
+#
+# ★ WHAT THIS ORACLE IS, AND — just as important — WHAT IT IS NOT.
+#   It is a LINUX/gcc ELF fixture built inside WSL. The leg under test is a native
+#   Windows pe64 binary linking tcl86.dll + the MS CRT. So unlike the .sh's, this
+#   oracle is ONE-SIDED and must be read that way:
+#     · oracle FAILS the same .test  → strong exoneration. The failure is upstream
+#       or test-suite, not DSS codegen. Every confound this driver already carries
+#       (walsetlk wall-clock, the zipfile-25.0 testdir leak, recoverfault's OOM
+#       oracle) is exactly this shape and would have been settled by it.
+#     · oracle PASSES                → INCONCLUSIVE. It does NOT convict DSS: a
+#       Windows/CRT platform difference passes on Linux by construction. The
+#       fpconv1-2.0 anchor at the top of this file is the proof — it was settled by
+#       a gcc build linking msvcrt.dll, i.e. a WINDOWS reference, which this is not.
+#   That asymmetry is why the verdict line spells it out instead of just printing a
+#   path. An oracle whose limits are not stated is a trap, not evidence.
+#
+# It is preserved into $STAGE — this harness's OWN output tree, NOT the sqlite
+# checkout — so sqlite's `make clean`/`distclean` can never take it, and it is
+# Windows-visible so a human triaging on the Windows side can see it exists. There
+# is no counterpart to the .sh's "clear the previous run's copy BEFORE building":
+# `rm -rf "$STAGE"` at the top of this script already guarantees the stronger
+# property (past that line the preserved path holds THIS run's binary or nothing),
+# and sqlite is pulled on every run, so a stale oracle would attribute against
+# sources that are no longer the ones under test — strictly worse than none.
+REF_KEEP="$STAGE/reference-testfixture"
+REF_LOG="$STAGE/reference-build.log"
+if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_LOG" 2>&1; then
+  # Plain `cp` + a best-effort `chmod +x`, NOT the .sh's `cp -p`. $STAGE is a
+  # DrvFs (/mnt/c) path: `cp -p` there can fail on the ownership/timestamp
+  # preservation it cannot honour and report non-zero for a copy that in fact
+  # landed — which would make this announce a MISSING oracle that is sitting right
+  # there. The copy is the load-bearing half; DrvFs already presents files as 0777
+  # by default, so the chmod only matters when the mount carries real metadata.
+  if cp "$BLD/testfixture" "$REF_KEEP"; then
+    chmod +x "$REF_KEEP" 2>/dev/null || true
+    echo "REF-ORACLE=$REF_KEEP"
+    echo "REF-ORACLE-WIN=$(wslpath -m "$REF_KEEP")"
+  else
+    echo "REF-ORACLE-MISS=reference testfixture LINKED but could NOT be preserved to $REF_KEEP -- it is about to be deleted to expose the recipe, so no oracle survives this run. Check permissions / free space."
+  fi
+else
+  echo "REF-ORACLE-MISS=reference gcc testfixture did not fully link (tolerated -- byproducts + recipe still harvested). Log KEPT at $(wslpath -m "$REF_LOG") -- READ IT.${REF_LDFLAGS:+ NOTE: link-path repair WAS in effect (LDFLAGS=$REF_LDFLAGS), so this is a DIFFERENT miss.}"
+fi
 rm -f "$BLD/testfixture"
 RECIPE="$STAGE/testfixture-recipe.txt"
 ( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
@@ -438,6 +651,18 @@ cp "$BLD"/*.h "$STAGE/sqlite/bld/" 2>/dev/null || true
 # the .test corpus + its tcl harness (tester.tcl …) — testfixture.exe runs these
 cp -r "$DIR/test/." "$STAGE/test/" 2>/dev/null || true
 # real tcl8.6 headers (parsed agnostically — NO descriptor, D-FFI-SHIPPED-LIBS-OS-ONLY)
+# ★ KNOWN, STILL LATENT — NOT repaired by this cycle's Tcl-9 work above, and left
+#   here on purpose rather than silently half-fixed. Two 8.6-shaped assumptions:
+#     · this picks its tclConfig.sh with `find /usr/lib | head -1` rather than the
+#       TCL_CONFIG_SH the Makefile records — so on a distro carrying BOTH 8.6 and 9
+#       the headers staged for the pe64 compile can come from a DIFFERENT Tcl than
+#       the one configure selected for the reference link;
+#     · the fallback below globs `-path '*tcl8*'`, which cannot match a Tcl 9 tree
+#       at all, so the "tcl.h not found" hard-fail below fires on a 9-only distro.
+#   Both are the SAME Tcl-9 story as the -L repair above and both fire on the same
+#   trigger (the WSL distro's default Tcl moving to 9.x). They are reported, not
+#   patched, because fixing them changes which headers the pe64 leg is COMPILED
+#   against — a behaviour change that needs its own measured run, not a drive-by.
 TCLH="$( . "$(find /usr/lib -name tclConfig.sh 2>/dev/null | head -1)" >/dev/null 2>&1; printf '%s' "${TCL_INCLUDE_SPEC#-I}" )"
 [ -f "$TCLH/tcl.h" ] || TCLH="$(dirname "$(find /usr/include -name tcl.h -path '*tcl8*' 2>/dev/null | head -1)")"
 [ -f "$TCLH/tcl.h" ] || { echo "tcl.h not found in WSL — apt-get install tcl-dev" >&2; exit 1; }
@@ -532,6 +757,36 @@ $m = ($deriveOut | Select-String -Pattern '^CLONE-LOCK-NOTES=(.+)$' | Select-Obj
 if ($m) { $CloneLockNotes += "shared-clone lock: $($m.Matches[0].Groups[1].Value.TrimEnd('; ',' '))" }
 foreach ($n in $CloneLockNotes) { Warn $n }
 Info "clone lock: WRITE taken + released for the staging window (the .ps1 touches the clone only here)"
+# ── the reference link repair + the ATTRIBUTION ORACLE (both live on the WSL side) ─
+# $deriveOut is only PRINTED when the derivation FAILS, so everything the Tcl-9
+# link repair and the oracle preservation have to say would otherwise vanish on a
+# SUCCESSFUL run — which is exactly how an oracle goes missing with nobody noticing
+# (D-SQLITE-GCC-REFERENCE-FIXTURE-AS-ORACLE). Re-emit the markers as ordinary
+# Info/Warn lines. The marker NAMES are a CONTRACT with the ref_note/ref_warn/
+# REF-ORACLE* emitters in the WSL script above: rename one end only and the
+# operator silently stops being told anything.
+foreach ($ln in $deriveOut) {
+  if     ($ln -match '^REF-LINK-NOTE=(.*)$') { Info "reference link: $($Matches[1])" }
+  elseif ($ln -match '^REF-LINK-WARN=(.*)$') { Warn "reference link: $($Matches[1])" }
+}
+# Deliberately NOT read through `Marker`: that helper indexes .Matches[0]
+# unconditionally and throws when its marker is absent, and an ABSENT oracle is a
+# normal, TOLERATED outcome here (the byproducts + recipe are what the run needs).
+# This is the same null-safe shape the clone-lock notes above use.
+$RefOracle = ''; $RefOracleWin = ''; $RefOracleMiss = ''
+$om = ($deriveOut | Select-String -Pattern '^REF-ORACLE=(.+)$'      | Select-Object -Last 1)
+if ($om) { $RefOracle     = $om.Matches[0].Groups[1].Value.Trim() }
+$om = ($deriveOut | Select-String -Pattern '^REF-ORACLE-WIN=(.+)$'  | Select-Object -Last 1)
+if ($om) { $RefOracleWin  = $om.Matches[0].Groups[1].Value.Trim() }
+$om = ($deriveOut | Select-String -Pattern '^REF-ORACLE-MISS=(.+)$' | Select-Object -Last 1)
+if ($om) { $RefOracleMiss = $om.Matches[0].Groups[1].Value.Trim() }
+if ($RefOracle) {
+  Info "oracle: reference gcc testfixture preserved -> $RefOracleWin"
+} else {
+  if (-not $RefOracleMiss) { $RefOracleMiss = 'the WSL derivation emitted no oracle marker at all (REF-ORACLE/REF-ORACLE-MISS) — the reference-build block above may have been edited out of the derive script.' }
+  Warn "oracle: ABSENT -- $RefOracleMiss"
+  Warn "        a corpus failure on this leg therefore cannot be EXONERATED against a non-DSS build."
+}
 if (-not (Test-Path "$Stage\tus.txt")) { Die "recipe derivation produced no tus.txt:`n$($deriveOut -join "`n")" }
 Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
@@ -1249,6 +1504,26 @@ Step '9/9  Results'
 Info "compiler : $DssBin @ $dssHead"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
+# The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will actually
+# see it. Its ABSENCE is printed too, and loudly: a missing oracle is the difference
+# between attributing a corpus failure and arguing about it, so it must never be
+# silent. Step 3+4 preserves this copy OUT of the make target's path — see "the
+# reference build, and the PRESERVED oracle" there.
+# ★ THE ONE-SIDEDNESS IS PART OF THE VERDICT, not a footnote. This fixture is a
+#   LINUX/gcc ELF and the leg under test is Windows pe64, so it can EXONERATE
+#   (it fails too → upstream, not DSS) but it can NEVER convict (it passes → could
+#   still be a Windows/CRT difference; fpconv1-2.0 is the standing example). Do not
+#   "tidy" that sentence away — a reader who takes an oracle pass as proof of a DSS
+#   bug will chase a defect that is not there.
+if ($RefOracle) {
+  Info "oracle   : $RefOracleWin"
+  Info "             LINUX/gcc reference testfixture (WSL ELF, NOT pe64). Run it on the same"
+  Info "             .test to EXONERATE dss:   wsl.exe -- $RefOracle <staged .test>"
+  Info "             It fails too => upstream/test-suite. It passes => INCONCLUSIVE, never proof of a dss bug."
+} else {
+  Warn "oracle   : ABSENT — no reference fixture survived this run, so a corpus failure"
+  Warn "             cannot be attributed to DSS vs upstream. $RefOracleMiss"
+}
 Info "tier     : $Tier.test   outputs: $Work"
 Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every `$allquicktests-derived permutation, still run under 'full')" } else { '(none — the full tier ran)' })"
 # Only printed when there is something to say: a clean single-segment run leaves
