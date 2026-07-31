@@ -384,10 +384,36 @@ echo "CLONE-LOCK=WRITE $DSS_CLONE_LOCK_DIR"
 # Only now is anything destroyed: a run that gets refused above still has its
 # previous stage intact.
 rm -rf "$STAGE"; mkdir -p "$STAGE"
-# clone-or-update sqlite (external dependency — DOES pull)
+# clone-or-update sqlite (external dependency — DOES pull).
+#
+# ★ THIS BLOCK USED TO SWALLOW ITS OWN FAILURES. It read
+#     git -C "$DIR" fetch --all --prune --quiet            || true
+#     git -C "$DIR" pull  --rebase --quiet    2>/dev/null  || true
+#   so a failed update (offline, detached HEAD, dirty tree, rebase conflict) was
+#   discarded ALONG WITH the stderr explaining it, the run continued on a STALE
+#   checkout, and Step 9 still printed an authoritative-looking `sqlite @ <sha>`.
+#   That is a silent-WRONG-PROVENANCE defect, not merely a stale-corpus one: the
+#   verdict names a version the run did not actually get. Under the
+#   `set -Eeuo pipefail` at the top of this script a bare failure now ABORTS.
+#
+# ★ THE DEFAULT-BRANCH CHECKOUT IS LOAD-BEARING, and mirrors the .sh's
+#   clone_or_update (incl. its `default_branch` helper — sqlite's default is
+#   `master`/`trunk`, never `main`, so it must be RESOLVED, never assumed).
+#   The two drivers SHARE this clone ($HOME/src/sqlite). Without the checkout the
+#   .ps1 pulls whatever branch — or detached HEAD — the .sh last left behind, so
+#   the WINDOWS leg's corpus version silently depended on the LINUX leg's
+#   execution history. Resolving locally via symbolic-ref keeps the common path
+#   OFFLINE-clean; `remote show origin` is only the fallback.
 if [ -d "$DIR/.git" ]; then
-  git -C "$DIR" fetch --all --prune --quiet || true
-  git -C "$DIR" pull --rebase --quiet 2>/dev/null || true
+  git -C "$DIR" fetch --all --prune --quiet
+  SQLITE_BRANCH="$(git -C "$DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  SQLITE_BRANCH="${SQLITE_BRANCH#origin/}"
+  if [ -z "$SQLITE_BRANCH" ]; then
+    SQLITE_BRANCH="$(git -C "$DIR" remote show origin | sed -n 's/.*HEAD branch: //p')"
+  fi
+  [ -n "$SQLITE_BRANCH" ] || { echo "could not resolve sqlite's default branch in $DIR" >&2; exit 1; }
+  git -C "$DIR" checkout --quiet "$SQLITE_BRANCH"
+  git -C "$DIR" pull --rebase --quiet
 elif [ ! -e "$DIR/configure" ]; then
   mkdir -p "$(dirname "$DIR")"
   git clone --quiet https://github.com/sqlite/sqlite.git "$DIR"
