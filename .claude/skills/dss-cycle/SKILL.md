@@ -212,9 +212,20 @@ operator**.
    claim wear the voice of a measured one. "I verified X" and "X is documented to be true"
    and "X follows from Y" are three different statements with three different failure modes.
 2. **Never state what a loader/parser/config accepts, rejects, or defaults to without
-   reading it.** "The sibling family does X" is a hypothesis. (Real case: `.format.json`
-   was asserted twice to enforce a closed root-key set. It does not — unknown keys are
-   silently ignored, so a typo'd capability presents as "unsupported".)
+   reading it.** "The sibling family does X" is a hypothesis. (Original case: `.format.json`
+   was asserted twice to enforce a closed root-key set, and at the time it did not — unknown
+   keys were silently ignored, so a typo'd capability presented as "unsupported".)
+   ★★ **AND THIS VERY EXAMPLE THEN BECAME THE RULE'S BEST DEMONSTRATION — AGAINST THE
+   OPERATOR, TF-C97.** TF-C75 gave `.format.json` a real closed key set
+   (`kFormatDocumentKeys` + the rejection loop in `src/link/object_format_schema_json.cpp`),
+   so unknown keys are now REJECTED. Nobody updated this note, and the operator kept quoting
+   it as a live fact for several cycles — including into a delegation brief — until an agent
+   read the loader and refuted it. **A "known trap" recalled from memory is a claim like any
+   other, and a stale caution is worse than none: it points at the wrong hazard.** Here the
+   real risk was the exact INVERSE of the warning — adding a key to the 24 format files
+   WITHOUT adding it to the vocabulary would have broken every shipped format at LOAD, while
+   the note had you bracing for a silent no-op. **Re-read the loader every time; do not trust
+   this list, including this entry.**
 3. **Re-validate after EVERY edit, not once per file.** JSON parse, `bash -n`, parse-check.
    The *second* edit is the one that breaks it. (Real case: a validated `stdio.json` was
    edited again and shipped with unescaped quotes, breaking every `#include <stdio.h>`.)
