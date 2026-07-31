@@ -9,6 +9,12 @@
 
   "$dataModelComment": "LP64 (64-bit Darwin: int 32, long 64, ptr 64) -- same as the x86_64 exec/object siblings.",
   "dataModel": "LP64",
+  "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
+  "predefinedMacros": [
+    { "name": "__LP64__", "kind": "constant", "value": "1" },
+    { "name": "_LP64",    "kind": "constant", "value": "1" }
+  ],
+
 
   "$longDoubleFormatComment": "x86_64 macOS `long double` is the 80-bit x87 extended type (16-byte aligned) -- the same value the macho64-x86_64-darwin-exec sibling declares. (arm64 macOS uses IEEE-754 binary128 and its dylib omits this field.)",
   "longDoubleFormat": "x87-80",

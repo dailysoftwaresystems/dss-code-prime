@@ -428,6 +428,12 @@ void LspServer::enqueueParse_(std::string uri) {
         // make `#ifdef __aarch64__` resolve differently in the editor than in
         // the build, which is worse than resolving neither arm. Trigger to
         // revisit: the day the LSP learns the workspace's active target.
+        // TF-C97: likewise no `setFormatPredefinedMacros`. The argument is the
+        // same one, and the format half is if anything stronger: with no active
+        // format there is no `dataModel`, so guessing `__LP64__` would make the
+        // editor take LP64 header arms in a workspace that might build LLP64.
+        // Same trigger — both channels light up together the day the LSP learns
+        // the workspace's `<target>:<format>` pair.
         dss::UnitBuilder builder{snap.schema};
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(

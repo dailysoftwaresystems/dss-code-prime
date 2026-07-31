@@ -1826,3 +1826,197 @@ TEST(FormatRootKeyVocabulary, AllShippedFormatsLoadCleanUnderClosedVocabulary) {
                        "root-key vocabulary";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES) — the FORMAT's own predefined
+// macros: the C-visible face of `dataModel`.
+//
+// A format schema may now declare `predefinedMacros`, the same key name and the
+// same shared entry grammar the language and target loaders use. The shipped
+// population is DERIVED FROM `dataModel`: LP64 formats declare `__LP64__` and
+// `_LP64`; LLP64 and ILP32 formats declare NEITHER, and that negative is the
+// whole reason the channel lives at the format layer rather than the target's
+// (one CPU — x86_64 — is LP64 under elf64/macho64 and LLP64 under pe64).
+//
+// ★ THE FAILURE MODE THESE TESTS EXIST FOR is not "the macro is wrong", it is
+// "the key does nothing". A config key that is written but never READ presents
+// as a feature that silently no-ops, which is why the first test below asserts
+// the PARSED ROWS and not merely that the file loads.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A row of the shipped predefine shape, for comparison against a loaded schema.
+struct MacroRow {
+    std::string_view name;
+    std::string_view value;
+};
+
+// The rows a LOADED schema exposes, flattened for order-sensitive comparison.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>>
+macroRowsOf(ObjectFormatSchema const& s) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (auto const& pm : s.predefinedMacros()) out.emplace_back(pm.name, pm.value);
+    return out;
+}
+
+}  // namespace
+
+// ★ THE "IS THE KEY ACTUALLY READ?" PIN, and the reason it is FIRST.
+//
+// The registry row that opened this anchor recorded the format loader as having
+// NO closed root-key set, so a typo'd key would be silently ignored and the
+// feature would present as "does nothing". MEASURED at TF-C97: that is no longer
+// true — TF-C75 closed the format vocabulary (`kFormatDocumentKeys`) — but the
+// deeper hazard survives the guard, because a key can be in the vocabulary and
+// still be parsed by nobody. This test closes THAT: it asserts the loader
+// produced ROWS, with their names and VALUES, from the JSON text.
+//
+// RED-ON-DISABLE: delete the `predefinedMacros` parse block in
+// object_format_schema_json.cpp (leaving the name in `kFormatDocumentKeys`, so
+// the file still loads clean) and this fails while every other test here passes
+// — which is exactly the shape of the silent no-op being prevented.
+TEST(FormatPredefinedMacros, KeyIsPARSEDNotMerelyAccepted) {
+    auto r = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacros":[
+             {"name":"__PROBE_A__","kind":"constant","value":"1"},
+             {"name":"__PROBE_B__","kind":"constant","value":"7"}])"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(macroRowsOf(**r),
+              (std::vector<std::pair<std::string, std::string>>{
+                  {"__PROBE_A__", "1"}, {"__PROBE_B__", "7"}}))
+        << "the loader must PARSE the rows (names AND values, in declaration "
+           "order) — merely accepting the key would make it a knob that lies";
+}
+
+// A schema that declares no `predefinedMacros` exposes an EMPTY span, never a
+// synthesized default. Absence is the LLP64/ILP32 answer, so a loader that
+// invented rows here would silently define `__LP64__` on Windows.
+TEST(FormatPredefinedMacros, AbsentKeyIsEmptyNeverSynthesized) {
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->predefinedMacros().empty())
+        << "the loader must never synthesize a macro from `dataModel` — the "
+           "spelling is a C-family fact and belongs in config, not in the "
+           "object-format tier";
+}
+
+// The typo discriminator over THIS key. Without it, `"predefinedMacro"` (no
+// trailing s) would load clean and the whole feature would no-op in silence —
+// the precise trap the anchor row warned about.
+TEST(FormatPredefinedMacros, MisspelledKeyRejectedAndNamed) {
+    auto r = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacro":[{"name":"__X__","kind":"constant","value":"1"}])"));
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled predefine key must be REJECTED — silently ignoring it "
+           "presents as 'the feature does nothing', not as an error";
+    EXPECT_TRUE(anyHasMalformedJson(r.error()));
+    EXPECT_TRUE(anyMessageMentions(r.error(), "predefinedMacro"))
+        << "the diagnostic must NAME the offending key";
+}
+
+// The entry grammar is INHERITED from `parsePredefinedMacroArray`, not
+// re-implemented — so the language loader's rules apply here for free. Pinned on
+// two of them (the Constant⇒`value` requirement and the within-array duplicate
+// reject) because a copy-pasted parser is exactly what would drift.
+TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
+    auto missingValue = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant"}])"));
+    EXPECT_FALSE(missingValue.has_value())
+        << "a 'constant' entry without `value` must be rejected, exactly as on "
+           "the language and target sides";
+
+    auto duplicate = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1"},
+                               {"name":"__X__","kind":"constant","value":"2"}])"));
+    EXPECT_FALSE(duplicate.has_value())
+        << "a duplicate name WITHIN one array must be rejected — the effective "
+           "value would otherwise depend on which seed site iterated last";
+
+    auto notAnArray = ObjectFormatSchema::loadFromText(
+        withRootKey(R"("predefinedMacros":{"name":"__X__"})"));
+    EXPECT_FALSE(notAnArray.has_value())
+        << "'predefinedMacros' must be an array";
+    EXPECT_TRUE(anyHasMalformedJson(notAnArray.error()));
+}
+
+// ★ THE SHIPPED-POPULATION PIN, BOTH DIRECTIONS, OVER ALL 24 FILES.
+//
+// The expectation is keyed on each schema's OWN `dataModel()` — never on its
+// name — because that is the rule the config author applied and the only rule
+// that stays true when a 25th format lands. A `if (name.starts_with("macho"))`
+// here would pass today and encode the agnosticism break this cycle exists to
+// avoid.
+//
+// BOTH directions matter and the NEGATIVE matters more: an LP64-only assertion
+// would stay green if a maintainer pasted the rows into the pe64 files, which is
+// the miscompile (Windows headers taking their LP64 arms against a 32-bit
+// `long`) that motivated putting the channel on the format at all.
+//
+// RED-ON-DISABLE: delete the `predefinedMacros` key from any single LP64
+// `.format.json` (its leg reds), or add it to any pe64/wasm/spirv file (that leg
+// reds). MEASURED both ways during TF-C97.
+TEST(FormatPredefinedMacros, ShippedPopulationFollowsDataModelNotFormatName) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed — a sample "
+                  "is exactly how a multi-site miss stays green");
+
+    // The LP64 rows, as the shipped files spell them. Stated ONCE here so the
+    // expectation is a single fact rather than 18 restatements.
+    constexpr MacroRow kLp64Rows[] = {{"__LP64__", "1"}, {"_LP64", "1"}};
+
+    std::size_t lp64Seen = 0, otherSeen = 0;
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        auto const& s = **r;
+        auto const rows = macroRowsOf(s);
+
+        if (s.dataModel() == DataModel::Lp64) {
+            ++lp64Seen;
+            std::vector<std::pair<std::string, std::string>> want;
+            for (auto const& m : kLp64Rows) {
+                want.emplace_back(std::string{m.name}, std::string{m.value});
+            }
+            EXPECT_EQ(rows, want)
+                << name << " declares dataModel LP64, so it must predefine "
+                           "BOTH __LP64__ and _LP64 as 1";
+            // UNGATED: the rows apply on every object format this FILE serves
+            // (the file already IS the format). A stray
+            // `availableObjectFormats` here would silently drop them.
+            for (auto const& pm : s.predefinedMacros()) {
+                EXPECT_TRUE(pm.availableObjectFormats.empty())
+                    << name << ": a format's OWN rows must be ungated — the "
+                               "file is already the gate";
+                EXPECT_EQ(pm.kind, PredefinedMacroKind::Constant) << name;
+                EXPECT_FALSE(pm.isFunctionLike) << name;
+            }
+        } else {
+            ++otherSeen;
+            EXPECT_TRUE(rows.empty())
+                << name << " declares dataModel "
+                << dataModelName(s.dataModel())
+                << ", so it must predefine NEITHER __LP64__ nor _LP64 — the "
+                   "negative is the whole reason this channel lives on the "
+                   "format instead of the target";
+        }
+    }
+    // MEASURED at TF-C97: 18 LP64 (10 elf + 8 macho), 6 not (4 pe LLP64 + 2
+    // ILP32 skeletons). Pinned so a file added or dropped without a decision
+    // shows up here rather than passing vacuously.
+    EXPECT_EQ(lp64Seen, 18u);
+    EXPECT_EQ(otherSeen, 6u);
+}

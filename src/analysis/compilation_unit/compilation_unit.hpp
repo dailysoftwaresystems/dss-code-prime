@@ -321,6 +321,22 @@ public:
     // Aborts if called after finish().
     void setTargetPredefinedMacros(std::vector<PredefinedMacroDef> macros);
 
+    // TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): declare the active OBJECT
+    // FORMAT's predefined macros (`ObjectFormatSchema::predefinedMacros()`) —
+    // the C-visible face of the format's own ABI axes, `__LP64__`/`_LP64`
+    // first among them. Merged with the language's and the target's by the
+    // preprocessor. UNSET (the default) ⇒ empty ⇒ byte-identical to
+    // pre-TF-C97, the state the LSP and the FFI header parser stay in.
+    //
+    // ★ THIS IS NOT `setActiveFormat`, AND ONE DOES NOT IMPLY THE OTHER.
+    // `setActiveFormat` takes a format KIND (the `availableObjectFormats`
+    // filter axis, shared by every macho/elf/pe file alike); this takes the
+    // rows of ONE format FILE, which is a finer grain — two files of the same
+    // kind may legitimately declare different macros. That is exactly why the
+    // driver's CU cache key carries the format NAME and not only the kind.
+    // Aborts if called after finish().
+    void setFormatPredefinedMacros(std::vector<PredefinedMacroDef> macros);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -403,6 +419,7 @@ private:
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
+    std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

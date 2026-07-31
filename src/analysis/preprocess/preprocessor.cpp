@@ -8,6 +8,7 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -5199,9 +5200,10 @@ std::optional<std::string> embedResourceSizeError(std::size_t byteCount) {
           "~2 tokens/byte and would exhaust memory (see D-PP-EMBED-STREAMING)";
 }
 
-// ── TF-C74: the ONE merge of the language and target predefine lists ──────
+// ── TF-C74 + TF-C97: the ONE merge of the language, target and format
+//    predefine lists ─────────────────────────────────────────────────────
 //
-// See `preprocessor.hpp` for the contract. The two invariants worth restating
+// See `preprocessor.hpp` for the contract. The three invariants worth restating
 // where the code is:
 //
 //   • the collision scan runs BEFORE the format filter. A language `_WIN32`
@@ -5210,16 +5212,27 @@ std::optional<std::string> embedResourceSizeError(std::size_t byteCount) {
 //     fault is that two configs claim the same NAME, and if it only surfaced
 //     on the pe leg a maintainer could ship the conflict and never see it.
 //
+//   • the scan covers ALL THREE ORDERED PAIRS, and that is why the families are
+//     a TABLE here rather than three hand-written loops. TF-C97 added a third
+//     family; with two, one loop was the whole scan, and the natural way to add
+//     a third is to write one more loop against the language — which silently
+//     leaves target×format unscanned. Enumerating pairs over a table makes
+//     "every pair" structural, so a FOURTH family is one row and not a fresh
+//     chance to miss a pair.
+//
 //   • the format filter runs exactly ONCE, right here. `effective` is the only
 //     predefine list that leaves this function, and every seed site consumes
 //     it verbatim.
 //
-// NOTE (agnosticism): nothing in this function knows any macro's name or any
-// architecture's name. It compares config-supplied strings to each other and
-// never to a literal.
+// NOTE (agnosticism): nothing in this function knows any macro's name, any
+// architecture's name or any object format's name. It compares config-supplied
+// strings to each other and never to a literal; the only literals are the JSON
+// POINTER PATHS of the three config families, which name FILES to edit and are
+// what makes the diagnostic actionable.
 MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
+    std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat) {
     MergedPredefinedMacros out;
 
@@ -5232,36 +5245,62 @@ MergedPredefinedMacros mergePredefinedMacros(
                                                   *activeFormat);
     };
 
-    // (a) COLLISION SCAN — pre-filter, so gating cannot hide a conflict.
-    for (PredefinedMacroDef const& tgt : targetMacros) {
-        for (PredefinedMacroDef const& lang : languageMacros) {
-            if (lang.name != tgt.name) continue;
-            out.conflicts.push_back(std::format(
-                "predefined macro '{}' is declared by BOTH the language config "
-                "(/preprocess/predefinedMacros) and the target config "
-                "(/predefinedMacros) — neither declaration may silently win; "
-                "remove one, or rename it so the two configs own distinct "
-                "names",
-                tgt.name));
-            break;
+    // The three families, in merge order. `label`+`path` exist ONLY to build
+    // the diagnostic: a collision message that does not name both config files
+    // leaves the maintainer to guess which of three to edit. ★ The path carries
+    // the FILE FAMILY as well as the JSON pointer because the target and format
+    // families use the SAME pointer (`/predefinedMacros`) — a bare pointer
+    // would name two different files identically, which is precisely the
+    // "which file do I edit?" failure the paths are here to prevent.
+    struct Family {
+        std::span<PredefinedMacroDef const> macros;
+        std::string_view                    label;
+        std::string_view                    path;
+    };
+    std::array<Family, 3> const families{
+        Family{languageMacros, "language",
+               "<lang>.lang.json /preprocess/predefinedMacros"},
+        Family{targetMacros, "target",
+               "<arch>.target.json /predefinedMacros"},
+        Family{formatMacros, "format",
+               "<name>.format.json /predefinedMacros"}};
+
+    // (a) COLLISION SCAN — pre-filter, so gating cannot hide a conflict, over
+    // every unordered pair of families (i < j).
+    for (std::size_t i = 0; i < families.size(); ++i) {
+        for (std::size_t j = i + 1; j < families.size(); ++j) {
+            for (PredefinedMacroDef const& a : families[i].macros) {
+                for (PredefinedMacroDef const& b : families[j].macros) {
+                    if (a.name != b.name) continue;
+                    out.conflicts.push_back(std::format(
+                        "predefined macro '{}' is declared by BOTH the {} "
+                        "config ({}) and the {} config ({}) — neither "
+                        "declaration may silently win; remove one, or rename "
+                        "it so the two configs own distinct names",
+                        a.name, families[i].label, families[i].path,
+                        families[j].label, families[j].path));
+                    break;
+                }
+            }
         }
     }
     // Within-list duplicates are rejected at LOAD (`parsePredefinedMacroArray`),
-    // so a name can appear at most once per side and the scan above is
+    // so a name can appear at most once per family and the scan above is
     // sufficient. Returning early keeps `effective` empty — there is no
     // partially-merged state a caller could mistake for usable.
     if (!out.conflicts.empty()) return out;
 
-    // (b)+(c) FILTER ONCE, stable order: language entries first, then target.
-    out.effective.reserve(languageMacros.size() + targetMacros.size());
-    for (PredefinedMacroDef const& pm : languageMacros) {
-        if (availableHere(pm)) out.effective.push_back(pm);
+    // (b)+(c) FILTER ONCE, stable order: language, then target, then format.
+    out.effective.reserve(languageMacros.size() + targetMacros.size()
+                          + formatMacros.size());
+    for (Family const& fam : families) {
+        for (PredefinedMacroDef const& pm : fam.macros) {
+            if (availableHere(pm)) out.effective.push_back(pm);
+        }
     }
-    for (PredefinedMacroDef const& pm : targetMacros) {
-        if (availableHere(pm)) out.effective.push_back(pm);
-    }
-    // (d) an empty `targetMacros` leaves exactly the format-filtered
-    // language-only list the pre-TF-C74 engine built at each seed site.
+    // (d) empty `targetMacros` + empty `formatMacros` leaves exactly the
+    // format-filtered language-only list the pre-TF-C74 engine built at each
+    // seed site.
     return out;
 }
 
@@ -5272,7 +5311,8 @@ PreprocessResult preprocess(
     std::span<fs::path const>            systemDirs,
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
-    std::span<PredefinedMacroDef const>  targetPredefinedMacros) {
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros,
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -5282,17 +5322,17 @@ PreprocessResult preprocess(
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>();
 
-    // TF-C74: merge the LANGUAGE and TARGET predefined-macro lists ONCE, here,
-    // and apply the per-format filter ONCE while doing it. Every one of the
-    // four downstream seed sites reads `merged.effective` and nothing else —
-    // that is what makes the pre-scan/authoritative agreement structural rather
-    // than a convention four sites have to keep.
+    // TF-C74 + TF-C97: merge the LANGUAGE, TARGET and FORMAT predefined-macro
+    // lists ONCE, here, and apply the per-format filter ONCE while doing it.
+    // Every one of the four downstream seed sites reads `merged.effective` and
+    // nothing else — that is what makes the pre-scan/authoritative agreement
+    // structural rather than a convention four sites have to keep.
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         schema->preprocess().predefinedMacros, targetPredefinedMacros,
-        activeFormat);
+        formatPredefinedMacros, activeFormat);
     if (!merged.conflicts.empty()) {
-        // A name owned by BOTH configs. Neither may silently win, so the pass
-        // does not run at all: `fatal` stops the caller from treating the
+        // A name owned by more than one config. None may silently win, so the
+        // pass does not run at all: `fatal` stops the caller from treating the
         // (empty) token stream as a successful preprocess.
         for (std::string const& msg : merged.conflicts) {
             emitPP(*result.diagnostics,

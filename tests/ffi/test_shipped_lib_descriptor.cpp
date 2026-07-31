@@ -5475,4 +5475,90 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
            "surface (guards vacuous ABSENT passes)";
 }
 
+
+// ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): two DESCRIPTORS, one
+// ── `timespec` — the PREMISE this cycle had to measure before it could design
+//
+// The anchor was opened on the inferred claim that `time.json` and
+// `sys/stat.json` declare a textually identical `timespec` and "intern DISTINCT
+// TypeIds". MEASURED here, into ONE interner exactly as a real compile does:
+// they intern the SAME TypeId. The complete-at-once composite path derives its
+// `declSiteKey` from the FIELD CONTENT, so two byte-identical rows collapse —
+// and had they NOT, `ShippedTypeConsistency` would have reported
+// F_ShippedTypeIdentityConflict on the second read rather than letting a second
+// type through silently.
+//
+// So this pin is a GUARD, not the fix's witness: the day someone re-spells one
+// of the two rows `i64 "long"` (the exact `struct timeval` divergence this
+// project has already shipped three times), the identity splits and this goes
+// RED — one file above the place the user would otherwise meet it, as an
+// unexplained assignment error. The cross-ORIGIN half of the anchor (a SOURCE
+// declaration of the same tag shadowing the injected one) is not visible at this
+// tier at all; it is pinned in
+// tests/analysis/semantic/test_semantic_analyzer_c_subset.cpp.
+//
+// RED-ON-DISABLE (MEASURED by demonstration): change either descriptor's
+// `tv_sec` to `i64 "long"` and both the tag EQ and the member EQ go red.
+TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    auto structNamed = [](ShippedLibDescriptor const& d,
+                          std::string_view sname) -> ShippedStruct const* {
+        for (auto const& s : d.structs)
+            if (s.name == sname) return &s;
+        return nullptr;
+    };
+    auto fieldNamed = [](ShippedStruct const& s,
+                         std::string_view fname) -> ShippedField const* {
+        for (auto const& f : s.fields)
+            if (f.name == fname) return &f;
+        return nullptr;
+    };
+
+    // ONE interner + ONE registry — the arrangement the semantic phase uses, so
+    // the identity measured here is the identity a compile sees.
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto timeDesc = readShippedLibDescriptor(
+        root / "time.json", interner, typeReg, rep, DataModel::Lp64,
+        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+    auto statDesc = readShippedLibDescriptor(
+        root / "sys" / "stat.json", interner, typeReg, rep, DataModel::Lp64,
+        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+    ASSERT_TRUE(timeDesc.has_value());
+    ASSERT_TRUE(statDesc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    auto const* fromTime = structNamed(*timeDesc, "timespec");
+    auto const* fromStat = structNamed(*statDesc, "timespec");
+    ASSERT_NE(fromTime, nullptr) << "time.json must declare struct timespec";
+    ASSERT_NE(fromStat, nullptr) << "sys/stat.json must declare struct timespec";
+
+    // THE DIRECT IDENTITY ASSERTION — exact TypeIds, not "compatible".
+    EXPECT_EQ(fromTime->typeId, fromStat->typeId)
+        << "two descriptors declaring a byte-identical `timespec` must intern "
+           "ONE TypeId; a split here is the cross-file identity defect at the "
+           "descriptor tier";
+
+    // And the MEMBER — the surface that actually breaks when identity splits.
+    auto const* st = structNamed(*statDesc, "stat");
+    ASSERT_NE(st, nullptr);
+    auto const* mtimespec = fieldNamed(*st, "st_mtimespec");
+    ASSERT_NE(mtimespec, nullptr) << "the macho variant must carry st_mtimespec";
+    EXPECT_EQ(mtimespec->type, fromTime->typeId)
+        << "`stat.st_mtimespec` must denote the SAME timespec `struct timespec "
+           "x;` resolves to — this is the assignment sqlite os_unix.c:7731 makes";
+
+    // Positive control: the shared type is the real 16-byte {i64,i64}, so the
+    // EQ above cannot pass vacuously on two invalid/empty ids.
+    EXPECT_TRUE(fromTime->typeId.valid());
+    auto const layout = computeLayout(fromTime->typeId, interner, kNatural16,
+                                      DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 16u);
+    EXPECT_EQ(interner.kind(fromTime->typeId), TypeKind::Struct);
+}
+
 } // namespace

@@ -15,6 +15,7 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
 #include "core/types/unsuppressable_codes.hpp"  // TF-C86: the refusal's closed-table pin
+#include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
 
@@ -7615,7 +7616,7 @@ TEST(Preprocessor, TFC74MergeOrderIsLanguageThenTargetStable) {
                                          targetMacro("L2", "2")};
     std::vector<PredefinedMacroDef> tgt{targetMacro("T1", "3"),
                                         targetMacro("T2", "4")};
-    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::Elf);
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::Elf);
     ASSERT_TRUE(merged.conflicts.empty());
     std::vector<std::string> names;
     for (auto const& pm : merged.effective) names.push_back(pm.name);
@@ -7629,7 +7630,7 @@ TEST(Preprocessor, TFC74MergeAppliesFormatFilterOnceToBothSides) {
                                          targetMacro("LANY", "2")};
     std::vector<PredefinedMacroDef> tgt{targetMacro("TMACHO", "3", {"macho"}),
                                         targetMacro("TANY", "4")};
-    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::MachO);
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::MachO);
     ASSERT_TRUE(merged.conflicts.empty());
     std::vector<std::string> names;
     for (auto const& pm : merged.effective) names.push_back(pm.name);
@@ -7643,7 +7644,7 @@ TEST(Preprocessor, TFC74MergeAppliesFormatFilterOnceToBothSides) {
 TEST(Preprocessor, TFC74MergeConflictYieldsNoUsableList) {
     std::vector<PredefinedMacroDef> lang{targetMacro("DUP", "1")};
     std::vector<PredefinedMacroDef> tgt{targetMacro("DUP", "2")};
-    auto merged = mergePredefinedMacros(lang, tgt, ObjectFormatKind::Elf);
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::Elf);
     EXPECT_EQ(merged.conflicts.size(), 1u);
     EXPECT_TRUE(merged.effective.empty());
 }
@@ -7669,14 +7670,14 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         return out;
     };
     auto langSurviving = [&](std::optional<ObjectFormatKind> fmt) {
-        return mergePredefinedMacros((*c)->preprocess().predefinedMacros, {}, fmt)
+        return mergePredefinedMacros((*c)->preprocess().predefinedMacros, {}, {}, fmt)
             .effective.size();
     };
 
     // arm64 on MACHO: all four spellings, including the Apple-only pair.
     {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
-                                       (*arm)->predefinedMacros(),
+                                       (*arm)->predefinedMacros(), {},
                                        ObjectFormatKind::MachO);
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and arm64 configs must not collide";
@@ -7698,7 +7699,7 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
     // arm64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc.
     {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
-                                       (*arm)->predefinedMacros(),
+                                       (*arm)->predefinedMacros(), {},
                                        ObjectFormatKind::Elf);
         ASSERT_TRUE(m.conflicts.empty());
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
@@ -7714,7 +7715,7 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
                                  ObjectFormatKind::Pe}) {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
-                                       (*x86)->predefinedMacros(), fmt);
+                                       (*x86)->predefinedMacros(), {}, fmt);
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and x86_64 configs must not collide";
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(fmt)),
@@ -8689,4 +8690,291 @@ TEST(Preprocessor, Tf87GuardSplitAcrossLineContinuationIsStillDetected) {
                         "#endif\n",
                         kInnerIncludesOuterBack);
     expectReentryPermitted(f, "guard operand on a continuation line");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES) — the FORMAT's predefines, the
+// THIRD config family.
+//
+// `<name>.format.json` may now carry `predefinedMacros`, merged with the
+// language's and the target's by the same `mergePredefinedMacros`. What the
+// format owns is the C-visible face of ITS OWN axes — `__LP64__`/`_LP64`, the
+// face of `dataModel` — which is neither a language fact nor a CPU fact: the
+// SAME x86_64 target is LP64 under elf64/macho64 and LLP64 under pe64, so a
+// target-side row would be wrong on one of its own formats.
+//
+// ★ THE DEFECT THIS CLOSED, MEASURED on `arm64:macho64-arm64-darwin-staticlib`
+// before the change: `__arm64__` and `__APPLE__` defined, `__LP64__` NOT
+// defined, `sizeof(long)==8`, `sizeof(void*)==8` — LP64 widths with ILP32
+// headers. The macOS SDK gates 234 occurrences across 91 headers on `__LP64__`;
+// `mach/port.h:113-114` then asserted the user32 struct size 12 instead of
+// user64's 16, which is sqlite `mem1.c`'s three `error[S0029]`.
+//
+// ★ WHAT THESE TESTS PIN THAT THE FORMAT-SCHEMA TESTS CANNOT
+// (tests/link/test_object_format_schema.cpp owns the loader half): that the
+// parsed rows actually REACH the preprocessor, that the NEGATIVE holds, and
+// that the collision policy covers every PAIR of the three families — the last
+// being the specific thing a two-family implementation grown by one loop
+// silently misses.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// `ppLexemesForTarget`, plus a FORMAT predefine list. Kept separate rather than
+// widening the TF-C74 helper so its ~20 existing callers stay byte-identical.
+[[nodiscard]] std::vector<std::string> ppLexemesForTargetAndFormat(
+    std::string text, std::optional<ObjectFormatKind> fmt,
+    std::span<PredefinedMacroDef const> targetMacros,
+    std::span<PredefinedMacroDef const> formatMacros, PreprocessResult& out) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines, targetMacros,
+                     formatMacros);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+
+}  // namespace
+
+// The channel is READ end-to-end: a format-declared predefine EXPANDS in
+// ordinary code, exactly as a target-declared one does.
+// RED-ON-DISABLE: drop `formatPredefinedMacros` from the `mergePredefinedMacros`
+// call in `preprocess()` and the token comes back as the bare identifier.
+TEST(Preprocessor, TFC97FormatPredefineExpands) {
+    std::vector<PredefinedMacroDef> fms{targetMacro("__FMTPROBE__", "9")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTargetAndFormat("int x = __FMTPROBE__;\n",
+                                            ObjectFormatKind::MachO, {}, fms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "9", ";"}))
+        << "a FORMAT-declared predefine must reach the MacroExpander, not just "
+           "the merge result";
+}
+
+// ...and it is visible to `#if defined()`, i.e. to the include-gating pre-scan's
+// definedness oracle — the seed site a naive wiring misses. The SDK arms this
+// unblocks are `#if defined(__LP64__)` shapes, so this is the site that matters.
+TEST(Preprocessor, TFC97FormatPredefineIsVisibleToConditionalInclusion) {
+    std::vector<PredefinedMacroDef> fms{targetMacro("__FMTPROBE__", "1")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTargetAndFormat(
+        "#if defined(__FMTPROBE__)\nint yes;\n#else\nint no;\n#endif\n",
+        ObjectFormatKind::MachO, {}, fms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "yes", ";"}));
+}
+
+// ── the COLLISION policy, over ALL THREE PAIRS ────────────────────────────
+//
+// ★ THE TARGET×FORMAT PAIR IS THE ONE THAT WOULD BE MISSED. With two families
+// the scan was one loop; the natural way to add a third is to write one more
+// loop against the LANGUAGE, which leaves target×format silently unscanned and
+// therefore silently last-writer-wins. That is why the scan enumerates pairs
+// over a table, and why this test asserts the pair, not just the code.
+TEST(Preprocessor, TFC97CollisionCoversEveryPairOfTheThreeFamilies) {
+    auto run = [](std::span<PredefinedMacroDef const> tgt,
+                  std::span<PredefinedMacroDef const> fmt) {
+        auto schema = cSubset();
+        auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+        return preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Elf,
+                          noDefines, tgt, fmt);
+    };
+
+    // (1) LANGUAGE × FORMAT. `__LINE__` is declared by the shipped c-subset
+    // language config.
+    {
+        std::vector<PredefinedMacroDef> fms{targetMacro("__LINE__", "1")};
+        PreprocessResult r = run({}, fms);
+        EXPECT_TRUE(r.fatal);
+        ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+        bool named = false;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+            named = d.actual.find(".lang.json") != std::string::npos
+                 && d.actual.find(".format.json") != std::string::npos
+                 && d.actual.find("__LINE__") != std::string::npos;
+            if (named) break;
+        }
+        EXPECT_TRUE(named)
+            << "the message must name the macro AND both declaring config "
+               "FILES — target and format share the JSON pointer "
+               "`/predefinedMacros`, so a bare pointer would name two "
+               "different files identically";
+    }
+
+    // (2) TARGET × FORMAT — neither side is the language, so a scan written
+    // only against the language misses it entirely.
+    {
+        std::vector<PredefinedMacroDef> tms{targetMacro("__COLLIDE__", "1")};
+        std::vector<PredefinedMacroDef> fms{targetMacro("__COLLIDE__", "2")};
+        PreprocessResult r = run(tms, fms);
+        EXPECT_TRUE(r.fatal)
+            << "a TARGET/FORMAT collision must abort the pass — the language "
+               "is not involved, so a language-anchored scan would silently "
+               "resolve it to whichever side merged last";
+        ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+        bool named = false;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+            named = d.actual.find(".target.json") != std::string::npos
+                 && d.actual.find(".format.json") != std::string::npos;
+            if (named) break;
+        }
+        EXPECT_TRUE(named) << "the message must name BOTH config files";
+    }
+
+    // (3) LANGUAGE × TARGET still fires (the TF-C74 pair, unregressed).
+    {
+        std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+        PreprocessResult r = run(tms, {});
+        EXPECT_TRUE(r.fatal);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+    }
+}
+
+// The collision scan still runs BEFORE the format filter for the new family:
+// a `["pe"]`-gated FORMAT row collides with an ungated target row even on ELF,
+// where the gated entry would not survive. Gating decides which formats SEE a
+// macro, never who OWNS the name.
+TEST(Preprocessor, TFC97FormatCollisionDetectedBeforeFormatFilter) {
+    std::vector<PredefinedMacroDef> tms{targetMacro("__COLLIDE__", "1")};
+    std::vector<PredefinedMacroDef> fms{targetMacro("__COLLIDE__", "2", {"pe"})};
+    auto merged = mergePredefinedMacros({}, tms, fms, ObjectFormatKind::Elf);
+    EXPECT_FALSE(merged.conflicts.empty())
+        << "a pe-GATED format row must still collide with an UNGATED target "
+           "row on an ELF build";
+    EXPECT_TRUE(merged.effective.empty())
+        << "a failed merge must leave NO partially-merged list a caller could "
+           "mistake for usable";
+}
+
+// Order is language, then target, then format — stable within each family. The
+// seed sites lower the effective list to `#define` STREAMS, so order is
+// observable behaviour, not an accident.
+TEST(Preprocessor, TFC97MergeOrderIsLanguageThenTargetThenFormat) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("L1", "1")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("T1", "2"),
+                                        targetMacro("T2", "3")};
+    std::vector<PredefinedMacroDef> fmt{targetMacro("F1", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, fmt, ObjectFormatKind::Elf);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"L1", "T1", "T2", "F1"}));
+}
+
+// The per-entry `availableObjectFormats` filter applies to FORMAT rows too, and
+// is still applied exactly ONCE. (Shipped format rows are ungated — the file is
+// already the gate — but the mechanism must not quietly skip this family.)
+TEST(Preprocessor, TFC97FormatRowsAreFormatFilteredLikeEveryOther) {
+    std::vector<PredefinedMacroDef> fmt{targetMacro("PE_ONLY", "1", {"pe"}),
+                                        targetMacro("UNIVERSAL", "2")};
+    auto onElf = mergePredefinedMacros({}, {}, fmt, ObjectFormatKind::Elf);
+    ASSERT_TRUE(onElf.conflicts.empty());
+    ASSERT_EQ(onElf.effective.size(), 1u);
+    EXPECT_EQ(onElf.effective[0].name, "UNIVERSAL");
+
+    auto onPe = mergePredefinedMacros({}, {}, fmt, ObjectFormatKind::Pe);
+    ASSERT_EQ(onPe.effective.size(), 2u);
+}
+
+// The NO-REGRESSION invariant: an EMPTY format span leaves the synthesized text
+// byte-identical to the pre-TF-C97 call shape, on every format. This is what
+// lets the LSP and the FFI header parser keep their (deliberate) empty lists.
+TEST(Preprocessor, TFC97EmptyFormatSpanIsByteIdenticalToLegacy) {
+    static constexpr char const* kSrc =
+        "#ifdef _WIN32\nint w = 1;\n#endif\n"
+        "#ifdef __APPLE__\nint a = 1;\n#endif\n"
+        "long v = __STDC_VERSION__;\n";
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{}}) {
+        auto schema = cSubset();
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+        std::vector<PredefinedMacroDef>    none;
+
+        auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult legacy = preprocess(legacyBuf, schema, noDirs, {}, fmt,
+                                             noDefines, none);
+        auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult withEmpty = preprocess(newBuf, schema, noDirs, {}, fmt,
+                                                noDefines, none, none);
+        ASSERT_FALSE(legacy.fatal);
+        ASSERT_FALSE(withEmpty.fatal);
+        EXPECT_EQ(legacy.synthBuffer->text(), withEmpty.synthBuffer->text());
+    }
+}
+
+// ★ THE SHIPPED-CONFIG END-TO-END PIN, BOTH DIRECTIONS.
+//
+// Everything above uses hand-built rows so it pins the ENGINE. This one drives
+// the REAL shipped language + target + format configs through the real merge and
+// asserts what a C program on each leg actually sees. The negative half (pe64
+// defines NEITHER spelling) is the reason the channel is on the format, so it is
+// asserted as strictly as the positive.
+//
+// The expectation is keyed on the loaded schema's `dataModel()`, never on a
+// format name — the same discipline the config author applied.
+TEST(Preprocessor, TFC97ShippedFormatsGiveACoherentDataModelWorld) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+
+    struct Leg {
+        std::string_view formatName;
+        std::shared_ptr<TargetSchema const> target;
+        ObjectFormatKind kind;
+    };
+    std::vector<Leg> const legs{
+        {"macho64-arm64-darwin-exec",  *arm, ObjectFormatKind::MachO},
+        {"macho64-arm64-darwin-staticlib", *arm, ObjectFormatKind::MachO},
+        {"elf64-aarch64-linux-exec",   *arm, ObjectFormatKind::Elf},
+        {"elf64-x86_64-linux-exec",    *x86, ObjectFormatKind::Elf},
+        {"macho64-x86_64-darwin-exec", *x86, ObjectFormatKind::MachO},
+        {"pe64-x86_64-windows-exec",   *x86, ObjectFormatKind::Pe},
+        {"pe64-x86_64-windows-dll",    *x86, ObjectFormatKind::Pe},
+    };
+
+    std::size_t lp64Legs = 0, llp64Legs = 0;
+    for (Leg const& leg : legs) {
+        auto f = ObjectFormatSchema::loadShipped(std::string{leg.formatName});
+        ASSERT_TRUE(f.has_value()) << leg.formatName;
+        auto merged = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                            leg.target->predefinedMacros(),
+                                            (*f)->predefinedMacros(), leg.kind);
+        ASSERT_TRUE(merged.conflicts.empty())
+            << leg.formatName
+            << ": the shipped language, target and format configs must not "
+               "collide on any name";
+        auto defines = [&](std::string_view n) {
+            for (auto const& pm : merged.effective) {
+                if (pm.name == n) return true;
+            }
+            return false;
+        };
+        bool const wantLp64 = (*f)->dataModel() == DataModel::Lp64;
+        if (wantLp64) ++lp64Legs; else ++llp64Legs;
+        EXPECT_EQ(defines("__LP64__"), wantLp64) << leg.formatName;
+        EXPECT_EQ(defines("_LP64"), wantLp64) << leg.formatName;
+        // ★ The two spellings must move TOGETHER. A leg that defined one and
+        // not the other would satisfy a naive "is __LP64__ defined?" check
+        // while leaving every `#ifdef _LP64` SDK arm on the wrong branch.
+        EXPECT_EQ(defines("__LP64__"), defines("_LP64")) << leg.formatName;
+    }
+    EXPECT_EQ(lp64Legs, 5u);
+    EXPECT_EQ(llp64Legs, 2u);
 }

@@ -7751,6 +7751,235 @@ TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
            "different categories, must collide in either order";
 }
 
+// ── TF-C97 D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE (C11 6.7p3) — "a typedef name may be
+//    redefined to denote the same type as it currently does, provided that type is
+//    not a variably modified type". A typedef is neither a proto nor an extern nor
+//    a tentative, so BOTH sides rank as definitions and the Pass-1 merge gate
+//    (`!bothDefinitions`) rejected even a LEGAL repeat as S_RedeclaredSymbol. The
+//    fix admits the Type↔Type both-definitions pair into the merge and VERIFIES it
+//    after Pass 1.5 against the two RESOLVED TypeIds — never against spellings.
+
+// Every SymbolRecord named `name` whose kind is Type — absorbed OR surviving. The
+// C11 rule is about the two DECLARATIONS agreeing, so the assertions below must be
+// able to see BOTH records, which `countSurvivingSymbols` (absorbed-filtering) hides.
+[[nodiscard]] inline std::vector<SymbolRecord const*>
+typedefRecords(SemanticModel const& model, std::string_view name) {
+    std::vector<SymbolRecord const*> out;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Type) out.push_back(&r);
+    }
+    return out;
+}
+
+// (1) THE RULE, positive: an IDENTICAL same-scope repeat is legal C11 and must
+// analyze clean — AND the two declarations must resolve to the SAME TypeId, which
+// is the property the whole merge exists to guarantee (a clean analysis with two
+// unrelated types would be a silent miscompile waiting at the first use site).
+// RED-ON-DISABLE: drop `|| typedefRepeat` from the Pass-1 merge gate and the pair
+// falls into the bothDefinitions collision arm -> this S_RedeclaredSymbol count
+// becomes 1 and the EXPECT_FALSE(hasErrors) flips red. MEASURED, not predicted.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefSameTypeIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct S SS;\n"
+        "typedef struct S SS;\n"
+        "struct S { int a; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "C11 6.7p3 permits a typedef name to be redefined to the same type";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u);
+    auto const recs = typedefRecords(model, "SS");
+    ASSERT_EQ(recs.size(), 2u) << "both typedef declarations must mint a record";
+    ASSERT_TRUE(recs[0]->type.valid());
+    ASSERT_TRUE(recs[1]->type.valid());
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "the two spellings of one typedef must resolve to the SAME TypeId — "
+           "identical TypeIds are what makes the merge sound";
+}
+
+// (2) THE REGRESSION WITNESS — the real macOS SDK shape, and the reason this rule
+// had to close for the arm64-macho sqlite leg to reach zero. Two DIFFERENT headers
+// typedef ONE tag: `$SDK/usr/include/malloc/_malloc_type.h:79` names the
+// forward-declared `struct _malloc_zone_t`, then `malloc/malloc.h:246` typedefs the
+// SAME tag AT ITS COMPLETION (`typedef struct _malloc_zone_t { … } malloc_zone_t;`).
+// After the preprocessor flattens the TU they are two same-scope typedefs of one
+// name — MEASURED in sqlite's mem1.c, and MEASURED again here by extracting the two
+// declarations verbatim from `clang -E` output. A synthetic-only test would miss
+// this: the two spellings differ (one is a bare tag reference, the other completes
+// the tag), so only comparing RESOLVED types can accept it.
+// RED-ON-DISABLE: revert the Pass-1 admission -> exactly one S0002 on
+// `malloc_zone_t`, which is the sqlite failure this closes.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefAcrossHeadersCompletingTagIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        // "header A" — the tag is forward-declared, then aliased.
+        "struct _mz_t;\n"
+        "typedef struct _mz_t mz_t;\n"
+        // "header B" — the SAME tag, completed, aliased again under one name.
+        "typedef struct _mz_t { int version; int size; } mz_t;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the malloc_zone_t shape — one tag, two headers — is legal C11";
+    auto const recs = typedefRecords(model, "mz_t");
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "the forward-declared tag and its completion are ONE type — the alias "
+           "minted before the body must not be a second, distinct type";
+}
+
+// (3) THE RULE, negative: two DIFFERENT types under one typedef name stay LOUD.
+// The specific code is S_IncompatibleRedeclaration — the deferred post-1.5 verdict
+// the merged-decl sweep already emits for every other type-mismatched merge pair —
+// NOT a vague "some error". RED-ON-DISABLE: drop the post-1.5 Type↔Type arm and the
+// pair merges silently (count 0) with the FIRST type winning every later use.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefDifferentTypeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "typedef long T;\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "`typedef int T; typedef long T;` is a real C11 error and must stay one";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "exactly ONE diagnostic for one mistake — not a collision AND a mismatch";
+}
+
+// (4) The negative that the OBJECT composite rule must not leak into: C 6.2.7 lets
+// `extern char v[]; char v[3];` compose into the completed array, but 6.7p3 asks the
+// strictly stronger "does it denote the SAME type". MEASURED against /usr/bin/clang:
+// `typedef int T[3]; typedef int T[];` is `error: typedef redefinition with
+// different types ('int[]' vs 'int[3]')`. RED-ON-DISABLE: let the Type↔Type pair
+// fall through to the incomplete-array relaxation below it and this count drops to
+// 0 — the mismatch is silently accepted.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefIncompleteVsSizedArrayFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[3];\n"
+        "typedef int T[];\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "a sized and an incomplete array are not the SAME type — the OBJECT "
+           "composite-type relaxation must not reach a typedef repeat";
+}
+
+// (5) THE C11 CARVE-OUT: 6.7p3's permission excludes a VARIABLY MODIFIED type, so an
+// IDENTICALLY spelled VLA typedef repeat is still invalid (C99 6.7.7p2 evaluates the
+// size expression exactly once, AT the typedef — repeating the name would demand it
+// twice). The interner has no length operand on a vlaArray, so the two TypeIds are
+// EQUAL and a plain same-TypeId check would silently accept precisely the shape the
+// standard singles out. MEASURED against /usr/bin/clang: `error: redefinition of
+// typedef for variably-modified type 'int[n]'`. Reported as S_RedeclaredSymbol — the
+// code this shape already produced from the Pass-1 collision, so the carve-out is
+// byte-identical in CODE and only gains a message. RED-ON-DISABLE: drop the
+// `variablyModified` term and the same-TypeId fast path accepts it — count 0.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefVariablyModifiedFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "int main(void) { typedef int V[n]; typedef int V[n]; return 0; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a variably-modified typedef may not be repeated, even identically";
+}
+
+// (6) The carve-out dominates: when the repeat is BOTH variably modified AND of a
+// different type, the VM verdict is the one reported — the repeat is forbidden
+// outright, which is a stronger statement than "these two differ". MEASURED against
+// /usr/bin/clang, which reports `redefinition of typedef for variably-modified type
+// 'long[n]'` (not its different-types diagnostic) for exactly this source.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefVariablyModifiedAndDifferentReportsVM) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "int main(void) { typedef int V[n]; typedef long V[n]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "the variably-modified carve-out is tested first and wins";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "one mistake, one diagnostic — never both verdicts";
+}
+
+// (7) SCOPE PIN, positive: an INNER-scope typedef SHADOWING an outer one is legal C
+// and untouched — `mergeOrCollideRedeclaration` runs only when `s.scopes.bind`
+// returns a prior in the SAME scope, so a shadow never reaches this rule at all.
+// This guards that the admission did not widen scope handling: the two typedefs
+// here differ in type, and the ONLY reason that is legal is the scope boundary.
+TEST(SemanticAnalyzerCSubset, TypedefShadowingInInnerScopeStaysLegal) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "int main(void) { typedef long T; return (int)sizeof(T); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "a shadowing typedef in an INNER scope is not a redefinition";
+}
+
+// (8) SCOPE PIN, negative mirror: the SAME two typedefs in ONE (inner) scope ARE a
+// redefinition and stay loud. Together with (7) this pins that the rule follows the
+// SCOPE, not the nesting depth — the file-scope pair in (3) and this block-scope
+// pair must behave identically.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefDifferentTypeInBlockScopeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { typedef int T; typedef long T; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "same-scope is same-scope — a block scope obeys 6.7p3 exactly as file "
+           "scope does";
+}
+
+// (9) THE ADMISSION IS Type↔Type ONLY. A typedef repeating a NON-typedef name is a
+// different KIND of symbol (clang: "redefinition of 'x' as different kind of
+// symbol") and must still collide S_RedeclaredSymbol — the `category()` guard, not
+// the definedness rank, is what rejects it, and the new gate is conjoined with
+// `sameCategory` so it can never reach a cross-category pair. RED-ON-DISABLE: widen
+// `typedefRepeat` to drop its `category(...) == Type` term and this becomes 0 — an
+// object would be silently absorbed into a typedef.
+TEST(SemanticAnalyzerCSubset, ObjectThenTypedefStillCollidesAfterRepeatAdmission) {
+    auto model = analyzeShipped("c-subset", {
+        "int x;\n"
+        "typedef int x;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "an object and a typedef of one name are different kinds of symbol — "
+           "the Type↔Type admission must not reach them";
+}
+
+// (10) A FUNCTION-TYPE typedef repeat is legal too (MEASURED: /usr/bin/clang accepts
+// `typedef int F(void);` twice), and it must route through the SAME resolved-TypeId
+// check rather than the sweep's FnSig-candidate arm — that arm is gated on the
+// SURVIVOR being a real Function, which a typedef is not. Guards the interaction
+// between this rule and D-CSUBSET-FN-TYPEDEF-PROTOTYPE.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefFunctionTypeIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int F(void);\n"
+        "typedef int F(void);\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    auto const recs = typedefRecords(model, "F");
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "two identical function-type typedefs are ONE interned FnSig";
+}
+
 // ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
 //    an initializer is a TENTATIVE DEFINITION (C 6.9.2): any number of tentatives
 //    + at most one real (initialized) definition of the same name MERGE into one
@@ -14198,4 +14427,284 @@ TEST(SemanticAnalyzerCSubset, ZeroLengthBoundInATypedefStillFailsLoud) {
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
         << "the zero-length-array extension is a struct-MEMBER rule; a typedef "
            "gets the absent-bound rule only";
+}
+
+// ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): ONE file-scope TAG, ──
+// ── ONE TYPE — across the descriptor / source boundary (C 6.2.3)            ──
+//
+// The sqlite `os_unix.c:7731` shape, and the LAST error on the arm64-macho leg:
+//     struct timespec conchModTime;          /* :7711 */
+//     conchModTime = buf.st_mtimespec;       /* :7731 → error[S0003] */
+//
+// ★★ WHAT THESE PINS ASSERT IS THE **ASSIGNMENT**, NEVER THE TAG RESOLUTION,
+// and that is the whole point. The tag BINDING was never the wrong one — a
+// `struct timespec x;` declaration has always resolved. What was wrong is the
+// MEMBER: `sys/stat.json`'s `st_mtimespec` is interned against the DESCRIPTOR's
+// `timespec` when the descriptor loads, while the tag in that TU is claimed by a
+// SOURCE declaration whose tree-root binding shadows the descriptor's cuRoot one.
+// A tag-resolution test is therefore VACUOUS here: it stays GREEN with the defect
+// fully present. (MEASURED, this cycle: `struct timespec conchModTime;` resolved
+// clean while the very next line failed.)
+//
+// ⚠ AND A MEASURED CORRECTION TO THE ORIGINAL DIAGNOSIS, recorded so it cannot
+// be re-proposed: the second party is NOT a second DESCRIPTOR. `time.json` and
+// `sys/stat.json` both declare `timespec` and they already intern ONE TypeId —
+// the interner's complete-at-once path keys a composite on its FIELD CONTENT, so
+// two byte-identical rows collapse, and `ShippedTypeConsistency` would have
+// reported a conflict had they not (`DescriptorOnlyTimespecIsAlreadyOneType`
+// below pins exactly that, and it is green on BOTH sides of this change). The
+// real second party is the macOS SDK's `sys/_types/_timespec.h`, reached through
+// `sys/fcntl.h` — a header DSS ships no descriptor for, so its `struct timespec`
+// is parsed as SOURCE. `SourceTagUnifiesWithDescriptorMember` is the pin that
+// goes RED when the fix is reverted.
+
+namespace {
+
+// The real-shipped-descriptor analysis used by these pins. Unlike
+// `analyzeRealTgmath` it threads the ACTIVE TARGET (`arch`) — `struct stat`'s
+// `st_mtimespec` lives only in the `when:{format:macho}` variant — and it passes
+// `AggregateLayoutParams`, which is REQUIRED: the unification is licensed by the
+// layout engine, so a caller that supplies no layout params gets no unification
+// at all (the gate in semantic_analyzer.cpp), by design.
+[[nodiscard]] SemanticModel analyzeRealShippedForTarget(
+    std::string mainSrc, ObjectFormatKind format, std::string_view arch,
+    DataModel dataModel) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                   std::nullopt, format, arch);
+}
+
+// The symbol a SOURCE declaration minted (a valid `tree`), vs the one descriptor
+// injection minted (`InvalidTree`). Both spell `timespec`, so every identity
+// assertion below has to say WHICH one it means — `findSym`'s first-match would
+// be an accident waiting to flip.
+[[nodiscard]] SymbolRecord const* findSourceSym(SemanticModel const& m,
+                                                std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name && m.symbols()[i].tree.valid())
+            return &m.symbols()[i];
+    return nullptr;
+}
+[[nodiscard]] SymbolRecord const* findInjectedSym(SemanticModel const& m,
+                                                  std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name && !m.symbols()[i].tree.valid())
+            return &m.symbols()[i];
+    return nullptr;
+}
+
+// The xnu `sys/_types/_timespec.h` declaration verbatim (`__darwin_time_t` is
+// `long` on LP64) — so it interns {i64 "long", i64 "long"} against the
+// descriptors' bare {i64, i64}: the SAME 16 bytes, DIFFERENT TypeIds. That gap
+// is why a TypeId-equality comparison alone can never license this unification,
+// and why the layout engine is the authority.
+constexpr char const* kSourceTimespecDecl =
+    "struct timespec { long tv_sec; long tv_nsec; };\n";
+
+// The os_unix.c body, reduced: poison, stat, the BY-VALUE assignment, then read
+// the nested members back.
+constexpr char const* kMtimespecAssignBody =
+    "int main(void) {\n"
+    "    struct stat sb;\n"
+    "    struct timespec conchModTime;\n"
+    "    conchModTime.tv_sec = -1;\n"
+    "    if (stat(\"/\", &sb) != 0) return 1;\n"
+    "    conchModTime = sb.st_mtimespec;\n"
+    "    return (int)(conchModTime.tv_sec + conchModTime.tv_nsec);\n"
+    "}\n";
+
+} // namespace
+
+// ★★★ THE CLOSING PIN. A SOURCE declaration of the tag and the descriptor's
+// `st_mtimespec` member are ONE type, so the by-value assignment COMPILES.
+// RED-ON-DISABLE (MEASURED by demonstration this cycle, against the real
+// compiler on the real corpus, not just here): revert the member adoption and
+// sqlite `os_unix.c` returns to exactly one `error[S0003] got buf.st_mtimespec`
+// — the same diagnostic this TU produces without it.
+TEST(SemanticAnalyzerCSubset, SourceTagUnifiesWithDescriptorMember) {
+    auto model = analyzeRealShippedForTarget(
+        std::string{"#include <time.h>\n#include <sys/stat.h>\n"}
+            + kSourceTimespecDecl + kMtimespecAssignBody,
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`conchModTime = sb.st_mtimespec` is the assignment this anchor "
+           "exists for — an S0003 here IS the defect";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 0u)
+        << "the two declarations lay out identically, so the unification is "
+           "licensed and nothing is reported";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    // The IDENTITY itself, asserted directly and in BOTH directions so a green
+    // result cannot come from a weakened assignment check.
+    SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
+    SymbolRecord const* userTag = findSourceSym(model, "timespec");
+    SymbolRecord const* shippedTag = findInjectedSym(model, "timespec");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    ASSERT_NE(shippedTag, nullptr);
+    EXPECT_EQ(member->type.v, userTag->type.v)
+        << "the descriptor's member must denote the ONE type its tag names in "
+           "this translation unit (C 6.2.3)";
+    EXPECT_NE(member->type.v, shippedTag->type.v)
+        << "and it must have MOVED off the descriptor's own pre-interned type — "
+           "equal here would mean the adoption never ran";
+
+    // Same 16 bytes either way: the unification never changes the layout.
+    TypeInterner const& in = model.lattice().interner();
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16};
+    auto const userLay = computeLayout(userTag->type, in, params, DataModel::Lp64);
+    auto const shippedLay = computeLayout(shippedTag->type, in, params, DataModel::Lp64);
+    ASSERT_TRUE(userLay.has_value());
+    ASSERT_TRUE(shippedLay.has_value());
+    EXPECT_EQ(userLay->size, 16u);
+    EXPECT_EQ(shippedLay->size, 16u);
+}
+
+// THE PREMISE PIN — and it is labelled as such on purpose. Two DESCRIPTORS
+// declaring `timespec` (`time.json` + `sys/stat.json`) already intern ONE
+// TypeId, so the member assignment compiles with NO source declaration in sight.
+// ⚠ THIS TEST IS GREEN ON BOTH SIDES OF TF-C97 — it is a guard against a future
+// descriptor edit (spelling one of the two `i64 "long"`) silently splitting the
+// identity, NOT evidence that the fix works. The closing pin is the one above.
+TEST(SemanticAnalyzerCSubset, DescriptorOnlyTimespecIsAlreadyOneType) {
+    auto model = analyzeRealShippedForTarget(
+        std::string{"#include <time.h>\n#include <sys/stat.h>\n"}
+            + kMtimespecAssignBody,
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
+    SymbolRecord const* tag    = findInjectedSym(model, "timespec");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(tag, nullptr);
+    EXPECT_EQ(member->type.v, tag->type.v)
+        << "time.json's timespec and sys/stat.json's are content-identical, so "
+           "the interner's content-keyed composite path collapses them; a split "
+           "here would ALSO have been reported as F_ShippedTypeIdentityConflict";
+}
+
+// FAIL LOUD, WITH THE SPECIFIC CODE. A source declaration of the same tag that
+// does NOT lay out the same is REFUSED — the layout engine (the one authority)
+// says 8 bytes vs 16, so the unification is reported rather than performed.
+TEST(SemanticAnalyzerCSubset, SourceTagLayoutDisagreementFailsLoud) {
+    auto model = analyzeRealShippedForTarget(
+        "#include <sys/stat.h>\n"
+        "struct timespec { int tv_sec; int tv_nsec; };\n"
+        + std::string{kMtimespecAssignBody},
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 1u)
+        << "a 8-byte source `timespec` against the descriptor's 16-byte one must "
+           "fail LOUD with the EXISTING cross-declaration identity code — never "
+           "unify, and never a generic error";
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// ★★ THE PER-TARGET PIN — the guard against keying identity GLOBALLY, which is
+// the one mistake that would have made this feature dangerous. ONE scratch
+// descriptor and ONE source text, analyzed under TWO data models:
+//
+//   * LP64  — `long` is 64 bits, so the source `probe_ts` is 16 bytes and matches
+//             the descriptor's `{i64,i64}`: unified, and the by-value assignment
+//             compiles;
+//   * LLP64 — `long` is 32 bits, so the SAME source text is 8 bytes: the layouts
+//             disagree, the two stay DISTINCT TypeIds, and the conflict is
+//             reported.
+//
+// Identity is keyed (tag, THIS compilation), and a compilation carries exactly
+// one target/dataModel — so the LP64 and LLP64 types can never be candidates for
+// each other, which is what keeps
+// D-CSUBSET-DARWIN-STRUCT-LAYOUT-DISAGREEMENT closed. A global key would make
+// both legs green here and silently give one of them the other's layout.
+namespace {
+constexpr char const* kProbeTagDescriptor =
+    R"({ "header": "probe.h",
+         "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+         "structs": [
+           { "name": "probe_ts",
+             "fields": [ { "name": "a", "type": "i64" },
+                         { "name": "b", "type": "i64" } ] },
+           { "name": "probe_box",
+             "fields": [ { "name": "stamp", "type": "probe_ts" },
+                         { "name": "tag",   "type": "i32" } ] }
+         ] })";
+
+constexpr char const* kProbeTagSource =
+    "#include <probe.h>\n"
+    "struct probe_ts { long a; long b; };\n"
+    "int main(void) {\n"
+    "    struct probe_box bx;\n"
+    "    struct probe_ts t;\n"
+    "    t = bx.stamp;\n"
+    "    return (int)(t.a + t.b);\n"
+    "}\n";
+
+[[nodiscard]] SemanticModel analyzeProbeTag(ScratchDir const& sysDir,
+                                            DataModel dataModel) {
+    auto cu = buildAngleDescriptorUnit(sysDir, "probe.json", kProbeTagDescriptor,
+                                       kProbeTagSource);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+}
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, CrossOriginTagUnifiesOnLp64) {
+    ScratchDir sysDir{Location::Temp, "c97-probe-lp64"};
+    auto model = analyzeProbeTag(sysDir, DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    SymbolRecord const* member  = findInjectedSym(model, "stamp");
+    SymbolRecord const* userTag = findSourceSym(model, "probe_ts");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    EXPECT_EQ(member->type.v, userTag->type.v)
+        << "on LP64 `long` is 64 bits, so the two declarations lay out the same "
+           "16 bytes and the tag names ONE type";
+}
+
+TEST(SemanticAnalyzerCSubset, CrossOriginTagStaysDistinctOnLlp64) {
+    ScratchDir sysDir{Location::Temp, "c97-probe-llp64"};
+    auto model = analyzeProbeTag(sysDir, DataModel::Llp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 1u)
+        << "on LLP64 `long` is 32 bits: the source struct is 8 bytes against the "
+           "descriptor's 16, so the identity must be REFUSED and reported";
+
+    SymbolRecord const* member  = findInjectedSym(model, "stamp");
+    SymbolRecord const* userTag = findSourceSym(model, "probe_ts");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    EXPECT_NE(member->type.v, userTag->type.v)
+        << "★ THE ANTI-GLOBAL-KEY ASSERTION: the SAME tag under a DIFFERENT data "
+           "model must remain a DIFFERENT TypeId — a global key would have "
+           "unified these and handed one leg the other's layout";
 }

@@ -6,6 +6,7 @@
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/predefined_macro_json.hpp"  // detail::parsePredefinedMacroArray (TF-C97 — the SHARED predefine grammar, 3rd family)
 
 #include <nlohmann/json.hpp>
 
@@ -80,16 +81,19 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // file happens to contain and start failing legitimate keys only other
     // files use). `relocations` is read indirectly, through the shared
     // `loadRelocationTable(doc, …)` substrate below. RE-DERIVED (not
-    // decremented) after `charSignedness` was removed: 25 keys appear in a
+    // incremented) after TF-C97 added `predefinedMacros`: 26 keys appear in a
     // direct `doc.contains(…)`/`doc.at(…)`, plus `relocations` through the
-    // shared substrate, = 26. VERIFIED against the union of non-`$` root keys
-    // across all 24 shipped files (also 26): the two sets are identical — no
-    // key is read-but-never-declared, and none is declared-but-never-read.
-    static constexpr std::array<std::string_view, 26> kFormatDocumentKeys{
+    // shared substrate, = 27. VERIFIED against the union of non-`$` root keys
+    // across all 24 shipped files: that union is 27 once the 18 LP64 files
+    // declare `predefinedMacros`, and the two sets are identical — no key is
+    // read-but-never-declared, and none is declared-but-never-read.
+    static constexpr std::array<std::string_view, 27> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        // the C-visible face of those axes (TF-C97 — `__LP64__`/`_LP64`)
+        "predefinedMacros",
         // output packaging + artifact vocabulary
         "container", "artifactProfiles",
         // program-entry cluster
@@ -365,6 +369,46 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   "of 'LP64', 'LLP64', 'ILP32'", s));
         } else {
             data.dataModel = *dm;
+        }
+    }
+
+    // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): OPTIONAL
+    //    `predefinedMacros` ────────────────────────────────────────────
+    //
+    // The macros this FORMAT predefines — the C-visible face of the axes
+    // declared immediately above, `dataModel` first among them
+    // (`__LP64__`/`_LP64`). Declared HERE and not on the target because the
+    // axis is per-FORMAT: one CPU (x86_64) is LP64 under elf64/macho64 and
+    // LLP64 under pe64, so a target-side row would be wrong on one of its own
+    // formats. Both `.target.json` files say exactly this in prose and defer
+    // to this key.
+    //
+    // The per-entry grammar is the SHARED parser the language and target
+    // loaders use (`parsePredefinedMacroArray`), so the closed `kind` verb
+    // set, the Constant⇒`value` rule, the function-like `params` checks, the
+    // within-array duplicate-name reject and the `availableObjectFormats`
+    // validation are INHERITED rather than re-implemented — the same argument
+    // that extracted the parser at TF-C74, now paying off a third time.
+    // Malformed entries emit `C_MalformedJson` (this family's code for a
+    // structurally-wrong value, as `dataModel`/`bitFieldStrategy` above do);
+    // MISSING required fields emit the universal `C_MissingField`.
+    //
+    // ★ THE LOADER NEVER SYNTHESIZES A MACRO NAME. It reads whatever the file
+    // declares; which names an LP64 format ought to declare is derived by the
+    // config author from that file's own `dataModel`, in the file. Deriving it
+    // here would bake a C spelling into the object-format tier — a
+    // source-language-agnosticism break, not a shortcut. OPTIONAL; absent ⇒
+    // empty ⇒ the effective predefine list is byte-identical to pre-TF-C97,
+    // which is the DECLARED answer for every LLP64/ILP32 format.
+    if (doc.contains("predefinedMacros")) {
+        json const& pms = doc.at("predefinedMacros");
+        if (!pms.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/predefinedMacros",
+                      "'predefinedMacros' must be an array");
+        } else {
+            detail::parsePredefinedMacroArray(
+                pms, "/predefinedMacros", DiagnosticCode::C_MalformedJson,
+                coll, data.predefinedMacros);
         }
     }
 

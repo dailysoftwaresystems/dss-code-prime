@@ -265,49 +265,64 @@ struct DSS_EXPORT PreprocessResult {
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
 };
 
-// ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the effective list ──────
+// ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS) + TF-C97
+//    (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the effective list ─────────────
 //
 // The ONE effective-predefined-macro list.
 //
-// Predefined macros come from TWO independent config families: the LANGUAGE
-// (`preprocess.predefinedMacros` in `<lang>.lang.json` — `__LINE__`, `_WIN32`,
-// …) and the TARGET (`predefinedMacros` in `<arch>.target.json` — the
-// per-architecture identity macros `__aarch64__`, `__x86_64__`, …). They are
-// paired only at COMPILE time, when a (language, target) pair actually exists,
-// so this is where the merge — and the collision check — must live.
+// Predefined macros come from THREE independent config families — and the three
+// are exactly the project's agnosticism axes, which is why there are three and
+// not two:
+//   • the LANGUAGE (`preprocess.predefinedMacros` in `<lang>.lang.json` —
+//     `__LINE__`, `_WIN32`, …): the SOURCE half.
+//   • the TARGET (`predefinedMacros` in `<arch>.target.json` — `__aarch64__`,
+//     `__x86_64__`, …): the PROCESSOR half. Per-CPU facts.
+//   • the FORMAT (`predefinedMacros` in `<name>.format.json` —
+//     `__LP64__`/`_LP64`): the OBJECT-FORMAT half. Facts that are neither the
+//     language's nor the CPU's, because ONE CPU answers differently on two of
+//     its own formats (x86_64 is LP64 under elf64/macho64, LLP64 under pe64).
+// All three are paired only at COMPILE time, when a (language, target, format)
+// triple actually exists, so this is where the merge — and the collision check
+// — must live.
 struct DSS_EXPORT MergedPredefinedMacros {
-    // The effective list: language entries FIRST, then target entries, each in
-    // declaration order, with the per-entry `availableObjectFormats` filter
-    // ALREADY APPLIED. This is the single list every seed site iterates, which
-    // is why the filter is applied exactly ONCE, here — the four seed sites can
-    // no longer each apply their own copy and drift.
+    // The effective list: language entries FIRST, then target, then format,
+    // each in declaration order, with the per-entry `availableObjectFormats`
+    // filter ALREADY APPLIED. This is the single list every seed site iterates,
+    // which is why the filter is applied exactly ONCE, here — the four seed
+    // sites can no longer each apply their own copy and drift.
     std::vector<PredefinedMacroDef> effective;
     // One message per colliding NAME, each naming BOTH declaring config paths.
     // NON-EMPTY ⇒ the merge FAILED: `effective` is not usable and the caller
     // must emit `C_ConflictingPredefinedMacro` and abort the pass. There is no
-    // "merge anyway" mode — a silent last-writer-wins in either direction is
+    // "merge anyway" mode — a silent last-writer-wins in any direction is
     // the exact wrong-value miscompile this check exists to prevent.
     std::vector<std::string> conflicts;
 };
 
-// Merge the language and target predefined-macro lists for `activeFormat`.
+// Merge the language, target and format predefined-macro lists for
+// `activeFormat`.
 //
 // Properties (each pinned by a test):
-//  (a) a NAME present in BOTH lists is a conflict, compared BEFORE the format
-//      filter — so a `["pe"]`-gated language `_WIN32` still collides with an
-//      ungated target `_WIN32`. Gating is about which formats SEE a macro, not
-//      about who OWNS the name; deferring the check until after the filter
-//      would let a collision hide on every leg but one.
+//  (a) a NAME present in more than one list is a conflict, compared BEFORE the
+//      format filter — so a `["pe"]`-gated language `_WIN32` still collides
+//      with an ungated target `_WIN32`. Gating is about which formats SEE a
+//      macro, not about who OWNS the name; deferring the check until after the
+//      filter would let a collision hide on every leg but one. ALL THREE PAIRS
+//      are scanned (language×target, language×format, target×format): with
+//      three families a scan that covered only two would leave one pair able to
+//      ship a silent last-writer-wins.
 //  (b) the per-format filter is applied ONCE, here. (An entry with an EMPTY
 //      `availableObjectFormats` is available on every format; a non-empty set
 //      restricts it to those formats; absent an active format only a
 //      universal entry survives.)
-//  (c) order is stable: language entries first, then target entries.
-//  (d) an EMPTY `targetMacros` yields exactly the language-only list the
-//      pre-TF-C74 engine computed — the no-regression invariant.
+//  (c) order is stable: language entries, then target, then format.
+//  (d) EMPTY `targetMacros` + EMPTY `formatMacros` yields exactly the
+//      language-only list the pre-TF-C74 engine computed — the no-regression
+//      invariant, which is also the LSP / FFI-header-parser configuration.
 [[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
+    std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat);
 
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
@@ -344,11 +359,16 @@ struct DSS_EXPORT MergedPredefinedMacros {
 // "<built-in>" prologue. Defaults to {} — every existing caller unchanged.
 // TF-C74: `targetPredefinedMacros` is the ACTIVE TARGET's `predefinedMacros`
 // list (`TargetSchema::predefinedMacros()`) — the per-architecture identity
-// macros. Merged with the language's ONCE at entry (`mergePredefinedMacros`),
-// producing the single effective list all four seed sites then iterate. A name
-// declared by BOTH families is FATAL (`C_ConflictingPredefinedMacro`), never
-// silently resolved. Defaults to {} ⇒ output byte-identical to pre-TF-C74, so
-// every existing caller compiles and behaves unchanged.
+// macros. TF-C97: `formatPredefinedMacros` is the ACTIVE OBJECT FORMAT's
+// (`ObjectFormatSchema::predefinedMacros()`) — the data-model face,
+// `__LP64__`/`_LP64`. Note these are the format SCHEMA's rows, i.e. per format
+// FILE, while `activeFormat` is only the format KIND; the two are independent
+// inputs and a caller must not try to derive one from the other. All three
+// lists are merged ONCE at entry (`mergePredefinedMacros`), producing the
+// single effective list all four seed sites then iterate. A name declared by
+// more than one family is FATAL (`C_ConflictingPredefinedMacro`), never
+// silently resolved. Both default to {} ⇒ output byte-identical to pre-TF-C74,
+// so every existing caller compiles and behaves unchanged.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
@@ -356,7 +376,8 @@ struct DSS_EXPORT MergedPredefinedMacros {
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {},
-    std::span<PredefinedMacroDef const>  targetPredefinedMacros = {});
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros = {},
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros = {});
 
 // FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
 // check for the cycle-1 `#embed` splice. The splice materializes the resource as

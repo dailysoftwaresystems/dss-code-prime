@@ -6,6 +6,7 @@
 #include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
+#include "core/types/preprocess_config.hpp"   // PredefinedMacroDef (TF-C97 — the format's data-model predefines)
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
@@ -805,6 +806,45 @@ struct DSS_EXPORT ObjectFormatData {
     // NO target-side fallback field — the axis is format-only.
     LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
 
+    // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the format's own
+    //    predefined macros ─────────────────────────────────────────────
+    //
+    // OPTIONAL top-level `"predefinedMacros"` — the SAME entry grammar as
+    // the language's `preprocess.predefinedMacros` and the target's
+    // `predefinedMacros`, parsed by the SHARED `parsePredefinedMacroArray`,
+    // merged with both at preprocess time by `mergePredefinedMacros`.
+    //
+    // ★ WHAT BELONGS HERE, AND WHY IT IS A THIRD FAMILY RATHER THAN A
+    // WIDENING OF THE TARGET'S. The macros a C program uses to read this
+    // schema's OWN axes — first among them `dataModel`, whose C-visible face
+    // is `__LP64__`/`_LP64`. Those are NOT architecture facts: ONE CPU
+    // (x86_64) is LP64 under elf64/macho64 and LLP64 under pe64, so a
+    // target-side row would be a lie on one of its own formats — exactly the
+    // argument that keeps `bitFieldStrategy` and `longDoubleFormat` here and
+    // sends `charIsUnsigned` to the target. Both `.target.json` files record
+    // the same conclusion in prose, and this key is what finally lets them
+    // stop deferring it.
+    //
+    // ★ WHY THE MACRO NAMES ARE CONFIG DATA AND NOT DERIVED IN THE LOADER.
+    // `__LP64__` is a C-FAMILY SPELLING. A loader that synthesized it from
+    // `dataModel == Lp64` would hardcode one source language's vocabulary
+    // into the object-format tier, which is the source-agnosticism break the
+    // whole config-driven design exists to prevent (and it would have no
+    // answer at all for a second language that spells the same fact
+    // differently). The loader therefore knows only "this format declares
+    // some predefines"; WHICH ones is derived — by the config author, in the
+    // file, from that file's own `dataModel` value — and never from a format
+    // NAME. Nothing in the engine compares a format name to a literal.
+    //
+    // OPTIONAL; absent ⇒ empty ⇒ the preprocessor's effective list is
+    // byte-identical to the pre-TF-C97 (language + target) list. That is the
+    // state the LLP64 and ILP32 formats deliberately stay in: defining
+    // NEITHER macro is the whole point of putting the channel here, so their
+    // silence is a DECLARED answer, not an omission (each such file records
+    // it in a `$predefinedMacrosComment`). Per-entry `availableObjectFormats`
+    // still applies and is still filtered ONCE downstream.
+    std::vector<PredefinedMacroDef> predefinedMacros;
+
     // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-
     // PLATFORM) ─────────────────────────────────────────────────────────
     // The axis is (processor × platform), and it is declared ENTIRELY on the
@@ -1142,6 +1182,17 @@ public:
     [[nodiscard]] LongDoubleFormat     longDoubleFormat() const noexcept {
         return d_.longDoubleFormat;
     }
+
+    // ── Format-owned predefined macros (TF-C97) ───────────────────
+    // The format's `predefinedMacros` rows, in declaration order and
+    // UNFILTERED — the per-entry `availableObjectFormats` filter is
+    // applied ONCE downstream in `mergePredefinedMacros`, alongside
+    // the language's and the target's, so no seed site can drift.
+    // Symmetric with `TargetSchema::predefinedMacros()`. EMPTY for a
+    // format that declares none (every LLP64/ILP32 format today) ⇒
+    // the effective list is the language+target list unchanged.
+    [[nodiscard]] std::span<PredefinedMacroDef const>
+    predefinedMacros() const noexcept { return d_.predefinedMacros; }
 
     // Relocation accessors — symmetric with TargetSchema's. The
     // linker calls `relocationByKind(kind)` to find which

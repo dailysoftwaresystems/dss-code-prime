@@ -26,4 +26,13 @@ target_include_directories(link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # files produced here.
 target_compile_definitions(link PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
+# TF-C97 — the same repo-root VERSION forward `core` does, for the same header.
+# `object_format_schema_json.cpp` now includes `predefined_macro_json.hpp` (the
+# ONE shared `predefinedMacros` grammar, third consumer after the language and
+# target loaders), and that header hard-`#error`s without DSS_PROJECT_VERSION.
+# `DSS_VERSION` is the stripped repo-root VERSION already read by the top-level
+# CMakeLists — the SAME variable `core` uses, so the version is still written in
+# exactly one place. A botched wireup fails the BUILD, never silently.
+target_compile_definitions(link PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
+
 target_link_libraries(link PRIVATE core asm lir mir nlohmann_json::nlohmann_json)

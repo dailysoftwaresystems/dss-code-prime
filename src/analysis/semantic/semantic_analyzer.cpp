@@ -5247,7 +5247,10 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
 //                 global (C 6.9.2); the absorbed tentative emits no HIR node.
 //   definition → definition : two bodies / two REAL (initialized) object definitions
 //                 → S_RedeclaredSymbol. (`int g=1; int g=2;` collides; `int g; int
-//                 g=5;` does NOT — the tentative is non-defining.)
+//                 g=5;` does NOT — the tentative is non-defining.) ONE exception,
+//                 TF-C97 (C11 6.7p3): a TYPEDEF↔TYPEDEF pair (both Type-kind, so
+//                 both rank as definitions) MERGES and is verified after Pass 1.5
+//                 against the two RESOLVED TypeIds — see `typedefRepeat` below.
 // CATEGORY GUARD: a non-defining declaration MERGES only with a declaration of the
 // SAME declaration category — Function, Variable, Type, or Table. A function and an
 // OBJECT (Variable), a typedef (Type) and an object/function, or any future Table vs
@@ -5337,7 +5340,32 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     bool const crossFnVarMerge =
         (priorIsFn && s.symbols.at(newId).maybeFnTypedefProto)
         || (newIsFn && priorRec.maybeFnTypedefProto);
-    if ((sameCategory || crossFnVarMerge) && !bothDefinitions) {
+    // TF-C97 (D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE, C11 6.7p3): "a typedef name may
+    // be redefined to denote the same type as it currently does, provided that
+    // type is not a variably modified type". A typedef is neither a prototype nor
+    // an extern nor a tentative definition, so `definingRank` ranks BOTH sides 3
+    // and `bothDefinitions` is true — the definedness ladder has no notion of a
+    // typedef, which is why a LEGAL repeat collided S_RedeclaredSymbol. The
+    // category was never the problem (`category()` already returns Type for both);
+    // admit the both-definitions arm for a Type↔Type pair ALONE and let the
+    // post-1.5 sweep decide, exactly as C34c's candidate does.
+    // ★ WHY NOT DECIDE HERE: at Pass 1 neither side's type is resolved (each
+    // declarator's type is composed in Pass 1.5), so "do they denote the same
+    // type" is unanswerable at this seam — `typedef struct _mz_t mz_t;` names a
+    // tag that a LATER declaration completes. Reusing `mergedFnDecls` rather than
+    // opening a second post-1.5 sweep is deliberate: one sweep cannot drift from
+    // itself, and the verification (resolved TypeId equality + the C11
+    // variably-modified carve-out) lives entirely there.
+    // ★ SPELLINGS ARE NEVER COMPARED — only RESOLVED TypeIds. Two spellings of one
+    // type must merge (`struct _mz_t` reached through a forward declaration and
+    // through its completion); one spelling of two types must not.
+    // MEASURED WITNESS: sqlite's mem1.c on macOS reaches `malloc_zone_t` twice —
+    // `$SDK/usr/include/malloc/_malloc_type.h:79` typedefs the forward-declared
+    // tag, `malloc/malloc.h:246` typedefs the SAME tag at its completion. Legal
+    // C11, and the last S0002 on the arm64-macho sqlite leg.
+    bool const typedefRepeat = bothDefinitions && sameCategory
+                               && category(priorRec) == DeclarationKind::Type;
+    if (((sameCategory || crossFnVarMerge) && !bothDefinitions) || typedefRepeat) {
         // TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): a thread-storage
         // specifier "shall be present in the declaration of every declared
         // name with thread storage duration" — an OBJECT merge pair that
@@ -12944,6 +12972,24 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // surviving to the linker as an undefined symbol.
     std::unordered_map<std::string, SuppressedShippedSymbol>
         suppressedShippedLibraries;
+    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: one CANDIDATE per (descriptor
+    // composite, SOURCE composite) pair whose tag BOTH origins declare at file
+    // scope, carrying every descriptor SURFACE symbol typed by it (a composite
+    // member, or a typedef that denotes the tag). Recorded here — outside the
+    // injection block — because the SOURCE side is still a Pass-1 forward mint
+    // when the descriptors are read (its fields arrive at Pass 1.5), so the SHAPE
+    // COMPARISON that licenses the unification cannot run yet. NOTHING is
+    // rewritten until it has: see the verification loop just above Pass 2, which
+    // either retypes every listed surface or reports and leaves the two types
+    // DISTINCT.
+    struct ShippedTagAdoption {
+        std::string           tag;       // the struct/union tag BOTH origins declare
+        TypeId                shipped;   // the descriptor's interned composite
+        TypeId                user;      // the SOURCE declaration's composite
+        std::string           origin;    // the descriptor's header spelling (diagnostic)
+        std::vector<SymbolId> surfaces;  // descriptor symbols (members, typedefs) typed `shipped`
+    };
+    std::vector<ShippedTagAdoption> shippedTagAdoptions;
     {
         // Names any USER declaration (top-level, in any tree's own root scope)
         // claimed — the goal-2 skip set. A binding whose symbol's `tree` is the
@@ -12957,22 +13003,111 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // for a descriptor TYPEDEF keys on THIS set instead of the full one;
         // see the typedef-injection loop below for why.
         std::unordered_set<std::string> userNonTypeDeclaredNames;
+        // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: the SOURCE's FILE-SCOPE
+        // struct/union TAGS (tag name → the Pass-1 forward-minted composite).
+        // C 6.2.3: within ONE translation unit a struct tag names exactly ONE
+        // type, so a tag a shipped descriptor ALSO declares is the SAME type —
+        // this map is what lets the descriptor's own members adopt it below.
+        // FILE SCOPE only (these are the tree ROOT scopes): a block-scoped
+        // `struct timespec {…}` really is a DISTINCT C type and must never be
+        // unified with anything.
+        std::unordered_map<std::string, TypeId> userFileScopeTags;
         for (auto const& [treeV, scope] : treeRootScope) {
             // Across BOTH namespaces: a user declaration of `name` (object,
             // function, typedef, OR a struct/union/enum tag) blocks a
             // descriptor symbol of that name — this is a NAME-level goal-2 skip
             // (the descriptor injects ordinary names; a same-name user tag
             // still claims the spelling, preserving the pre-tag-namespace
-            // behavior). `ns` is intentionally unused here.
+            // behavior). `ns` separates the two C 6.2.3 namespaces for the tag
+            // map below; the goal-2 sets are deliberately namespace-BLIND.
             for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
-                (void)ns;
                 if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
+                    SymbolRecord const& urec = s.symbols.at(sym);
                     userDeclaredNames.insert(std::string{name});
-                    if (s.symbols.at(sym).kind != DeclarationKind::Type)
+                    if (urec.kind != DeclarationKind::Type)
                         userNonTypeDeclaredNames.insert(std::string{name});
+                    // A tag with a VALID type is a DEFINITION (Pass 1 forward-mints
+                    // only when the declaration opened a field scope). A bare
+                    // `struct timespec;` forward declaration carries no type and is
+                    // skipped — there is nothing to unify with, and the descriptor's
+                    // own type keeps its current meaning.
+                    else if (ns == SymbolNamespace::Tag && urec.type.valid())
+                        userFileScopeTags.try_emplace(std::string{name}, urec.type);
                 }
             }
         }
+
+        // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY — THE UNIFICATION POINT.
+        //
+        // MEASURED (arm64-macho, sqlite `os_unix.c:7731` `conchModTime =
+        // buf.st_mtimespec;` → `error[S0003] S_TypeMismatch`): a descriptor
+        // struct's member type is PRE-INTERNED when its descriptor loads, so
+        // `sys/stat.json`'s `st_mtimespec` is baked to the DESCRIPTOR's
+        // `timespec`, while `struct timespec conchModTime;` resolves the TAG —
+        // and the SOURCE declaration of that tag (here the macOS SDK's
+        // `sys/_types/_timespec.h`, reached through `sys/fcntl.h`, for which DSS
+        // ships no descriptor) SHADOWS the injected cuRoot tag. Two TypeIds for
+        // one file-scope tag ⇒ the by-value assignment is rejected. Fixing the
+        // TAG BINDING alone cannot reach this: the binding was never the wrong
+        // one — the MEMBER was.
+        //
+        // So the substitution happens exactly where a descriptor type is turned
+        // into a symbol the user can NAME: every injected composite FIELD whose
+        // type is such a tag is NOTED here and retyped — after Pass 1.5 has
+        // completed the source side and the layouts have been PROVED equal — onto
+        // the one type its tag denotes in THIS translation unit. The user's
+        // declaration wins (goal-2), so member access on it then resolves through
+        // the SOURCE's own field scope and its own member spellings.
+        //
+        // ★ THE KEY IS (tag, THIS COMPILATION) — NEVER GLOBAL. `userFileScopeTags`
+        // is rebuilt per `analyze()` call and the descriptor TypeIds it is matched
+        // against were interned into THIS CU's interner AFTER this target's
+        // `variants` selection, so the map cannot reach across targets: a `long
+        // tv_sec` timespec stays 16 bytes on LP64 and 8 on LLP64 as DISTINCT
+        // types, and the LP64/LLP64 pair is never even a candidate for
+        // unification (D-CSUBSET-DARWIN-STRUCT-LAYOUT-DISAGREEMENT does not
+        // regress).
+        //
+        // ★ FAIL LOUD, AND NOTHING MOVES BEFORE IT IS PROVED. The pair is only
+        // RECORDED here; after Pass 1.5 has completed the SOURCE side it is
+        // checked through the LAYOUT ENGINE — the same `computeLayout` `sizeof`,
+        // member-access codegen and MIR read, so there is ONE shape authority and
+        // no second comparison to drift from it. Layouts identical ⇒ the members
+        // are retyped. Layouts DIFFER ⇒ `F_ShippedTypeIdentityConflict` (the
+        // existing cross-declaration identity diagnostic, unsuppressable) and the
+        // two types STAY DISTINCT. Content-blind: a tag-name membership test over
+        // whatever the source and the descriptors happen to declare, never an
+        // `if (name == "timespec")`.
+        //
+        // ★ NO LAYOUT PARAMS, NO UNIFICATION. A direct-API / LSP / unit caller
+        // passes no `aggregateLayout`, so the engine CANNOT compute either side's
+        // layout and the verification could never license the adoption. Unifying
+        // anyway would be exactly the silent structural merge this design rejects,
+        // so the whole mechanism is gated OFF there: those callers analyze
+        // byte-identically to before and a genuine divergence still surfaces as
+        // the pre-existing loud `S_TypeMismatch` at the assignment.
+        std::unordered_map<std::uint64_t, std::size_t> adoptionIndex;   // key → row
+        auto noteTagSurface = [&](SymbolId fid, TypeId t, std::string_view origin) {
+            if (!t.valid() || !s.aggregateLayout.has_value()) return;
+            TypeInterner const& in = s.lattice.interner();
+            TypeKind const k = in.kind(t);
+            if (k != TypeKind::Struct && k != TypeKind::Union) return;
+            std::string tag{in.name(t)};
+            if (tag.empty()) return;                        // anonymous: no tag identity
+            auto const uit = userFileScopeTags.find(tag);
+            if (uit == userFileScopeTags.end()) return;     // source never declared it
+            TypeId const user = uit->second;
+            if (user.v == t.v) return;                      // already ONE type
+            if (in.kind(user) != k) return;                 // struct vs union: different tags
+            std::uint64_t const key =
+                (static_cast<std::uint64_t>(t.v) << 32) | static_cast<std::uint64_t>(user.v);
+            auto const [it, fresh] = adoptionIndex.try_emplace(key, shippedTagAdoptions.size());
+            if (fresh) {
+                shippedTagAdoptions.push_back(ShippedTagAdoption{
+                    std::move(tag), t, user, std::string{origin}, {}});
+            }
+            shippedTagAdoptions[it->second].surfaces.push_back(fid);
+        };
 
         // Dedup descriptor paths (the same `#include <stdio.h>` in two trees, or
         // twice in one tree, records the path twice) AND symbol names already
@@ -13305,6 +13440,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 rec.kind  = DeclarationKind::Type;
                 rec.type  = td.type;
                 SymbolId const id = s.symbols.mint(rec);
+                // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: a typedef that
+                // DENOTES a tag the source also declares (`typedef struct
+                // timespec ts_t;`) is the same surface as a composite member and
+                // takes the same rule — otherwise the alias and the tag would name
+                // two types in one TU. Compound spellings (`ptr<tag>`) are NOT
+                // rewritten: reaching inside a constructed type is a re-intern, not
+                // an identity choice, and leaving them alone keeps the failure LOUD
+                // (a pointer mismatch at the use) rather than half-unified.
+                noteTagSurface(id, td.type, desc->header);
                 s.scopes.injectBinding(cuRoot, td.name, id);
             }
 
@@ -13331,6 +13475,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     f.type       = st.fields[i].type;
                     f.fieldIndex = i;             // == position in the interned operands
                     SymbolId const fid = s.symbols.mint(f);
+                    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: note a
+                    // composite-typed member whose TAG the source also declares
+                    // (`stat.st_mtimespec` is the measured case) so it can adopt
+                    // the ONE type that tag names in this TU (C 6.2.3) once the
+                    // layouts have been proved equal. Every other type is untouched.
+                    noteTagSurface(fid, st.fields[i].type, desc->header);
                     s.scopes.injectBinding(fieldScope, st.fields[i].name, fid);
                 }
                 s.compositeScopeByType[st.typeId.v] = fieldScope;
@@ -13370,6 +13520,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     f.type       = un.fields[i].type;
                     f.fieldIndex = i;             // == position in the interned operands
                     SymbolId const fid = s.symbols.mint(f);
+                    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: the union sibling
+                    // of the `structs` note — one tag, one type, same rule.
+                    noteTagSurface(fid, un.fields[i].type, desc->header);
                     s.scopes.injectBinding(memberScope, un.fields[i].name, fid);
                 }
                 s.compositeScopeByType[un.typeId.v] = memberScope;
@@ -13623,6 +13776,83 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 }
                 continue;
             }
+            // TF-C97 (D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE, C11 6.7p3): THE
+            // VERIFICATION for the Type↔Type pair Pass 1 admitted optimistically.
+            // Runs BEFORE the generic `sRec.type.v == aRec.type.v` fast-path
+            // below because BOTH of this rule's answers differ from the generic
+            // one, in BOTH directions:
+            //   ① EQUAL IS NOT ALWAYS LEGAL. 6.7p3's permission excludes a
+            //      VARIABLY MODIFIED type ("provided that type is not a variably
+            //      modified type") — `typedef int V[n];` twice is invalid even
+            //      though it is spelled identically, because `n` would be
+            //      evaluated twice for one name (C99 6.7.7p2 evaluates a VLA
+            //      typedef's size expression exactly once, AT the typedef). The
+            //      interner has no length operand to distinguish two vlaArrays,
+            //      so their TypeIds ARE equal and the fast-path would silently
+            //      accept the one shape the standard singles out. MEASURED
+            //      against /usr/bin/clang: `error: redefinition of typedef for
+            //      variably-modified type 'int[n]'` — and clang reports that same
+            //      VM reason even when the two VM types ALSO differ
+            //      (`typedef int V[n]; typedef long V[n];`), so the carve-out is
+            //      tested FIRST here for the same reason: the repeat is forbidden
+            //      outright, which is a stronger statement than "these differ".
+            //      Reported as S_RedeclaredSymbol — the code this shape already
+            //      produced from the Pass-1 collision, so the VM case is
+            //      byte-identical in CODE and only gains a message; and it is the
+            //      honest one, since the types are the SAME and calling them
+            //      incompatible would be a lie.
+            //   ② UNEQUAL IS NEVER RELAXED. The incomplete-array relaxation below
+            //      (C 6.2.7 composite types, `extern char v[]; char v[3];`) is an
+            //      OBJECT rule — two declarations of one object compose into the
+            //      completed type. 6.7p3 asks the strictly stronger question
+            //      "does it denote the SAME type", with no composite step.
+            //      MEASURED against /usr/bin/clang: `typedef int T[3]; typedef
+            //      int T[];` is `error: typedef redefinition with different types
+            //      ('int[]' vs 'int[3]')`. Falling through would have admitted it
+            //      silently, so this arm ends in `continue` either way.
+            // Reported at the ABSORBED (later) declaration with a related location
+            // at the survivor — the shape every other gate in this sweep uses.
+            if (sRec.kind == DeclarationKind::Type
+                && aRec.kind == DeclarationKind::Type) {
+                auto const& in = s.lattice.interner();
+                auto isVariablyModified = [&in](TypeId t) {
+                    return in.isVlaArray(t) || in.typeContainsVla(t);
+                };
+                bool const variablyModified = isVariablyModified(sRec.type)
+                                           || isVariablyModified(aRec.type);
+                // The C11 permission, in full: same resolved type AND not
+                // variably modified. Anything else falls through to fail loud.
+                if (!variablyModified && sRec.type.v == aRec.type.v) continue;
+                auto aTreeIt = treeById.find(aRec.tree.v);
+                if (aTreeIt == treeById.end()) continue;
+                Tree const& aTree = *aTreeIt->second;
+                ParseDiagnostic d;
+                d.code     = variablyModified
+                                 ? DiagnosticCode::S_RedeclaredSymbol
+                                 : DiagnosticCode::S_IncompatibleRedeclaration;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = aTree.source().id();
+                d.span     = aTree.span(aRec.declNode);
+                d.actual   = variablyModified
+                    ? std::format(
+                          "'{}' — a typedef name of a VARIABLY MODIFIED type may "
+                          "not be redefined, even identically (C11 6.7p3)",
+                          aRec.name)
+                    : std::format(
+                          "'{}' — a typedef name may be redefined only to denote "
+                          "the SAME type (C11 6.7p3)", aRec.name);
+                auto sTreeIt = treeById.find(sRec.tree.v);
+                if (sTreeIt != treeById.end()) {
+                    Tree const& sTree = *sTreeIt->second;
+                    d.related.push_back(RelatedLocation{
+                        sTree.source().id(),
+                        sTree.span(sRec.declNode),
+                        "previously declared here",
+                    });
+                }
+                s.reporter.report(std::move(d));
+                continue;
+            }
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the
@@ -13668,6 +13898,91 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 });
             }
             s.reporter.report(std::move(d));
+        }
+    }
+
+    // ── D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: license, then adopt ──
+    //
+    // Descriptor injection NOTED every member whose TAG the SOURCE also declares
+    // at file scope, but changed nothing: the source composite was still a Pass-1
+    // forward mint back then. Pass 1.5 has now completed it, so the decision is
+    // taken HERE — against the LAYOUT ENGINE, the SAME `computeLayout` `sizeof`,
+    // `_Alignof`, member-access codegen and MIR read. Deliberately ONE shape
+    // authority: a hand-rolled field walk beside it could drift, and the thing
+    // that must not drift is precisely "do these two declarations lay out the
+    // same bytes on THIS target".
+    //
+    // Identical layout ⇒ the two declarations describe ONE type (C 6.2.3) and
+    // every noted member is retyped onto the source's. ANY divergence — a
+    // different size, alignment, field offset, field count, field kind, or bit
+    // placement, and equally a shape the engine cannot compute (an incomplete
+    // composite) — leaves the two types DISTINCT, exactly as before this
+    // mechanism existed, and reports `F_ShippedTypeIdentityConflict`: the
+    // existing cross-declaration identity diagnostic, unsuppressable, which stops
+    // the pipeline before a single byte is emitted. There is no silent path in
+    // either direction — nothing is unified without a PROOF, and nothing is left
+    // un-unified without a DIAGNOSTIC.
+    if (!shippedTagAdoptions.empty()) {
+        TypeInterner const& in = s.lattice.interner();
+        for (auto const& ad : shippedTagAdoptions) {
+            // `aggregateLayout` is necessarily present — nothing is ever recorded
+            // without it (the injection gate above).
+            auto const shippedLay =
+                computeLayout(ad.shipped, in, *s.aggregateLayout, s.dataModel);
+            auto const userLay =
+                computeLayout(ad.user, in, *s.aggregateLayout, s.dataModel);
+            bool agree = shippedLay.has_value() && userLay.has_value()
+                      && shippedLay->size  == userLay->size
+                      && shippedLay->align == userLay->align
+                      && shippedLay->fieldOffsets == userLay->fieldOffsets
+                      && shippedLay->bitFields.size() == userLay->bitFields.size()
+                      && shippedLay->hasFlexibleArrayMember
+                             == userLay->hasFlexibleArrayMember;
+            // Same bytes AND the same members occupying them: equal offsets alone
+            // would accept `{u32,u32}` for `{i32,i32}` (a signedness swap moves no
+            // offset), so each field's KIND and bit placement is compared too.
+            if (agree) {
+                auto const a = in.operands(ad.shipped);
+                auto const b = in.operands(ad.user);
+                agree = a.size() == b.size();
+                for (std::size_t i = 0; agree && i < a.size(); ++i)
+                    if (in.kind(a[i]) != in.kind(b[i])) agree = false;
+                for (std::size_t i = 0; agree && i < shippedLay->bitFields.size(); ++i) {
+                    BitFieldPlacement const& p = shippedLay->bitFields[i];
+                    BitFieldPlacement const& q = userLay->bitFields[i];
+                    if (p.unitBytes != q.unitBytes || p.bitOffset != q.bitOffset
+                        || p.bitWidth != q.bitWidth)
+                        agree = false;
+                }
+            }
+            if (agree) {
+                // LICENSED: the descriptor's own members now denote the type the
+                // tag names in this TU, so `stat.st_mtimespec` and a source
+                // `struct timespec` are one type and the by-value assignment
+                // type-checks in Pass 2 (which has not run yet).
+                for (SymbolId fid : ad.surfaces) s.symbols.at(fid).type = ad.user;
+                continue;
+            }
+            auto const extent = [&](std::optional<StructLayout> const& l) {
+                return l.has_value()
+                           ? std::to_string(l->size) + " bytes / align "
+                                 + std::to_string(l->align.bytes())
+                           : std::string{"<no computable layout>"};
+            };
+            dss::report(
+                s.reporter, DiagnosticCode::F_ShippedTypeIdentityConflict,
+                DiagnosticSeverity::Error,
+                "shipped-lib descriptor '" + ad.origin + "' declares tag '" + ad.tag
+                    + "' (" + extent(shippedLay)
+                    + ") but this translation unit declares the SAME tag as a "
+                      "DIFFERENT layout (" + extent(userLay)
+                    + ") for this target. C 6.2.3 gives a file-scope tag exactly ONE "
+                      "type per translation unit, so the descriptor's own members of "
+                      "that tag would denote the source declaration — which is only "
+                      "sound while the two lay out identically, so they were left as "
+                      "TWO types and nothing was unified. Make the descriptor's "
+                      "declaration byte-identical for this target (per-format / "
+                      "per-dataModel `variants` when the type genuinely diverges)");
         }
     }
 

@@ -964,11 +964,29 @@ std::optional<ObjectFormatKind> formatKindOfSpec(std::string const& spec) {
 // `targetName` is a CACHE KEY and nothing else — it is compared only against
 // other target names, NEVER against a literal. Empty when the language has no
 // preprocess pass, so such a build still collapses to ONE CU for all targets.
+//
+// ── TF-C97: `formatName` joins the key, for the SAME reason `targetName` did ──
+//
+// The preprocessed text now also depends on the OBJECT FORMAT's own
+// `predefinedMacros` (`__LP64__`/`_LP64`), and those are declared per format
+// FILE, not per format KIND. `format` (the kind) cannot stand in for the file:
+// `x86_64:elf64-x86_64-linux-exec` and a hypothetical `elf32-*` file are both
+// kind `elf` while declaring DIFFERENT data models — one key, two answers, and
+// the second target would silently inherit the first's macros. That is the
+// identical silent miscompile TF-C74 widened this key to prevent, one layer
+// down, so this widening is a REQUIRED CORRECTNESS CHANGE too and not an
+// optimization. It costs nothing on the shipped matrix: within one target,
+// distinct format names already mean distinct legs.
+//
+// `formatName` is likewise a CACHE KEY and nothing else — compared only
+// against other format names, never against a literal.
 struct CuBuildKey {
     std::string                     targetName;
+    std::string                     formatName;
     std::optional<ObjectFormatKind> format;
     [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
         if (targetName != o.targetName) return targetName < o.targetName;
+        if (formatName != o.formatName) return formatName < o.formatName;
         return format < o.format;
     }
 };
@@ -984,7 +1002,8 @@ struct CuBuildKey {
 // case builds exactly once. Returns 0 on success, 1 on any error.
 int runCusToTargets(
     std::function<std::vector<CompilationUnit>(
-        CuBuildKey const&, std::span<PredefinedMacroDef const>)> buildCus,
+        CuBuildKey const&, std::span<PredefinedMacroDef const>,
+        std::span<PredefinedMacroDef const>)> buildCus,
     GrammarSchema const&                        grammar,
     std::string const&                          sourceStem,
     std::vector<std::string> const&             targets,
@@ -1055,11 +1074,12 @@ int runCusToTargets(
     // the reason this check owns its own key is unchanged.) Its
     // `formatChecked` set keeps the diagnostic one-per-distinct-format-name.
     //
-    // The format schema is retained only FOR THE DURATION OF THIS PASS (the
-    // PAIR check below needs it next to its target), and then dropped: this
-    // pass owns rejection, not caching. `compileOneTarget` remains the
-    // authoritative consumer and still loads its own, so nothing downstream
-    // depends on a copy kept alive here.
+    // The format schema is retained for the DURATION OF THIS FUNCTION (the
+    // PAIR check below needs it next to its target, and — TF-C97 — the CU-key
+    // loop reads its `predefinedMacros`), then dropped: this pass owns
+    // rejection, not caching. `compileOneTarget` remains the authoritative
+    // consumer and still loads its own, so nothing downstream depends on a
+    // copy kept alive here.
     //
     // ── TF-C74 (D-PROGRAM-TARGET-FORMAT-PAIR-VALIDATED-LATE): the PAIR ────
     //
@@ -1184,17 +1204,24 @@ int runCusToTargets(
     for (auto const& spec : targets) {
         CuBuildKey key;
         std::span<PredefinedMacroDef const> targetPredefines;
+        std::span<PredefinedMacroDef const> formatPredefines;
         if (ppEnabled) {
             key.format = formatKindOfSpec(spec);
             // The spec parsed cleanly above (we returned otherwise), so this
             // lookup always resolves.
             auto const parsed = TargetSpec::parse(spec);
             key.targetName    = parsed->targetName;
+            key.formatName    = parsed->formatName;
             targetPredefines  = targetByName.at(key.targetName)->predefinedMacros();
+            // TF-C97: the FORMAT's own predefines. `formatByName` was populated
+            // by the pre-flight above and every surviving spec's format is in
+            // it — a failed load already returned at the drain.
+            formatPredefines  = formatByName.at(key.formatName)->predefinedMacros();
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
-            cuByKey.emplace(key, buildCus(key, targetPredefines));
+            cuByKey.emplace(key,
+                            buildCus(key, targetPredefines, formatPredefines));
         }
     }
 
@@ -1794,7 +1821,8 @@ int Program::compileFiles(
     // (pure-existence, unchanged). The build still runs on the 64 MiB worker stack
     // (D-PARSE-DEEP-FRONTEND-STACK).
     auto buildCus = [&](CuBuildKey const&                   key,
-                        std::span<PredefinedMacroDef const> targetPredefines)
+                        std::span<PredefinedMacroDef const> targetPredefines,
+                        std::span<PredefinedMacroDef const> formatPredefines)
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
@@ -1804,6 +1832,9 @@ int Program::compileFiles(
                 // TF-C74: the active target's per-architecture identity macros.
                 builder.setTargetPredefinedMacros(
                     {targetPredefines.begin(), targetPredefines.end()});
+                // TF-C97: the active format's data-model macros.
+                builder.setFormatPredefinedMacros(
+                    {formatPredefines.begin(), formatPredefines.end()});
                 builder.setUserDefines(userDefines());  // c105: --define
                 applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                 for (auto const& path : sourceFiles) {
@@ -1880,7 +1911,8 @@ int Program::compileUnits(
     // (the closure `runCusToTargets` invokes), so `__has_include` is per-target
     // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
     auto buildCus = [&](CuBuildKey const&                   key,
-                        std::span<PredefinedMacroDef const> targetPredefines)
+                        std::span<PredefinedMacroDef const> targetPredefines,
+                        std::span<PredefinedMacroDef const> formatPredefines)
         -> std::vector<CompilationUnit> {
         std::vector<CompilationUnit> cus;
         cus.reserve(sourceFiles.size());
@@ -1896,6 +1928,9 @@ int Program::compileUnits(
                     // TF-C74: the active target's per-architecture identity macros.
                     builder.setTargetPredefinedMacros(
                         {targetPredefines.begin(), targetPredefines.end()});
+                    // TF-C97: the active format's data-model macros.
+                    builder.setFormatPredefinedMacros(
+                        {formatPredefines.begin(), formatPredefines.end()});
                     builder.setUserDefines(userDefines());  // c105: --define
                     applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                     builder.addFile(fs::path{path});

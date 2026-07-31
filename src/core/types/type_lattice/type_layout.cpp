@@ -83,6 +83,46 @@ compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
     return Alignment::fromBytes(req);
 }
 
+// ── The ONE member-alignment CLAMP (D-CSUBSET-PACKED-BITFIELD-INTERACTION) ──
+//
+// The exact DUAL of `compositeSeedAlign` above: that one RAISES the aggregate's
+// own alignment, this one LOWERS each MEMBER's baseline. `packed` and
+// `#pragma pack(N)` are the two channels that do the lowering, and EVERY
+// member-alignment site in this engine now funnels through here — the Struct
+// arm's `effectiveAlign`, the Union arm's, and BOTH bit-field packers (via
+// `bitfieldPackerEffectiveAlign` for an ordinary field, and directly for a
+// bit-field's storage-unit alignment).
+//
+// TF-C97: before this cycle the clamp was written TWICE — once in each
+// non-bit-field arm — and the two bit-field packers had NEITHER copy, so
+// `#pragma pack(N)` was silently IGNORED for any struct containing a bit-field.
+// MEASURED vs `/usr/bin/clang -arch arm64`: `#pragma pack(4) struct { u64 a;
+// unsigned b:1; }` came out 16/8 where clang says 12/4, and `pack(2) struct
+// { unsigned a; u64 b:40; }` came out 16/8 where clang says 10/2. ONE helper is
+// the point, not a tidiness preference: a fourth copy is a fourth chance to miss
+// a site, and a missed site here is a silent ABI miscompile, not a crash.
+//
+// `packed` WINS over a surrounding `pack(N)` (gcc agrees: an explicit
+// `__attribute__((packed))` is never weakened by a wider pragma cap), which
+// falls out of returning the packed baseline FIRST and only clamping the
+// natural one. A cap WEAKER than the member's natural alignment is a no-op, so
+// `pack(8)` over a `char` is inert — by construction, with no comparison branch
+// to get backwards.
+//
+// Returns nullopt when a stored cap is not a representable alignment. The value
+// is validated a power of two in [1, 256] at the pragma AND again at
+// `completeComposite`, so an unrepresentable one reaching here is an upstream
+// bug — fail LOUD rather than silently lay the composite out uncapped.
+//
+// AGNOSTIC: both inputs are interned per-composite data; no target/format/
+// language identity is consulted.
+[[nodiscard]] std::optional<Alignment>
+clampedBaselineAlign(bool packed, std::uint32_t packCap, Alignment natural) noexcept {
+    if (packed) return Alignment::of<1>();
+    if (packCap == 0 || packCap >= natural.bytes()) return natural;
+    return Alignment::fromBytes(packCap);
+}
+
 // Is the declared bit-field strategy one the engine actually realizes? A
 // declared-but-unbuilt strategy (e.g. a future ABI value) — and `None` (not
 // declared at all) — fail loud at the consumer rather than silently using a
@@ -114,26 +154,33 @@ bitFieldStrategyRealized(BitFieldStrategy s) noexcept {
 // zero-width break) + `out.fieldOffsets` (one byte offset per field) + the
 // running `out.align` + the final `out.size`.
 
-// D-CSUBSET-MEMBER-ALIGNAS: fold field `i`'s explicit `alignas` override into its
-// natural alignment with MAX semantics — the SAME rule the non-bitfield struct/union
-// arm's `effectiveAlign` lambda applies, hoisted here so BOTH bit-field packers honor
-// a member `alignas` on their ORDINARY (non-bit-field) fields (a bit-field FIELD itself
-// can't carry alignas — the semantic phase rejects it). `alignas` on a non-bit-field
-// member of a bit-field-bearing struct is legal C11 6.7.5 and RAISES that field's (and
-// thus the struct's) alignment — it must never be silently dropped. Returns the natural
-// alignment unchanged when the struct carries no aligns or this field has no override;
-// `nullopt` when a stored override is not a power of two in [1, 256] (an upstream
-// alignas-semantics bug — fail loud rather than silently mis-pad, mirroring the
-// non-bit-field path's `Alignment::fromBytes` reject).
+// D-CSUBSET-MEMBER-ALIGNAS: field `i`'s EFFECTIVE alignment inside a bit-field
+// packer — the clamped baseline (`clampedBaselineAlign`) folded with the field's
+// explicit `alignas` override under MAX semantics. This is the SAME two-step the
+// non-bitfield struct/union arm's `effectiveAlign` lambda applies, hoisted here so
+// BOTH bit-field packers honor it on their ORDINARY (non-bit-field) fields (a
+// bit-field FIELD itself can't carry alignas — the semantic phase rejects it).
+//
+// `alignas` on a non-bit-field member of a bit-field-bearing struct is legal C11
+// 6.7.5 and RAISES that field's (and thus the struct's) alignment — it must never be
+// silently dropped; a `pack(N)` cap LOWERS it, and alignas still wins per-field over
+// the cap via the MAX-fold. TF-C97 MEASURED: the cap half of this is what places `a`
+// at offset 4 (not 8) in clang's `#pragma pack(4) struct { unsigned b:3; u64 a; }`.
+//
+// Returns `nullopt` when a stored cap or override is not a power of two in [1, 256]
+// (an upstream pragma-/alignas-semantics bug — fail loud rather than silently
+// mis-pad, mirroring the non-bit-field path's `Alignment::fromBytes` reject).
 [[nodiscard]] std::optional<Alignment>
-bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id,
-                             std::size_t i, Alignment natural) {
-    if (!interner.hasExplicitAligns(id)) return natural;
+bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id, std::size_t i,
+                             bool packed, std::uint32_t packCap, Alignment natural) {
+    auto const baseline = clampedBaselineAlign(packed, packCap, natural);
+    if (!baseline) return std::nullopt;
+    if (!interner.hasExplicitAligns(id)) return baseline;
     std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
-    if (ovr == 0) return natural;   // no override on this field
+    if (ovr == 0) return baseline;   // no override on this field
     auto const a = Alignment::fromBytes(ovr);
     if (!a) return std::nullopt;
-    return maxAlign(natural, *a);
+    return maxAlign(*baseline, *a);
 }
 
 // GnuPacked: SysV/Itanium/GNU/AAPCS64/Apple little-endian. Bits flow LSB-first
@@ -148,6 +195,34 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                                AggregateLayoutParams params, DataModel dm,
                                StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
+    // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap this
+    // composite was defined under — read ONCE here, then fed through
+    // `clampedBaselineAlign` at every alignment site below. `packed` is currently
+    // always false here (the Struct arm's fail-loud belt rejects packed + bit-fields
+    // before dispatch); it is threaded through anyway so this packer is correct BY
+    // CONSTRUCTION if that belt is ever lifted, rather than silently unpacked.
+    bool const          packed  = interner.isPacked(id);
+    std::uint32_t const packCap = interner.maxFieldAlign(id);
+    // The GNU straddle rule is CONDITIONAL on there being no member-alignment cap.
+    // MEASURED (`/usr/bin/clang -arch arm64`): `struct { unsigned char a; unsigned
+    // b:31; unsigned char c; }` is sizeof 12 bare but sizeof 8 under `#pragma
+    // pack(4)` — AND ALSO 8 under `pack(16)`, a cap that clamps nothing. So it is
+    // the mere PRESENCE of a cap, not its value, that turns the bump off: bits then
+    // flow straight through the unit boundary instead of skipping to the next unit.
+    // This mirrors clang's `AllowPadding = MaxFieldAlignment.isZero()`
+    // (ItaniumRecordLayoutBuilder) and gcc's `maximum_field_alignment == 0` gate on
+    // the whole PCC_BITFIELD_TYPE_MATTERS block — the two independent
+    // implementations of the ABI this strategy names.
+    //
+    // ⚠ What this gate BUYS is fail-loud, not (yet) a correct packed layout. A field
+    // that flows through a unit boundary is exactly a field that trips the
+    // representability guard further down, so under a cap a would-be straddler is
+    // REFUSED rather than laid out. That is still the whole point: with the bump left
+    // on, `pack(2) struct { unsigned a; u64 b:40; }` silently computes sizeof 14 where
+    // clang says 10 — a wrong ABI nobody is told about. Cases where no field straddles
+    // (every one in the macOS SDK's pack+bit-field closure) are unaffected by this
+    // gate and are fixed by the alignment clamp alone.
+    bool const allowStraddlePadding = !packed && packCap == 0;
     std::uint64_t bitCursor = 0;   // absolute bits from the struct start
     for (std::size_t i = 0; i < fields.size(); ++i) {
         TypeId const f  = fields[i];
@@ -163,8 +238,8 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 if (!elem) return std::nullopt;
                 // A FAM can carry `alignas` (`alignas(16) int fam[];`): raise its
                 // effective alignment exactly as the non-bit-field path does.
-                auto const ea =
-                    bitfieldPackerEffectiveAlign(interner, id, i, elem->align);
+                auto const ea = bitfieldPackerEffectiveAlign(
+                    interner, id, i, packed, packCap, elem->align);
                 if (!ea) return std::nullopt;
                 std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
                 out.fieldOffsets.push_back(fo);
@@ -175,10 +250,12 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
             }
             auto const fl = computeLayout(f, interner, params, dm);
             if (!fl) return std::nullopt;
-            // Fold a member `alignas` override into the ordinary field's alignment
-            // (D-CSUBSET-MEMBER-ALIGNAS) — a bit-field-bearing struct's non-bit-field
-            // member may be over-aligned; the offset AND the struct align must honor it.
-            auto const ea = bitfieldPackerEffectiveAlign(interner, id, i, fl->align);
+            // Fold the cap + a member `alignas` override into the ordinary field's
+            // alignment (D-CSUBSET-MEMBER-ALIGNAS) — a bit-field-bearing struct's
+            // non-bit-field member may be over-aligned OR capped; the offset AND the
+            // struct align must honor both.
+            auto const ea = bitfieldPackerEffectiveAlign(
+                interner, id, i, packed, packCap, fl->align);
             if (!ea) return std::nullopt;
             std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
             out.fieldOffsets.push_back(fo);
@@ -189,7 +266,13 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
         // Bit-field: the allocation unit is its declared type's size.
         auto const fl = computeLayout(f, interner, params, dm);
         if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
-        out.align = maxAlign(out.align, fl->align);
+        // A bit-field's storage unit contributes its declared type's alignment to the
+        // struct — CLAMPED by the cap, exactly like an ordinary field's. MEASURED:
+        // clang's `#pragma pack(4) struct { char c; u64 b:1; }` is _Alignof 4 (the
+        // capped u64), not 8 (uncapped) and not 1 (dropped).
+        auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
+        if (!unitAlign) return std::nullopt;
+        out.align = maxAlign(out.align, *unitAlign);
         std::uint64_t const unitBits = fl->size * 8;
         std::uint32_t const w        = *bw;
         if (w == 0) {
@@ -200,16 +283,37 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
             continue;
         }
         if (w > unitBits) return std::nullopt;   // defensive (semantic validates first)
-        // If w bits at the cursor would straddle the type's unit
-        // boundary, bump to the next aligned unit (the GNU rule).
-        if (bitCursor / unitBits != (bitCursor + w - 1) / unitBits) {
+        // If w bits at the cursor would straddle the type's unit boundary, bump to
+        // the next aligned unit (the GNU rule) — UNLESS a member-alignment cap is in
+        // effect, which turns the bump off entirely (see `allowStraddlePadding`).
+        if (allowStraddlePadding
+            && bitCursor / unitBits != (bitCursor + w - 1) / unitBits) {
             bitCursor = ((bitCursor + unitBits - 1) / unitBits) * unitBits;
         }
+        // With the bump suppressed a field CAN now cross its allocation unit, and a
+        // straddling placement is NOT REPRESENTABLE: `BitFieldPlacement` describes one
+        // `unitBytes`-wide integer load/store at `fieldOffsets[i]`, so the consumers
+        // (hir_to_mir's `emitBitfieldExtract`/`-Insert`, asm.cpp's initializer packer)
+        // would read/write only the bits inside that unit — and the signed-extract
+        // shift `B - bitOffset - bitWidth` would UNDERFLOW. Re-anchoring the unit onto
+        // the field cannot be done safely either: the only anchors that cover the
+        // field either run past the struct's own end (a read-modify-write there
+        // CLOBBERS the next array element) or need the final struct size, which this
+        // single forward pass does not yet know.
+        //
+        // So: fail LOUD (nullopt → positioned diag) rather than emit a placement whose
+        // accesses silently drop the overhanging bits. Closing this properly means
+        // widening `BitFieldPlacement` to a multi-unit/byte-granular access and
+        // teaching both consumers — a change well outside the layout engine.
+        // MEASURED: inert on the whole macOS SDK pack+bit-field closure (no straddler);
+        // the one shape that trips it is `pack(2) struct { unsigned a; u64 b:40; }`.
+        std::uint64_t const bitInUnit = bitCursor % unitBits;
+        if (bitInUnit + w > unitBits) return std::nullopt;
         std::uint64_t const unitByteOffset = (bitCursor / unitBits) * fl->size;
         out.fieldOffsets.push_back(unitByteOffset);
         out.bitFields[i] = BitFieldPlacement{
             static_cast<std::uint32_t>(fl->size),
-            static_cast<std::uint32_t>(bitCursor % unitBits),
+            static_cast<std::uint32_t>(bitInUnit),
             w};
         bitCursor += w;
     }
@@ -232,6 +336,19 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                                   AggregateLayoutParams params, DataModel dm,
                                   StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
+    // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap, read
+    // ONCE and fed through `clampedBaselineAlign` at every alignment site below —
+    // the same treatment the GnuPacked packer gets. `#pragma pack(N)` is MSVC's OWN
+    // native mechanism, so ignoring it here was the more glaring half of the defect.
+    // ⚠ INFERRED, not cl.exe-MEASURED (no MSVC toolchain on this host): the clamp
+    // follows MSVC's documented `#pragma pack(n)` semantics ("align on the smaller of
+    // natural alignment or n") applied to a bit-field's allocation unit, matching
+    // clang's MicrosoftRecordLayoutBuilder (`FieldAlign = min(FieldAlign,
+    // MaxFieldAlignment)` in its `layoutBitField`). The unit-REUSE rule above is
+    // untouched — unlike the GNU straddle bump it is not gated on the cap, so this
+    // packer keeps its cl.exe-derived placement exactly.
+    bool const          packed  = interner.isPacked(id);
+    std::uint32_t const packCap = interner.maxFieldAlign(id);
     std::uint64_t highWaterByte = 0;   // one past all placed content
     std::uint64_t unitTypeSize  = 0;   // bytes of the open bit-field unit (0 = none)
     std::uint64_t unitStartByte = 0;   // byte offset where the open unit begins
@@ -251,8 +368,8 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 if (!elem) return std::nullopt;
                 // A FAM can carry `alignas`: raise its effective alignment
                 // (D-CSUBSET-MEMBER-ALIGNAS), mirroring the non-bit-field path.
-                auto const ea =
-                    bitfieldPackerEffectiveAlign(interner, id, i, elem->align);
+                auto const ea = bitfieldPackerEffectiveAlign(
+                    interner, id, i, packed, packCap, elem->align);
                 if (!ea) return std::nullopt;
                 std::uint64_t const fo = ea->alignUp(highWaterByte);
                 out.fieldOffsets.push_back(fo);
@@ -263,10 +380,11 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
             }
             auto const fl = computeLayout(f, interner, params, dm);
             if (!fl) return std::nullopt;
-            // Fold a member `alignas` override into the ordinary field's alignment
-            // (D-CSUBSET-MEMBER-ALIGNAS) — legal on a non-bit-field member of a
-            // bit-field-bearing struct; the offset AND struct align must honor it.
-            auto const ea = bitfieldPackerEffectiveAlign(interner, id, i, fl->align);
+            // Fold the cap + a member `alignas` override into the ordinary field's
+            // alignment (D-CSUBSET-MEMBER-ALIGNAS) — legal on a non-bit-field member
+            // of a bit-field-bearing struct; the offset AND struct align honor both.
+            auto const ea = bitfieldPackerEffectiveAlign(
+                interner, id, i, packed, packCap, fl->align);
             if (!ea) return std::nullopt;
             std::uint64_t const fo = ea->alignUp(highWaterByte);
             out.fieldOffsets.push_back(fo);
@@ -278,16 +396,21 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
         // its declared type's natural alignment.
         auto const fl = computeLayout(f, interner, params, dm);
         if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
-        out.align = maxAlign(out.align, fl->align);
+        // The unit's alignment — its declared type's, CLAMPED by the cap. Used both
+        // for the struct-alignment fold and to place the unit itself below, so a
+        // capped composite can never open a unit at an over-aligned byte.
+        auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
+        if (!unitAlign) return std::nullopt;
+        out.align = maxAlign(out.align, *unitAlign);
         std::uint64_t const t        = fl->size;          // unit type size (bytes)
         std::uint64_t const unitBits = t * 8;
         std::uint32_t const w        = *bw;
         if (w == 0) {
             // Zero-width unnamed bit-field: break the run AND force the high-water
-            // to this type's natural-unit boundary; no addressable field. (Next
+            // to this type's (capped) unit boundary; no addressable field. (Next
             // real field then opens fresh, re-aligned to ITS own type.)
             unitTypeSize  = 0;
-            highWaterByte = fl->align.alignUp(highWaterByte);
+            highWaterByte = unitAlign->alignUp(highWaterByte);
             out.fieldOffsets.push_back(highWaterByte);   // marker; unitBytes stays 0
             continue;
         }
@@ -295,8 +418,8 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
         bool const canContinue =
             (unitTypeSize == t) && (unitBitsUsed + w <= unitBits);
         if (!canContinue) {
-            // Open a fresh unit of this type at the next type-aligned byte.
-            unitStartByte = fl->align.alignUp(highWaterByte);
+            // Open a fresh unit of this type at the next (capped) type-aligned byte.
+            unitStartByte = unitAlign->alignUp(highWaterByte);
             unitTypeSize  = t;
             unitBitsUsed  = 0;
         }
@@ -631,11 +754,26 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // routes every existing struct down the unchanged byte path below.
             bool const anyBitfield = !interner.scalars(id).empty();
             // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
-            // packed baseline is applied ONLY on the non-bit-field path (the
-            // `effectiveAlign` lambda below). A packed struct reaching the bit-field
-            // packer would silently get a NON-packed layout, so fail loud here
-            // (nullopt → positioned diag). The semantic `S_PackedBitfieldUnsupported`
-            // is the good-UX front door; this nullopt is the reliable backstop.
+            // semantic phase REJECTS `packed` + bit-fields at the front door
+            // (`S_PackedBitfieldUnsupported`); this nullopt is its layout backstop.
+            //
+            // ★ TF-C97 deliberately KEEPS this belt, and the reason has changed. It
+            // used to hold because the packed baseline was applied ONLY on the
+            // non-bit-field path, so a packed struct reaching a packer got a silently
+            // NON-packed layout. That is no longer true: both packers now take the
+            // baseline through `clampedBaselineAlign` and honor `packed`, and
+            // `__attribute__((packed))` is MEASURED byte-identical to `#pragma
+            // pack(1)` for bit-fields on clang arm64 (`{char c; unsigned b:9;}` → 3/1,
+            // `{char c; u64 b:60; char d;}` → 10/1, `{u64 a; unsigned b:1;}` → 9/1,
+            // `{char c; unsigned :0; char d;}` → 5/1, all four spellings agreeing), so
+            // the LAYOUT half is now computable.
+            //
+            // It stays shut because opening it is NOT a layout-engine change: the
+            // semantic gate is what a user actually hits, and lifting only the
+            // backstop would leave the feature still rejected while removing the guard
+            // that keeps a future gate-lift from going silently wrong. Opening it =
+            // drop `S_PackedBitfieldUnsupported` + drop this line + pin the four
+            // shapes above — one deliberate cycle, not a side effect of this one.
             if (packed && anyBitfield) return std::nullopt;
             if (!anyBitfield) {
                 // D-CSUBSET-MEMBER-ALIGNAS: a struct may carry per-field `alignas`
@@ -657,27 +795,15 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 std::uint32_t const packCap = interner.maxFieldAlign(id);
                 auto effectiveAlign =
                     [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
-                    // D-CSUBSET-PACKED: a packed composite removes all derived padding
-                    // — the per-field BASELINE alignment becomes 1. A member `alignas`
-                    // still RAISES it via the MAX-fold below (alignas wins per-field
-                    // even under packed — `alignas(8) int x;` in a packed struct keeps
-                    // 8-byte alignment).
-                    //
-                    // TF-C82: `#pragma pack(N)` caps the baseline at N. `packed` is
-                    // the cap==1 special case and WINS when both apply (gcc agrees:
-                    // an explicit `__attribute__((packed))` is not weakened by a
-                    // surrounding `pack(4)`), which falls out of taking the packed
-                    // baseline FIRST and only clamping the natural one.
-                    Alignment baseline = packed ? Alignment::of<1>() : natural;
-                    if (!packed && packCap != 0 && packCap < baseline.bytes()) {
-                        auto const capped = Alignment::fromBytes(packCap);
-                        // The cap is validated a power of two in [1,256] at the
-                        // pragma AND again at `completeComposite`; an unrepresentable
-                        // value reaching here is an upstream bug, so fail loud rather
-                        // than silently lay the struct out uncapped.
-                        if (!capped) return std::nullopt;
-                        baseline = *capped;
-                    }
+                    // D-CSUBSET-PACKED / TF-C82: `packed` drops the per-field BASELINE
+                    // to 1 and `#pragma pack(N)` caps it at N — both via the ONE
+                    // shared clamp (TF-C97), which the bit-field packers now call too.
+                    // A member `alignas` still RAISES it via the MAX-fold below
+                    // (alignas wins per-field even under packed — `alignas(8) int x;`
+                    // in a packed struct keeps 8-byte alignment).
+                    auto const clamped = clampedBaselineAlign(packed, packCap, natural);
+                    if (!clamped) return std::nullopt;   // upstream bug — never silent
+                    Alignment const baseline = *clamped;
                     if (!hasAligns) return baseline;
                     std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
                     if (ovr == 0) return baseline;   // no override on this field
@@ -799,14 +925,12 @@ computeLayout(TypeId id, TypeInterner const& interner,
             std::uint32_t const packCap = interner.maxFieldAlign(id);
             auto effectiveAlign =
                 [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
-                // D-CSUBSET-PACKED: a packed union removes the per-member baseline
-                // alignment (→ 1); a member `alignas` still RAISES it via the MAX-fold.
-                Alignment baseline = packed ? Alignment::of<1>() : natural;
-                if (!packed && packCap != 0 && packCap < baseline.bytes()) {
-                    auto const capped = Alignment::fromBytes(packCap);
-                    if (!capped) return std::nullopt;   // upstream bug — never silent
-                    baseline = *capped;
-                }
+                // D-CSUBSET-PACKED / TF-C82: a packed union drops the per-member
+                // baseline to 1 and `#pragma pack(N)` caps it — the ONE shared clamp
+                // (TF-C97); a member `alignas` still RAISES it via the MAX-fold.
+                auto const clamped = clampedBaselineAlign(packed, packCap, natural);
+                if (!clamped) return std::nullopt;   // upstream bug — never silent
+                Alignment const baseline = *clamped;
                 if (!hasAligns) return baseline;
                 std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
                 if (ovr == 0) return baseline;   // no override on this member

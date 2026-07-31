@@ -673,6 +673,71 @@ TEST(TypeLayout, PragmaPackCapOnUnionLowersAlignAndSize) {
     EXPECT_EQ(l.size, 8u);
 }
 
+// ★★ TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the cap on a struct that
+// CONTAINS a bit-field — the hole in the block above.
+//
+// Every test above this one is bit-field FREE, and that was exactly the shape of the
+// defect: the cap was read only on the non-bit-field path, so ONE `unsigned b:1;`
+// made `computeLayout` forget it — no diagnostic, just the wrong ABI. The
+// cross-compile-compare twin lives in `test_packed_abi_conformance.cpp`
+// (`DssPackBitfieldLayoutMatchesNativeCompiler`, which re-derives these from the host
+// compiler); these hermetic pins hold on a box with no toolchain.
+//
+// clang -arch arm64 MEASURED (compiled AND run), cross-checked -arch x86_64.
+[[nodiscard]] TypeId cappedBitfieldStruct(TypeInterner& ti, std::string_view name,
+                                          std::uint64_t key,
+                                          std::span<TypeId const> fields,
+                                          std::span<std::int64_t const> widths,
+                                          std::uint32_t cap) {
+    TypeId const s = ti.forwardComposite(TypeKind::Struct, name, key);
+    ti.completeComposite(s, fields, /*packed=*/false, widths,
+                         /*fieldOffsets=*/{}, /*fieldAligns=*/{},
+                         /*explicitAlign=*/0, cap);
+    return s;
+}
+
+TEST(TypeLayout, PragmaPackCapAppliesToBitfieldBearingStruct) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(4) struct { unsigned long long a; unsigned b:1; }`
+    // clang: size 12, align 4.  Uncapped (what DSS computed before): 16 / 8.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::U64),
+                                       ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{kNotBitfield, 1};
+    TypeId const capped = cappedBitfieldStruct(ti, "QA", 1, fields, widths, 4u);
+    auto const l = layoutOf(capped, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 12u);           // RED-ON-DISABLE (uncapped 16)
+
+    // The CONTROL that makes both lines above non-vacuous: identical fields and
+    // widths, NO cap. Also the interning pin — the cap is part of the content
+    // identity even for a bit-field struct, so these must not collapse to one TypeId.
+    TypeId const nat = ti.forwardComposite(TypeKind::Struct, "QA", 2);
+    ti.completeComposite(nat, fields, /*packed=*/false, widths);
+    EXPECT_NE(nat.v, capped.v)
+        << "identical bit-field structs under different pack caps lay out to "
+           "different sizes; collapsing them onto one TypeId is a layout miscompile";
+    auto const ln = layoutOf(nat, ti, kGnu16);
+    EXPECT_EQ(ln.align.bytes(), 8u);
+    EXPECT_EQ(ln.size, 16u);
+}
+
+TEST(TypeLayout, PragmaPackCapMovesAnOrdinaryFieldThatFollowsABitfield) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(4) struct { unsigned b:3; unsigned long long a; }`
+    // clang: offsetof(a) == 4, size 12, align 4. Uncapped: a@8, size 16, align 8.
+    // The bit-field comes FIRST here, so this pins that the cap reaches the ORDINARY
+    // field's placement inside the bit-field packer — not just the struct alignment.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::U32),
+                                       ti.primitive(TypeKind::U64)};
+    std::array<std::int64_t, 2> const widths{3, kNotBitfield};
+    TypeId const capped = cappedBitfieldStruct(ti, "QB", 3, fields, widths, 4u);
+    auto const l = layoutOf(capped, ti, kGnu16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.align.bytes(), 4u);     // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 12u);             // RED-ON-DISABLE (uncapped 16)
+}
+
 TEST(TypeLayout, CompositeAlignedWeakerThanNaturalIsANoOp) {
     auto ti = makeInterner(1);
     // ★ THE MAX-vs-ASSIGNMENT CONTROL. clang:
