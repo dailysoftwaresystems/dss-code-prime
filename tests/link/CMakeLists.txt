@@ -79,6 +79,35 @@ dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)
 dss_add_test(NAME link/test_link_writer_new_identity
              SOURCES test_link_writer_new_identity.cpp)
 
+# D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED — the staging-temp claim must be
+# EXCLUSIVE (`fopen` mode "x" = O_CREAT|O_EXCL): race-free against a concurrent
+# process, and it STEPS OVER a stale `.dsstmp-*` left by a killed run instead of
+# adopting and truncating it. Nothing pinned that — disabling the exclusive
+# create left EVERY existing link-writer test green. That count is LEG-DEPENDENT
+# (MEASURED): 19 on POSIX = 12 in test_link_writer.cpp + 7 in
+# test_link_writer_new_identity.cpp; 18 on Windows, where
+# LinkWriter.ExecutableOutputCarriesExecuteBitPosix is compiled out by
+# `#ifndef _WIN32`. On either leg none of them touched exclusivity: each
+# concurrent writer targets a DIFFERENT path, and no test ever pre-created a
+# stale temp. The disable recipe is itself PER ARM — the two arms are genuinely
+# different code, so one measurement cannot cover both — Windows: `L"wbx"` ->
+# `L"wb"`; POSIX: drop `O_EXCL` from the `open` flags. Pinned by calling
+# `linker::detail::createExclusiveBinary`
+# DIRECTLY (fresh path opens; an existing path is refused and left byte-intact;
+# the refusal has no side effect), because the property is invisible through
+# `writeBytes` — its candidate names embed a pid and a process-wide counter. The
+# closing test then reaches the retry/`exists()`-continue branch at the
+# `writeBytes` level, and earns the right to pre-create candidate names by first
+# requiring an exhaustion failure over exactly `detail::kMaxClaimAttempts`
+# occupied slots — READ from writer.hpp, never hand-copied, so lowering the cap
+# cannot silently vacate those pins. A zero-byte write covers the empty-span
+# commit branch. The test file's header records which sub-assertions are
+# host-specific: exclusivity is red-on-disable on BOTH arms, but "leaves it
+# byte-intact" discriminates only on Windows (POSIX has no O_TRUNC here) and the
+# directory refusal passes either way on both.
+dss_add_test(NAME link/test_link_writer_exclusive_claim
+             SOURCES test_link_writer_exclusive_claim.cpp)
+
 # Plan 14 §2.13 D-LK10-ENTRY Slice C — runnable-binary spine
 # (first DSS-produced binary the OS actually runs).
 dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)

@@ -4,20 +4,22 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
-#include <fstream>
-#include <ios>
+#include <memory>
 #include <span>
 #include <string>
 #include <system_error>
 #include <utility>
 
-// `getpid` — a HOST process id, used only as the seed for a unique temp
-// filename (see `processSeed` below). Same include dance as
+// HOST facilities, not target ones: `getpid` seeds the unique temp filename
+// (see `processSeed` below), and on POSIX `open`/`O_EXCL` performs the atomic
+// exclusive claim (see `detail::createExclusiveBinary`). Same include dance as
 // `tests/test_support/scratch_dir.hpp`, which established this precedent.
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -48,10 +50,9 @@ void emit(DiagnosticReporter& reporter,
 // stale scratch dirs were being silently SHARED because the code claimed
 // its slot with a call that reports success when the slot already exists.
 // So the pid+counter pair here is only the SEED. The claim itself is made
-// ATOMICALLY by opening with `std::ios::noreplace` (C++23 P2467R1 —
-// `fopen` mode "x", i.e. O_CREAT|O_EXCL), which succeeds only when THIS
-// call created the file; a slot we did not create is stepped over, never
-// reused.
+// ATOMICALLY by `createExclusiveBinary` below (`fopen` mode "x", i.e.
+// O_CREAT|O_EXCL), which succeeds only when THIS call created the file; a
+// slot we did not create is stepped over, never reused.
 [[nodiscard]] std::uint64_t processSeed() {
 #ifdef _WIN32
     return static_cast<std::uint64_t>(_getpid());
@@ -59,6 +60,157 @@ void emit(DiagnosticReporter& reporter,
     return static_cast<std::uint64_t>(getpid());
 #endif
 }
+
+} // namespace
+
+// `createExclusiveBinary` lives in `detail` rather than the anonymous
+// namespace ABOVE for exactly one reason: the EXCLUSIVITY it provides is the
+// whole point of the claim loop below, and nothing that goes through
+// `writeBytes` can observe it directly — the claim's candidate name embeds a
+// pid and a process-wide counter, so a test that merely pre-creates a name and
+// watches it survive cannot tell "stepped over" from "never considered".
+// (Only exhausting every one of the `kMaxClaimAttempts` slots can, which is
+// what the integration arm of that test does — at a cost of a thousand files.
+// The property itself deserves a direct pin.) Declared in `writer.hpp` under the
+// same `detail` sub-namespace convention this tree already uses for
+// independently-testable sub-builders (`dss::macho::detail::
+// buildAdHocCodeSignature`, `dss::link::format::detail::writeU32LEAt`), and
+// pinned directly by `tests/link/test_link_writer_exclusive_claim.cpp`:
+// a fresh path opens, an EXISTING path is REFUSED (null) and left byte-intact.
+// RED ON DISABLE, stated PER ARM because the two arms are genuinely different
+// code and one measurement cannot cover both (the TF-C104 lesson recurring):
+// on Windows, swap `L"wbx"` for `L"wb"`; on POSIX, drop `O_EXCL` from the
+// `open` flags. Either one turns that second pin red.
+namespace detail {
+
+// Create `p` and open it for binary write EXCLUSIVELY — the call succeeds
+// only if it was the one that created the file. Returns null on ANY failure,
+// including the "someone already holds this name" case; the caller
+// disambiguates the two (see the claim loop in `writeBytes`).
+//
+// D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED — this reaches straight for
+// the CRT primitive instead of `std::ios::noreplace` (C++23 P2467R1), which
+// is the identical request expressed one layer up, because the iostreams
+// layer does not honour it for the argument type we pass. MEASURED on the
+// build compiler (MinGW-W64 UCRT g++ 13.2.0, `-std=c++23`), same directory,
+// same openmode `binary|out|noreplace`, varying ONLY what is handed to
+// `std::ofstream`:
+//     std::string             -> OPEN OK
+//     char const*             -> OPEN OK
+//     std::filesystem::path   -> FAILS, every time
+// On Windows `path::value_type` is `wchar_t`, so the path overload dispatches
+// into libstdc++'s WIDE `basic_filebuf` open while the other two arms take
+// the NARROW one. On POSIX `value_type` is `char`, so all three arms ARE the
+// narrow route — the Linux control (g++ 13.3.0) opens on all three. It is a
+// narrow-vs-wide CODE-PATH gap, not a compiler-version gap.
+//
+// The wide route does not merely IGNORE `noreplace` — it REJECTS it.
+// Controlled on the same wide (`fs::path`) overload, same directory, varying
+// ONLY that one bit:
+//     binary|out             -> OPEN OK
+//     binary|out|trunc       -> OPEN OK
+//     binary|out|noreplace   -> FAILS, and leaves NO file behind
+// So the wide openmode -> mode-string mapping matches no case containing the
+// bit and fails the open whole; it never degrades to a silent non-exclusive
+// open. Worth knowing when reading the C104 fallout: the regression was LOUD
+// (every write errored) and cannot have shipped a silently non-atomic claim
+// — but "loud" there meant no artifact at all.
+//
+// The trap is that it compiles perfectly clean (`__cpp_lib_ios_noreplace` ==
+// 202207 — the feature is "present"); the defect is runtime-only. That is how
+// it shipped in TF-C104 and took out EVERY artifact write on Windows
+// (`error[K_ImageWriteOpenFailed] ... failed to create the staging temp`,
+// 546 of 770 ctest cases red) while the two Linux legs stayed green.
+//
+// Going to `fopen`'s "x" is not a weaker substitute for `noreplace`: "x" is
+// what P2467R1 SPECIFIES `noreplace` to mean, so this is the same
+// atomic-check-and-create guarantee taken from the layer that actually
+// implements it. MEASURED here on the same toolchain: a fresh path opens, an
+// EXISTING path is REFUSED (null) and is left byte-intact — not truncated.
+//
+// `path::c_str()` returns `value_type const*`, which is already exactly the
+// type each host's CRT entry point wants, so neither arm narrows a path (the
+// throw hazard `pathForDiag` documents). This is the same shape as the
+// `getpid` split above: ONE `#ifdef _WIN32` for ONE CRT spelling, confined to
+// this function. It is a HOST split, never a target/format/language one.
+//
+// ★ THE TWO ARMS DELIBERATELY USE DIFFERENT PRIMITIVES, and the asymmetry is
+// the point rather than an oversight:
+//
+//   * Windows uses `_wfopen(…, L"wbx")` because it is MEASURED working on the
+//     leg we actually build here (fresh path opens; existing path refused,
+//     left byte-intact), and it keeps the wide path wide.
+//
+//   * POSIX uses `open(O_CREAT|O_EXCL)` + `fdopen` rather than
+//     `fopen(…, "wbx")`. Both were measured EQUIVALENT on glibc (fresh opens,
+//     existing refused, occupant's bytes preserved) — so this is not chosen on
+//     behaviour. It is chosen on GUARANTEE: `O_EXCL` is POSIX.1 MANDATORY and
+//     predates C11 by decades, whereas `"x"` is a C11 addition. Our POSIX legs
+//     are glibc; the DARWIN leg (libc++ / Apple libc) CANNOT BE TESTED FROM
+//     HERE, and "macOS surely implements C11 fopen 'x'" is exactly the kind of
+//     read-it-and-assume claim that produced the TF-C104 outage this function
+//     exists to repair. `O_EXCL` needs no such assumption.
+//
+//   * And the deeper reason: the defect being repaired WAS a library layer
+//     refusing a mode/openmode it did not recognise. `O_EXCL` expresses
+//     exclusivity as a kernel open flag, so it never passes through a
+//     mode-string parser at all — the failure mode is structurally absent
+//     rather than merely absent on the libcs we happened to test.
+//
+// `fdopen` adopts the descriptor on success. On FAILURE the POSIX arm has to
+// undo BOTH halves of what it has already done, because by the time `fdopen`
+// can fail the `open` above has ALREADY CREATED the file:
+//   * the descriptor is closed, so a failed claim can never leak an fd (the
+//     claim loop may run up to `kMaxClaimAttempts` times); and
+//   * the file that `open` just created is unlinked, so a failed claim leaves
+//     no residue behind.
+//
+// The second half is not housekeeping. The claim loop in `writeBytes`
+// disambiguates a null return by asking `std::filesystem::exists(candidate)`:
+// a zero-byte file WE created would read back as "another writer holds that
+// slot", so the loop would step over its OWN debris and try the next name. A
+// persistent `fdopen` failure (ENOMEM) would therefore leave up to
+// `kMaxClaimAttempts` empty `.dsstmp-*` files next to the artifact and then
+// emit a diagnostic blaming "an earlier run was killed before it could clean
+// up" — a FALSE attribution of a fault that is entirely inside THIS process.
+//
+// The Windows arm has no such window: `_wfopen(…, L"wbx")` creates nothing
+// when it fails. So both arms keep one promise — a claim that does not hand
+// back a stream leaves the directory exactly as it found it.
+[[nodiscard]] std::FILE*
+createExclusiveBinary(std::filesystem::path const& p) {
+#ifdef _WIN32
+    return ::_wfopen(p.c_str(), L"wbx");
+#else
+    // 0666 & umask — the same permissions `fopen` would have created, so
+    // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.
+    int const fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) { return nullptr; }
+    std::FILE* const f = ::fdopen(fd, "wb");
+    if (!f) {
+        ::close(fd);
+        ::unlink(p.c_str());
+    }
+    return f;
+#endif
+}
+
+} // namespace detail
+
+namespace {
+
+// Owning handle for the staging temp, so it is closed on EVERY path out of
+// `writeBytes` — including one where building a diagnostic string throws.
+// The COMMIT path deliberately takes the handle back with `release()` and
+// closes it itself, because there `fclose`'s return value is load-bearing
+// (K_ImageWriteCloseFailed). This deleter therefore only ever runs on paths
+// that have ALREADY failed loudly, where a deferred flush error on a file
+// that is about to be deleted is not new information — the same
+// one-failure == one-diagnostic rule `removeTempNote` follows.
+struct StagedFileCloser {
+    void operator()(std::FILE* f) const noexcept { std::fclose(f); }
+};
+using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 
 // Windows-safe path-to-string for diagnostic messages. Both
 // `path::string()` AND `path::generic_string()` perform narrowing
@@ -292,25 +444,30 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     //     point — writing through is what reuses the inode.
     // ─────────────────────────────────────────────────────────────────
 
-    // Claim a staging temp ATOMICALLY. `std::ios::noreplace` (C++23
-    // P2467R1) is `fopen` mode "x" — O_CREAT|O_EXCL — so the open succeeds
-    // only when THIS call created the file. That check-and-create is atomic
-    // in the OS, making it race-free against concurrent processes AND
-    // making it step over a stale temp left by a killed run instead of
-    // silently sharing it (the `scratch_dir.hpp` lesson; see `processSeed`).
+    // Claim a staging temp ATOMICALLY via `createExclusiveBinary` — `fopen`
+    // mode "x", O_CREAT|O_EXCL — so the open succeeds only when THIS call
+    // created the file. That check-and-create is atomic in the OS, making it
+    // race-free against concurrent processes AND making it step over a stale
+    // temp left by a killed run instead of silently sharing it (the
+    // `scratch_dir.hpp` lesson; see `processSeed`). Do NOT "modernise" this
+    // to `std::ofstream` + `std::ios::noreplace`: on this host that spelling is
+    // REJECTED OUTRIGHT — the open fails whole and leaves no file behind, so
+    // NO artifact is emitted at all. It never degrades to a silent
+    // non-exclusive open; it stops every write dead. Read the measurement on
+    // `createExclusiveBinary`
+    // (D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED).
     static std::atomic<std::uint64_t> tempCounter{0};
     auto const                        seed = processSeed();
-    constexpr std::uint32_t           kMaxClaimAttempts = 1000;
 
     std::filesystem::path tempPath;
-    std::ofstream         out;
+    StagedFile            out;
     for (std::uint32_t attempt = 0;; ++attempt) {
-        if (attempt >= kMaxClaimAttempts) {
+        if (attempt >= detail::kMaxClaimAttempts) {
             emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
                  std::string{"link::writeBytes: could not claim a unique "
                              "staging temp next to '"}
                      + pathForDiag(path) + "' after "
-                     + std::to_string(kMaxClaimAttempts)
+                     + std::to_string(detail::kMaxClaimAttempts)
                      + " attempts. Stale '.dsstmp-*' files are accumulating "
                        "in that directory — an earlier run was killed before "
                        "it could clean up. Delete them and re-run.");
@@ -324,12 +481,12 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         candidate += ".dsstmp-" + std::to_string(seed) + "-"
                    + std::to_string(tempCounter.fetch_add(1));
 
-        std::ofstream claim(
-            candidate,
-            std::ios::binary | std::ios::out | std::ios::noreplace);
-        if (claim) {
+        if (std::FILE* claimed = detail::createExclusiveBinary(candidate)) {
+            // Take ownership FIRST: the path assignment below allocates, and
+            // nothing between the successful open and the guard may be able
+            // to leave the handle unowned.
+            out.reset(claimed);
             tempPath = std::move(candidate);
-            out      = std::move(claim);
             break;
         }
         // The open failed, and the two causes need opposite responses.
@@ -354,9 +511,26 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         return false;
     }
 
-    out.write(reinterpret_cast<char const*>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size()));
-    if (!out) {
+    // `fwrite` is UB on a null pointer even with a zero count, and
+    // `span::data()` is permitted to be null for an EMPTY span, so a
+    // zero-byte artifact skips the call rather than betting on the libc being
+    // lenient. It still commits: an empty staging temp is renamed into place,
+    // which is the right answer for a producer whose output genuinely is zero
+    // bytes. (`writeImage` rejects empty bytes one level up, but the
+    // raw-bytes producers that call `writeBytes` directly do not.)
+    std::size_t const written =
+        bytes.empty()
+            ? std::size_t{0}
+            : std::fwrite(bytes.data(), 1, bytes.size(), out.get());
+    if (written != bytes.size()) {
+        // Close BEFORE attempting cleanup: on Windows an open handle blocks
+        // `remove`, so leaving it open would turn every short write into a
+        // leaked temp plus a misleading "could NOT be removed" note. The
+        // close's own status is deliberately not reported here — the write
+        // already failed loudly and these bytes are being discarded, so a
+        // deferred flush error on a file we are about to delete is not new
+        // information (one failure == one diagnostic, per `removeTempNote`).
+        out.reset();
         emit(reporter, DiagnosticCode::K_ImageWriteShort,
              std::string{"link::writeBytes: short write to the staging temp "
                          "for '"}
@@ -365,13 +539,17 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
                  + removeTempNote(tempPath));
         return false;
     }
-    out.close();
-    if (!out) {
-        // close() can fail when buffered writes flush to disk.
-        // ofstream destruction would silently swallow this; we
+    // `release()` hands the handle out of the guard so it is closed EXACTLY
+    // once — here, where the result is actually checked — and the guard is
+    // left empty for every path below.
+    if (std::fclose(out.release()) != 0) {
+        // fclose() can fail when buffered writes flush to disk.
+        // Letting the guard close it silently would swallow this; we
         // surface it as a write failure. Because the bytes were staged in a
         // temp, the artifact at `path` is still the PREVIOUS good one — the
-        // partial file is the temp, and it is removed.
+        // partial file is the temp, and it is removed. (`fclose` closes the
+        // stream even when it reports failure, so there is nothing left to
+        // release.)
         emit(reporter, DiagnosticCode::K_ImageWriteCloseFailed,
              std::string{"link::writeBytes: close() failed for the staging "
                          "temp for '"}

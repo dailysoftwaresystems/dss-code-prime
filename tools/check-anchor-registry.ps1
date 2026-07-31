@@ -30,8 +30,40 @@ function Get-Anchors([string]$Path, [string[]]$Filters) {
     return $anchors.Keys | Sort-Object
 }
 
-$srcAnchors = (Get-Anchors 'src'      @('*.cpp', '*.hpp', '*.json')) +
-              (Get-Anchors 'examples' @('*.c'))
+# The scanned set MUST match the .sh sibling EXACTLY (`src/ examples/` x
+# {cpp,hpp,json,c}). It did not: this script scanned `src` without `*.c` and
+# `examples` with ONLY `*.c`, so every anchor cited solely in an
+# `examples/**/expected.json` was invisible HERE while the .sh guard saw it —
+# measured 2026-07-31 as a reproducible 777 (ps1) vs 781 (sh) disagreement.
+# THAT divergence was false-NEGATIVE only (this guard checked strictly fewer
+# SOURCE files, so it could never red where .sh greens), which is precisely why
+# it survived: the weaker guard is the one the Windows leg runs.
+# ⚠ But "this guard is merely the weaker one" is NOT true in general — see
+# residual (iii) below, which leans the other way.
+# An instance of D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED — the pairing itself is
+# unenforced, so the two scripts can drift again silently. Note the registry
+# lists this pair as PAIRED, which was true and not sufficient: pairing by
+# EXISTENCE is not pairing by BEHAVIOUR.
+#
+# TWO KNOWN DIVERGENCES SURVIVE this fix. Neither bites today; both are
+# recorded so the next reader does not have to re-derive them:
+#   * `Get-ChildItem -Recurse` skips hidden files and directories unless
+#     `-Force` is passed, whereas `grep -r` descends into them. Harmless only
+#     while no source lives under a dotted path in `src/` or `examples/`.
+#   * The `.sh` FAIL path matches with `grep -rln` (a REGEX) while this one
+#     uses `-SimpleMatch` (a literal). Harmless only while anchor names carry
+#     no regex metacharacters — which the `D-[A-Z0-9_-]+` shape guarantees
+#     today, but nothing enforces.
+#   * (iii) THE PLAN-SIDE RESOLVE DIVERGES THE OTHER WAY, so this guard is not
+#     uniformly the weaker one: `.sh` resolves an anchor with
+#     `grep -qrF -- "$a" .plans/` over EVERY file under `.plans/`, whereas this
+#     script reads only `.plans/**/*.md`. That makes THIS guard STRICTER — a
+#     potential false-POSITIVE (an anchor cited only in a non-`.md` plan file
+#     would red here and green there). Inert today ONLY because `.plans/`
+#     currently contains zero non-`.md` files; nothing enforces that.
+$AnchorFileFilters = @('*.cpp', '*.hpp', '*.json', '*.c')
+$srcAnchors = (Get-Anchors 'src'      $AnchorFileFilters) +
+              (Get-Anchors 'examples' $AnchorFileFilters)
 $srcAnchors = $srcAnchors | Sort-Object -Unique
 
 # Read every plan-file's raw content for substring matching. Substring
@@ -59,7 +91,11 @@ Write-Host "have no matching row/citation in any .plans/*.md file:"
 Write-Host ""
 foreach ($a in $missing) {
     Write-Host "  $a"
-    $files = Get-ChildItem -Path 'src' -Recurse -File -Include '*.cpp', '*.hpp', '*.json'
+    # Same scanned set as the collection above — a citation this guard FOUND
+    # must also be LOCATABLE here, or the FAIL output names an anchor with no
+    # "cited in:" line and the fix is a guessing game.
+    $files = Get-ChildItem -Path 'src', 'examples' -Recurse -File `
+                           -Include $AnchorFileFilters -ErrorAction SilentlyContinue
     foreach ($f in $files) {
         if (Select-String -LiteralPath $f.FullName -Pattern $a -SimpleMatch -Quiet) {
             Write-Host "    cited in: $($f.FullName.Replace($RepoRoot + [IO.Path]::DirectorySeparatorChar, ''))"

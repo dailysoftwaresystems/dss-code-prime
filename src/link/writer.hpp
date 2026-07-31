@@ -5,6 +5,7 @@
 #include "link/linker.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <span>
 
@@ -102,7 +103,10 @@ writeImage(LinkedImage const&             image,
 //
 // ATOMIC REPLACE, NEW IDENTITY (D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING).
 // The bytes are staged in a uniquely-named SIBLING temp (`<path>.dsstmp-*`,
-// claimed with `std::ios::noreplace`) and then renamed over `path`. The
+// claimed with an exclusive create -- `detail::createExclusiveBinary` below;
+// NOT `std::ios::noreplace`, which is rejected outright for a
+// `std::filesystem::path` on MinGW/libstdc++ --
+// D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED) and then renamed over `path`. The
 // artifact is therefore never truncated in place, and every write produces a
 // NEW file identity -- required because macOS attaches an exec DENY to a
 // REUSED inode, killing a rebuilt binary at that inode (exit 137) while a
@@ -122,5 +126,56 @@ writeImage(LinkedImage const&             image,
 writeBytes(std::span<std::uint8_t const> bytes,
            std::filesystem::path const&  path,
            DiagnosticReporter&           reporter);
+
+// ── Internal seam ──────────────────────────────────────────────────────────
+//
+// NOT part of the substrate's contract; declared here only so the claim
+// behaviour `writeBytes` cannot expose through its own surface can be pinned
+// directly — the exclusive-claim primitive itself, and the attempt cap that
+// makes its exhaustion arm reachable. Same shape as the tree's other
+// independently-testable sub-builders
+// (`dss::macho::detail::buildAdHocCodeSignature`,
+// `dss::link::format::detail::writeU32LEAt`): the primitive is defined in the
+// .cpp and called by nothing outside it; both are exercised by
+// `tests/link/test_link_writer_exclusive_claim.cpp`.
+namespace detail {
+
+// How many staging-temp candidates `writeBytes` will try before it gives up
+// and fails loud. THE SINGLE SOURCE OF TRUTH for that cap: `writeBytes` reads
+// it, and a test that drives the exhaustion arm must READ IT TOO rather than
+// hand-copy the literal — which is why an implementation number is published
+// through this seam at all. The exhaustion arm is only reachable by occupying
+// exactly this many consecutive slots, so a copied literal goes silently
+// VACUOUS the moment the cap is LOWERED here: the test would occupy more slots
+// than the writer ever tries, still see the exhaustion failure it expects, and
+// then advance its derived slot counter further than the writer advanced its
+// own — leaving every later decoy off the writer's candidate list, where it
+// survives for the wrong reason and pins nothing.
+inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
+
+// Create `p` and open it for binary write EXCLUSIVELY: the call succeeds ONLY
+// if it was the one that created the file, and returns NULL for every other
+// outcome INCLUDING "the path already exists" -- i.e. O_CREAT|O_EXCL, exactly
+// what C++23's `std::ios::noreplace` is specified to mean, taken from the layer
+// that actually implements it (D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED).
+// The two arms reach that ONE semantic by DIFFERENT primitives and the wording
+// must not imply otherwise: Windows uses `_wfopen(…, L"wbx")` (the C11 "x"
+// mode), POSIX uses `open(O_CREAT|O_EXCL)` + `fdopen` and never calls `fopen`
+// at all. See writer.cpp for why that asymmetry is deliberate.
+//
+// That exclusivity is load-bearing twice over, and neither consequence is
+// observable through `writeBytes`: it makes the staging-temp claim race-free
+// against a concurrent process, and it makes a stale `.dsstmp-*` left by a
+// killed run get STEPPED OVER rather than silently shared and truncated (the
+// `tests/test_support/scratch_dir.hpp` lesson). An existing file is left
+// BYTE-INTACT by a refused claim -- never truncated. Reasoning, the measured
+// three-way path-type differential, and the host split are at the definition
+// site in writer.cpp.
+//
+// Caller owns the returned stream and must `std::fclose` it.
+[[nodiscard]] DSS_EXPORT std::FILE*
+createExclusiveBinary(std::filesystem::path const& p);
+
+} // namespace detail
 
 } // namespace dss::linker
