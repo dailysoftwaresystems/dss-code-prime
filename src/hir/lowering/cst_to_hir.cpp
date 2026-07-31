@@ -7760,9 +7760,19 @@ struct Lowerer {
     // ADDRESS-TAKEABLE, so `(cond ? die : other)(1)` is legal C; firstNameToken
     // would resolve that to `die` and wrongly wrap it → eliding `other`'s return
     // path = a MISCOMPILE. A ternary / deref / cast callee lowers to a NON-Ref node
-    // → false (safe, conservative); a function-POINTER object `fp(1)` lowers to
-    // Ref(fp) whose record has isNoreturn==false → false (safe). Only a bare direct
-    // call to a noreturn callee is wrapped.
+    // → false (safe, conservative). Only a bare direct call to a noreturn callee is
+    // wrapped.
+    //
+    // ★ TF-C94 — A FUNCTION-POINTER OBJECT NOW REACHES THIS PREDICATE FOR REAL.
+    // `fp(1)` has ALWAYS lowered its callee to `Ref(fp)`; what changed is that
+    // `SymbolRecord.isNoreturn` can now be TRUE for such a symbol, because Pass 1's
+    // noreturn apply admits a `Ptr<FnSig>` declarator (GNU binds the attribute to
+    // the pointee's function type, and host clang honors it there). This comment
+    // previously asserted the pointer case was "isNoreturn==false → false (safe)"
+    // as a standing property; it was only ever true because nothing SET the flag on
+    // a pointer, and that is exactly the shape of claim that rots. The wrap is
+    // correct here for the same reason it is correct for a direct call: the
+    // declaration says the callee does not return.
     [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
         if (builder.kind(id) != HirKind::Call) return false;
         auto const kids = builder.children(id);

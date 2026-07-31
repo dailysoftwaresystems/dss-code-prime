@@ -1683,6 +1683,217 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
 
+// ── TF-C101 — two INDEPENDENT C11 gaps that compose in Tcl 9.0's tclDecls.h ──
+//
+// The witness is `tclDecls.h:4046`'s TCLBOOLWARNING, which writes
+//   `(void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int), "…");
+//                          int dummy;}))`
+// and needs BOTH of these, each legal C11 on its own and each previously a hard
+// parse error (MEASURED at HEAD before this change: `P0001 expected 'ParenClose'
+// — got '{'` for (i); `P0009 … got '_Static_assert'` for (ii)):
+//
+//   (i)  6.7.7p1 + 6.5.3.4p2 — a struct-or-union-specifier WITH a member list is a
+//        legal specifier-qualifier-list, so an anonymous struct DEFINITION (not
+//        merely a tag reference) is a legal `sizeof` type-name operand. Fixed at
+//        the ONE type-name chokepoint, `castTypeBase`, by routing its composite
+//        arms through the c25 UNIFIED `structSpec`/`unionSpec`/`enumSpec` instead
+//        of the ref-only `structTypeRef`/`unionTypeRef`/`enumTypeRef`.
+//   (ii) 6.7.2.1p1 — `struct-declaration` has TWO productions, and the second is
+//        `static_assert-declaration`. Fixed in `structBody`/`unionBody` by making
+//        the member repeat an inline 2-way alt.
+//
+// The pins below assert them SEPARATELY before the composed form, because the two
+// halves were separately broken and a single composed test would not say which.
+//
+// ★ EVERY POSITIVE PIN HERE IS PAIRED WITH A FALSE TWIN, and that pairing is the
+// point rather than symmetry for its own sake: a `_Static_assert` that PARSES but
+// is never EVALUATED would make every positive pin pass while the construct was
+// silently inert — and the assertion in the real macro is load-bearing (it is what
+// enforces `sizeof(*boolPtr) <= sizeof(int)`). The false twins are what prove the
+// condition actually reaches `constIntExpr`. They also pin the FOLDED VALUE: a
+// `sizeof` that folded to the wrong number would flip both counts.
+
+// (i) alone — an anonymous struct DEFINITION as the sizeof type-name operand. The
+// static_assert here is only the oracle: it reports what the sizeof folded to.
+TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(struct { int dummy; }) == 4, \"anon struct is 4\");\n"
+        "_Static_assert(sizeof(struct { int a; int b; }) == 8, \"anon struct is 8\");\n"
+        "_Static_assert(sizeof(union { int a; double b; }) == 8, \"anon union is 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof over an INLINE anonymous struct/union definition must parse "
+           "(C 6.7.7p1) and lay the body out through the aggregateLayout engine";
+}
+
+// The false twin of (i): proves the size is really COMPUTED from the inline body,
+// not rubber-stamped. Both assertions must fail — 2, not 1, not 0.
+TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionWrongSizeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(struct { int dummy; }) == 99, \"not 99\");\n"
+        "_Static_assert(sizeof(struct { int a; int b; }) == 4, \"not 4\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 2u)
+        << "a WRONG size over an inline anonymous struct must fail loud — the "
+           "positive pin above must not be passing on a rubber-stamped fold";
+}
+
+// REGRESSION PIN for the castTypeBase swap. Replacing the ref-only arms with the
+// unified specifiers must NOT disturb the pre-existing tag-REFERENCE reading in a
+// type-name position — `sizeof(struct S)` / `sizeof(union U)` / `sizeof(enum E)`
+// all still resolve their tag (body-absent ⇒ the `isTagReference` arm). This is
+// the test that would have caught the swap breaking what already worked.
+TEST(SemanticAnalyzerCSubset, SizeofNamedCompositeTagStillResolvesAfterUnify) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "union  U { int a; double b; };\n"
+        "enum   E { E0, E1 };\n"
+        "_Static_assert(sizeof(struct S) == 8, \"S is 8\");\n"
+        "_Static_assert(sizeof(union U) == 8, \"U is 8\");\n"
+        "_Static_assert(sizeof(enum E) == 4, \"E is 4\");\n"
+        "int main(void){ return (int)sizeof(struct S); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a body-ABSENT composite in a type-name is still a tag reference";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u)
+        << "the unified specifier must resolve the tag exactly as the ref-only "
+           "rule it replaced did";
+}
+
+// (ii) alone — `_Static_assert` as a struct-declaration (C 6.7.2.1p1), TRUE arm.
+TEST(SemanticAnalyzerCSubset, StaticAssertAsStructMemberParses) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(sizeof(int) <= sizeof(long), \"int fits in long\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "union V {\n"
+        "  static_assert(sizeof(int) == 4);\n"
+        "  int dummy;\n"
+        "};\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a static_assert is a legal struct-declaration in BOTH composite bodies "
+           "and in BOTH spellings (reserved + C23 1-arg)";
+}
+
+// ★ THE LOAD-BEARING NEGATIVE. Admitting the construct without EVALUATING it would
+// be a silent hole: the grammar change alone makes the true pin above pass. These
+// three assertions are false and MUST each fail loud, from struct-member position,
+// union-member position, and through the aggregateLayout fold.
+TEST(SemanticAnalyzerCSubset, StaticAssertFalseInStructMemberFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(1 == 2, \"struct member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "union V {\n"
+        "  _Static_assert(sizeof(int) == 99, \"union member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "struct T {\n"
+        "  _Static_assert(sizeof(struct S) == 77, \"layout-folded member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 3u)
+        << "a FALSE static assertion in member position must fail loud — parsing "
+           "it and skipping the check would be a silent hole";
+}
+
+// A static_assert is a DECLARATION, not a member: it must mint no field and must
+// not perturb the layout. The oracle is the enclosing struct's own size — a
+// mistakenly-minted field would change it and this would fail loud.
+TEST(SemanticAnalyzerCSubset, StaticAssertStructMemberMintsNoField) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(1, \"leading\");\n"
+        "  int a;\n"
+        "  _Static_assert(1, \"middle\");\n"
+        "  int b;\n"
+        "  _Static_assert(1, \"trailing\");\n"
+        "};\n"
+        "_Static_assert(sizeof(struct S) == 8, \"asserts mint no field\");\n"
+        "int main(void){ struct S s; s.a = 1; s.b = 2; return s.a + s.b; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "static_assert declarations in leading/middle/trailing member position "
+           "must not add storage — sizeof(struct S) stays 8";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "the real fields around the assertions must still resolve";
+}
+
+// (i)+(ii) COMPOSED — the literal tclDecls.h:4046 TCLBOOLWARNING shape, in both
+// polarities. `int *boolPtr` ⇒ 4 <= 4 holds; the false twin uses `long long *`
+// ⇒ 8 <= 4, which is exactly the misuse the real macro exists to catch.
+TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormHolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  int b = 0;\n"
+        "  int *boolPtr = &b;\n"
+        "  (void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int),"
+        " \"sizeof(boolPtr) too large\");int dummy;}));\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the composed Tcl 9 macro must compile clean for a correctly-sized "
+           "pointee";
+}
+
+TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormCatchesOversizedPointee) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  long long b = 0;\n"
+        "  long long *boolPtr = &b;\n"
+        "  (void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int),"
+        " \"sizeof(boolPtr) too large\");int dummy;}));\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "an 8-byte pointee must trip the macro's assertion — this is the check "
+           "the construct exists to perform, and admitting it inertly would lose it";
+}
+
 // ── C11/C23 6.5.3.4 _Alignof — the alignof-folding requirement ───────────────
 //
 // `_Static_assert(_Alignof(T)==N, ...)` const-evaluates the alignof through the
@@ -9695,6 +9906,29 @@ TEST(SemanticAnalyzerCSubset, EnumUnderlyingStructFailsLoud) {
         << "a struct underlying type must fail loud S_InvalidEnumUnderlyingType";
 }
 
+// TF-C101 — the pin that keeps `enumUnderlyingBase` SEPARATE from `castTypeBase`.
+// The clause's base is followed immediately by the enumerator-list `{`, so it must
+// stay REF-ONLY: routing it through the definition-admitting type-name base makes
+// `structSpec`'s greedy `{optional structBody}` swallow `{ A }`, the struct body
+// then desyncs on `A`, the speculative clause rolls back whole, and the single
+// precise diagnostic above becomes a nine-entry parse cascade (MEASURED). This test
+// is the TYPEDEF spelling of the same constraint violation — it reaches the check
+// through the Identifier arm, with no brace binding in play — so the two together
+// pin the constraint from both directions and neither can be satisfied by a parse
+// error standing in for the analysis.
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingTypedefStructFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Foo { int x; };\n"
+        "typedef struct Foo FooT;\n"
+        "enum E : FooT { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a typedef'd struct underlying type must fail loud by CONSTRAINT, at the "
+           "semantic tier — not as a parse cascade";
+}
+
 TEST(SemanticAnalyzerCSubset, EnumeratorValueOutOfRangeFailsLoud) {
     auto model = analyzeShipped("c-subset", {
         "enum E : unsigned char { A = 256 };\n"
@@ -14717,4 +14951,175 @@ TEST(SemanticAnalyzerCSubset, CrossOriginTagStaysDistinctOnLlp64) {
         << "★ THE ANTI-GLOBAL-KEY ASSERTION: the SAME tag under a DIFFERENT data "
            "model must remain a DIFFERENT TypeId — a global key would have "
            "unified these and handed one leg the other's layout";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C94 (D-CSUBSET-GNU-ATTRIBUTE): the LEADING struct/union member attribute
+// position, and the `noreturn` sink that makes opening it safe.
+//
+// THE WITNESS: Tcl 9.0's `TclStubs` (tclDecls.h:1893/:2024/:2185) writes
+//   TCL_NORETURN1 void (*tcl_Panic) (const char *format, ...) …;
+// where tcl.h:116 expands TCL_NORETURN1 to `__attribute__ ((__noreturn__))`.
+// Before this cycle the shape was `error[P0009] … got '__attribute__'`.
+//
+// ★★ WHY THESE TESTS ASSERT A FLAG AND NOT "no error". Opening an attribute
+// POSITION whose names have no consumer converts a LOUD parse error into a
+// SILENT drop — the trap `compositeAttrList`'s $packedStaysNoneComment records
+// after `packed` compiled clean at the wrong `sizeof`. A member can NEVER be a
+// FnSig (host clang: "field 'f' declared as a function"), so under the old
+// `isFnSig`-only apply gate every `noreturn` written here would have been READ
+// by `specifierPrefixNamesNoreturn` and then discarded. The gate now admits
+// `Ptr<FnSig>` — which is what GNU means (the attribute binds the POINTEE's
+// function type) and what host clang honors — so the fact lands on the symbol.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// (a) THE TCL SHAPE. The decorated member's SymbolRecord carries isNoreturn;
+// the undecorated sibling member of the SAME struct does NOT — so the flag
+// tracks the SPELLING, not the position or the type.
+// RED-ON-DISABLE: revert the apply gate to `isFnSig &&` → `panic` flips false
+// while `plain` stays false, i.e. the attribute parses and vanishes.
+TEST(SemanticAnalyzerCSubset, NoreturnOnStructMemberFunctionPointerReachesTheSink) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct TclStubs {\n"
+        "    __attribute__((__noreturn__)) void (*panic)(int);\n"
+        "    void (*plain)(int);\n"
+        "};\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "the leading GNU member attribute must analyze cleanly";
+
+    SymbolRecord const* panic = findSym(model, "panic");
+    SymbolRecord const* plain = findSym(model, "plain");
+    ASSERT_NE(panic, nullptr);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_TRUE(panic->isNoreturn)
+        << "__attribute__((__noreturn__)) on a function-pointer MEMBER must "
+           "reach SymbolRecord.isNoreturn — parsing it and dropping it is the "
+           "silent-miscompile shape this position was opened to avoid";
+    EXPECT_FALSE(plain->isNoreturn)
+        << "an undecorated member of the same struct must stay clean — the flag "
+           "must track the spelling, not the member list";
+}
+
+// (b) THE SAME SPELLING IN THE ALREADY-OPEN FILE-SCOPE POSITION, where the flag
+// is not merely recorded but CONSUMED: a call through such an object lowers its
+// callee to Ref(gp), which `isDirectNoreturnCall` reads (see the HIR pin
+// NoreturnFunctionPointerObjectCallWrapsAndVerifies). Host clang is likewise
+// SILENT here and honors it (-Wreturn-type, measured).
+TEST(SemanticAnalyzerCSubset, NoreturnOnFunctionPointerObjectReachesTheSink) {
+    auto cu = buildShippedUnit("c-subset", {
+        "__attribute__((__noreturn__)) void (*gp)(int);\n"
+        "void (*gp2)(int);\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* gp  = findSym(model, "gp");
+    SymbolRecord const* gp2 = findSym(model, "gp2");
+    ASSERT_NE(gp, nullptr);
+    ASSERT_NE(gp2, nullptr);
+    EXPECT_TRUE(gp->isNoreturn);
+    EXPECT_FALSE(gp2->isNoreturn);
+}
+
+// (c) THE WIDENING MUST NOT LEAK. A plain data object still gets NO flag: the
+// gate admits FnSig and Ptr<FnSig> ONLY, so the pre-existing
+// `_Noreturn`-on-a-non-function safe-miss deferral is untouched and no data
+// symbol carries a codegen directive nothing can honor. Host clang WARNS on
+// this shape ("'__noreturn__' only applies to function types", measured); DSS's
+// silence here is the separate open row
+// D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT / the `none`-verb
+// row split, NOT something this cycle introduced.
+// RED-ON-DISABLE: widen the gate to "any declarator" → both EXPECTs flip.
+TEST(SemanticAnalyzerCSubset, NoreturnOnPlainDataObjectStaysInert) {
+    auto cu = buildShippedUnit("c-subset", {
+        "__attribute__((__noreturn__)) int gv = 1;\n"
+        "struct S { __attribute__((__noreturn__)) int m; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    SymbolRecord const* gv = findSym(model, "gv");
+    SymbolRecord const* m  = findSym(model, "m");
+    ASSERT_NE(gv, nullptr);
+    ASSERT_NE(m, nullptr);
+    EXPECT_FALSE(gv->isNoreturn)
+        << "a non-function, non-function-pointer object must carry NO noreturn";
+    EXPECT_FALSE(m->isNoreturn)
+        << "the member arm must obey the same gate as the file-scope arm";
+}
+
+// (d) THE POSITION REACHES `scanAttributeSemantics`, NOT JUST THE NORETURN
+// SCAN. A leading `aligned(N)` on a member is HONORED into the member symbol's
+// explicitAlignment — the same sink the shipped TRAILING member slot feeds — so
+// the whole effects table is live in the new position, not only one name.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignedAttributeIsHonored) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { __attribute__((aligned(16))) int a; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->explicitAlignment.has_value())
+        << "a LEADING member `aligned(N)` must reach the alignment sink";
+    EXPECT_EQ(*a->explicitAlignment, 16u);
+}
+
+// (e) AN UNRECOGNIZED GNU NAME IN THE NEW POSITION IS LOUD. structField /
+// unionField carry `unknownStrictAttributeIsError: true`, and the leading slot
+// inherits it because it folds into the SAME declaration's facts. Without this
+// the new position would be a hole in the name axis exactly as
+// D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP describes.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingUnknownAttributeIsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { __attribute__((frobnicate)) int x; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "an unknown GNU attribute name in the leading member position must "
+           "fail loud, never be skipped";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+}
+
+// (f) THE DECL-KIND GATE (TF-C93) IS LIVE IN THE NEW POSITION. `noinline` is
+// `appliesTo: ["function"]`, a member is a variable, so the shared warning
+// fires — identical to what the shipped TRAILING member slot already does
+// (measured at the pre-change HEAD). One attribute must not mean two different
+// things depending on which side of the declarator it is written.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingNoinlineWarnsLikeTheTrailingSlot) {
+    for (char const* src : {
+             "struct S { __attribute__((noinline)) int x; };\n",
+             "struct S { int x __attribute__((noinline)); };\n"}) {
+        auto cu = buildShippedUnit("c-subset", { std::string(src) });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  1u)
+            << "leading and trailing member slots must be judged identically: "
+            << src;
+    }
+}
+
+// (g) REGRESSION: the rule that grew the alt still carries its original
+// content, and a MIXED run (alignas + attribute, either order) folds both.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignasAndAttributeCompose) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { alignas(16) __attribute__((__noreturn__)) void (*p)(int); };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->explicitAlignment.has_value())
+        << "the alignas branch of the run must still reach its sink";
+    EXPECT_EQ(*p->explicitAlignment, 16u);
+    EXPECT_TRUE(p->isNoreturn)
+        << "and the attribute branch beside it must still reach its own";
 }

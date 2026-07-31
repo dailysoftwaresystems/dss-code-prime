@@ -815,6 +815,12 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
 // forward-declared so pass2Post's nullptr operator gate (D-CSUBSET-NULLPTR) can
 // classify a binary/unary operator by its shared HIR verb.
 [[nodiscard]] std::optional<HirOpKind> coreOpFromNameSem(std::string_view s);
+// TF-C94: `Ptr<FnSig>` — a pointer-to-function TYPE, zero language identity.
+// Defined below (beside the call-path unwrapping that is its other caller);
+// forward-declared so Pass-1's `noreturn` apply can ask the question with the
+// SAME predicate the call path already uses, rather than growing a second,
+// differently-shaped hand-copy of "is this a function pointer?".
+[[nodiscard]] bool isFnPointerType(TypeInterner const& in, TypeId t);
 
 // R1: the SINGLE source for member-access (`obj.field` / `ptr->field`) field-type
 // resolution, shared by the Pass-2 member arm (which adds diagnostics + symbol
@@ -7257,12 +7263,64 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             return k;
                         };
                         // FC16 (D-CSUBSET-NORETURN): mark a FUNCTION symbol whose
-                        // declaration named the attribute. Gated on `isFnSig` so a
+                        // declaration named the attribute. Gated so a
                         // `_Noreturn int x;` (non-function) is INERT (a safe miss —
                         // the named `_Noreturn`-on-non-function deferral), never a
                         // wrongly-flagged data object. OR-merged into a proto/def
                         // survivor by the post-1.5 sweep so a call sees the flag.
-                        if (isFnSig && declHasNoreturn)
+                        //
+                        // ★★ TF-C94 — THE GATE ADMITS `Ptr<FnSig>` AS WELL AS
+                        // `FnSig`, AND THAT WIDENING IS WHAT MAKES THE LEADING
+                        // MEMBER ATTRIBUTE POSITION (c-subset's
+                        // `structMemberDeclSpecifier`) HONORED RATHER THAN
+                        // PARSED-AND-DROPPED. A struct/union member can NEVER be a
+                        // FnSig — MEASURED, `struct T { __attribute__((noreturn))
+                        // void f(int); };` is `error: field 'f' declared as a
+                        // function` in host clang too — so under an `isFnSig`-only
+                        // gate every `noreturn` written on a member would be read
+                        // by `specifierPrefixNamesNoreturn` and then discarded in
+                        // silence. The shipped witness is Tcl 9's `TclStubs`
+                        // (`tclDecls.h:1893/:2024/:2185`, the `TCL_NORETURN1`
+                        // macro), whose members are POINTERS to noreturn functions.
+                        //
+                        // ★ IT IS THE C SEMANTICS, NOT AN ACCOMMODATION. GNU binds
+                        // `noreturn` to the FUNCTION TYPE, so on a pointer
+                        // declarator it appertains to the POINTEE, and host clang
+                        // HONORS it there — MEASURED, `struct S {
+                        // __attribute__((__noreturn__)) void (*p)(int); }; int
+                        // f(struct S *s) { s->p(1); }` draws NO `-Wreturn-type`
+                        // while the undecorated control DOES. clang is likewise
+                        // SILENT on `__attribute__((__noreturn__)) void
+                        // (*gp)(int);` while it WARNS on `__attribute__((
+                        // __noreturn__)) int gv;` ("only applies to function
+                        // types") — so a gate that refused the pointer would
+                        // diverge from every real toolchain on the one shape that
+                        // matters, and would have been a NEW instance of
+                        // D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT.
+                        //
+                        // ★ THE FLAG IS REALLY CONSUMED FOR A FUNCTION-POINTER
+                        // OBJECT, WHICH IS WHY THIS IS A SINK AND NOT A PARKING
+                        // SPOT: a call through such an object lowers its callee to
+                        // `Ref(fp)` (see cst_to_hir's `isDirectNoreturnCall`, whose
+                        // comment records the previously-always-false pointer case),
+                        // so `fp(1);` now wraps `Block{ExprStmt(call),Unreachable}`
+                        // exactly as a direct call to a noreturn function does. For
+                        // a struct MEMBER the fact is RECORDED on the member's
+                        // SymbolRecord but not yet read — `s->p(1)`'s callee is a
+                        // field access, not a `Ref` — the honest residue, and the
+                        // reason the fact is stored now rather than re-derived
+                        // later (the `no_sanitize_thread` "true NOW, not true by
+                        // vacuity" posture).
+                        //
+                        // ★ NOTHING ELSE MOVES: a non-function, non-function-pointer
+                        // declarator still gets NO flag, so the `_Noreturn int x;`
+                        // deferral is untouched, and the predicate is the SHARED
+                        // `isFnPointerType` the call path uses — no second
+                        // hand-copy to lose a term.
+                        bool const noreturnCarrier =
+                            isFnSig
+                            || isFnPointerType(s.lattice.interner(), declTy);
+                        if (noreturnCarrier && declHasNoreturn)
                             s.symbols.at(sym).isNoreturn = true;
                         // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99
                         // 6.7.4): record the inline-without-extern reading on a

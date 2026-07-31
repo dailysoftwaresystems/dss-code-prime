@@ -1936,11 +1936,15 @@ struct DSS_EXPORT SemanticConfig {
     // 6.7.4); `noreturnAttributeNames` is the recognized ATTRIBUTE-identifier set
     // (`noreturn` — C23 6.7.12.7 `[[noreturn]]` / GNU `__attribute__((noreturn))`
     // / `[[gnu::noreturn]]`, dunder-normalized at the scan so `__noreturn__`
-    // matches). The semantic tier scans a function declaration's SPECIFIER PREFIX
-    // for EITHER form (`specifierPrefixNamesNoreturn`) and marks the function
-    // symbol `isNoreturn`; the HIR lowering then wraps a direct call to such a
+    // matches). The semantic tier scans a declaration's SPECIFIER PREFIX for
+    // EITHER form (`specifierPrefixNamesNoreturn`) and marks the symbol
+    // `isNoreturn`; the HIR lowering then wraps a direct call to such a
     // function as `Block{ ExprStmt(call), Unreachable }` so a noreturn-terminated
     // path structurally terminates (the `wrapIfProvablyInfinite` precedent).
+    // TF-C94: the apply admits a POINTER-to-function declarator as well as a
+    // function one (GNU binds the attribute to the pointee's function type, which
+    // is what a Tcl-9 `TclStubs` member spells), so a call through such a pointer
+    // wraps identically; anything else still gets NO flag.
     // Both invalid/empty ⇒ the language has no `noreturn` surface (the scan never
     // runs — toy/tsql). Source-AGNOSTIC: WHICH token + WHICH names are per-language
     // config; the engine never hardcodes the spelling "noreturn".

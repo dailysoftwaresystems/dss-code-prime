@@ -2583,6 +2583,130 @@ TEST(ParserCSubsetSmoke, MidListMemberAttributeFailsLoud) {
            "never parse into a shape that drops the attribute";
 }
 
+// ── TF-C94: the LEADING member attribute position (`structMemberDeclSpecifier`)
+//
+// The Tcl-9 gap. `struct TclStubs { TCL_NORETURN1 void (*tcl_Panic)(…); … }`
+// (tclDecls.h:1893/:2024/:2185, the `tcl.h:116` macro
+// `#define TCL_NORETURN1 __attribute__ ((__noreturn__))`) put a GNU attribute
+// BEFORE a member's declaration-specifiers, which GNU 6.34 permits on any
+// declaration. RED-ON-DISABLE (measured through the real CLI at the pre-change
+// HEAD): restore `"sequence": [ "alignasSpec", { "repeat": "alignasSpec" } ]` on
+// `structMemberDeclSpecifiers` and this input reports
+//   error[P0009]: expected 'Identifier', 'BlockClose', 'VoidKeyword', … — got
+//                 '__attribute__'
+// plus two cascading `— got '('`, all with `scope: Block`.
+//
+// The prefix is child 0 and is STRIPPED by decl_prefix_strip.hpp before
+// positional counting, so the structField row's `head: 0` / `declaratorList: 1`
+// are unmoved — the same contract `structMemberDeclSpecifiers` already had for
+// `alignas`. That is what the role string pins: the attribute must ride the
+// EXISTING prefix rather than becoming a new positional child.
+constexpr std::string_view kLeadDecoratedMemberRoles =
+    "rule:structMemberDeclSpecifiers/rule:typeRefAllowingStruct/"
+    "rule:structMemberDeclaratorList/tok:EndStatement";
+
+TEST(ParserCSubsetSmoke, StructMemberLeadingGnuAttributeRidesTheSpecifierPrefix) {
+    Tree t = parseCSubset(
+        "struct S { __attribute__((__noreturn__)) void (*p)(int); };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the Tcl 9 TclStubs member shape must parse: " << firstErrorText(t);
+
+    NodeId const field = findFirstNodeWithRule(t, "structField");
+    ASSERT_TRUE(field.valid());
+    EXPECT_EQ(visibleChildRoles(t, field), kLeadDecoratedMemberRoles)
+        << "the leading decoration must ride the specifier PREFIX (child 0, "
+           "stripped) — head/declaratorList must not shift";
+
+    // ★ THE HONORING PIN, not a shape pin. `specifierPrefixChild` returns this
+    // node, and `specifierPrefixNamesNoreturn` / `scanAttributeSemantics` /
+    // `firstAlignasSpecInPrefix` all walk it. An attrSpec parked anywhere else
+    // would parse and be invisible to every one of them.
+    NodeId const prefix = findFirstNodeWithRule(t, "structMemberDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(t.parent(prefix).v, field.v)
+        << "structMemberDeclSpecifiers must be a DIRECT child of structField — "
+           "that is what specifierPrefix matches";
+    EXPECT_EQ(visibleChildRoles(t, prefix), "rule:structMemberDeclSpecifier")
+        << "one specifier in the run";
+    NodeId const one = findFirstNodeWithRule(t, "structMemberDeclSpecifier");
+    ASSERT_TRUE(one.valid());
+    EXPECT_EQ(t.parent(one).v, prefix.v);
+    EXPECT_EQ(visibleChildRoles(t, one), "rule:attrSpec")
+        << "the alt must have committed to the GNU attribute branch";
+}
+
+TEST(ParserCSubsetSmoke, UnionMemberLeadingGnuAttributeMirrorsStruct) {
+    Tree t = parseCSubset(
+        "union U { __attribute__((__noreturn__)) void (*p)(int); int x; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "unionField shares the member prefix rule: " << firstErrorText(t);
+    NodeId const field = findFirstNodeWithRule(t, "unionField");
+    ASSERT_TRUE(field.valid());
+    EXPECT_EQ(visibleChildRoles(t, field), kLeadDecoratedMemberRoles)
+        << "unionField mirrors structField exactly — one attribute must not mean "
+           "two things depending on which composite it is written in";
+}
+
+// REGRESSION: the rule that grew the alt still parses its ORIGINAL content.
+// `alignas` now reaches the prefix through `structMemberDeclSpecifier` instead
+// of directly, and the extra wrapper level must be transparent (every prefix
+// consumer is a bounded descendant walk, never a fixed-child-index read).
+TEST(ParserCSubsetSmoke, StructMemberLeadingAlignasStillRidesTheSamePrefix) {
+    Tree t = parseCSubset("struct S { alignas(16) int a; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    NodeId const prefix = findFirstNodeWithRule(t, "structMemberDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(visibleChildRoles(t, prefix), "rule:structMemberDeclSpecifier");
+    NodeId const one = findFirstNodeWithRule(t, "structMemberDeclSpecifier");
+    ASSERT_TRUE(one.valid());
+    EXPECT_EQ(visibleChildRoles(t, one), "rule:alignasSpec")
+        << "the alignment branch of the alt must still be reachable";
+}
+
+// The two member slots are INDEPENDENT: a leading decoration and the shipped
+// TF-C73 trailing one coexist on one member, each in its own node, and the
+// declarator list still sits between them at role index 1 post-strip.
+TEST(ParserCSubsetSmoke, MemberLeadingAndTrailingAttributeSlotsCoexist) {
+    Tree t = parseCSubset(
+        "struct S { __attribute__((aligned(8))) int x __attribute__((aligned(16))); };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    NodeId const field = findFirstNodeWithRule(t, "structField");
+    ASSERT_TRUE(field.valid());
+    EXPECT_EQ(visibleChildRoles(t, field),
+              "rule:structMemberDeclSpecifiers/rule:typeRefAllowingStruct/"
+              "rule:structMemberDeclaratorList/rule:structMemberAttrList/"
+              "tok:EndStatement")
+        << "leading prefix + trailing run must both be present and distinct";
+}
+
+// A member with NO leading decoration must emit NO prefix node — the
+// `{ optional }` stays absent, so the post-strip indices of the undecorated
+// form are byte-identical to what they were before this cycle.
+TEST(ParserCSubsetSmoke, UndecoratedMemberEmitsNoLeadingSpecifierPrefix) {
+    Tree t = parseCSubset("struct S { int x; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "structMemberDeclSpecifiers"))
+        << "no leading specifier is present, so the optional must emit NOTHING";
+}
+
+// NAMED RESIDUE, pinned so it stays LOUD rather than drifting into a silent
+// mis-parse. `structMemberDeclSpecifier` admits the GNU `attrSpec` only — the
+// C23 `[[…]]` spelling is excluded to keep BracketOpen out of the prefix's
+// FIRST set. The input is valid C23 (clang accepts AND honors it, measured) —
+// this pins DSS's narrower admission, not a claim about the language.
+TEST(ParserCSubsetSmoke, LeadingStdAttributeOnAMemberFailsLoud) {
+    Tree t = parseCSubset("struct S { [[deprecated]] int x; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "a leading C23 member attribute is residue — it must fail loud, "
+           "never parse into a shape that drops the attribute";
+}
+
 // ── TF-C73: `stdAttrItem`'s argument is now the shared `attrArgs` rule ───────
 //
 // RED-ON-DISABLE (measured): restore the inline

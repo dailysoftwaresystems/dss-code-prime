@@ -2274,6 +2274,66 @@ TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
     }
 }
 
+// ── TF-C94: a call through a function POINTER whose DECLARATION spells
+//    `noreturn` IS wrapped — the other half of the pair above ────────────────
+//
+// `NoreturnIndirectCalleeIsNotWrapped` case (2) pins the UNDECORATED pointer:
+// Ref(fp), record not noreturn, NOT wrapped, verifier still loud. This pins the
+// DECORATED one. The two together say the wrap keys on the RECORD, never on the
+// callee's syntactic shape — which is what keeps the F1 miscompile guard true
+// while still honoring the attribute GNU actually binds to the pointee type.
+//
+// This is the CONSUMPTION end of the sink the Tcl 9 `TclStubs` member shape
+// feeds (`struct { __attribute__((__noreturn__)) void (*tcl_Panic)(…); }` —
+// tclDecls.h:1893). Host clang honors it here too: measured, `int f(struct S
+// *s){ s->p(1); }` draws no -Wreturn-type when `p` is decorated and does when
+// it is not.
+//
+// RED-ON-DISABLE: revert the Pass-1 apply gate from `isFnSig ||
+// isFnPointerType` back to `isFnSig` → `gp`'s record loses isNoreturn, the tail
+// stops terminating, H_VerifierFailure count goes 0 → 1 and the synthetic
+// Unreachable disappears.
+TEST(HirLoweringCSubset, NoreturnFunctionPointerObjectCallWrapsAndVerifies) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((__noreturn__)) void (*gp)(int); "
+        "int f(int x){ if(x>0) return x; gp(1); } "
+        "int main(){ return f(1); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "a call through a pointer DECLARED noreturn must terminate the tail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "the GNU spelling on a file-scope pointer must not trip the linkage scan";
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+        << "the decorated function-pointer call must be wrapped with a synthetic "
+           "Unreachable, exactly as a direct call to a noreturn function is";
+}
+
+// The Tcl 9 `TclStubs` declaration itself, end-to-end through HIR: the leading
+// member attribute position must LOWER, not merely parse. Two decorated
+// function-pointer members plus a trailing `__format__` run — the literal shape
+// at tclDecls.h:1893/:2024.
+TEST(HirLoweringCSubset, TclStubsLeadingMemberAttributeLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "typedef struct TclStubs {\n"
+        "  int magic;\n"
+        "  __attribute__((__noreturn__)) void (*tcl_Panic)(const char *, ...)\n"
+        "      __attribute__((__format__ (__printf__, 1, 2)));\n"
+        "  __attribute__((__noreturn__)) void (*tcl_Exit)(int);\n"
+        "} TclStubs;\n"
+        "int main(){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+}
+
 // ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the GNU semantic-attribute spellings
 //    at FILE scope ride the linkage scan's by-NAME skip end-to-end ────────────
 

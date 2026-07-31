@@ -151,13 +151,37 @@ TEST(ParserCastExpr, PointerCastParses) {
 }
 
 // `(struct S*)q` — struct-tag type base.
+//
+// TF-C101: the base node is `structSpec`, not the ref-only `structTypeRef` it was
+// before. That rename IS the fix, not a side effect — `castTypeBase` now routes its
+// composite arms through the c25 UNIFIED specifier so a type-name may carry a struct
+// DEFINITION (`sizeof(struct { int dummy; })`, C 6.7.7p1). A body-ABSENT `structSpec`
+// is still exactly a tag reference (the `isTagReference` semantics arm), so this
+// cast's MEANING is unchanged; only the rule that owns the position moved. Asserting
+// the node is present keeps the structural pin: were the composite arm ever dropped
+// from the type-name base, this fires instead of the cast silently re-reading as a
+// parenthesized value.
 TEST(ParserCastExpr, StructPointerCastParses) {
     auto r = parseCSubset("int main() { return (struct S*)q; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
     ASSERT_TRUE(cast.valid());
-    EXPECT_NE(findFirstNodeWithRule(t, "structTypeRef"), InvalidNode);
+    EXPECT_NE(findFirstNodeWithRule(t, "structSpec"), InvalidNode);
+}
+
+// TF-C101 companion: the type-name base admits a composite DEFINITION, and it must
+// still be the cast's type — the construct that motivated the unify. A struct-typed
+// cast is a constraint violation downstream (a cast target must be scalar), so this
+// pins PARSE structure only, which is precisely the tier the gap lived at.
+TEST(ParserCastExpr, SizeofAnonymousStructDefinitionParses) {
+    auto r = parseCSubset("int main() { return (int)sizeof(struct { int dummy; }); }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_NE(findFirstNodeWithRule(t, "sizeofType"), InvalidNode);
+    EXPECT_NE(findFirstNodeWithRule(t, "structBody"), InvalidNode)
+        << "the inline member list must parse as the struct's BODY inside the "
+           "sizeof type-name, not be rejected at the '{'";
 }
 
 // `(const long)v` — const-qualified keyword base.
