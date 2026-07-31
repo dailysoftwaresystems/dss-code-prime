@@ -576,6 +576,42 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-INTRINSIC-BSWAP: byte reverse — a structural clone of `clz`/`rbit` above (data-processing 1-source: Rn bits 9:5 = source (wire 0), Rd bits 4:0 = result), differing ONLY in the opcode field (bits 15:10) and, at 64 bits, sf. Base words: 0x5AC00000 (W, sf=0) / 0xDAC00000 (X, sf=1), cross-validated against the shipped `rbit` (opcode 000000 -> 0x5AC00000) and `clz` (opcode 000100 -> 0x5AC01000) rows. THREE width-keyed variants, because arm64 — unlike x86 — encodes all three widths natively, so MIR Bswap never needs the universal-ALU expansion here:  width 16 -> REV16 Wd,Wn, opcode 000001 -> 0x5AC00400 = 1522533376;  width 32 -> REV Wd,Wn, opcode 000010 with sf=0 -> 0x5AC00800 = 1522534400;  width 64 -> REV Xd,Xn, opcode 000011 with sf=1 -> 0xDAC00C00 = 3670019072. ★★ THE 32-BIT SLOT IS **REV W-FORM**, NOT REV32 — a trap worth stating because the mnemonic reads like the right one and the deferred-anchor registry row named it wrongly. AArch64 `REV32` is X-FORM ONLY (0xDAC00800, opcode 000010 with sf=1) and reverses the bytes WITHIN EACH 32-BIT HALF of a 64-bit register — a DIFFERENT operation. A 32-bit byte swap is REV at sf=0. ★ REV16 IS PER-HALFWORD: `REV16 Wd,Wn` reverses the bytes of EACH halfword of the W register independently, so its low 16 bits are the correct swap of the input's low 16 bits REGARDLESS of what sits above them — which is exactly why the width-16 arm is safe against DSS's lazy-narrowing model (a U16 value may carry stale bits 31:16). Its OWN bits 31:16 are then the swapped garbage; that is permitted for a U16 result and the consumer's UXTH narrows it. Do NOT 'fix' this by substituting REV at width 16: REV would reverse all four bytes and put the input's bits 31:24 into the result's low byte — a silent wrong answer.",
+      "mnemonic":      "bswap",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670019072 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522534400 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 1522533376 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
       "mnemonic":      "ldaxr",
       "result":        "value",

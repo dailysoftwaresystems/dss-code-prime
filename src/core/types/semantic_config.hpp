@@ -993,6 +993,19 @@ enum class BuiltinLowering : std::uint16_t {
     // prints numerically in `.dsshir` text (the AtomicLoad/Store + ComplexConj
     // numeric-stability precedent).
     AtomicFence,
+    // D-CSUBSET-INTRINSIC-BSWAP: the MSVC `_byteswap_{ushort,ulong,uint64}`
+    // byte-reverse intrinsics — ONE width-blind lowering tag shared by all three
+    // rows (the popcount/clz/ctz precedent: the width lives in the param core and
+    // is read back at mir_to_lir from the MIR operand type). Maps to the dedicated
+    // MirOpcode::Bswap, realized NATIVE where the target declares a `bswap`
+    // encoding AT THAT WIDTH (x86 BSWAP 32/64, arm64 REV16/REV/REV(X) 16/32/64)
+    // and otherwise by a universal-ALU byte-reversal expansion (x86 declares NO
+    // width-16 BSWAP — GAS refuses `bswap %ax` — so `_byteswap_ushort` takes the
+    // expansion there BY DESIGN). APPENDED (not grouped by Popcount/Clz/Ctz) so
+    // every pre-existing enumerator keeps its integer value — the BuiltinCall
+    // payload prints numerically in `.dsshir` text (the AtomicLoad/Store +
+    // ComplexConj + AtomicFence numeric-stability precedent).
+    Bswap,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -1021,6 +1034,10 @@ builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "popcount") { return BuiltinLowering::Popcount; }
     if (name == "clz")      { return BuiltinLowering::Clz;      }
     if (name == "ctz")      { return BuiltinLowering::Ctz;      }
+    // D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse verb shared by the 3
+    // `_byteswap_*` rows (the width lives in the param core U16/U32/U64, read by
+    // the hir_to_mir arm — the lowering tag is width-blind, like popcount/clz/ctz).
+    if (name == "bswap")    { return BuiltinLowering::Bswap;    }
     // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings
     // (shared by each op's 4 width rows — the width lives in the param core, read
     // by the hir_to_mir arm; the lowering tag is width-blind, like popcount/clz/ctz).

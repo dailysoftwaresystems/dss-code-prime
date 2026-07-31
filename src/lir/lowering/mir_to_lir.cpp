@@ -35,6 +35,7 @@ namespace {
         case MirOpcode::Popcount:      return "Popcount";  // FC17.9(b)
         case MirOpcode::Clz:           return "Clz";       // FC17.9(b)
         case MirOpcode::Ctz:           return "Ctz";       // FC17.9(b)
+        case MirOpcode::Bswap:         return "Bswap";     // D-CSUBSET-INTRINSIC-BSWAP
         case MirOpcode::AtomicCas:     return "AtomicCas";
         case MirOpcode::AtomicLoad:    return "AtomicLoad";   // FC17.9(d)
         case MirOpcode::AtomicStore:   return "AtomicStore";  // FC17.9(d)
@@ -310,6 +311,18 @@ enum class MnemonicSlot : std::uint8_t {
     ClzNative,
     CtzNative,
     Rbit,
+    // D-CSUBSET-INTRINSIC-BSWAP: the NATIVE byte-reverse realization MIR Bswap
+    // lowers to — a SHARED VERB across targets exactly like `clz` (x86 BSWAP
+    // 0F C8+rd, arm64 REV16/REV/REV(X)), never a per-arch mnemonic. ★ UNLIKE
+    // every other slot in this family, its capability probe is PER-WIDTH
+    // (`opcodeWithWidth`), NOT mnemonic-presence: BOTH shipped targets declare
+    // "bswap", but x86 declares only the 32- and 64-bit forms (there is no
+    // encodable `bswap r16` — MEASURED: GAS rejects `bswap %ax` with "operand
+    // size mismatch"), so a presence-only probe would emit a width-16 bswap that
+    // matches no variant and dies at A_NoMatchingEncodingVariant. A width the
+    // target does not encode falls back to the universal-ALU byte-reversal
+    // expansion — never fail-loud, never an `if (arch==…)`.
+    Bswap,
     // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
     // realizations MIR AtomicLoad/AtomicStore lower to, probed by mnemonic
     // presence (the lowerAtomicCas capability-probe — NEVER an `if (arch==)`).
@@ -479,6 +492,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::ClzNative,          "clz"},       // FC17.9(b): x86 LZCNT / arm64 CLZ
     {MnemonicSlot::CtzNative,          "ctz"},       // FC17.9(b): x86 TZCNT
     {MnemonicSlot::Rbit,               "rbit"},      // FC17.9(b): arm64 RBIT (→ ctz via CLZ)
+    {MnemonicSlot::Bswap,              "bswap"},     // D-CSUBSET-INTRINSIC-BSWAP: x86 BSWAP / arm64 REV16|REV
     {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
     {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
     {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
@@ -1068,6 +1082,39 @@ struct Lowerer {
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
         return cache_[static_cast<std::size_t>(s)].id;
+    }
+
+    // D-CSUBSET-INTRINSIC-BSWAP: the WIDTH-AWARE capability probe — `opcode(s)`
+    // narrowed to "…and it declares a variant that can encode at `widthFlags`".
+    //
+    // WHY THIS EXISTS AT ALL. `opcode()` answers only "does the target name this
+    // verb?", which is the right question for a verb whose declared widths are
+    // uniform (popcount/clz/ctz/rbit each ship 32 AND 64 on every target that
+    // ships them at all). It is the WRONG question for a verb whose width
+    // coverage is RAGGED: x86 names "bswap" but encodes only 32 and 64, so a
+    // presence-only probe would route a width-16 byte-swap to the native path and
+    // the encoder would then fail A_NoMatchingEncodingVariant on an instruction
+    // the lowering itself chose to emit — a fail-loud, but at the wrong layer and
+    // for a case the substrate can serve perfectly well by expansion.
+    //
+    // `guardWidthBits == 0` = a WIDTH-ABSENT (match-any) variant, which by the
+    // schema's own overlap rule (target_schema.cpp:851-869) can only appear when
+    // NO sibling of the same operand shape is width-keyed — so it genuinely
+    // encodes every width and counts as a hit. Same scan the riprel-load fold
+    // uses (~:4256), factored so the two cannot drift.
+    [[nodiscard]] std::optional<std::uint16_t>
+    opcodeWithWidth(MnemonicSlot s, std::uint8_t widthFlags) const {
+        auto const id = opcode(s);
+        if (!id.has_value()) return std::nullopt;
+        auto const* info = target.opcodeInfo(*id);
+        if (info == nullptr) return std::nullopt;
+        std::uint8_t const widthBits = lirInstWidthBits(widthFlags);
+        for (auto const& v : info->encoding.variants) {
+            if (v.guardWidthBits == 0 || v.guardWidthBits == widthBits) {
+                return id;
+            }
+        }
+        return std::nullopt;
     }
 
     // D-CSUBSET-BITFIELD-WIDE-UNIT: does the target declare a `mov`
@@ -1873,6 +1920,8 @@ struct Lowerer {
             case MirOpcode::Popcount: return lowerPopcount(id);
             case MirOpcode::Clz:      return lowerClz(id);
             case MirOpcode::Ctz:      return lowerCtz(id);
+            // D-CSUBSET-INTRINSIC-BSWAP: byte reverse (the `_byteswap_*` family).
+            case MirOpcode::Bswap:    return lowerBswap(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
             // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): per-order fence
             // matrix. Relaxed/consume reuse the plain scalar Load/Store; the
@@ -6401,6 +6450,164 @@ struct Lowerer {
         }
         // Rule 3 — SWAR fallback (neither TZCNT nor RBIT+CLZ).
         auto const r = emitSwarCtz(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
+    // ── D-CSUBSET-INTRINSIC-BSWAP: MIR Bswap → native-or-EXPANDED ─────────────
+    //
+    // Same capability split as the bit-count trio above — probe the config-
+    // declared opcode vocabulary, emit the hardware instruction where the target
+    // has one, else build the operation out of the universal ALU verbs. NO
+    // `if (arch==…)` anywhere: which of the two arms runs is decided ENTIRELY by
+    // what the `.target.json` declares.
+    //
+    // ★★ TWO WIDTHS — AND THEY ARE GENUINELY DIFFERENT QUANTITIES. This is the
+    // one thing here that is not obvious, and collapsing them breaks the lowering
+    // in a DIFFERENT way in each direction (one loud, one silent), so both are
+    // named and threaded separately:
+    //
+    //   SEMANTIC width W = `widthFlagsForType(operand type)` ∈ {16,32,64} —
+    //     HOW MANY BYTES ARE BEING REVERSED. Drives the per-variant
+    //     `guardWidthBits` probe AND the native emission.
+    //   MACHINE width P = max(W, 32), i.e. exactly `registerOpWidthFlags` (the
+    //     SAME promotion every other register-resident sub-native value takes,
+    //     D-CSUBSET-SUBNATIVE-ALU-FORMS) — drives EVERY instruction of the
+    //     software expansion.
+    //
+    //   * Threading W into the EXPANSION fails LOUD at W=16: x86 declares no
+    //     width-8/16 ALU variants at all (`and`/`or`/`shl`/`shr_l` are 64/32
+    //     only — a sub-native value lives PROMOTED in a 32-bit register), so
+    //     every emitted instruction would miss its encoding
+    //     (A_NoMatchingEncodingVariant) and `_byteswap_ushort` would simply never
+    //     compile.
+    //   * Threading P into the PROBE fails SILENTLY at W=16: arm64 declares a
+    //     width-32 `bswap` (REV Wd,Wn — reverse all FOUR bytes of the W
+    //     register), so probing at the promoted 32 would select REV where REV16
+    //     (per-HALFWORD reverse) is required, and the 16-bit swap would return a
+    //     wrong value with no diagnostic anywhere. That is the forbidden
+    //     direction, which is why the probe is width-EXACT.
+    //
+    // ★ AND THE PROBE MUST BE PER-WIDTH, NOT PRESENCE-ONLY. `opcode(slot)`
+    // answers "does the target name this verb?", which is enough for the
+    // bit-count trio (uniform 32+64 coverage) and WRONG here: x86 names "bswap"
+    // but encodes only 32 and 64 (there is no `bswap r16` — MEASURED: GAS refuses
+    // `bswap %ax` with "operand size mismatch", and gcc emits none across 20 flag
+    // combinations). Hence `opcodeWithWidth`.
+
+    // The generic byte reversal, over the universal ALU verbs, at MACHINE width
+    // `pWidth`: reverse the low `nBytes` bytes of `x`, i.e.
+    //     OR over i∈[0,nBytes)  of  ((x >> 8i) & 0xFF) << 8(nBytes-1-i)
+    // (the shift by 0 at each end is skipped rather than emitted).
+    //
+    // ★★ IT MASKS ITS INTERMEDIATES AND NEVER ITS RESULT — that is not a style
+    // choice, it is the correctness argument. DSS's lazy-narrowing model
+    // (see the Trunc note ~:1428) permits a U16-typed value to sit in a register
+    // with STALE bits 31:16: narrowing realizes at the width-exact CONSUMER, not
+    // at the producer. So for x = [g3 g2 b1 b0] (g = garbage, b = the real
+    // halfword) the tempting two-instruction form `(x<<8)|(x>>8)` followed by a
+    // trailing `& 0xFFFF` is WRONG — after the OR, bits 15:8 hold `b0 | g2`, and
+    // no trailing mask can remove `g2`. Masking each byte BEFORE it is placed is
+    // the only form that is correct for a dirty input.
+    //   ⚠ It would be right BY LUCK on sqlite today (`get2byteAligned` is
+    //   `_byteswap_ushort(*(u16*)(x))` and x86's width-16 load is a zero-
+    //   extending movzx, so bits 31:16 happen to be clean), which means the
+    //   sqlite probe would pass over the broken form. Do not rely on it.
+    //   The runtime probe therefore feeds a value with deliberately dirty upper
+    //   bits, not a fresh 16-bit load.
+    //
+    // Conversely the RESULT is left unnarrowed on purpose: its MIR type is the
+    // operand's own (U16 here), and a U16 value's bits above 15 are insignificant
+    // by that same contract — the ZExt/UXTH at the consumer is where it narrows,
+    // exactly as for every other U16 value in the system. (This arm happens to
+    // produce a CLEAN result anyway, since every term was masked; arm64's native
+    // REV16 does not, and both are equally valid — see lowerBswap.)
+    [[nodiscard]] std::optional<LirReg> emitBswapExpansion(
+            LirReg x, unsigned nBytes, std::uint8_t pWidth) {
+        auto const andOp = opcode(MnemonicSlot::And);
+        auto const orOp  = opcode(MnemonicSlot::Or);
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "byte-swap expansion"); return std::nullopt; }
+        if (!orOp.has_value())  { reportMissingOpcode(MnemonicSlot::Or,  "byte-swap expansion"); return std::nullopt; }
+        // ONE 0xFF register, reused by every term (materializing it per byte
+        // would emit `nBytes` redundant movs for the allocator to keep live).
+        std::optional<LirReg> const byteMask = emitBareConstToFresh(0xFF);
+        if (!byteMask.has_value()) return std::nullopt;
+        std::optional<LirReg> acc;
+        for (unsigned i = 0; i < nBytes; ++i) {
+            auto const srcShift = static_cast<std::uint8_t>(8u * i);
+            auto const dstShift =
+                static_cast<std::uint8_t>(8u * (nBytes - 1u - i));
+            LirReg cur = x;
+            if (srcShift != 0) {
+                auto const sh = emitShiftConst(cur, srcShift,
+                                               MnemonicSlot::ShrL, pWidth);
+                if (!sh.has_value()) return std::nullopt;
+                cur = *sh;
+            }
+            cur = emitAluRegReg(*andOp, cur, *byteMask, pWidth);
+            if (dstShift != 0) {
+                auto const sh = emitShiftConst(cur, dstShift,
+                                               MnemonicSlot::Shl, pWidth);
+                if (!sh.has_value()) return std::nullopt;
+                cur = *sh;
+            }
+            acc = acc.has_value() ? emitAluRegReg(*orOp, *acc, cur, pWidth)
+                                  : cur;
+        }
+        // `nBytes == 0` is unreachable (lirInstWidthBits yields 8/16/32/64, so
+        // nBytes ∈ {1,2,4,8}), but returning an empty optional here without a
+        // diagnostic would be a SILENT no-lowering — fail loud instead.
+        if (!acc.has_value()) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        return acc;
+    }
+
+    void lowerBswap(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const x = regForValue(operands[0]);
+        if (!x.has_value()) return;
+        // W and P (see the block comment above). Both read from the OPERAND
+        // type: it is identical to the result type for this op, but the operand
+        // is the authority — it is where the bytes actually live.
+        TypeId const opTy = mir.instType(operands[0]);
+        std::uint8_t const wWidth = widthFlagsForType(opTy);
+        std::uint8_t const pWidth = registerOpWidthFlags(opTy);
+
+        // Rule 1 — NATIVE, probed AT THE SEMANTIC WIDTH W. x86 hits at 32/64
+        // (BSWAP 0F C8+rd) and MISSES at 16; arm64 hits at all three (REV16 Wd,Wn
+        // / REV Wd,Wn / REV Xd,Xn).
+        if (auto const nativeOp = opcodeWithWidth(MnemonicSlot::Bswap, wWidth);
+            nativeOp.has_value()) {
+            // ★ THE TWO TARGETS NEED DIFFERENT REASONING ABOUT THE UPPER BITS,
+            // and both land on "correct":
+            //   x86 — BSWAP is only reached at W∈{32,64}, i.e. the FULL register
+            //     width, so there are no upper bits outside the operation; the
+            //     32-bit form's register write additionally zero-extends.
+            //   arm64 at W=16 — REV16 Wd,Wn is PER-HALFWORD, so it reverses the
+            //     low halfword using ONLY the low halfword. Its bits 31:16 are
+            //     the (byte-swapped) garbage from the input's upper half, which
+            //     is exactly what DSS's lazy-narrowing contract permits a U16
+            //     value to carry; the consumer's ZExt/UXTH narrows it. No
+            //     trailing UXTH is emitted here — one WOULD be sufficient on
+            //     arm64 (unlike the expansion, where a trailing mask cannot
+            //     repair a dirty result), but emitting it would make this the one
+            //     U16 producer in the compiler that eagerly narrows, and the
+            //     inconsistency would be the more dangerous thing to carry.
+            auto const r = emitNativeUnary(*nativeOp, *x, wWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // Rule 2 — the generic expansion, which reverses W/8 bytes but computes
+        // at the MACHINE width P (x86 `_byteswap_ushort` is the shipped case).
+        unsigned const nBytes = lirInstWidthBits(wWidth) / 8u;
+        auto const r = emitBswapExpansion(*x, nBytes, pWidth);
         if (!r.has_value()) { poisonValue(id); return; }
         defineValue(id, *r);
     }

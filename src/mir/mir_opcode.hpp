@@ -114,6 +114,22 @@ enum class MirOpcode : std::uint16_t {
     // `opcode(MnemonicSlot::…Native)`, never an arch identity. (arm64 has no scalar
     // GPR popcount → SWAR, runtime-witnessed on the arm64-elf example arm.)
     Popcount, Clz, Ctz,
+    // D-CSUBSET-INTRINSIC-BSWAP: reverse the BYTE order of the operand, at the
+    // OPERAND TYPE's width W∈{16,32,64} (the MSVC `_byteswap_*` family). The same
+    // pure-unary shape as the three above — but note the ONE way it differs from
+    // them, and why it needed its own op rather than an ALU composition: the
+    // bit-count trio all return a small COUNT (0..64) whose upper bits are zero
+    // at ANY width, so their MIR type may be the I32 result; Bswap's result is the
+    // operand's OWN type, so the width MUST travel on the MIR type and be read
+    // back at mir_to_lir. Lowered native-or-EXPANDED (lowerBswap): a target that
+    // declares a `bswap` encoding AT THE OPERAND'S WIDTH emits the hardware
+    // instruction (x86 BSWAP 32/64; arm64 REV16/REV/REV(X) 16/32/64), one that
+    // does not gets a byte-reversal over the universal ALU verbs. The probe is
+    // PER-WIDTH, not mnemonic-presence: x86 declares `bswap` but has NO width-16
+    // form, and a presence-only probe would emit a width-16 bswap that no variant
+    // encodes. Not const-folded / not commutative / no side effect, exactly like
+    // Popcount (so intentionally absent from those switches).
+    Bswap,
     // ── integer comparison (result = Bool/i1) ──
     ICmpEq, ICmpNe, ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
     ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
@@ -433,6 +449,10 @@ struct MirOpcodeInfo {
         case MirOpcode::Popcount: return {1, 1, 0, 0, R::Value, false, false, false, "popcount"};
         case MirOpcode::Clz:      return {1, 1, 0, 0, R::Value, false, false, false, "clz"};
         case MirOpcode::Ctz:      return {1, 1, 0, 0, R::Value, false, false, false, "ctz"};
+        // D-CSUBSET-INTRINSIC-BSWAP: byte reverse. Same {1,1} pure-unary row as the
+        // trio above; its result carries the OPERAND's type (not I32), so the
+        // width rides `MirInst.type` all the way to mir_to_lir.
+        case MirOpcode::Bswap:    return {1, 1, 0, 0, R::Value, false, false, false, "bswap"};
 
         // integer comparison.
         case MirOpcode::ICmpEq:  return {2, 2, 0, 0, R::Value, false, false, false, "icmp.eq"};

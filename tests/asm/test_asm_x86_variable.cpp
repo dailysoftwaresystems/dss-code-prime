@@ -679,6 +679,126 @@ TEST(X86VariableEncoder, TzcntEaxEax32EmitsF3_0F_BC_C0) {
     EXPECT_EQ(bytes[4], 0xC3);
 }
 
+// ── D-CSUBSET-INTRINSIC-BSWAP: BSWAP r32/r64 — 0F C8+rd / REX.W 0F C8+rd ──
+//
+// A DIFFERENT ENCODING SHAPE from the three bit-count pins above, in the one way
+// that matters: BSWAP has NO ModR/M byte. Its destination rides the LAST OPCODE
+// BYTE (`+rd`, like `mov r64, imm64`'s B8+rd), and it is destructive, so the
+// x86_64 row declares `requires2Address` with the operand-0 wire in `opcode.reg`
+// and NO resultSlot. In LIR terms that is `bswap R` with result == operand 0 —
+// the post-`lir_2addr_legalize` shape these tests build directly.
+//
+// ★ THE HIGH-REGISTER CASE IS THE DISCRIMINATING ONE, and r8 would NOT do:
+// BSWAP's base opcode 0xC8 already has bit 3 set, so r8 (hwEncoding 8, low 3 bits
+// 0) leaves the byte at 0xC8 and cannot distinguish a missing `& 7` from a correct
+// one. r15 (low 3 bits = 7 → 0xCF) does — and it pins REX.B derivation at the same
+// time.
+//
+// ★ PAIRED WITH A LIR-TIER SELECTION PIN. These byte pins resolve the mnemonic
+// themselves, so they would ALL still pass if `lowerBswap` never selected native
+// (rename "bswap" in both target configs and every byte-swap silently routes
+// through the universal-ALU expansion — right answers, no diagnostic, no BSWAP).
+// The companions that close that hole are test_mir_to_lir's
+// BswapSelectsNativeOnX86AtWidth32 / …AtWidth64 (`countLirOp(…, "bswap") == 1`).
+namespace {
+// `<mnemonic> reg` in the 2-address self form (result == operand 0) — the shape
+// `lir_2addr_legalize` produces for a `requires2Address` unary opcode.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleUnarySelfReg(char const* mnemonic, std::string_view regName,
+                     bool width32) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(schema.has_value());
+    auto const op     = (*schema)->opcodeByMnemonic(mnemonic);
+    auto const regOrd = (*schema)->registerByName(regName);
+    EXPECT_TRUE(op.has_value());
+    EXPECT_TRUE(regOrd.has_value());
+    LirReg const r{static_cast<std::uint32_t>(*regOrd),
+                   /*isPhysical=*/1,
+                   /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(r) };
+        (void)b.addInst(*op, r, ops, /*payload=*/0,
+                        width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    });
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+} // namespace
+
+TEST(X86VariableEncoder, BswapEax32Emits0F_C8) {
+    // bswap eax — 0F C8 | (rax hwEncoding 0 & 7) = 0F C8, no REX at all.
+    auto const bytes = assembleUnarySelfReg("bswap", "rax", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 3u);
+    EXPECT_EQ(bytes[0], 0x0F);
+    EXPECT_EQ(bytes[1], 0xC8);
+    EXPECT_EQ(bytes[2], 0xC3);  // ret
+}
+
+TEST(X86VariableEncoder, BswapRax64Emits48_0F_C8) {
+    // bswap rax — REX.W (0x48) + 0F C8. Byte 0 is the ONLY difference from the
+    // 32-bit form above: dropping it would byte-swap the low 4 bytes of a u64.
+    auto const bytes = assembleUnarySelfReg("bswap", "rax", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xC8);
+    EXPECT_EQ(bytes[3], 0xC3);
+}
+
+TEST(X86VariableEncoder, BswapR1564DerivesRexB_49_0F_CF) {
+    // bswap r15 — hwEncoding 15: low 3 bits = 7 → opcode byte C8|7 = 0xCF;
+    // high bit = 1 → REX.B, so REX = 0x48 | B(1) = 0x49. The case a missing
+    // `& 7` (which would emit 0xC8|15 = 0xCF too, but only by accident of the
+    // low bits) or a dropped REX.B would silently decode as `bswap rdi`.
+    auto const bytes = assembleUnarySelfReg("bswap", "r15", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x49);  // REX.W + REX.B
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xCF);  // C8 | (15 & 7) = C8 | 7
+    EXPECT_EQ(bytes[3], 0xC3);
+}
+
+TEST(X86VariableEncoder, BswapRoundTripsThroughDisasm) {
+    // The round-trip oracle must recover r15 from the `+rd` opcode byte + REX.B.
+    // ★ This is the pin the `variantUsesOpcodePlusReg` fix was made for: before
+    // it, the predicate consulted only `resultSlot`, so a variant that carries
+    // `opcode.reg` on a WIRE exact-matched the base opcode byte — `49 0F CF`
+    // would match NO variant (A_RoundTripMismatch), and the one register whose
+    // low 3 bits are zero would match but recover nullopt for the slot, a silent
+    // "register 0" hole. Both directions are exercised here: a NON-zero low-3
+    // register that must MATCH, and a concrete recovered value that must EQUAL 15.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const bswapOp = (*schema)->opcodeByMnemonic("bswap");
+    auto const r15Ord  = (*schema)->registerByName("r15");
+    auto const retOp   = (*schema)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(bswapOp.has_value() && r15Ord.has_value() && retOp.has_value());
+    LirReg const r15{static_cast<std::uint32_t>(*r15Ord), 1,
+                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+
+    LirBuilder b{**schema};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(r15) };
+    LirInstId const bswapInst = b.addInst(*bswapOp, r15, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    DiagnosticReporter rep;
+    auto const result = assemble(lir, **schema, lirToMir, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.functions.size(), 1u);
+    auto const& bytes = result.functions[0].bytes;
+    ASSERT_GE(bytes.size(), 3u);
+    std::span<std::uint8_t const> const bswapBytes{bytes.data(), 3u};
+    EXPECT_TRUE(roundTripVerify(**schema, lir, bswapInst, bswapBytes, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
 // ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10r split, 2026-06-04) ──
 //
 // Cycle 10r splits the cycle-10q compound opcodes into separate pre

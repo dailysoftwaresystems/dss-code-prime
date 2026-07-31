@@ -12191,6 +12191,95 @@ TEST(MirLoweringCSubset, BitCountBuiltinsLowerToDedicatedMirOps) {
     EXPECT_EQ(interner.kind(m.instType(popInst)), TypeKind::I32);
 }
 
+// D-CSUBSET-INTRINSIC-BSWAP: all SIX byte-swap spellings — the MSVC family
+// `_byteswap_{ushort,ulong,uint64}` and the GCC family `__builtin_bswap{16,32,64}`
+// — route to the SAME dedicated pure-unary MIR op (Bswap). Six NAMES, ONE verb,
+// zero extra engine code: the six c-subset.lang.json rows differ only in their
+// param/result cores.
+//
+// ★ THE `Call == 0` HALF IS THE REAL PIN, and it is not redundant with the Bswap
+// count. A mis-bound verb does NOT fail loud: an unknown `lowering` string, or a
+// row that never reaches the BuiltinLowering::Bswap arm, leaves the name a plain
+// declared FUNCTION, so the call site lowers to MirOpcode::Call against a symbol
+// that no CRT exports — `msvcrt.dll` exports no `_byteswap_*` (MEASURED, objdump
+// -p), and DSS eager-imports every descriptor symbol, so on pe that becomes a
+// LOADER failure (0xC0000139) in a binary that compiled and linked clean. Counting
+// only Bswap would go red for the three MSVC spellings and stay green for a subtler
+// half-binding; counting Calls closes it from the other side.
+//
+// ★ The RESULT TYPE is pinned per width because it is the sole carrier of the
+// semantic width W: unlike Popcount/Clz/Ctz (whose result is always the GCC `int`),
+// each Bswap's type IS its operand's type, and mir_to_lir reads exactly that back
+// to choose between a native encoding and the software expansion. A row whose
+// `result` core drifted from its `params` core would silently byte-swap the wrong
+// number of bytes.
+//
+// RED-ON-DISABLE: change any of the 6 rows' `"lowering": "bswap"` in
+// c-subset.lang.json (or delete the `case BuiltinLowering::Bswap:` arm in
+// hir_to_mir) → nBswap drops below 6 AND nCall rises above 0.
+TEST(MirLoweringCSubset, ByteSwapBuiltinsAllRouteToOneMirBswapNeverACall) {
+    auto L = lowerCSubset(
+        "typedef unsigned short     u16;\n"
+        "typedef unsigned int       u32;\n"
+        "typedef unsigned long long u64;\n"
+        "u16 ms16(u16 x){return _byteswap_ushort(x);}\n"
+        "u32 ms32(u32 x){return _byteswap_ulong(x);}\n"
+        "u64 ms64(u64 x){return _byteswap_uint64(x);}\n"
+        "u16 gc16(u16 x){return __builtin_bswap16(x);}\n"
+        "u32 gc32(u32 x){return __builtin_bswap32(x);}\n"
+        "u64 gc64(u64 x){return __builtin_bswap64(x);}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR lowering: " << (L.hirReporter.all().empty()
+            ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    int nBswap = 0, nCall = 0;
+    std::vector<MirInstId> bswaps;
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            switch (m.instOpcode(id)) {
+                case MirOpcode::Bswap: ++nBswap; bswaps.push_back(id); break;
+                case MirOpcode::Call:  ++nCall;  break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_EQ(nBswap, 6)
+        << "all 6 byte-swap spellings must lower to MirOpcode::Bswap";
+    EXPECT_EQ(nCall, 0)
+        << "a compiler intrinsic is NOT a linkable symbol — a mis-bound `lowering` "
+           "verb would silently become a Call to a name no CRT exports";
+
+    // Per-spelling structure: unary, operand = the wrapper's own Arg, result type
+    // = the operand's type (the width carrier). Functions lower in source order,
+    // so the widths are 16/32/64 twice over.
+    ASSERT_EQ(bswaps.size(), 6u);
+    constexpr TypeKind kExpected[6] = {
+        TypeKind::U16, TypeKind::U32, TypeKind::U64,   // _byteswap_*
+        TypeKind::U16, TypeKind::U32, TypeKind::U64,   // __builtin_bswap*
+    };
+    for (std::size_t i = 0; i < bswaps.size(); ++i) {
+        auto const ops = m.instOperands(bswaps[i]);
+        ASSERT_EQ(ops.size(), 1u) << "byte-swap #" << i << " must be unary";
+        EXPECT_EQ(m.instOpcode(ops[0]), MirOpcode::Arg)
+            << "byte-swap #" << i << " must consume the wrapper's Arg (single-eval)";
+        EXPECT_EQ(interner.kind(m.instType(bswaps[i])), kExpected[i])
+            << "byte-swap #" << i << " must carry its operand's own width";
+        EXPECT_EQ(interner.kind(m.instType(ops[0])), kExpected[i])
+            << "byte-swap #" << i << ": operand and result widths must agree";
+    }
+}
+
 // ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op MIR-shape pins ──
 // Each `__builtin_stdc_<op>_<T>` lowers (hir_to_mir emitStdbitOp) to a width-correct
 // BRANCHLESS composition of the 3 primitives (Popcount/Clz/Ctz) + universal ALU

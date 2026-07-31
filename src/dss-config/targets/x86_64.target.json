@@ -624,6 +624,29 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-INTRINSIC-BSWAP: BSWAP r — reverse the byte order of a register (Intel SDM Vol. 2A BSWAP). 0F C8+rd; width 64 adds REX.W (48 0F C8+rd). ★ A DIFFERENT SHAPE FROM ITS THREE NEIGHBOURS ABOVE, in the one way that matters: BSWAP's destination rides the OPCODE BYTE (+rd), not ModR/M — the instruction has no ModR/M byte at all — and it is destructive (dest == source). So it is declared `requires2Address: true` with the operand-0 wire in `opcode.reg` and NO `resultSlot`, exactly like `add`/`not` declare theirs in `modrm.rm`: after `lir_2addr_legalize` inserts `mov result, operands[0]` and rewrites operand 0 to the result register, operand 0 IS the destination, so wiring it places the destination. (target_schema's rule-G `isDestSlot` lists `opcode.reg` for precisely this shape; the `mov r64,imm64` variant uses the same slot but as a `resultSlot`, a different code path.) ★★ NO WIDTH-16 VARIANT, AND THAT IS DELIBERATE, NOT AN OVERSIGHT: `bswap r16` is architecturally undefined (SDM: 'BSWAP with a 16-bit register is undefined'), MEASURED — GAS REFUSES `bswap %ax` outright with 'operand size mismatch', and gcc emits no 16-bit bswap across 20 flag combinations. `_byteswap_ushort` therefore takes mir_to_lir's generic universal-ALU byte-reversal expansion on x86 BY DESIGN; the lowering's capability probe is PER-WIDTH (`opcodeWithWidth`) rather than mnemonic-presence for exactly this reason — a presence-only probe would emit a width-16 bswap that matches no variant here. arm64 needs no such fallback (it declares all three widths: REV16/REV/REV(X)). Both variants below are width-keyed because the schema rejects mixing a width-keyed variant with a width-absent sibling of the same operand shape.",
+      "mnemonic": "bswap", "result": "value",
+      "requires2Address": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [15, 200] },
+            "wires":    [{ "index": 0, "slotKind": "opcode.reg" }]
+          },
+          {
+            "$comment": "bswap r32 — 0F C8+rd without REX.W. A 32-bit register write auto-zero-extends to the full 64-bit register, so the u32 result is clean.",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [15, 200] },
+            "wires":    [{ "index": 0, "slotKind": "opcode.reg" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) — atomic compare-and-swap, mem-dest: LOCK CMPXCHG [base+disp32], reg (LOCK 0xF0 mandatoryPrefix + 0x0F 0xB1 /r). Semantics: compares RAX/EAX (the implicit 'comparand' input-role) with [mem]; equal -> stores the wired reg (the NEW value, modrm.reg); unequal -> loads [mem] into RAX/EAX. EITHER way RAX ends holding the ORIGINAL observed value (the 'old' output-role the MIR AtomicCas lowering captures). LOCK makes it a full barrier — the correct strength for Win32 InterlockedCompareExchange. Operand shape mirrors `store`'s 4-op mem-dest form: [newval_reg, base_reg, MemBase(scale), MemOffset(disp)]. mandatoryPrefix [240] emits BEFORE the auto-REX (the 0x66 width-16-store precedent — legacy prefixes precede REX, REX immediately precedes the opcode), so a high-numbered base/newval register REX.B/R composes correctly: F0 [REX] 0F B1 /r. Width 32 = the Win32 LONG (LLP64) CAS — NO rexW; width 64 for completeness (a future 64-bit CAS consumer). implicitRegisters: inputs=[rax] (the comparand), outputs/clobbered=[rax] (the observed-original; outputs ⊆ clobbered).",
       "mnemonic":      "lock_cmpxchg",
       "result":        "none",

@@ -204,6 +204,50 @@ TEST(MirOpcode, AtomicFenceIsSideEffectingMemoryClobber) {
     EXPECT_FALSE(isCommutative(MirOpcode::AtomicFence));
 }
 
+// D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse op the 6 byte-swap builtins
+// (`_byteswap_ushort`/`_byteswap_ulong`/`_byteswap_uint64` + the GCC spellings
+// `__builtin_bswap16`/`32`/`64`) all lower to. It is the EXACT INVERSE of the three
+// fence ops above: Bswap is PURE — no side effect, no memory clobber — and that
+// purity is the load-bearing table fact, because it is what lets CSE dedupe it,
+// LICM hoist it out of a loop, and DCE delete an unused one. A stray
+// `hasSideEffects: true` here would silently pessimize every byte-swap in sqlite's
+// btree/pager hot paths; a stray `opcodeClobbersMemory` membership would fence
+// unrelated Load/Store motion across a pure register computation.
+//
+// The arity/result row is equally load-bearing: {1,1} + R::Value is what
+// `lowerBswap` reads back (it rejects any other operand count with
+// reportUnsupported), and the result carries the OPERAND's own type — the width
+// W∈{16,32,64} that drives `opcodeWithWidth`'s per-width variant probe.
+//
+// NOT commutative: `isCommutative` gates CSE's operand-order canonicalization, and
+// a unary op has nothing to commute — a true here would be read as a licence to
+// reorder operands that do not exist.
+//
+// RED-ON-DISABLE: flip any of the three descriptor bools in mir_opcode.hpp's
+// `Bswap` row, add Bswap to `opcodeClobbersMemory`, or change the mnemonic string,
+// and the corresponding EXPECT fails.
+TEST(MirOpcode, BswapIsAPureUnaryValueOp) {
+    // 1 operand, 1 Value result, mnemonic "bswap".
+    EXPECT_EQ(opcodeInfo(MirOpcode::Bswap).minOperands, 1);
+    EXPECT_EQ(opcodeInfo(MirOpcode::Bswap).maxOperands, 1);
+    EXPECT_EQ(resultRule(MirOpcode::Bswap), MirResultRule::Value);
+    EXPECT_EQ(mnemonic(MirOpcode::Bswap), "bswap");
+    // ★ PURITY — the optimizer-visibility axis. Both must stay false.
+    EXPECT_FALSE(opcodeInfo(MirOpcode::Bswap).hasSideEffects)
+        << "Bswap is a pure register computation — a side effect would exclude it "
+           "from CSE/LICM and keep dead byte-swaps alive through DCE";
+    EXPECT_FALSE(opcodeClobbersMemory(MirOpcode::Bswap))
+        << "Bswap touches no memory — clobber membership would fence unrelated "
+           "Load/Store motion";
+    // Neither a terminator, phi, nor a commutative op.
+    EXPECT_FALSE(isTerminator(MirOpcode::Bswap));
+    EXPECT_FALSE(isPhi(MirOpcode::Bswap));
+    EXPECT_FALSE(isCommutative(MirOpcode::Bswap));
+    // A value-producing non-terminator carries no CFG successors.
+    EXPECT_EQ(opcodeInfo(MirOpcode::Bswap).minSuccessors, 0);
+    EXPECT_EQ(opcodeInfo(MirOpcode::Bswap).maxSuccessors, 0);
+}
+
 TEST(MirOpcode, InvalidSentinelHasImpossibleArity) {
     // The slot-0 sentinel's impossible {min=1, max=0} arity surfaces any
     // accidental use loudly (no real opcode can satisfy min > max).

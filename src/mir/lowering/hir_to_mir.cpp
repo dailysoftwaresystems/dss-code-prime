@@ -2729,6 +2729,25 @@ struct Lowerer {
                         return mir.addInst(MirOpcode::Clz, operands, t);
                     case BuiltinLowering::Ctz:
                         return mir.addInst(MirOpcode::Ctz, operands, t);
+                    // D-CSUBSET-INTRINSIC-BSWAP: `_byteswap_{ushort,ulong,uint64}`
+                    // → MirOpcode::Bswap. Unlike the bit-count trio above, `t` is
+                    // NOT a fixed I32: each row's `result` core EQUALS its param
+                    // core (U16/U32/U64 — the MSVC signatures), so the width the
+                    // mir_to_lir lowering needs travels on BOTH the operand type
+                    // and the result type and can never drift from the encoding
+                    // it selects. Arity is checked HERE (not left to the
+                    // mir_to_lir operand helper) so a malformed config row —
+                    // `params` with 0 or 2 entries against a 1-operand MIR op —
+                    // fails at the frontend with the source node in hand rather
+                    // than as a shapeless L_UnsupportedLoweringForOpcode later.
+                    case BuiltinLowering::Bswap: {
+                        if (operands.size() != 1) {
+                            unsupported(node,
+                                "a byte-swap builtin expects exactly 1 argument");
+                            return InvalidMirInst;
+                        }
+                        return mir.addInst(MirOpcode::Bswap, operands, t);
+                    }
                     // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* ops
                     // COMPOSE the 3 primitives above + universal ALU verbs into the
                     // N3096 §7.18 formula — one shared, width-correct, single-eval,

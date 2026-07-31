@@ -6982,6 +6982,224 @@ TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
         << "the SWAR popcount's x -= (x>>1)&m1 step";
 }
 
+// ── D-CSUBSET-INTRINSIC-BSWAP: native-or-EXPANDED byte reversal ───────────────
+//
+// `lowerBswap` probes the target's declared `bswap` encoding AT THE SEMANTIC WIDTH
+// W (`opcodeWithWidth`), not by mnemonic PRESENCE. That distinction is the whole
+// design, and it is invisible to any test that only asks "did a bswap come out?":
+//
+//   x86_64 declares `bswap` at widths 32 and 64 ONLY (0F C8+rd; `bswap r16` is
+//     architecturally undefined and GAS refuses it), so width 16 MUST take the
+//     universal-ALU expansion — a DESIGNED outcome, not a gap.
+//   arm64 declares all three (REV16 / REV / REV(X)), so no width expands there.
+//
+// ★ These are also the LIR-tier COMPANIONS to the encoder byte-pins in
+// test_asm_x86_variable (`0f c8` / `48 0f c8` / the r15 `+rd` form) and
+// test_asm_arm64 (the three REV words). A byte-pin alone cannot prove NATIVE was
+// SELECTED: rename the `bswap` mnemonic in both target configs and every byte-pin
+// still passes (it resolves the mnemonic itself) while every byte-swap in the
+// compiler silently routes through the expansion — correct results, no diagnostic,
+// no native instruction. `countLirOp(..., "bswap")` is what closes that hole.
+namespace {
+// One byte-swap wrapper per width; a per-width program keeps every count exact.
+constexpr char const* kBswapSrc16 =
+    "unsigned short f(unsigned short x){ return _byteswap_ushort(x); }\n";
+constexpr char const* kBswapSrc32 =
+    "unsigned int f(unsigned int x){ return _byteswap_ulong(x); }\n";
+constexpr char const* kBswapSrc64 =
+    "unsigned long long f(unsigned long long x){ return _byteswap_uint64(x); }\n";
+
+// The universal-ALU expansion of an n-byte reversal is
+//     OR over i∈[0,n) of ((x >> 8i) & 0xFF) << 8(n-1-i)
+// with the zero shift at each end skipped, so its op counts are FIXED by n:
+//   `and` = n (one mask per byte), `shl` = `shr_l` = n-1, `or` = n-1.
+// Pinning the exact counts (not `>= 1`) is what makes a degraded expansion —
+// e.g. one that masks only the final result instead of each intermediate, the
+// dirty-upper-bits miscompile — visible here rather than only at runtime.
+void expectBswapExpansionShape(Lir const& lir, TargetSchema const& sch,
+                               int nBytes, char const* what) {
+    EXPECT_EQ(countLirOp(lir, sch, "and"), nBytes)
+        << what << ": one 0xFF mask per byte";
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), nBytes - 1)
+        << what << ": one place-shift per byte, the last skipped";
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), nBytes - 1)
+        << what << ": one extract-shift per byte, the first skipped";
+    EXPECT_EQ(countLirOp(lir, sch, "or"), nBytes - 1)
+        << what << ": one OR per byte after the first";
+}
+} // namespace
+
+TEST(MirToLir, BswapSelectsNativeOnX86AtWidth32) {
+    auto L = lowerCSubsetToLir(kBswapSrc32);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1)
+        << "x86 declares bswap at width 32 — exactly one native BSWAP";
+    // And NOTHING of the expansion: a native hit must not also emit the ALU form.
+    EXPECT_EQ(countLirOp(lir, sch, "or"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0);
+}
+
+TEST(MirToLir, BswapSelectsNativeOnX86AtWidth64) {
+    auto L = lowerCSubsetToLir(kBswapSrc64);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1)
+        << "x86 declares bswap at width 64 (REX.W 0F C8+rd) — one native BSWAP";
+    EXPECT_EQ(countLirOp(lir, sch, "or"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0);
+}
+
+// ★ THE WIDTH-16 FALLBACK IS A DESIGNED BEHAVIOUR — pin it, do not let it drift
+// into a fail-loud. If the probe were mnemonic-presence instead of per-width, a
+// width-16 `bswap` LIR inst would be emitted here and then die at the assembler
+// with A_NoMatchingEncodingVariant; `_byteswap_ushort` (sqlite's `get2byteAligned`)
+// would simply never compile on x86.
+TEST(MirToLir, BswapWidth16TakesTheSoftwareExpansionOnX86) {
+    auto L = lowerCSubsetToLir(kBswapSrc16);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the width-16 expansion must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    // The mnemonic IS declared — this is a per-WIDTH miss, not an absent verb.
+    EXPECT_TRUE(sch.opcodeByMnemonic("bswap").has_value())
+        << "precondition: x86_64 declares `bswap` (just not at width 16)";
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 0)
+        << "x86 has NO width-16 BSWAP — emitting one would die at the assembler";
+    expectBswapExpansionShape(lir, sch, /*nBytes=*/2, "x86 width-16 expansion");
+}
+
+// arm64 declares all three widths as single-word REVs, so the SAME lowering arm
+// that expands on x86 at width 16 selects native here — capability probing, no
+// arch identity anywhere. This is also the LIR companion to test_asm_arm64's three
+// REV word pins (see the note above).
+TEST(MirToLir, BswapSelectsNativeAtAllThreeWidthsOnArm64) {
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    struct Case { char const* src; char const* what; };
+    for (Case const c : {Case{kBswapSrc16, "arm64 width 16 (REV16 Wd,Wn)"},
+                         Case{kBswapSrc32, "arm64 width 32 (REV Wd,Wn)"},
+                         Case{kBswapSrc64, "arm64 width 64 (REV Xd,Xn)"}}) {
+        auto L = lowerCSubsetToLir(c.src, *arm);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << c.what << ": " << (L.lirReporter.all().empty()
+                ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        Lir const& lir = L.lir.lir;
+        EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1) << c.what;
+        // No expansion anywhere — arm64 never needs one for a byte swap.
+        EXPECT_EQ(countLirOp(lir, sch, "or"), 0)    << c.what;
+        EXPECT_EQ(countLirOp(lir, sch, "shl"), 0)   << c.what;
+        EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0) << c.what;
+    }
+}
+
+// ── RED-ON-DISABLE, LEVEL 1: delete the whole `bswap` mnemonic ────────────────
+//
+// Every width must fall back to the expansion — NOT fail loud, NOT emit a bswap.
+// This is the `PopcountFallsBackToSwarWhenNoNativeMnemonic` shape: it proves the
+// expansion is a REAL, reachable realization rather than dead code that only the
+// x86 width-16 arm happens to touch.
+TEST(MirToLir, BswapFallsBackToExpansionAtEveryWidthWhenMnemonicAbsent) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"bswap"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(x86_64, -bswap) failed";
+    EXPECT_FALSE((*mutated)->opcodeByMnemonic("bswap").has_value())
+        << "the mnemonic really was removed";
+    struct Case { char const* src; int nBytes; char const* what; };
+    for (Case const c : {Case{kBswapSrc16, 2, "width 16, no native bswap"},
+                         Case{kBswapSrc32, 4, "width 32, no native bswap"},
+                         Case{kBswapSrc64, 8, "width 64, no native bswap"}}) {
+        auto L = lowerCSubsetToLir(c.src, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << c.what << " must lower cleanly, NOT fail loud: "
+            << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        Lir const& lir = L.lir.lir;
+        EXPECT_EQ(countLirOp(lir, sch, "bswap"), 0) << c.what;
+        expectBswapExpansionShape(lir, sch, c.nBytes, c.what);
+    }
+}
+
+// ── RED-ON-DISABLE, LEVEL 2: delete a SINGLE WIDTH VARIANT ────────────────────
+//
+// ★ WITHOUT THIS ONE, `opcodeWithWidth`'s per-width scan is unpinned. Level 1
+// above removes the mnemonic entirely, so a regression that degraded the probe
+// back to mnemonic-PRESENCE would still pass it (absent verb ⇒ miss either way).
+// Here the verb is present and only its width-16 VARIANT is gone: a presence-only
+// probe would emit a width-16 `bswap` that matches no variant and dies at the
+// assembler, while the correct per-width probe expands at 16 and stays native at
+// 32/64. arm64 is the right target for this because it is the only one that
+// declares a width-16 form to remove.
+TEST(MirToLir, BswapPerWidthProbeFallsBackOnlyForTheDeletedWidthOnArm64) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "bswap") continue;
+                auto& variants = op["encoding"]["variants"];
+                variants.erase(
+                    std::remove_if(
+                        variants.begin(), variants.end(),
+                        [](nlohmann::json const& v) {
+                            return v.contains("guard")
+                                && v["guard"].value("width", 0) == 16;
+                        }),
+                    variants.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "stripping ONE bswap width variant must not fail the loader";
+    // The verb is STILL declared — only the width-16 variant is gone.
+    ASSERT_TRUE((*mutated)->opcodeByMnemonic("bswap").has_value())
+        << "precondition: the mnemonic must survive, or this degenerates into "
+           "the level-1 test above";
+    auto const* info =
+        (*mutated)->opcodeInfo(*(*mutated)->opcodeByMnemonic("bswap"));
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->encoding.variants.size(), 2u)
+        << "arm64 ships 3 bswap width variants; exactly one was removed";
+
+    // Width 16 — the removed variant — now expands.
+    {
+        auto L = lowerCSubsetToLir(kBswapSrc16, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << "the deleted width must EXPAND, not fail loud: "
+            << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "bswap"), 0)
+            << "no width-16 variant remains — a presence-only probe would emit "
+               "a bswap here that no variant can encode";
+        expectBswapExpansionShape(L.lir.lir, sch, /*nBytes=*/2,
+                                  "arm64 width-16 after variant deletion");
+    }
+    // Widths 32 and 64 — untouched variants — stay NATIVE.
+    for (char const* src : {kBswapSrc32, kBswapSrc64}) {
+        auto L = lowerCSubsetToLir(src, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok);
+        auto const& sch = *L.target;
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "bswap"), 1)
+            << "deleting the width-16 variant must not disturb 32/64";
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "or"), 0);
+    }
+}
+
 // ── TF-C94 (D-CSUBSET-INT128-LIR-WIDTH): a 128-bit MEMORY access fails loud ──
 //
 // MEASURED at HEAD 57eae7b, before this gate: `reprKind` was IDENTITY for

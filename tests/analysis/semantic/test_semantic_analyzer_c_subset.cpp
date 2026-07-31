@@ -60,13 +60,19 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // `atomic_store_explicit`, always-injected builtins; D-CSUBSET-ATOMIC).
     // FC17.9(f) (D-CSUBSET-COMPLEX): + the 4 complex builtins __builtin_complex/
     // __builtin_creal/__builtin_cimag/__builtin_conj (always-injected like the rest).
-    ASSERT_EQ(model.symbols().size() - 1, 81u)
+    // D-CSUBSET-INTRINSIC-BSWAP: + the 6 byte-swap builtins (`_byteswap_ushort`/
+    // `_byteswap_ulong`/`_byteswap_uint64` + their GCC spellings
+    // `__builtin_bswap16`/`__builtin_bswap32`/`__builtin_bswap64` — six NAMES over
+    // ONE `lowering: "bswap"` verb, always-injected like every other builtin).
+    ASSERT_EQ(model.symbols().size() - 1, 87u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + __sync_synchronize + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
-           "creal/cimag/conj complex builtins + __func__ + __FUNCTION__";
+           "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
+           "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
+           "__builtin_bswap16/32/64) + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -3261,9 +3267,11 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
     // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
-    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap
+    // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
+    // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 82u);
+    EXPECT_EQ(model.symbols().size() - 1, 88u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -3288,9 +3296,11 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
     // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
-    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap
+    // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
+    // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 81u);
+    ASSERT_EQ(model.symbols().size() - 1, 87u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -6126,14 +6136,19 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
     // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.9(d) atomic
     // accessors (atomic_load_explicit + atomic_store_explicit, D-CSUBSET-ATOMIC) +
+    // the 4 FC17.9(f) complex builtins (__builtin_complex/creal/cimag/conj,
+    // D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap builtins
+    // (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + __builtin_bswap16/32/64) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 82u)
+    EXPECT_EQ(model.symbols().size() - 1, 88u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
            "the 6 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
+           "the 6 byte-swap builtins (_byteswap_ushort/_byteswap_ulong/"
+           "_byteswap_uint64 + __builtin_bswap16/32/64) + "
            "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 

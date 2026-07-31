@@ -41,10 +41,31 @@ readImm64LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
 // opcode-plus-register destination form? (The opcode byte's low 3 bits
 // carry the register, so the disasm must match the byte by its high 5
 // bits, not exact-match it.)
+//
+// D-CSUBSET-INTRINSIC-BSWAP: the slot reaches this form from TWO
+// sources, and the ENCODER treats them identically — `wireSlot`
+// (x86_variable.cpp:211-244) fills `opcodePlusReg3` from either, and
+// the emit at :1122-1130 ORs it into the last opcode byte without
+// asking which one wrote it. Only THIS predicate was asymmetric:
+//   * a `resultSlot` of `opcode.reg`  — `mov r64, imm64` (B8+rd io);
+//   * a WIRE on operand 0 of `opcode.reg` — the 2-address `+rd` shape
+//     (`bswap`, 0F C8+rd), where `requires2Address` makes operand 0 BE
+//     the destination and the opcode has no ModR/M byte to carry it.
+// Testing `resultSlot` alone would exact-match the base opcode byte, so
+// `0F C9` (`bswap ecx`) would fail to match ANY variant, and `0F C8`
+// (`bswap eax`, low 3 bits happen to be 0) would match but return
+// nullopt for the slot value (`hasOpcodeReg` never set) — a silent
+// "register 0" hole. Scan both.
 [[nodiscard]] bool
 variantUsesOpcodePlusReg(TargetEncodingVariant const& v) noexcept {
-    return v.resultSlot.has_value()
-        && *v.resultSlot == EncodingSlotKind::OpcodePlusReg;
+    if (v.resultSlot.has_value()
+        && *v.resultSlot == EncodingSlotKind::OpcodePlusReg) {
+        return true;
+    }
+    for (auto const& w : v.wires) {
+        if (w.slotKind == EncodingSlotKind::OpcodePlusReg) return true;
+    }
+    return false;
 }
 
 // Per-variant peel state — mirrors the encoder's EncodingState but
