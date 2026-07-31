@@ -125,6 +125,22 @@ add_subdirectory(examples)
 # entries at ../CMakeLists.txt:228-241 must dispatch `bash` vs
 # `powershell -File` precisely because their command is a SCRIPT. This command is
 # a binary; there is nothing to interpret.
+#
+# CONCURRENCY — AND WHY THERE IS DELIBERATELY NO `RUN_SERIAL` HERE
+# (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES). This arm is a SECOND ctest entry
+# on the SAME binary, so an ordinary `ctest -j` overlaps it with the plain entry
+# and TWO live processes of that binary run at once. That is by design and must
+# stay that way: `RUN_SERIAL`/`RESOURCE_LOCK` would bury the very contention that
+# is cheapest to catch right here, and would spend every gate run the 6.0 s this
+# arm was budgeted to overlap away.
+#
+# The obligation that buys the overlap falls on the SUITE, not on ctest: a suite
+# registered on this arm must derive every scratch path from a PER-RUN root, and
+# never from a constant one. test_preprocessor.cpp meets that at its
+# `ppScratchRoot()` chokepoint (see the docblock there, and the shared scheme in
+# tests/test_support/scratch_dir.hpp). MEASURED before that root existed: the two
+# entries clobbered each other's fixture files and `ctest -j 8` over just this
+# pair went red 1 run in 3. Any suite added to this arm inherits the obligation.
 function(dss_add_shuffle_arm)
     cmake_parse_arguments(DSS "" "NAME;REPEAT" "" ${ARGN})
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")

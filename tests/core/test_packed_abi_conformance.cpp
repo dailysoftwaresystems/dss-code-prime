@@ -13,7 +13,17 @@
 // The battery is restricted to structs where GNU `__attribute__((packed))` and MSVC
 // `#pragma pack(1)` AGREE (no bit-fields — packed + bit-field is fail-loud, and no
 // over-aligned members): both mean "remove ALL inter-field padding, alignment 1",
-// which is exactly what DSS models. Skips cleanly when no toolchain is present.
+// which is exactly what DSS models.
+//
+// SKIPS ONLY WHEN THE TOOL IS ABSENT. TF-C97 fixed this file's run-step shell quoting
+// but left the SECOND half of the defect in place: a compiler that was present and
+// then failed to build, launch or answer still collapsed into the same `nullopt` as
+// "no compiler installed", and the test skipped green either way. The quoting fix is
+// what made that branch unreachable HERE — not anything that made it safe. It is now
+// a fail-loud assert, and the probe machinery is shared (`native_c_probe.hpp`) so the
+// bit-field twin cannot drift away from it again.
+//
+// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
 
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
@@ -22,22 +32,21 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 
-#include "scratch_dir.hpp"
+#include "native_c_probe.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
-#include <functional>
 #include <map>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
+namespace native_probe = dss::test_support::native_probe;
 using namespace dss;
 
 namespace {
@@ -87,86 +96,18 @@ struct NativeLayout {
     std::vector<std::uint64_t> offsets;
 };
 
-struct Compiler {
-    std::string kind;   // "msvc" | "unix"
-    std::function<std::string(fs::path const&, fs::path const&)> buildCmd;
-};
+// Locating the host compiler, spelling the run-step redirect for the host shell, and
+// building/launching/reading back the probe now live in `native_c_probe.hpp` — shared
+// verbatim with `test_bitfield_abi_conformance.cpp`. They used to be two copies, and
+// that duplication is exactly what let the TF-C97 quoting fix land on this file only.
 
-[[nodiscard]] bool fileExists(fs::path const& p) {
-    std::error_code ec;
-    return fs::exists(p, ec);
-}
-
-// Run `exe` with stdout redirected into `out`, spelled for the host's shell.
-//
-// These two spellings are NOT interchangeable, and getting it wrong is SILENT: the
-// cmd.exe form wraps the whole command in an extra pair of quotes (`""prog" > "file""`)
-// so a spaced path survives, but a POSIX shell reads that same string as ONE command
-// name and reports `prog > file: No such file or directory`. `std::system` then
-// returns non-zero, `measure*Native` returns nullopt, and the test GTEST_SKIPs with
-// "no native C compiler available" — a conformance witness that looks fine in the log
-// while never actually comparing anything.
-//
-// MEASURED: that is exactly what this file (and its bitfield twin) did on macOS —
-// the cmd.exe form was used unconditionally, so the cross-compile-compare leg had
-// been inert on every Unix host. Both call sites below go through here now.
-[[nodiscard]] std::string redirectCmd(fs::path const& exe, fs::path const& out) {
-#if defined(_WIN32)
-    return "\"\"" + exe.string() + "\" > \"" + out.string() + "\"\"";
-#else
-    return "\"" + exe.string() + "\" > \"" + out.string() + "\"";
-#endif
-}
-
-[[nodiscard]] std::optional<Compiler> findCompiler(fs::path const& work) {
-#if defined(_WIN32)
-    fs::path const vswhere =
-        fs::path{"C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"};
-    if (!fileExists(vswhere)) return std::nullopt;
-    fs::path const vswhereOut = work / "vsinstall.txt";
-    std::string const q =
-        "\"\"" + vswhere.string() + "\" -latest -products * "
-        "-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
-        "-property installationPath > \"" + vswhereOut.string() + "\"\"";
-    if (std::system(q.c_str()) != 0) return std::nullopt;
-    std::ifstream vin{vswhereOut};
-    std::string vsPath;
-    std::getline(vin, vsPath);
-    while (!vsPath.empty() && (vsPath.back() == '\r' || vsPath.back() == '\n'))
-        vsPath.pop_back();
-    if (vsPath.empty()) return std::nullopt;
-    fs::path const vcvars =
-        fs::path{vsPath} / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
-    if (!fileExists(vcvars)) return std::nullopt;
-    Compiler c;
-    c.kind = "msvc";
-    c.buildCmd = [vcvars, work](fs::path const& src, fs::path const& exe) -> std::string {
-        fs::path const bat = work / "build_probe.bat";
-        std::ofstream b{bat};
-        b << "@echo off\r\n"
-          << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
-          << "cl /nologo /W3 /Fe:\"" << exe.string() << "\" \""
-          << src.string() << "\" >nul 2>&1\r\n";
-        b.close();
-        return "\"\"" + bat.string() + "\"\"";
-    };
-    return c;
-#else
-    for (char const* cc : {"cc", "clang", "gcc"}) {
-        std::string const probe = std::string{"command -v "} + cc + " >/dev/null 2>&1";
-        if (std::system(probe.c_str()) == 0) {
-            Compiler c;
-            c.kind = "unix";
-            std::string const ccName = cc;
-            c.buildCmd = [ccName](fs::path const& src, fs::path const& exe) -> std::string {
-                return ccName + " -std=c11 -O0 -o \"" + exe.string() + "\" \""
-                     + src.string() + "\"";
-            };
-            return c;
-        }
-    }
-    return std::nullopt;
-#endif
+// The number of field offsets this battery expects the oracle to compare. DERIVED
+// from the battery so the inert-oracle floor cannot drift away from the data it
+// guards; a hand-typed count is a floor that silently stops being one.
+[[nodiscard]] std::size_t probedFieldCount(std::vector<PackedProbe> const& bs) {
+    std::size_t n = 0;
+    for (auto const& b : bs) n += b.fieldTypes.size();
+    return n;
 }
 
 // Emit the probe C program: declares each packed struct (host-specific packed
@@ -196,38 +137,16 @@ void writeProbeSource(fs::path const& src, std::vector<PackedProbe> const& bs,
     o << "  return 0;\n}\n";
 }
 
-std::optional<std::map<std::string, NativeLayout>>
-measureNative(std::vector<PackedProbe> const& bs) {
-    test_support::ScratchDir scratch{test_support::Location::Temp, "packed-abi"};
-    fs::path const work = scratch.path();
-    auto comp = findCompiler(work);
-    if (!comp) return std::nullopt;
-
-    fs::path const src = work / "probe.c";
-    fs::path const exe = work / (
-#if defined(_WIN32)
-        "probe.exe"
-#else
-        "probe"
-#endif
-    );
-    writeProbeSource(src, bs, comp->kind == "msvc");
-
-    std::string const build = comp->buildCmd(src, exe);
-    if (build.empty()) return std::nullopt;
-    if (std::system(build.c_str()) != 0 || !fileExists(exe)) return std::nullopt;
-
-    fs::path const out = work / "probe_out.txt";
-    std::string const run = redirectCmd(exe, out);
-    if (std::system(run.c_str()) != 0) return std::nullopt;
-
-    std::ifstream in{out};
-    if (!in) return std::nullopt;
+// Parse the probe's captured stdout into per-struct layouts. PURE PARSING — whether
+// the probe ran at all is decided upstream by `runNativeCProbe`'s status, never by
+// this returning an empty map.
+std::map<std::string, NativeLayout>
+parseNative(std::vector<PackedProbe> const& bs,
+            std::vector<std::string> const& lines) {
     std::map<std::string, NativeLayout> result;
     for (auto const& b : bs) result[b.name].offsets.assign(b.fieldTypes.size(), 0);
 
-    std::string line;
-    while (std::getline(in, line)) {
+    for (auto const& line : lines) {
         std::istringstream ls{line};
         std::string tok;
         ls >> tok;
@@ -356,36 +275,11 @@ struct NativeSizeAlign {
     std::uint64_t align = 0;
 };
 
-std::optional<std::map<std::string, NativeSizeAlign>>
-measurePackBitNative(std::vector<PackBitProbe> const& bs) {
-    test_support::ScratchDir scratch{test_support::Location::Temp, "pack-bitfield-abi"};
-    fs::path const work = scratch.path();
-    auto comp = findCompiler(work);
-    if (!comp) return std::nullopt;
-
-    fs::path const src = work / "probe.c";
-    fs::path const exe = work / (
-#if defined(_WIN32)
-        "probe.exe"
-#else
-        "probe"
-#endif
-    );
-    writePackBitProbeSource(src, bs);
-
-    std::string const build = comp->buildCmd(src, exe);
-    if (build.empty()) return std::nullopt;
-    if (std::system(build.c_str()) != 0 || !fileExists(exe)) return std::nullopt;
-
-    fs::path const out = work / "probe_out.txt";
-    std::string const run = redirectCmd(exe, out);
-    if (std::system(run.c_str()) != 0) return std::nullopt;
-
-    std::ifstream in{out};
-    if (!in) return std::nullopt;
+// Parse the pack+bit-field probe's captured stdout. PURE PARSING — see `parseNative`.
+std::map<std::string, NativeSizeAlign>
+parsePackBitNative(std::vector<std::string> const& lines) {
     std::map<std::string, NativeSizeAlign> result;
-    std::string line;
-    while (std::getline(in, line)) {
+    for (auto const& line : lines) {
         std::istringstream ls{line};
         std::string name, szT, alT;
         if (!(ls >> name >> szT >> alT)) continue;
@@ -420,22 +314,39 @@ measurePackBitNative(std::vector<PackBitProbe> const& bs) {
 // pin the layout; this CI leg re-derives them where a compiler is present).
 TEST(PackedAbiConformance, DssPackedLayoutMatchesNativeCompiler) {
     auto const bs = battery();
-    auto const native = measureNative(bs);
-    if (!native) {
-        GTEST_SKIP() << "no native C compiler available (or it failed to build the "
-                        "probe) — the hermetic packed goldens in test_type_layout "
-                        "still pin the layout; this CI leg re-derives them where a "
-                        "toolchain is present.";
+    auto const probe = native_probe::runNativeCProbe(
+        "packed-abi", [&bs](fs::path const& src, native_probe::Toolchain tc) {
+            writeProbeSource(src, bs, tc == native_probe::Toolchain::Msvc);
+        });
+
+    // The ONE legitimate skip: no toolchain on this machine. `probe.detail` says WHICH
+    // shape of absent (nothing on PATH, or a shim that cannot build a trivial program).
+    if (probe.toolAbsent()) {
+        GTEST_SKIP() << "no usable native C compiler on this host (" << probe.detail
+                     << ") — the hermetic packed goldens in test_type_layout still pin "
+                        "the layout; this CI leg re-derives them where a toolchain is "
+                        "present.";
     }
+    // Every other outcome is a harness defect, not a missing tool. Fail loud.
+    ASSERT_TRUE(probe.ok()) << probe.describe();
+
+    auto const native = parseNative(bs, probe.lines);
 
     // Packed layout is data-model-independent (all scalar widths are fixed by their
     // TypeKind; no pointers in the battery), so Lp64 params suffice on every host.
     AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16};
+
+    // The inert-oracle guard — below every early exit so a legitimate skip is not
+    // turned into a red. Floors derived from the battery, never typed in.
+    native_probe::ExecutedRows sizeRows{"packed sizeof vs native", bs.size()};
+    native_probe::ExecutedRows offsetRows{"packed field offset vs native",
+                                          probedFieldCount(bs)};
+
     TypeInterner ti{CompilationUnitId{1}};
     std::uint64_t key = 100;
     for (auto const& b : bs) {
-        auto const itN = native->find(b.name);
-        ASSERT_NE(itN, native->end()) << b.name;
+        auto const itN = native.find(b.name);
+        ASSERT_NE(itN, native.end()) << b.name;
         NativeLayout const& nl = itN->second;
 
         TypeId const s = internPacked(ti, b, key++);
@@ -446,12 +357,15 @@ TEST(PackedAbiConformance, DssPackedLayoutMatchesNativeCompiler) {
         EXPECT_EQ(l->size, nl.size)
             << "packed struct " << b.name << ": dss sizeof " << l->size
             << " != native " << nl.size;
+        sizeRows.record();
+
         ASSERT_EQ(l->fieldOffsets.size(), nl.offsets.size()) << b.name;
         for (std::size_t i = 0; i < nl.offsets.size(); ++i) {
             EXPECT_EQ(l->fieldOffsets[i], nl.offsets[i])
                 << "packed struct " << b.name << " field " << i
                 << ": dss offset " << l->fieldOffsets[i]
                 << " != native " << nl.offsets[i];
+            offsetRows.record();
         }
     }
 }
@@ -474,24 +388,40 @@ TEST(PackedAbiConformance, DssPackBitfieldLayoutMatchesNativeCompiler) {
                     "rather than pinned to a guess.";
 #else
     auto const bs = packBitBattery();
-    auto const native = measurePackBitNative(bs);
-    if (!native) {
-        GTEST_SKIP() << "no native C compiler available (or it failed to build the "
-                        "probe) — this leg re-derives the pack+bit-field layout "
-                        "wherever a toolchain is present.";
+    auto const probe = native_probe::runNativeCProbe(
+        "pack-bitfield-abi", [&bs](fs::path const& src, native_probe::Toolchain) {
+            writePackBitProbeSource(src, bs);
+        });
+
+    // The ONE legitimate skip: no toolchain on this machine (see the twin above for
+    // why the detail is echoed).
+    if (probe.toolAbsent()) {
+        GTEST_SKIP() << "no usable native C compiler on this host (" << probe.detail
+                     << ") — this leg re-derives the pack+bit-field layout wherever a "
+                        "toolchain is present.";
     }
+    // Every other outcome is a harness defect, not a missing tool. Fail loud.
+    ASSERT_TRUE(probe.ok()) << probe.describe();
+
+    auto const native = parsePackBitNative(probe.lines);
 
     // GnuPacked: the strategy every GNU-ABI host (Linux/macOS, gcc/clang) uses, which
     // is the ABI the probe was just compiled under.
     AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16,
                                        BitFieldStrategy::GnuPacked};
+
+    // The inert-oracle guard. Each row contributes a sizeof AND an _Alignof
+    // comparison, so the floor is the battery size for each ledger.
+    native_probe::ExecutedRows sizeRows{"pack+bit-field sizeof vs native", bs.size()};
+    native_probe::ExecutedRows alignRows{"pack+bit-field _Alignof vs native", bs.size()};
+
     TypeInterner ti{CompilationUnitId{1}};
     std::uint64_t key = 900;
     for (auto const& b : bs) {
         ASSERT_EQ(b.fieldTypes.size(), b.widths.size())
             << b.name << ": probe field/width arity disagreement";
-        auto const itN = native->find(b.name);
-        ASSERT_NE(itN, native->end()) << b.name;
+        auto const itN = native.find(b.name);
+        ASSERT_NE(itN, native.end()) << b.name;
         NativeSizeAlign const& nl = itN->second;
         ASSERT_GT(nl.size, 0u) << b.name << ": native probe produced no size";
 
@@ -504,9 +434,12 @@ TEST(PackedAbiConformance, DssPackBitfieldLayoutMatchesNativeCompiler) {
         EXPECT_EQ(l->size, nl.size)
             << "pack(" << b.packN << ") " << b.cDecl << ": dss sizeof " << l->size
             << " != native " << nl.size;
+        sizeRows.record();
+
         EXPECT_EQ(l->align.bytes(), nl.align)
             << "pack(" << b.packN << ") " << b.cDecl << ": dss _Alignof "
             << l->align.bytes() << " != native " << nl.align;
+        alignRows.record();
     }
 #endif
 }

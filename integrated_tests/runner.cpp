@@ -37,8 +37,18 @@
 #include <iostream>
 #include <iterator>  // std::istreambuf_iterator (do not rely on a transitive include)
 #include <optional>  // std::optional (per-target exitCode override)
+#include <stdexcept>     // std::runtime_error (scratch-root setup fails loud)
 #include <string>
+#include <system_error>  // std::error_code (do not rely on a transitive include)
+#include <utility>       // std::pair (kept-root prune list)
 #include <vector>
+
+// The per-run scratch root seeds its unique name with the pid.
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -156,6 +166,80 @@ void check(std::string const& description, bool condition,
 #else
     return cmd;
 #endif
+}
+
+// ── Filesystem answers that cannot terminate the run ───────────
+//
+// D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: the examples-corpus path uses the `error_code` overload of every `std::filesystem` call, because the throwing forms here sit OUTSIDE any `try` and end the process via `std::terminate`.
+//
+// What that cost was not an unhandled corner: `libc++abi: terminating` is the
+// WHOLE output. No `[FAIL]` line, no example name, no path, no Results line —
+// an aggregate test that reports nothing about what it was doing when it died.
+// The scratch-root section below was hardened for the same reason (TF-C98);
+// this is the other half of the same file.
+//
+// The sharpest part, and why this is not tidying: the artifact checks are what
+// a RED run reaches. A genuinely failing example could terminate the runner
+// instead of reporting itself, so the harness was least informative at exactly
+// the moment it mattered most.
+//
+// A negative answer carries its own REASON because the reasons are not
+// interchangeable — "absent", "0 bytes" and "cannot be read" send a reader to
+// three different places, and printing the wrong one would trade a crash for a
+// confident wrong diagnostic, which is the worse of the two.
+struct FsAnswer {
+    bool        ok = false;
+    std::string why;  // empty iff ok
+};
+
+// `exists` with the failure kept SEPARATE from the answer. An unreadable path
+// is not an absent one — ELOOP on a self-referential symlink, EACCES on a
+// locked parent — and only the `error_code` overload can tell them apart; the
+// throwing form answers one of those two questions by aborting the run.
+[[nodiscard]] FsAnswer fileExists(fs::path const& p) {
+    std::error_code ec;
+    bool const present = fs::exists(p, ec);
+    if (ec) {
+        return {false,
+                "cannot stat '" + p.generic_string() + "': " + ec.message()};
+    }
+    // Plain absence says "absent" and NOT the path: both callers already name
+    // the path in the check's description, and the commonest red line in the
+    // corpus should not print it twice. An ERROR keeps its path, because that
+    // branch carries a cause worth being unambiguous about.
+    return {present, present ? std::string{} : "absent"};
+}
+
+// NOT `file_size(p)`. Its no-argument form THROWS for a file that is missing
+// (ENOENT — e.g. an artifact deleted under a concurrent run, the exact shape
+// D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES produced) or that is not a regular
+// file, and both are RED-run states. An error is a FAILED check reported with
+// its own cause: calling it "empty" would replace a crash with a diagnostic
+// that sends the reader to look at a file that is not even there.
+[[nodiscard]] FsAnswer fileNonEmpty(fs::path const& p) {
+    std::error_code ec;
+    auto const size = fs::file_size(p, ec);
+    if (ec) {
+        return {false, "cannot read the size of '" + p.generic_string()
+                           + "': " + ec.message()};
+    }
+    return {size > 0u, size > 0u ? std::string{} : "0 bytes"};
+}
+
+// `create_directories`, reported rather than thrown. Deliberately SILENT on
+// success: a new `[PASS]` per example would change this runner's pinned pass
+// count, and a behaviour change wearing error handling's clothes is not what
+// this defect asked for.
+[[nodiscard]] FsAnswer madeDirectory(fs::path const& d) {
+    std::error_code ec;
+    // A false return with `ec` clear only means "already there" — the error
+    // code is the answer, not the return value.
+    fs::create_directories(d, ec);
+    if (ec) {
+        return {false,
+                "cannot create '" + d.generic_string() + "': " + ec.message()};
+    }
+    return {true, {}};
 }
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one prerequisite LIBRARY artifact a
@@ -450,11 +534,21 @@ buildDependsOnArtifactCli(std::string const&       compiler,
         + " > " + quote(depLog.string()) + " 2>&1";
     int const depRc = std::system(shellWrap(depCmd).c_str());
     auto const depArtifact = outDir / dep.artifact;
-    bool const depOk = (depRc == 0) && fs::exists(depArtifact)
-                    && fs::file_size(depArtifact) > 0u;
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: `error_code` overloads — the throwing `exists`/`file_size` pair terminated the run instead of failing this check.
+    // The three causes stay distinguishable in the ONE check this has always
+    // emitted (a second check here would change the pinned pass count).
+    std::string depWhy;
+    if (depRc != 0) {
+        depWhy = "rc=" + std::to_string(depRc);
+    } else if (auto const present = fileExists(depArtifact); !present.ok) {
+        depWhy = present.why;
+    } else if (auto const nonEmpty = fileNonEmpty(depArtifact); !nonEmpty.ok) {
+        depWhy = nonEmpty.why;
+    }
+    bool const depOk = depWhy.empty();
     check(exampleName + ": dependsOn library " + dep.spec + " built ("
           + depArtifact.generic_string() + ", buildlog: "
-          + depLog.generic_string() + ")", depOk);
+          + depLog.generic_string() + ")", depOk, depWhy);
     if (!depOk) return std::nullopt;
     return depArtifact;
 }
@@ -503,7 +597,11 @@ void runExampleViaCli(std::string const& compiler,
     }();
     auto const outDir =
         outputBase / "ex" / exampleName / specDir;
-    fs::create_directories(outDir);
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: a full temp filesystem used to abort the whole run here; it is now this one example's [FAIL].
+    if (auto const made = madeDirectory(outDir); !made.ok) {
+        check(exampleName + ": output directory created", false, made.why);
+        return;
+    }
 
     // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
     // artifact FIRST (into the same out dir) via a separate CLI invocation,
@@ -558,16 +656,18 @@ void runExampleViaCli(std::string const& compiler,
     if (!compileOk) return;
     check(exampleName + ": compile exits 0", true);
 
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: THE case this defect is about — these two are the checks a RED run reaches, and in their throwing form a failing example killed the runner rather than naming itself.
     auto const artifactPath = outDir / target->artifact;
-    bool const artifactExists = fs::exists(artifactPath);
+    auto const artifactPresent = fileExists(artifactPath);
     check(exampleName + ": artifact exists at "
-          + artifactPath.generic_string(), artifactExists);
-    if (!artifactExists) return;
+          + artifactPath.generic_string(),
+          artifactPresent.ok, artifactPresent.why);
+    if (!artifactPresent.ok) return;
 
-    bool const artifactNonEmpty =
-        artifactExists && fs::file_size(artifactPath) > 0u;
-    check(exampleName + ": artifact non-empty", artifactNonEmpty);
-    if (!artifactNonEmpty) return;
+    auto const artifactNonEmpty = fileNonEmpty(artifactPath);
+    check(exampleName + ": artifact non-empty",
+          artifactNonEmpty.ok, artifactNonEmpty.why);
+    if (!artifactNonEmpty.ok) return;
 
     // D-LK10-ENTRY-ARM64: cross-ARCH execution gate. The runOn match
     // above reconciled the host OS; now reconcile the host ARCH. A
@@ -642,7 +742,11 @@ void runErrorExampleViaCli(std::string const& compiler,
         return s;
     }();
     auto const outDir = outputBase / "ex" / exampleName / specDir;
-    fs::create_directories(outDir);
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: as in runExampleViaCli — reported against THIS example, never thrown out of the run.
+    if (auto const made = madeDirectory(outDir); !made.ok) {
+        check(exampleName + ": output directory created", false, made.why);
+        return;
+    }
 
     std::string compileArgs;
     for (auto const& s : m.sources) {
@@ -691,7 +795,26 @@ void runErrorExampleViaCli(std::string const& compiler,
 void runAllExamples(std::string const& compiler,
                     fs::path const&    examplesRoot,
                     fs::path const&    outputBase) {
-    if (!fs::is_directory(examplesRoot)) {
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: this whole walk uses the `error_code` overloads, and every failure below is reported and counted rather than thrown out of a function no `try` encloses.
+    //
+    // The severity split is deliberate, and it is the decision most worth
+    // getting right here. The corpus ROOT — unreadable, or not a directory —
+    // is a SETUP error: nothing can run, so it is loud and it ENDS the walk.
+    // A single ENTRY — one looping symlink, one directory whose permissions
+    // were stripped — is a reported FAILURE and the walk CONTINUES. Inverted
+    // either way this reads badly: a broken setup would emit 500 confusing
+    // per-example failures, or one bad symlink would black out the whole
+    // corpus. Both severities are counted, so RC is 1 in every case.
+    std::error_code rootEc;
+    bool const rootIsDir = fs::is_directory(examplesRoot, rootEc);
+    if (rootEc) {
+        std::cerr << "[ERROR] cannot stat examples root "
+                  << examplesRoot.generic_string() << ": " << rootEc.message()
+                  << "\n";
+        ++failures;
+        return;
+    }
+    if (!rootIsDir) {
         std::cerr << "[ERROR] examples root not a directory: "
                   << examplesRoot.generic_string() << "\n";
         ++failures;
@@ -701,14 +824,95 @@ void runAllExamples(std::string const& compiler,
     // is fixed (2 levels) so a recursive iterator is overkill;
     // a nested loop is clearer.
     std::vector<fs::path> manifestPaths;
-    for (auto const& langEntry : fs::directory_iterator(examplesRoot)) {
-        if (!langEntry.is_directory()) continue;
-        for (auto const& nameEntry :
-             fs::directory_iterator(langEntry.path())) {
-            if (!nameEntry.is_directory()) continue;
-            auto const mp = nameEntry.path() / "expected.json";
-            if (fs::exists(mp)) manifestPaths.push_back(mp);
+    std::error_code langEc;
+    fs::directory_iterator langIt(examplesRoot, langEc);
+    if (langEc) {
+        std::cerr << "[ERROR] cannot scan examples root "
+                  << examplesRoot.generic_string() << ": " << langEc.message()
+                  << "\n";
+        ++failures;
+        return;
+    }
+    // `it.increment(ec)`, NOT a range-for: the range-for's `operator++` is the
+    // THROWING increment — the same reason `pruneKeptRoots` spells its walk out
+    // longhand. A readdir can fail mid-walk (EIO, or ESTALE on a networked
+    // checkout) long after the directory opened cleanly.
+    for (fs::directory_iterator const langEnd; langIt != langEnd;
+         langIt.increment(langEc)) {
+        if (langEc) break;  // reported after the loop
+        auto const langPath = langIt->path();
+        // `is_directory(ec)`, NOT `is_directory()`: this reaches the filesystem
+        // whenever the entry's cached readdir type is a symlink or unknown, and
+        // a self-referential symlink answers ELOOP rather than yes-or-no.
+        std::error_code langKindEc;
+        bool const langIsDir = langIt->is_directory(langKindEc);
+        if (langKindEc) {
+            std::cerr << "[ERROR] cannot stat corpus entry "
+                      << langPath.generic_string() << ": "
+                      << langKindEc.message() << "\n";
+            ++failures;
+            continue;  // one bad entry, not the corpus
         }
+        if (!langIsDir) continue;
+
+        std::error_code nameEc;
+        fs::directory_iterator nameIt(langPath, nameEc);
+        if (nameEc) {
+            std::cerr << "[ERROR] cannot scan corpus language directory "
+                      << langPath.generic_string() << ": " << nameEc.message()
+                      << "\n";
+            ++failures;
+            continue;
+        }
+        for (fs::directory_iterator const nameEnd; nameIt != nameEnd;
+             nameIt.increment(nameEc)) {
+            if (nameEc) break;  // reported after this inner loop
+            auto const namePath = nameIt->path();
+            std::error_code nameKindEc;
+            bool const nameIsDir = nameIt->is_directory(nameKindEc);
+            if (nameKindEc) {
+                std::cerr << "[ERROR] cannot stat corpus entry "
+                          << namePath.generic_string() << ": "
+                          << nameKindEc.message() << "\n";
+                ++failures;
+                continue;
+            }
+            if (!nameIsDir) continue;
+            auto const mp = namePath / "expected.json";
+            // Three outcomes, not two. ABSENT is ordinary — a `<name>/` with
+            // no manifest simply is not an example, exactly as before. But a
+            // manifest that cannot be LOOKED AT is reported rather than
+            // skipped: dropping it silently would shrink the corpus and still
+            // print a green Results line, which is the failure mode this
+            // defect is named for.
+            std::error_code mpEc;
+            bool const haveManifest = fs::exists(mp, mpEc);
+            if (mpEc) {
+                std::cerr << "[ERROR] cannot stat manifest "
+                          << mp.generic_string() << ": " << mpEc.message()
+                          << "\n";
+                ++failures;
+                continue;
+            }
+            if (haveManifest) manifestPaths.push_back(mp);
+        }
+        // Checked here rather than at the `break`: a failed `increment` may
+        // leave the iterator AT `end`, in which case the loop condition ends
+        // the walk and the body never runs again. One report covers both exits.
+        if (nameEc) {
+            std::cerr << "[ERROR] scan of corpus language directory "
+                      << langPath.generic_string() << " stopped early: "
+                      << nameEc.message() << " — examples under it are missing"
+                      << " from this run\n";
+            ++failures;
+        }
+    }
+    if (langEc) {
+        std::cerr << "[ERROR] scan of examples root "
+                  << examplesRoot.generic_string() << " stopped early: "
+                  << langEc.message() << " — examples are missing from this"
+                  << " run\n";
+        ++failures;
     }
     // Deterministic order for reproducible logs.
     std::sort(manifestPaths.begin(), manifestPaths.end());
@@ -739,6 +943,303 @@ void runAllExamples(std::string const& compiler,
     std::cout << "\n";
 }
 
+// ── Per-run scratch root ───────────────────────────────────────
+//
+// D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES (opened TF-C97): this root MUST be unique per run. Do NOT "simplify" it back to a fixed name.
+//
+// It USED to be the constant `temp_directory_path()/"dss-integrated-tests"`,
+// wiped with `remove_all` at startup. Every run on the host therefore shared
+// ONE directory and DELETED it out from under any run already in flight, so
+// two concurrent runs — two out-of-tree build dirs on one machine, e.g.
+// parallel agents — destroyed each other's artifacts mid-run. What that
+// produced was not a clean error but a large, alarming, entirely SPURIOUS
+// failure set: ENOENT from `chmod` on an artifact deleted underneath the run,
+// and `got 137` (SIGKILL) from binaries whose files vanished mid-exec. Four
+// agents once reported four different whole-suite counts for one commit and
+// all of it was this. The real cost is not the wasted time — a big spurious
+// failure set is exactly the condition under which a GENUINE regression gets
+// waved away as "probably the flake". That is why the tidy fixed name is the
+// wrong trade at any price.
+//
+// Two non-fixes, recorded so they are not re-proposed: retrying on ENOENT
+// HIDES the collision rather than removing it (that is how this stayed
+// invisible), and serialising the test (a lock, RESOURCE_LOCK, RUN_SERIAL)
+// conceals it while slowing every gate. The path must be UNIQUE, not
+// contended-for.
+//
+// Uniqueness is by CONSTRUCTION rather than by hope, and deliberately reuses
+// the scheme `tests/test_support/scratch_dir.hpp` arrived at when
+// `D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE` was corrected: a pid is a
+// SEED, not a guarantee (pids recycle, and a killed run leaves its directory
+// behind), so the guarantee is the atomic `create_directory` claim below. That
+// header is not reused DIRECTLY because its destructor removes the directory
+// unconditionally, and a FAILED integration run has to stay inspectable — see
+// the cleanup policy at the end of `main`.
+
+// Every run claims its root inside this base. Pruning is scoped to it and
+// touches nothing else.
+//
+// The name deliberately DIFFERS from the pre-fix `dss-integrated-tests`, and
+// that is load-bearing rather than cosmetic. A pre-fix build of this runner
+// still calls `remove_all()` on that exact path at startup, and every stale
+// build directory on the host has one. Had the per-run roots been nested
+// INSIDE the old name, a single stale binary would still have deleted all of
+// them at once — the new scheme would have been correct and still lost the
+// race. Renaming puts the roots somewhere a pre-fix binary cannot reach.
+[[nodiscard]] fs::path scratchBase() {
+    return fs::temp_directory_path() / "dss-integrated-tests-runs";
+}
+
+// The path a pre-fix runner used, kept ONLY so the leftovers can be named.
+constexpr char const* kLegacyBaseName = "dss-integrated-tests";
+// Written in the scratch base once the leftovers have been reported. This is
+// what stops that report from becoming a permanent fixture — see
+// `reportLegacyDebris`.
+constexpr char const* kLegacyNotedName = "legacy-debris-noted.txt";
+
+// Written once at claim time. Two jobs: it tells a human which build dir
+// produced a kept root, and it is the marker that lets the prune recognise a
+// directory as this runner's before removing anything.
+constexpr char const* kRunInfoName = "run-info.txt";
+// Present for the lifetime of the run, removed at exit. A root still carrying
+// one may belong to a LIVE sibling, so the prune leaves it alone.
+constexpr char const* kRunningName = ".running";
+// Kept roots retained. MEASURED: a full corpus run leaves ~24 MB, so 3 kept
+// roots is ~72 MB — enough history to compare two red runs, small enough that
+// an agent looping on a failure cannot fill the temp filesystem.
+constexpr std::size_t kKeptRootLimit = 3;
+// A killed run cannot remove its own sentinel. Past this age `.running` is
+// treated as stale rather than live, so a `kill -9` cannot leak a root
+// forever. It is orders of magnitude longer than a full corpus run.
+constexpr auto kRunningStaleAfter = std::chrono::hours{6};
+
+// Claim a scratch root no other process can be using, and return it.
+[[nodiscard]] fs::path claimRunRoot(std::string const& compiler,
+                                    fs::path const&    examplesRoot) {
+    auto const base = scratchBase();
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    if (ec) {
+        throw std::runtime_error("cannot create scratch base '"
+            + base.generic_string() + "': " + ec.message());
+    }
+
+#ifdef _WIN32
+    auto const pid = static_cast<std::uint64_t>(_getpid());
+#else
+    auto const pid = static_cast<std::uint64_t>(getpid());
+#endif
+
+    for (std::uint32_t attempt = 0; attempt < 10000u; ++attempt) {
+        auto candidate =
+            base / (std::to_string(pid) + "-" + std::to_string(attempt));
+        std::error_code cec;
+        // `create_directory` (SINGULAR) returns true ONLY for the caller that
+        // actually created the directory, and that check-and-create is atomic
+        // in the OS — this one call IS the uniqueness guarantee, across
+        // processes as well as threads. `create_directories` (PLURAL) cannot
+        // do the job: it reports SUCCESS for a directory that already exists,
+        // which is precisely how a run would silently adopt a live sibling's
+        // root and re-open this defect.
+        if (!fs::create_directory(candidate, cec)) {
+            if (cec) {
+                throw std::runtime_error("create_directory('"
+                    + candidate.generic_string() + "') failed: "
+                    + cec.message());
+            }
+            continue;  // taken — a live sibling, or a stale kept root
+        }
+        // `run-info.txt` BEFORE `.running`: a crash between the two leaves a
+        // root the prune can still recognise and reclaim. The other order
+        // would leak it permanently.
+        std::ofstream info((candidate / kRunInfoName).string());
+        info << "pid:           " << pid << "\n"
+             << "compiler:      " << compiler << "\n"
+             << "examples root: " << examplesRoot.generic_string() << "\n"
+             << "host:          " << currentHostOs() << "/"
+             << currentHostArch() << "\n";
+        std::ofstream running((candidate / kRunningName).string());
+        if (!info || !running) {
+            throw std::runtime_error("could not write the run markers in '"
+                + candidate.generic_string() + "' — without them a kept root "
+                "is never reclaimed");
+        }
+        return candidate;
+    }
+    throw std::runtime_error("could not claim a unique scratch root under '"
+        + base.generic_string() + "' after 10000 attempts. Kept roots are "
+        "accumulating — delete the directory and re-run.");
+}
+
+// Bound the population of KEPT roots (a red run keeps its own — see `main`).
+// Called once at startup AFTER this run claimed `mine`, so `mine` is never a
+// candidate.
+//
+// The rule, one sentence so it stays debuggable: retain the `kKeptRootLimit`
+// most recent roots and delete the rest — but NEVER one still holding a
+// `.running` sentinel younger than `kRunningStaleAfter`, because that root may
+// belong to a live sibling. That exclusion is the whole reason pruning is safe
+// here: deleting a live run's directory is the ORIGINAL defect, and a
+// retention bound that quietly reintroduced it would be worse than no bound.
+//
+// BEST-EFFORT, ALWAYS — a prune that cannot proceed logs and gets out of the
+// way. It must NEVER fail the run, and that is a correctness requirement, not
+// politeness: this function exists so that concurrent runs stop failing
+// spuriously, so a prune that itself reds a run under concurrency would be the
+// defect wearing the fix's clothes. Hence every filesystem call below is the
+// `error_code` overload and every failure path is `continue`/`break`/`return`.
+// Do NOT "improve" any of this into a hard error; the THROWING overloads
+// surface out of `main`'s setup path as `[ERROR] scratch root setup failed`
+// and RC=1 for the WHOLE integrated_tests run.
+//
+// MEASURED (macOS/APFS + libc++, 2026-07-31) so the next reader does not have
+// to re-derive it: an entry that merely VANISHES mid-scan does not throw there,
+// because `status()` maps ENOENT to `file_type::not_found` rather than to an
+// error. The throwing forms still abort the run on every OTHER error class —
+// a stat that hits EACCES or ELOOP, a readdir that hits EIO or an ESTALE on a
+// networked TMPDIR — all measured to throw from inside this exact loop. The
+// `error_code` forms are what make the loop survivable on every host and every
+// error class rather than on the one that happens to be benign here.
+void pruneKeptRoots(fs::path const& base, fs::path const& mine) {
+    auto const now = fs::file_time_type::clock::now();
+
+    std::error_code ec;
+    fs::directory_iterator it(base, ec);
+    if (ec) {
+        std::cerr << "[WARN] cannot scan scratch base '"
+                  << base.generic_string() << "': " << ec.message()
+                  << " — kept roots may accumulate\n";
+        return;
+    }
+
+    std::vector<std::pair<fs::file_time_type, fs::path>> prunable;
+    // `it.increment(ec)`, NOT a range-for: the range-for's `operator++` is the
+    // throwing increment. A sibling's prune mutates this directory WHILE we
+    // walk it — that is the expected condition here, not the exotic one.
+    for (fs::directory_iterator const end; it != end; it.increment(ec)) {
+        if (ec) break;  // reported after the loop
+        auto const p = it->path();
+        // `is_directory(dec)`, NOT `is_directory()`: same reason, and this one
+        // reaches the filesystem whenever the entry's cached type is a symlink
+        // or unknown.
+        std::error_code dec;
+        if (p == mine || !it->is_directory(dec) || dec) continue;
+        // Only ever remove a directory this runner demonstrably created.
+        std::error_code iec;
+        if (!fs::exists(p / kRunInfoName, iec) || iec) continue;
+        // A sentinel we cannot READ counts as LIVE. The uncertainty is
+        // asymmetric: keeping a dead root costs a little temp space, while
+        // deleting a live one is D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES
+        // over again.
+        std::error_code rec;
+        auto const running = p / kRunningName;
+        bool const sentinel = fs::exists(running, rec);
+        if (rec) continue;  // could not even ask
+        if (sentinel) {
+            auto const stamp = fs::last_write_time(running, rec);
+            if (rec || now - stamp < kRunningStaleAfter) continue;  // maybe LIVE
+        }
+        std::error_code mec;
+        auto const mtime = fs::last_write_time(p, mec);
+        if (mec) continue;  // vanished under us — a sibling cleaning up
+        prunable.emplace_back(mtime, p);
+    }
+    // Checked here rather than at the `break`: a failed `increment` may leave
+    // the iterator AT `end`, in which case the loop condition ends the walk and
+    // the body never runs again. One report covers both exits.
+    if (ec) {
+        std::cerr << "[WARN] scratch base scan of '" << base.generic_string()
+                  << "' stopped early: " << ec.message()
+                  << " — kept roots may accumulate\n";
+    }
+    if (prunable.size() <= kKeptRootLimit) return;
+
+    std::sort(prunable.begin(), prunable.end(),
+              [](auto const& a, auto const& b) { return a.first > b.first; });
+    for (std::size_t i = kKeptRootLimit; i < prunable.size(); ++i) {
+        auto const& root = prunable[i].second;
+        std::error_code rec;
+        fs::remove_all(root, rec);
+        if (!rec) continue;
+        // A sibling prune got there first: the root is GONE, which is the
+        // outcome this loop wanted, so there is nothing to report. MEASURED
+        // (six concurrent runs over a 6000-root base): libc++ reports ENOENT
+        // from the middle of `remove_all`'s own recursion, and warning on it
+        // emitted ~2500 [WARN] lines PER RUN — a spurious noise burst thrown by
+        // the very function whose job is to stop concurrency producing spurious
+        // noise. Warn only if the root is still THERE, i.e. only when a human
+        // actually has something to do.
+        std::error_code xec;
+        if (!fs::exists(root, xec) && !xec) continue;
+        std::cerr << "[WARN] cannot prune kept root '"
+                  << root.generic_string() << "': " << rec.message() << "\n";
+    }
+}
+
+// Nothing writes to the pre-fix shared tree any more, so it is inert — but it
+// is also invisible, and it holds a whole corpus run's artifacts. REPORT it
+// rather than delete it: a stale build of this runner may be using that exact
+// tree right now, and removing it underneath them is the very collision this
+// whole section exists to end.
+//
+// The note EXPIRES, and that is the point of the marker below. A `[NOTE]` on
+// EVERY run is not a reminder, it is wallpaper: read once, scrolled past
+// forever, and thereafter indistinguishable from the noise it is competing
+// with — while the thing it describes is a ONE-TIME manual chore. So say it
+// ONCE per scratch base, with the exact command, then be quiet. Exactly one
+// condition re-arms it, and it is the one that makes it news again: the legacy
+// tree being WRITTEN to since we last spoke, i.e. a pre-fix build still in
+// flight. Marker and debris share a temp tree, so a wiped `/tmp` clears both
+// together and the note is neither leaked nor lost.
+void reportLegacyDebris(fs::path const& base) {
+    // Derived from `base`, not from a fresh `temp_directory_path()`: the two
+    // are siblings BY CONSTRUCTION (see `scratchBase`), and the no-argument
+    // `temp_directory_path()` throws — unwanted on a best-effort path.
+    auto const legacy = base.parent_path() / kLegacyBaseName;
+    std::error_code lec;
+    auto const legacyStamp = fs::last_write_time(legacy, lec);
+    if (lec) return;  // absent (the normal case), or unreadable — say nothing
+
+    auto const marker = base / kLegacyNotedName;
+    std::error_code mec;
+    auto const noted = fs::last_write_time(marker, mec);
+    bool const saidBefore = !mec;
+    if (saidBefore && noted >= legacyStamp) {
+        return;  // already said, and nothing has touched the tree since
+    }
+
+#ifdef _WIN32
+    constexpr char const* removeCmd = "rmdir /s /q ";
+#else
+    constexpr char const* removeCmd = "rm -rf ";
+#endif
+    std::cout << "[NOTE] '" << legacy.generic_string()
+              << "' is the pre-fix SHARED scratch tree. ";
+    if (saidBefore) {
+        // The ONLY way to be here a second time is that the tree was written
+        // to since the last note — so the "nothing writes there now" wording
+        // below would be flatly untrue, and the advice inverts with it.
+        std::cout << "It has been WRITTEN TO since this was last reported, so"
+                     " a pre-fix build really is still in flight — leave the"
+                     " tree alone until that build is gone, then remove it"
+                     " with `" << removeCmd << legacy.generic_string()
+                  << "`.\n";
+    } else {
+        std::cout << "Nothing writes there now — remove it with `" << removeCmd
+                  << legacy.generic_string()
+                  << "` once no pre-fix build of this runner is in flight.\n"
+                     "       (said once per scratch base; it returns only if"
+                     " that tree is written to again)\n";
+    }
+
+    // Best-effort: if the marker cannot be written the note simply repeats,
+    // which is the old behaviour and harmless.
+    std::ofstream(marker.string())
+        << "Reported the pre-fix shared scratch tree\n  "
+        << legacy.generic_string()
+        << "\nonce. Delete THIS file to be told about it again.\n";
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -748,18 +1249,57 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string const compiler = fs::absolute(argv[1]).string();
-    fs::path const examplesRoot = fs::absolute(argv[2]);
-    fs::path const outputBase   =
-        fs::temp_directory_path() / "dss-integrated-tests";
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT (delta beyond the walk itself): these two sit ABOVE the `try` below, and the no-argument `absolute` throws — it consults `current_path()`, which fails if the cwd was deleted.
+    // The corpus root is what this defect is about, so it is resolved with the
+    // same discipline as the walk that reads it.
+    std::error_code argEc;
+    auto const compilerPath = fs::absolute(argv[1], argEc);
+    if (argEc) {
+        std::cerr << "[ERROR] cannot resolve compiler path '" << argv[1]
+                  << "': " << argEc.message() << "\n";
+        return 1;
+    }
+    fs::path const examplesRoot = fs::absolute(argv[2], argEc);
+    if (argEc) {
+        std::cerr << "[ERROR] cannot resolve examples root '" << argv[2]
+                  << "': " << argEc.message() << "\n";
+        return 1;
+    }
+    std::string const compiler = compilerPath.string();
 
-    fs::remove_all(outputBase);
-    fs::create_directories(outputBase);
+    // Per-run, never fixed — see the section comment above `scratchBase()`.
+    fs::path outputBase;
+    try {
+        outputBase = claimRunRoot(compiler, examplesRoot);
+    } catch (std::exception const& e) {
+        std::cerr << "[ERROR] scratch root setup failed: " << e.what() << "\n";
+        return 1;
+    }
 
+    // Housekeeping, deliberately OUTSIDE the fatal `try` above: CLAIMING a root
+    // is a precondition of running, tidying up after old ones is not, and the
+    // two must not share an exit status. Both calls already report-and-continue
+    // on their own (`error_code` overloads throughout — see `pruneKeptRoots`);
+    // this catch is the second layer, so that an edit which reintroduces a
+    // throwing call — `scratchBase()` itself is one, since the no-argument
+    // `temp_directory_path()` throws — costs one [WARN] line rather than the
+    // whole suite's verdict.
+    try {
+        auto const base = scratchBase();
+        reportLegacyDebris(base);
+        pruneKeptRoots(base, outputBase);
+    } catch (std::exception const& e) {
+        std::cerr << "[WARN] scratch housekeeping skipped: " << e.what()
+                  << " — kept roots may accumulate\n";
+    }
+
+    // The chosen root is LOGGED once, here, so a failing run stays
+    // inspectable even though the name is no longer predictable.
     std::cout << "=== DSS Code Prime — Integration Tests ===\n"
               << "Compiler:      " << compiler << "\n"
               << "Examples root: " << examplesRoot.generic_string() << "\n"
-              << "Output:        " << outputBase.string() << "\n"
+              << "Output:        " << outputBase.string()
+              << "  (per-run, unique to THIS process)\n"
               << "Host OS:       " << currentHostOs() << "\n\n";
 
     // ── Test 1: Default invocation prints ready message ──
@@ -809,7 +1349,27 @@ int main(int argc, char* argv[]) {
               << "Results: " << passes << " passed, "
               << failures << " failed\n";
 
-    fs::remove_all(outputBase);
+    // Cleanup policy. A GREEN run leaves nothing behind. A RED run KEEPS its
+    // root, because every `[FAIL]` line above cites a `cli.log` path inside
+    // it: the old code removed the tree unconditionally right here, so those
+    // paths named files that no longer existed by the time anyone read them.
+    // `pruneKeptRoots` at the next run's startup is what stops kept roots
+    // accumulating — the retention is bounded, not open-ended.
+    std::error_code ec;
+    fs::remove(outputBase / kRunningName, ec);  // this run is over either way
+    if (failures == 0) {
+        fs::remove_all(outputBase, ec);
+        if (ec) {
+            std::cerr << "[WARN] could not remove scratch root '"
+                      << outputBase.generic_string() << "': " << ec.message()
+                      << "\n";
+        }
+    } else {
+        std::cout << "Artifacts KEPT for inspection: " << outputBase.string()
+                  << "\n(kept only on failure; the " << kKeptRootLimit
+                  << " most recent are retained, older ones are pruned at the"
+                     " next run's startup)\n";
+    }
 
     return failures > 0 ? 1 : 0;
 }

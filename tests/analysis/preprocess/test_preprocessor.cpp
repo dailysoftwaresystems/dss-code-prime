@@ -18,6 +18,7 @@
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
+#include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
 
 #include <gtest/gtest.h>
 
@@ -38,6 +39,50 @@
 namespace {
 
 using namespace dss;
+
+// ── THE scratch-path chokepoint ────────────────────────────────────────────
+// Every filesystem fixture in this file hangs its directory off THIS root.
+// Nothing below may name `temp_directory_path()` directly — that is the whole
+// point of routing 39 sites through one function.
+//
+// WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
+// `tests/CMakeLists.txt:156` registers a SECOND ctest entry that runs THIS
+// binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
+// serialization. So on any ordinary `ctest -j` two live processes of this
+// binary overlap — and while the fixtures derived their directories from
+// CONSTANT `/tmp/dss_pp_*` names they addressed the same bytes: one process's
+// `remove_all` deleted a header the other had just written and was about to
+// read. MEASURED pre-fix on this host: `ctest -j 8` over the two entries went
+// red 1 run in 3 with `SourceBuffer::fromFile: cannot open
+// .../dss_tf87_depthcap/rec.h`, and two concurrent bare processes BOTH went red
+// with DIFFERENT counts (20 vs 18 distinct tests) — the tell that this is
+// contention and not a real regression.
+//
+// The paths must be UNIQUE, not contended-for. Serializing the two entries
+// (`RUN_SERIAL` / `RESOURCE_LOCK`) would bury the defect and slow every gate
+// run, and dropping the shuffle arm would give up the order-dependence
+// coverage it exists for. Neither is a fix; do not "simplify" back to either.
+//
+// `ScratchDir` (tests/test_support/scratch_dir.hpp:114) already carries the
+// correct scheme, so this REUSES it rather than growing a second one: a PID
+// SEED plus an atomic claim via `create_directory` (SINGULAR) in a loop. The
+// singular form returns true only for the caller that actually created the
+// directory — check-and-create is atomic in the OS — so the claim is race-free
+// against a concurrent sibling AND steps over a stale directory left by a
+// killed run instead of silently sharing it. A PID alone would not do: PIDs
+// recycle.
+//
+// ONE root per process, not one per fixture, and that is load-bearing twice
+// over: repeated calls with the SAME tag must resolve to the SAME directory
+// (`writeEmbedResource` is called twice with "dss_embed_t10" to sit two
+// resources side by side), and the static's destructor sweeps the whole tree at
+// exit, so a fixture whose trailing `remove_all` is skipped by an early
+// `ASSERT_*` return no longer leaks a directory under the temp base.
+[[nodiscard]] std::filesystem::path const& ppScratchRoot() {
+    static test_support::ScratchDir const root{test_support::Location::Temp,
+                                               "preprocess"};
+    return root.path();
+}
 
 // Shared schema fixture: load once per test binary process, and hand back a
 // REFERENCE to the cached owner. Same shape as `x86Schema()` in
@@ -1265,7 +1310,7 @@ TEST(Preprocessor, DeepNestedMacroArgumentFailsLoudNotSilent) {
 // fails.
 TEST(Preprocessor, HeaderOriginDiagnosticAttributesToHeader) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_linemap_test";
+    auto dir = ppScratchRoot() / "dss_pp_linemap_test";
     fs::create_directories(dir);
     // The header contains a malformed construct (a stray `@` is an illegal
     // char in c-subset) so the parser/lexer emits a diagnostic whose span
@@ -1363,7 +1408,7 @@ TEST(Preprocessor, ShiftOperatorInDefineIsNotMisLexedAsHeader) {
 // registration (or the makeRemap main-origin remap) breaks one of these.
 TEST(Preprocessor, IncludeSpliceDiagnosticsRenderToRealFilesAndLines) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_render_attribution_test";
+    auto dir = ppScratchRoot() / "dss_pp_render_attribution_test";
     fs::create_directories(dir);
     // Header error: a stray `@` (illegal char) on the header's line 1.
     { std::ofstream(dir / "bad.h", std::ios::binary)
@@ -2371,7 +2416,7 @@ TEST(Preprocessor, FC15bFileResolvesToSourceName) {
 // buffer name (ignoring the line-map origin) yields "main.c" inside the header.
 TEST(Preprocessor, FC15bFileInIncludedHeaderReportsHeaderName) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_file_macro_test";
+    auto dir = ppScratchRoot() / "dss_pp_file_macro_test";
     fs::create_directories(dir);
     // The header USES __FILE__ -- so the product must carry the HEADER's name.
     { std::ofstream(dir / "hdr.h", std::ios::binary)
@@ -3570,7 +3615,7 @@ TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
 // `__has_include` arm the identifier folds to 0 -> the #else branch.
 TEST(Preprocessor, FC15cHasIncludeQuoteExistingFileIsOne) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_fc15c_has_include_q";
+    auto dir = ppScratchRoot() / "dss_fc15c_has_include_q";
     fs::create_directories(dir);
     { std::ofstream(dir / "real_header.h", std::ios::binary) << "/* x */\n"; }
     PreprocessResult r;
@@ -3609,7 +3654,7 @@ TEST(Preprocessor, FC15cHasIncludeQuoteMissingFileIsZero) {
 // systemDirs (which holds only `stdio.json`) yields 0 -> the wrong branch.
 TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
     namespace fs = std::filesystem;
-    auto sysdir = fs::temp_directory_path() / "dss_fc15c_has_include_sys";
+    auto sysdir = ppScratchRoot() / "dss_fc15c_has_include_sys";
     fs::create_directories(sysdir);
     // Ship a JSON descriptor (the shape DSS ships), NOT a `.h` file.
     { std::ofstream(sysdir / "stdio.json", std::ios::binary) << "{}\n"; }
@@ -3650,7 +3695,7 @@ TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
 // appears (the header text is absent), and the `#` of the directive survives.
 TEST(Preprocessor, FC15cAngleSourceFallbackSplicesHeaderTextually) {
     namespace fs = std::filesystem;
-    auto inc = fs::temp_directory_path() / "dss_angle_src_fallback_p1";
+    auto inc = ppScratchRoot() / "dss_angle_src_fallback_p1";
     fs::create_directories(inc);
     { std::ofstream(inc / "foo.h", std::ios::binary)
         << "#define FOO_OK 7\nint foo_sym;\n"; }
@@ -3686,7 +3731,7 @@ TEST(Preprocessor, FC15cAngleSourceFallbackSplicesHeaderTextually) {
 // -- exactly the FC15c silent-miscompile this parity forbids.
 TEST(Preprocessor, FC15cAngleSourceFallbackHasIncludeParity) {
     namespace fs = std::filesystem;
-    auto inc = fs::temp_directory_path() / "dss_angle_src_fallback_p5";
+    auto inc = ppScratchRoot() / "dss_angle_src_fallback_p5";
     fs::create_directories(inc);
     { std::ofstream(inc / "foo.h", std::ios::binary) << "/* x */\n"; }
     {
@@ -3724,7 +3769,7 @@ TEST(Preprocessor, FC15cAngleSourceFallbackHasIncludeParity) {
 // / missing the child → the seed never covers the descriptor's typedefs.
 TEST(Preprocessor, DPerf2ResolvedShippedDescriptorsIncludeTransitiveClosure) {
     namespace fs = std::filesystem;
-    auto sysdir = fs::temp_directory_path() / "dss_dperf2_resolved_desc";
+    auto sysdir = ppScratchRoot() / "dss_dperf2_resolved_desc";
     fs::create_directories(sysdir);
     { std::ofstream(sysdir / "parent.json", std::ios::binary)
         << R"({ "header": "parent.h", "includes": ["child.h"],
@@ -3769,7 +3814,7 @@ TEST(Preprocessor, DPerf2ResolvedShippedDescriptorsIncludeTransitiveClosure) {
 // dead-branch assertions below fail.
 TEST(Preprocessor, DPerf2SeedSetMatchesLiveOracleNotDeadBranch) {
     namespace fs = std::filesystem;
-    auto sysdir = fs::temp_directory_path() / "dss_dperf2_deadbranch";
+    auto sysdir = ppScratchRoot() / "dss_dperf2_deadbranch";
     fs::create_directories(sysdir);
     // A typedef-only descriptor for `<stddef.h>` (the `size_t` shape). Its typedef
     // surface is injected SEMANTICALLY, so an angle include does not splice text —
@@ -4428,7 +4473,7 @@ TEST(Preprocessor, DefineMakesIfBranchLiveSoIncludeErrors) {
 // RED-ON-DISABLE: fresh per-child localMacros (the pre-fix state) drops inner.h.
 TEST(Preprocessor, Tf60GateDefinedInChildHeaderMakesParentIncludeLive) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf60_c2p";
+    auto dir = ppScratchRoot() / "dss_tf60_c2p";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "gate.h", std::ios::binary) << "#define GATE 1\n"; }
@@ -4461,7 +4506,7 @@ TEST(Preprocessor, Tf60GateDefinedInChildHeaderMakesParentIncludeLive) {
 // RED-ON-DISABLE: the child's fresh localMacros drops inner.h the same way.
 TEST(Preprocessor, Tf60GateDefinedInParentSourceMakesChildIncludeLive) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf60_p2c";
+    auto dir = ppScratchRoot() / "dss_tf60_p2c";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "outer.h", std::ios::binary)
@@ -4520,7 +4565,7 @@ TEST(Preprocessor, Tf60GateDefinedInParentSourceMakesChildIncludeLive) {
 // work already changed once.
 TEST(Preprocessor, Tf60CharLiteralMacroReplacementSurvivesGuardEval) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf60_charlit";
+    auto dir = ppScratchRoot() / "dss_tf60_charlit";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "inner.h", std::ios::binary) << "int lit_ok_zzz;\n"; }
@@ -4568,7 +4613,7 @@ TEST(Preprocessor, Tf60ObjectMacroExpandingToFunclikeIsUncertainUnderNegation) {
 // pass a mere "is live" assertion.
 TEST(Preprocessor, Tf60MintedProductSlicesExactValueThroughChain) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf60_mint";
+    auto dir = ppScratchRoot() / "dss_tf60_mint";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "inner.h", std::ios::binary) << "int mint_ok_zzz;\n"; }
@@ -4609,7 +4654,7 @@ TEST(Preprocessor, Tf60MintedProductSlicesExactValueThroughChain) {
 // pre-scan's over-eager splice, the marker below would LEAK into the output.
 TEST(Preprocessor, Tf60FunclikeGuardedUndefMoreLiveEdgeStaysBenign) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf60_morelive";
+    auto dir = ppScratchRoot() / "dss_tf60_morelive";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "a.h", std::ios::binary)
@@ -4715,7 +4760,7 @@ TEST(Preprocessor, CommandLineDefineViaDefinedOperatorIncludeLive) {
 // never learns GATE -> inner skipped -> no error.
 TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_c19_child_seed";
+    auto dir = ppScratchRoot() / "dss_c19_child_seed";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "outer.h", std::ios::binary)
@@ -4743,7 +4788,7 @@ TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
 // single-buffer, which is exactly the coverage hole the audit found).
 TEST(Preprocessor, Tf59LineDirectiveInHeaderDoesNotRenumberIncluder) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf59_line_hdr";
+    auto dir = ppScratchRoot() / "dss_tf59_line_hdr";
     std::error_code ec;
     fs::create_directories(dir, ec);
     { std::ofstream(dir / "h.h", std::ios::binary)
@@ -4983,8 +5028,8 @@ TEST(Preprocessor, CommandLineDefineThenUndefComposesDead) {
 TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_pos_sys";
-    auto incdir = fs::temp_directory_path() / "dss_ppangle_pos_inc";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_pos_sys";
+    auto incdir = ppScratchRoot() / "dss_ppangle_pos_inc";
     fs::create_directories(sysdir, ec);
     fs::create_directories(incdir, ec);
     { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
@@ -5028,7 +5073,7 @@ TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
 TEST(Preprocessor, DeadBranchAngleShippedMacroDoesNotLeakToFinalOutput) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_dead_sys";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_dead_sys";
     fs::create_directories(sysdir, ec);
     { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
           << "{ \"header\": \"shippedmac.h\", \"macros\": ["
@@ -5068,7 +5113,7 @@ TEST(Preprocessor, DeadBranchAngleShippedMacroDoesNotLeakToFinalOutput) {
 TEST(Preprocessor, DeadBranchAngleShippedMacroInvisibleToLaterPrescanGuard) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_p0016_sys";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_p0016_sys";
     fs::create_directories(sysdir, ec);
     { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
           << "{ \"header\": \"shippedmac.h\", \"macros\": ["
@@ -5113,7 +5158,7 @@ TEST(Preprocessor, DeadBranchAngleShippedMacroInvisibleToLaterPrescanGuard) {
 TEST(Preprocessor, DeadBranchMalformedShippedDescriptorStaysSilent) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_malformed_sys";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_malformed_sys";
     fs::create_directories(sysdir, ec);
     // Malformed: `macros` is not an array -> readShippedLibMacros fails to decode ->
     // the "descriptor malformed (macros)" P_PreprocessorIncludeError would fire.
@@ -5149,7 +5194,7 @@ TEST(Preprocessor, DeadBranchMalformedShippedDescriptorStaysSilent) {
 TEST(Preprocessor, AngleIncludeSplicesTransitiveSiblingMacros) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_transitive_sys";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_transitive_sys";
     fs::create_directories(sysdir, ec);
     // parent.json declares NO macros of its own — only the `includes` edge.
     { std::ofstream(sysdir / "parent.json", std::ios::binary)
@@ -5182,7 +5227,7 @@ TEST(Preprocessor, AngleIncludeSplicesTransitiveSiblingMacros) {
 TEST(Preprocessor, AngleIncludeCyclicIncludesTerminate) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto sysdir = fs::temp_directory_path() / "dss_ppangle_cyclic_sys";
+    auto sysdir = ppScratchRoot() / "dss_ppangle_cyclic_sys";
     fs::create_directories(sysdir, ec);
     { std::ofstream(sysdir / "pa.json", std::ios::binary)
           << "{ \"header\": \"pa.h\", \"includes\": [\"pb.h\"], \"macros\": ["
@@ -5962,7 +6007,7 @@ TEST(Preprocessor, ElifdefIsConfigDrivenFailsLoudWhenStripped) {
 // live include is never spliced -> `included_by_elifdef` is missing.
 TEST(Preprocessor, ElifdefLiveArmResolvesNestedQuoteInclude) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_elifdef_live_inc";
+    auto dir = ppScratchRoot() / "dss_elifdef_live_inc";
     fs::create_directories(dir);
     { std::ofstream(dir / "elifdef_live.h", std::ios::binary)
           << "int included_by_elifdef;\n"; }
@@ -6035,7 +6080,7 @@ namespace fsemb = std::filesystem;
 [[nodiscard]] fsemb::path
 writeEmbedResource(std::string const& sub, std::string const& name,
                    std::string const& bytes) {
-    auto dir = fsemb::temp_directory_path() / sub;
+    auto dir = ppScratchRoot() / sub;
     fsemb::create_directories(dir);
     std::ofstream out(dir / name, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -6154,7 +6199,7 @@ TEST(Preprocessor, FC179EmbedProbeShapeSingleByteIsFortyTwo) {
 // the `#embed "res.bin"`; `inc/res.bin` exists but NO copy sits next to main.c.
 // RED-ON-DISABLE: resolving against the main dir (not the header's) misses res.bin.
 TEST(Preprocessor, FC179EmbedResolvesRelativeToIncludingHeader) {
-    auto root = fsemb::temp_directory_path() / "dss_embed_t4";
+    auto root = ppScratchRoot() / "dss_embed_t4";
     auto inc  = root / "inc";
     fsemb::create_directories(inc);
     { std::ofstream(inc / "h.h", std::ios::binary)
@@ -7367,7 +7412,8 @@ TEST(Preprocessor, TFC74TargetPredefineExpandsSeedSiteExpander) {
 // `MARKER_FROM_HEADER` never appears.
 TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tfc74_prescan_ifdef";
+    auto dir = ppScratchRoot() / "dss_tfc74_prescan_ifdef";
+    std::error_code ec;
     fs::create_directories(dir);
     {
         std::ofstream h(dir / "arch_gated.h");
@@ -7400,7 +7446,13 @@ TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
     auto lexs2 = ppLexemesForTarget(kSrc, ObjectFormatKind::Elf, {}, r2, dirs);
     EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_FROM_HEADER"),
               lexs2.end());
-    fs::remove_all(dir);
+    // `ec` overload, like the other 50 cleanup calls in this file: a teardown
+    // hiccup must not throw out of a test body that has already made every
+    // assertion it exists to make. (This site and its twin below were the two
+    // that still threw — MEASURED as `filesystem error: in remove_all: No such
+    // file or directory` when a colliding sibling process removed the directory
+    // first, back when the path was a constant.)
+    fs::remove_all(dir, ec);
 }
 
 // ── SEED SITE #4: the pre-scan's VALUE prefix ─────────────────────────────
@@ -7412,7 +7464,8 @@ TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
 // silently dropped.
 TEST(Preprocessor, TFC74TargetPredefineValueGatesIncludeSeedSitePreScanValue) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tfc74_prescan_value";
+    auto dir = ppScratchRoot() / "dss_tfc74_prescan_value";
+    std::error_code ec;
     fs::create_directories(dir);
     {
         std::ofstream h(dir / "value_gated.h");
@@ -7442,7 +7495,7 @@ TEST(Preprocessor, TFC74TargetPredefineValueGatesIncludeSeedSitePreScanValue) {
                                     ObjectFormatKind::Elf, tms, r2, dirs);
     EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_VALUE_GATED"),
               lexs2.end());
-    fs::remove_all(dir);
+    fs::remove_all(dir, ec);   // `ec` overload — see the twin site above
 }
 
 // ── SEED SITE #3: the "<built-in>" prologue (FUNCTION-LIKE predefines) ────
@@ -7888,7 +7941,7 @@ TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
 // `F001A: got mach/boolean.h` on a header that was present the whole time.
 TEST(Preprocessor, TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd) {
     namespace fs = std::filesystem;
-    auto inc = fs::temp_directory_path() / "dss_tfc86_shim_endtoend";
+    auto inc = ppScratchRoot() / "dss_tfc86_shim_endtoend";
     std::error_code ec;
     fs::remove_all(inc, ec);
     fs::create_directories(inc);
@@ -8044,7 +8097,7 @@ TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
 // `return false;` reds this test and only this test.
 TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
     namespace fs = std::filesystem;
-    auto inc = fs::temp_directory_path() / "dss_tfc86_prescan_gate";
+    auto inc = ppScratchRoot() / "dss_tfc86_prescan_gate";
     std::error_code ec;
     fs::remove_all(inc, ec);
     fs::create_directories(inc);
@@ -8090,7 +8143,7 @@ TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
 // filter from the pre-scan's `#define` arm reds this test.
 TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
     namespace fs = std::filesystem;
-    auto inc = fs::temp_directory_path() / "dss_tfc86_prescan_norecord";
+    auto inc = ppScratchRoot() / "dss_tfc86_prescan_norecord";
     std::error_code ec;
     fs::remove_all(inc, ec);
     fs::create_directories(inc);
@@ -8189,7 +8242,7 @@ struct ReentryFixture {
                                         std::string const& innerText) {
     namespace fs = std::filesystem;
     ReentryFixture f;
-    f.dir = fs::temp_directory_path() / ("dss_tf87_" + tag);
+    f.dir = ppScratchRoot() / ("dss_tf87_" + tag);
     std::error_code ec;
     fs::remove_all(f.dir, ec);
     fs::create_directories(f.dir, ec);
@@ -8364,7 +8417,7 @@ TEST(Preprocessor, Tf87ReentryPermittedWhenGuardNameComesFromElif) {
 // must not be confusable with the depth-cap backstop.
 TEST(Preprocessor, Tf87UnguardedSelfIncludeIsRefusedLoudlyAndDiagnosably) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_unguarded";
+    auto dir = ppScratchRoot() / "dss_tf87_unguarded";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
@@ -8424,7 +8477,7 @@ TEST(Preprocessor, Tf87UnguardedSelfIncludeIsRefusedLoudlyAndDiagnosably) {
 // detector gap that is not there.
 TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_pragma_once";
+    auto dir = ppScratchRoot() / "dss_tf87_pragma_once";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
@@ -8474,7 +8527,7 @@ TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
 // different from the refusal.
 TEST(Preprocessor, Tf87DepthCapFiresLoudlyOnGuardedButStillRecursiveHeader) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_depthcap";
+    auto dir = ppScratchRoot() / "dss_tf87_depthcap";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
@@ -8530,7 +8583,7 @@ TEST(Preprocessor, Tf87DepthCapFiresLoudlyOnGuardedButStillRecursiveHeader) {
 // witness, because the blowup is only reachable AT the cap depth.
 TEST(Preprocessor, Tf87DepthCapShortCircuitsTheWholeSpliceNotJustOneArm) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_depthcap_branch";
+    auto dir = ppScratchRoot() / "dss_tf87_depthcap_branch";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
@@ -8555,7 +8608,7 @@ TEST(Preprocessor, Tf87DepthCapShortCircuitsTheWholeSpliceNotJustOneArm) {
 // fix would have left all 4 F001A in place.
 TEST(Preprocessor, Tf87ReentryPermittedThroughTheAngleSourceIncludeArm) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_angle";
+    auto dir = ppScratchRoot() / "dss_tf87_angle";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir / "sub", ec);
@@ -8603,7 +8656,7 @@ TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) 
     std::shared_ptr<GrammarSchema const> schema = *loaded;
     ASSERT_EQ(schema->preprocess().ifndefDirective, "unlesseth");
 
-    auto dir = fs::temp_directory_path() / "dss_tf87_agnostic";
+    auto dir = ppScratchRoot() / "dss_tf87_agnostic";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
@@ -8639,7 +8692,7 @@ TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) 
 // half of this design exists to avoid.
 TEST(Preprocessor, Tf87DefineOutsideTheClosedConditionalIsNotAGuard) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_tf87_halfguard";
+    auto dir = ppScratchRoot() / "dss_tf87_halfguard";
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);

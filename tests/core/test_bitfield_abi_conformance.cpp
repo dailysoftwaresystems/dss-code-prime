@@ -16,10 +16,23 @@
 // divergences are char/wchar_t signedness, long double=double, va_list, the red
 // zone, the stack argument area, and empty structs — NOT bit-field allocation).
 //
-// HERMETIC WHERE PRESENT, SKIPPED OTHERWISE: if no native C compiler is found (or
-// it fails to build/run the probe), the test GTEST_SKIPs rather than failing — the
-// witness runs wherever the toolchain exists (every CI leg ships one) and never
-// blocks a toolchain-less dev box.
+// HERMETIC WHERE PRESENT, SKIPPED ONLY WHEN THE TOOL IS ABSENT: with no native C
+// compiler that can build a trivial program the test GTEST_SKIPs, so a toolchain-less
+// dev box is never blocked — and a bare `cc` SHIM with no toolchain behind it counts
+// as absent, not as broken. Any OTHER failure — a compiler that builds a trivial
+// program but cannot build, launch or be read back from THIS probe — is a HARNESS
+// DEFECT and goes RED.
+//
+// That sentence used to end "or it fails to build/run the probe, the test GTEST_SKIPs
+// rather than failing", and the difference was not academic. The run step was spelled
+// with cmd.exe quoting unconditionally, POSIX `sh` rejected it, and the skip branch
+// swallowed the failure under the message "no native C compiler available" — so on
+// every Unix host this witness executed ZERO comparisons and reported success. It is
+// **the ONLY runtime witness for Apple-arm64**, which means the platform this file
+// claims to cover is exactly the platform it was silent on. See `native_c_probe.hpp`
+// for the seam that now separates a missing tool from a broken invocation.
+//
+// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
 
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
@@ -28,15 +41,14 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 
-#include "scratch_dir.hpp"
+#include "native_c_probe.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
-#include <functional>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -44,6 +56,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+namespace native_probe = dss::test_support::native_probe;
 using namespace dss;
 
 namespace {
@@ -85,73 +98,20 @@ struct NativeLayout {
     std::vector<std::optional<std::uint64_t>> fieldFirstBit;  // per field; nullopt = ordinary
 };
 
-// Locate a host C compiler. Returns a shell-ready command PREFIX that compiles
-// `<src>` to `<exe>`, or nullopt if none found. On Windows this wraps cl.exe in a
-// vcvars64 batch (cl needs INCLUDE/LIB); on Unix it uses cc/clang/gcc directly.
-struct Compiler {
-    std::string kind;   // "msvc" | "unix" — selects the expected dss strategy
-    // Build `src` → `exe`; returns the full system() command. Empty string = unsupported.
-    std::function<std::string(fs::path const&, fs::path const&)> buildCmd;
-};
+// Locating the host compiler, spelling the run-step redirect for the host shell, and
+// building/launching/reading back the probe all live in `native_c_probe.hpp` now —
+// shared verbatim with `test_packed_abi_conformance.cpp`. They were duplicated here,
+// and the duplicate is what let the TF-C97 quoting fix reach only one of the two.
 
-[[nodiscard]] bool fileExists(fs::path const& p) {
-    std::error_code ec;
-    return fs::exists(p, ec);
-}
-
-[[nodiscard]] std::optional<Compiler> findCompiler(fs::path const& work) {
-#if defined(_WIN32)
-    // Find cl.exe via vswhere → the MSVC toolset → Hostx64\x64. We compile through
-    // a generated .bat that first runs vcvars64 (so cl has INCLUDE/LIB), then cl.
-    fs::path const vswhere =
-        fs::path{"C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"};
-    if (!fileExists(vswhere)) return std::nullopt;
-    fs::path const vswhereOut = work / "vsinstall.txt";
-    std::string const q =
-        "\"\"" + vswhere.string() + "\" -latest -products * "
-        "-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
-        "-property installationPath > \"" + vswhereOut.string() + "\"\"";
-    if (std::system(q.c_str()) != 0) return std::nullopt;
-    std::ifstream vin{vswhereOut};
-    std::string vsPath;
-    std::getline(vin, vsPath);
-    while (!vsPath.empty() && (vsPath.back() == '\r' || vsPath.back() == '\n'))
-        vsPath.pop_back();
-    if (vsPath.empty()) return std::nullopt;
-    fs::path const vcvars =
-        fs::path{vsPath} / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
-    if (!fileExists(vcvars)) return std::nullopt;
-    Compiler c;
-    c.kind = "msvc";
-    c.buildCmd = [vcvars, work](fs::path const& src, fs::path const& exe) -> std::string {
-        // Generate a build batch: call vcvars64, then cl. Quote everything.
-        fs::path const bat = work / "build_probe.bat";
-        std::ofstream b{bat};
-        b << "@echo off\r\n"
-          << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
-          << "cl /nologo /W3 /Fe:\"" << exe.string() << "\" \""
-          << src.string() << "\" >nul 2>&1\r\n";
-        b.close();
-        return "\"\"" + bat.string() + "\"\"";
-    };
-    return c;
-#else
-    // Unix: cc / clang / gcc — any in PATH builds the probe directly (no env setup).
-    for (char const* cc : {"cc", "clang", "gcc"}) {
-        std::string const probe = std::string{"command -v "} + cc + " >/dev/null 2>&1";
-        if (std::system(probe.c_str()) == 0) {
-            Compiler c;
-            c.kind = "unix";
-            std::string const ccName = cc;
-            c.buildCmd = [ccName](fs::path const& src, fs::path const& exe) -> std::string {
-                return ccName + " -std=c11 -O0 -o \"" + exe.string() + "\" \""
-                     + src.string() + "\"";
-            };
-            return c;
-        }
-    }
-    return std::nullopt;
-#endif
+// The number of bit-field positions this battery expects the oracle to compare.
+// DERIVED from the battery so the inert-oracle floor below cannot drift away from the
+// data it guards; a hand-typed count is a floor that silently stops being one.
+[[nodiscard]] std::size_t probedBitFieldCount(std::vector<ProbeStruct> const& bs) {
+    std::size_t n = 0;
+    for (auto const& b : bs)
+        for (auto w : b.widths)
+            if (w != kNotBitfield && w != 0) ++n;
+    return n;
 }
 
 // The C identifier of field `i` in a probe struct. The battery uses a,b,c for the
@@ -192,40 +152,20 @@ void writeProbeSource(fs::path const& src, std::vector<ProbeStruct> const& bs) {
     o << "  return 0;\n}\n";
 }
 
-// Run the native compiler on the battery + parse its output. nullopt = the
-// toolchain is absent or the compile/run failed (→ the caller GTEST_SKIPs).
-std::optional<std::map<std::string, NativeLayout>>
-measureNative(std::vector<ProbeStruct> const& bs) {
-    test_support::ScratchDir scratch{test_support::Location::Temp, "bitfield-abi"};
-    fs::path const work = scratch.path();
-    auto comp = findCompiler(work);
-    if (!comp) return std::nullopt;
-
-    fs::path const src = work / "probe.c";
-    fs::path const exe = work / (
-#if defined(_WIN32)
-        "probe.exe"
-#else
-        "probe"
-#endif
-    );
-    writeProbeSource(src, bs);
-
-    std::string const build = comp->buildCmd(src, exe);
-    if (build.empty()) return std::nullopt;
-    if (std::system(build.c_str()) != 0 || !fileExists(exe)) return std::nullopt;
-
-    fs::path const out = work / "probe_out.txt";
-    std::string const run = "\"\"" + exe.string() + "\" > \"" + out.string() + "\"\"";
-    if (std::system(run.c_str()) != 0) return std::nullopt;
-
-    std::ifstream in{out};
-    if (!in) return std::nullopt;
+// Parse the probe's captured stdout into per-struct layouts.
+//
+// PURE PARSING, deliberately. Whether the probe ran at all is decided upstream by
+// `runNativeCProbe`'s status; this function never reports "no toolchain". Folding the
+// two together is what produced the original defect — a parse over zero lines yields
+// a map of zeroes that is indistinguishable from a real measurement of a zero-sized
+// struct, so the emptiness has to be caught before it gets here.
+std::map<std::string, NativeLayout>
+parseNative(std::vector<ProbeStruct> const& bs,
+            std::vector<std::string> const& lines) {
     std::map<std::string, NativeLayout> result;
     for (auto const& b : bs) result[b.name].fieldFirstBit.assign(b.widths.size(), std::nullopt);
 
-    std::string line;
-    while (std::getline(in, line)) {
+    for (auto const& line : lines) {
         std::istringstream ls{line};
         std::string tok;
         ls >> tok;
@@ -268,16 +208,31 @@ measureNative(std::vector<ProbeStruct> const& bs) {
 
 // THE cross-compile-compare witness. For every struct in the battery, dss's
 // computeLayout (under the host-ABI strategy) MUST equal the native compiler's
-// sizeof + per-bit-field absolute bit position. Skips cleanly when no toolchain.
+// sizeof + per-bit-field absolute bit position.
+//
+// SKIPS only when the machine has no C compiler at all. A compiler that IS present
+// and then fails to build, launch, or answer is a defect in this harness and goes
+// RED — see the `native_c_probe.hpp` docblock for the three cycles that policy cost.
 TEST(BitFieldAbiConformance, DssLayoutMatchesNativeCompiler) {
     auto const bs = battery();
-    auto const native = measureNative(bs);
-    if (!native) {
-        GTEST_SKIP() << "no native C compiler available (or it failed to build the "
-                        "probe) — the hermetic goldens in test_type_layout still pin "
-                        "the per-ABI layout; this CI leg re-derives them where a "
-                        "toolchain is present.";
+    auto const probe = native_probe::runNativeCProbe(
+        "bitfield-abi",
+        [&bs](fs::path const& src, native_probe::Toolchain) { writeProbeSource(src, bs); });
+
+    // The ONE legitimate skip: no toolchain on this machine. `probe.detail` is echoed
+    // because "absent" now has two shapes — nothing on PATH, and a shim that cannot
+    // build a trivial program — and a reader of a skipped CI leg needs to know which.
+    if (probe.toolAbsent()) {
+        GTEST_SKIP() << "no usable native C compiler on this host (" << probe.detail
+                     << ") — the hermetic goldens in test_type_layout still pin the "
+                        "per-ABI layout; this CI leg re-derives them where a toolchain "
+                        "is present.";
     }
+    // Every other outcome is FAIL-LOUD. This assert is the whole fix: it is the
+    // branch that used to be folded into the skip above.
+    ASSERT_TRUE(probe.ok()) << probe.describe();
+
+    auto const native = parseNative(bs, probe.lines);
 
     // The host ABI selects the strategy: Windows → MsvcStraddle, else GnuPacked.
 #if defined(_WIN32)
@@ -289,10 +244,17 @@ TEST(BitFieldAbiConformance, DssLayoutMatchesNativeCompiler) {
 #endif
     AggregateLayoutParams params{ScalarAlignmentRule::Natural, 16, strat};
 
+    // The inert-oracle guard. Constructed HERE, below every early exit, so a
+    // legitimate tool-absent skip never trips it. Both floors are derived from the
+    // battery, so adding a probe struct raises the bar automatically.
+    native_probe::ExecutedRows sizeRows{"bit-field sizeof vs native", bs.size()};
+    native_probe::ExecutedRows bitRows{"bit-field bit-position vs native",
+                                       probedBitFieldCount(bs)};
+
     TypeInterner ti{CompilationUnitId{1}};
     for (auto const& b : bs) {
-        auto const itN = native->find(b.name);
-        ASSERT_NE(itN, native->end()) << b.name;
+        auto const itN = native.find(b.name);
+        ASSERT_NE(itN, native.end()) << b.name;
         NativeLayout const& nl = itN->second;
 
         TypeId const s = internStruct(ti, b);
@@ -303,6 +265,7 @@ TEST(BitFieldAbiConformance, DssLayoutMatchesNativeCompiler) {
         EXPECT_EQ(l->size, nl.size)
             << "struct " << b.name << ": dss sizeof " << l->size
             << " != native " << nl.size << " (" << stratName << ")";
+        sizeRows.record();
 
         ASSERT_EQ(l->bitFields.size(), b.widths.size()) << b.name;
         for (std::size_t i = 0; i < b.widths.size(); ++i) {
@@ -316,6 +279,7 @@ TEST(BitFieldAbiConformance, DssLayoutMatchesNativeCompiler) {
                 << "struct " << b.name << " field " << i
                 << ": dss bit position " << dssAbsBit << " != native "
                 << *nl.fieldFirstBit[i] << " (" << stratName << ")";
+            bitRows.record();
         }
     }
 }

@@ -43,6 +43,13 @@
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 
+// The native-witness skip-vs-fail vocabulary, shared with the two ABI conformance
+// witnesses under tests/core (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX). Spelled relative
+// because only `tests/test_support` is on this target's include path; the header's
+// natural long-term home IS `tests/test_support/`, and moving it there would drop this
+// `../` — deliberately left for whoever owns that shared directory.
+#include "../core/native_c_probe.hpp"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -59,6 +66,7 @@
 #include <vector>
 
 using namespace dss;
+namespace native_probe = dss::test_support::native_probe;
 
 namespace {
 
@@ -937,10 +945,21 @@ TEST(CoffForeignObject, CrossObjectComdatAnyDedupsInMerge) {
 namespace {
 
 #if defined(_WIN32)
-// Locate a cl.exe/lib.exe toolchain via vswhere -> vcvars64. Returns a functor
-// that runs a command line under the MSVC environment in `work`, or nullopt if
-// no toolchain is present (the native witnesses then GTEST_SKIP). Mirrors the
-// vcvars64 shell-out in tests/core/test_bitfield_abi_conformance.cpp.
+// The vcvars64-entered cl.exe/lib.exe environment. LOCATING it is not done here —
+// `native_probe::locateMsvcToolchain` is the single implementation, shared with the ABI
+// conformance witnesses; this struct only USES what that returns.
+//
+// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
+//
+// The lookup used to be written TWICE — once here, once inside `native_c_probe.hpp`'s
+// `findCompiler` — and the copies disagreed about the same machine: this one reddened
+// on a non-zero vswhere exit while that one skipped GREEN. Two implementations of one
+// decision is the defect the header was hoisted to prevent, so the second one is gone
+// rather than re-synchronised.
+//
+// NOTE the asymmetry with the ABI witnesses: the SECOND stage here was always correct.
+// `env.run(...)` is consumed by `ASSERT_TRUE(...)` at every call site, so a failing
+// `cl`/`lib` already went red. Only the lookup conflated, and only the lookup changed.
 struct MsvcEnv {
     std::filesystem::path vcvars;
     std::filesystem::path work;
@@ -958,29 +977,6 @@ struct MsvcEnv {
     }
 };
 
-[[nodiscard]] std::optional<MsvcEnv> findMsvc(std::filesystem::path const& work) {
-    std::filesystem::path const vswhere =
-        "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe";
-    std::error_code ec;
-    if (!std::filesystem::exists(vswhere, ec)) return std::nullopt;
-    auto const outTxt = work / "vsinstall.txt";
-    std::string const q =
-        "\"\"" + vswhere.string() + "\" -latest -products * "
-        "-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
-        "-property installationPath > \"" + outTxt.string() + "\"\"";
-    if (std::system(q.c_str()) != 0) return std::nullopt;
-    std::ifstream vin{outTxt};
-    std::string vsPath;
-    std::getline(vin, vsPath);
-    while (!vsPath.empty() && (vsPath.back() == '\r' || vsPath.back() == '\n'))
-        vsPath.pop_back();
-    if (vsPath.empty()) return std::nullopt;
-    std::filesystem::path const vcvars =
-        std::filesystem::path{vsPath} / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
-    if (!std::filesystem::exists(vcvars, ec)) return std::nullopt;
-    return MsvcEnv{vcvars, work};
-}
-
 [[nodiscard]] std::vector<std::uint8_t> readFile(std::filesystem::path const& p) {
     std::ifstream in{p, std::ios::binary};
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
@@ -996,8 +992,10 @@ TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign"};
     auto const dir = scratch.path();
-    auto const msvc = findMsvc(dir);
-    if (!msvc) GTEST_SKIP() << "no cl.exe toolchain (vswhere/vcvars64 absent)";
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1009,7 +1007,7 @@ TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
     { std::ofstream f{dir / "bar.c"};
       f << "int helper(int*p);\n"
            "int bar(int x){ int b[16]; for(int i=0;i<16;++i) b[i]=x+i; return helper(b); }\n"; }
-    ASSERT_TRUE(msvc->run("cl /nologo /c /GS- bar.c")) << "cl must compile bar.c";
+    ASSERT_TRUE(env.run("cl /nologo /c /GS- bar.c")) << "cl must compile bar.c";
     ASSERT_TRUE(std::filesystem::exists(dir / "bar.obj"));
 
     auto const bytes = readFile(dir / "bar.obj");
@@ -1035,8 +1033,10 @@ TEST(CoffForeignObjectNative, RealGyObjComdatFunctionAssociativeMetadataSkipped)
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign"};
     auto const dir = scratch.path();
-    auto const msvc = findMsvc(dir);
-    if (!msvc) GTEST_SKIP() << "no cl.exe toolchain";
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1047,7 +1047,7 @@ TEST(CoffForeignObjectNative, RealGyObjComdatFunctionAssociativeMetadataSkipped)
     { std::ofstream f{dir / "barg.c"};
       f << "int helper(int*p);\n"
            "int barg(int x){ int b[16]; for(int i=0;i<16;++i) b[i]=x+i; return helper(b); }\n"; }
-    ASSERT_TRUE(msvc->run("cl /nologo /c /GS- /Gy barg.c"));
+    ASSERT_TRUE(env.run("cl /nologo /c /GS- /Gy barg.c"));
     ASSERT_TRUE(std::filesystem::exists(dir / "barg.obj"));
 
     auto const bytes = readFile(dir / "barg.obj");
@@ -1072,13 +1072,15 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign"};
     auto const dir = scratch.path();
-    auto const msvc = findMsvc(dir);
-    if (!msvc) GTEST_SKIP() << "no cl.exe/lib.exe toolchain";
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
 
     { std::ofstream f{dir / "foo.c"}; f << "int foo(void){ return 42; }\n"; }
-    ASSERT_TRUE(msvc->run("cl /nologo /c /GS- foo.c")) << "cl must compile foo.c";
+    ASSERT_TRUE(env.run("cl /nologo /c /GS- foo.c")) << "cl must compile foo.c";
     ASSERT_TRUE(std::filesystem::exists(dir / "foo.obj"));
-    ASSERT_TRUE(msvc->run("lib /nologo /out:foo.lib foo.obj")) << "lib must wrap foo.obj";
+    ASSERT_TRUE(env.run("lib /nologo /out:foo.lib foo.obj")) << "lib must wrap foo.obj";
     ASSERT_TRUE(std::filesystem::exists(dir / "foo.lib"));
 
     { std::ofstream m{dir / "main.c"};
@@ -1112,8 +1114,10 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
 #else
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign"};
     auto const dir = scratch.path();
-    auto const msvc = findMsvc(dir);
-    if (!msvc) GTEST_SKIP() << "no cl.exe/lib.exe toolchain";
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
 
     // a.c + b.c each define a DISTINCT function AND the SAME selectany COMDAT
     // datum `shared_w` (ANY selection). main references BOTH functions -> BOTH
@@ -1122,9 +1126,9 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
       f << "__declspec(selectany) int shared_w = 1;\nint alpha(void){ return 20; }\n"; }
     { std::ofstream f{dir / "b.c"};
       f << "__declspec(selectany) int shared_w = 1;\nint beta(void){ return 22; }\n"; }
-    ASSERT_TRUE(msvc->run("cl /nologo /c /GS- a.c"));
-    ASSERT_TRUE(msvc->run("cl /nologo /c /GS- b.c"));
-    ASSERT_TRUE(msvc->run("lib /nologo /out:ab.lib a.obj b.obj"));
+    ASSERT_TRUE(env.run("cl /nologo /c /GS- a.c"));
+    ASSERT_TRUE(env.run("cl /nologo /c /GS- b.c"));
+    ASSERT_TRUE(env.run("lib /nologo /out:ab.lib a.obj b.obj"));
     ASSERT_TRUE(std::filesystem::exists(dir / "ab.lib"));
 
     { std::ofstream m{dir / "main.c"};
