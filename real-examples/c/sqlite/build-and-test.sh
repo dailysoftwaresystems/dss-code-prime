@@ -146,7 +146,26 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # both linking the same libtcl8.6.so: gcc 4 pass / 2 fail (tm -35334590, -35331430),
 # dss 3 pass / 3 fail (tm -35335818, +36338628, -35333129). Same intermittency, same
 # ~35.3 s magnitude, both signs. See D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED.
-DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^walsetlk_recover- ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ emulated:^writecrash-}"
+# (loadext-2.1 / loadext-2.2 — ADDED 2026-07-31 (TF-C103), the first confounds this
+# harness EARNED using its own reference oracle, and the reason the oracle was
+# repaired the cycle before. They are the only two non-confound failures in the whole
+# `full` tier: 2 out of 1,061,550 tests. MECHANISM, MEASURED and not inferred:
+# loadext.test:64-65 hardcodes the macOS dyld error string as
+# `{dlopen.%s, 10.: .*image.*found.*}`, and macOS 26.5.2 (build 25F84) changed that
+# string in TWO independent ways — the dlopen flags now print in HEX (`0x000A`) where
+# the regex wants DECIMAL (`10`), and the phrase is now `(no such file)` inside a
+# `tried: <path>, <path>, …` enumeration where the regex wants `image not found`.
+# EVIDENCE — this is exoneration, not resemblance: the reference cc-built full-source
+# testfixture, which contains no DSS-compiled code at all, fails the SAME TWO tests on
+# the SAME machine and sqlite tree — `2 errors out of 52 tests`, `!Failures on these
+# tests: loadext-2.1 loadext-2.2` — and emits the identical new-format string. A
+# compiler cannot change what dyld prints. ⚠ SCOPED DELIBERATELY NARROW: anchored to
+# these two test NAMES, NOT to `^loadext-`, so a real DSS defect anywhere else in
+# loadext.test still fails loud — the extension-loading path is exactly where a
+# codegen or linkage defect would plausibly show up. Revisit when sqlite updates the
+# regex upstream or the macOS string changes again. See
+# D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT.)
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^walsetlk_recover- ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ ^loadext-2\.1$ ^loadext-2\.2$ emulated:^writecrash-}"
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
@@ -1765,6 +1784,72 @@ print("sources=%d includes=%d defines=%d" % (
 PY
 }
 compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
+# >>> dss:fresh-inode >>>
+# ── FRESH-INODE INSTALL (macOS only) ─────────────────────────────────────────
+# ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE
+#
+# WHY THE EXEC'D FILE MUST BE A NEW INODE, AND WHY AN IN-PLACE REBUILD IS NOT ONE.
+# dss-code-prime writes the fixture with an O_TRUNC open (src/link/writer.cpp:
+# `std::ofstream out(path, … | std::ios::trunc)`), so a rebuild replaces the
+# CONTENT of the SAME inode the previous run exec'd thousands of times. On macOS 26
+# that inode can pick up a PERMANENT exec DENY: every exec is SIGKILLed (137)
+# before one byte of output, the kernel logging
+#     proc N: load code signature error 2 for file "testfixture"
+#     (AppleSystemPolicy) ASP: Security policy would not allow process: N, <path>
+# A full tier run died exactly there — FAIL:11 fixture ABORT(s), a ZERO-BYTE
+# corpus.log, 12 unit groups NOT REACHED after the 10-resume budget was spent.
+#
+# MEASURED on the live soured artifact (2026-07-31, macOS 26.5.2 / arm64):
+#   · exec at the soured path                     → 137, 137, 137, no output
+#   · byte-identical copy at ANY other path        → 0, 0, 0
+#         ⇒ NOT the bytes, NOT the Mach-O layout, NOT the ad-hoc signature, and
+#           NOT the shared `com.dss.macho_arm64_exit` identifier.
+#   · HARD LINK to the soured inode (DIFFERENT path, SAME inode) → 137, 137, 137
+#         ⇒ the verdict is bound to the INODE, not to the path string.
+#   · overwriting the soured path IN PLACE with known-good bytes → STILL 137, 137,
+#     137.  ⇒ THE HARNESS-FATAL PART: a rebuild cannot clear it, so once the path
+#           sours every later run is dead on arrival.
+#   · renaming a fresh temp file over that same path → 0, 0, 0, while the old inode,
+#     kept alive by the hard link, stayed dead.
+# `codesign -f -s -` appearing to "repair" a soured binary is the SAME effect, not
+# a different one: codesign writes a temp file and RENAMES it (inode measured to
+# change across a re-sign), so it was always the new inode doing the work.
+#
+# Hence: do NOT re-sign, do NOT strip xattrs (the soured file and a running copy
+# carry a BYTE-IDENTICAL com.apple.provenance), do NOT touch AMFI. The artifact is
+# already valid — the copy control proves it. What must change is that the file
+# Step 8 EXECS is an inode that has never been exec'd under different content.
+# The PATH stays stable (the runner, the resume engine, the pre-flight sweep and
+# the Step-9 verdict all read `<outd>/<fmt>/testfixture`); only the inode behind it
+# is swapped: copy to a sibling temp name, then rename over. `mv` inside ONE
+# directory is rename(2) on the same filesystem, so the path ends up owning the
+# temp file's brand-new inode and the compiler-truncated one is unlinked.
+# The inode is RE-READ afterwards and a non-change is FATAL — a later
+# "simplification" back to an in-place overwrite fails loudly here instead of
+# silently restoring the 137s at the end of a multi-hour corpus.
+# Linux/WSL: gated on HOST_OS at the call site — there is no AppleSystemPolicy and
+# no such per-inode verdict, and `stat -f` is BSD-only, so nothing runs there.
+#
+# `cp -p`, not a plain `cp` + `chmod 755`: writer.cpp sets the fixture's mode by
+# ADDING 0111 on top of whatever the umask left (D-OUTPUT-EXEC-BIT), so hardcoding
+# 755 here would WIDEN the permissions of anyone running under a tighter umask.
+# -p reproduces the compiler's mode (and mtime) exactly; BSD cp treats an
+# unpreservable uid/gid as non-fatal, so -p cannot turn a good build into a
+# spurious abort. The `-x` assert then proves the installed file is still
+# executable rather than assuming it.
+fixture_fresh_inode() {
+  local p="$1" tmp old new
+  old="$(/usr/bin/stat -f '%i' "$p")" || return 1
+  tmp="$p.freshinode.$$"
+  rm -f "$tmp"
+  cp -p "$p" "$tmp" && [[ -x "$tmp" ]] && mv -f "$tmp" "$p" || { rm -f "$tmp"; return 1; }
+  new="$(/usr/bin/stat -f '%i' "$p")" || return 1
+  # The whole point of this function. If the inode did not change, the rename did
+  # not happen and Step 8 would exec the very inode that carries the DENY.
+  [[ "$new" != "$old" ]] || return 2
+  printf '%s\n' "$new"
+}
+# <<< dss:fresh-inode <<<
 declare -a PREFLIGHT_KILLS=()
 for leg in "${LEG_ORDER[@]}"; do
   spec="${LEG_SPEC[$leg]}"; fmt="${spec##*:}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
@@ -1806,6 +1891,24 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
     fi
   else
+    # >>> dss:fresh-inode-install >>>
+    # Give the just-built fixture a BRAND-NEW inode before anyone execs it —
+    # D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE (rationale + the
+    # measurements at `fixture_fresh_inode`, above). SUCCESS BRANCH ONLY: on a
+    # failed build the path is left exactly as the compiler left it, so the
+    # `error[` / `-x "$bin"` verdict above keeps its current meaning. Fail-loud:
+    # a copy/rename that does not land, or that lands on the SAME inode, is a
+    # hard stop — continuing would exec the inode that carries the DENY and burn
+    # the whole corpus on 137s.
+    if [[ "$HOST_OS" == "macos" ]]; then
+      fresh_ino="$(fixture_fresh_inode "$bin")" || die "[$leg] could not install the fixture on a FRESH INODE at $bin (rc=$?).
+      D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE: macOS pins a permanent
+      exec DENY to the INODE, and an in-place rebuild inherits it — the fixture
+      would be SIGKILLed (137) on every unit with no output at all. Refusing to
+      run the corpus against a fixture that may still be sitting on the old inode."
+      info "[$leg] fresh-inode install: $bin now inode $fresh_ino"
+    fi
+    # <<< dss:fresh-inode-install <<<
     FIXTURE["$leg"]="$bin"; COMPILE_OK["$leg"]=1
     pass "[$leg] testfixture -> $bin$(compile_time_suffix "$log")"
   fi
