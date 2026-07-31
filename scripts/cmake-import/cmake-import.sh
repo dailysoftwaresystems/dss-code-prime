@@ -171,18 +171,45 @@ fi
 # The default generator does not always emit compile_commands.json (Visual
 # Studio / Xcode do not; Ninja + Unix Makefiles do). Try the default first,
 # then fall back to Ninja, then Unix Makefiles. A fresh build dir per attempt
-# (generators can't be switched in place). The build dir is removed on exit.
+# (generators can't be switched in place). The scratch root is removed on exit.
+#
+# The scratch root MUST be unique per run — do NOT "simplify" it back to a
+# constant name. Two concurrent imports of the SAME project (a CI matrix, a
+# parallel test suite, two people on one host) would otherwise share one
+# directory, and each run's cleanup would delete the other's in-flight CMake
+# output. `mktemp -d` CREATES the directory atomically and prints its name, so
+# no two runs can ever agree on one; a pid suffix alone would NOT be enough,
+# because pids recycle and a killed run leaves its directory behind.
+#
+# Portability: a template argument ending in X's is honoured by both BSD/macOS
+# and GNU/Linux mktemp. GNU-only long options (--tmpdir, --directory) are not,
+# and must not be introduced here.
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD_DIR="$ROOT_ABS/.dss-cmake-import-build"
-LOG="$BUILD_DIR/.cmake-import.log"
+SCRATCH_ROOT="$(mktemp -d "$ROOT_ABS/.dss-cmake-import-build.XXXXXXXXXX")" \
+    || die "could not create a scratch build directory under '$ROOT_ABS'"
+LOG="$SCRATCH_ROOT/.cmake-import.log"
 
-cleanup() { rm -rf "$BUILD_DIR" 2>/dev/null || true; }
+# Log the chosen root once, so a run that fails or is interrupted is still
+# debuggable even though the directory name is different every time.
+printf '%s: scratch build dir: %s\n' "$prog" "$SCRATCH_ROOT" >&2
+
+cleanup() { rm -rf "$SCRATCH_ROOT" 2>/dev/null || true; }
+# EXIT covers normal and error exits; INT/TERM/HUP make an interrupted run
+# clean up too, instead of leaking the directory into the user's project.
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM HUP
 
+gen_attempt=0
 try_generator() {
     # $1 = generator name, or "" for the default generator.
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
+    # Each attempt gets its OWN fresh sub-directory, because CMake cannot
+    # switch generators inside an existing build tree. A never-reused name
+    # means nothing has to be deleted here: the per-run scratch root is
+    # created only by mktemp, which is exactly what keeps it ours alone.
+    gen_attempt=$((gen_attempt + 1))
+    BUILD_DIR="$SCRATCH_ROOT/attempt$gen_attempt"
+    mkdir -p "$BUILD_DIR" || return 1
     if [ -z "$1" ]; then
         cmake -S "$ROOT_ABS" -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$LOG" 2>&1
     else

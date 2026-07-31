@@ -154,3 +154,47 @@ function(dss_add_shuffle_arm)
 endfunction()
 
 dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
+
+# D-TEST-FIXED-SCRATCH-PATH-POPULATION — the suites below all derived a scratch
+# path from a CONSTANT and clobbered each other under concurrency; they now derive
+# it from ScratchDir's per-run root. These arms are what keep that true. A comment
+# saying "do not simplify this back" is not a guard; a second concurrent ctest entry
+# on the same binary is, because reverting to a constant path reddens the gate here
+# instead of passing quietly. MEASURED pre-fix under exactly this overlap: import
+# resolver 6/6 rounds red plus 4 SIGSEGVs, type-name oracle 6/6 red, hir / schema
+# cache / c-subset red with DIVERGENT per-instance failure counts. Post-fix all
+# green with counts identical between the two instances.
+#
+# REPEAT is measured, not guessed — single-run wall time on this host was 0.06-0.17 s
+# for the five small binaries and 4.13 s for the c-subset one, so 20x and 3x keep the
+# whole set near ~23 s of added work spread over six entries that ctest -j overlaps.
+#
+# ONE SUITE IN THE SAME FIX IS DELIBERATELY *NOT* HERE:
+#   * program/test_input_resolver — it was already pid-seeded and stayed GREEN pre-fix.
+#     It served as the NEGATIVE CONTROL proving the A/B discriminated rather than just
+#     producing noise, and it has no constant-path regression to catch.
+#
+# fc3_width_semantics IS here, but only because a prerequisite was fixed first, and the
+# sequence is worth keeping: its two descriptor tests used to assert ONLY negative
+# properties (no value, errorCount > 0), which a VANISHED fixture satisfies just as well
+# as the malformed content under test. An arm would have been theater — green whether or
+# not the per-run root survived. It now fatally asserts the fixture exists on disk
+# byte-for-byte AND pins the specific rejection (code plus message; MEASURED, the loader
+# reuses F_ShippedLibDescriptorMalformed for at least three distinct rejections, so a
+# code-only assertion cannot discriminate them). Proven by a DETERMINISTIC pre/post pair
+# that removes the fixture right after the write: pre-change both tests PASS, post-change
+# both FAIL. ⚠ Do not "simplify" those existence assertions away — they are what makes
+# this arm mean anything.
+#
+# fc3 and test_compilation_unit are both THINLY exposed: their write-to-read windows are
+# sub-millisecond, so a randomized-timing hammer usually misses (MEASURED: one hammer run
+# reported 0 fixtures actually deleted across 12,000 test instances — a green that proved
+# nothing). That is an argument for MORE repeats, not fewer, which is why they sit at 20
+# alongside the suites that redden easily rather than being dialled down.
+dss_add_shuffle_arm(NAME analysis/compilation_unit/test_type_name_oracle REPEAT 20)
+dss_add_shuffle_arm(NAME analysis/compilation_unit/test_import_resolver REPEAT 20)
+dss_add_shuffle_arm(NAME analysis/compilation_unit/test_compilation_unit REPEAT 20)
+dss_add_shuffle_arm(NAME hir/test_hir_lowering_multi_lang REPEAT 20)
+dss_add_shuffle_arm(NAME lsp/test_schema_cache REPEAT 20)
+dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c_subset REPEAT 3)
+dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)

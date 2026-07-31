@@ -8,17 +8,11 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "program/input_resolver.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
-#include <atomic>
-#include <cstdint>
 #include <filesystem>
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 #include <fstream>
 #include <string>
 #include <vector>
@@ -26,36 +20,29 @@
 namespace fs = std::filesystem;
 using namespace dss;
 
-namespace {
+// In-repo scratch dir (test artifacts; auto-removed by dtor). This file used to
+// carry its OWN copy of `ScratchDir` — that duplicate is what
+// D-TEST-FIXED-SCRATCH-PATH-POPULATION calls out here, and it is now deleted in
+// favour of the shared `tests/test_support/scratch_dir.hpp`.
+//
+// The copy was not a live collision: it already seeded the path with the PID.
+// It was weaker in the CLAIM. It took the slot with PLURAL
+// `create_directories`, which reports SUCCESS when the directory already
+// exists, so it could silently share a stale directory left behind by a killed
+// run that drew the same PID (PIDs recycle). The shared type claims with
+// SINGULAR `create_directory` in a loop — true only for the caller that
+// actually created the directory, atomic at the OS level — so it is race-free
+// AND it steps over stale slots. `Location::InsideRepo, "input-resolver"`
+// reproduces the exact base this file used, `<cwd>/test-scratch/input-resolver`.
+//
+// MEASURED: two concurrent processes of this binary, `--gtest_repeat=12
+// --gtest_shuffle`, 6 rounds — green BOTH before and after, which is the
+// expected result for the one site here that was already PID-seeded. It served
+// as the negative control for the three counter-only fixtures that did fail.
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
 
-// In-repo scratch dir (test artifacts; auto-removed by dtor).
-class ScratchDir {
-public:
-    ScratchDir() {
-        static std::atomic<std::uint64_t> counter{0};
-#ifdef _WIN32
-        auto const pid = static_cast<std::uint64_t>(_getpid());
-#else
-        auto const pid = static_cast<std::uint64_t>(getpid());
-#endif
-        std::error_code ec;
-        originalCwd_ = fs::current_path(ec);
-        auto const base = originalCwd_ / "test-scratch" / "input-resolver";
-        fs::create_directories(base, ec);
-        path_ = base / (std::to_string(pid) + "-"
-                        + std::to_string(counter.fetch_add(1)));
-        fs::create_directories(path_, ec);
-    }
-    ~ScratchDir() {
-        std::error_code ec;
-        fs::current_path(originalCwd_, ec);
-        fs::remove_all(path_, ec);
-    }
-    [[nodiscard]] fs::path const& path() const noexcept { return path_; }
-private:
-    fs::path path_;
-    fs::path originalCwd_;
-};
+namespace {
 
 void writeFile(fs::path const& p, std::string_view content = "x") {
     std::error_code ec;
@@ -75,7 +62,7 @@ void writeFile(fs::path const& p, std::string_view content = "x") {
 // ── resolveDirectory ────────────────────────────────────────
 
 TEST(InputResolver, RecursiveScanPicksUpAllMatchingFiles) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "a.c");
     writeFile(scratch.path() / "sub" / "b.c");
     writeFile(scratch.path() / "sub" / "deep" / "c.c");
@@ -92,7 +79,7 @@ TEST(InputResolver, RecursiveScanPicksUpAllMatchingFiles) {
 }
 
 TEST(InputResolver, FlatScanIgnoresSubdirectories) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "a.c");
     writeFile(scratch.path() / "sub" / "b.c");
     writeFile(scratch.path() / "sub" / "deep" / "c.c");
@@ -108,7 +95,7 @@ TEST(InputResolver, FlatScanIgnoresSubdirectories) {
 }
 
 TEST(InputResolver, ExtensionFilterRejectsNonMatches) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "src.c");
     writeFile(scratch.path() / "src.h");
     writeFile(scratch.path() / "src.cpp");
@@ -124,7 +111,7 @@ TEST(InputResolver, ExtensionFilterRejectsNonMatches) {
 }
 
 TEST(InputResolver, OutputSortedForDeterminism) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "z.c");
     writeFile(scratch.path() / "m.c");
     writeFile(scratch.path() / "a.c");
@@ -143,7 +130,7 @@ TEST(InputResolver, OutputSortedForDeterminism) {
 }
 
 TEST(InputResolver, MissingDirectoryFiresFileNotFound) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     auto const ghost = scratch.path() / "does-not-exist";
     std::vector<std::string> exts{".c"};
     std::vector<std::string> out;
@@ -154,7 +141,7 @@ TEST(InputResolver, MissingDirectoryFiresFileNotFound) {
 }
 
 TEST(InputResolver, EmptyMatchSetFiresEmptyInput) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "ignored.txt");
     std::vector<std::string> exts{".c"};
     std::vector<std::string> out;
@@ -167,7 +154,7 @@ TEST(InputResolver, EmptyMatchSetFiresEmptyInput) {
 // ── validateFiles ────────────────────────────────────────────
 
 TEST(InputResolver, ValidateFilesAcceptsExistingFiles) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     auto const a = scratch.path() / "a.c";
     auto const b = scratch.path() / "b.c";
     writeFile(a);
@@ -182,7 +169,7 @@ TEST(InputResolver, ValidateFilesAcceptsExistingFiles) {
 }
 
 TEST(InputResolver, ValidateFilesRejectsMissing) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     auto const real = scratch.path() / "real.c";
     auto const ghost = scratch.path() / "ghost.c";
     writeFile(real);

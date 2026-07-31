@@ -19,6 +19,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -31,6 +32,15 @@ using namespace dss;
 namespace fs = std::filesystem;
 
 namespace {
+
+// D-TEST-FIXED-SCRATCH-PATH-POPULATION — the two `addFile` tests below need real
+// files on disk. They used to derive the directory from a CONSTANT name under
+// `temp_directory_path()`, so two concurrent instances of this binary shared one
+// directory and each one's trailing `remove_all` deleted the OTHER's inputs
+// mid-test. `ScratchDir` claims a per-instance slot atomically (SINGULAR
+// `create_directory`, with the pid only as a seed) and cleans up in its dtor.
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
 
 [[nodiscard]] std::shared_ptr<GrammarSchema const> shipped(std::string_view name) {
     auto loaded = GrammarSchema::loadShipped(name);
@@ -95,9 +105,9 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
 
     // Write a .c and a .sql temp file; addFile must route each to the language
     // whose declared fileExtensions match the path — no explicit schema.
-    fs::path const dir = fs::temp_directory_path() / "dss_hr11_routing";
-    fs::create_directories(dir);
-    fs::path const cFile = dir / "unit.c", sqlFile = dir / "unit.sql";
+    ScratchDir scratch{Location::Temp, "hr11-routing"};
+    fs::path const cFile = scratch.path() / "unit.c",
+                   sqlFile = scratch.path() / "unit.sql";
     { std::ofstream o{cFile,   std::ios::binary}; o << kCProgram; }
     { std::ofstream o{sqlFile, std::ios::binary}; o << kSqlProgram; }
 
@@ -117,9 +127,7 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(res->hir.moduleDecls(res->hir.root()).size(), 3u);   // c fn + sql CREATE + SELECT
-
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    // Cleanup is `scratch`'s dtor — no manual `remove_all`.
 }
 
 TEST(HirLoweringMultiLang, MultiSchemaCtorAndDeclOrderFollowsTreeOrder) {
@@ -152,9 +160,8 @@ TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
     // silently parses under the primary grammar.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    fs::path const dir = fs::temp_directory_path() / "dss_hr11_unknown_ext";
-    fs::create_directories(dir);
-    fs::path const py = dir / "script.py";
+    ScratchDir scratch{Location::Temp, "hr11-unknown-ext"};
+    fs::path const py = scratch.path() / "script.py";
     { std::ofstream o{py, std::ios::binary}; o << "print(1)\n"; }
 
     UnitBuilder ub{c};
@@ -167,9 +174,7 @@ TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
     for (auto const& d : cu->driverDiagnostics().all())
         if (d.code == DiagnosticCode::D_UnknownFileExtension) ++unknownExt;
     EXPECT_EQ(unknownExt, 1u) << "an unroutable extension must be loud";
-
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    // Cleanup is `scratch`'s dtor — no manual `remove_all`.
 }
 
 TEST(HirLoweringMultiLang, ExplicitInMemorySchemaNeedNotBePreRegistered) {

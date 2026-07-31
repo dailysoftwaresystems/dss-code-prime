@@ -1,5 +1,5 @@
 {
-  "$comment": "TF-C51 (D-FF1-STATICLIB-FAT-ARCHIVE): the FAT/merged static-library RUNTIME witness at the corpus tier. Building a `-staticlib` while passing INPUT `--resolve-library` static archives MERGES their members into the output library. This example needs a NESTED dependsOn (D-EXAMPLES-RUNNER-MULTI-ARTIFACT extension): each target's dependsOn is the FAT lib `fatlib.a` (from fatlib.c, defining dss_fat_extra), whose OWN nested dependsOn is the INPUT lib `input.a` (from input.c, defining dss_input_answer==42). The runner builds bottom-up: input.a, then fatlib.a RESOLVING input.a (the FAT MERGE -> fatlib.a carries BOTH members), then main RESOLVING ONLY fatlib.a. main references dss_input_answer, reaching it SOLELY via the merged copy in fatlib.a (input.a is NOT on main's --resolve-library) -> runs -> exit 42 IFF the merge worked. RED-ON-DISABLE (both gates verified, x86_64 native + arm64 qemu): (1) BUILD -- removing the merge restores the D_StaticLibFatArchiveUnsupported fail-loud so fatlib.a's dependsOn build returns rc!=0 -> red; (2) RUN -- a silent-no-op merge leaves fatlib.a without dss_input_answer and main STILL links (the open D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD gap: DSS emits the exec with the symbol unresolved) but fails at RUNTIME with the loader's 'undefined symbol: dss_input_answer' -> exit 127 != 42 -> the runner's exit-code assert fires -> red. NOTE: artifact names track the driver's `<sourceStem>.a`/`.lib`/`.exe` output naming (input.c -> input.a|input.lib, fatlib.c -> fatlib.a|fatlib.lib, main.c -> main|main.exe), NOT a 'lib' prefix. x86_64 runs natively under WSL / the ubuntu leg; arm64 under qemu-aarch64; pe64 (COFF .lib -> .exe) natively on the Windows leg (verified: fatlib.lib merges input.lib -> main.exe exit 42), build-clean + SkippedCrossHost elsewhere.",
+  "$comment": "TF-C51 (D-FF1-STATICLIB-FAT-ARCHIVE): the FAT/merged static-library RUNTIME witness at the corpus tier. Building a `-staticlib` while passing INPUT `--resolve-library` static archives MERGES their members into the output library. This example needs a NESTED dependsOn (D-EXAMPLES-RUNNER-MULTI-ARTIFACT extension): each target's dependsOn is the FAT lib `fatlib.a` (from fatlib.c, defining dss_fat_extra), whose OWN nested dependsOn is the INPUT lib `input.a` (from input.c, defining dss_input_answer==42). The runner builds bottom-up: input.a, then fatlib.a RESOLVING input.a (the FAT MERGE -> fatlib.a carries BOTH members), then main RESOLVING ONLY fatlib.a. main references dss_input_answer, reaching it SOLELY via the merged copy in fatlib.a (input.a is NOT on main's --resolve-library) -> runs -> exit 42 IFF the merge worked. RED-ON-DISABLE (both gates verified, x86_64 native + arm64 qemu): (1) BUILD -- removing the merge restores the D_StaticLibFatArchiveUnsupported fail-loud so fatlib.a's dependsOn build returns rc!=0 -> red; (2) RUN -- a silent-no-op merge leaves fatlib.a without dss_input_answer and main STILL links (the open D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD gap: DSS emits the exec with the symbol unresolved) but fails at RUNTIME with the loader's 'undefined symbol: dss_input_answer' -> exit 127 != 42 -> the runner's exit-code assert fires -> red. NOTE: artifact names track the driver's `<sourceStem>.a`/`.lib`/`.exe` output naming (input.c -> input.a|input.lib, fatlib.c -> fatlib.a|fatlib.lib, main.c -> main|main.exe), NOT a 'lib' prefix. x86_64 runs natively under WSL / the ubuntu leg; arm64 under qemu-aarch64; pe64 (COFF .lib -> .exe) natively on the Windows leg (verified: fatlib.lib merges input.lib -> main.exe exit 42); macho64 arm64 NATIVELY on the darwin leg, build-clean + SkippedCrossHost elsewhere. D-TEST-EXAMPLES-DEPENDSON-UNCOVERED-ON-DARWIN: the macho64 arm is what makes the NESTED dependsOn path RUN on darwin at all. Before it, NEITHER dependsOn manifest carried a `darwin` runOn, so integrated_tests' `buildDependsOnArtifactCli` -- which SKIPS an example outright when no target's runOn matches the host -- was reached by ZERO checks on the leg this project gates on every cycle, leaving the recursion free to rot behind a green suite. MEASURED on darwin arm64, the full bottom-up chain: input.a (426 B), then fatlib.a RESOLVING it -> 774 B (the merge -- it carries BOTH members), then main RESOLVING ONLY fatlib.a, spawned -> exit 42. RUN-gate RED-ON-DISABLE re-MEASURED on this host, not merely inherited from the linux/windows legs: build fatlib.a WITHOUT the nested resolve and it stays 420 B (unmerged); main still links, but dyld aborts with `Symbol not found: _dss_input_answer` -> exit 134 != 42 -> red. Note the darwin RUN-gate signal is SIGABRT-134 from dyld, not the 127 the ELF loader gives; either way it is != 42, which is all the exit-code assert needs.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -57,6 +57,25 @@
               "sources": ["input.c"],
               "spec": "x86_64:pe64-x86_64-windows-staticlib",
               "artifact": "input.lib"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {
+          "sources": ["fatlib.c"],
+          "spec": "arm64:macho64-arm64-darwin-staticlib",
+          "artifact": "fatlib.a",
+          "dependsOn": [
+            {
+              "sources": ["input.c"],
+              "spec": "arm64:macho64-arm64-darwin-staticlib",
+              "artifact": "input.a"
             }
           ]
         }

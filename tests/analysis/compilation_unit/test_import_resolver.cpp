@@ -15,7 +15,6 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -32,33 +31,13 @@ using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
 // RAII temp directory for the c-subset include tests: files must share a
-// directory so same-directory `#include` resolution finds them.
-class TempDir {
-public:
-    TempDir() {
-        static std::atomic<unsigned> counter{0};
-        dir_ = std::filesystem::temp_directory_path() /
-               ("dss_cu4_" + std::to_string(counter.fetch_add(1)));
-        std::filesystem::create_directories(dir_);
-    }
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(dir_, ec);
-    }
-    TempDir(TempDir const&)            = delete;
-    TempDir& operator=(TempDir const&) = delete;
-
-    std::filesystem::path write(std::string const& name, std::string const& content) const {
-        auto path = dir_ / name;
-        std::ofstream(path, std::ios::binary) << content;
-        return path;
-    }
-
-    [[nodiscard]] std::filesystem::path const& path() const noexcept { return dir_; }
-
-private:
-    std::filesystem::path dir_;
-};
+// directory so same-directory `#include` resolution finds them. The facade —
+// and the reason its unique-path scheme is NOT reimplemented locally, defect
+// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
+// identical here and in test_type_name_oracle.cpp. The GROUP below is this
+// suite's own, so its scratch tree stays separate from that sibling's.
+constexpr char kScratchGroup[] = "cu4-import-resolver";
+using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
 // Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
 // `src/dss-config/sources/` directory — mirrors GrammarSchema::loadShipped's
@@ -502,7 +481,7 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
+    ASSERT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
     // The quote-include failure is reported ONCE, by the preprocessor.
     bool sawPPInclude = false;
     for (auto const& d : cu.trees()[0].diagnostics().all()) {
@@ -768,7 +747,7 @@ TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
     // FC13: main.c's quote include is INLINED by the preprocessor (no edge),
     // and the explicitly-added helper.h is its own (separately parsed) tree.
     // So there are TWO trees but ZERO cross-refs -- the include is textual.
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // main.c's tree carries the inlined helper text.
     EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int helper()"),
@@ -789,7 +768,7 @@ TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
     // FC13: each TU inlines its own copy of common.h. Two trees (a.c, b.c),
     // zero cross-refs, and BOTH trees carry the header text. (A shared header
     // is recompiled per TU -- standard C textual-include semantics.)
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int common()"),
               std::string::npos);
@@ -821,7 +800,7 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
     builder.addInMemory("#include \"dep.h\"\nint main() { return 0; }\n", "main.c");
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // FC13 (Fix 3): with no include dir, `dep.h` cannot be resolved. The
     // PREPROCESSOR owns the failed quote include and reports it ONCE as
@@ -857,7 +836,7 @@ TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
     builder.addFile(mainPath);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // main.c is tree[1] (the in-memory helper was added first as tree[0]). Its
     // inlined include text is the ON-DISK helper, proving the preprocessor

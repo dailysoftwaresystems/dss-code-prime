@@ -34,13 +34,9 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 
 namespace {
@@ -49,37 +45,14 @@ using namespace dss;
 using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
-// RAII temp directory (same pattern as test_import_resolver.cpp): include
-// targets must share the includer's directory.
-class TempDir {
-public:
-    TempDir() {
-        static std::atomic<unsigned> counter{0};
-        dir_ = std::filesystem::temp_directory_path() /
-               ("dss_fc2_oracle_" + std::to_string(counter.fetch_add(1)));
-        std::filesystem::create_directories(dir_);
-    }
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(dir_, ec);
-    }
-    TempDir(TempDir const&)            = delete;
-    TempDir& operator=(TempDir const&) = delete;
-
-    std::filesystem::path write(std::string const& name,
-                                std::string const& content) const {
-        auto path = dir_ / name;
-        std::ofstream(path, std::ios::binary) << content;
-        return path;
-    }
-
-    [[nodiscard]] std::filesystem::path const& path() const noexcept {
-        return dir_;
-    }
-
-private:
-    std::filesystem::path dir_;
-};
+// RAII temp directory (same facade as test_import_resolver.cpp): include
+// targets must share the includer's directory. The facade — and the reason its
+// unique-path scheme is NOT reimplemented locally, defect
+// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
+// identical here and in test_import_resolver.cpp. The GROUP below is this
+// suite's own, so its scratch tree stays separate from that sibling's.
+constexpr char kScratchGroup[] = "fc2-type-name-oracle";
+using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
 // Normalized structural signature of the subtree rooted at `n`: schema-relative
 // rule/token ids + token spelling, NO spans/NodeIds, EmptySpace leaves skipped.

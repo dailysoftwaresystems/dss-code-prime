@@ -4252,16 +4252,26 @@ TEST(SemanticAnalyzerCSubset, BreakAfterLoopIsOutsideLoop) {
 // closes GAP F and proves the FC13 splice handles a spaced directive: one
 // tree, zero cross-refs, header text present.
 TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
-    namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_gapF_include_test";
-    fs::create_directories(dir);
+    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the one site in this file that had
+    // drifted: the include dir came from a CONSTANT name under
+    // `temp_directory_path()`, so two concurrent instances of this binary shared
+    // it and the first one's `remove_all` deleted `x.h` while the second was
+    // preprocessing (MEASURED: "cannot open .../dss_gapF_include_test/x.h" and
+    // "quote include not found: x.h"). Every other scratch site in this file
+    // already uses `ScratchDir`, where the pid is only a SEED and the actual
+    // guarantee is the atomic claim — SINGULAR `create_directory`, which returns
+    // true only for the caller that created the slot — so this one now matches
+    // its neighbours. `dss::test_support::` is spelled out because the `using`
+    // declarations for it appear further down, in the FF11 block.
+    dss::test_support::ScratchDir incDir{
+        dss::test_support::Location::Temp, "gapF-include"};
     {
-        std::ofstream(dir / "x.h", std::ios::binary)
+        std::ofstream(incDir.path() / "x.h", std::ios::binary)
             << "int helper() { return 1; }\n";
     }
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
-    builder.addIncludeDir(dir);
+    builder.addIncludeDir(incDir.path());
     builder.addInMemory("# include \"x.h\"\nint main() { return helper(); }\n", "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
@@ -4271,8 +4281,8 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
     EXPECT_NE(std::string{cu->trees()[0].source().text()}.find("int helper()"),
               std::string::npos)
         << "a spaced `# include` must still be recognized + inlined";
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    // No manual `remove_all` — `incDir`'s dtor owns the cleanup (and warns loudly
+    // on stderr if it cannot, so a leak stays visible).
 }
 
 // ── FF11: angle-include resolves a NEUTRAL JSON DESCRIPTOR + injects its ──────

@@ -161,15 +161,55 @@ if ($targets.Count -eq 0) {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CMake configure — export compile_commands.json (default -> Ninja -> Makefiles)
+#
+# The scratch root MUST be unique per run — do NOT "simplify" it back to a
+# constant name. Two concurrent imports of the SAME project (a CI matrix, a
+# parallel test suite, two people on one host) would otherwise share one
+# directory, and each run's cleanup would delete the other's in-flight CMake
+# output. PowerShell has no mktemp, so the name carries a GUID and the
+# creation is VERIFIED rather than assumed: New-Item WITHOUT -Force fails if
+# the directory already exists, which is the collision check we want, and the
+# loop retries. Note that -Force would silently hand back an EXISTING
+# directory, quietly re-introducing the sharing — that is why it is absent
+# here. A pid suffix alone would NOT be enough, because pids recycle and a
+# killed run leaves its directory behind.
 # ─────────────────────────────────────────────────────────────────────────────
-$buildDir = Join-Path $rootAbs '.dss-cmake-import-build'
-$log = Join-Path $buildDir '.cmake-import.log'
+$scratchRoot = $null
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    $suffix = [System.Guid]::NewGuid().ToString('N').Substring(0, 10)
+    $candidate = Join-Path $rootAbs ".dss-cmake-import-build.$suffix"
+    try {
+        New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+    } catch {
+        continue    # name already taken (or unwritable) — try another
+    }
+    if (Test-Path -LiteralPath $candidate -PathType Container) {
+        $scratchRoot = $candidate
+        break
+    }
+}
+if ($null -eq $scratchRoot) {
+    Die "could not create a unique scratch build directory under '$rootAbs'"
+}
+
+# Log the chosen root once, so a run that fails or is interrupted is still
+# debuggable even though the directory name is different every time.
+[Console]::Error.WriteLine("${prog}: scratch build dir: $scratchRoot")
+
+$log = Join-Path $scratchRoot '.cmake-import.log'
 $ccjson = $null
+$buildDir = $null
+$genAttempt = 0
 
 function Invoke-CMakeGen([string]$generator) {
-    if (Test-Path -LiteralPath $buildDir) { Remove-Item -Recurse -Force -LiteralPath $buildDir }
-    New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-    $cmakeArgs = @('-S', $rootAbs, '-B', $buildDir, '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON')
+    # Each attempt gets its OWN fresh sub-directory, because CMake cannot
+    # switch generators inside an existing build tree. A never-reused name
+    # means nothing has to be deleted here — which also removes the
+    # Test-Path/Remove-Item race that made concurrent runs fail outright.
+    $script:genAttempt++
+    $script:buildDir = Join-Path $scratchRoot "attempt$($script:genAttempt)"
+    New-Item -ItemType Directory -Force -Path $script:buildDir | Out-Null
+    $cmakeArgs = @('-S', $rootAbs, '-B', $script:buildDir, '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON')
     if ($generator -ne '') { $cmakeArgs += @('-G', $generator) }
     & cmake @cmakeArgs *> $log
     return ($LASTEXITCODE -eq 0)
@@ -216,7 +256,18 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
-    if (Test-Path -LiteralPath $buildDir) {
-        Remove-Item -Recurse -Force -LiteralPath $buildDir -ErrorAction SilentlyContinue
+    # Removes the whole per-run scratch root (every generator attempt lives
+    # inside it). `finally` also runs when the body throws or exits, and on
+    # Ctrl-C, so an interrupted run does not leak into the user's project.
+    #
+    # Known limitation, measured on pwsh 7.5 / .NET 9: `finally` does NOT run
+    # when a POSIX host delivers SIGTERM or SIGHUP (how CI cancels a job), so
+    # the scratch root survives those, as it does a SIGKILL. Do NOT try to
+    # close that with PosixSignalRegistration: its callback runs on a native
+    # thread with no PowerShell runspace, which aborts the process outright
+    # (exit 134) and still leaks. The unique name is what keeps such a
+    # leftover harmless — it can never collide with a later run.
+    if ($null -ne $scratchRoot -and (Test-Path -LiteralPath $scratchRoot)) {
+        Remove-Item -Recurse -Force -LiteralPath $scratchRoot -ErrorAction SilentlyContinue
     }
 }

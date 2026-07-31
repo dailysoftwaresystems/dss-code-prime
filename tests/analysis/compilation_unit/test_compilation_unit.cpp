@@ -10,11 +10,11 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/e2e_harness.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -55,19 +55,34 @@ using dss::tests::tokenizeShipped;
                        [code](ParseDiagnostic const& d) { return d.code == code; });
 }
 
-// RAII temp file: writes `content` to a uniquely-named file in the temp dir
-// and removes it on destruction. Used by addFile tests.
+// RAII temp file: writes `content` to a file in a uniquely-named scratch dir
+// and removes that dir on destruction. Used by addFile tests.
+//
+// The unique-path scheme is NOT reimplemented here — it is the shared one in
+// `tests/test_support/scratch_dir.hpp`. It used to be reimplemented, and that
+// is the defect D-TEST-FIXED-SCRATCH-PATH-POPULATION names: the path came from
+// an atomic counter with NO per-process seed, so the Nth TempFile of EVERY
+// process of this binary resolved to the same `<temp>/dss_cu2_<n>.toy` and the
+// dtor's `remove` deleted a concurrent sibling process's fixture file mid-test.
+// Uniqueness now comes from the DIRECTORY (claimed atomically); the leaf name
+// inside it is free to be constant.
+//
+// MEASURED here before the change, two concurrent processes of this binary
+// filtered to just the four TempFile tests (`--gtest_repeat=300
+// --gtest_shuffle`): 4 of 4 rounds red, 0..526 failures per process per round —
+// the count DIVERGING that far (one process green while its sibling failed) is
+// the contention tell. Note the UNFILTERED binary stayed green over 6 rounds:
+// the write→addFile window is sub-millisecond and only 4 of this suite's tests
+// open it, so the defect is real but thinly exposed unless density is raised.
+// The visible symptom is `cu.trees().size() == 0`, NOT a `filesystem_error`:
+// libc++ maps the vanished entry's ENOENT to `file_type::not_found`, so the
+// file is simply gone and nothing throws.
 class TempFile {
 public:
-    explicit TempFile(std::string content) {
-        static std::atomic<unsigned> counter{0};
-        path_ = std::filesystem::temp_directory_path() /
-                ("dss_cu2_" + std::to_string(counter.fetch_add(1)) + ".toy");
+    explicit TempFile(std::string const& content)
+        : dir_{dss::test_support::Location::Temp, "cu2-compilation-unit"},
+          path_{dir_.path() / "unit.toy"} {
         std::ofstream(path_, std::ios::binary) << content;
-    }
-    ~TempFile() {
-        std::error_code ec;
-        std::filesystem::remove(path_, ec);
     }
     TempFile(TempFile const&)            = delete;
     TempFile& operator=(TempFile const&) = delete;
@@ -75,7 +90,8 @@ public:
     [[nodiscard]] std::filesystem::path const& path() const noexcept { return path_; }
 
 private:
-    std::filesystem::path path_;
+    dss::test_support::ScratchDir dir_;
+    std::filesystem::path         path_;
 };
 
 } // namespace

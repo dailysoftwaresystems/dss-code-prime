@@ -1,5 +1,5 @@
 {
-  "$comment": "D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): the FIRST multi-artifact corpus example, across THREE targets. Each target's `dependsOn` builds `dsslib.c` (exporting dss_lib_answer) into a STATIC LIBRARY via the c171-D `-staticlib` format (a `.lib` on pe64 / a `.a` on elf64 x86_64 + aarch64), then builds `main.c` (extern dss_lib_answer) RESOLVING against it via --resolve-library -> the c169/c170 COFF / c165 ELF static-link pulls the member into a SELF-CONTAINED exec -> exit 42. Witnesses, at the corpus tier + end-to-end: the c171 dependsOn runner capability, the c171-D staticlib driver surface, and the static-link pull/merge. RUNTIME per leg: PE runs natively on the Windows gate; ELF x86_64 runs natively under WSL / on the ubuntu leg; ELF aarch64 runs under qemu-aarch64 (the emulator) / on the ubuntu-24.04-arm leg -- the arm64 arm is the runnable witness that CLOSES D-LK-STATIC-LINK-AARCH64-RUNTIME (arm64 static-link had been build-only). SkippedCrossHost where a leg cannot run, with the BUILD still giving structural coverage.",
+  "$comment": "D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): the FIRST multi-artifact corpus example, across FOUR targets. Each target's `dependsOn` builds `dsslib.c` (exporting dss_lib_answer) into a STATIC LIBRARY via the c171-D `-staticlib` format (a `.lib` on pe64 / a `.a` on elf64 x86_64 + aarch64 and on macho64 arm64), then builds `main.c` (extern dss_lib_answer) RESOLVING against it via --resolve-library -> the c169/c170 COFF / c165 ELF static-link pulls the member into a SELF-CONTAINED exec -> exit 42. Witnesses, at the corpus tier + end-to-end: the c171 dependsOn runner capability, the c171-D staticlib driver surface, and the static-link pull/merge. RUNTIME per leg: PE runs natively on the Windows gate; ELF x86_64 runs natively under WSL / on the ubuntu leg; ELF aarch64 runs under qemu-aarch64 (the emulator) / on the ubuntu-24.04-arm leg -- the arm64 arm is the runnable witness that CLOSES D-LK-STATIC-LINK-AARCH64-RUNTIME (arm64 static-link had been build-only); MACH-O arm64 runs NATIVELY on the darwin leg. SkippedCrossHost where a leg cannot run, with the BUILD still giving structural coverage. D-TEST-EXAMPLES-DEPENDSON-UNCOVERED-ON-DARWIN: the macho64 arm is the entry that makes the `dependsOn` path RUN on darwin at all. Before it, NEITHER dependsOn manifest carried a `darwin` runOn, so integrated_tests' `buildDependsOnArtifactCli` -- which SKIPS an example outright when no target's runOn matches the host -- was reached by ZERO checks on the leg this project gates on every cycle: a whole build path free to rot while the suite reported green. MEASURED on darwin arm64: dsslib.a (422 B) built, main linked resolving it, spawned -> exit 42. RED-ON-DISABLE (MEASURED, same host): drop the `--resolve-library` (i.e. lose the dependsOn thread) and main STILL links -- DSS does not yet fail loud on an undefined exec symbol (the open D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD gap) -- but dyld aborts at RUNTIME with `Symbol not found: _dss_lib_answer` -> exit 134 != 42 -> the exit-code assert fires -> red. So 42 here is a real function of the archive pull, not a constant.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -37,6 +37,18 @@
         {
           "sources": ["dsslib.c"],
           "spec": "arm64:elf64-aarch64-linux-staticlib",
+          "artifact": "dsslib.a"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:macho64-arm64-darwin-staticlib",
           "artifact": "dsslib.a"
         }
       ]
