@@ -446,10 +446,18 @@ static std::optional<CuMirModule> buildCuMirImpl(
         //      a named binary: bind to it (the true DT_NEEDED / import
         //      descriptor for a DSS-built library that has no descriptor).
         //   4. a governed extern ABSENT from every named binary:
-        //      * KNOWN system symbol (in some shipped descriptor, e.g. a bare
-        //        `extern int puts;` the user did not #include) → fall through
-        //        to the format-default library (`externLibraryByFormat`), the
-        //        gcc implicit-libc semantics -- NOT a fail-loud;
+        //      * KNOWN system symbol AND declared for the ACTIVE OBJECT FORMAT
+        //        (in some shipped descriptor, e.g. a bare `extern int puts;`
+        //        the user did not #include) → fall through to the format-default
+        //        library (`externLibraryByFormat`), the gcc implicit-libc
+        //        semantics -- NOT a fail-loud;
+        //      * KNOWN system symbol but declared ONLY FOR OTHER FORMATS (the
+        //        elf-only `fdatasync` referenced by a macho build) → FAIL LOUD
+        //        F_ShippedSymbolUnavailableForTarget. Falling through here would
+        //        bind it to a library the config says has no such export: the
+        //        image links CLEAN and dies at LOAD with no diagnostic at all
+        //        (MEASURED exit 255). See the oracle call site below --
+        //        D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS;
         //      * anything else → route to the UNBOUND channel (precedence 1's
         //        empty-library shape) and let the LINK tier decide. TF-C66
         //        (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture): this stage is
@@ -526,17 +534,88 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // channel) so the LINK tier resolves a sibling-TU definition,
             // drops an unreferenced declaration, or rejects a referenced-
             // undefined symbol LOUD (K_SymbolUndefined) -- see the precedence
-            // comment above (TF-C66). `shippedNames == nullopt` (config
-            // discovery failed) ⇒ treat every symbol as possibly-known and
-            // fall through -- never a false-positive.
-            auto const shippedNames = ffi::collectShippedExternSymbolNames();
+            // comment above (TF-C66).
+            // D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS: the oracle is
+            // FORMAT-AWARE. It answers name -> the UNION (across every declaring
+            // row, in every descriptor) of the object formats that name is
+            // available on; an EMPTY set means "every format" (the
+            // `objectFormatInAvailabilitySet` encoding). Three outcomes below,
+            // and the middle one is the whole point of the anchor: a name that
+            // is REAL but NOT ON THIS FORMAT used to be judged "known" and bound
+            // to the format-default library, which links clean and then dies at
+            // LOAD with no diagnostic at all (MEASURED: elf-only `fdatasync` on a
+            // macho build -> the loader cannot resolve it in libSystem -> exit
+            // 255). The UNION is load-bearing: `call_once`/`thrd_create`/
+            // `mtx_lock` (+~20 more) are declared by THREE separate rows gated
+            // ["elf"] / ["macho"] / ["pe"], and `sprintf` by an ["elf","macho"]
+            // row plus a ["pe"] row -- a per-row test would turn the whole C11
+            // threads surface red on every format.
+            auto const shippedFormats = ffi::collectShippedExternSymbolFormats();
             std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
             for (auto const& g : binaryGoverned) {
                 if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
-                bool const known =
-                    !shippedNames.has_value()
-                    || shippedNames->count(std::string{g.canonicalName}) != 0;
-                if (known) {
+                // `shippedFormats == nullopt` (config discovery failed) => treat
+                // every symbol as possibly-known and fall through -- never a
+                // false-positive fail-loud just because DSS_CONFIG_ROOT was unset.
+                std::vector<std::string> const* declaredFormats = nullptr;
+                bool inDescriptors = false;
+                if (shippedFormats.has_value()) {
+                    if (auto it = shippedFormats->find(
+                            std::string{g.canonicalName});
+                        it != shippedFormats->end()) {
+                        inDescriptors   = true;
+                        declaredFormats = &it->second;
+                    }
+                } else {
+                    inDescriptors = true;   // discovery failed -> assume known
+                }
+                // Known ON THIS FORMAT? `declaredFormats == nullptr` is the
+                // discovery-failed arm (assume yes). Otherwise ask the ONE shared
+                // membership predicate the #include / __has_include / semantic-
+                // injection gates all use, so the oracle can never drift from
+                // them (and no `if (format == ...)` appears anywhere here).
+                bool const availableHere =
+                    declaredFormats == nullptr
+                    || ffi::objectFormatInAvailabilitySet(*declaredFormats,
+                                                          format.kind());
+                // `declaredFormats != nullptr` (rather than `inDescriptors`)
+                // makes the deref below locally provable: availableHere is
+                // unconditionally true when the pointer is null, so the two
+                // spellings select the same set of externs.
+                if (declaredFormats != nullptr && !availableHere) {
+                    // REAL SYMBOL, WRONG FORMAT. Binding it to the format
+                    // default is provably wrong -- the config states it does not
+                    // exist there. Fail LOUD naming the symbol, the active
+                    // format, and the formats it IS declared for, so the user can
+                    // tell this apart from "never heard of this symbol" (which
+                    // routes unbound below and surfaces as K_SymbolUndefined at
+                    // link).
+                    std::string declared;
+                    for (auto const& f : *declaredFormats) {
+                        if (!declared.empty()) declared += ", ";
+                        declared += f;
+                    }
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::F_ShippedSymbolUnavailableForTarget;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "shipped system symbol '{}' is NOT available on object "
+                        "format '{}' -- the shipped descriptors declare it only "
+                        "for: {}. Under --resolve-library it matched no named "
+                        "binary's export table, and binding it to this format's "
+                        "default library would link clean and then FAIL AT LOAD "
+                        "(that library has no such export). Guard the reference "
+                        "per platform, use this format's own spelling of the "
+                        "facility, or declare the symbol for '{}' in its shipped "
+                        "descriptor if it really exists there.",
+                        g.canonicalName,
+                        objectFormatKindName(format.kind()),
+                        declared,
+                        objectFormatKindName(format.kind()));
+                    reporter.report(std::move(d));
+                    continue;   // never binds, never routes
+                }
+                if (inDescriptors) {
                     fallThrough.push_back(g);  // system symbol -> format-default
                 } else {
                     // Unknown to the named binaries AND the descriptors:

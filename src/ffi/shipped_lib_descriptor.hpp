@@ -622,29 +622,62 @@ DSS_EXPORT void forEachDescriptorInClosure(
 [[nodiscard]] DSS_EXPORT bool shippedHeaderAvailableForFormat(
     std::filesystem::path const& descriptorPath, ObjectFormatKind fmt);
 
-// c162 fold (D-FF1-READER-CONSUMER): the UNION of every extern symbol NAME
-// declared by any shipped-library descriptor under `src/dss-config/shippedLibs`
-// (the `symbols[].name` set, FORMAT-AGNOSTIC -- a symbol known on ANY format
-// counts). This is the "is X a known system symbol" oracle the `--resolve-library`
+// c162 fold (D-FF1-READER-CONSUMER), made FORMAT-AWARE by
+// D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS: every extern symbol NAME
+// declared by any shipped-library descriptor under `src/dss-config/shippedLibs`,
+// mapped to the set of OBJECT FORMATS that name is AVAILABLE on. This is the
+// "is X a known system symbol ON THIS TARGET" oracle the `--resolve-library`
 // consumer uses to distinguish a bare `extern puts;` (a real libc symbol the
 // user did not #include -- resolve it against the format-default library, NOT
 // fail loud) from a genuine typo (`dss_lib_answr` -- in neither the named
-// binary nor any descriptor -> fail loud). Returns std::nullopt iff the
-// shippedLibs directory cannot be located (DSS_CONFIG_ROOT unset + no ancestor
-// hit) -- the caller then treats every symbol as "possibly known" and falls
-// through to the format-default (SAFE: never a false-positive fail-loud on a
-// legitimate program just because config discovery failed).
+// binary nor any descriptor -> route unbound, the link tier judges) from a
+// name that is real BUT NOT ON THIS FORMAT (elf-only `fdatasync` in a macho
+// build -> fail loud F_ShippedSymbolUnavailableForTarget instead of binding it
+// to a libSystem that has no such export and dying silently at load).
 //
-// Names only (no signature decode / interner needed) -- a lightweight scan
-// distinct from the full `readShippedLibDescriptor`. Lenient per-file: an
-// unreadable / malformed descriptor is SKIPPED (its symbols are absent from the
-// set, so they would fail loud under --resolve-library -- an acceptable, LOUD,
-// user-fixable outcome; the descriptor's malformedness is caught for real by
-// the semantic-injection reader on #include + the AllShippedDescriptorsDecode
-// test). Not cached -- runs only on the --resolve-library path when a governed
-// extern is unmatched by the named binaries (the uncommon case).
-[[nodiscard]] DSS_EXPORT std::optional<std::unordered_set<std::string>>
-collectShippedExternSymbolNames();
+// ★ THE VALUE IS A UNION ACROSS ROWS, NOT ONE ROW'S GATE. The SAME name is
+// routinely declared by SEVERAL rows with DIFFERENT gates: `call_once` /
+// `thrd_create` / `mtx_lock` and ~20 more carry three separate rows in
+// threads.json gated ["elf"] / ["macho"] / ["pe"]; `sprintf` has an
+// ["elf","macho"] row AND a ["pe"] row in stdio.json; `fabsf`/`ldexpf` appear in
+// both math.json and tgmath.json. The predicate the consumer needs is therefore
+// "does ANY row declare this name available on the target format?", so this map
+// accumulates the union -- a per-row answer would turn the whole C11 threads
+// surface red on every format.
+//
+// VALUE ENCODING (the `objectFormatInAvailabilitySet` contract, verbatim): an
+// EMPTY vector means AVAILABLE ON EVERY FORMAT, exactly as an empty
+// `availableObjectFormats` does everywhere else in this header. The union
+// therefore SATURATES: once any row of a name is unrestricted, the name is
+// unrestricted. Test membership with `objectFormatInAvailabilitySet` -- the ONE
+// shared predicate, so this oracle can never drift from the `#include` /
+// `__has_include` / semantic-injection gates.
+//
+// TWO-LEVEL FALLBACK per row, mirroring the semantic injector: a symbol with no
+// `availableObjectFormats` key inherits the DOCUMENT-level
+// `availableObjectFormats`; if the document has none either, the row is
+// available everywhere.
+//
+// Returns std::nullopt iff the shippedLibs directory cannot be located
+// (DSS_CONFIG_ROOT unset + no ancestor hit) -- the caller then treats every
+// symbol as "possibly known" and falls through to the format-default (SAFE:
+// never a false-positive fail-loud on a legitimate program just because config
+// discovery failed).
+//
+// Names + availability only (no signature decode / interner needed) -- a
+// lightweight scan distinct from the full `readShippedLibDescriptor`. Lenient
+// per-file: an unreadable / malformed descriptor is SKIPPED (its symbols are
+// absent from the map, so they route unbound under --resolve-library -- an
+// acceptable, LOUD, user-fixable outcome; the descriptor's malformedness is
+// caught for real by the semantic-injection reader on #include + the
+// AllShippedDescriptorsDecode test). A malformed/unknown availability ENTRY
+// inside an otherwise-readable descriptor is likewise skipped, which can only
+// WIDEN the row's set -- never narrow it into a false fail-loud. Not cached --
+// runs only on the --resolve-library path when a governed extern is unmatched by
+// the named binaries (the uncommon case).
+[[nodiscard]] DSS_EXPORT
+std::optional<std::unordered_map<std::string, std::vector<std::string>>>
+collectShippedExternSymbolFormats();
 
 } // namespace ffi
 } // namespace dss

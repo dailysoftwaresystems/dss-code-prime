@@ -43,9 +43,11 @@
 // -- anchored D-FF1-AR-WRITER-STATIC-LINK.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/binary_reader.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -137,7 +139,307 @@ int buildOne(fs::path const& outDir,
                        });
 }
 
+// The `actual` text of the FIRST diagnostic carrying `code` (empty if none).
+// Used to assert the fail-loud message really NAMES the symbol + the offending
+// object format, not merely that "some error occurred".
+[[nodiscard]] std::string messageForCode(DiagnosticReporter const& r,
+                                         DiagnosticCode code) {
+    for (auto const& d : r.all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+
+// The severity of the FIRST diagnostic carrying `code` (Hint if none — a value
+// no assertion below accepts, so an absent diagnostic cannot pass as Error).
+[[nodiscard]] DiagnosticSeverity severityForCode(DiagnosticReporter const& r,
+                                                 DiagnosticCode code) {
+    for (auto const& d : r.all()) {
+        if (d.code == code) return d.severity;
+    }
+    return DiagnosticSeverity::Hint;
+}
+
+// One object format's (dynamic-library, exec) target pair. DSS is a
+// cross-compiler with no external toolchain, so EVERY leg builds on EVERY host
+// — none of the artifacts below is RUN (the availability verdict is a
+// COMPILE-time judgment), so no host gating is needed and the coverage stays
+// live on all three formats everywhere.
+struct FormatLeg {
+    std::string_view formatName;   // the `objectFormatKindName` spelling
+    std::string_view libTarget;
+    std::string_view execTarget;
+    std::string_view libArtifact;
+};
+constexpr FormatLeg kFormatLegs[] = {
+    {"elf",   "x86_64:elf64-x86_64-linux-dyn",
+     "x86_64:elf64-x86_64-linux-exec",      "dsslib.so"},
+    {"pe",    "x86_64:pe64-x86_64-windows-dll",
+     "x86_64:pe64-x86_64-windows-exec",     "dsslib.dll"},
+    {"macho", "x86_64:macho64-x86_64-darwin-dylib",
+     "x86_64:macho64-x86_64-darwin-exec",   "dsslib.dylib"},
+};
+
 }  // namespace
+
+// ══ D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ════════════════════
+//
+// The `--resolve-library` oracle used to answer "is X a known system symbol?"
+// FORMAT-BLIND: it unioned every `symbols[].name` across every shipped
+// descriptor and IGNORED each row's `availableObjectFormats`. So a symbol
+// declared for ONE object format was silently vouched for on EVERY format, and
+// the pipeline bound it to the TARGET'S FORMAT-DEFAULT library. MEASURED
+// end-to-end: `fdatasync` is declared elf-only in unistd.json; a macho build
+// referencing it was judged known, bound to libSystem (which has no such
+// export), LINKED CLEAN, and the binary died at load with exit 255 and NO
+// diagnostic at all. A loud link error had been converted into a silent loader
+// death. The three tests below pin the fix from three angles.
+
+// ── (1) The end-to-end fail-loud + its POSITIVE CONTROL ───────────────────
+//
+// A symbol declared ONLY for other formats must FAIL LOUD at compile time,
+// naming the symbol, the active object format, and the format(s) it IS declared
+// for — and a structurally IDENTICAL program whose symbols ARE declared for the
+// active format must still bind and link. The control is what stops a blanket-
+// reject regression (fail on every unmatched governed extern) from passing: it
+// exercises BOTH availability encodings — `random` carries a NON-EMPTY set that
+// CONTAINS macho, and `puts` carries no gate at all (the empty set = "every
+// format"). RED-ON-DISABLE: force `availableHere` true in compile_pipeline step
+// 2.5(ii) and the negative arm builds clean (rc 0, zero diagnostics) — exactly
+// the silent-loader-death shape the anchor names.
+TEST(FfiResolveLibraryRoundTrip, FormatUnavailableShippedSymbolFailsLoud) {
+    // The macho leg: `fdatasync` is declared elf-only (unistd.json), so a macho
+    // target is where the blind oracle mis-vouched for it.
+    FormatLeg const& leg = kFormatLegs[2];
+    ASSERT_EQ(leg.formatName, "macho");
+
+    ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), std::string{leg.libTarget},
+                       libRep), 0)
+        << "DSS must build the dynamic library for the " << leg.formatName
+        << " leg";
+    auto const libPath = dir / std::string{leg.libArtifact};
+    ASSERT_TRUE(fs::exists(libPath));
+    // Precondition: neither probe symbol is an export of the resolve-library,
+    // so BOTH reach the shipped-descriptor oracle as unmatched governed externs
+    // (the exact class under test).
+    ASSERT_FALSE(libraryExportsSymbol(libPath, "fdatasync"));
+    ASSERT_FALSE(libraryExportsSymbol(libPath, "random"));
+
+    // ── NEGATIVE: elf-only `fdatasync` on a macho target ──────────────────
+    auto const badSrc = writeSrc(
+        dir, "fmt_bad.c",
+        "extern int fdatasync(int);\n"
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ fdatasync(1); return dss_lib_answer(); }\n");
+    DiagnosticReporter badRep;
+    int const badRc = buildOne(dir, {libPath}, badSrc.string(),
+                               std::string{leg.execTarget}, badRep);
+    EXPECT_NE(badRc, 0)
+        << "a shipped symbol declared only for OTHER object formats must FAIL "
+           "the build, not bind to this format's default library";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  badRep,
+                  DiagnosticCode::F_ShippedSymbolUnavailableForTarget),
+              1u)
+        << "exactly one F_ShippedSymbolUnavailableForTarget — the per-SYMBOL "
+           "sibling of F_ShippedHeaderUnavailableForTarget";
+    EXPECT_EQ(severityForCode(
+                  badRep,
+                  DiagnosticCode::F_ShippedSymbolUnavailableForTarget),
+              DiagnosticSeverity::Error);
+    // The message must be ACTIONABLE: it names the symbol, the target format,
+    // and the format(s) the descriptors DO declare it for. Without all three the
+    // user cannot tell this apart from "never heard of this symbol".
+    std::string const msg = messageForCode(
+        badRep, DiagnosticCode::F_ShippedSymbolUnavailableForTarget);
+    EXPECT_NE(msg.find("fdatasync"), std::string::npos)
+        << "the diagnostic must NAME the symbol; got: [" << msg << "]";
+    EXPECT_NE(msg.find("macho"), std::string::npos)
+        << "the diagnostic must NAME the active object format; got: [" << msg
+        << "]";
+    EXPECT_NE(msg.find("elf"), std::string::npos)
+        << "the diagnostic must NAME the format(s) the symbol IS declared for; "
+           "got: [" << msg << "]";
+    // DISTINGUISHABLE from the typo class: a name in NO descriptor routes
+    // UNBOUND to the link tier (TF-C66) and surfaces as K_SymbolUndefined, so
+    // this verdict must NOT be the link-tier one.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  badRep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "a format-unavailable KNOWN symbol is a distinct verdict from an "
+           "unknown one — it must not masquerade as K_SymbolUndefined";
+    EXPECT_FALSE(fs::exists(dir / "fmt_bad"))
+        << "no artifact on a failed build";
+
+    // ── POSITIVE CONTROL: same shape, symbols available on macho ──────────
+    // `random` is declared macho-only (a NON-EMPTY set that CONTAINS the target
+    // — the membership test must accept it); `abs` carries no gate at all (the
+    // EMPTY set = every format). Both must still fall through to the format
+    // default, and `dss_lib_answer` must still bind to the read library. (No
+    // string literal anywhere in the probe: the x86_64-darwin-exec flavor does
+    // not advertise a `rodata` section yet [K_NoMatchingObjectFormat], an
+    // unrelated linker limitation that would confound this control.)
+    auto const okSrc = writeSrc(
+        dir, "fmt_ok.c",
+        "extern long random(void);\n"
+        "extern int abs(int);\n"
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ random(); abs(-1); return dss_lib_answer(); }\n");
+    DiagnosticReporter okRep;
+    int const okRc = buildOne(dir, {libPath}, okSrc.string(),
+                              std::string{leg.execTarget}, okRep);
+    EXPECT_EQ(::dss::test_support::countCode(
+                  okRep,
+                  DiagnosticCode::F_ShippedSymbolUnavailableForTarget),
+              0u)
+        << "a symbol DECLARED for the active format must never trip the "
+           "availability gate — a blanket reject is the regression this "
+           "control exists to catch";
+    EXPECT_EQ(okRc, 0)
+        << "the control program must still BUILD (random+puts -> the macho "
+           "format default, dss_lib_answer -> the read library)";
+    EXPECT_TRUE(fs::exists(dir / "fmt_ok"))
+        << "the control program's artifact must be emitted";
+}
+
+// ── (2) UNION ACROSS ROWS, end-to-end on all three formats ────────────────
+//
+// ★ The semantics that is easiest to get wrong. The SAME name is routinely
+// declared by SEVERAL rows with DIFFERENT gates: `mtx_lock` (like `call_once`,
+// `thrd_create` and ~20 more) carries THREE separate rows in threads.json gated
+// ["elf"], ["macho"] and ["pe"]. The correct predicate is "does ANY row declare
+// this name available on the target format?" — a per-ROW test would judge
+// `mtx_lock` unavailable on two of every three formats and turn the entire C11
+// threads surface red everywhere. RED-ON-DISABLE for the union specifically:
+// make the oracle keep only the LAST (or first) row's gate instead of unioning
+// and two of these three legs fail.
+TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
+    for (FormatLeg const& leg : kFormatLegs) {
+        SCOPED_TRACE(std::string{"object format: "} + std::string{leg.formatName});
+        ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
+        auto const dir = scratch.path();
+        auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+
+        DiagnosticReporter libRep;
+        ASSERT_EQ(buildOne(dir, {}, libSrc.string(),
+                           std::string{leg.libTarget}, libRep), 0);
+        auto const libPath = dir / std::string{leg.libArtifact};
+        ASSERT_TRUE(fs::exists(libPath));
+
+        auto const src = writeSrc(
+            dir, "union_probe.c",
+            "extern int mtx_lock(void*);\n"
+            "extern int dss_lib_answer(void);\n"
+            "int main(void){ mtx_lock(0); return dss_lib_answer(); }\n");
+        DiagnosticReporter rep;
+        int const rc = buildOne(dir, {libPath}, src.string(),
+                                std::string{leg.execTarget}, rep);
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep,
+                      DiagnosticCode::F_ShippedSymbolUnavailableForTarget),
+                  0u)
+            << "mtx_lock is declared by THREE per-format rows; the UNION makes "
+               "it known on every format. A per-row predicate fails here.";
+        EXPECT_EQ(rc, 0)
+            << "the union-declared symbol must still fall through to the "
+               "format default and link";
+    }
+}
+
+// ── (3) The oracle's own contract, measured against the REAL config ───────
+//
+// The end-to-end tests above prove the pipeline verdict; this pins the
+// PREDICATE itself against the shipped descriptors as they actually ship, at
+// unit precision and unit speed. Every expectation below is a MEASURED property
+// of `src/dss-config/shippedLibs/**` (43 descriptors, 131 per-symbol-gated rows,
+// 32 document-level gates), read through the SAME `objectFormatInAvailabilitySet`
+// membership predicate the `#include` / `__has_include` / semantic-injection
+// gates use — so this test also pins that the oracle cannot drift from them.
+TEST(FfiResolveLibraryRoundTrip, ShippedSymbolFormatOracleContract) {
+    auto const m = ffi::collectShippedExternSymbolFormats();
+    ASSERT_TRUE(m.has_value())
+        << "the shippedLibs directory must be discoverable from the test cwd "
+           "(DSS_CONFIG_ROOT or an ancestor walk)";
+
+    auto availability = [&](std::string const& name)
+        -> std::vector<std::string> const* {
+        auto const it = m->find(name);
+        return it == m->end() ? nullptr : &it->second;
+    };
+    auto availableOn = [&](std::string const& name, ObjectFormatKind fmt) {
+        auto const* v = availability(name);
+        return v != nullptr && ffi::objectFormatInAvailabilitySet(*v, fmt);
+    };
+
+    // (a) UNION across three per-format rows (threads.json ["elf"]/["macho"]/
+    //     ["pe"]) — known on all three, and the set is NON-EMPTY, proving the
+    //     answer came from unioning gated rows rather than from an ungated one.
+    ASSERT_NE(availability("mtx_lock"), nullptr);
+    EXPECT_FALSE(availability("mtx_lock")->empty())
+        << "mtx_lock's rows are ALL gated — an empty (= every format) answer "
+           "would mean the gates were dropped, not unioned";
+    EXPECT_TRUE(availableOn("mtx_lock", ObjectFormatKind::Elf));
+    EXPECT_TRUE(availableOn("mtx_lock", ObjectFormatKind::Pe));
+    EXPECT_TRUE(availableOn("mtx_lock", ObjectFormatKind::MachO));
+
+    // (b) UNION across rows in ONE descriptor with UNEQUAL widths: stdio.json
+    //     declares sprintf twice — an ["elf","macho"] row and a ["pe"] row.
+    EXPECT_TRUE(availableOn("sprintf", ObjectFormatKind::Elf));
+    EXPECT_TRUE(availableOn("sprintf", ObjectFormatKind::MachO));
+    EXPECT_TRUE(availableOn("sprintf", ObjectFormatKind::Pe));
+
+    // (c) UNION across TWO DESCRIPTORS: fabsf ships in math.json AND
+    //     tgmath.json, both gated ["elf","macho"] — so it stays unavailable on
+    //     pe. A union that saturated on any second row would wrongly admit pe.
+    EXPECT_TRUE(availableOn("fabsf", ObjectFormatKind::Elf));
+    EXPECT_TRUE(availableOn("fabsf", ObjectFormatKind::MachO));
+    EXPECT_FALSE(availableOn("fabsf", ObjectFormatKind::Pe));
+
+    // (d) THE DEFECT'S OWN SYMBOL: fdatasync is elf-only (unistd.json), so it
+    //     must be KNOWN on elf and UNAVAILABLE on macho/pe. This single row is
+    //     what the blind oracle vouched for everywhere.
+    ASSERT_NE(availability("fdatasync"), nullptr);
+    EXPECT_EQ(*availability("fdatasync"), (std::vector<std::string>{"elf"}));
+    EXPECT_TRUE(availableOn("fdatasync", ObjectFormatKind::Elf));
+    EXPECT_FALSE(availableOn("fdatasync", ObjectFormatKind::MachO));
+    EXPECT_FALSE(availableOn("fdatasync", ObjectFormatKind::Pe));
+
+    // (e) An ASYMMETRIC per-symbol gate that excludes a format the descriptor
+    //     itself allows: stdlib.json's `atexit` is ["pe","macho"] (elf routes
+    //     through __cxa_atexit instead).
+    EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::Pe));
+    EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::MachO));
+    EXPECT_FALSE(availableOn("atexit", ObjectFormatKind::Elf));
+
+    // (f) FALLBACK TIER 3 — a row with NO per-symbol gate in a descriptor with
+    //     NO document gate is available EVERYWHERE, spelled as the EMPTY set
+    //     (the `objectFormatInAvailabilitySet` encoding). stdio.json's `puts`.
+    ASSERT_NE(availability("puts"), nullptr);
+    EXPECT_TRUE(availability("puts")->empty())
+        << "an ungated symbol in an ungated descriptor must carry the EMPTY "
+           "(= every format) set, not an enumerated one";
+    EXPECT_TRUE(availableOn("puts", ObjectFormatKind::Elf));
+    EXPECT_TRUE(availableOn("puts", ObjectFormatKind::Pe));
+    EXPECT_TRUE(availableOn("puts", ObjectFormatKind::MachO));
+
+    // (g) FALLBACK TIER 2 — a row with NO per-symbol gate INHERITS its
+    //     DOCUMENT's gate. windows.json is document-gated ["pe"] and its
+    //     symbols carry no gates of their own.
+    ASSERT_NE(availability("CloseHandle"), nullptr);
+    EXPECT_EQ(*availability("CloseHandle"), (std::vector<std::string>{"pe"}));
+    EXPECT_TRUE(availableOn("CloseHandle", ObjectFormatKind::Pe));
+    EXPECT_FALSE(availableOn("CloseHandle", ObjectFormatKind::Elf));
+    EXPECT_FALSE(availableOn("CloseHandle", ObjectFormatKind::MachO));
+
+    // (h) A name in NO descriptor is ABSENT from the map entirely — the
+    //     "never heard of this symbol" class the consumer routes UNBOUND to the
+    //     link tier, structurally distinct from "declared, wrong format".
+    EXPECT_EQ(availability("dss_absent_symbol"), nullptr);
+}
 
 // ── Validation fail-loud (all hosts) -- red-on-disable (a) ─────────────────
 //
@@ -198,6 +500,17 @@ TEST(FfiResolveLibraryRoundTrip, GenuinelyUnknownExternFailsLoud) {
         << "the fail-loud must be K_SymbolUndefined -- the referenced extern "
            "is unbound (not in the resolve-library, not a descriptor name) "
            "and no linked TU defines it (TF-C66 link-tier verdict)";
+    // D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS: the TWO fail-loud
+    // classes must stay DISTINGUISHABLE. A name in NO descriptor is the
+    // link-tier verdict above; the per-format availability verdict
+    // (F_ShippedSymbolUnavailableForTarget) is for a name that IS declared but
+    // not for this format, and must NOT fire here.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  mainRep,
+                  DiagnosticCode::F_ShippedSymbolUnavailableForTarget),
+              0u)
+        << "an UNKNOWN symbol must not be reported as format-unavailable -- "
+           "the two verdicts name different user-fixable problems";
     EXPECT_FALSE(fs::exists(dir / "main_typo"))
         << "no ELF artifact on a failed build";
     EXPECT_FALSE(fs::exists(dir / "main_typo.exe"))

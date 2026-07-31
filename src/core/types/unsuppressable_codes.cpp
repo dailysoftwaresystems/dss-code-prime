@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 133> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -118,6 +118,15 @@ constexpr std::array<DiagnosticCode, 133> kUnsuppressableCodes{{
     // platform — the exact wrong-platform silent miscompile this fail-loud
     // closes. A direct sibling of the three shipped-header surfaces above.
     DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
+    // F_ShippedSymbolUnavailableForTarget (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS,
+    // 2026-07-30): the per-SYMBOL sibling of the header gate directly above. The
+    // `--resolve-library` oracle judged a name KNOWN on a format its descriptors
+    // do NOT declare it for, and bound it to the format-default library; the
+    // image then LINKED CLEAN and died at LOAD with no diagnostic (MEASURED:
+    // elf-only `fdatasync` on a macho build → exit 255). Suppressing this would
+    // restore exactly that silent loader death — the class this fail-loud exists
+    // to convert into a compile-time error.
+    DiagnosticCode::F_ShippedSymbolUnavailableForTarget,
     // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
     // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
     // active (arch, format). The selection contract is exactly-one-matches;

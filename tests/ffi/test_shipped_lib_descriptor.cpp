@@ -5245,10 +5245,17 @@ static ShippedSymbol const* findDarwinBsdSymbol(DarwinBsdClusterRead const& r,
 // PRESENT side of one macho-only symbol: exact decoded FnSig shape
 // (result + params, param pointees where the param is a pointer) + the exact
 // ["macho"] availability set + the injector gate excluding elf/pe.
+//
+// `retPointee` is the RESULT's pointee, asserted only when engaged — the
+// trailing-optional keeps every pre-existing caller byte-identical while
+// letting a pointer-RETURNING row (the malloc-zone cluster: four of the seven
+// hand back `malloc_zone_t *`/`void *`) pin `ptr<void>` rather than settle for
+// "some Ptr", which alone would not distinguish it from `ptr<char>`.
 static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view name,
                               TypeKind ret,
                               std::vector<TypeKind> const& params,
-                              std::vector<std::optional<TypeKind>> const& pointees) {
+                              std::vector<std::optional<TypeKind>> const& pointees,
+                              std::optional<TypeKind> retPointee = std::nullopt) {
     ASSERT_EQ(params.size(), pointees.size()) << "test-table shape";
     auto const* sym = findDarwinBsdSymbol(r, name);
     ASSERT_NE(sym, nullptr) << name << " row absent (RED-ON-DISABLE: this is "
@@ -5256,6 +5263,12 @@ static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view na
     ASSERT_EQ(r.interner.kind(sym->signature), TypeKind::FnSig) << name;
     EXPECT_EQ(r.interner.kind(r.interner.fnResult(sym->signature)), ret)
         << name << " return kind";
+    if (retPointee.has_value()) {
+        auto relem = r.interner.operands(r.interner.fnResult(sym->signature));
+        ASSERT_EQ(relem.size(), 1u) << name << " result pointee";
+        EXPECT_EQ(r.interner.kind(relem[0]), *retPointee)
+            << name << " result pointee kind";
+    }
     auto ps = r.interner.fnParams(sym->signature);
     ASSERT_EQ(ps.size(), params.size()) << name << " arity";
     for (std::size_t i = 0; i < params.size(); ++i) {
@@ -5357,6 +5370,85 @@ TEST(ShippedLibDescriptor, RealStdlibJsonRandomSrandomdevMachoOnly) {
         << "positive control: rand ships ungated (every format)";
 }
 
+// D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the seven Darwin ZONE
+// ALLOCATOR externs sqlite mem1.c's SQLITE_SYSTEM_MALLOC Darwin arm references
+// on the DEFAULT macho path. libsystem_malloc owns them; they reach the program
+// re-exported through the libSystem umbrella, so the honest existence check is
+// dlopen+dlsym, NOT libSystem.B.dylib's own export trie (that trie lists six
+// symbols total and reports all seven absent — a false negative).
+//
+// DELIBERATELY NO malloc_zone_t MODELLING: mem1.c uses it only as an opaque
+// pointer plus calls through its function-pointer members, so every
+// `malloc_zone_t *` is ptr<void> here and the REAL type keeps arriving from the
+// SDK malloc/malloc.h via D-INCLUDE-ANGLE-SOURCE-FALLBACK. That fallback is
+// also why these rows live in stdlib.json instead of a new malloc/malloc.json:
+// a descriptor SHADOWS its header totally, so a partial malloc/malloc.json
+// would delete mem1.c's access to the real malloc_zone_t and REGRESS a TU that
+// compiles today.
+//
+// The size_t/vm_size_t params are asserted U64 exactly. A flat u64 is correct
+// ONLY because the ["macho"] gate narrows these rows to LP64 (all eight
+// macho64-* formats declare dataModel LP64) — an ungated row would have needed
+// an LLP64 arm, so the availability assert below is load-bearing for the
+// SIGNATURE's correctness and not merely for the no-over-ship rule.
+TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "stdlib.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // malloc/malloc.h:390 `malloc_zone_t *malloc_default_zone(void)`
+        expectMachoOnlyFn(m, "malloc_default_zone", K::Ptr, {}, {}, K::Void);
+        // :394 `malloc_zone_t *malloc_create_zone(vm_size_t, unsigned)` —
+        // vm_size_t is 8-byte unsigned, `unsigned flags` is u32.
+        expectMachoOnlyFn(m, "malloc_create_zone", K::Ptr, {K::U64, K::U32},
+                          {std::nullopt, std::nullopt}, K::Void);
+        // :509 `void malloc_set_zone_name(malloc_zone_t *, const char *)` —
+        // the ptr<char> name param is what distinguishes it from a zone ptr.
+        expectMachoOnlyFn(m, "malloc_set_zone_name", K::Void, {K::Ptr, K::Ptr},
+                          {K::Void, K::Char});
+        // :457 `size_t malloc_size(const void *)` — the U64 RESULT is the
+        // load-bearing kind: mem1.c uses it as the allocation-size oracle, so
+        // an i32 result would silently truncate a >2GB block's size.
+        expectMachoOnlyFn(m, "malloc_size", K::U64, {K::Ptr}, {K::Void});
+        // :403 / :447 / :450 — the zone-scoped malloc/free/realloc trio.
+        expectMachoOnlyFn(m, "malloc_zone_malloc", K::Ptr, {K::Ptr, K::U64},
+                          {K::Void, std::nullopt}, K::Void);
+        expectMachoOnlyFn(m, "malloc_zone_free", K::Void, {K::Ptr, K::Ptr},
+                          {K::Void, K::Void});
+        expectMachoOnlyFn(m, "malloc_zone_realloc", K::Ptr,
+                          {K::Ptr, K::Ptr, K::U64},
+                          {K::Void, K::Void, std::nullopt}, K::Void);
+    }
+
+    // Elf read: rows persist in the decode; the gate predicate IS the elf
+    // absence. Positive control: malloc (ungated) — it also proves this read
+    // decoded a real symbol surface rather than an empty one.
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"malloc_default_zone", "malloc_create_zone",
+                             "malloc_set_zone_name", "malloc_size",
+                             "malloc_zone_malloc", "malloc_zone_free",
+                             "malloc_zone_realloc"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf))
+            << name << " must NOT be injected on elf: glibc has no zone "
+                       "allocator at all, so declaring it there would plant an "
+                       "undefined import that kills the loader";
+    }
+    auto const* malloc_ = findDarwinBsdSymbol(e, "malloc");
+    ASSERT_NE(malloc_, nullptr) << "positive control: malloc must be present";
+    EXPECT_TRUE(malloc_->availableObjectFormats.empty())
+        << "positive control: malloc ships ungated (every format)";
+}
+
 TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
@@ -5418,6 +5510,77 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
     auto const* close_ = findDarwinBsdSymbol(e, "close");
     ASSERT_NE(close_, nullptr) << "positive control: close must be present";
     EXPECT_TRUE(close_->availableObjectFormats.empty())
+        << "positive control: close ships with no per-symbol set";
+}
+
+// D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the five Darwin filesystem/
+// sysctl externs sqlite's DEFAULT macho path references (os_unix.c: flock,
+// statfs, fstatfs; test1.c: sysctl; mem1.c: sysctlbyname). Unlike the AFP
+// cluster above these are NOT behind SQLITE_ENABLE_LOCKING_STYLE, so each was a
+// hard K_SymbolUndefined at link until its row existed — DSS imports only
+// DECLARED shipped externs.
+//
+// Every signature is asserted EXACTLY (arity, each param kind, each pointee),
+// not merely "the name decodes": these are raw syscall wrappers whose args are
+// pointers to caller-owned buffers, so a silently wrong width or a dropped
+// param is an ABI defect that still links and still runs. The two that would
+// bite hardest are sysctl/sysctlbyname, where `size_t *oldlenp` is an IN-OUT
+// buffer-length cell — decode it as ptr<u32> and the callee writes 8 bytes into
+// a 4-byte view of the caller's stack slot.
+TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // SDK sys/fcntl.h:616 `int flock(int, int)` — NOT sys/file.h, whose
+        // __BEGIN_DECLS block is EMPTY (it only re-includes sys/fcntl.h).
+        expectMachoOnlyFn(m, "flock", K::I32, {K::I32, K::I32},
+                          {std::nullopt, std::nullopt});
+        // SDK sys/mount.h:460/:442. `struct statfs *` keeps the fsctl/futimes
+        // opaque ptr<void> spelling — no consumer needs its layout, and the
+        // real type still reaches mem1.c/os_unix.c through the SDK header.
+        expectMachoOnlyFn(m, "statfs", K::I32, {K::Ptr, K::Ptr},
+                          {K::Char, K::Void});
+        expectMachoOnlyFn(m, "fstatfs", K::I32, {K::I32, K::Ptr},
+                          {std::nullopt, K::Void});
+        // SDK sys/sysctl.h:800 `int sysctl(int *, u_int, void *, size_t *,
+        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h:30),
+        // size_t/size_t* are 8-byte unsigned on every macho64 format (all eight
+        // declare dataModel LP64), which is exactly why the row may ship a FLAT
+        // signature with no signatureByDataModel.
+        expectMachoOnlyFn(m, "sysctl", K::I32,
+                          {K::Ptr, K::U32, K::Ptr, K::Ptr, K::Ptr, K::U64},
+                          {K::I32, std::nullopt, K::Void, K::U64, K::Void,
+                           std::nullopt});
+        // SDK sys/sysctl.h:802 — same tail, name-keyed head.
+        expectMachoOnlyFn(m, "sysctlbyname", K::I32,
+                          {K::Ptr, K::Ptr, K::Ptr, K::Ptr, K::U64},
+                          {K::Char, K::Void, K::U64, K::Void, std::nullopt});
+    }
+
+    // Elf read: rows persist in the decode (gating is at injection, not decode);
+    // the gate predicate IS the elf absence. Positive control: close (ungated).
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"flock", "statfs", "fstatfs", "sysctl",
+                             "sysctlbyname"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf))
+            << name << " must NOT be injected on elf: glibc exports no "
+                       "sysctlbyname, and declaring it there would plant an "
+                       "undefined import (DSS eager-imports every shipped extern)";
+    }
+    auto const* closeCtl = findDarwinBsdSymbol(e, "close");
+    ASSERT_NE(closeCtl, nullptr) << "positive control: close must be present";
+    EXPECT_TRUE(closeCtl->availableObjectFormats.empty())
         << "positive control: close ships with no per-symbol set";
 }
 

@@ -2356,8 +2356,8 @@ bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath
     return objectFormatInAvailabilitySet(*avail, fmt);
 }
 
-std::optional<std::unordered_set<std::string>>
-collectShippedExternSymbolNames() {
+std::optional<std::unordered_map<std::string, std::vector<std::string>>>
+collectShippedExternSymbolFormats() {
     namespace fs = std::filesystem;
     // Locate src/dss-config/shippedLibs -- DSS_CONFIG_ROOT override first, then a
     // cwd-walk up to 8 ancestors (mirrors findShippedConfig's discipline, but for
@@ -2385,7 +2385,40 @@ collectShippedExternSymbolNames() {
     }
     if (root.empty()) return std::nullopt;  // discovery failed -> caller falls through
 
-    std::unordered_set<std::string> names;
+    // ── D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ────────────────────
+    // name -> the UNION of the object-format names every declaring row makes it
+    // available on. EMPTY vector ⇒ available on EVERY format (the
+    // `objectFormatInAvailabilitySet` encoding, verbatim), so the union
+    // SATURATES: once any row is unrestricted the name is unrestricted and no
+    // later restricted row may narrow it back.
+    std::unordered_map<std::string, std::vector<std::string>> byName;
+    // Names whose union has saturated to "every format". Tracked explicitly
+    // because the saturated state and the "nothing accumulated yet" state share
+    // the same empty-vector spelling in the result map.
+    std::unordered_set<std::string> unrestricted;
+
+    // Decode ONE `availableObjectFormats` array into `out`, generically: every
+    // entry must name a real format in the `objectFormatKindFromName` vocabulary
+    // AND must not be the `unknown` sentinel (which spells correctly but selects
+    // nothing). A bad entry is SKIPPED here rather than errored -- this scan is
+    // lenient by contract (the strict validation lives in the semantic read on
+    // the same descriptor), and skipping can only WIDEN a row's set, never
+    // narrow it into a false fail-loud. Returns false iff the key is absent /
+    // not an array, so the caller can apply the next fallback tier.
+    auto decodeFormats = [](nlohmann::json const& obj,
+                            std::vector<std::string>& out) -> bool {
+        auto const it = obj.find("availableObjectFormats");
+        if (it == obj.end() || !it->is_array()) return false;
+        for (auto const& v : *it) {
+            if (!v.is_string()) continue;
+            auto const name = v.get<std::string>();
+            auto const kind = objectFormatKindFromName(name);
+            if (!kind || !isSelectableObjectFormatKind(*kind)) continue;
+            out.push_back(name);
+        }
+        return true;
+    };
+
     std::error_code ec;
     for (auto const& entry : fs::recursive_directory_iterator(root, ec)) {
         if (ec) break;
@@ -2396,9 +2429,10 @@ collectShippedExternSymbolNames() {
         std::ifstream in(entry.path(), std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
         nlohmann::json j;
-        // Names-only scan: no signature decode, no interner. A malformed
-        // descriptor is skipped (its symbols simply are not "known" -- caught
-        // for real by the semantic reader on #include + AllShippedDescriptorsDecode).
+        // Names + availability scan: no signature decode, no interner. A
+        // malformed descriptor is skipped (its symbols simply are not "known" --
+        // caught for real by the semantic reader on #include +
+        // AllShippedDescriptorsDecode).
         try {
             in >> j;
         } catch (...) {
@@ -2408,14 +2442,47 @@ collectShippedExternSymbolNames() {
             || !j.at("symbols").is_array()) {
             continue;
         }
+        // DOCUMENT-level availability — the fallback a symbol row with no
+        // `availableObjectFormats` key of its own inherits (mirrors the semantic
+        // injector's two-level gate). `hasDoc == false` ⇒ the document itself is
+        // unrestricted, so such a row is available on every format.
+        std::vector<std::string> docFormats;
+        bool const hasDoc = decodeFormats(j, docFormats);
+
         for (auto const& sym : j.at("symbols")) {
-            if (sym.is_object() && sym.contains("name")
-                && sym.at("name").is_string()) {
-                names.insert(sym.at("name").get<std::string>());
+            if (!sym.is_object() || !sym.contains("name")
+                || !sym.at("name").is_string()) {
+                continue;
+            }
+            auto name = sym.at("name").get<std::string>();
+            if (unrestricted.count(name) != 0) continue;  // already saturated
+
+            // TIER 1 per-symbol gate, TIER 2 the document gate, else everywhere.
+            std::vector<std::string> rowFormats;
+            bool const rowRestricted =
+                decodeFormats(sym, rowFormats)
+                    ? true
+                    : (hasDoc ? (rowFormats = docFormats, true) : false);
+
+            if (!rowRestricted || rowFormats.empty()) {
+                // Unrestricted row (no gate at either tier) — or a gate that
+                // decoded to nothing usable, which the empty-set contract also
+                // reads as "every format". SATURATE: drop any accumulated
+                // restriction so a later restricted row cannot narrow it.
+                unrestricted.insert(name);
+                byName[std::move(name)].clear();
+                continue;
+            }
+            // UNION this row's formats into the name's accumulated set.
+            auto& acc = byName[std::move(name)];
+            for (auto& f : rowFormats) {
+                if (std::find(acc.begin(), acc.end(), f) == acc.end()) {
+                    acc.push_back(std::move(f));
+                }
             }
         }
     }
-    return names;
+    return byName;
 }
 
 } // namespace dss::ffi

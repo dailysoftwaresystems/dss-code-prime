@@ -2628,6 +2628,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   type genuinely diverges). Member of `kUnsuppressableCodes`.
     //   (D-LANG-TYPE-IDENTITY-VOCABULARY, 2026-07-20.)
     F_ShippedTypeIdentityConflict = 0x5023,
+    // F_ShippedSymbolUnavailableForTarget: the per-SYMBOL sibling of
+    //   F_ShippedHeaderUnavailableForTarget (0x501D). Under the
+    //   `--resolve-library` surface (c162, D-FF1-READER-CONSUMER) an unbound
+    //   binary-governed extern is tested against the shipped-descriptor
+    //   "is this a known system symbol" ORACLE; a KNOWN name falls through to
+    //   the target's FORMAT-DEFAULT library (gcc implicit-libc semantics).
+    //   This code fires when the name IS declared by some shipped descriptor
+    //   but NOT for the ACTIVE object format — the union of every declaring
+    //   row's `availableObjectFormats` excludes it (e.g. `fdatasync`, declared
+    //   elf-only in unistd.json, referenced by a macho build). Binding such a
+    //   name to the format default is PROVABLY WRONG: the config states the
+    //   symbol does not exist there, so the image links clean and then DIES AT
+    //   LOAD with no diagnostic at all (MEASURED: exit 255, dyld cannot resolve
+    //   `_fdatasync` in libSystem). Fail-loud converts that silent loader death
+    //   into a compile-time error. DISTINCT from "never heard of this symbol":
+    //   a name in NO descriptor still routes UNBOUND to the link tier (TF-C66),
+    //   where a sibling-TU definition resolves it and a genuine typo rejects
+    //   K_SymbolUndefined. The message names the symbol, the active format, and
+    //   the format(s) the descriptors DO declare it for. Remediation: guard the
+    //   reference per platform, use the format's own spelling of the facility,
+    //   or declare the symbol for this format in its descriptor if it really
+    //   exists there. Member of `kUnsuppressableCodes` (a silent-loader-death
+    //   guard). (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS, 2026-07-30.)
+    F_ShippedSymbolUnavailableForTarget = 0x5024,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
