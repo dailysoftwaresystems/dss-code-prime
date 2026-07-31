@@ -37,14 +37,17 @@
 
 namespace dss::linker {
 
-// Write `image.bytes` to `path`, truncating any existing file.
-// Returns `true` iff the bytes landed on disk. On failure, emits
+// Write `image.bytes` to `path`, REPLACING any existing file with a new
+// file identity (see `writeBytes` below — the artifact is staged in a
+// sibling temp and renamed over the target; it is never truncated in
+// place). Returns `true` iff the bytes landed on disk. On failure, emits
 // one of six remediation-distinct K_* codes into `reporter` and
 // returns `false`:
 //   * `K_ImageNotOk`               — `image.ok() == false`
 //   * `K_ImageEmpty`               — `ok() == true` but bytes empty
 //   * `K_ImageWriteParentMissing`  — parent dir absent
-//   * `K_ImageWriteOpenFailed`     — open() failbit
+//   * `K_ImageWriteOpenFailed`     — no filename component, temp-create
+//                                    failbit, or the commit rename failed
 //   * `K_ImageWriteShort`          — write() mid-stream failbit
 //   * `K_ImageWriteCloseFailed`    — close() flush failbit
 //
@@ -83,17 +86,33 @@ writeImage(LinkedImage const&             image,
            DiagnosticReporter&            reporter,
            bool                           executable = false);
 
-// Commit a raw byte buffer to `path`, truncating any existing file. The
-// byte-integrity core `writeImage` delegates to AFTER its LinkedImage-shape
-// preconditions -- factored out so other artifact producers that are NOT a
-// `LinkedImage` (the c163 `ar` static-archive writer -- an archive has no
-// `ok()`/function-count contract) reuse the SAME open/write/close fail-loud
-// discipline. Returns true iff every byte landed on disk; on failure emits one
-// of the same four remediation-distinct K_* codes into `reporter`:
+// Commit a raw byte buffer to `path`. The byte-integrity core `writeImage`
+// delegates to AFTER its LinkedImage-shape preconditions -- factored out so
+// other artifact producers that are NOT a `LinkedImage` (the c163 `ar`
+// static-archive writer -- an archive has no `ok()`/function-count contract)
+// reuse the SAME fail-loud discipline. Returns true iff every byte landed on
+// disk; on failure emits one of the same four remediation-distinct K_* codes
+// into `reporter`:
 //   * `K_ImageWriteParentMissing`  -- parent dir absent
-//   * `K_ImageWriteOpenFailed`     -- open() failbit
+//   * `K_ImageWriteOpenFailed`     -- path has no filename component, the
+//                                     staging temp could not be created, or
+//                                     the commit rename failed
 //   * `K_ImageWriteShort`          -- write() mid-stream failbit
 //   * `K_ImageWriteCloseFailed`    -- close() flush failbit
+//
+// ATOMIC REPLACE, NEW IDENTITY (D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING).
+// The bytes are staged in a uniquely-named SIBLING temp (`<path>.dsstmp-*`,
+// claimed with `std::ios::noreplace`) and then renamed over `path`. The
+// artifact is therefore never truncated in place, and every write produces a
+// NEW file identity -- required because macOS attaches an exec DENY to a
+// REUSED inode, killing a rebuilt binary at that inode (exit 137) while a
+// byte-identical copy runs. Consequences callers should know: `path` appears
+// with complete bytes or not at all (a failed write leaves the PREVIOUS
+// artifact intact and untouched); the new file carries fresh permission bits
+// at the host umask rather than inheriting the old file's; and if `path` is a
+// symlink or hard link the rename replaces THAT NAME rather than writing
+// through to the shared file. Reasoning and the cross-platform determination
+// are in writer.cpp at the fix site.
 // Does NOT gate on `bytes.empty()` (that is a LinkedImage-specific contract --
 // an empty write is a legitimate raw-bytes request) and never sets the POSIX
 // execute bit (an archive / relocatable output is not executable; `writeImage`

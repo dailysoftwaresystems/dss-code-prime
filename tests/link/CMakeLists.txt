@@ -66,6 +66,19 @@ dss_add_test(NAME link/test_spirv_writer         SOURCES test_spirv_writer.cpp)
 # Plan 14 LK10 cycle 1 — file-emission substrate.
 dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)
 
+# D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING — the emitted artifact must be a
+# NEW FILE IDENTITY on every write (staged in a sibling temp, renamed over the
+# target), never a truncate-in-place that recycles the destination's inode.
+# macOS attaches an exec DENY to a soured inode, so a repeatedly-rebuilt binary
+# dies with exit 137 at that inode while a byte-identical copy runs. Bytes are
+# NOT the property under test: the defective code produced correct bytes.
+# Pinned portably (no `#ifdef`, so the windows-msvc-release leg really runs it)
+# via `create_hard_link` + `equivalent`, plus the fail-loud/no-residue belts for
+# the temp-create, rename, missing-parent and filename-less failure paths and a
+# concurrent-writers uniqueness pin.
+dss_add_test(NAME link/test_link_writer_new_identity
+             SOURCES test_link_writer_new_identity.cpp)
+
 # Plan 14 §2.13 D-LK10-ENTRY Slice C — runnable-binary spine
 # (first DSS-produced binary the OS actually runs).
 dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)
