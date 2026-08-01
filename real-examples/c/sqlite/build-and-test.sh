@@ -165,6 +165,52 @@ DSS_CONFIG="${DSS_CONFIG:-release}"
 # codegen or linkage defect would plausibly show up. Revisit when sqlite updates the
 # regex upstream or the macOS string changes again. See
 # D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT.)
+# (^busy2- and ^recoverfault — CONTROL RECORDED 2026-08-01 (TF-C108). Until this
+# date these were the only two patterns here carrying a DESCRIPTION but no MEASURED
+# matched control, i.e. they were asserted rather than earned. They are now earned,
+# by one experiment: the DSS-built and the gcc-built REFERENCE testfixture ran
+# `full.test` CONCURRENTLY on the same box and the same sqlite tree (23 min; DSS 12
+# errors / 1,061,995, reference 8 errors / 1,062,222). ^recoverfault gets the
+# strongest possible control — the SAME FOUR NAMES failed in BOTH fixtures
+# (recoverfault-{1,2}-oom-{persistent,transient}.{459,460}), and a compiler cannot
+# change which allocation an OOM oracle stops at. ^busy2- is earned as a CLASS: both
+# fixtures failed a busy2 wall-clock assertion, DIFFERENT members each (DSS
+# busy2-2.2.5, reference busy2-1.2.3) — which is the signature of an intermittent
+# environment effect, not of codegen. A SECOND, INDEPENDENT datum points the same
+# way: in the 2026-07-31 `full` run the SAME name, busy2-2.1.3, failed on the host
+# x86_64 leg AND on the arm64-under-qemu leg — two different code generators and two
+# different instruction sets producing the identical timing failure in one run. The same run also re-validated ^walsetlk- (DSS
+# 2.1.3/2.1.12/2.1.14/2.2.6/2.2.8, reference 2.1.8), ^walsetlk_recover- (BOTH negative
+# and near-identical: DSS -33,932,622 us, reference -33,923,905 us) and ^zipfile-25.0
+# (both). ⓘ WHY THE WHOLE FAMILY MOVES TOGETHER: every one of these assertions takes
+# its number from Tcl's `time`, which lives entirely outside DSS-compiled code —
+# VERIFIED, not assumed: ldd resolves libtcl8.6.so to the SAME
+# /lib/x86_64-linux-gnu/libtcl8.6.so for both fixtures, and `nm -D --defined-only`
+# finds Tcl_GetTime defined in NEITHER fixture while that .so exports it; and
+# sqlite's own unixSleep
+# (src/os_unix.c) calls nanosleep(&sp, NULL) with no EINTR retry while
+# sqliteDefaultBusyCallback credits the NOMINAL delay from its totals[] table, so a
+# caught signal shortens the real wait with the handler none the wiser.
+# ★★ ROOT CAUSE, MEASURED THE SAME DAY — THE CLOCK ON THIS BOX IS BROKEN, AND IT IS
+# NOT A COMPILER PROBLEM. CLOCK_REALTIME oscillates between two fixed values ~34.47 s
+# apart, flipping every ~5 s. Two independent instruments: a shell sampler (791
+# intervals) saw 49 steps, max +34.4495 / min -34.4496 s; a single-process probe
+# calling clock_gettime(CLOCK_REALTIME) and clock_gettime(CLOCK_MONOTONIC) back to
+# back at 20 Hz (2,382 samples) saw 48 steps, with (realtime - monotonic) — a
+# CONSTANT unless realtime is stepped — taking exactly two values, SPREAD 35.164 s.
+# The magnitude is the smoking gun: EVERY walsetlk_recover-1.3 negative elapsed ever
+# recorded (-33,932,622 / -33,923,905 / -33,969,790 / -35,334,590 / -35,331,430 /
+# -35,335,818 us) falls inside that spread. A test that reads the clock either side
+# of a wait and straddles a flip mismeasures it by +/-34.5 s. This is why the whole
+# family moves together and why the gcc reference suffers it identically. Tracked by
+# D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S; when the clock is fixed, several of the
+# patterns below may simply evaporate — re-evaluate then and NARROW this list.
+# ⚠ SCOPE NOTE:
+# ^busy2- stays a whole-FILE pattern, which is broader than the per-NAME standard set
+# by loadext-2.1/2.2; narrowing it needs per-name controls that do not exist yet. And
+# misc7-7.0, which fails by the SAME mechanism, is deliberately NOT added here —
+# family resemblance is not a control. See D-SQLITE-MISC7-BUSYTIMEOUT-DELAY-WINDOW-
+# GENUINE and D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED.)
 DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^walsetlk_recover- ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ ^loadext-2\.1$ ^loadext-2\.2$ emulated:^writecrash-}"
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var

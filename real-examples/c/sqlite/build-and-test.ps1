@@ -165,6 +165,15 @@ $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # this list does not. Adding it here would suppress a failure that has never been
 # observed on pe64 — a confound must be EARNED per platform, not copied across.
 # Tracked by D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
+# ⚠ PER-DRIVER SCOPE, recorded 2026-08-01 (TF-C108): build-and-test.sh now carries a
+# MEASURED matched control for '^busy2-' and '^recoverfault' (DSS and a gcc-built
+# reference testfixture ran full.test concurrently; recoverfault failed on the SAME
+# FOUR NAMES in both, busy2 on different members of the family in each). That control
+# was earned on LINUX and does NOT transfer here — it says nothing about pe64, whose
+# own 'full' tier has so far reported 0 errors out of 979,736, i.e. these patterns
+# currently suppress NOTHING on this driver. Should a busy2/recoverfault failure ever
+# appear on pe64, it must be re-earned with a pe64 control (the reference testfixture
+# this driver already builds), not inherited from the Linux row.
 $Confounds    = if ($env:DSS_CONFOUNDS) { $env:DSS_CONFOUNDS -split '\s+' } `
                 else { @('^walsetlk-', '^walsetlk\.', '^walsetlk_recover-', '^busy2-', '^zipfile-25\.0$', '^recoverfault') }
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
