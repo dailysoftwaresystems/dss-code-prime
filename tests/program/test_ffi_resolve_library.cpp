@@ -48,6 +48,7 @@
 #include "diagnostic_count.hpp"
 #include "ffi/binary_reader.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
+#include "host_native_target.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -528,36 +529,18 @@ TEST(FfiResolveLibraryRoundTrip, GenuinelyUnknownExternFailsLoud) {
 // this 2770 times); the link tier resolves the reference against the sibling
 // definition and the program RUNS. RED-ON-DISABLE: restore the per-CU
 // fail-loud arm and this build errors spuriously.
+// D-TEST-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the artifact,
+// so the target must match the HOST. RETARGET rather than skip — a GTEST_SKIP
+// would quietly stop testing --resolve-library on whichever host it excluded,
+// which is exactly the coverage the first macOS run needed. The per-host ladder
+// that used to live here (and whose missing arm64 arm reddened the native arm64
+// CI leg with `posix_spawn ... rc=8`) now lives in ONE place.
 TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary) {
-#if defined(_WIN32)
-    std::string const libTarget   = "x86_64:pe64-x86_64-windows-dll";
-    std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
-    std::string const libArtifact = "dsslib.dll";
-    std::string const exeArtifact = "decl.exe";
-// D-TEST-MACOS-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the
-// artifact, so the target must match the HOST. The original two-arm shape read
-// "Windows or else Linux", which silently handed macOS an elf64-x86_64 binary —
-// `posix_spawn` then failed rc=8 (ENOEXEC) and the suite could never be green on
-// a Mac. RETARGET rather than skip: the round-trip assertion stays LIVE on every
-// host (a GTEST_SKIP here would quietly stop testing --resolve-library on macOS,
-// which is exactly the coverage the first macOS run needed). Arch is selected
-// from the host too — Apple Silicon and Intel Macs both ship dylib+exec formats.
-#elif defined(__APPLE__)
-#  if defined(__aarch64__)
-    std::string const libTarget   = "arm64:macho64-arm64-darwin-dylib";
-    std::string const execTarget  = "arm64:macho64-arm64-darwin-exec";
-#  else
-    std::string const libTarget   = "x86_64:macho64-x86_64-darwin-dylib";
-    std::string const execTarget  = "x86_64:macho64-x86_64-darwin-exec";
-#  endif
-    std::string const libArtifact = "dsslib.dylib";
-    std::string const exeArtifact = "decl";
-#else
-    std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
-    std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";
-    std::string const libArtifact = "dsslib.so";
-    std::string const exeArtifact = "decl";
-#endif
+    auto const host = hostNativeTarget();
+    std::string const libTarget   = std::string{host.libTarget};
+    std::string const execTarget  = std::string{host.execTarget};
+    std::string const libArtifact = hostLibArtifact("dsslib");
+    std::string const exeArtifact = hostExeArtifact("decl");
     ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
     auto const dir = scratch.path();
     // The --resolve-library binary is present + ACTIVE (dsslib exports
@@ -624,36 +607,14 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
 // exemption: an unbound data extern is sibling-resolved at link (row stripped),
 // or rejected LOUD if unresolved. RED-ON-DISABLE: revert the ExternGlobal
 // exemption and this build fails H0009 on `dss_data_answer`.
+// D-TEST-HOST-SPAWNS-FOREIGN-BINARY: builds then SPAWNS, so the target must
+// match the HOST — see `tests/test_support/host_native_target.hpp`.
 TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibrary) {
-#if defined(_WIN32)
-    std::string const libTarget   = "x86_64:pe64-x86_64-windows-dll";
-    std::string const execTarget  = "x86_64:pe64-x86_64-windows-exec";
-    std::string const libArtifact = "dsslib.dll";
-    std::string const exeArtifact = "decl.exe";
-// D-TEST-MACOS-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the
-// artifact, so the target must match the HOST. The original two-arm shape read
-// "Windows or else Linux", which silently handed macOS an elf64-x86_64 binary —
-// `posix_spawn` then failed rc=8 (ENOEXEC) and the suite could never be green on
-// a Mac. RETARGET rather than skip: the round-trip assertion stays LIVE on every
-// host (a GTEST_SKIP here would quietly stop testing --resolve-library on macOS,
-// which is exactly the coverage the first macOS run needed). Arch is selected
-// from the host too — Apple Silicon and Intel Macs both ship dylib+exec formats.
-#elif defined(__APPLE__)
-#  if defined(__aarch64__)
-    std::string const libTarget   = "arm64:macho64-arm64-darwin-dylib";
-    std::string const execTarget  = "arm64:macho64-arm64-darwin-exec";
-#  else
-    std::string const libTarget   = "x86_64:macho64-x86_64-darwin-dylib";
-    std::string const execTarget  = "x86_64:macho64-x86_64-darwin-exec";
-#  endif
-    std::string const libArtifact = "dsslib.dylib";
-    std::string const exeArtifact = "decl";
-#else
-    std::string const libTarget   = "x86_64:elf64-x86_64-linux-dyn";
-    std::string const execTarget  = "x86_64:elf64-x86_64-linux-exec";
-    std::string const libArtifact = "dsslib.so";
-    std::string const exeArtifact = "decl";
-#endif
+    auto const host = hostNativeTarget();
+    std::string const libTarget   = std::string{host.libTarget};
+    std::string const execTarget  = std::string{host.execTarget};
+    std::string const libArtifact = hostLibArtifact("dsslib");
+    std::string const exeArtifact = hostExeArtifact("decl");
     ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
     auto const dir = scratch.path();
     auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
@@ -843,25 +804,31 @@ TEST(FfiResolveLibraryRoundTrip, PeMixedBareSystemExternAndOwnLibraryExitFortyTw
 
 // ── ELF dynamic round-trip (Linux host) -- the native witness ──────────────
 //
-// Gated on __linux__ AND an x86_64 host: the artifacts are built for the
-// x86_64:elf64-x86_64-linux-{dyn,exec} targets, so the run needs an x86_64
-// Linux host to execute them. On the ubuntu-x86_64 CI leg this runs for real;
-// on the ubuntu-ARM64 leg it is compiled out (an x86_64 ELF cannot execute
-// there -- ENOEXEC), matching how the Windows/macOS legs compile it out. There
-// is no aarch64 `.so` (ET_DYN) format flavor yet, so the ELF DYNAMIC round-trip
-// has no arm64 runtime form (follow-up D-LK-ELF-DYN-AARCH64-FLAVOR); the local
-// WSL run is the dev-box witness.
-#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+// Gated on __linux__ only, and BUILT FOR THE HOST's own arch: the artifacts are
+// spawned, so a foreign build would fail ENOEXEC.
+//
+// ⚠ The previous gate here also required an x86_64 host, on the stated grounds
+// that "there is no aarch64 `.so` (ET_DYN) format flavor yet". That premise is
+// STALE and was MEASURED false at TF-C109: `elf64-aarch64-linux-dyn` shipped in
+// c171 (D-LK-ELF-DYN-AARCH64-FLAVOR) and the round-trip works end to end — DSS
+// emits the aarch64 ET_DYN with a real-named `.dynsym` export, an aarch64 exec
+// resolves its extern against it, and the program runs to exit 42. So the
+// arm64 leg was silently forfeiting real coverage it could have had. The gate
+// now widens: the native ubuntu-24.04-arm leg runs this for real.
+#if defined(__linux__)
 TEST(FfiResolveLibraryRoundTrip, ElfDynamicRoundTripExitsFortyTwo) {
     ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
     auto const dir = scratch.path();
     auto const libSrc  = writeSrc(dir, "dsslib.c", kLibSrc);
     auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
 
+    // Built for the HOST's own arch — this test spawns its output.
+    auto const host = hostNativeTarget();
+
     // 1. DSS builds dsslib.so (ELF ET_DYN, c150 -- real-named .dynsym export).
     DiagnosticReporter libRep;
     ASSERT_EQ(buildOne(dir, {}, libSrc.string(),
-                       "x86_64:elf64-x86_64-linux-dyn", libRep), 0);
+                       std::string{host.libTarget}, libRep), 0);
     auto const soPath = dir / "dsslib.so";
     ASSERT_TRUE(fs::exists(soPath));
     ASSERT_TRUE(libraryExportsSymbol(soPath, "dss_lib_answer"));
@@ -869,7 +836,7 @@ TEST(FfiResolveLibraryRoundTrip, ElfDynamicRoundTripExitsFortyTwo) {
     // 2. DSS builds main RESOLVING its extern against dsslib.so.
     DiagnosticReporter mainRep;
     ASSERT_EQ(buildOne(dir, {soPath}, mainSrc.string(),
-                       "x86_64:elf64-x86_64-linux-exec", mainRep), 0);
+                       std::string{host.execTarget}, mainRep), 0);
     auto const mainPath = dir / "main";
     ASSERT_TRUE(fs::exists(mainPath));
 
@@ -895,14 +862,17 @@ TEST(FfiResolveLibraryRoundTrip, ElfMixedBareSystemExternAndOwnLibraryExitFortyT
     auto const libSrc  = writeSrc(dir, "dsslib.c", kLibSrc);
     auto const mainSrc = writeSrc(dir, "mixed.c", kMixedSrc);
 
+    // Built for the HOST's own arch — this test spawns its output.
+    auto const host = hostNativeTarget();
+
     DiagnosticReporter libRep;
     ASSERT_EQ(buildOne(dir, {}, libSrc.string(),
-                       "x86_64:elf64-x86_64-linux-dyn", libRep), 0);
+                       std::string{host.libTarget}, libRep), 0);
     auto const soPath = dir / "dsslib.so";
 
     DiagnosticReporter mainRep;
     ASSERT_EQ(buildOne(dir, {soPath}, mainSrc.string(),
-                       "x86_64:elf64-x86_64-linux-exec", mainRep), 0)
+                       std::string{host.execTarget}, mainRep), 0)
         << "the mixed bare-puts + own-lib program must BUILD -- puts falls "
            "through to libc.so.6, dss_lib_answer binds to dsslib.so.";
     auto const mainPath = dir / "mixed";
