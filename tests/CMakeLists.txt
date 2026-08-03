@@ -114,7 +114,10 @@ add_subdirectory(examples)
 # COST, MEASURED on this host (Release, Apple clang, 314 tests):
 #   repeat=1 -> 0.31 s   repeat=10 -> 3.00 s
 #   repeat=20 -> 6.03 s  repeat=40 -> 12.11 s   (~0.30 s per order, linear)
-# N=20 chosen: 20 independent orders for 6.0 s. It is its OWN ctest entry, so
+# N=20 chosen: 20 independent orders for 6.0 s. ⚠ THAT PRICE IS THIS CONFIG'S, NOT
+# EVERY CONFIG'S — the same 20 orders cost 598.72 s on the Debug+ASan+UBSan leg,
+# ~100x this figure, which is why N is now divided per leg rather than taken as a
+# global constant; see the divisor block above dss_add_shuffle_arm. It is its OWN ctest entry, so
 # the existing `analysis/preprocess/test_preprocessor` entry keeps its ~0.7 s and
 # ctest's -j overlaps this one with the other 745 entries.
 #
@@ -141,11 +144,100 @@ add_subdirectory(examples)
 # tests/test_support/scratch_dir.hpp). MEASURED before that root existed: the two
 # entries clobbered each other's fixture files and `ctest -j 8` over just this
 # pair went red 1 run in 3. Any suite added to this arm inherits the obligation.
+# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO (D-TEST-SHUFFLE-ARM-
+# ── REPEAT-BUDGET-IS-PER-LEG) ──
+#
+# Every N below was chosen against a cost that differs by ~28x between the legs
+# that run it, so no single global constant can be right on all of them. MEASURED,
+# CI run 30815752993, both legs 773 tests under `ctest --parallel 4` on a 4-core
+# runner (sum of per-test wall times, from each job's own ctest output):
+#
+#     leg                    whole suite      these 8 arms
+#     linux-gcc-release          301.8 s     117.8 s  (39%)
+#     linux-clang-asan        ~7565.0 s*    3311.5 s  (44%)
+#     * 7221.3 s measured over the 687 tests that ran + ~344 s projected for the
+#       86 that did not, at the ~4 s/test the surrounding examples averaged.
+#
+# The Release column is what the block above sized N against ("repeat=20 -> 6.03 s",
+# Apple clang). The sanitizer column is what the SAME arms actually cost on the leg
+# this file calls the stronger instrument. That leg's Test step is budgeted 30 min
+# (pipeline-pr.yml), needed ~31.5 min, and so was KILLED at 687/773 — every test it
+# reached PASSED. The 86 it never reached were all examples/c-subset, t* through z*,
+# so they took ZERO sanitizer coverage, every run, always the same tail.
+#
+# WHY TRIMMING HERE RAISES TOTAL DETECTION INSTEAD OF LOWERING IT. These arms are
+# the weaker instrument and this file already says so (~line 100): the motivating
+# defect measured 0/40 by order-shuffling alone and 40/40 under ASan, because ASan
+# poisons freed memory and catches the read on ANY order rather than waiting for an
+# allocator coincidence. So extra orders buy the least exactly where they cost the
+# most. Giving up ~18 sampled orders per arm on that one leg, to hand 86 corpus
+# examples back their sanitizer coverage, is a net gain — and of those two numbers
+# only the 86 was measured at zero.
+#
+# SAY WHAT IT COSTS RATHER THAN ONLY WHAT IT BUYS. The scratch-path RACE class
+# below is NOT made order-independent by ASan the way the UAF is, so fewer repeats
+# there really is fewer chances at those sub-millisecond windows. That coverage
+# stays at full strength on the four uninstrumented legs, where 20 orders cost
+# 117.8 s all told; only the leg that cannot afford them trims. PROJECTED after
+# this change (measured base x new repeat): the 8 arms cost ~598 s — still ~5x the
+# release leg's absolute sampling time — and the Test step lands ~20.2 min against
+# its 30-min budget.
+#
+# DERIVED FROM THE FLAGS THE COMPILER ACTUALLY RECEIVES, never from a separate
+# bookkeeping variable someone has to remember to set: a parallel source of truth
+# is a thing that can drift, and the drift that matters here — a fast leg quietly
+# dropping to 2 orders — looks exactly like a healthy run in every log we keep.
+#
+# TRUTH and POLICY therefore stay SEPARATE variables on purpose.
+# DSS_SHUFFLE_SANITIZED is an observation of this build; DSS_SHUFFLE_REPEAT_DIVISOR
+# is what we decided to do about it. Collapsing them into one would make the guard
+# in the function vacuous — it could then only compare a policy against itself, so
+# a divisor forced on an uninstrumented build (exactly how this silently loses
+# orders) would sail straight through. Kept apart, that case is a configure-time
+# FATAL_ERROR; MEASURED by forcing the divisor to 10 with clean flags, which fails
+# the configure with rc=1 rather than quietly registering repeat=2.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _dss_build_type_upper)
+set(DSS_SHUFFLE_SANITIZED OFF)
+if ("${CMAKE_CXX_FLAGS}" MATCHES "[-/]fsanitize="
+        OR "${CMAKE_CXX_FLAGS_${_dss_build_type_upper}}" MATCHES "[-/]fsanitize=")
+    set(DSS_SHUFFLE_SANITIZED ON)
+endif()
+
+set(DSS_SHUFFLE_REPEAT_DIVISOR 1)
+if (DSS_SHUFFLE_SANITIZED)
+    set(DSS_SHUFFLE_REPEAT_DIVISOR 10)
+endif()
+message(STATUS
+    "dss: shuffle-arm sanitized=${DSS_SHUFFLE_SANITIZED} "
+    "repeat divisor=${DSS_SHUFFLE_REPEAT_DIVISOR}")
+
 function(dss_add_shuffle_arm)
     cmake_parse_arguments(DSS "" "NAME;REPEAT" "" ${ARGN})
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")
+
+    # Integer division, then a floor of 1. An arm sampling ONE order still runs a
+    # second concurrent process against the plain entry, which is the whole of what
+    # the race class needs; an arm at 0 would simply not exist.
+    math(EXPR repeat "${DSS_REPEAT} / ${DSS_SHUFFLE_REPEAT_DIVISOR}")
+    if (repeat LESS 1)
+        set(repeat 1)
+    endif()
+
+    # Cross-check POLICY against the OBSERVED build, not against itself. Reducing
+    # the count is legitimate only where ASan detects order-dependent UB without
+    # needing the orders; anywhere else it discards sampling that nothing in the
+    # gate replaces, and a green run looks exactly the same afterwards.
+    if (NOT DSS_SHUFFLE_SANITIZED AND NOT repeat EQUAL DSS_REPEAT)
+        message(FATAL_ERROR
+            "dss_add_shuffle_arm(${DSS_NAME}): this build is NOT instrumented "
+            "(no [-/]fsanitize= in CMAKE_CXX_FLAGS or CMAKE_CXX_FLAGS_"
+            "${_dss_build_type_upper}), yet the repeat count was reduced "
+            "${DSS_REPEAT} -> ${repeat} by divisor ${DSS_SHUFFLE_REPEAT_DIVISOR}. "
+            "That silently drops test orders this leg is the only one sampling.")
+    endif()
+
     add_test(NAME ${DSS_NAME}_shuffled
-             COMMAND ${target} --gtest_shuffle --gtest_repeat=${DSS_REPEAT})
+             COMMAND ${target} --gtest_shuffle --gtest_repeat=${repeat})
     # Mirrors dss_add_test's ENVIRONMENT (see the note at its set_tests_properties
     # above): findShippedConfig() prefers $DSS_CONFIG_ROOT over its cwd-walk, so
     # an out-of-tree build resolves shipped config identically.
@@ -168,6 +260,10 @@ dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
 # REPEAT is measured, not guessed — single-run wall time on this host was 0.06-0.17 s
 # for the five small binaries and 4.13 s for the c-subset one, so 20x and 3x keep the
 # whole set near ~23 s of added work spread over six entries that ctest -j overlaps.
+# ⚠ THAT ~23 s IS AN UNINSTRUMENTED PRICE. The same eight arms measured 3311.5 s on
+# the Debug+ASan+UBSan leg — 44% of that leg's entire budget, and enough to run it
+# out of wall clock. The N values here stay the uninstrumented ones; the sanitizer
+# leg divides them at the dss_add_shuffle_arm chokepoint.
 #
 # ONE SUITE IN THE SAME FIX IS DELIBERATELY *NOT* HERE:
 #   * program/test_input_resolver — it was already pid-seeded and stayed GREEN pre-fix.
