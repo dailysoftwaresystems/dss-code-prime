@@ -23,19 +23,24 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "link/object_format_schema.hpp"
+#include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 using namespace dss;
@@ -405,14 +410,24 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
     EXPECT_EQ(countCode(widen.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "F32 widens implicitly into a double param";
-    auto narrow = analyzeCSubset(
-        "int take(float v) { return 0; }\n"
-        "int main() { int r; r = take(1.5); return 0; }\n");
-    EXPECT_EQ(countCode(narrow.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "unsuffixed 1.5 stays F64 — narrowing into float must "
-           "mismatch, proving the suffix (not the base core) typed "
-           "1.5f";
+    // (Formerly: `take(1.5)` into a float param was expected to MISMATCH, using the
+    // narrowing rejection as a proxy that unsuffixed 1.5 is F64. D-CSUBSET-FLOAT-FROM-
+    // DOUBLE-NARROWING now ADMITS double->float narrowing, so that proxy is obsolete —
+    // the width is pinned DIRECTLY via _Generic SELECTION, which matches on the
+    // controlling expression's TYPE with NO promotion: 1.5f selects the `float:`
+    // association and 1.5 selects `double:`, proving the SUFFIX, not the base core,
+    // typed the literal. selectedGenericArms observes the winning arm at the semantic
+    // tier — no const-fold. RED-ON-DISABLE of the SUFFIX: were 1.5f typed F64 it would
+    // select the double arm ("2") instead of "1".)
+    auto suffixTypes = analyzeCSubset(
+        "int main() {\n"
+        "  _Generic(1.5f, float: 1, double: 2, default: 0);\n"
+        "  _Generic(1.5,  float: 3, double: 4, default: 0);\n"
+        "  return 0; }\n");
+    EXPECT_FALSE(suffixTypes.hasErrors());
+    EXPECT_EQ(selectedGenericArms(suffixTypes), (std::vector<std::string>{"1", "4"}))
+        << "1.5f selects the float association (\"1\") and 1.5 selects double (\"4\") — "
+           "the suffix (not the base core) types the literal F32 vs F64";
 }
 
 // ── FC3.5 sweep-c2: floatLiteralTyping loader validation ────────────────
@@ -684,6 +699,129 @@ TEST(Fc3ShiftResult, ShippedAndAbsentDefaultToPromotedLeft) {
         << "absent shiftResult → default promotedLeft (back-compat) → 4";
 }
 
+// ── D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-UNARY-
+//    PROMOTION-DRIFT: the SEMANTIC type-oracle (`subtreeType`) reports C's
+//    LANGUAGE result types for operator expressions ─────────────────────────
+//
+// A comparison / logical result is `int` (C 6.5.8p6 relational, 6.5.9p3
+// equality, 6.5.13p3 `&&`, 6.5.14p3 `||`, 6.5.3.3p5 `!`) — NOT the 1-byte i1/Bool
+// SSA carrier the CST→HIR tier emits (that carrier is UNTOUCHED and intentionally
+// divergent: D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE). A unary
+// `+`/`-`/`~` on a sub-int operand integer-promotes to `int` (6.5.3.3p2/p3/p4).
+// BOTH are sourced config-drivenly through `integerPromotedType` — NEVER a
+// hardcoded I32 — proven by the `minRankType` flip (int→4 ↔ long long→8, the
+// same red-on-disable discipline the shift-result verb uses above). The probe
+// folds `sizeof(EXPR)` into `char arr[...]` (subtreeType is the array-dim
+// deriver), so `arrayDimOf(arr)` == sizeof(the expression's RESULT type).
+
+TEST(Fc3ComparisonResult, WholeIsoFamilyResultsTypeInt) {
+    // The ENTIRE ISO family (no sizeof-only special case): relational, equality,
+    // and logical operators. `char` operands make the pre-fix Bool(1) vs post-fix
+    // int(4) split crisp. RED-ON-DISABLE: revert subtreeType's comparison/logical
+    // arms → every dim collapses to 1.
+    auto m = analyzeWithArithMutation(
+        "char a; char b;\n"
+        "long long al; long long bl;\n"
+        "char lt[sizeof(a <  b)];\n"
+        "char gt[sizeof(a >  b)];\n"
+        "char le[sizeof(a <= b)];\n"
+        "char ge[sizeof(a >= b)];\n"
+        "char eq[sizeof(a == b)];\n"
+        "char ne[sizeof(a != b)];\n"
+        "char an[sizeof(a && b)];\n"
+        "char orr[sizeof(a || b)];\n"
+        "char no[sizeof(!a)];\n"
+        "char llcmp[sizeof(al < bl)];\n",
+        [](nlohmann::json&) { /* shipped config */ });
+    EXPECT_FALSE(m.hasErrors());
+    for (char const* n : {"lt", "gt", "le", "ge", "eq", "ne", "an", "orr", "no"}) {
+        EXPECT_EQ(arrayDimOf(m, n), 4)
+            << n << ": a comparison/logical result types as int (4), not Bool (1)";
+    }
+    // WIDTH-INDEPENDENCE hardening pin: `long long < long long` is STILL int (4),
+    // NOT the operands' common type (long long, 8). A regression that typed a
+    // comparison as commonArithType(lhs,rhs) would pass every int/char row above
+    // but be C-wrong here (8 != 4) — this is the row that catches it.
+    EXPECT_EQ(arrayDimOf(m, "llcmp"), 4)
+        << "a comparison of two `long long`s is int (4), never the common type (8)";
+}
+
+TEST(Fc3ComparisonResult, ResultTypeTracksTheConfigInt) {
+    // The result type is sourced from the .lang vocabulary (integerPromotedType
+    // routes Bool through the promote set to `minRankType`), NEVER a hardcoded I32:
+    // widen minRankType int→long long and the SAME `sizeof(a<b)` flips 4→8. A
+    // hardcoded-int implementation would peg BOTH arms at 4 (a dead knob).
+    auto shipped = analyzeWithArithMutation(
+        "int a; int b; char arr[sizeof(a < b)];\n",
+        [](nlohmann::json&) { /* shipped minRankType: int */ });
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped `int` → 4";
+    auto widened = analyzeWithArithMutation(
+        "int a; int b; char arr[sizeof(a < b)];\n",
+        [](nlohmann::json& ac) {
+            ac["integerPromotion"]["minRankType"] = "long long";
+        });
+    EXPECT_EQ(arrayDimOf(widened, "arr"), 8)
+        << "minRankType long long → the comparison result is `long long` → 8 "
+           "(the config-driven flip; a hardcoded I32 would stay 4)";
+}
+
+TEST(Fc3ComparisonResult, GenericControllingExprSelectsIntArm) {
+    // `subtreeType` types a `_Generic` controlling expression (pass2Post too); a
+    // comparison controls as `int`, selecting the `int:` association (C 6.5.1.1).
+    // Pre-fix it controlled as Bool → no int match → the `default:` arm ("0").
+    auto m = analyzeCSubset(
+        "int main(void){ return _Generic((1 < 2), int: 7, default: 0); }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"7"}))
+        << "a comparison controls a _Generic as int → the int: arm wins";
+}
+
+TEST(Fc3ComparisonResult, BoolPrimitiveSizeofStaysOne) {
+    // Surgical guard (mandatory condition): the flip is on the operator RESULT
+    // type ONLY — the `_Bool` PRIMITIVE is untouched, so `sizeof(_Bool)` is still
+    // 1. Reds if a future edit widened the Bool primitive itself.
+    auto m = analyzeWithArithMutation(
+        "_Bool b; char arr[sizeof(b)];\n", [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 1)
+        << "sizeof(_Bool) is 1 — the primitive type is not touched";
+}
+
+TEST(Fc3UnaryPromotion, SubIntUnaryOperatorsPromoteToInt) {
+    // unary `+`/`-`/`~` integer-promote a sub-int operand to int (C 6.5.3.3),
+    // mirroring cst_to_hir's c72 arm so the two typers cannot drift. char→4,
+    // short→4. RED-ON-DISABLE: revert subtreeType's unary arm → neg/bnot/pos fold
+    // to the raw char (1) and negsh to the raw short (2).
+    auto m = analyzeWithArithMutation(
+        "char c; short sh;\n"
+        "char neg[sizeof(-c)];\n"
+        "char bnot[sizeof(~c)];\n"
+        "char pos[sizeof(+c)];\n"
+        "char negsh[sizeof(-sh)];\n",
+        [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "neg"),   4) << "-char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "bnot"),  4) << "~char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "pos"),   4) << "+char promotes to int (4), not raw char (1)";
+    EXPECT_EQ(arrayDimOf(m, "negsh"), 4) << "-short promotes to int (4), not raw short (2)";
+}
+
+TEST(Fc3UnaryPromotion, ResultTypeTracksTheConfigInt) {
+    // The unary promotion target is the config `minRankType`, not a hardcoded I32:
+    // `sizeof(-c)` flips 4→8 when minRankType widens int→long long.
+    auto shipped = analyzeWithArithMutation(
+        "char c; char arr[sizeof(-c)];\n", [](nlohmann::json&) {});
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped `int` → 4";
+    auto widened = analyzeWithArithMutation(
+        "char c; char arr[sizeof(-c)];\n",
+        [](nlohmann::json& ac) {
+            ac["integerPromotion"]["minRankType"] = "long long";
+        });
+    EXPECT_EQ(arrayDimOf(widened, "arr"), 8)
+        << "minRankType long long → -char promotes to long long → 8 "
+           "(the config-driven flip; a hardcoded I32 would stay 4)";
+}
+
 // ── Format-schema dataModel fail-louds ──────────────────────────────────
 
 namespace {
@@ -733,6 +871,88 @@ TEST(Fc3FormatDataModel, ShippedFormatsDeclareTheirOsModels) {
 
 // ── P5: descriptor signatureByDataModel ─────────────────────────────────
 
+namespace {
+
+// The two descriptor-rejection tests below assert only NEGATIVE properties
+// ("no descriptor came back, and something errored"). Negative-only is
+// VACUOUS: a VANISHED or half-written fixture satisfies both just as well as
+// the malformed content the test means to pin, so the test can report green
+// while never once reaching the `signatureByDataModel` rejection path.
+// MEASURED at the time these helpers were added: with the descriptor files
+// hammer-deleted for a whole run, both tests still reported OK. These two
+// helpers close that hole from both ends — the PREMISE (the fixture really is
+// on disk, byte-for-byte what the test wrote) and the CONCLUSION (the error
+// raised is the SPECIFIC one under test, not an incidental I/O one).
+
+// FATAL premise check: the fixture exists and its on-disk bytes are exactly
+// `expected`. A missing fixture must fail LOUDLY here, at the premise, rather
+// than quietly satisfying the rejection assertions downstream.
+// Call through ASSERT_NO_FATAL_FAILURE — a fatal failure inside a subroutine
+// returns from the SUBROUTINE only, so an unwrapped call would keep going.
+void assertFixtureOnDisk(std::filesystem::path const& p,
+                         std::string_view expected) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    bool const present = fs::exists(p, ec);
+    ASSERT_FALSE(ec) << "fixture exists() failed for " << p.generic_string()
+                     << ": " << ec.message();
+    ASSERT_TRUE(present) << "fixture VANISHED before it could be read: "
+                         << p.generic_string()
+                         << " — the rejection path under test was never reached";
+    // CAREFUL: `file_size(missing, ec)` returns uintmax_t(-1), NOT 0. An
+    // untested `ec` would report a MISSING file as a huge "non-empty" size and
+    // sail straight through — worse than the vacuity being fixed. Test `ec`.
+    auto const size = fs::file_size(p, ec);
+    ASSERT_FALSE(ec) << "fixture file_size() failed for " << p.generic_string()
+                     << ": " << ec.message();
+    ASSERT_EQ(size, expected.size())
+        << "fixture on disk is not the size the test wrote: "
+        << p.generic_string();
+    std::ifstream in{p, std::ios::binary};
+    ASSERT_TRUE(in.is_open()) << "fixture could not be reopened: "
+                              << p.generic_string();
+    std::string const got{std::istreambuf_iterator<char>{in},
+                          std::istreambuf_iterator<char>{}};
+    ASSERT_FALSE(in.bad()) << "fixture read failed: " << p.generic_string();
+    ASSERT_EQ(got, std::string{expected})
+        << "fixture on disk differs from what the test wrote: "
+        << p.generic_string();
+}
+
+// The first diagnostic whose code is `code` and whose message contains EVERY
+// needle, else nullptr. Code alone does not discriminate: a missing file, a
+// wrong-shaped field and an unknown enum key all land on
+// F_ShippedLibDescriptorMalformed, so the message is what pins WHICH rejection
+// ran.
+[[nodiscard]] ParseDiagnostic const*
+findDiagnostic(DiagnosticReporter const& rep, DiagnosticCode code,
+               std::initializer_list<std::string_view> needles) {
+    for (auto const& d : rep.all()) {
+        if (d.code != code) continue;
+        bool const allPresent =
+            std::all_of(needles.begin(), needles.end(), [&](std::string_view n) {
+                return d.actual.find(n) != std::string::npos;
+            });
+        if (allPresent) return &d;
+    }
+    return nullptr;
+}
+
+// Every diagnostic, one per line — the "what DID you emit, then?" text on a
+// missed match.
+[[nodiscard]] std::string renderDiagnostics(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) {
+        out += "\n  [";
+        out += diagnosticCodeName(d.code);
+        out += "] ";
+        out += d.actual;
+    }
+    return out.empty() ? std::string{"\n  <no diagnostics at all>"} : out;
+}
+
+} // namespace
+
 TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
     // The SAME shipped stdio.json yields the LP64 i64 offset under LP64
     // and the LLP64 i32 offset under LLP64 — the reader resolves the
@@ -781,14 +1001,31 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
 }
 
 TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
-    namespace fs = std::filesystem;
-    auto const tmp = fs::temp_directory_path() / "fc3_desc_badkey.json";
-    {
-        std::ofstream out{tmp, std::ios::binary};
-        out << R"({"header":"x.h","symbols":[
+    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the descriptor used to be a CONSTANT
+    // filename under `temp_directory_path()`, shared by every concurrent instance
+    // of this binary. That never went RED here (MEASURED: 600/600 green with the
+    // file hammer-deleted throughout the run) because both assertions below are
+    // NEGATIVE — a vanished or half-written file also yields "no descriptor" plus
+    // an error — so contention degraded this into a test that PASSES WITHOUT EVER
+    // EXERCISING the unknown-key rejection path. A per-instance `ScratchDir` (pid
+    // SEED + atomic SINGULAR `create_directory` claim) makes the file the test
+    // wrote the only file the test can read.
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "fc3-desc-badkey"};
+    auto const tmp = scratch.path() / "desc.json";
+    // The exact bytes the fixture must have on disk — the premise the
+    // rejection assertions below are only meaningful against.
+    static constexpr std::string_view kDescriptor =
+        R"({"header":"x.h","symbols":[
           {"name":"f","signature":"fn(i32) -> i32",
            "signatureByDataModel":{"LLP65":"fn(i32) -> i32"}}]})";
+    {
+        std::ofstream out{tmp, std::ios::binary};
+        out << kDescriptor;
     }
+    // Writing is only half the premise: prove the bytes ARE there before
+    // reading anything into a "load failed" result.
+    ASSERT_NO_FATAL_FAILURE(assertFixtureOnDisk(tmp, kDescriptor));
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry registry;
     DiagnosticReporter rep;
@@ -796,20 +1033,44 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    fs::remove(tmp);
+    // …and it must be THE unknown-key rejection, named in the message. Code
+    // alone is not enough: F_ShippedLibDescriptorMalformed is also what a
+    // missing file, a non-object `signatureByDataModel` and a non-string
+    // override all raise, so `errorCount() > 0` (and even a code match) is
+    // satisfied by rejections that never look at the key vocabulary.
+    EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
+                             {"'signatureByDataModel' has unknown data-model key",
+                              "'LLP65'"}),
+              nullptr)
+        << "the unknown-key rejection never ran; diagnostics were:"
+        << renderDiagnostics(rep);
+    // Specifically NOT the I/O rejection — that is the vacuous pass this test
+    // used to accept.
+    EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
+                             {"failed to open"}),
+              nullptr)
+        << "the descriptor was not even readable; diagnostics were:"
+        << renderDiagnostics(rep);
+    // `scratch`'s dtor removes the file — no manual `fs::remove`.
 }
 
 TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
     // A broken LLP64 override must fail the read under LP64 too — it
     // would otherwise lurk until the first Windows compile.
-    namespace fs = std::filesystem;
-    auto const tmp = fs::temp_directory_path() / "fc3_desc_badsig.json";
-    {
-        std::ofstream out{tmp, std::ios::binary};
-        out << R"({"header":"x.h","symbols":[
+    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — same fixed-name/false-green hazard as
+    // the sibling above; see the note there.
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "fc3-desc-badsig"};
+    auto const tmp = scratch.path() / "desc.json";
+    static constexpr std::string_view kDescriptor =
+        R"({"header":"x.h","symbols":[
           {"name":"f","signature":"fn(i32) -> i32",
            "signatureByDataModel":{"LLP64":"fn(notatype) -> i32"}}]})";
+    {
+        std::ofstream out{tmp, std::ios::binary};
+        out << kDescriptor;
     }
+    ASSERT_NO_FATAL_FAILURE(assertFixtureOnDisk(tmp, kDescriptor));
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry registry;
     DiagnosticReporter rep;
@@ -817,7 +1078,30 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    fs::remove(tmp);
+    // …and the error must name the NON-SELECTED LLP64 override — that is the
+    // whole claim of this test. `errorCount() > 0` alone is equally satisfied
+    // by an unreadable file or by the BASE signature failing to decode, i.e.
+    // by rejections that prove nothing about the lurking-override rule.
+    EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
+                             {"'signatureByDataModel.LLP64' that failed to "
+                              "decode as a type",
+                              "fn(notatype) -> i32"}),
+              nullptr)
+        << "the non-selected override was never decoded; diagnostics were:"
+        << renderDiagnostics(rep);
+    // The BASE (LP64-selected) signature is well-formed — if IT is what failed,
+    // the override rule was not what rejected this descriptor.
+    EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
+                             {"has a 'signature' that failed to decode"}),
+              nullptr)
+        << "the base signature failed instead of the override; diagnostics were:"
+        << renderDiagnostics(rep);
+    EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
+                             {"failed to open"}),
+              nullptr)
+        << "the descriptor was not even readable; diagnostics were:"
+        << renderDiagnostics(rep);
+    // `scratch`'s dtor removes the file — no manual `fs::remove`.
 }
 
 // ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 5-way _Generic routing ──

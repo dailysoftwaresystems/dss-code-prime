@@ -549,3 +549,60 @@ TEST(MirAlias, RegionWalkTreatsMemoryClobberOpsAsClobber) {
         << "a memory-clobbering non-Store op (CompilerBarrier) must be an "
            "opaque clobber — Loads may not move across the fence";
 }
+
+// D-CSUBSET-ATOMIC-FENCE: the AtomicFence (__sync_synchronize) twin of the
+// CompilerBarrier test above — the SAME chokepoint, the SAME doubly-load-bearing
+// negative control (a non-aliasing Store + the Return terminator must NOT
+// clobber). A standalone CPU fence is a full ordering barrier: the region walk
+// must treat it as an opaque clobber even though every Store in the region
+// provably does not alias the Load pointer. RED-on-disable: THIS is the test
+// that reds when AtomicFence's `opcodeClobbersMemory` membership is dropped
+// (mir_opcode.hpp) — without the membership the walk skips the fence (not a
+// Store) and the positive half fails; the fence's hasSideEffects flag alone
+// canNOT save it (the negative control's terminator proves the walk never keys
+// on that flag).
+TEST(MirAlias, RegionWalkTreatsAtomicFenceAsClobber) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    // One builder recipe, two modules: [a, b, store→b] (+ the seq_cst fence in
+    // the second). The Load pointer is `a`; the Store writes through `b`
+    // (distinct Alloca → Rule 2 says No), so ONLY the fence can clobber.
+    auto const build = [&](bool withFence) {
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirInstId const a = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirInstId const b = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirLiteralValue v; v.value = std::int64_t{1}; v.core = TypeKind::I32;
+        MirInstId const c = mb.addConst(v, i32);
+        MirInstId const st[] = {c, b};
+        (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+        if (withFence) {
+            (void)mb.addInst(MirOpcode::AtomicFence, {}, InvalidType,
+                             /*payload=*/5);   // seq_cst — the sole producer
+        }
+        mb.addReturn();
+        struct Out { Mir mir; MirInstId loadPtr; MirBlockId block; };
+        return Out{std::move(mb).finish(), a, entry};
+    };
+
+    auto const clean = build(/*withFence=*/false);
+    MirBlockId const cleanRegion[] = {clean.block};
+    EXPECT_FALSE(mirAnyMayAliasingStoreInRegion(
+        clean.mir, interner, clean.loadPtr, cleanRegion))
+        << "negative control: a non-aliasing Store + the block's Return "
+           "TERMINATOR (hasSideEffects=true) must NOT clobber — the walk "
+           "keys on opcodeClobbersMemory, never the DCE-liveness flag";
+
+    auto const fenced = build(/*withFence=*/true);
+    MirBlockId const fencedRegion[] = {fenced.block};
+    EXPECT_TRUE(mirAnyMayAliasingStoreInRegion(
+        fenced.mir, interner, fenced.loadPtr, fencedRegion))
+        << "a standalone CPU fence (AtomicFence) must be an opaque clobber — "
+           "Loads may not move across it (D-CSUBSET-ATOMIC-FENCE)";
+}

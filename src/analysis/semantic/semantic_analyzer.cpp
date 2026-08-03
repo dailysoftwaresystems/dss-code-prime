@@ -1,6 +1,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 
 #include "analysis/compilation_unit/unit_attribute.hpp"
+#include "analysis/preprocess/preprocessor.hpp"   // TF-C82: kPragmaPackAmbiguous
 #include "analysis/semantic/scope_tree.hpp"
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
@@ -225,7 +226,8 @@ struct EngineState {
           nodeToSymbol{cu},
           nodeToType{cu},
           nodeToSelectedExpr{cu},
-          nullPointerConstantNodes{cu} {}
+          nullPointerConstantNodes{cu},
+          ffiIntPointeeCompatNodes{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -253,6 +255,15 @@ struct EngineState {
     // unrelated expression replaced by Literal 0). UnitAttribute routes per-tree,
     // exactly like nodeToType/nodeToSymbol.
     UnitAttribute<bool>        nullPointerConstantNodes;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: call-ARG source nodes admitted via
+    // the shipped-descriptor integer-pointee pointer relaxation (a real C integer
+    // pointer into a descriptor `ptr<i64>`-style param — same representation,
+    // distinct identity). Written by `checkCallAgainstSig` ONLY when the strict
+    // `isAssignable` FAILED but the relaxed one SUCCEEDED (node-mark ⟺ relaxation
+    // fired); read by CST→HIR `coerce` to realize the Ptr→Ptr bitcast. TREE-KEYED
+    // UnitAttribute for the same cross-tree-aliasing reason as
+    // `nullPointerConstantNodes` (NodeId is tree-local).
+    UnitAttribute<bool>        ffiIntPointeeCompatNodes;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -280,7 +291,7 @@ struct EngineState {
     // c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT): the builtin `va_list` TypeId the
     // per-CC injection minted (set alongside the builtin scope build). TWO
     // consumers: the FF11 shipped-descriptor read binds it as the `va_list`
-    // named-type alias, and `adjustArrayToPointer` EXCLUDES it — a va_list
+    // named-type alias, and `adjustParamDeclaredType` EXCLUDES it — a va_list
     // param keeps its per-CC form (SysV: the `__va_list_tag[1]` array) because
     // the va_* machinery (c63) owns va_list parameter passing END-TO-END
     // (param slot + decay-at-call + va_arg addressing, validated per-ABI);
@@ -337,6 +348,43 @@ struct EngineState {
         return *active_;
     }
 
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the CURRENT tree's `#pragma pack` stamps
+    // (`CompilationUnit::pragmaPackFor`), or null when the pass is not inside a
+    // per-tree walk. Set beside `activate` in the Pass 1.5 loop — the ONE pass
+    // that composes composite types, and therefore the only one that can ask.
+    // Null / absent-offset both mean NO cap, which is exactly the pre-TF-C82
+    // layout, so every non-preprocessed and every pack-free TU is untouched.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* pragmaPack = nullptr;
+
+    // The `#pragma pack` member-alignment cap in effect where the token at synth
+    // byte `offset` was emitted; 0 = none. An EXACT per-token lookup, not a range
+    // search: the preprocessor stamps the state at EMISSION, so a composite that
+    // arrived from a macro replacement list answers with the cap at its
+    // INVOCATION rather than the one surrounding its `#define`.
+    [[nodiscard]] std::uint32_t packCapAtOffset(std::uint32_t offset) const {
+        if (pragmaPack == nullptr) return 0;
+        auto const it = pragmaPack->find(offset);
+        return it == pragmaPack->end() ? 0u : it->second;
+    }
+
+    // ★★ TF-C85: the CURRENT tree's `#pragma optimize` stamps
+    // (`CompilationUnit::pragmaNoOptimizeFor`), bound beside `pragmaPack` in the
+    // Pass 1.5 loop and null outside it. Null / absent-offset both mean
+    // "optimize normally", which is exactly the pre-TF-C85 behavior, so every
+    // non-preprocessed and every `#pragma optimize`-free TU is untouched.
+    std::unordered_set<std::uint32_t> const* pragmaNoOptimize = nullptr;
+
+    // TRUE iff the token at synth byte `offset` was emitted inside a
+    // `#pragma optimize("", off)` region. An EXACT per-token lookup, not a range
+    // search — the same argument as `packCapAtOffset`: the state is stamped at
+    // EMISSION, so a function definition that arrived from a macro replacement
+    // list answers with the state at its INVOCATION rather than the one
+    // surrounding its `#define`.
+    [[nodiscard]] bool noOptimizeAtOffset(std::uint32_t offset) const {
+        if (pragmaNoOptimize == nullptr) return false;
+        return pragmaNoOptimize->contains(offset);
+    }
+
     [[nodiscard]] TypeId typeAt(NodeId id) const {
         auto const* p = nodeToType.tryGet(id);
         return p ? *p : InvalidType;
@@ -376,6 +424,32 @@ nodeHasVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
         }
     }
     return false;
+}
+
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the synth byte offset of `node`'s LEFTMOST
+// TOKEN leaf — the key the preprocessor's `#pragma pack` stamps are recorded
+// under.
+//
+// ★ WHY THE LEFTMOST TOKEN AND NOT `tree.span(node).start()`. They agree today,
+// and relying on that is exactly the kind of incidental agreement that turns
+// into a silent wrong layout when a future grammar change gives an internal node
+// a span that starts before its first token (a synthesized lead slot, an
+// always-emitted empty run — this grammar already has both). The stamps are
+// keyed on REAL EMITTED TOKENS, so the lookup asks for a real emitted token.
+// Falls back to the node's own span start when the subtree holds no token at all
+// (an empty always-emitted run), which can only mean there was nothing to stamp.
+[[nodiscard]] std::uint32_t leftmostTokenOffset(Tree const& tree, NodeId node) {
+    NodeId cur = node;
+    for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+        if (tree.kind(cur) == NodeKind::Token) {
+            return static_cast<std::uint32_t>(tree.span(cur).start());
+        }
+        NodeId next{};
+        for (NodeId c : visibleChildren(tree, cur)) { next = c; break; }
+        if (!next.valid()) break;
+        cur = next;
+    }
+    return static_cast<std::uint32_t>(tree.span(node).start());
 }
 
 // FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the FIRST visible child of `node` whose
@@ -429,6 +503,91 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
             && isFnSuffixRule(tree.rule(c), dc)) {
             return true;
         }
+    }
+    return false;
+}
+
+// C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): is `nameNode` the name of an
+// UNDECORATED declarator — a plain identifier with NO pointer layer and NO array
+// or function suffix at ANY enclosing level — so its declared type is EXACTLY the
+// declaration head's type? Per the declarator grammar (`declaratorRule :=
+// pointerLayer* directRule`, `directRule := (nameToken | groupRule) suffix*`), a
+// bare `name` is: the name's parent is the `directRule` carrying ONLY the name
+// token (no Internal child — a fn/array suffix or a group base are all Internal),
+// AND every enclosing level up to the declaration row carries no decoration —
+// checked by the upward walk below. A star / array / fn-suffix makes the declared
+// type a Ptr / Array / function-returning form that is NOT the head type verbatim,
+// so this returns false — precisely excluding a function-POINTER object
+// (`Fn *fp;`) and an illegal function-returning-function (`Fn (f)(int);`, whose
+// fn-suffix hides behind a redundant-paren group) from the prototype path, while
+// still admitting a bare redundant grouping (`Fn (f);` ≡ `Fn f;`, no suffix).
+[[nodiscard]] bool
+declaratorIsUndecoratedName(Tree const& tree, NodeId nameNode,
+                            DeclaratorConfig const& dc) {
+    NodeId const direct = tree.parent(nameNode);
+    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
+        || tree.rule(direct) != dc.directRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Internal) return false;   // a suffix / group
+    }
+    // Walk the declarator chain UPWARD from the name: the declared type equals the
+    // head type verbatim ONLY if NO pointer layer and NO array/function suffix
+    // decorates the name at ANY enclosing level — INCLUDING through redundant
+    // parenthesis groups. A `declaratorRule` carrying a pointer layer (`Fn *fp;`),
+    // or an enclosing `directRule` whose parenthesized-group base carries a suffix
+    // (`Fn (f)(int);` — an illegal function-returning-function, C 6.7.6.3p1), makes
+    // the declared type a Ptr / function-returning form, NOT the head type. A
+    // single-level check sees only the name's own `declaratorRule` and lets a
+    // group-wrapped suffix (`(f)(int)`) escape — silently mis-accepted as a bare
+    // prototype (a swallowed S0018). The alternating chain is
+    // directRule → declaratorRule → (groupRule → directRule → declaratorRule)* →
+    // {initDeclaratorRule | decl row}: at each `declaratorRule` any Internal child
+    // other than the declarator we ascended from is a pointer layer; at each
+    // enclosing `directRule` (reached through a group) any such child is a suffix.
+    NodeId cur = direct;
+    while (true) {
+        NodeId const p = tree.parent(cur);
+        if (!p.valid() || tree.kind(p) != NodeKind::Internal) break;
+        RuleId const pr = tree.rule(p);
+        if (pr == dc.declaratorRule || pr == dc.directRule) {
+            for (NodeId c : visibleChildren(tree, p)) {
+                if (tree.kind(c) == NodeKind::Internal && c.v != cur.v) return false;
+            }
+            cur = p;
+        } else if (pr == dc.groupRule) {
+            cur = p;   // a pure grouping level carries no decoration of its own
+        } else {
+            break;     // exited the declarator subtree (initDeclarator / decl row)
+        }
+    }
+    return true;
+}
+
+// C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): does the declaration HEAD (the
+// type-specifier prefix `headNode`) name a type via a type-name IDENTIFIER — i.e.
+// a POTENTIAL typedef alias (`Fn` / `Tcl_ObjCmdProc`), as opposed to a builtin
+// keyword specifier (`int`, `unsigned long`, `struct S`)? A typedef name is an
+// identifier token; builtin specifiers and struct/union/enum tags are keyword
+// tokens (a tag's name identifier is nested under a composite-specifier, not the
+// bare head). Bounded DFS for the first identifier token (the VLA head-alias
+// extraction shape). A false positive is harmless: the post-1.5 FnSig gate is the
+// precise arbiter; this only keeps a plainly-builtin-typed declaration (`int x;`)
+// off the deferral path so its collisions stay byte-identical.
+[[nodiscard]] bool
+headNamesPotentialTypedef(Tree const& tree, NodeId headNode,
+                          SchemaTokenId identifierToken) {
+    if (!headNode.valid() || !identifierToken.valid()) return false;
+    std::vector<NodeId> stk{headNode};
+    for (int guard = 0; guard < 4096 && !stk.empty(); ++guard) {
+        NodeId const cur = stk.back();
+        stk.pop_back();
+        if (tree.kind(cur) == NodeKind::Token) {
+            if (tree.tokenKind(cur) == identifierToken) return true;
+            continue;
+        }
+        for (NodeId c : visibleChildren(tree, cur)) stk.push_back(c);
     }
     return false;
 }
@@ -656,6 +815,12 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
 // forward-declared so pass2Post's nullptr operator gate (D-CSUBSET-NULLPTR) can
 // classify a binary/unary operator by its shared HIR verb.
 [[nodiscard]] std::optional<HirOpKind> coreOpFromNameSem(std::string_view s);
+// TF-C94: `Ptr<FnSig>` — a pointer-to-function TYPE, zero language identity.
+// Defined below (beside the call-path unwrapping that is its other caller);
+// forward-declared so Pass-1's `noreturn` apply can ask the question with the
+// SAME predicate the call path already uses, rather than growing a second,
+// differently-shaped hand-copy of "is this a function pointer?".
+[[nodiscard]] bool isFnPointerType(TypeInterner const& in, TypeId t);
 
 // R1: the SINGLE source for member-access (`obj.field` / `ptr->field`) field-type
 // resolution, shared by the Pass-2 member arm (which adds diagnostics + symbol
@@ -808,10 +973,17 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
 // `declaratorDeclaredType` (the c27 volatile path) — one structural model, the
 // const verdict cannot drift from the type the declarator actually forms.
 //
-// SCOPE: a GROUPED pointer declarator `char (* const p)` hides its layer inside
-// the group, so it falls to the whole-decl scan (STATUS QUO — no regression; it
-// was coarse before too). Grouped-with-head-const stays a pre-existing
-// over-approximation (anchor D-CSUBSET-GROUPED-DECLARATOR-CONST).
+// GROUPS (D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
+// CLASSIFICATION, closed together): a GROUPED pointer declarator hides its layer
+// inside the parens — `char (* const p)` (scalar), and the array-of-const-fn-ptr
+// direct-declarator spelling `int (* const ops[N])(int)` (an array whose ELEMENT
+// is a const pointer; C 6.7.3p9 so-qualifies the element, and gcc/clang park such
+// a table in relocated-read-only `.data.rel.ro`). The pointer-layer scan now
+// DESCENDS the group (same recursion `directDeclaredType` / `declaratorNameNode`
+// use) to reach the TRUE outermost object-forming pointer layer, so both spellings
+// classify like their `int * const p` / typedef'd `const op tab[N]` siblings.
+// A grouped-with-head-const `const char (*p)` is thereby MUTABLE (the inner `*`
+// carries no const), the correct verdict — the former over-approximation is gone.
 [[nodiscard]] bool
 declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         DeclaratorConfig const& dc, SchemaTokenId constMarker,
@@ -832,16 +1004,57 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
             if (d.valid()) inner = d;
         }
     }
-    // The LAST pointer layer in source order = the outermost pointer, whose
-    // qualifier governs the OBJECT. visibleChildren is source-ordered.
+    // Find the pointer layer (if any) forming the OBJECT's outermost derivation,
+    // whose `* const` qualifier governs object-const-ness (a HEAD/pointee const
+    // leaves the pointer object MUTABLE — c36). The LAST pointer layer in source
+    // order at a declarator level = the outermost pointer. When NO pointer layer
+    // is a DIRECT child, an object-forming pointer may still be parenthesized
+    // inside the direct's GROUP — `char (* const p)` (a grouped scalar const
+    // pointer) or `int (* const ops[N])(int)` (an array of const fn-ptrs, the
+    // direct-declarator spelling) — so descend the group exactly as
+    // directDeclaredType / declaratorNameNode do (by config-resolved ROLE, never a
+    // rule name), skipping the direct's own array/fn suffixes (they carry outer
+    // array-/fn-ness, never the object's const, which lives on the pointer star).
+    // D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
+    // CLASSIFICATION: without this descent the grouped/element-forming layer was
+    // invisible, the object fell to the head scan below, and an array of const
+    // pointers mis-classified MUTABLE → its file-scope global landed in writable
+    // `.data` instead of relocated-read-only relro on EVERY format (correctness-
+    // neutral at runtime — a writable const table still links + runs — but it
+    // dropped the relro hardening + the object's const-ness). visibleChildren is
+    // source-ordered; the depth cap turns a corrupt/cyclic node graph into a
+    // bounded miss (→ head scan) instead of a hang, mirroring declaratorNameNode.
     NodeId lastLayer{};
-    if (inner.valid() && tree.kind(inner) == NodeKind::Internal) {
-        for (NodeId c : visibleChildren(tree, inner)) {
-            if (tree.kind(c) == NodeKind::Internal
-                && tree.rule(c) == dc.pointerLayerRule) {
-                lastLayer = c;
+    NodeId cur = inner;
+    for (std::size_t step = 0;
+         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal
+            || tree.rule(cur) != dc.declaratorRule) {
+            break;
+        }
+        NodeId layerHere{};
+        NodeId direct{};
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.pointerLayerRule) {
+                layerHere = c;                          // last-wins = outermost
+            } else if (cr == dc.directRule && !direct.valid()) {
+                direct = c;
             }
         }
+        if (layerHere.valid()) { lastLayer = layerHere; break; }
+        // No pointer layer at THIS level: an object-forming pointer (if any) is
+        // hidden inside the direct's parenthesized group — descend it. A name-only
+        // direct (no group) or a malformed level ⇒ no object pointer ⇒ the object
+        // is a scalar / array-of-scalar / typedef'd-pointer whose const is on the
+        // HEAD, handled by the fallback scan below.
+        if (!direct.valid()) break;
+        NodeId const group = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, direct, dc.groupRule);
+        if (!group.valid()) break;
+        cur = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, group, dc.declaratorRule);
     }
     if (lastLayer.valid())
         return subtreeContainsToken(tree, lastLayer, constMarker, declByRule,
@@ -1115,7 +1328,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray,
                    bool allowInitInferredArray = false,
-                   bool paramDecay = false);
+                   bool paramDecay = false,
+                   bool typeAliasRow = false);
 
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
@@ -1856,14 +2070,33 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // SE5: a non-builtin name in type position may be a type alias.
         // Resolve it through the scope chain; a Type-kind symbol with a
         // valid type contributes the aliased type.
+        //
+        // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+        // the walk uses `lookupIf` — an unusable binding (not a TYPE
+        // symbol, or a TYPE symbol whose own type has not been resolved yet)
+        // is SKIPPED and the walk CONTINUES OUTWARD, instead of stopping at the
+        // innermost binding and failing. C 6.2.1p7 scopes a declarator's
+        // identifier "just after the completion of its declarator", so in the
+        // region BEFORE an inner declaration of the name the ENCLOSING
+        // declaration is the one in scope — and the scope tree binds a whole
+        // file's declarations up front, so "its type is not resolved yet" is
+        // this engine's faithful proxy for "we are still before it" (Pass 1.5
+        // resolves declaration types in TREE ORDER). MEASURED consequence of
+        // stopping early: a TU that uses a shipped typedef and LATER
+        // redeclares it (SQLite's `typedef INT16_TYPE i16;` over the macOS
+        // SDK's own `typedef short int16_t;`) resolved the name to NOTHING for
+        // every use above the redeclaration.
+        //
+        // A name with NO usable binding anywhere on the chain still returns
+        // InvalidType and the caller's miss arm fails LOUD — this widens WHERE
+        // a type may be found, never WHETHER a miss is reported.
         if (scope.valid()) {
-            SymbolId const aliasSym = s.scopes.lookup(scope, text);
-            if (aliasSym.valid()) {
-                auto const& rec = s.symbols.at(aliasSym);
-                if (rec.kind == DeclarationKind::Type && rec.type.valid()) {
-                    return rec.type;
-                }
-            }
+            SymbolId const aliasSym =
+                s.scopes.lookupIf(scope, text, [&s](SymbolId cand) {
+                    auto const& r = s.symbols.at(cand);
+                    return r.kind == DeclarationKind::Type && r.type.valid();
+                });
+            if (aliasSym.valid()) return s.symbols.at(aliasSym).type;
         }
         return InvalidType;
     }
@@ -2168,6 +2401,35 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
                 case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
                 case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
+                // ★ D-CSUBSET-INT128-CONSTFOLD (TF-C94): the two 128-bit STANDARD
+                // kinds. WITHOUT these rows they fell to `default: nullopt` and the
+                // whole cast was non-foldable — which MEASURED as *every* 128-bit
+                // integer constant expression refusing, not just wide ones:
+                // `_Static_assert((__uint128_t)5 == 5, "")` fired S_StaticAssertFailed
+                // ("not an integer constant expression"), and so did `(__uint128_t)5`,
+                // `((__uint128_t)5 + 1) == 6` and `(int)((__uint128_t)5) == 5`, while
+                // the `_BitInt(128)` twin of the first was already clean. These rows
+                // are what make the 128-bit arm in cst_const_eval.cpp's Cast fold
+                // (which routes them through the bignum, NOT through the int64
+                // `narrowIntToBits`) reachable at all.
+                //   ★ WHY `isInteger` AND NOT `isBitPrecise`: a `__int128` is a
+                // STANDARD-rank integer, not a bit-precise one. Carrying it as
+                // `isBitPrecise` would tag the folded result `TypeKind::BitInt` and a
+                // `__int128` expression would silently change type mid-fold (the exact
+                // hazard `bitIntOperandType` orders its checks against). The 128-bit
+                // Cast arm keys on `intBits == 128` and mints an I128/U128 core.
+                //   ★ NO TRUNCATION IS OPENED BY THIS — MEASURED, and this is the
+                // load-bearing safety property: the folded value rides a 128-bit
+                // `BitIntValue`, and BOTH 64-bit ICE slots reject that width rather
+                // than narrow it. `asInt64` (const_eval_arith.hpp) nullopts for
+                // `width() > 64`, so `asInt64Bridge` — the array-dimension /
+                // static-assert / enumerator bridge — fails loud, and the generic
+                // `isInteger` narrowing arm below is never reached for a wide operand
+                // for the same reason. That is byte-for-byte the behaviour
+                // `_BitInt(128)` has shipped with since C4b: `int a[(_BitInt(128))5];`
+                // MEASURED S_NonConstantArrayLength, never a truncated bound.
+                case TypeKind::I128: t.isInteger=true; t.intBits=128; t.intSigned=true;  break;
+                case TypeKind::U128: t.isInteger=true; t.intBits=128; t.intSigned=false; break;
                 // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
                 // `_BitInt(N)` folds via the wrap-aware bignum at width N (mod-2^N),
                 // for ANY N (narrow AND wide) — `(_BitInt(4))15 + 1 == 0` /
@@ -2355,6 +2617,9 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
+            // TF-C62 / TF-C88: an after-declarator DECORATION (attribute or asm
+            // label) is not the initializer.
+            if (isDeclaratorDecorationNode(tree, *cfg.declarators, c)) continue;
             initNode = c;
             break;
         }
@@ -2502,11 +2767,22 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
     bool const absentLength =
         !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
-    // c82: `arrayToPointer` (C 6.7.6.3p7 parameter adjustment) admits the
+    // c82: `paramAdjustments` (C 6.7.6.3p7 parameter adjustment) admits the
     // absent length through the SAME incomplete-array path — the caller's
-    // `adjustArrayToPointer` rewrites the result to Ptr<element>, so the
+    // `adjustParamDeclaredType` rewrites the result to Ptr<element>, so the
     // incomplete array never escapes as a param's final type.
-    if (absentLength && (decl.allowFlexibleArray || decl.arrayToPointer)) {
+    //
+    // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1): the legacy-facet twin —
+    // a row that declares a TYPE rather than an object may NAME an incomplete
+    // array (`typedef int T[];`). Gated on `absentLength`, exactly like its
+    // declarator-mode counterpart is placed below every present-bound arm, so a
+    // VLA typedef `typedef int R[n];` is untouched. NO shipped config row
+    // declares an `arraySuffix` facet today, so this arm is unreachable in
+    // practice; it is written anyway because the two resolvers drifting is the
+    // failure mode this pairing exists to prevent.
+    if (absentLength
+        && (decl.allowFlexibleArray || decl.paramAdjustments
+            || decl.kind == DeclarationKind::Type)) {
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
@@ -2517,13 +2793,15 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         // automatic-storage constraints are enforced by the Pass-2
         // `validateVlaDeclarator` (reading the symbol's binding scope), NOT by the
         // type-construction `fromScope` (a descendant of the file scope even for a
-        // file-scope decl). Params (`arrayToPointer`) + struct fields
+        // file-scope decl). Params (`paramAdjustments`) + struct fields
         // (`allowFlexibleArray`) already took their absent-length paths above.
         // `visibleChildren(suffix).size() > 2` mirrors the twin's `hasPresentLength`:
         // a PRESENT length (`[ expr ]`, 3 children) is a VLA; an ABSENT one (`[]`, 2)
-        // stays S_NonConstantArrayLength (defense-in-depth — the only legacy array-
-        // suffix row today is `externDecl`/allowFlexibleArray, skipped above).
-        if (!decl.allowFlexibleArray && !decl.arrayToPointer
+        // stays S_NonConstantArrayLength (defense-in-depth — MEASURED at TF-C96, NO
+        // shipped config row declares an `arraySuffix` facet at all, so this whole
+        // legacy resolver is currently unreachable; it is kept in step with its
+        // declarator-mode twin arm-for-arm precisely because nothing exercises it).
+        if (!decl.allowFlexibleArray && !decl.paramAdjustments
             && visibleChildren(tree, suffix).size() > 2) {
             TypeInterner& in = s.lattice.interner();
             // VLA C3 (D-CSUBSET-VLA): a VLA whose element is itself an array or a VLA
@@ -2534,6 +2812,16 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         }
         emit(DiagnosticCode::S_NonConstantArrayLength);
         return InvalidType;
+    }
+    // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a bound
+    // that folds to EXACTLY 0 on a row that admits a flexible array member is
+    // the SAME incomplete array the absent-length `[]` yields above — ONE
+    // mechanism, not a parallel one, so `[0]` and `[]` can never diverge on
+    // layout, on position checking, or between the two resolvers. This is the
+    // legacy-facet twin of the identical arm in `applyDeclaratorSuffix`. A `[0]`
+    // on any other row keeps the out-of-range reject below.
+    if (*len == 0 && decl.allowFlexibleArray) {
+        return s.lattice.interner().incompleteArray(base);
     }
     // C99 §6.7.5.2: array length is a positive integer constant
     // expression. Negative folds (e.g. `int a[-1]`) and zero are
@@ -2762,6 +3050,48 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     return false;
 }
 
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): true iff a declaration's
+// specifier prefix carries the C99 6.7.4 `inline` KEYWORD *without* one of
+// `cfg.inlineExternSpecifierTokens`. The `specifierPrefixHasConstexpr` mirror,
+// keyword-form only — `inline` has no attribute spelling (GNU's `__inline` /
+// `__inline__` are additional KEYWORD spellings that share the one token kind,
+// not attribute names), so unlike `specifierPrefixNamesNoreturn` there is no
+// identifier arm and a name-matching pass would be dead code.
+//
+// ★ THE `extern` TEST IS PART OF THE PREDICATE, NOT A SEPARATE QUERY, because
+// 6.7.4p7 is phrased over "the inline function specifier without extern" — the
+// two tokens together mean the OPPOSITE of `inline` alone (an EXTERNAL
+// definition rather than an inline definition). Folding both into one scan is
+// what lets the caller AND-merge a single boolean across every declaration of
+// the function and land on the standard's rule exactly.
+//
+// Emits NOTHING: the 6.7.4p1 non-function constraint is reported by the caller,
+// which is the only site that knows the declared type.
+[[nodiscard]] bool
+specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
+                         NodeId declNode, DeclarationRule const& decl) {
+    if (!cfg.inlineKeywordToken.has_value()
+        || !cfg.inlineKeywordToken->valid()) {
+        return false;
+    }
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return false;
+    bool sawInline = false;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        SchemaTokenId const kind = tree.tokenKind(c);
+        if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; continue; }
+        for (SchemaTokenId ex : cfg.inlineExternSpecifierTokens)
+            if (kind == ex) return false;
+    }
+    return sawInline;
+}
+
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
 // declaration's specifier prefix. Keyed on the SAME per-row `linkageSpecifiers`
 // facet CST→HIR's `linkageFrom` folds (token SOURCE TEXT → effect), so the
@@ -2842,7 +3172,163 @@ struct AttributeSemanticsFacts {
     std::string deprecatedMessage;
     bool        nodiscard   = false;   // warnOnDiscard row matched
     std::string nodiscardMessage;
+    bool        noInline    = false;   // noInline row matched (TF-C78)
+    bool        alwaysInline = false;  // alwaysInline row matched (TF-C81)
+    bool        noSanitizeThread = false;  // noSanitizeThread row matched (TF-C92)
+    // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
+    // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
+    // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
+    // nullopt = no `aligned` clause (or every one of them errored / folded to the
+    // 6.7.5p3 no-op zero).
+    std::optional<std::uint32_t> alignment;
+
+    // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): EVERY MATCHED
+    // CLAUSE, kept as itself so the decl-kind gate can REPORT.
+    //
+    // ★ WHY THIS MEMBER HAS TO EXIST AT ALL. Everything above is a BOOLEAN (or a
+    // folded number): there is no attribute NAME and no `NodeId` anywhere in these
+    // facts, because until now nothing needed to say WHICH spelling produced a
+    // fact or WHERE it was written. The gate needs both — a warning that cannot
+    // name the attribute or underline it is not actionable — so the facts grow a
+    // per-clause record rather than the gate re-walking the tree and risking a
+    // second, differently-shaped enumeration of what a clause is.
+    //
+    // ★★ POPULATED BEFORE THE VERB SWITCH, WHICH IS THE WHOLE DESIGN. See
+    // `scanAttributeSemantics`: the push happens as soon as `row != nullptr` is
+    // established and BEFORE `switch (row->effect)`, so the list is
+    // VERB-AGNOSTIC BY CONSTRUCTION and a verb added tomorrow inherits the gate
+    // without touching it. A `none` row lands here too and is exempted
+    // STRUCTURALLY (its `appliesTo` is empty — the loader guarantees the
+    // equivalence), so the engine tests the CONFIG, never the verb.
+    struct KindScopedClause {
+        std::string                  name;          // dunder-normalized spelling
+        AttributeSemanticsRow const* row = nullptr; // the matched effects row
+        NodeId                       clauseNode{};  // the clause, for the span
+    };
+    std::vector<KindScopedClause> kindScopedClauses;
 };
+
+// TF-C73: the OPERAND node inside ONE attribute clause's argument group — the
+// node `foldAlignmentOperand` should fold for `__attribute__((aligned(N)))`.
+// Locates the clause's DIRECT `cfg.attributeArgRule` child (never a fixed index),
+// then descends through whatever list/item WRAPPERS the grammar interposes
+// (`attrArgs > attrArgList > attrArgItem > attrArgAtom` today) by following the
+// SOLE Internal visible child. DEPTH-AGNOSTIC on purpose: TF-C72 already added
+// one wrapper level to this exact path and silently broke a message decode by
+// reading a fixed depth; the next reshape must not be able to repeat that.
+// Returns an INVALID NodeId when the clause has no argument group at all (bare
+// `__attribute__((aligned))`) or an EMPTY one (`aligned()`) — the caller FAILS
+// LOUD on both rather than guessing "maximum useful alignment".
+[[nodiscard]] NodeId attrClauseArgOperand(SemanticConfig const& cfg,
+                                          Tree const& tree, NodeId clauseNode) {
+    if (!cfg.attributeArgRule.valid() || !clauseNode.valid()) return {};
+    NodeId group{};
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c).v == cfg.attributeArgRule.v) { group = c; break; }
+    }
+    if (!group.valid()) return {};
+    NodeId cur = group;
+    for (int guard = 0; guard < 32; ++guard) {
+        NodeId only{};
+        int n = 0;
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) == NodeKind::Internal) { only = c; ++n; }
+        }
+        if (n != 1) break;   // 0 = empty parens; >1 = a multi-argument list
+        cur = only;
+    }
+    if (cur.v == group.v) return {};   // `aligned()` — an argument group with nothing in it
+    return cur;
+}
+
+// TF-C73: collect every ATTRIBUTE NODE (a GNU `attrSpec` / a C23 `stdAttr`) in
+// `root`'s subtree, STOPPING AT each one (an attribute never nests inside another).
+// The ONE walk both attribute consumers share — `scanAttributeSemantics` (effect
+// folding) and `scanCompositePacked` (the composite `packed` scan) — so a grammar
+// reshape that moves attributes cannot fix one consumer and silently leave the
+// other reading the old shape. Tolerates a WRAPPER between `root` and the
+// attribute node (c-subset's `compositeAttr` alt), since it descends until it
+// matches rather than reading a fixed child.
+void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
+                      std::vector<NodeId>& out) {
+    if (!root.valid()) return;
+    if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
+    std::vector<NodeId> stack{root};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId const c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(c);
+        if ((cfg.stdAttrRule.valid()  && r.v == cfg.stdAttrRule.v)
+            || (cfg.attrSpecRule.valid() && r.v == cfg.attrSpecRule.v)) {
+            out.push_back(c);
+            continue;   // stop AT the attribute node
+        }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+}
+
+// TF-C73: enumerate the CLAUSES of ONE attribute node, and report which FORM it
+// is (return true = the C23 `[[...]]` standard form, whose unknown names are
+// standard-IGNORABLE; false = the GNU `__attribute__` form, whose unknown names
+// are meaningful and fail loud). Every clause is yielded EXACTLY ONCE, which is
+// the whole point: before this existed, only the FIRST clause of
+// `__attribute__((a, b))` was ever examined.
+//
+//   • C23 `[[a, b]]` → each `stdAttrItem` Internal child is one clause. The
+//     per-item loop is the ONLY producer for this form; a generic "nested node
+//     with a direct identifier child" descent would yield each item a SECOND time
+//     (and double-fire its diagnostics), so this arm returns immediately.
+//   • GNU `__attribute__((a, b))` → the `attrSpec` node ITSELF is clause #1 (its
+//     name is a DIRECT identifier child, which is exactly what
+//     `extractOneAttrClause` reads), and each trailing clause nests in its own
+//     node carrying its OWN direct identifier. Trailing clauses are found
+//     STRUCTURALLY ("a nested node with a direct name identifier"), never by rule
+//     NAME — the same model `extractOneAttrClause`'s sibling-clause skip already
+//     uses, so the two cannot disagree about what a clause is.
+//
+// ★ THE ARGUMENT-GROUP EXCLUSION is load-bearing: the descent NEVER enters a
+// `cfg.attributeArgRule` subtree. `format(printf,1,2)` nests its argument
+// identifier `printf` in an `attrArgAtom` whose direct child IS an identifier —
+// so without this skip the structural rule would mint a PHANTOM clause named
+// `printf` and fail it loud as an unknown attribute, on legal C.
+[[nodiscard]] bool
+collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
+                   std::vector<NodeId>& out) {
+    if (!attrNode.valid() || tree.kind(attrNode) != NodeKind::Internal) return false;
+    RuleId const r = tree.rule(attrNode);
+    if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
+        for (NodeId item : visibleChildren(tree, attrNode))
+            if (tree.kind(item) == NodeKind::Internal) out.push_back(item);
+        return true;   // the standard, ignorable form
+    }
+    if (!cfg.attrSpecRule.valid() || r.v != cfg.attrSpecRule.v) return false;
+    out.push_back(attrNode);   // clause #1 — its name is a direct child
+    auto const ownsName = [&](NodeId n) {
+        if (!cfg.identifierToken.valid()) return false;
+        for (NodeId g : visibleChildren(tree, n))
+            if (tree.kind(g) == NodeKind::Token
+                && tree.tokenKind(g) == cfg.identifierToken)
+                return true;
+        return false;
+    };
+    std::vector<NodeId> stack;
+    for (NodeId c : visibleChildren(tree, attrNode))
+        if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
+    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        NodeId const cur = stack.back(); stack.pop_back();
+        RuleId const cr = tree.rule(cur);
+        // ★ never descend into an ARGUMENT group (the phantom-clause exclusion),
+        // and never re-enter a nested attribute node (its own arm owns its clauses).
+        if (cfg.attributeArgRule.valid() && cr.v == cfg.attributeArgRule.v) continue;
+        if (cfg.stdAttrRule.valid()      && cr.v == cfg.stdAttrRule.v)      continue;
+        if (cr.v == r.v)                                                    continue;
+        if (ownsName(cur)) { out.push_back(cur); continue; }   // a trailing clause
+        for (NodeId g : visibleChildren(tree, cur))
+            if (tree.kind(g) == NodeKind::Internal) stack.push_back(g);
+    }
+    return false;   // the GNU, fail-loud form
+}
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): extract ONE attribute clause from a
 // clause node — a whole `attrSpec` (`__attribute__((deprecated("m")))` is ONE
@@ -2850,51 +3336,196 @@ struct AttributeSemanticsFacts {
 // `[[...]]`). The NAME is the LAST identifier among the node's DIRECT visible
 // children (the `::`-namespaced form's final segment — `gnu::packed` → `packed`;
 // both shapes inline their sequences, so the identifier(s) land flat),
-// dunder-normalized via the shared `stripDunder`. The OPTIONAL string argument
-// is the sole Internal direct child (a `stringLiteralExpr`), decoded via the
-// SHARED `decodeAdjacentStringBodies` chokepoint (the static_assert message
-// precedent — escapes + adjacent concat decode identically everywhere). A
-// clause with no identifier (an empty `__attribute__(())`) yields nullopt.
+// dunder-normalized via the shared `stripDunder`. A clause with no identifier
+// (an empty `__attribute__(())`) yields nullopt. The name is resolved to its
+// `attributeEffects` ROW here (`row` — nullptr = a name the language does not
+// model), so the clause's effect and its argument validity are decided at ONE
+// site.
+//
+// The OPTIONAL string argument is found by SEARCHING the clause's argument
+// subtree — deliberately NOT a fixed child index and NOT a fixed descent path.
+// Pre-TF-C62 the argument WAS the sole Internal direct child; TF-C62 pushed the
+// GNU form's argument down into an `attrArgs` subtree and TF-C72 added another
+// `attrArgAtom` level, so the string now sits an implementation-defined number
+// of levels deep (`attrArgs > attrArgList > attrArgItem > attrArgAtom >
+// stringLiteralExpr` today) — and an `attrSpec` may carry `attrClauseTail`
+// Internal children beside the argument. Reading the first Internal child
+// therefore handed `decodeAdjacentStringBodies` a node with NO body children:
+// it returned "" (its documented no-body-child result), NOT nullopt, and the
+// message was SILENTLY dropped (measured: `__attribute__((deprecated("use g")))`
+// warned `f`, the C23 `[[deprecated("use g")]]` warned `f: use g`). The search
+// is DEPTH-AGNOSTIC so the next grammar reshape cannot re-open that drop.
+//
+// Two scoping rules keep the search on THIS clause's argument:
+//   • a node matching the language's `stringLiteralExprRule` IS the string
+//     argument — descent STOPS there, so a C 5.1.1.2 phase-6 adjacent-concat run
+//     (`deprecated("use " "g")`) stays ONE argument and decodes through the
+//     SHARED `decodeAdjacentStringBodies` chokepoint (the static_assert message
+//     precedent — escapes + concat decode identically everywhere). A language
+//     that declares no such rule falls back to "a node with a direct body token",
+//     the shape that chokepoint decodes, so a message is never silently lost;
+//   • a nested Internal node carrying its OWN direct name identifier is a
+//     SIBLING CLAUSE (`__attribute__((deprecated, visibility("hidden")))` nests
+//     the second clause in `attrClauseTail`), never this clause's argument — it
+//     is skipped WHOLESALE. That is exactly the "the name is a direct identifier
+//     child" model this function uses for the clause itself, applied recursively;
+//     without it the first clause would silently adopt a LATER clause's string.
+//
+// EXACTLY ONE string argument ⇒ decoded into `message`. NONE ⇒ `message` stays
+// nullopt — which is why it is an optional at all: `__attribute__((deprecated))`
+// has NO message while `__attribute__((deprecated("")))` has an explicitly EMPTY
+// one, and collapsing both to "" is the silent drop above. MORE THAN ONE (the
+// message is AMBIGUOUS), or a MALFORMED escape (the chokepoint decodes nothing),
+// leaves `message` nullopt and fails loud S_UnknownTypeAttribute — the semantic
+// tier's "an attribute in a honored position whose form this implementation
+// cannot honor, fail loud rather than silently drop an attribute the program may
+// depend on" code (the mirror of `linkageFrom`'s H_UnknownLinkageSpecifier
+// fail-loud on a concatenated specifier argument). NEITHER path guesses.
+//
+// Both fail-louds are gated on the name being one the language MODELS
+// (`row != nullptr`), which is load-bearing: an UNMODELLED multi-string GNU
+// attribute (`__attribute__((__availability__(macos, message="a",
+// replacement="b")))` — real SDK-header shape, TF-C72's motivating case) has no
+// consumed message to lose, so it stays inert exactly as before, never newly
+// rejected.
 struct AttributeClause {
-    std::string_view name;      // dunder-normalized final name segment
-    std::string      message;   // decoded string argument ("" = none/undecodable)
+    std::string_view                name;      // dunder-normalized final name segment
+    std::optional<std::string>      message;   // decoded string argument (nullopt = NONE)
+    AttributeSemanticsRow const*    row = nullptr;   // matched effect row (nullptr = unmodelled)
 };
+//
+// ★ TF-C73 `emitDiagnostics` — the DOUBLE-FIRE gate. The two `failLoud` calls
+// below were previously UNCONDITIONAL while the unknown-NAME warning in the
+// caller was already gated on `emitUnknown`. That asymmetry meant any second
+// visit of the same clause (which multi-root scanning makes reachable) emitted
+// the malformed/ambiguous-argument S_UnknownTypeAttribute TWICE for ONE spelling
+// — a doubled error on a shared DiagnosticCode, which is precisely the failure a
+// bare-count test cannot see. The flag now covers EVERY diagnostic this function
+// can emit, so "am I the once-per-declaration emitting visit?" has ONE answer
+// instead of two. (Visiting is also exactly-once by construction — the caller
+// scans declaration-level roots ONCE and copies the facts per declarator — so
+// this gate is the belt to that braces.)
 [[nodiscard]] std::optional<AttributeClause>
 extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
-                     Tree const& tree, NodeId clauseNode) {
+                     Tree const& tree, NodeId clauseNode,
+                     bool emitDiagnostics) {
     NodeId nameTok{};
-    NodeId msgNode{};
     for (NodeId c : visibleChildren(tree, clauseNode)) {
-        if (tree.kind(c) == NodeKind::Token) {
-            if (cfg.identifierToken.valid()
-                && tree.tokenKind(c) == cfg.identifierToken) {
-                nameTok = c;   // LAST identifier wins → the ::-final segment
-            }
-            continue;
+        if (tree.kind(c) != NodeKind::Token) continue;
+        if (cfg.identifierToken.valid()
+            && tree.tokenKind(c) == cfg.identifierToken) {
+            nameTok = c;   // LAST identifier wins → the ::-final segment
         }
-        // The only Internal child either shape admits is the parenthesized
-        // string-literal argument (`stringLiteralExpr`).
-        if (!msgNode.valid()) msgNode = c;
     }
     if (!nameTok.valid()) return std::nullopt;
     AttributeClause out;
     out.name = stripDunder(tree.text(nameTok));
-    if (msgNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
-        if (auto decoded = decodeAdjacentStringBodies(
-                tree, msgNode, s.idx().stringLiteralBodyToken)) {
-            out.message = std::move(*decoded);
+    for (auto const& r : cfg.attributeEffects) {
+        for (auto const& nm : r.names) {
+            if (out.name == nm) { out.row = &r; break; }
         }
+        if (out.row != nullptr) break;
+    }
+    if (!s.idx().stringLiteralBodyToken.valid()) return out;
+    // A string-literal ARGUMENT node: the language's declared string-expression
+    // rule when it has one, else any node the shared chokepoint can decode (one
+    // carrying a direct body token). Keyed on config, never on a rule NAME here.
+    auto const isStringArg = [&](NodeId n) {
+        if (s.idx().stringLiteralExprRule.valid())
+            return tree.rule(n).v == s.idx().stringLiteralExprRule.v;
+        for (NodeId c : tree.children(n)) {
+            if (tree.kind(c) == NodeKind::Token
+                && tree.tokenKind(c).v == s.idx().stringLiteralBodyToken.v)
+                return true;
+        }
+        return false;
+    };
+    // A nested node with its OWN direct name identifier is a SIBLING clause.
+    auto const startsOwnClause = [&](NodeId n) {
+        if (!cfg.identifierToken.valid()) return false;
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Token
+                && tree.tokenKind(c) == cfg.identifierToken)
+                return true;
+        }
+        return false;
+    };
+    NodeId strNode{};
+    bool   ambiguous = false;
+    std::vector<NodeId> stack;
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
+    }
+    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        NodeId const cur = stack.back();
+        stack.pop_back();
+        if (isStringArg(cur)) {
+            if (strNode.valid()) { ambiguous = true; break; }
+            strNode = cur;
+            continue;   // STOP at the string node — an adjacent-concat run is ONE argument
+        }
+        if (startsOwnClause(cur)) continue;   // a later clause's args, not ours
+        for (NodeId g : visibleChildren(tree, cur)) {
+            if (tree.kind(g) == NodeKind::Internal) stack.push_back(g);
+        }
+    }
+    // Both message-loss paths report through ONE gate: a name the language MODELS
+    // (an unmodelled attribute's message is never consumed, so its argument form
+    // stays its own business and nothing is dropped).
+    auto const failLoud = [&](std::string reason) {
+        if (out.row == nullptr) return;
+        if (!emitDiagnostics) return;   // ★ not the emitting visit — never double-fire
+        // ★ TF-C73: the gate is "is this clause's MESSAGE actually CONSUMED?", not
+        // the weaker "is the NAME modelled?" it started as. Only the two warning
+        // effects ever read `message`; `none` / `suppressUnused` / `align` rows
+        // never look at it, so a string-argument problem costs them nothing and
+        // must not be reported. This matters the moment a real SDK attribute joins
+        // the table as INERT: `availability` is now a modelled `none` row, and
+        // `__attribute__((__availability__(macos, message="a", replacement="b")))`
+        // — genuine macOS SDK shape — legitimately carries TWO strings. Under the
+        // name-based gate that became an ERROR and every SDK header using the
+        // availability form stopped compiling (MEASURED as a regression here).
+        // Keying on consumption instead means a row can be added to the table for
+        // its NAME alone without inheriting an argument-form contract it does not
+        // participate in.
+        if (out.row->effect != AttributeEffect::WarnOnUse
+            && out.row->effect != AttributeEffect::WarnOnDiscard) return;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(clauseNode);
+        d.actual   = std::move(reason);
+        s.reporter.report(std::move(d));
+    };
+    if (ambiguous) {
+        failLoud(std::format("attribute '{}' carries more than one string argument",
+                             out.name));
+        return out;   // message stays nullopt — never guess WHICH string was meant
+    }
+    if (strNode.valid()) {
+        out.message = decodeAdjacentStringBodies(
+            tree, strNode, s.idx().stringLiteralBodyToken);
+        // The chokepoint returns nullopt on a MALFORMED escape (C 5.1.1.2 phase 5).
+        // Left unreported that is the SAME silent drop as the nesting defect above,
+        // just via a different door — `deprecated("bad\uZZZZ")` would warn with the
+        // message quietly gone (MEASURED before this gate existed).
+        if (!out.message.has_value())
+            failLoud(std::format("attribute '{}' has a malformed escape in its "
+                                 "string argument", out.name));
     }
     return out;
 }
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the attribute-semantics effects
 // over every attribute specifier in `startNode`'s subtree (a declaration's
-// STRIPPED specifier prefix, or a bare attribute-declaration statement). A
-// bounded descent that STOPS AT each attribute node: a `stdAttrRule` node
-// (C23 `[[...]]`) contributes one clause per Internal child (`stdAttrItem` —
-// `[[a, b]]` is two clauses); an `attrSpecRule` node (GNU `__attribute__`) is
-// ONE clause. Each clause's name is matched (dunder-normalized) against the
+// STRIPPED specifier prefix, a DECLARATOR's after-declarator attribute run, or a
+// bare attribute-declaration statement). The shared `collectAttrNodes` +
+// `collectAttrClauses` enumerators supply the clauses: a `stdAttrRule` node
+// (C23 `[[...]]`) contributes one clause per `stdAttrItem` (`[[a, b]]` is two),
+// and a GNU `attrSpecRule` node contributes its first clause PLUS every trailing
+// `, b` clause (TF-C73 — folding only the first is how `((__nothrow__,
+// aligned(32)))` silently dropped the alignment). Each name is matched against the
 // config's `attributeEffects` rows and the matched row's effect folds into
 // `out` (messages first-non-empty-wins).
 //
@@ -2905,22 +3536,29 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 // pre-existing loud gates (file-scope H_UnknownLinkageSpecifier at the HIR
 // linkage scan; the block-scope wholesale-ignore is the named deferral
 // D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME).
+// The GNU `aligned(N)` arm folds its operand through the SHARED alignment ladder,
+// which is DEFINED below this TU point (it sits with the alignas machinery it was
+// extracted from) — forward-declare it, the same way `constIntExpr` is.
+[[nodiscard]] std::optional<std::uint32_t>
+foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId argNode, NodeId diagNode, ScopeId fromScope);
+
 void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                             Tree const& tree, NodeId startNode,
-                            bool emitUnknown, AttributeSemanticsFacts& out) {
+                            bool emitUnknown, AttributeSemanticsFacts& out,
+                            ScopeId fromScope = {},
+                            bool strictUnknownIsError = false) {
     if (!startNode.valid()) return;
     if (cfg.attributeEffects.empty()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
     auto const foldClause = [&](NodeId clauseNode, bool fromStdForm) {
-        auto clause = extractOneAttrClause(s, cfg, tree, clauseNode);
+        auto clause = extractOneAttrClause(s, cfg, tree, clauseNode,
+                                           /*emitDiagnostics=*/emitUnknown);
         if (!clause.has_value()) return;
-        AttributeSemanticsRow const* row = nullptr;
-        for (auto const& r : cfg.attributeEffects) {
-            for (auto const& nm : r.names) {
-                if (clause->name == nm) { row = &r; break; }
-            }
-            if (row != nullptr) break;
-        }
+        // The name→effect-row match is `extractOneAttrClause`'s (it needs the row
+        // to decide whether a malformed argument is worth failing loud over), so
+        // there is exactly ONE match site and no drift between the two.
+        AttributeSemanticsRow const* row = clause->row;
         if (row == nullptr) {
             if (fromStdForm && emitUnknown) {
                 ParseDiagnostic d;
@@ -2931,74 +3569,199 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 d.actual   = std::string{tree.text(clauseNode)};
                 s.reporter.report(std::move(d));
             }
+            // ★ TF-C73 — THE STRICT UNKNOWN-NAME GATE (work item 3).
+            // A `typedefDecl` declares NO `linkageSpecifiers`, so `linkageFrom`
+            // early-returns and an unknown GNU name in a typedef position was
+            // reported by NOBODY: `typedef __attribute__((desprecated)) int T;`
+            // compiled clean with the decoration silently unapplied. When the
+            // declaration row opts in (`unknownStrictAttributeIsError`) and the
+            // form is GNU, that is now an ERROR — the SAME code and severity
+            // `scanCompositePacked` already uses for an unrecognized strict
+            // attribute, so the two strict surfaces speak with one voice.
+            // The C23 `[[...]]` path is untouched: C23 REQUIRES an unknown
+            // standard attribute to be ignorable, so it keeps its suppressible
+            // S_UnknownAttribute Warning above and never reaches here.
+            if (!fromStdForm && emitUnknown && strictUnknownIsError) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(clauseNode);
+                d.actual   = std::string{tree.text(clauseNode)};
+                s.reporter.report(std::move(d));
+            }
             return;
         }
+        // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) — RECORD
+        // THE CLAUSE FOR THE DECL-KIND GATE, DELIBERATELY **ABOVE** THE SWITCH.
+        //
+        // Placement is the design, not convenience. Below the switch this would
+        // have to be one push per arm (or a per-verb allow-list), and a verb added
+        // later would be silently exempt from the gate — the exact shape of the
+        // defect being closed, re-created one tier up. Here the ONLY precondition
+        // is "the language MODELS this name", so every present and future verb is
+        // covered by construction and the engine names no attribute and no verb.
+        //
+        // A `none`-verb clause is recorded too and exempted STRUCTURALLY at the
+        // gate (`appliesTo.empty()`); the loader is what makes that equivalent to
+        // "the verb is `none`", by REQUIRING a non-empty `appliesTo` on every
+        // other verb and REFUSING the key on `none`.
+        //
+        // `clause->name` is COPIED, not moved: the Align arm below still formats
+        // with it (and it is a `string_view` into the tree, so it is a copy either
+        // way at this boundary).
+        out.kindScopedClauses.push_back(
+            AttributeSemanticsFacts::KindScopedClause{
+                std::string{clause->name}, row, clauseNode});
         switch (row->effect) {
             case AttributeEffect::SuppressUnused:
                 out.maybeUnused = true;
                 break;
             case AttributeEffect::WarnOnUse:
                 out.deprecated = true;
-                if (out.deprecatedMessage.empty())
-                    out.deprecatedMessage = std::move(clause->message);
+                if (out.deprecatedMessage.empty() && clause->message.has_value())
+                    out.deprecatedMessage = std::move(*clause->message);
                 break;
             case AttributeEffect::WarnOnDiscard:
                 out.nodiscard = true;
-                if (out.nodiscardMessage.empty())
-                    out.nodiscardMessage = std::move(clause->message);
+                if (out.nodiscardMessage.empty() && clause->message.has_value())
+                    out.nodiscardMessage = std::move(*clause->message);
+                break;
+            case AttributeEffect::Align: {
+                // TF-C73: GNU `__attribute__((aligned(N)))`. The operand folds
+                // through the SAME `foldAlignmentOperand` ladder `alignas` uses —
+                // one power-of-two check, one >256 cap, one non-constant check, the
+                // same three diagnostic codes. MAX-fold per C 6.7.5p6.
+                NodeId const operand =
+                    attrClauseArgOperand(cfg, tree, clauseNode);
+                if (!operand.valid()) {
+                    // ★ BARE `__attribute__((aligned))` — gcc reads this as "the
+                    // largest alignment useful on this target", a TARGET-dependent
+                    // number this engine has no business inventing (and which is
+                    // exactly the sort of quiet guess that produces a wrong ABI).
+                    // FAIL LOUD instead; the programmer can write the number.
+                    if (emitUnknown) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(clauseNode);
+                        d.actual   = std::format(
+                            "attribute '{}' requires an explicit alignment argument "
+                            "(the bare form means the target's maximum useful "
+                            "alignment, which this implementation does not assume)",
+                            clause->name);
+                        s.reporter.report(std::move(d));
+                    }
+                    break;
+                }
+                if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
+                                                  /*diagNode=*/clauseNode,
+                                                  fromScope)) {
+                    if (!out.alignment.has_value() || *a > *out.alignment)
+                        out.alignment = a;
+                }
+                break;
+            }
+            case AttributeEffect::NoInline:
+                // TF-C78 (D-CSUBSET-NOINLINE): a pure marker — no argument, no
+                // message, no MAX-fold. Applied to the declarator's symbol below
+                // gated on the declared type being a FnSig.
+                out.noInline = true;
+                break;
+            case AttributeEffect::AlwaysInline:
+                // TF-C81 (D-CSUBSET-ALWAYSINLINE): a pure marker, exactly like
+                // the NoInline arm above — no argument, no message, no MAX-fold.
+                // Applied to the declarator's symbol below gated on the declared
+                // type being a FnSig, and CROSS-CHECKED against `noInline` there
+                // (the two directives contradict each other).
+                out.alwaysInline = true;
+                break;
+            case AttributeEffect::NoSanitizeThread:
+                // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): a pure marker, exactly
+                // like the two arms above — no argument, no message, no MAX-fold.
+                // Applied to the declarator's symbol below gated on the declared
+                // type being a FnSig. NO cross-check against a partner verb: this
+                // axis contradicts nothing (see `SymbolRecord.isNoSanitizeThread`).
+                //
+                // ★ THE STRING-ARGUMENT SPELLING `no_sanitize("thread")` DOES NOT
+                // REACH THIS ARM, DELIBERATELY, AND IT FAILS LOUD RATHER THAN
+                // SILENTLY MISSING. That form's clause NAME is `no_sanitize`, and
+                // `linkageFrom`'s composite-key pairing turns it into the key
+                // `no_sanitize:thread` before the semantic tier ever runs.
+                // MEASURED at TF-C92 HEAD with the shipped CLI:
+                // `static __attribute__((no_sanitize("thread"))) int g(int k){…}`
+                // → `error[H000C] 'no_sanitize:thread' is not a recognized linkage
+                // specifier`. Matching it here would need the effects table to key
+                // on a clause ARGUMENT VALUE, which no verb does; sqlite writes
+                // only the bare `no_sanitize_thread` spelling, so the loud refusal
+                // is the correct residue, not a gap. TF-C92 fold: PINNED, no
+                // longer prose-only — HirLoweringCSubset
+                // .NoSanitizeStringArgumentFormIsRefusedLoud asserts exactly one
+                // H_UnknownLinkageSpecifier naming the composite key, for BOTH
+                // `("thread")` and `("address")`. The same statement in the file a
+                // config author reads is the `★ THE STRING-ARGUMENT SPELLING`
+                // paragraph of this effect's own row `$comment` in
+                // `semantics.attributeSemantics.effects` (c-subset.lang.json,
+                // `"names": ["no_sanitize_thread"]`) — there is deliberately no
+                // separate `$noSanitizeStringFormComment` key, which an earlier
+                // draft of THIS comment cited by name and which never existed.
+                out.noSanitizeThread = true;
                 break;
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
     };
-    std::vector<NodeId> stack{startNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) != NodeKind::Internal) continue;
-        RuleId const r = tree.rule(c);
-        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
-            for (NodeId item : visibleChildren(tree, c)) {
-                if (tree.kind(item) == NodeKind::Internal)
-                    foldClause(item, /*fromStdForm=*/true);
-            }
-            continue;   // stop AT the attribute node
-        }
-        if (cfg.attrSpecRule.valid() && r.v == cfg.attrSpecRule.v) {
-            foldClause(c, /*fromStdForm=*/false);
-            continue;   // stop AT the attribute node
-        }
-        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    // TF-C73: EVERY clause of EVERY attribute node, via the shared enumerators.
+    // Previously only the FIRST clause of a GNU `__attribute__((a, b))` was folded,
+    // so `((__nothrow__, aligned(32)))` silently dropped the alignment.
+    std::vector<NodeId> attrNodes;
+    collectAttrNodes(cfg, tree, startNode, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId an : attrNodes) {
+        clauses.clear();
+        bool const stdForm = collectAttrClauses(cfg, tree, an, clauses);
+        for (NodeId cl : clauses) foldClause(cl, stdForm);
     }
 }
 
-// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
-// `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
-// `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
-// alignment via `computeLayout(...)->align` (== _Alignof(T)); anything else
-// (VALUE form) const-evaluates the constant-expression via the SAME `constIntExpr`
-// static_assert / array-dimension folding uses. Validates:
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS) + GNU `aligned(N)` (D-CSUBSET-GNU-ATTRIBUTE):
+// the SHARED alignment-operand ladder — compute + validate the alignment ONE
+// operand node requests. Extracted VERBATIM from `evalOneAlignasSpec` (TF-C73) so
+// the C11 `alignas` path and the GNU `__attribute__((aligned(N)))` path cannot
+// drift: one descent, one type-vs-value discrimination, one `constIntExpr` fold,
+// one no-layout-params guard, one 0/negative/power-of-two/>256 ladder, and the
+// SAME three diagnostics. A second, "equivalent" copy for the attribute path is
+// exactly how a validation ladder rots — `aligned(3)` must reject for the same
+// reason and with the same code as `alignas(3)`, forever, because it is literally
+// the same code. (Pinned: the shared-ladder tests bypass-check that removing this
+// function's pow2/max arms makes BOTH spellings go silent, which is what proves
+// SHARED rather than merely equivalent.)
+//
 //   • 0 ⇒ nullopt, NO error (6.7.5p3: "an alignment specification of zero has no
 //     effect" — a NO-OP, treated as "no override" by the caller);
 //   • not a power of two ⇒ S_AlignasNotPowerOfTwo, nullopt;
 //   • > 256 ⇒ S_AlignasExceedsMax, nullopt (the `Alignment` newtype cap);
 //   • non-constant value ⇒ S_AlignasNonConstant, nullopt.
-// The WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared
-// type). Returns the validated alignment in bytes, or nullopt on 0/error.
+//
+// `argNode` is the operand (an `alignasArg` alt wrapper, or a GNU attribute's
+// argument node); `diagNode` is the node whose span/text every diagnostic carries
+// — the caller's WHOLE construct (the `alignasSpec`, or the attribute clause), so
+// the message points at `alignas(3)` / `aligned(3)`, not at the bare `3`. The
+// WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared type).
 [[nodiscard]] std::optional<std::uint32_t>
-evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                   NodeId alignasSpecNode, ScopeId fromScope) {
+foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId argNode, NodeId diagNode, ScopeId fromScope) {
+    if (!argNode.valid() || !diagNode.valid()) return std::nullopt;
     auto emit = [&](DiagnosticCode code) {
         ParseDiagnostic d;
         d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
-        d.span     = tree.span(alignasSpecNode);
-        d.actual   = std::string{tree.text(alignasSpecNode)};
+        d.span     = tree.span(diagNode);
+        d.actual   = std::string{tree.text(diagNode)};
         s.reporter.report(std::move(d));
     };
-    auto kids = visibleChildren(tree, alignasSpecNode);
-    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
-    NodeId const argNode = kids[cfg.alignasArgChild];
     // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
     // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
     // child's rule. Descend to the sole visible child of the `alignasArg` alt
@@ -3061,9 +3824,40 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return static_cast<std::uint32_t>(uv);
 }
 
-// FC16 (D-CSUBSET-PACKED): scan a struct/union specifier node's TRAILING
-// composite-attribute list (`compositeAttrListRule`) for a honored `packed`
-// attribute. Returns true iff a recognized `packed` spelling is present.
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
+// `alignasSpec` node requests. Locates the `alignasArg` operand (visible-child
+// `alignasArgChild`) and hands it to the SHARED `foldAlignmentOperand` ladder —
+// which owns the type-vs-value discrimination, the fold, and every diagnostic.
+// `diagNode` is the whole `alignasSpec`, so each diagnostic's span/text is
+// byte-identical to the pre-extraction behavior (the regression wall: the alignas
+// path must not shift by one character).
+[[nodiscard]] std::optional<std::uint32_t>
+evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId alignasSpecNode, ScopeId fromScope) {
+    auto kids = visibleChildren(tree, alignasSpecNode);
+    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
+    return foldAlignmentOperand(s, cfg, tree, kids[cfg.alignasArgChild],
+                                /*diagNode=*/alignasSpecNode, fromScope);
+}
+
+// FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the whole-composite
+// attribute facts a struct/union DEFINITION's attribute surfaces contribute.
+//
+// `packed` and `alignment` are two INDEPENDENT channels of the interned composite,
+// not one decision: packed removes the inter-field padding, `aligned(N)` raises the
+// aggregate's own alignment, and they COMBINE (`packed, aligned(16)` is clang
+// sizeof 16 / _Alignof 16 — MEASURED — not packed's bare 5 / 1). Returning them
+// together is what lets ONE clause-by-clause scan feed both without either
+// swallowing the other, which is precisely the bug this function already carries a
+// tombstone for.
+struct CompositeAttrFacts {
+    bool                         packed = false;
+    std::optional<std::uint32_t> alignment;   // nullopt = no honored `aligned(N)`
+};
+
+// FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): scan a
+// struct/union specifier node's composite-attribute surfaces for the honored
+// whole-composite attributes — `packed`, and a GNU/C23 `aligned(N)`.
 //
 // When `emitDiagnostics` is true (the ONE composition site), an UNRECOGNIZED
 // attribute in the STRICT (GNU `__attribute__`) form fails loud
@@ -3080,63 +3874,177 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // IDENTIFIER leaf (dunder-normalized via the shared `stripDunder`, so `__packed__`
 // ≡ `packed` and `[[gnu::packed]]`'s final segment `packed` matches) against
 // `packedAttributeNames` — a string ARGUMENT (`section("packed")`) is a
-// string-literal leaf, not an identifier, so it never false-matches.
-[[nodiscard]] bool
+// string-literal leaf, not an identifier, so it never false-matches. The `aligned`
+// spelling is likewise NOT hardcoded: the clause name is matched against the
+// declared `attributeEffects` rows and honored iff the matched row's effect is
+// `Align`, the same table `scanAttributeSemantics` folds for declarations.
+[[nodiscard]] CompositeAttrFacts
 scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                    NodeId specNode, bool emitDiagnostics) {
-    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return false;
-    // The `compositeAttrList` is the structSpec/unionSpec's trailing direct child.
-    NodeId listNode{};
+                    NodeId specNode, bool emitDiagnostics, ScopeId fromScope = {}) {
+    CompositeAttrFacts facts;
+    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return facts;
+    // TF-C73 MULTI-ROOT, composite edition. A struct/union carries attributes in
+    // TWO positions, and scanning only one is the same silent-drop shape this
+    // cycle is closing everywhere else:
+    //   • the TRAILING `compositeAttrList` — `struct S {...} __attribute__((packed));`
+    //   • the LEADING slot(s) named by this composite row's `declarationAttrSlotRules`
+    //     — `__attribute__((packed)) struct S {...};`
+    // The lead slot is read from the COMPOSITE's own DeclarationRule via
+    // `declByRule` (RuleId → declarations index), so it stays rule-name-driven
+    // config with no new parameter to thread and no rule-name literal here.
+    //
+    // ★★ NO `break`, DELIBERATELY. This loop used to select the FIRST
+    // `compositeAttrList` direct child and STOP, and that single-surface assumption
+    // was load-bearing in the worst way: it is what BLOCKED the after-keyword
+    // composite attribute slot (`struct __attribute__((packed)) S { … };`, the
+    // `mach-o/dyld_images.h` shape — 64 of the SDK audit's 204 `aligned` sites).
+    // With the `break` in place a lead slot under a DISTINCT rule name is invisible
+    // to this scan, so `packed` — KNOWN-and-inert in the effects table — is silently
+    // DROPPED: MEASURED, that shape compiled CLEAN at sizeof 8 against clang's 5,
+    // turning a loud error into a silent miscompile. Reusing the existing rule name
+    // instead forces the slot to be `{optional}`, which shifts the tag off its
+    // positional index and binds a TAGGED struct anonymously. Neither branch is
+    // acceptable, and neither is closable from config.
+    //
+    // So the scan is surface-COUNT-agnostic in BOTH directions — it accumulates
+    // EVERY matching direct child (any number of `compositeAttrList` nodes) AND
+    // every child named by the composite row's own `declarationAttrSlotRules` (the
+    // general lead-slot mechanism this cycle added for typedefs and members). A
+    // scan that handles exactly one attribute list is the same single-site
+    // assumption that produced the clause-swallowing bug tombstoned below.
+    std::vector<RuleId> slotRules;
+    if (auto const dIt = s.idx().declByRule.find(tree.rule(specNode).v);
+        dIt != s.idx().declByRule.end()) {
+        slotRules = cfg.declarations[dIt->second].declarationAttrSlotRules;
+    }
+    std::vector<NodeId> roots;
     for (NodeId c : visibleChildren(tree, specNode)) {
-        if (tree.kind(c) == NodeKind::Internal
-            && tree.rule(c).v == cfg.compositeAttrListRule.v) {
-            listNode = c;
-            break;
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == cfg.compositeAttrListRule.v) { roots.push_back(c); continue; }
+        for (RuleId sr : slotRules)
+            if (tree.rule(c).v == sr.v) { roots.push_back(c); break; }
+    }
+    if (roots.empty()) return facts;
+    // ★★ TF-C73 — THE SILENT MISCOMPILE THIS LOOP USED TO BE.
+    // This scan previously treated a whole attribute NODE as one unit: it walked
+    // the entire subtree looking for ANY identifier naming `packed`, and on a hit
+    // did `packed = true; continue;` — SWALLOWING every other clause in the list.
+    // MEASURED end-to-end on arm64:
+    //     struct S { char a; int b; } __attribute__((packed, aligned(16)));
+    // gave DSS `sizeof` 5 against clang's 16, with ZERO diagnostics — the
+    // `aligned(16)` was parsed and thrown away because `packed` matched first.
+    // The mirror was just as bad: `__attribute__((bogus_xyz, packed))` was
+    // ACCEPTED silently, because the unknown name never got its own look — the
+    // typo protection this function exists for was defeated by clause order.
+    // Both are gone: the list is enumerated CLAUSE BY CLAUSE through the shared
+    // `collectAttrClauses`, so every clause is examined on its own merits and an
+    // unknown GNU name still fails loud no matter which position it sits in.
+    std::vector<NodeId> attrNodes;
+    for (NodeId root : roots) collectAttrNodes(cfg, tree, root, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId attr : attrNodes) {
+        // The STRICT (GNU) form's unknown names are meaningful → fail loud (typo
+        // protection); a C23 `[[...]]` is standard-ignorable. `compositeStrictAttrRule`
+        // names the strict shape for THIS feature; `collectAttrClauses`'s form flag is
+        // the general answer — require both to agree before failing loud, so a
+        // language that declares no strict rule never newly rejects.
+        bool const strict =
+            cfg.compositeStrictAttrRule.valid()
+            && tree.rule(attr).v == cfg.compositeStrictAttrRule.v;
+        clauses.clear();
+        bool const stdForm = collectAttrClauses(cfg, tree, attr, clauses);
+        for (NodeId cl : clauses) {
+            // The clause NAME is the LAST identifier among its DIRECT visible
+            // children — the same reading `extractOneAttrClause` uses (the
+            // `::`-namespaced form's final segment: `gnu::packed` → `packed`),
+            // dunder-normalized through the shared `stripDunder`. Reading DIRECT
+            // children only is what keeps a string ARGUMENT (`section("packed")`)
+            // and an argument IDENTIFIER (`format(printf,1,2)`) from false-matching.
+            NodeId nameTok{};
+            for (NodeId g : visibleChildren(tree, cl)) {
+                if (tree.kind(g) == NodeKind::Token
+                    && cfg.identifierToken.valid()
+                    && tree.tokenKind(g) == cfg.identifierToken)
+                    nameTok = g;
+            }
+            if (!nameTok.valid()) continue;   // an empty `__attribute__(())`
+            std::string_view const id = stripDunder(tree.text(nameTok));
+            bool named = false;
+            for (std::string const& nm : cfg.packedAttributeNames)
+                if (id == nm) { named = true; break; }
+            if (named) { facts.packed = true; continue; }
+            // ★★ TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED) — THE COMPOSITE `aligned(N)`
+            // SINK. Until the interner grew a per-COMPOSITE alignment channel there
+            // was nowhere to put this number, so the clause fell through to the
+            // strict-unknown arm below and failed loud — deliberately, because the
+            // alternative on offer (smuggling it into `fieldAligns[0]`) would have
+            // lied about member 0's `_Alignof`, been unrepresentable for a zero-field
+            // composite, and reinterned as a different type. The channel now exists,
+            // so the clause is HONORED here instead of refused.
+            //
+            // The name is matched against the DECLARED `attributeEffects` rows (the
+            // same table `scanAttributeSemantics` folds), and honored only when the
+            // matched row's effect is `Align` — so the spelling stays config
+            // vocabulary, never a literal in this engine. The operand goes through
+            // the SHARED `foldAlignmentOperand` ladder that `alignas` and the
+            // declaration-level `aligned(N)` both use: one pow2 check, one >256 cap,
+            // one non-constant check, the same three diagnostic codes. MAX-fold over
+            // repeated clauses per C 6.7.5p6 (the strictest wins).
+            //
+            // GATED on `emitDiagnostics`: `foldAlignmentOperand` reports
+            // unconditionally, and the OTHER caller of this function is the member-
+            // alignas baseline probe, which may run once PER MEMBER — folding there
+            // would multiply one bad `aligned(3)` into one diagnostic per member.
+            // The probe reads only `.packed`, so skipping the fold loses nothing.
+            if (emitDiagnostics) {
+                AttributeSemanticsRow const* alignRow = nullptr;
+                for (AttributeSemanticsRow const& row : cfg.attributeEffects) {
+                    if (row.effect != AttributeEffect::Align) continue;
+                    for (std::string const& nm : row.names)
+                        if (id == nm) { alignRow = &row; break; }
+                    if (alignRow != nullptr) break;
+                }
+                if (alignRow != nullptr) {
+                    NodeId const operand = attrClauseArgOperand(cfg, tree, cl);
+                    if (!operand.valid()) {
+                        // ★ BARE `__attribute__((aligned))` on a composite — gcc reads
+                        // it as "the largest alignment useful on this target", a
+                        // TARGET-dependent number this engine has no business
+                        // inventing. FAIL LOUD, exactly as the declaration-level arm
+                        // does; the programmer can write the number.
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(cl);
+                        d.actual   = std::format(
+                            "attribute '{}' requires an explicit alignment argument "
+                            "(the bare form means the target's maximum useful "
+                            "alignment, which this implementation does not assume)",
+                            id);
+                        s.reporter.report(std::move(d));
+                        continue;
+                    }
+                    if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
+                                                      /*diagNode=*/cl, fromScope)) {
+                        if (!facts.alignment.has_value() || *a > *facts.alignment)
+                            facts.alignment = a;
+                    }
+                    continue;   // honored (or already diagnosed) — never "unknown"
+                }
+            }
+            if (strict && !stdForm && emitDiagnostics) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(cl);
+                d.actual   = std::string{tree.text(cl)};
+                s.reporter.report(std::move(d));
+            }
         }
     }
-    if (!listNode.valid()) return false;
-    bool packed = false;
-    // Each visible child of the list is ONE composite attribute (`compositeAttr` ->
-    // attrSpec | stdAttr). For each: does it NAME a packed attribute? and is it the
-    // STRICT (GNU) form (unrecognized -> diagnose) or the ignorable (C23) form?
-    for (NodeId attr : visibleChildren(tree, listNode)) {
-        if (tree.kind(attr) != NodeKind::Internal) continue;
-        bool named  = false;   // this attribute names `packed`
-        bool strict = false;   // this attribute is the GNU `__attribute__` form
-        std::vector<NodeId> stack{attr};
-        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
-            NodeId const cur = stack.back();
-            stack.pop_back();
-            if (tree.kind(cur) == NodeKind::Internal) {
-                if (cfg.compositeStrictAttrRule.valid()
-                    && tree.rule(cur).v == cfg.compositeStrictAttrRule.v) {
-                    strict = true;
-                }
-                for (NodeId g : visibleChildren(tree, cur)) stack.push_back(g);
-                continue;
-            }
-            if (cfg.identifierToken.valid()
-                && tree.tokenKind(cur) == cfg.identifierToken) {
-                std::string_view const id = stripDunder(tree.text(cur));
-                for (std::string const& nm : cfg.packedAttributeNames) {
-                    if (id == nm) { named = true; break; }
-                }
-            }
-        }
-        if (named) { packed = true; continue; }
-        // Not a recognized packed attribute. A GNU `__attribute__` typo / unsupported
-        // spelling fails loud (typo protection); a C23 `[[...]]` is standard-ignorable.
-        if (strict && emitDiagnostics) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-            d.severity = DiagnosticSeverity::Error;
-            d.buffer   = tree.source().id();
-            d.span     = tree.span(attr);
-            d.actual   = std::string{tree.text(attr)};
-            s.reporter.report(std::move(d));
-        }
-    }
-    return packed;
+    return facts;
 }
 
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EFFECTIVE alignment override a
@@ -3341,22 +4249,46 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        ScopeId scope, bool emitOnMiss,
                        bool allowFlexibleArray = false,
                        bool allowInitInferredArray = false,
-                       bool paramDecay = false);
+                       bool paramDecay = false,
+                       bool typeAliasRow = false);
 
-// c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): a declaration form with
-// `arrayToPointer` whose resolved declarator type is an ARRAY — sized
-// (`int a[64]`), incomplete (`int a[]`), or multi-dimensional (`int a[][5]`
-// — only the OUTERMOST dimension is the parameter's own type constructor) —
-// ADJUSTS to a POINTER to its element type. Applied at BOTH resolution
-// sites (the definitive Pass-1.5 visit that binds the symbol, and the
-// FnSig param harvest `declRowDeclaredType`), so the bound symbol, the
-// FnSig, and every call site agree by construction. The transparent
-// kind()/operands() accessors make a qualified element ride into the
-// pointee unchanged. Non-array types (and rows without the flag) pass
-// through untouched.
+// THE C 6.7.6.3 PARAMETER-TYPE ADJUSTMENTS — the ONE place a declaration
+// form flagged `paramAdjustments` rewrites a parameter's DECLARED type into
+// the type the parameter actually has. Two adjustments, both mandated by
+// the same clause and both landed here so coverage is BY CONSTRUCTION:
+//
+//   p7 (c82, D-CSUBSET-PARAM-ARRAY-ADJUSTMENT) — an ARRAY declared type,
+//      sized (`int a[64]`), incomplete (`int a[]`) or multi-dimensional
+//      (`int a[][5]` — only the OUTERMOST dimension is the parameter's own
+//      type constructor), ADJUSTS to POINTER-to-element.
+//   p8 (D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT) — a FUNCTION declared type
+//      (`void f(int g(int))`, or via one of the SDK's FUNCTION typedefs
+//      `void f(memory_reader_t r)` — `<malloc/malloc.h>`'s
+//      `memory_reader_t` / `vm_range_recorder_t` / `print_task_printer_t`
+//      are function, NOT function-pointer, typedefs) ADJUSTS to
+//      POINTER-to-function.
+//
+// ★ WHY p8 BELONGS HERE AND NOT AT THE REJECT SITE. Before this, a
+// function-typed parameter reached the FnSig-typed-Variable arm of the
+// Pass-1.5 bind and fired S_InvalidFunctionDeclarator ("function prototype
+// declarations are not supported here"). SUPPRESSING that reject would have
+// left the symbol typed `FnSig` — a function VALUE in a parameter slot,
+// which is not a thing that exists at runtime: a silent miscompile. The
+// adjustment is the actual C rule, and doing it here means every parameter
+// resolution path gets it, because they ALL funnel through this helper:
+// the definitive Pass-1.5 visit that binds the symbol, and the three
+// `declRowDeclaredType` arms (named declarator, ABSTRACT/type-only, legacy
+// typeChild row) that `collectParamTypes` routes every parameter through
+// to build the FnSig. Bound symbol, FnSig and call site therefore agree by
+// construction — no prototype-vs-definition asymmetry is expressible.
+//
+// c82: the CC's `va_list` is EXCLUDED — see the guard's own comment.
+// Non-array, non-function types (and rows without the flag) pass through
+// untouched. The transparent kind()/operands() accessors make a qualified
+// array element ride into the pointee unchanged.
 [[nodiscard]] TypeId
-adjustArrayToPointer(EngineState& s, DeclarationRule const& decl, TypeId t) {
-    if (!decl.arrayToPointer || !t.valid()) return t;
+adjustParamDeclaredType(EngineState& s, DeclarationRule const& decl, TypeId t) {
+    if (!decl.paramAdjustments || !t.valid()) return t;
     // c82: the CC's `va_list` is EXCLUDED — the per-CC va_* machinery (c63)
     // owns va_list parameter passing end-to-end (param slot, decay-at-call,
     // va_arg addressing), and C 7.16 makes a va_list observable only through
@@ -3366,6 +4298,11 @@ adjustArrayToPointer(EngineState& s, DeclarationRule const& decl, TypeId t) {
     // helper, so prototype/definition FnSigs stay structurally equal.
     if (s.vaListType.has_value() && t == *s.vaListType) return t;
     auto& in = s.lattice.interner();
+    // C 6.7.6.3p8: "A declaration of a parameter as 'function returning
+    // type' shall be adjusted to 'pointer to function returning type'."
+    // Ptr<FnSig> is ALREADY the adjusted form (isFnSig false) and is left
+    // alone — adjusting it again would build a pointer-to-pointer.
+    if (in.kind(t) == TypeKind::FnSig) return in.pointer(t);
     if (in.kind(t) != TypeKind::Array) return t;
     auto const elems = in.operands(t);
     if (elems.empty() || !elems[0].valid()) return t;  // interner invariant —
@@ -3397,7 +4334,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
                 // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA, FIX-2): an
-                // `arrayToPointer` row is a C PARAMETER — route its array-decay
+                // `paramAdjustments` row is a C PARAMETER — route its array-decay
                 // through the DISTINCT `paramDecay` signal (NOT the struct-field FAM
                 // `allowFlexibleArray`, which stays false here). paramDecay admits the
                 // absent-length `T x[]` AND builds a `vlaArray` for a non-outermost
@@ -3409,19 +4346,22 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     emitOnMiss,
                     /*allowFlexibleArray=*/false,
                     /*allowInitInferredArray=*/false,
-                    /*paramDecay=*/decl.arrayToPointer);
-                return adjustArrayToPointer(s, decl, t);
+                    /*paramDecay=*/decl.paramAdjustments,
+                    /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
+                return adjustParamDeclaredType(s, decl, t);
             }
             // Declarator structurally absent — a TYPE-ONLY (abstract) param.
-            // C 6.7.6.3p7 adjusts the declared type REGARDLESS of a name:
+            // C 6.7.6.3p7/p8 adjust the declared type REGARDLESS of a name:
             // `int f(const int[4]);` and `int f(const int a[4]);` are the
-            // SAME signature. Both the named path (above) and this abstract
-            // path run the ONE shared helper, so a prototype and its
-            // definition can never drift into an S0022/S0003 asymmetry —
-            // the exact mid-c82 shell.c failure (`sqlite3_vmprintf(const
-            // char*, va_list)` abstract vs the named caller param; va_list
-            // itself is EXCLUDED inside the helper, see its comment).
-            return adjustArrayToPointer(s, decl, head);
+            // SAME signature, and so are `void f(Fn);` and `void f(Fn g);`
+            // for a FUNCTION typedef `Fn`. Both the named path (above) and
+            // this abstract path run the ONE shared helper, so a prototype
+            // and its definition can never drift into an S0022/S0003
+            // asymmetry — the exact mid-c82 shell.c failure
+            // (`sqlite3_vmprintf(const char*, va_list)` abstract vs the
+            // named caller param; va_list itself is EXCLUDED inside the
+            // helper, see its comment).
+            return adjustParamDeclaredType(s, decl, head);
         }
         return InvalidType;   // a LIST row has no single param type
     }
@@ -3431,7 +4371,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         pty = applyArraySuffix(s, tree, decl, declNode, pty, scope, &cfg);
         // c82: the legacy-row twin of the declarator-mode adjustment above —
         // the two param-resolution shapes must not drift.
-        return adjustArrayToPointer(s, decl, pty);
+        return adjustParamDeclaredType(s, decl, pty);
     }
     return InvalidType;
 }
@@ -3443,7 +4383,9 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId suffix, TypeId inner,
                       ScopeId scope, bool emitOnMiss,
                       bool allowFlexibleArray = false,
-                      bool paramDecay = false) {
+                      bool paramDecay = false,
+                      bool allowInitInferredArray = false,
+                      bool typeAliasRow = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
     if (isFnSuffixRule(r, dc)) {
@@ -3505,7 +4447,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // ONLY inside a function-parameter declarator (C 6.7.6.3p7 adjusts it to
         // a pointer). For a PARAMETER (`paramDecay`) it is an UNSPECIFIED-size
         // (absent-length) array — IDENTICAL to a bare `[]` — that
-        // `adjustArrayToPointer` then strips to `Ptr<element>`; the `*` carries
+        // `adjustParamDeclaredType` then strips to `Ptr<element>`; the `*` carries
         // no runtime bound (unlike `[static n]`, so NEVER a vlaArray). A
         // NON-parameter `[*]` is a constraint violation — the SAME paramDecay
         // gate + diagnostic (S_ArrayParamQualifierNonParameter, 0xE054) a
@@ -3578,13 +4520,13 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
                     .has_value();
             // VLA C4a-param (D-CSUBSET-VLA, Option B): a C PARAMETER declarator
-            // (`arrayToPointer` row — a DISTINCT signal threaded as `paramDecay`, NEVER
+            // (`paramAdjustments` row — a DISTINCT signal threaded as `paramDecay`, NEVER
             // the struct-field FAM `allowFlexibleArray`). C 6.7.6.3p7 adjusts a param's
             // OUTERMOST array to a pointer, but a NON-outermost VLA suffix survives in
             // the pointee (`int (*p)[n]` → `int (*)[n]`; `int a[][n]` → same after the
             // decayed outer `[]`). Build the vlaArray for a PRESENT length so the
             // pointee carries the runtime row shape; an ABSENT `[]` is the (possibly
-            // outermost) decaying dim → incompleteArray, which `adjustArrayToPointer`
+            // outermost) decaying dim → incompleteArray, which `adjustParamDeclaredType`
             // then strips to `Ptr<element>`. Checked FIRST + kept off the FAM bool so
             // the struct-field FAM path (below) stays BYTE-IDENTICAL — a param never
             // reaches the FAM branch, a field never reaches here.
@@ -3614,8 +4556,52 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // already produced `inner` as the element; HIR→MIR sizes the runtime stride.
             if (hasPresentLength)
                 return s.lattice.interner().vlaArray(inner);
+            // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1: "If the size is not
+            // present, the array type is an incomplete type"): the bound is ABSENT
+            // (every present-bound arm returned above) and this declaration declares
+            // a TYPE, not an object — `typedef int T[];`. MEASURED as sqlite's
+            // blocker: `$SDK/usr/include/mach/vm_region.h:355` defines
+            // `VM_PAGE_INFO_MAX` as an EMPTY object-like macro, so `:357` expands to
+            // `typedef int vm_page_info_data_t[];`.
+            //   ★ WHY `typeAliasRow` AND NOT `allowFlexibleArray`. Reusing the FAM
+            // flag was tried and MEASURED WRONG: it is tested ABOVE the VLA arm (a
+            // struct field's `int a[n]` is deliberately a FAM, not a VLA member), so
+            // a typedef carrying it made `typedef int R[n];` stop building a vlaArray
+            // and silently become an incomplete array instead. The two are different
+            // rules. C's own distinction is TYPE-vs-OBJECT — 6.7.6.2p1 lets a type be
+            // incomplete, 6.7p7 forbids an object from being — so the signal is the
+            // row's config-declared `kind`, and placing the arm HERE (below every
+            // present-bound return) makes the VLA path untouchable by construction.
+            //   The incompleteness does NOT leak: an OBJECT of the alias fails loud
+            // S_IncompleteTypeObject, `sizeof` refuses (computeLayout nullopts), and
+            // a non-last / sole member keeps S_FlexibleArrayNotLast / SoleMember.
+            if (typeAliasRow)
+                return s.lattice.interner().incompleteArray(inner);
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
+        }
+        // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
+        // TRAILING `uint64_t ns_threadids[0];` member — MEASURED at
+        // $SDK/usr/include/sys/mount.h:366 (`struct netfs_status`, which sqlite
+        // reaches) — is the GNU spelling of a flexible array member, and that is
+        // exactly how it is admitted: a bound folding to EXACTLY 0 on a row that
+        // admits a FAM routes into the SAME `incompleteArray` the absent-length
+        // `[]` branch above builds. ONE mechanism, per the registry row's
+        // instruction to find the shared chokepoint before adding a second: `[0]`
+        // and `[]` therefore agree by construction on layout (0 bytes, element
+        // alignment, `sizeof` of the containing struct unchanged — MEASURED
+        // identical to /usr/bin/clang) and on POSITION (a non-trailing `[0]` is
+        // S_FlexibleArrayNotLast, a sole one S_FlexibleArraySoleMember — both from
+        // the shared composite-composition guard, neither special-cased here).
+        //   `allowInitInferredArray` EXCLUDES the init-inference relaxation. That
+        // bool is why the flag reaching this function is `decl.allowFlexibleArray
+        // || initNode.valid()`: without the exclusion `int a[0] = {1};` would stop
+        // being S_ArrayLengthOutOfRange and get SILENTLY re-sized to `int[1]` by
+        // the initializer backfill — a written bound overwritten without a word.
+        //   A `[0]` on any other row (a plain local/global object, a parameter)
+        // keeps the out-of-range reject below.
+        if (*len == 0 && allowFlexibleArray && !allowInitInferredArray) {
+            return s.lattice.interner().incompleteArray(inner);
         }
         if (*len <= 0) {
             emit(DiagnosticCode::S_ArrayLengthOutOfRange);
@@ -3653,7 +4639,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray, bool allowInitInferredArray,
-                   bool paramDecay) {
+                   bool paramDecay, bool typeAliasRow) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!direct.valid() || !base.valid()) return InvalidType;
@@ -3700,7 +4686,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss, allowFlexibleArray, paramDecay);
+                                  emitOnMiss, allowFlexibleArray, paramDecay,
+                                  allowInitInferredArray, typeAliasRow);
         if (!t.valid()) return InvalidType;
     }
 
@@ -3729,7 +4716,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
                                       /*allowFlexibleArray=*/allowInitInferredArray,
                                       /*allowInitInferredArray=*/allowInitInferredArray,
-                                      /*paramDecay=*/false);
+                                      /*paramDecay=*/false,
+                                      /*typeAliasRow=*/typeAliasRow);
     }
     return t;   // abstract direct — the type itself
 }
@@ -3738,7 +4726,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
                               bool allowFlexibleArray, bool allowInitInferredArray,
-                              bool paramDecay) {
+                              bool paramDecay, bool typeAliasRow) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -3752,7 +4740,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         // signal belongs to the wrapped declarator, not this init-declarator shell).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay);
+                                      allowInitInferredArray, paramDecay,
+                                      typeAliasRow);
     }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
     // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
@@ -3776,7 +4765,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         // slot; paramDecay is false here in practice, but stay signal-preserving).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay);
+                                      allowInitInferredArray, paramDecay,
+                                      typeAliasRow);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -3825,7 +4815,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // depth from the loop above.
     return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
                               allowFlexibleArray, allowInitInferredArray,
-                              paramDecay);
+                              paramDecay, typeAliasRow);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -3937,6 +4927,21 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 // `declaratorRule` — structurally identical to how the HIR global-init lowering
 // finds the init (cst_to_hir.cpp `lowerVarLikeInto`), so the two cannot drift.
 // Config-driven on the resolved rule ROLES (no keyword / `=`-token identity).
+// TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): is `c` an AFTER-DECLARATOR attribute node
+// (`attrSpec`/`stdAttr` in an `initDeclarator`)? Every init-detection scan below
+// (which reads the "first non-declarator visible child" as the initializer) MUST
+// skip these, else `void f(void) __attribute__((format(printf,1,2)));` mis-reads
+// the attribute as the init value and type-checks its args → S_TypeMismatch.
+[[nodiscard]] inline bool isAfterDeclaratorAttrNode(Tree const& tree,
+                                                    DeclaratorConfig const& dc,
+                                                    NodeId c) {
+    if (tree.kind(c) != NodeKind::Internal) return false;
+    RuleId const r = tree.rule(c);
+    for (RuleId ar : dc.afterDeclaratorAttrRules)
+        if (r.v == ar.v) return true;
+    return false;
+}
+
 [[nodiscard]] bool declaratorHasInitializer(Tree const& tree,
                                             DeclaratorConfig const& dc,
                                             NodeId dNode) {
@@ -3945,9 +4950,81 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;   // skip the `=` token
         if (tree.rule(c) == dc.declaratorRule) continue;    // the declarator itself
+        if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
         return true;   // any other internal child IS the initValue
     }
     return false;
+}
+
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5):
+// the EXPLICIT assembler name written on
+// declarator carrier `dNode`, or `nullopt` when it carries none.
+//
+// The label's payload is a `stringLiteralExpr`, NOT a lone string token, because the
+// macOS SDK spelling is an adjacent-concatenated run (`__asm("_" __STRING(sym)
+// __DARWIN_SUF_UNIX03)`). Decoding routes through the SHARED
+// `decodeAdjacentStringBodies` chokepoint — a consumer that read only the first body
+// would rename every SDK symbol to `_`.
+//
+// FAIL-LOUD, NEVER A SILENT FALL-BACK TO THE C NAME (which is what an asm label
+// exists to replace):
+//   * two labels on one declarator  → S_AsmLabelDuplicate (which one was meant is
+//     genuinely unknown; first-wins would rename to one of two names in silence);
+//   * a malformed escape            → S_AsmLabelInvalid;
+//   * a decoded-EMPTY name          → S_AsmLabelInvalid. An empty name is the most
+//     dangerous of the three: `compile_pipeline`'s `nameOf` reads "" as
+//     "module-private" and DROPS the symbol-table row, so the object writer
+//     substitutes a synthetic `sym_<id>` and the build stays green to link.
+//
+// Structural, not rule-name-keyed: the payload is the asm-label node's sole visible
+// Internal child (the grammar is `AsmKeyword '(' stringLiteralExpr ')'`).
+[[nodiscard]] std::optional<std::string>
+readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+             NodeId dNode) {
+    if (!cfg.declarators.has_value()) return std::nullopt;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    NodeId const labelNode = asmLabelNodeOf(tree, dNode, dc);
+    if (!labelNode.valid()) return std::nullopt;
+    auto const fail = [&](DiagnosticCode code, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(labelNode);
+        d.actual   = std::move(what);
+        s.reporter.report(std::move(d));
+        return std::optional<std::string>{};
+    };
+    if (asmLabelCountOf(tree, dNode, dc) > 1) {
+        return fail(DiagnosticCode::S_AsmLabelDuplicate,
+                    std::format("'{}' — a declarator may carry at most one asm "
+                                "label; which assembler name was intended cannot "
+                                "be inferred", tree.text(dNode)));
+    }
+    NodeId payload{};
+    for (NodeId c : visibleChildren(tree, labelNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        payload = c;
+        break;
+    }
+    if (!payload.valid()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    std::string{tree.text(labelNode)});
+    }
+    auto decoded = decodeAdjacentStringBodies(tree, payload,
+                                              s.idx().stringLiteralBodyToken);
+    if (!decoded.has_value()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    std::format("'{}' — the asm label has a malformed escape; the "
+                                "assembler name cannot be decoded",
+                                tree.text(payload)));
+    }
+    if (decoded->empty()) {
+        return fail(DiagnosticCode::S_AsmLabelInvalid,
+                    "an asm label may not be empty — an empty assembler name "
+                    "would emit no symbol at all, silently");
+    }
+    return decoded;
 }
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): enforce the C11/C23 6.7.1 thread-storage
@@ -4176,7 +5253,10 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
 //                 global (C 6.9.2); the absorbed tentative emits no HIR node.
 //   definition → definition : two bodies / two REAL (initialized) object definitions
 //                 → S_RedeclaredSymbol. (`int g=1; int g=2;` collides; `int g; int
-//                 g=5;` does NOT — the tentative is non-defining.)
+//                 g=5;` does NOT — the tentative is non-defining.) ONE exception,
+//                 TF-C97 (C11 6.7p3): a TYPEDEF↔TYPEDEF pair (both Type-kind, so
+//                 both rank as definitions) MERGES and is verified after Pass 1.5
+//                 against the two RESOLVED TypeIds — see `typedefRepeat` below.
 // CATEGORY GUARD: a non-defining declaration MERGES only with a declaration of the
 // SAME declaration category — Function, Variable, Type, or Table. A function and an
 // OBJECT (Variable), a typedef (Type) and an object/function, or any future Table vs
@@ -4210,6 +5290,33 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     bool const priorNonDef = priorRec.isProtoDeclaration
                              || priorRec.isExternDeclaration
                              || priorRec.isTentativeDefinition;
+    // D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL: the surviving binding must
+    // be the MOST-DEFINING of the merged declarations, because emission keys off
+    // the survivor's flags. Defining rank: a REAL (initialized) definition emits
+    // storage AND collides with another → 3; a TENTATIVE definition emits storage
+    // but merges → 2; an EXTERN/proto declaration emits NO storage (an import row
+    // or nothing) → 1. The old routing kept the PRIOR binding whenever the new
+    // decl was non-defining, so `extern int g;` then `int g;` kept the EXTERN
+    // (rank 1) and dropped the tentative (rank 2) — the whole TU then emitted an
+    // import and no storage, and the link failed with an undefined symbol. This
+    // is the extern-in-header-then-define-in-.c pattern, so it blocked essentially
+    // every multi-file C program (the amalgamation masked it). Comparing ranks
+    // makes the tentative win over the extern, while leaving every prior case
+    // byte-identical (`priorNonDef && !newNonDef` was exactly "new rank 3 beats a
+    // prior rank < 3").
+    auto definingRank = [](SymbolRecord const& r, bool nonDef) -> int {
+        if (r.isTentativeDefinition) return 2;
+        if (r.isExternDeclaration || r.isProtoDeclaration) return 1;
+        // `nonDef` is derived at both call sites from exactly {isProto, isExtern,
+        // isTentative}, all matched above — so a non-defining record always took
+        // one of the earlier arms and the `nonDef ? 1` branch is unreachable
+        // today. Kept defensively: if a future flag makes a record non-defining
+        // without one of those three, it ranks as a declaration (1), not a
+        // definition (3) — the conservative direction (never invent storage).
+        return nonDef ? 1 : 3;
+    };
+    int const priorRank = definingRank(priorRec, priorNonDef);
+    int const newRank   = definingRank(s.symbols.at(newId), newNonDef);
     // Precise declaration category: a proto (kind Variable + isProtoDeclaration,
     // pre-upgrade) counts as Function; Variable / Type / Table stay distinct.
     auto category = [](SymbolRecord const& r) {
@@ -4219,7 +5326,52 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     };
     bool const sameCategory = category(priorRec) == category(s.symbols.at(newId));
     bool const bothDefinitions = !priorNonDef && !newNonDef;
-    if (sameCategory && !bothDefinitions) {
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): a `maybeFnTypedefProto` CANDIDATE (a
+    // bare typedef-headed object declaration, e.g. `Tcl_ObjCmdProc foo;`) meeting a
+    // GENUINE function of the same name is PROVISIONALLY a function prototype +
+    // its definition (C 6.7 / 6.9.1p2) — but the candidate's function-ness is not
+    // yet resolved (Pass 1). Route it through the SAME proto/def MERGE path (so the
+    // definition wins the binding and the candidate is absorbed) and VERIFY after
+    // Pass 1.5: the merged-decl sweep re-checks the candidate's resolved type and,
+    // if it is NOT a function signature, emits the deferred S_RedeclaredSymbol
+    // (a genuine object-vs-function clash). Deliberately ONE genuine function + ONE
+    // candidate — NEVER candidate-vs-candidate (two bare typedef-headed objects are
+    // ambiguous OBJECTS that keep the ordinary same-category tentative-merge path,
+    // never a function proto merge). `category()` is intentionally left unchanged so
+    // an object-object typedef merge is byte-identical.
+    bool const priorIsFn = priorRec.kind == DeclarationKind::Function
+                           || priorRec.isProtoDeclaration;
+    bool const newIsFn = s.symbols.at(newId).kind == DeclarationKind::Function
+                         || s.symbols.at(newId).isProtoDeclaration;
+    bool const crossFnVarMerge =
+        (priorIsFn && s.symbols.at(newId).maybeFnTypedefProto)
+        || (newIsFn && priorRec.maybeFnTypedefProto);
+    // TF-C97 (D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE, C11 6.7p3): "a typedef name may
+    // be redefined to denote the same type as it currently does, provided that
+    // type is not a variably modified type". A typedef is neither a prototype nor
+    // an extern nor a tentative definition, so `definingRank` ranks BOTH sides 3
+    // and `bothDefinitions` is true — the definedness ladder has no notion of a
+    // typedef, which is why a LEGAL repeat collided S_RedeclaredSymbol. The
+    // category was never the problem (`category()` already returns Type for both);
+    // admit the both-definitions arm for a Type↔Type pair ALONE and let the
+    // post-1.5 sweep decide, exactly as C34c's candidate does.
+    // ★ WHY NOT DECIDE HERE: at Pass 1 neither side's type is resolved (each
+    // declarator's type is composed in Pass 1.5), so "do they denote the same
+    // type" is unanswerable at this seam — `typedef struct _mz_t mz_t;` names a
+    // tag that a LATER declaration completes. Reusing `mergedFnDecls` rather than
+    // opening a second post-1.5 sweep is deliberate: one sweep cannot drift from
+    // itself, and the verification (resolved TypeId equality + the C11
+    // variably-modified carve-out) lives entirely there.
+    // ★ SPELLINGS ARE NEVER COMPARED — only RESOLVED TypeIds. Two spellings of one
+    // type must merge (`struct _mz_t` reached through a forward declaration and
+    // through its completion); one spelling of two types must not.
+    // MEASURED WITNESS: sqlite's mem1.c on macOS reaches `malloc_zone_t` twice —
+    // `$SDK/usr/include/malloc/_malloc_type.h:79` typedefs the forward-declared
+    // tag, `malloc/malloc.h:246` typedefs the SAME tag at its completion. Legal
+    // C11, and the last S0002 on the arm64-macho sqlite leg.
+    bool const typedefRepeat = bothDefinitions && sameCategory
+                               && category(priorRec) == DeclarationKind::Type;
+    if (((sameCategory || crossFnVarMerge) && !bothDefinitions) || typedefRepeat) {
         // TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): a thread-storage
         // specifier "shall be present in the declaration of every declared
         // name with thread storage duration" — an OBJECT merge pair that
@@ -4253,13 +5405,31 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             }
             s.reporter.report(std::move(d));
         }
-        if (priorNonDef && !newNonDef) {
-            // nonDefining → definition: the DEFINITION wins the binding; the prior
-            // non-defining decl is absorbed (a proto/extern declarator emits no HIR
-            // node — see the topLevelDecl proto-skip and lowerExternDecl's
-            // absorbed-skip).
+        if (newRank > priorRank) {
+            // The NEW declaration is more-defining (rank) than the prior, so it
+            // wins the binding and the prior is absorbed. Covers the classic
+            // nonDefining → definition (proto/extern → real def, rank 1→3) AND the
+            // D-CSUBSET-TENTATIVE-DEFINITION-AFTER-EXTERN-DECL case
+            // (extern → tentative, rank 1→2): the tentative must survive so it
+            // emits the zero-init global instead of the extern emitting an import.
+            // The absorbed prior emits no HIR node (the topLevelDecl proto-skip /
+            // lowerExternDeclInto absorbed-skip).
             s.scopes.injectBinding(bindScope, name, newId);
             priorRec.isAbsorbedProto = true;
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label RIDES THE
+            // MERGE. MEASURED
+            // against /usr/bin/clang — `int deffn(int) __asm("mydeffn"); int
+            // deffn(int x){…}` emits the symbol `mydeffn`, i.e. a label on the
+            // absorbed DECLARATION renames the surviving DEFINITION, which is
+            // exactly how every `__DARWIN_ALIAS` header is meant to work (the
+            // header declares the rename, the library defines the function).
+            // Carried only when the survivor has none of its own, so an explicit
+            // label on the definition wins and two conflicting labels never
+            // silently swap. Empty stays empty.
+            if (s.symbols.at(newId).asmName.empty()
+                && !priorRec.asmName.empty()) {
+                s.symbols.at(newId).asmName = priorRec.asmName;
+            }
             s.nodeToSymbol.set(nameNode, newId);
             s.mergedFnDecls.push_back({newId, prior});
         } else {
@@ -4272,6 +5442,16 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             // an incompatible def→proto / def→extern). Aiming at `prior` would clobber
             // the survivor's resolved type and hide the mismatch.
             s.symbols.at(newId).isAbsorbedProto = true;
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the mirror direction — a
+            // definition (or an earlier
+            // declaration) survives and the NEW redundant declaration carries the
+            // label (`int deffn(int x){…} int deffn(int) __asm("mydeffn");`).
+            // Same rule, same reason: the survivor keeps its own label if it has
+            // one, else it adopts the absorbed declaration's.
+            if (priorRec.asmName.empty()
+                && !s.symbols.at(newId).asmName.empty()) {
+                priorRec.asmName = s.symbols.at(newId).asmName;
+            }
             s.nodeToSymbol.set(nameNode, newId);
             s.mergedFnDecls.push_back({prior, newId});
         }
@@ -4430,8 +5610,38 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // is NOT one (its suffix sits on the outer declarator).
                         // Computed BEFORE the bind scope is chosen because a
                         // prototype re-homes onto the file scope (below).
+                        //
+                        // ★ A PARAMETER IS NEVER A PROTOTYPE (C 6.7.6.3p8 —
+                        // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT). The INLINE
+                        // function-typed parameter `int f(int g(int))` writes the
+                        // very same syntax a prototype does — a name carrying a
+                        // `()` suffix — so this purely SYNTACTIC test used to call
+                        // it one, and the damage was two-fold and MEASURED:
+                        //   (1) the bind scope below re-homed the parameter onto
+                        //       the FILE scope, so two functions whose parameters
+                        //       merely SHARE a name (`int a(int g(int))` and
+                        //       `int b(long g(long))`) collided as incompatible
+                        //       redeclarations (S0022) — a parameter name has no
+                        //       linkage and is scoped to its own declarator
+                        //       (C 6.2.1p4), so legal C was rejected;
+                        //   (2) `isProtoDeclaration` rode the SymbolRecord into
+                        //       CST→HIR, whose D-CSUBSET-FN-PROTOTYPE gate emits
+                        //       NO VarDecl for a prototype — the parameter slot
+                        //       silently vanished and the Function's param count
+                        //       fell BELOW its FnSig's (H_UnsupportedLoweringForKind
+                        //       at HIR→MIR: "param count 1 mismatches ... 2").
+                        // p8 makes the declared type of such a parameter a POINTER,
+                        // not a function, so `paramAdjustments` — the row flag that
+                        // declares "this row is a C PARAMETER, apply the 6.7.6.3
+                        // adjustments" and drives `adjustParamDeclaredType` — is
+                        // exactly the signal that no declarator on this row can be a
+                        // prototype. Config-driven, no rule-name identity. The
+                        // TYPEDEF spelling (`void f(Fn g)`) never reached here (its
+                        // declarator carries no `()` suffix), which is precisely why
+                        // it worked while the inline twin did not.
                         bool const isProto =
                             (effectiveKind == DeclarationKind::Variable)
+                            && !decl.paramAdjustments
                             && nameNode.valid()
                             && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
                         // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function
@@ -4449,8 +5659,24 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // at HIR→MIR exactly like a file-scope undefined proto
                         // (consistent fail-loud, not a block-local shadow). A
                         // non-proto declarator binds in `current` unchanged.
+                        //
+                        // D-CSUBSET-BLOCK-SCOPE-EXTERN / D-CSUBSET-EXTERN-MULTI-
+                        // DECLARATOR: the re-home is for a BARE prototype (implicit
+                        // external linkage referring to the file-scope function). An
+                        // EXPLICIT `extern` declaration (nonDefiningDeclaration) is
+                        // NOT re-homed: it is a non-defining declaration that already
+                        // merges cross-TU via the extern path (isExtern below), and a
+                        // block-scope extern — OBJECT (isProto false) OR FUNCTION
+                        // (isProto true, e.g. `extern int f(int);` in a body) — MUST
+                        // bind in the CURRENT block scope so a block extern that
+                        // shadows an outer local reads the extern, not the local
+                        // (C 6.2.1; design-audit Finding 3). Suppressing the re-home
+                        // for `nonDefiningDeclaration` keeps the C10 block-scope-extern
+                        // shadow rule for BOTH forms; a file-scope extern is already at
+                        // file scope, so the guard is a no-op there.
                         ScopeId bindScope = current;
-                        if (isProto) bindScope = fileScopeOf(s, tree, current);
+                        if (isProto && !decl.nonDefiningDeclaration)
+                            bindScope = fileScopeOf(s, tree, current);
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
                         // declaration with NO initializer is a TENTATIVE DEFINITION
                         // (C 6.9.2) — it announces an object whose single definition
@@ -4487,6 +5713,38 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             && cfg.declarators.has_value()
                             && !declaratorHasInitializer(tree, *cfg.declarators,
                                                          dNode);
+                        // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): a bare
+                        // UNDECORATED-name object declaration whose head is a
+                        // type-NAME (a potential typedef) is a CANDIDATE function
+                        // prototype — `T x;` declares a FUNCTION when T is a
+                        // function type (C 6.7 / 6.9.1p2). The head type is not
+                        // resolved until Pass 1.5 (and a shipped-descriptor typedef
+                        // is not even in scope during Pass 1), so the function-ness
+                        // is verified there; here we only FLAG the candidate so a
+                        // same-name definition MERGES with it (via `category()`)
+                        // instead of a premature cross-category collision. Gated to
+                        // object-declaration rows (a declarator LIST, no bit-field
+                        // suffix) so a struct field / parameter is never a candidate;
+                        // a syntactic `name()` proto (already `isProto`) and an
+                        // initialized declarator (a proto has no initializer) are
+                        // excluded.
+                        bool maybeFnTypedefProto = false;
+                        if (effectiveKind == DeclarationKind::Variable
+                            && !isProto
+                            && cfg.declarators.has_value()
+                            && decl.declaratorListChild.has_value()
+                            && !decl.bitfieldSuffix.has_value()
+                            && !declaratorHasInitializer(tree, *cfg.declarators,
+                                                         dNode)
+                            && declaratorIsUndecoratedName(tree, nameNode,
+                                                           *cfg.declarators)) {
+                            NodeId const headNode =
+                                (decl.headChild.has_value()
+                                 && *decl.headChild < kids.size())
+                                    ? kids[*decl.headChild] : NodeId{};
+                            maybeFnTypedefProto = headNamesPotentialTypedef(
+                                tree, headNode, cfg.identifierToken);
+                        }
                         SymbolRecord rec;
                         rec.name         = name;
                         rec.scope        = bindScope;
@@ -4494,6 +5752,53 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.declRuleNode = node;
                         rec.tree         = tree.id();
                         rec.kind         = effectiveKind;
+                        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the EXPLICIT
+                        // assembler name
+                        // for THIS declarator. Read here — inside the per-declarator
+                        // loop, from `dNode` — because a label is per-declarator in
+                        // C: `int a __asm("x"), b __asm("y");` names two different
+                        // symbols, and a declaration-level read would give both the
+                        // same one. `readAsmLabel` fails loud on a duplicate /
+                        // malformed / empty label and returns nullopt, so a rejected
+                        // label leaves `asmName` empty and the symbol keeps its
+                        // ordinary mangled name — the diagnostic, not a wrong
+                        // symbol, is what the programmer sees.
+                        if (auto label = readAsmLabel(s, cfg, tree, dNode))
+                            rec.asmName = std::move(*label);
+                        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): an asm label on
+                        // an AUTOMATIC block-scope object
+                        // has nothing to rename — the object lives in a stack slot,
+                        // not the symbol table. WARN and DROP the label (matching
+                        // `/usr/bin/clang`, MEASURED: "ignored asm label 'x' on
+                        // automatic variable"). Erroring would refuse C every real
+                        // toolchain compiles; staying silent would leave the
+                        // programmer believing a rename happened. The storage test
+                        // reads the SAME `linkageSpecifiers` staticStorage facet the
+                        // static-local LOWERING routes on, so the warning and the
+                        // routing can never disagree about which locals are
+                        // automatic. A FUNCTION, a prototype, an `extern`, a
+                        // file-scope object and a `static` local all keep theirs.
+                        if (!rec.asmName.empty()
+                            && effectiveKind == DeclarationKind::Variable
+                            && !isProto
+                            && !decl.nonDefiningDeclaration
+                            && bindScope.v != fileScopeOf(s, tree, bindScope).v
+                            && !scanSpecifierPrefixStorage(tree, node, decl)
+                                    .staticStorage) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::
+                                S_AsmLabelOnAutomaticVariable;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            d.actual   = std::format(
+                                "asm label '{}' is ignored on '{}' — an automatic "
+                                "variable has no assembler symbol to rename "
+                                "(declare it 'static' or at file scope)",
+                                rec.asmName, name);
+                            s.reporter.report(std::move(d));
+                            rec.asmName.clear();
+                        }
                         // A function PROTOTYPE is a function DECLARATION, never an
                         // "unused variable" — suppress warnIfUnused for it. This
                         // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-
@@ -4566,11 +5871,26 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             rec.isThreadLocal = true;
                         }
                         rec.isProtoDeclaration = isProto;
+                        rec.maybeFnTypedefProto = maybeFnTypedefProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
                         // declaration (c-subset's `extern`) — config-driven, no
                         // rule-name identity. Like a prototype it is a non-defining
                         // declaration that MERGES with an in-TU definition.
-                        bool const isExtern = decl.nonDefiningDeclaration;
+                        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an
+                        // `extern` on a FUNCTION DEFINITION (`extern int f(void){…}`)
+                        // is a DEFINING declaration despite the row's
+                        // `nonDefiningDeclaration` default — the body IS the
+                        // definition. The kindByChild discriminator already upgraded
+                        // effectiveKind to Function (a block tail present), so
+                        // suppress the non-defining marking there: the symbol carries
+                        // a body, collides (not merges) with another definition, and
+                        // CST→HIR lowers a real Function (not an ExternFunction
+                        // import). A prototype/object extern (effectiveKind Variable)
+                        // stays non-defining. Generic — any declarator-mode row that
+                        // is BOTH nonDefiningDeclaration AND kindByChild-Function
+                        // resolves a definition as defining (only externDecl is today).
+                        bool const isExtern = decl.nonDefiningDeclaration
+                            && effectiveKind != DeclarationKind::Function;
                         rec.isExternDeclaration = isExtern;
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
                         // state so a LATER redeclaration sees THIS symbol (as `prior`)
@@ -4962,6 +6282,7 @@ initializerNodeOf(Tree const& tree, NodeId dNode, DeclaratorConfig const& dc) {
     for (NodeId c : visibleChildren(tree, dNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == dc.declaratorRule.v) continue;
+        if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
         return c;   // the `= init` value subtree
     }
     return {};
@@ -5235,6 +6556,7 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         for (NodeId c : visibleChildren(tree, dNode)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c) == dc.declaratorRule) continue;
+            if (isDeclaratorDecorationNode(tree, dc, c)) continue;  // TF-C62 / TF-C88
             initNode = c;
             break;
         }
@@ -5539,6 +6861,12 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // on a non-function object is inert — a named safe-miss deferral).
                     bool const declHasNoreturn =
                         specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4):
+                    // does this declaration's specifier prefix spell `inline`
+                    // WITHOUT `extern`? Computed ONCE per declaration (the
+                    // `declHasNoreturn` shape); STORED per-declarator below.
+                    bool const declHasInline =
+                        specifierPrefixHasInline(cfg, tree, node, decl);
                     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the standard-
                     // attribute effects from this declaration's specifier
                     // prefix ONCE (like `declAlignasSpec`/`declHasNoreturn`);
@@ -5546,13 +6874,61 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // `[[maybe_unused]] int a, b;` flags both. emitUnknown=true
                     // — this is the once-per-declaration site, so an unknown
                     // `[[frobnicate]]` warns exactly once even multi-declarator.
+                    // ★ TF-C73 MULTI-ROOT SCAN, roots (a). The scan used to run from
+                    // the specifier prefix ALONE, so an attribute written anywhere
+                    // else on the declaration was parsed and SILENTLY IGNORED — for
+                    // `typedefDecl` that is both of its `typedefAttrRun` slots, i.e.
+                    // the SDK's dominant spellings (`typedef int64_t
+                    // __attribute__((__aligned__(8))) _OSAtomic_int64_t;`).
+                    // `declarationAttrSlotRules` names the DIRECT-CHILD rules that
+                    // carry them, by RULE NAME so a mistake is a loud loader error.
+                    // ORDER IS SOURCE ORDER — prefix first, then the slots in
+                    // `visibleChildren` order — because the fold is
+                    // first-non-empty-wins, and that must mean the LEFTMOST spelling.
                     AttributeSemanticsFacts declAttrFacts;
                     scanAttributeSemantics(
                         s, cfg, tree, specifierPrefixChild(tree, node, decl),
-                        /*emitUnknown=*/true, declAttrFacts);
+                        /*emitUnknown=*/true, declAttrFacts, here,
+                        decl.unknownStrictAttributeIsError);
+                    for (NodeId slot : visibleChildren(tree, node)) {
+                        if (tree.kind(slot) != NodeKind::Internal) continue;
+                        bool isSlot = false;
+                        for (RuleId sr : decl.declarationAttrSlotRules)
+                            if (tree.rule(slot).v == sr.v) { isSlot = true; break; }
+                        if (!isSlot) continue;
+                        scanAttributeSemantics(s, cfg, tree, slot,
+                                               /*emitUnknown=*/true, declAttrFacts,
+                                               here,
+                                               decl.unknownStrictAttributeIsError);
+                    }
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
                     bool alignasContextReported = false;
+                    // TF-C73: the GNU `aligned(N)` twin of `alignasContextReported`
+                    // — a DECLARATION-LEVEL `aligned` is ONE spelling shared by every
+                    // declarator, so an un-honorable context reports once. A
+                    // DECLARATOR-LEVEL one is its own spelling and is NOT gated.
+                    bool attrAlignContextReported = false;
+                    // ★★ TF-C93: the decl-kind gate's latch — the clause nodes it
+                    // has ALREADY reported for this declaration
+                    // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). Same
+                    // declaration scope and same purpose as the two flags above,
+                    // one granularity finer: keyed on the offending SPELLING
+                    // rather than on "has anything been reported", so
+                    // `__attribute__((noinline)) int a, b, c;` warns ONCE (the
+                    // declaration-level facts are copied into every declarator
+                    // carrying the same clause `NodeId`) while TWO differently
+                    // misplaced attributes on one declaration still get one
+                    // diagnostic EACH. `NodeId::v` (the raw handle) is stored so
+                    // the latch needs no ordering/hashing support from `NodeId`;
+                    // the list is at most one entry per attribute clause on one
+                    // declaration, so a linear scan is the right shape.
+                    // ⚠ MEASURED: deleting this latch does NOT change today's
+                    // output — `DiagnosticReporter`'s `dedupWindow` already
+                    // collapses the identical repeats. It is kept so the property
+                    // belongs to the gate rather than to a configurable noise cap;
+                    // the full reasoning is at the gate itself, below.
+                    std::vector<decltype(NodeId{}.v)> declKindAttrReported;
                     std::optional<std::uint32_t> declAlignOverride;
                     for (NodeId dNode : declarators) {
                         // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
@@ -5575,7 +6951,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
                         // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA,
-                        // FIX-2): an `arrayToPointer` row (a C parameter) routes
+                        // FIX-2): an `paramAdjustments` row (a C parameter) routes
                         // its array-decay through the DISTINCT `paramDecay`
                         // signal, NOT `allowIncomplete` (the struct-field FAM /
                         // init-inference bool) — so a param's present-length
@@ -5587,11 +6963,18 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // as the bound type.
                         bool const allowIncomplete =
                             decl.allowFlexibleArray || initNode.valid();
+                        // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
+                        // TYPE rather than an object may name an INCOMPLETE array
+                        // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
+                        // this row's own `kind`, so no new vocabulary and no rule
+                        // spelling; the resolver applies it BELOW its VLA arm, so a
+                        // `typedef int R[n];` still builds a vlaArray.
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, allowIncomplete,
                             /*allowInitInferredArray=*/initNode.valid(),
-                            /*paramDecay=*/decl.arrayToPointer);
+                            /*paramDecay=*/decl.paramAdjustments,
+                            /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
@@ -5600,12 +6983,17 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (!decl.allowFlexibleArray)
                             declTy = completeIncompleteArrayFromInit(
                                 s, s.idx(), tree, initNode, declTy);
-                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT: the definitive
-                        // adjustment — the bound param symbol carries the
-                        // POINTER (sizeof(param)==pointer-size, body indexing
-                        // reads through it), mirroring the harvest site in
-                        // `declRowDeclaredType` so the FnSig agrees.
-                        declTy = adjustArrayToPointer(s, decl, declTy);
+                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (p7) +
+                        // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (p8): the
+                        // definitive adjustment — the bound param symbol
+                        // carries the POINTER (sizeof(param)==pointer-size,
+                        // body indexing / calls read THROUGH it), mirroring
+                        // the harvest site in `declRowDeclaredType` so the
+                        // FnSig agrees. p8 running HERE is also what keeps
+                        // the FnSig-typed-Variable reject below unreachable
+                        // for parameters: the param's type is Ptr<FnSig>
+                        // (isFnSig false) by the time that arm is tested.
+                        declTy = adjustParamDeclaredType(s, decl, declTy);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -5715,12 +7103,33 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // (never an incomplete composite) and is correctly NOT
                             // flagged; an `extern` declaration (completed elsewhere)
                             // is excluded. Mirrors S_IncompleteTypeMember.
+                            //
+                            // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: the incomplete
+                            // ARRAY twin, and THE reason admitting `typedef int
+                            // T[];` is safe. An incomplete array reaching an
+                            // object declarator can only have arrived through a
+                            // TYPEDEF NAME (a written `[]` on a row without
+                            // `allowFlexibleArray` is already S_NonConstant-
+                            // ArrayLength, and an init-inferred `[]` was COMPLETED
+                            // above), and `computeLayout` returns nullopt for it —
+                            // so without this arm `T x;` would reach codegen as an
+                            // object whose size nobody can state, i.e. silently 0.
+                            // The C rule is the same one the composite arm cites
+                            // (6.7p7: an object shall have a complete type by the
+                            // end of its declarator). The FAM position is NOT
+                            // affected: a struct field row carries no
+                            // `requireNamedDeclarators`, so a last-and-non-sole
+                            // `T` member still lays out as a flexible array
+                            // member, and the non-last / sole positions keep their
+                            // own loud S_FlexibleArrayNotLast / SoleMember.
                             if (s.symbols.at(sym).kind
                                         == DeclarationKind::Variable
                                 && decl.requireNamedDeclarators
                                 && !s.symbols.at(sym).isExternDeclaration
-                                && s.lattice.interner()
-                                       .isIncompleteComposite(declTy)) {
+                                && (s.lattice.interner()
+                                        .isIncompleteComposite(declTy)
+                                    || s.lattice.interner()
+                                           .isIncompleteArray(declTy))) {
                                 ParseDiagnostic d;
                                 d.code     = DiagnosticCode::S_IncompleteTypeObject;
                                 d.severity = DiagnosticSeverity::Error;
@@ -5782,7 +7191,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         && scanCompositePacked(
                                                s, cfg, tree,
                                                s.scopes.scopes()[here.v].anchor,
-                                               /*emitDiagnostics=*/false)) {
+                                               /*emitDiagnostics=*/false).packed) {
                                         naturalBaseline = 1u;
                                     }
                                     declAlignOverride = resolveAlignasOverride(
@@ -5813,14 +7222,171 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // ★★ TF-C93: "WHAT KIND OF ENTITY DOES THIS DECLARATOR
+                        // EFFECTIVELY DECLARE?" — ONE definition, THREE readers.
+                        //
+                        // The predicate `isFnSig || isFunctionForm || kind ==
+                        // Function` existed in TWO independent copies before this
+                        // (the `alignas` context gate and the GNU-`aligned` sink),
+                        // and TF-C93 needs a third reader. Three hand-copies of a
+                        // three-term disjunction is how one of them quietly loses a
+                        // term; a lambda gives them one body.
+                        //
+                        // ★ IT READS `.kind` AT CALL TIME, ON PURPOSE. The two
+                        // existing sites each re-read `s.symbols.at(sym).kind`
+                        // where they stand, so a lambda (rather than a value
+                        // hoisted to here) is what makes this extraction
+                        // behavior-PRESERVING rather than behavior-adjacent. The
+                        // shipped `aligned` pins are the regression net for that
+                        // claim.
+                        //
+                        // ★★ AND NOTE THE TYPE CHANGE THE THIRD READER FORCED: the
+                        // existing expression is a **bool** ("is this effectively a
+                        // function?"), but a gate that walks a config-declared SET
+                        // of kinds needs an actual `DeclarationKind`. The mapping
+                        // is `isEffectivelyFunction ? Function : kind` — i.e. an
+                        // effectively-function declarator answers `Function` even
+                        // when its recorded `kind` is `Variable` (a definition
+                        // whose type failed to resolve, or a `kindByChild`
+                        // discriminated form), and everything else answers its
+                        // recorded kind unchanged. Each existing `if/else if`
+                        // ladder rewrites to an EQUIVALENT test on this value:
+                        // `eff == Function` is exactly the old disjunction, and
+                        // `eff == Type` is exactly the old `else if (kind ==
+                        // Type)` (reachable only when the disjunction was false).
+                        auto const effectiveDeclarationKind =
+                            [&]() -> DeclarationKind {
+                            DeclarationKind const k = s.symbols.at(sym).kind;
+                            if (isFnSig || isFunctionForm
+                                || k == DeclarationKind::Function)
+                                return DeclarationKind::Function;
+                            return k;
+                        };
                         // FC16 (D-CSUBSET-NORETURN): mark a FUNCTION symbol whose
-                        // declaration named the attribute. Gated on `isFnSig` so a
+                        // declaration named the attribute. Gated so a
                         // `_Noreturn int x;` (non-function) is INERT (a safe miss —
                         // the named `_Noreturn`-on-non-function deferral), never a
                         // wrongly-flagged data object. OR-merged into a proto/def
                         // survivor by the post-1.5 sweep so a call sees the flag.
-                        if (isFnSig && declHasNoreturn)
+                        //
+                        // ★★ TF-C94 — THE GATE ADMITS `Ptr<FnSig>` AS WELL AS
+                        // `FnSig`, AND THAT WIDENING IS WHAT MAKES THE LEADING
+                        // MEMBER ATTRIBUTE POSITION (c-subset's
+                        // `structMemberDeclSpecifier`) HONORED RATHER THAN
+                        // PARSED-AND-DROPPED. A struct/union member can NEVER be a
+                        // FnSig — MEASURED, `struct T { __attribute__((noreturn))
+                        // void f(int); };` is `error: field 'f' declared as a
+                        // function` in host clang too — so under an `isFnSig`-only
+                        // gate every `noreturn` written on a member would be read
+                        // by `specifierPrefixNamesNoreturn` and then discarded in
+                        // silence. The shipped witness is Tcl 9's `TclStubs`
+                        // (`tclDecls.h:1893/:2024/:2185`, the `TCL_NORETURN1`
+                        // macro), whose members are POINTERS to noreturn functions.
+                        //
+                        // ★ IT IS THE C SEMANTICS, NOT AN ACCOMMODATION. GNU binds
+                        // `noreturn` to the FUNCTION TYPE, so on a pointer
+                        // declarator it appertains to the POINTEE, and host clang
+                        // HONORS it there — MEASURED, `struct S {
+                        // __attribute__((__noreturn__)) void (*p)(int); }; int
+                        // f(struct S *s) { s->p(1); }` draws NO `-Wreturn-type`
+                        // while the undecorated control DOES. clang is likewise
+                        // SILENT on `__attribute__((__noreturn__)) void
+                        // (*gp)(int);` while it WARNS on `__attribute__((
+                        // __noreturn__)) int gv;` ("only applies to function
+                        // types") — so a gate that refused the pointer would
+                        // diverge from every real toolchain on the one shape that
+                        // matters, and would have been a NEW instance of
+                        // D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT.
+                        //
+                        // ★ THE FLAG IS REALLY CONSUMED FOR A FUNCTION-POINTER
+                        // OBJECT, WHICH IS WHY THIS IS A SINK AND NOT A PARKING
+                        // SPOT: a call through such an object lowers its callee to
+                        // `Ref(fp)` (see cst_to_hir's `isDirectNoreturnCall`, whose
+                        // comment records the previously-always-false pointer case),
+                        // so `fp(1);` now wraps `Block{ExprStmt(call),Unreachable}`
+                        // exactly as a direct call to a noreturn function does. For
+                        // a struct MEMBER the fact is RECORDED on the member's
+                        // SymbolRecord but not yet read — `s->p(1)`'s callee is a
+                        // field access, not a `Ref` — the honest residue, and the
+                        // reason the fact is stored now rather than re-derived
+                        // later (the `no_sanitize_thread` "true NOW, not true by
+                        // vacuity" posture).
+                        //
+                        // ★ NOTHING ELSE MOVES: a non-function, non-function-pointer
+                        // declarator still gets NO flag, so the `_Noreturn int x;`
+                        // deferral is untouched, and the predicate is the SHARED
+                        // `isFnPointerType` the call path uses — no second
+                        // hand-copy to lose a term.
+                        bool const noreturnCarrier =
+                            isFnSig
+                            || isFnPointerType(s.lattice.interner(), declTy);
+                        if (noreturnCarrier && declHasNoreturn)
                             s.symbols.at(sym).isNoreturn = true;
+                        // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99
+                        // 6.7.4): record the inline-without-extern reading on a
+                        // FUNCTION symbol; AND-merged across the proto/def pair
+                        // by the post-1.5 sweep and read at CST→HIR to decide
+                        // whether this definition provides an EXTERNAL
+                        // definition at all (6.7.4p7).
+                        //
+                        // ★ THE NON-FUNCTION CASE IS LOUD, NOT INERT — the one
+                        // place this departs from `declHasNoreturn` right above.
+                        // 6.7.4p1 confines the specifier to "the declaration of
+                        // a function", and unlike a stray `_Noreturn` (whose
+                        // loss is a safe miss) a dropped `inline` here would be
+                        // a specifier the compiler parsed and then honored
+                        // nowhere. `isFunctionForm` keeps a declarator whose
+                        // TYPE failed to resolve from producing a second,
+                        // misleading diagnostic on top of its own.
+                        if (isFnSig && declHasInline) {
+                            s.symbols.at(sym).isInline = true;
+                        } else if (declHasInline && declTy.valid()
+                                   && !isFunctionForm) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_InlineNonFunction;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode.valid() ? nameNode
+                                                                    : node);
+                            d.actual   =
+                                "'inline' on a declaration that does not declare "
+                                "a function (C99 6.7.4p1)";
+                            s.reporter.report(std::move(d));
+                        }
+                        // ★ TF-C73 ROOT (b) — DECLARATOR-DEPTH ATTRIBUTES.
+                        // `scanAttributeSemantics` used to run from ONE root (the
+                        // specifier prefix), so an attribute written after the
+                        // declarator — `int x __attribute__((deprecated));`, the
+                        // shape SDK headers use constantly — parsed fine and was
+                        // SILENTLY IGNORED. The declarator's own attribute run
+                        // (`afterDeclaratorAttrRules`, the same set
+                        // `isAfterDeclaratorAttrNode` already keeps out of the
+                        // initializer scan) is now a second root.
+                        //
+                        // ★★ PER-DECLARATOR ISOLATION — `attrFacts` is a COPY of the
+                        // declaration-level facts, deliberately NOT a reference. The
+                        // declaration-level scan ran ONCE above (so its diagnostics
+                        // fire once); each declarator then folds ITS OWN trailing
+                        // attributes into a PRIVATE copy. Folding into the shared
+                        // `declAttrFacts` would leak leftward-to-rightward:
+                        // `int a __attribute__((deprecated)), b;` would mark **b**
+                        // deprecated too, silently — a wrong fact on a symbol the
+                        // programmer never annotated. SOURCE ORDER is preserved
+                        // (declaration-level first, then this declarator's), so
+                        // first-non-empty-wins still means the LEFTMOST spelling.
+                        AttributeSemanticsFacts attrFacts = declAttrFacts;
+                        if (cfg.declarators.has_value()
+                            && tree.kind(dNode) == NodeKind::Internal) {
+                            for (NodeId ac : visibleChildren(tree, dNode)) {
+                                if (!isAfterDeclaratorAttrNode(
+                                        tree, *cfg.declarators, ac)) continue;
+                                // emitUnknown=true: this run is THIS declarator's own
+                                // distinct spelling, so its unknown-name diagnostic is
+                                // the first and only one for that text.
+                                scanAttributeSemantics(s, cfg, tree, ac,
+                                                       /*emitUnknown=*/true, attrFacts);
+                            }
+                        }
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
                         // declaration's folded attribute facts to THIS
                         // declarator's symbol (C23 6.7.13: an attribute in the
@@ -5830,21 +7396,236 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // function arm, deprecated by any use — an
                         // inapplicable-kind flag is inert, never wrong bytes.
                         // Messages first-non-empty-wins (F7).
-                        if (declAttrFacts.maybeUnused)
+                        if (attrFacts.maybeUnused)
                             s.symbols.at(sym).isMaybeUnused = true;
-                        if (declAttrFacts.deprecated) {
+                        if (attrFacts.deprecated) {
                             auto& atRec = s.symbols.at(sym);
                             atRec.isDeprecated = true;
                             if (atRec.deprecatedMessage.empty())
                                 atRec.deprecatedMessage =
-                                    declAttrFacts.deprecatedMessage;
+                                    attrFacts.deprecatedMessage;
                         }
-                        if (declAttrFacts.nodiscard) {
+                        if (attrFacts.nodiscard) {
                             auto& atRec = s.symbols.at(sym);
                             atRec.isNodiscard = true;
                             if (atRec.nodiscardMessage.empty())
                                 atRec.nodiscardMessage =
-                                    declAttrFacts.nodiscardMessage;
+                                    attrFacts.nodiscardMessage;
+                        }
+                        // ★★★ TF-C93 — THE **ONE SHARED** DECL-KIND GATE
+                        // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT).
+                        //
+                        // An attribute written on a kind of entity the LANGUAGE'S
+                        // OWN CONFIG says it does not appertain to was ACCEPTED and
+                        // SILENTLY DISCARDED. MEASURED at HEAD `199fe7d` with the
+                        // shipped CLI — four axes, every one exit 0 with ZERO
+                        // diagnostics: `__attribute__((no_sanitize_thread)) int gv =
+                        // 7;`, `__attribute__((noinline)) int gv2 = 7;`, the
+                        // `always_inline` twin, and `int gw1
+                        // __attribute__((warn_unused_result)) = 1;`. Host clang
+                        // diagnoses all four.
+                        //
+                        // ★★ THE GATE REPORTS; THE GUARDS BELOW STILL REFUSE. The
+                        // three `isFnSig &&` discard guards immediately following
+                        // are UNCHANGED and must stay that way. Both TF-C92 tests
+                        // say so explicitly: a diagnostic that ALSO recorded the
+                        // flag would be a WORSE bug than the silence — a data-object
+                        // symbol carrying a codegen directive no consumer can honor.
+                        // Report-and-refuse, never report-and-accept.
+                        //
+                        // ★★ AGNOSTICISM — WHAT THIS LOOP DOES **NOT** CONTAIN. No
+                        // attribute name, no effect verb, no `DiagnosticCode` per
+                        // axis. It walks the clauses the config matched and compares
+                        // the effective declaration kind against the kind set THAT
+                        // ROW declared (`appliesTo`). Adding a fifth axis is a
+                        // config row; adding a fifth VERB inherits this gate for
+                        // free, because the clause list is populated above the verb
+                        // switch in `scanAttributeSemantics`.
+                        //
+                        // ★ THE `appliesTo.empty()` SKIP **IS** THE `none`-VERB
+                        // EXEMPTION, expressed as a property of the config rather
+                        // than as a verb test. The loader makes the two equivalent:
+                        // it REQUIRES a non-empty `appliesTo` on every verb but
+                        // `none` and REFUSES the key on `none`. So an empty set can
+                        // only mean "this row declares no kind axis" — never "a row
+                        // that forgot the key", which is the
+                        // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] trap.
+                        //
+                        // ★★ THE LATCH, AND AN HONEST ACCOUNT OF WHAT IT BUYS —
+                        // BECAUSE THE OBVIOUS CLAIM ABOUT IT IS **MEASURABLY
+                        // FALSE**. This gate sits inside the per-DECLARATOR loop
+                        // while `attrFacts` folds once per DECLARATION and is
+                        // COPIED into every declarator, so `__attribute__((noinline))
+                        // int a, b, c;` reaches `report()` THREE times.
+                        //
+                        // ★ IT DOES **NOT** FOLLOW THAT THE USER SEES THREE
+                        // DIAGNOSTICS WITHOUT THIS LATCH — MEASURED, and the plan
+                        // for this cycle asserted otherwise. `DiagnosticReporter`
+                        // carries a `dedupWindow` (default 4) that drops a report
+                        // whose (code, buffer, span, ruleContext, `actual`) matches
+                        // a recent one, and all three of these match EXACTLY (same
+                        // clause span, and the message names the attribute and the
+                        // kind, neither of which varies across the declarators).
+                        // MEASURED with the latch DELETED: `int a, b, c;` still
+                        // yields ONE warning, and interleaving 13 other diagnostics
+                        // does not change that (they are emitted in a later pass,
+                        // so the three reports stay adjacent). So the latch is
+                        // REDUNDANT with respect to today's observable output.
+                        //
+                        // ★★ IT IS KEPT ANYWAY — BUT **NOT** FOR THE REASON AN
+                        // EARLIER DRAFT OF THIS COMMENT GAVE, WHICH WAS ITSELF
+                        // MEASURABLY FALSE AND IS RETRACTED HERE. That draft argued
+                        // the window is a knob some paths turn off, and contrasted
+                        // this harness's window of 4 with a driver that sets
+                        // `dedupWindow = 0`. ★ THAT CONTRAST DOES NOT EXIST.
+                        // `S_AttributeIgnoredForDeclarationKind` reports into
+                        // `s.reporter` — `EngineState::reporter`, a
+                        // DEFAULT-constructed `DiagnosticReporter` (hence window 4)
+                        // that nothing in this file ever reassigns or reconfigures,
+                        // and which is MOVED WHOLE into the returned
+                        // `SemanticModel`. So the window is 4 on EVERY path, the
+                        // CLI included, and the eight `dedupWindow = 0` reporters
+                        // (`compilation_unit.cpp`, `program.cpp`) are DRIVER and
+                        // per-CU / per-target SCRATCH reporters that receive
+                        // semantic diagnostics ALREADY deduped by this one. There
+                        // is no configuration of this compiler in which the cap is
+                        // absent here. VERIFIED, TF-C93.
+                        //
+                        // ★★ THE SECOND REASON IS SUFFICIENT ON ITS OWN, AND IT NOW
+                        // CARRIES THE WHOLE JUSTIFICATION. The dedup key is (code,
+                        // buffer, span, ruleContext, `actual`) — so the window stops
+                        // helping THE MOMENT THE MESSAGE GAINS PER-DECLARATOR
+                        // DETAIL. Naming the declared identifier is a natural
+                        // improvement to this very diagnostic, and it would make
+                        // `actual` differ across `int a, b, c;`; a gate leaning on
+                        // the cap would at that moment silently start emitting three
+                        // warnings for one mistake, with nothing in the diff to show
+                        // it. The single-diagnostic property must therefore be a
+                        // property of THIS GATE rather than of a noise cap that
+                        // exists for a different purpose and whose dedup key this
+                        // gate's own message text controls.
+                        //
+                        // ★ KEYED ON THE **CLAUSE NODE**, NOT A BARE BOOL. A single
+                        // bool would collapse the multi-declarator repeat but also
+                        // swallow the second of TWO DISTINCT misplaced attributes on
+                        // one declaration (`__attribute__((noinline))
+                        // __attribute__((warn_unused_result)) int gv;`) — a fresh
+                        // silent drop in the cycle that exists to remove them, and
+                        // one the reporter's dedup would NOT have caused (differing
+                        // `actual` ⇒ differing key; MEASURED: two warnings). Keying
+                        // on the clause node gives exactly ONE diagnostic PER
+                        // OFFENDING SPELLING: declaration-level entries carry
+                        // identical `NodeId`s in every declarator's copy (repeats
+                        // collapse), while a DECLARATOR-level attribute is its own
+                        // node and still reports — the same
+                        // decl-level/declarator-level distinction the
+                        // `attrAlignContextReported` gate draws with `fromDeclLevel`.
+                        for (auto const& ksc : attrFacts.kindScopedClauses) {
+                            if (ksc.row == nullptr) continue;
+                            if (ksc.row->appliesTo.empty()) continue;
+                            DeclarationKind const eff =
+                                effectiveDeclarationKind();
+                            if (std::ranges::find(ksc.row->appliesTo, eff)
+                                != ksc.row->appliesTo.end()) continue;
+                            if (std::ranges::find(declKindAttrReported,
+                                                  ksc.clauseNode.v)
+                                != declKindAttrReported.end()) continue;
+                            declKindAttrReported.push_back(ksc.clauseNode.v);
+                            std::string allowed;
+                            for (DeclarationKind ak : ksc.row->appliesTo) {
+                                if (!allowed.empty()) allowed += ", ";
+                                allowed += declarationKindName(ak);
+                            }
+                            ParseDiagnostic d;
+                            d.code = DiagnosticCode::
+                                S_AttributeIgnoredForDeclarationKind;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            // Underline the CLAUSE the programmer wrote when it is
+                            // available (that is the text to fix); fall back to the
+                            // declared name, then to the declaration, so the
+                            // diagnostic always has a position.
+                            d.span     = tree.span(
+                                ksc.clauseNode.valid() ? ksc.clauseNode
+                                : nameNode.valid()     ? nameNode
+                                                       : node);
+                            d.actual   = std::format(
+                                "attribute '{}' is ignored on this declaration and "
+                                "its effect was discarded: the declaration declares "
+                                "a {}, and this language declares the attribute "
+                                "applicable to {} only",
+                                ksc.name, declarationKindName(eff), allowed);
+                            s.reporter.report(std::move(d));
+                        }
+                        // TF-C78 (D-CSUBSET-NOINLINE): mark a FUNCTION symbol the
+                        // declaration annotated `noinline`. Gated on `isFnSig` —
+                        // the `isNoreturn` discipline one block below — so a
+                        // `__attribute__((noinline)) int x;` is INERT rather than
+                        // recorded on a data object that no inliner will ever
+                        // consult. Unlike the three effects above this one has a
+                        // type gate for a reason: those are diagnostic-only and an
+                        // inapplicable flag is merely unread, whereas this one
+                        // feeds a CODEGEN decision and should not be carried by a
+                        // symbol whose kind cannot honor it.
+                        if (isFnSig && attrFacts.noInline)
+                            s.symbols.at(sym).isNoInline = true;
+                        // TF-C81 (D-CSUBSET-ALWAYSINLINE): the structural mirror
+                        // of the block above — same FnSig gate, same reasoning
+                        // (this bit feeds a CODEGEN decision, so a symbol whose
+                        // kind cannot honor it must not carry it).
+                        if (isFnSig && attrFacts.alwaysInline)
+                            s.symbols.at(sym).isAlwaysInline = true;
+                        // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the third
+                        // attribute-borne per-function fact, same FnSig gate and
+                        // the same reason as its two neighbours — the flag exists
+                        // to be read by a CODEGEN/instrumentation consumer, so a
+                        // symbol whose kind could never honor it must not carry
+                        // it. `__attribute__((no_sanitize_thread)) int x;` is
+                        // therefore INERT rather than recorded on a data object.
+                        if (isFnSig && attrFacts.noSanitizeThread)
+                            s.symbols.at(sym).isNoSanitizeThread = true;
+                        // ★★ TF-C85: the `#pragma optimize("", off)` region flag.
+                        // Same FnSig gate and the same reason (it feeds a CODEGEN
+                        // decision), but its SOURCE is different in kind from the
+                        // two blocks above: not an attribute on this declaration,
+                        // but the lexically scoped preprocessor state that was in
+                        // effect where this declaration's LEFTMOST TOKEN was
+                        // EMITTED. `node` is this declaration's node; its leftmost
+                        // token is the key the preprocessor stamped (a macro-borne
+                        // definition therefore answers with the state at its
+                        // INVOCATION, which is the whole reason the stamps are
+                        // per-token rather than per-byte-range).
+                        if (isFnSig
+                            && s.noOptimizeAtOffset(
+                                   leftmostTokenOffset(tree, node))) {
+                            s.symbols.at(sym).isNoOptimize = true;
+                        }
+                        // TF-C81: ★ THE CONTRADICTION GATE. `always_inline` and
+                        // `noinline` on ONE declaration are exact opposites — one
+                        // forbids splicing the callee, the other exists solely to
+                        // force splicing past the cost model — so exactly one can
+                        // take effect and which one is invisible at the source.
+                        // FAIL LOUD instead of picking. MEASURED: Apple clang
+                        // 21.0.0 emits nothing at all here (even -Weverything) and
+                        // silently resolves it to `noinline` in both source
+                        // orders; that silent resolution is the last-writer-wins
+                        // outcome this project refuses, so DSS diverges
+                        // DELIBERATELY. The proto/definition SPLIT of the same
+                        // contradiction is caught by the post-1.5 `mergedFnDecls`
+                        // sweep, which skips any pair whose conflict was already
+                        // reported HERE so one mistake yields one diagnostic.
+                        if (isFnSig && attrFacts.alwaysInline
+                            && attrFacts.noInline) {
+                            ParseDiagnostic d;
+                            d.code = DiagnosticCode::S_ConflictingInlineAttributes;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode.valid() ? nameNode
+                                                                    : node);
+                            d.actual   =
+                                "'always_inline' and 'noinline' on the same "
+                                "function are contradictory directives";
+                            s.reporter.report(std::move(d));
                         }
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
@@ -5861,10 +7642,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // following one. Threading the stored value to globals/locals
                         // codegen is a SEPARATE deferred task (unconsumed for variables).
                         if (!decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
-                            DeclarationKind const dk = s.symbols.at(sym).kind;
+                            // TF-C93: reads the ONE extracted predicate. `eff ==
+                            // Function` is exactly the former `isFnSig ||
+                            // isFunctionForm || dk == Function`, and `eff == Type`
+                            // exactly the former `else if (dk == Type)` — the
+                            // `else` was only reachable when the disjunction was
+                            // false, which is precisely when `eff` keeps the
+                            // recorded kind.
+                            DeclarationKind const dk = effectiveDeclarationKind();
                             char const* badCtx = nullptr;
-                            if (isFnSig || isFunctionForm
-                                || dk == DeclarationKind::Function)
+                            if (dk == DeclarationKind::Function)
                                 badCtx = "alignas on a function";
                             else if (dk == DeclarationKind::Type)
                                 badCtx = "alignas on a typedef";
@@ -5890,6 +7677,111 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 s.symbols.at(sym).explicitAlignment = declAlignOverride;
                             }
                         }
+                        // ★★ TF-C73 — THE GNU `aligned(N)` SINK (work items 5 + 6).
+                        // Until now `aligned` had NO sink at all: it parsed, folded to
+                        // nothing, and the object was silently UNDER-ALIGNED. It now
+                        // lands in the SAME `explicitAlignment` slot `alignas` uses —
+                        // MAX-folded with it, per C 6.7.5p6 — which is what carries it
+                        // to objects AND to struct/union members (the composite's
+                        // Pass-1 completion gathers each member's `explicitAlignment`
+                        // into the `fieldAligns` span). One slot, one layout rule; the
+                        // two spellings cannot disagree about what a field's alignment
+                        // is, because they write the same field.
+                        if (attrFacts.alignment.has_value()) {
+                            std::uint32_t const want = *attrFacts.alignment;
+                            // A DECLARATION-level `aligned` is one shared spelling
+                            // (gate its context diagnostic); a DECLARATOR-level one is
+                            // this declarator's own (never gated).
+                            bool const fromDeclLevel =
+                                declAttrFacts.alignment.has_value()
+                                && attrFacts.alignment == declAttrFacts.alignment;
+                            auto const reportCtx = [&](std::string reason) {
+                                if (fromDeclLevel) {
+                                    if (attrAlignContextReported) return;
+                                    attrAlignContextReported = true;
+                                }
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = std::move(reason);
+                                s.reporter.report(std::move(d));
+                            };
+                            // TF-C93: the second reader of the ONE extracted
+                            // predicate (see the `alignas` gate above for why the
+                            // three-way ladder is equivalent term-for-term).
+                            DeclarationKind const adk = effectiveDeclarationKind();
+                            bool const isBitfield =
+                                s.symbols.at(sym).bitFieldWidth.has_value();
+                            if (adk == DeclarationKind::Function) {
+                                // FUNCTIONS stay LOUD. gcc accepts `aligned` on a
+                                // function (it aligns the code), DSS has no sink for
+                                // it, and the measured SDK cost of refusing is
+                                // 0 of 204 `aligned` sites — so refusing loudly beats
+                                // accepting it and dropping it.
+                                reportCtx("__attribute__((aligned)) on a function is "
+                                          "not supported (DSS aligns objects and "
+                                          "aggregate members only)");
+                            } else if (isBitfield) {
+                                reportCtx("__attribute__((aligned)) on a bit-field "
+                                          "member");
+                            } else if (adk == DeclarationKind::Type) {
+                                // ★ THE TYPEDEF RULE (work item 6). A typedef interns
+                                // to the SAME TypeId as its aliasee, so writing
+                                // `explicitAlignment` on the typedef's symbol is
+                                // provably INERT — every user of the alias reads the
+                                // aliasee's layout and never consults this record.
+                                // Storing it would therefore be the exact "parses but
+                                // sets nothing" silent drop this cycle exists to kill.
+                                // So the request is judged instead of stored:
+                                //
+                                //   • N > natural, layout params AVAILABLE ⇒ FAIL LOUD.
+                                //     The program asked for stricter alignment than the
+                                //     alias delivers and we genuinely cannot deliver it.
+                                //   • N <= natural, layout params AVAILABLE ⇒ accept
+                                //     SILENTLY. The alias ALREADY satisfies the request,
+                                //     so honoring it is a proven no-op — nothing is
+                                //     dropped and there is nothing to warn about.
+                                //   • layout params ABSENT ⇒ STAY SILENT, emit nothing.
+                                //     ★ This deliberately DIVERGES from the alignas
+                                //     precedent (which fails loud when it cannot compute
+                                //     an alignment). `src/lsp/lsp_server.cpp:429` calls
+                                //     `dss::analyze(cu)` with NO layout params, so
+                                //     failing loud here would put a red squiggle under
+                                //     every real SDK typedef in the editor while the
+                                //     very same source compiles clean from the CLI.
+                                //     CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
+                                //
+                                // ASYMMETRY WORTH STATING: GNU `aligned` on a typedef is
+                                // LEGAL C (clang accepts `typedef int t
+                                // __attribute__((aligned(16)));` clean), whereas C11
+                                // `alignas` on a typedef is a CONSTRAINT VIOLATION —
+                                // which is why this arm is a graded judgement and the
+                                // alignas arm is a flat rejection. NOTE the existing
+                                // `"alignas on a typedef"` arm above was MEASURED DEAD
+                                // (both spellings are P0001 parse errors before they
+                                // reach it); do not cite it as live behavior.
+                                if (declTy.valid() && s.aggregateLayout.has_value()) {
+                                    auto const lay = computeLayout(
+                                        declTy, s.lattice.interner(),
+                                        *s.aggregateLayout, s.dataModel);
+                                    if (lay && want > lay->align.bytes()) {
+                                        reportCtx(std::format(
+                                            "__attribute__((aligned({}))) on a typedef "
+                                            "cannot be honored: the alias resolves to "
+                                            "the same type as its aliasee, whose "
+                                            "alignment is {}",
+                                            want, lay->align.bytes()));
+                                    }
+                                }
+                            } else {
+                                auto& alRec = s.symbols.at(sym);
+                                if (!alRec.explicitAlignment.has_value()
+                                    || *alRec.explicitAlignment < want)
+                                    alRec.explicitAlignment = want;
+                            }
+                        }
                         if (isFunctionForm && declarators.size() == 1) {
                             // C 6.9.1 definition constraints, checked LOUD:
                             //  * the named direct-declarator must carry a
@@ -5908,12 +7800,33 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             }
                             if (tree.rule(dNode)
                                     == cfg.declarators->initDeclaratorRule) {
-                                std::size_t internals = 0;
+                                // TF-C88: count only the children that could BE an
+                                // initializer. This scan used to count EVERY
+                                // Internal child past the declarator, which made it
+                                // the SIXTH init-detection site in the compiler and
+                                // the one that never got TF-C62's decoration skip.
+                                // MEASURED at the pre-TF-C88 HEAD: `int f(void)
+                                // __attribute__((noinline)) { return 1; }` — which
+                                // clang compiles (with only a -Wgcc-compat warning)
+                                // — was REFUSED here as "cannot carry an
+                                // initializer", naming a construct the source does
+                                // not contain. The asm label would have inherited
+                                // the same mis-read. Routing through the shared
+                                // predicate makes this site agree with the other
+                                // five by construction.
+                                std::size_t initializers = 0;
                                 for (NodeId c : visibleChildren(tree, dNode)) {
-                                    if (tree.kind(c) == NodeKind::Internal)
-                                        ++internals;
+                                    if (tree.kind(c) != NodeKind::Internal)
+                                        continue;
+                                    if (tree.rule(c)
+                                        == cfg.declarators->declaratorRule)
+                                        continue;   // the declarator itself
+                                    if (isDeclaratorDecorationNode(
+                                            tree, *cfg.declarators, c))
+                                        continue;   // attribute / asm label
+                                    ++initializers;
                                 }
-                                if (internals > 1) {
+                                if (initializers > 0) {
                                     emitInvalidFn(
                                         dNode,
                                         "a function definition cannot carry "
@@ -5934,21 +7847,49 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         } else if (isFnSig
                                    && s.symbols.at(sym).kind
                                           == DeclarationKind::Variable) {
-                            // A bare function-TYPED object declaration — a C
-                            // function PROTOTYPE (`int f(int);`). D-CSUBSET-FN-
-                            // PROTOTYPE: a prototype IS a function declaration —
-                            // it is callable (forward / mutual recursion) and a
-                            // later definition MERGES with it (Pass 1 recorded
-                            // the merge). UPGRADE its kind to Function so Pass 2
-                            // resolves a call through it, and emit NOTHING. A
-                            // function-TYPED Variable that is NOT a prototype
-                            // (`isProtoDeclaration` false — e.g. a malformed
-                            // function-pointer form whose suffix landed on the
-                            // name) still fails loud: a silent FnSig-typed data
-                            // global would miscompile.
-                            if (s.symbols.at(sym).isProtoDeclaration) {
-                                s.symbols.at(sym).kind =
-                                    DeclarationKind::Function;
+                            // A bare function-TYPED declaration is a C function
+                            // PROTOTYPE (C 6.7 / 6.9.1p2: `T x;` where T is a
+                            // function type declares a FUNCTION). This holds
+                            // whether the function-ness is SYNTACTIC (`int f(int);`
+                            // — the name carries a `()` suffix, isProtoDeclaration
+                            // set in Pass 1) OR comes from the declared TYPE via a
+                            // typedef (`Fn foo;` / a shipped-descriptor
+                            // `Tcl_ObjCmdProc foo;` — flagged `maybeFnTypedefProto`
+                            // in Pass 1, its FnSig resolved only HERE). C34c:
+                            // `isFnSig` means the declared type IS a function
+                            // signature — NEVER a function POINTER (that is
+                            // Ptr<FnSig>, isFnSig false) — so this is UNAMBIGUOUSLY
+                            // a function declaration. UPGRADE its kind to Function
+                            // (so Pass 2 resolves a call through it and a later
+                            // definition MERGES — D-CSUBSET-FN-PROTOTYPE) and mark
+                            // it a proto so category()/HIR treat it as a
+                            // non-defining function declaration; emit NOTHING.
+                            //
+                            // A FnSig-typed Variable that is NEITHER a syntactic
+                            // proto NOR a typedef candidate — e.g. a function-typed
+                            // STRUCT FIELD (`struct S { Fn f; };`, which Pass 1 does
+                            // not flag) — still fails loud: a function-typed member
+                            // is not a prototype and would otherwise miscompile.
+                            //
+                            // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT: this arm is
+                            // UNREACHABLE FOR PARAMETERS. A function-typed
+                            // PARAMETER used to land here (`void f(int g(int))`,
+                            // and the SDK's function-typedef spellings
+                            // `void f(memory_reader_t r)`) and got the reject
+                            // below — the wrong answer twice over, since C
+                            // 6.7.6.3p8 says the parameter simply IS a pointer.
+                            // `adjustParamDeclaredType` now performs that
+                            // adjustment at the row's own resolution, so an
+                            // `paramAdjustments` row's declTy is Ptr<FnSig> here
+                            // and `isFnSig` is false. Suppressing the reject
+                            // instead of adjusting the type would have left the
+                            // symbol typed FnSig — a function VALUE in a
+                            // parameter slot, i.e. a silent miscompile.
+                            auto& symRec = s.symbols.at(sym);
+                            if (symRec.isProtoDeclaration
+                                || symRec.maybeFnTypedefProto) {
+                                symRec.kind = DeclarationKind::Function;
+                                symRec.isProtoDeclaration = true;
                             } else {
                                 emitInvalidFn(nameNode,
                                               "function prototype declarations "
@@ -6215,8 +8156,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // FieldChildrenDescriptor::compositeKind.
                                 CompositeKind const ck =
                                     decl.fieldChildren->compositeKind;
-                                // D-CSUBSET-PACKED: scan the composite's TRAILING
-                                // attribute list for a honored `packed` (emitting the
+                                // D-CSUBSET-PACKED: scan the composite's attribute
+                                // surfaces for a honored `packed` (emitting the
                                 // S_UnknownTypeAttribute typo diagnostic exactly ONCE
                                 // here). packed applies only to struct/union. A packed
                                 // composite that ALSO has a bit-field member is
@@ -6226,16 +8167,84 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // fails via the unsuppressable diagnostic; the layout
                                 // nullopt belt is the backstop for interner-direct
                                 // construction that bypasses this scan).
+                                //
+                                // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the SAME scan
+                                // now also returns a honored whole-composite
+                                // `aligned(N)`, which is handed to the interner's
+                                // per-composite alignment channel below. The two
+                                // travel together because they are two channels of one
+                                // composite and BOTH apply — `packed, aligned(16)` is
+                                // clang sizeof 16, not packed's bare 5.
                                 bool composedPacked = false;
+                                std::optional<std::uint32_t> composedAlign;
+                                // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma
+                                // pack(N)` MEMBER-ALIGNMENT CAP in effect where this
+                                // composite is DEFINED. It comes from the
+                                // preprocessor (a lexically scoped push/pop state),
+                                // keyed on the specifier's leftmost EMITTED TOKEN, and
+                                // is the last hop of the only chain in this cycle that
+                                // changes bytes. 0 = no cap = the layout every
+                                // composite got before TF-C82.
+                                //
+                                // Read for BOTH struct and union and for BOTH
+                                // definition arms below: `#pragma pack` is lexical, so
+                                // it applies to whatever composite definition sits
+                                // inside the region — it has nothing to do with which
+                                // attribute surfaces the definition happens to carry.
                                 NodeId const specNode =
                                     srec.structScope.valid()
                                         ? s.scopes.scopes()[srec.structScope.v].anchor
                                         : NodeId{};
+                                std::uint32_t composedPackCap =
+                                    specNode.valid()
+                                        ? s.packCapAtOffset(
+                                              leftmostTokenOffset(tree, specNode))
+                                        : 0u;
+                                // ★ THE AMBIGUITY IS JUDGED HERE, NOT WHERE IT WAS
+                                // DETECTED. The preprocessor knows a token was
+                                // stamped under two caps; only THIS site knows the
+                                // token is a composite's LAYOUT KEY. MEASURED, the
+                                // distinction is not academic: erroring at
+                                // detection refused a program clang compiles — a
+                                // shared MEMBER macro used in two pack regions
+                                // stamps its own tokens twice while every
+                                // composite stays anchored on an unambiguous
+                                // `struct` keyword. Reaching this arm means the
+                                // composite ITSELF came from such a macro, so its
+                                // two candidate layouts differ in size and in
+                                // every field offset, and there is no defensible
+                                // way to pick one.
+                                if (composedPackCap == kPragmaPackAmbiguous) {
+                                    ParseDiagnostic d;
+                                    d.code = DiagnosticCode::S_PragmaPackAmbiguous;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(specNode);
+                                    d.actual   = std::string{srec.name};
+                                    s.reporter.report(std::move(d));
+                                    composedPackCap = 0u;   // lay out UNCAPPED so
+                                                            // the type still
+                                                            // completes; the
+                                                            // unsuppressable error
+                                                            // fails the build.
+                                }
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
-                                    composedPacked = scanCompositePacked(
+                                    // The composite's ENCLOSING scope is the right
+                                    // lookup context for the alignment operand — an
+                                    // `aligned(N)` naming a constant / a type-name
+                                    // (`aligned(_Alignof(double))`) resolves where the
+                                    // composite is DECLARED, not inside its own member
+                                    // scope (the enum-underlying arm's precedent).
+                                    ScopeId const attrScope =
+                                        srec.structScope.valid()
+                                            ? s.scopes.scopes()[srec.structScope.v].parent
+                                            : ScopeId{};
+                                    auto const composedAttrs = scanCompositePacked(
                                         s, cfg, tree, specNode,
-                                        /*emitDiagnostics=*/true);
+                                        /*emitDiagnostics=*/true, attrScope);
+                                    composedPacked = composedAttrs.packed;
+                                    composedAlign  = composedAttrs.alignment;
                                     if (composedPacked) {
                                         bool anyBitfieldMember = false;
                                         for (std::int64_t const w : fieldBitWidths)
@@ -6371,7 +8380,18 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         s.lattice.interner().completeComposite(
                                             compositeTy, fieldTypes, composedPacked,
                                             fieldBitWidths, /*fieldOffsets=*/{},
-                                            fieldAligns);
+                                            fieldAligns,
+                                            // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the
+                                            // whole-union `aligned(N)` request; 0 = none.
+                                            // clang: `union U {char a; int b;}
+                                            // __attribute__((aligned(32)));` is 32/32.
+                                            composedAlign.value_or(0u),
+                                            // TF-C82: the `#pragma pack(N)` cap; 0 =
+                                            // none. Caps each member's alignment,
+                                            // which for a union (every member at
+                                            // offset 0) lowers the union's own
+                                            // alignment and therefore its size.
+                                            composedPackCap);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -6604,7 +8624,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         s.lattice.interner().completeComposite(
                                             compositeTy, fieldTypes, composedPacked,
                                             fieldBitWidths, /*fieldOffsets=*/{},
-                                            fieldAligns);
+                                            fieldAligns,
+                                            // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the
+                                            // whole-struct `aligned(N)` request; 0 =
+                                            // none. This is the sink that makes
+                                            // `struct S {char a; int b;}
+                                            // __attribute__((packed, aligned(16)));`
+                                            // come out at clang's sizeof 16 / _Alignof
+                                            // 16 instead of failing loud as
+                                            // unhonorable.
+                                            composedAlign.value_or(0u),
+                                            // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the
+                                            // `#pragma pack(N)` member-alignment cap;
+                                            // 0 = none. THE sink for this cycle —
+                                            // MEASURED, it is what turns
+                                            // `sys/fcntl.h`'s `struct log2phys` from
+                                            // the 24/8 DSS used to compute into
+                                            // clang's 20/4.
+                                            composedPackCap);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
@@ -7185,6 +9222,85 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
             }
         }
     }
+}
+
+// D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC: the FOLDED OPERANDS of a failing
+// static assertion's condition, rendered as a suffix for its diagnostic — or an
+// EMPTY string when the condition is not a binary comparison (degrade, never
+// crash, never guess).
+//
+// ★ WHY THE VALUES AND NOT THE SOURCE TEXT. MEASURED on sqlite's `src/mem1.c`:
+// its three S0029 come from ONE macro (`xnu_static_assert_struct_size`,
+// $SDK/usr/include/mach/port.h:100, `_Static_assert(sizeof(name) ==
+// expected_size, "struct changed size unexpectedly")`) instantiated ~25× in
+// `mach/message.h`. All three therefore share ONE span, ONE condition source
+// text and ONE author string — appending the condition's TEXT would have
+// produced three byte-identical messages, i.e. no instrument at all. The folded
+// VALUES are the only channel that discriminates them.
+//
+// ★ AGNOSTICISM. Nothing here knows the spelling `==`, `<`, or the rule name
+// `binaryExpr`. The binary-expression RULE comes from `hirLowering.binaryExprRule`
+// and the operator VERB from the config-declared `hirLowering.binaryOps`
+// token→verb table (the same table `cst_to_hir` and `cst_const_eval` dispatch on),
+// so a language whose comparison is spelled `.EQ.` reports its own verb with no
+// engine change, and a token absent from the table yields no suffix rather than a
+// guess. Operands are located the way every other consumer of this rule locates
+// them (`cst_const_eval.cpp`'s binary arm, `subtreeType`'s Binary frame): the
+// visible children are [lhs Internal, OP token, rhs Internal].
+//
+// The condition child is an `assignmentExpr`-shaped wrapper, so a BOUNDED
+// transparent descent (single-Internal-child layers — wrappers and parens) runs
+// first. Each operand is re-folded through `constIntExpr`, the SAME evaluator that
+// folded the whole condition; it is re-callable on any sub-node and emits nothing
+// (its resolvers all run with emitOnMiss=false), so this instrument can never add
+// a diagnostic of its own. A side that does not fold (a short-circuited
+// `LogicalOr` rhs, a non-ICE operand) renders as `<non-constant>` — still
+// discriminating, still honest.
+[[nodiscard]] std::string
+foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
+                        Tree const& tree, NodeId condNode, ScopeId here) {
+    if (!condNode.valid()) return {};
+    auto const& hirCfg = tree.schema().hirLowering();
+    if (!hirCfg.binaryExprRule.valid()) return {};   // no binary surface
+    // Bounded transparent descent to the binary node (assignmentExpr wrapper,
+    // parenthesized operand, …). Stops at the first non-transparent layer.
+    NodeId bin = condNode;
+    for (int guard = 0; guard < 64; ++guard) {
+        if (tree.kind(bin) != NodeKind::Internal) return {};
+        if (tree.rule(bin).v == hirCfg.binaryExprRule.v) break;
+        NodeId only{};
+        int internals = 0;
+        for (NodeId c : visibleChildren(tree, bin)) {
+            if (tree.kind(c) == NodeKind::Internal) { ++internals; only = c; }
+        }
+        if (internals != 1) return {};   // a leaf / a non-binary composite
+        bin = only;
+    }
+    if (tree.kind(bin) != NodeKind::Internal
+        || tree.rule(bin).v != hirCfg.binaryExprRule.v) {
+        return {};
+    }
+    NodeId lhsN{}, rhsN{}, opTok{};
+    for (NodeId c : visibleChildren(tree, bin)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (!opTok.valid()) opTok = c;
+        } else if (!lhsN.valid()) lhsN = c;
+        else if (!rhsN.valid()) rhsN = c;
+    }
+    if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return {};
+    HirOperatorEntry const* entry = nullptr;
+    std::uint32_t const tk = tree.tokenKind(opTok).v;
+    for (auto const& e : hirCfg.binaryOps) {
+        if (e.token.v == tk) { entry = &e; break; }
+    }
+    if (entry == nullptr) return {};   // an operator this language does not declare
+    auto const side = [&](NodeId n) -> std::string {
+        auto const v = constIntExpr(s, tree, n, here, &cfg);
+        return v.has_value() ? std::to_string(*v)
+                             : std::string{"<non-constant>"};
+    };
+    return " (folded: " + side(lhsN) + " " + entry->target + " " + side(rhsN)
+           + ")";
 }
 
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
@@ -7943,6 +10059,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             if (tree.kind(c) != NodeKind::Internal) continue;
                             if (tree.rule(c) == cfg.declarators->declaratorRule)
                                 continue;
+                            // TF-C62 / TF-C88
+                            if (isDeclaratorDecorationNode(tree,
+                                    *cfg.declarators, c)) continue;
                             initNode = c;
                             break;
                         }
@@ -8031,7 +10150,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -8079,7 +10198,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -8203,8 +10322,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                              /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows,
                                              /*intConvertsToFloat=*/cfg.intConvertsToFloat,
                                              /*floatConvertsToInt=*/cfg.floatConvertsToInt,
+                                             /*floatSameKindNarrows=*/cfg.floatSameKindNarrows,
                                              /*charArrayFromStringLiteralInit=*/false,
-                                             /*bitIntConversions=*/cfg.bitIntConversions)
+                                             /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)
                             && !admitsNullPointerConstant(
                                    s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
                             ParseDiagnostic d;
@@ -8316,6 +10436,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                ? std::string{"static assertion failed"}
                                : "static assertion failed: \"" + message + "\"";
             }
+            d.actual += foldedConditionOperands(s, cfg, tree, condNode, here);
             s.reporter.report(std::move(d));
         }
     }
@@ -8677,7 +10798,8 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
                          Tree const& tree, NodeId node,
                          std::vector<NodeId> const& kids,
                          CallRule const& call, TypeId fnSig,
-                         bool variadicBuiltin, ScopeId scope) {
+                         bool variadicBuiltin, bool calleeIsShippedFfi,
+                         ScopeId scope) {
     // FIX 2: the call EXPRESSION carries the callee's RESULT type — not its
     // FnSig. Without this, a `return f(args);` walk (subtreeType) would
     // surface the callee identifier's FnSig (which IS typed, below) and
@@ -8760,7 +10882,25 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-descriptor
+            // DIRECT call arg ONLY (config-gated + `calleeIsShippedFfi`), RETRY with
+            // the integer-pointee pointer relaxation — a descriptor `ptr<i64>`-style
+            // param accepts a real C integer pointer of the SAME representation
+            // (`long long*`/`sqlite3_int64*`/`long*`-on-LP64) via `sameRepresentation`.
+            // The strict `isAssignable` above already FAILED for this arg, so a
+            // success here is CAUSED by the relaxation → mark the arg node so CST→HIR
+            // realizes the matching Ptr→Ptr bitcast (node-mark ⟺ relaxation fired ⟺
+            // realize, by construction). Scoped to the call-arg boundary: init /
+            // assign / return keep the default-false strict form, and the fn-pointer /
+            // indirect call sites pass `calleeIsShippedFfi=false`. Identity untouched.
+            if (ptrRules.ffiDescriptorIntPointeeCompat && calleeIsShippedFfi
+                && isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
+                                /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool, /*ffiDescriptorPointeeIntCompat=*/true)) {
+                s.ffiIntPointeeCompatNodes.set(argNodes[i], true);
+                continue;
+            }
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -8983,14 +11123,21 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             return;  // unstamped callee expression — out of v1 scope
         }
         if (in.kind(landedTy) == TypeKind::FnSig) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: an EXPRESSION-callee FnSig
+            // (paren-wrapped / deref-peeled designator) is NOT the plain direct-name
+            // shipped call the relaxation is scoped to — pass false (stay strict).
             checkCallAgainstSig(s, cfg, tree, node, kids, call, landedTy,
-                                landedVariadicBuiltin, scope);
+                                landedVariadicBuiltin,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         if (isFnPointerType(in, landedTy)) {
+            // Indirect call through a fn-pointer VALUE — never a shipped-descriptor
+            // direct call (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT): pass false.
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 in.operands(landedTy)[0],
-                                /*variadicBuiltin=*/false, scope);
+                                /*variadicBuiltin=*/false,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         ParseDiagnostic d;
@@ -9059,9 +11206,16 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // own C-style variadic bit still applies inside the shared
         // tail. Purely lattice-kind-driven.
         if (isFnPointerType(s.lattice.interner(), fnTy)) {
+            // D-CSUBSET-FNPTR-INDIRECT-CALL: a bare-identifier callee typed
+            // Ptr<FnSig> is an INDIRECT call — even if the pointer was seeded from a
+            // shipped-descriptor function's address, the call is through a pointer
+            // value, so the integer-pointee relaxation stays OFF
+            // (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT — the fn-pointer round-trip
+            // must still S0003). Pass false.
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 s.lattice.interner().operands(fnTy)[0],
-                                /*variadicBuiltin=*/false, scope);
+                                /*variadicBuiltin=*/false,
+                                /*calleeIsShippedFfi=*/false, scope);
             return;
         }
         // Genuinely non-callable value (S_NotCallable is the RIGHT code
@@ -9116,8 +11270,13 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // the variadic-aware arity check, and per-arg assignability. The
     // symbol arm threads its own `variadicBuiltin` flag (e.g. tsql
     // COALESCE admits any arg count).
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: this is the DIRECT bare-name symbol
+    // call — the ONLY site that may relax integer-pointee pointer-arg compat. Thread
+    // the callee symbol's shipped-descriptor flag (config gate applied inside).
     checkCallAgainstSig(s, cfg, tree, node, kids, call, fnTy,
-                        s.symbols.at(calleeSym).variadicBuiltin, scope);
+                        s.symbols.at(calleeSym).variadicBuiltin,
+                        /*calleeIsShippedFfi=*/
+                        s.symbols.at(calleeSym).isShippedDescriptorFn, scope);
 }
 
 // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
@@ -9326,6 +11485,43 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         }
         return interner.commonType(a, b);
     };
+    // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: the C RESULT type of a
+    // comparison/logical operator is `int` (6.5.8p6 relational, 6.5.9p3
+    // equality, 6.5.13p3 `&&`, 6.5.14p3 `||`, 6.5.3.3p5 `!`) — NOT the 1-byte
+    // Bool the operand-carrier lowering emits. Sourced CONFIG-DRIVENLY, never a
+    // hardcoded I32: integer-promote Bool through the resolved
+    // `arithmeticConversions` engine — Bool is in the language's promote set
+    // (`alsoPromote`), so it lands on the config's `minRankType` (C's `int`). This
+    // is the SEMANTIC (language) type the type-oracle reports for sizeof / auto /
+    // _Generic / call-arg checking; the CST→HIR tier keeps the i1/Bool SSA carrier
+    // (a machine detail, widened on use) — a DELIBERATE divergence, exactly like
+    // char→i32, documented at D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE.
+    // A language with NO arithmeticConversions block (toy/tsql) has no `int` to
+    // name → the legacy Bool result is preserved byte-identically.
+    auto const comparisonResultType = [&]() -> TypeId {
+        if (arith.has_value()) {
+            TypeId const p = integerPromotedType(interner, boolType(), *arith);
+            if (p.valid()) return p;
+        }
+        return boolType();
+    };
+    // D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT: the EXACT semantic-tier mirror
+    // of cst_to_hir's c72 unary-promotion arm (D-CSUBSET-32BIT-ALU-FORMS) — unary
+    // `+`/`-`/`~` on a sub-int operand yield the INTEGER-PROMOTED operand type
+    // (C 6.5.3.3p2/p3/p4), so `sizeof(+c)`/`(-c)`/`(~c)` fold to sizeof(int) and
+    // `(-sh)` to sizeof(int). Config-driven via `integerPromotedType` (a no-op on
+    // float/pointer/≥int); Bool is EXCLUDED byte-identically to the CST→HIR tier
+    // (its native narrow forms are not gated) so the two typers cannot drift.
+    // Falls back to the raw operand type when a language declares no arithmetic
+    // block (toy/tsql — no promotion vocabulary to apply).
+    auto const promotedUnaryType = [&](TypeId ot) -> TypeId {
+        if (arith.has_value() && ot.valid()
+            && interner.kind(ot) != TypeKind::Bool) {
+            TypeId const p = integerPromotedType(interner, ot, *arith);
+            if (p.valid()) return p;
+        }
+        return ot;
+    };
     auto const& hirCfg = tree.schema().hirLowering();
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
@@ -9362,14 +11558,30 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
 
     // ── combine helpers (each verbatim from the prior recursive arm; operate on
     //    already-typed child results, so no recursion) ──
+    // C 6.3.2.1p3 array-to-pointer decay: an `Array<T,N>` in a value context decays
+    // to `Ptr<T>`. Shared by the pointer-SUBTRACTION arm (below) and the ternary
+    // (D-CSUBSET-TERNARY-ARRAY-DECAY) so the one decay law has a single chokepoint —
+    // a non-array passes through unchanged.
+    auto const decayArray = [&](TypeId t) -> TypeId {
+        if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+        auto const elems = interner.operands(t);
+        return elems.empty() ? t : interner.pointer(elems[0]);
+    };
     auto const combineBinary =
         [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
-        if (e->target == "LogicalAnd" || e->target == "LogicalOr") return boolType();
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: `&&`/`||` yield C's `int`
+        // (6.5.13p3 / 6.5.14p3), config-driven — the SSA carrier stays i1/Bool by
+        // design (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE).
+        if (e->target == "LogicalAnd" || e->target == "LogicalOr")
+            return comparisonResultType();
         if (e->target == "Comma")  return rt;                       // value of RHS
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
-            if (isComparison(*op)) return boolType();
+            // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: a relational/equality result
+            // is C's `int` (6.5.8p6 / 6.5.9p3), config-driven (comparisonResultType);
+            // the i1/Bool SSA carrier is the deliberate machine-tier divergence.
+            if (isComparison(*op)) return comparisonResultType();
             // Shift result type follows the config verb `shiftResult` via the
             // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
             // — the SAME function cst_to_hir's combineBinary uses.
@@ -9386,13 +11598,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // only. D-LANG-TYPE-IDENTITY-VOCABULARY: `ptrdiff_t` is C's NAMED
             // alias (`long` on LP64, `long long` on LLP64), declared per data
             // model — a bare anonymous I64 matches NEITHER in a `_Generic`.
-            if (*op == HirOpKind::Sub
-                && lt.valid() && rt.valid()
-                && interner.kind(lt) == TypeKind::Ptr
-                && interner.kind(rt) == TypeKind::Ptr
-                && interner.operands(lt)[0] == interner.operands(rt)[0]) {
-                return synthesizedType(interner, sem.pointerDifferenceType,
-                                       s.dataModel, TypeKind::I64);
+            //
+            // D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: an ARRAY operand of pointer
+            // SUBTRACTION decays to Ptr<elem> (C 6.3.2.1p3) FIRST, so `p - arr` /
+            // `arr - p` / `arr - arr` (the FTS5 `zOut - aBuf` shape used UNCAST in an
+            // integer context) type as a true pointer DIFFERENCE (ptrdiff_t), not the
+            // Ptr the un-decayed fallback would yield. Mirrors the HIR combineBinary
+            // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES) which already emits the decay
+            // Cast + the p-q lowering — this closes the semantic-tier asymmetry the
+            // explicit-cast pointer_minus_array example masked. Same-pointee only
+            // (matches c65): a mismatched `int* - char[]` (gcc rejects) is left
+            // un-decayed → falls through (loud, not silent). `p - n` / `arr - n`
+            // (integer rhs) keep the pre-existing behavior (decay leaves rtD non-Ptr
+            // → this arm does not fire).
+            if (*op == HirOpKind::Sub && lt.valid() && rt.valid()) {
+                TypeId const ltD = decayArray(lt);
+                TypeId const rtD = decayArray(rt);
+                if (interner.kind(ltD) == TypeKind::Ptr
+                    && interner.kind(rtD) == TypeKind::Ptr
+                    && interner.operands(ltD)[0] == interner.operands(rtD)[0]) {
+                    return synthesizedType(interner, sem.pointerDifferenceType,
+                                           s.dataModel, TypeKind::I64);
+                }
             }
             // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
             // the commutative add form) is a POINTER, not the integer. `p + n`
@@ -9411,7 +11638,18 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     };
     auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
-        if (e->target == "Deref")     return derefResultType(interner, ot);
+        if (e->target == "Deref") {
+            // D-CSUBSET-ARRAY-DECAY-IN-DEREF (C 6.3.2.1p3): unary `*` on an ARRAY
+            // operand decays it to Ptr<elem>, so `*(arr)` has the element type
+            // (== `arr[0]`). That decay now lives in the shared `derefResultType`
+            // law itself (Array<T,N>→T, the sibling of `indexResultType`), so BOTH
+            // tiers agree with NO manual pre-decay here — a PURE type derivation
+            // (the semantic tier never rewrites the tree; the HIR producer emits
+            // the actual decay Cast). Ptr<T>→T and the FnSig / Ptr<FnSig> identity
+            // hold as before, so a valid `(*(fnPtrArr))()` still resolves its callee
+            // (an array-of-fn-ptr decays to yield the function pointer).
+            return derefResultType(interner, ot);
+        }
         // FC-F1 (C 6.5.3.1): prefix `++x`/`--x` yields the OPERAND type (a value
         // equal to the post-increment object), exactly as postfix `combinePostfix`
         // does. Explicit here so the type does not rely on the `coreOpFromNameSem`
@@ -9419,14 +11657,22 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
         // type, so the two tiers agree.
         if (e->target == "PreInc" || e->target == "PreDec") return ot;
-        // c12 (C 6.5.3.3p2): unary `+` yields the INTEGER-PROMOTED operand value.
-        // Like Neg/BitNot the type is operand-preserving here (sub-int values live
-        // promoted in 32-bit regs — the lazy-consumer model — so the carried type
-        // is the operand's; the CST→HIR tier lowers `+x` to the operand itself).
-        if (e->target == "Pos") return ot;
+        // c12 (C 6.5.3.3p2) + D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT: unary
+        // `+` yields the INTEGER-PROMOTED operand type (the value already lives
+        // promoted in a 32-bit reg — the lazy-consumer model), so `sizeof(+c)`
+        // folds to sizeof(int). The EXACT semantic-tier mirror of cst_to_hir's c72
+        // arm via `promotedUnaryType` (config-driven; Bool excluded, float/ptr/≥int
+        // pass through) — so this oracle and the HIR tier cannot drift.
+        if (e->target == "Pos") return promotedUnaryType(ot);
         auto const op = coreOpFromNameSem(e->target);
-        if (op.has_value() && *op == HirOpKind::Not) return boolType();
-        return ot;   // Neg / BitNot are type-preserving
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: logical `!` is `(E == 0)`, whose C
+        // result type is `int` (6.5.3.3p5) — config-driven, NOT the Bool carrier
+        // (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE keeps the i1 SSA).
+        if (op.has_value() && *op == HirOpKind::Not) return comparisonResultType();
+        // Neg / BitNot yield the INTEGER-PROMOTED operand type (C 6.5.3.3p3/p4) —
+        // the same c72 mirror as `+` (sizeof(-c)/(~c) → sizeof(int), sizeof(-sh) →
+        // sizeof(int)); D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT.
+        return promotedUnaryType(ot);
     };
     auto const combinePostfix =
         [&](NodeId node, HirOperatorEntry const* e, TypeId bt) -> TypeId {
@@ -9536,11 +11782,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // SAME pointer type (the matching-element case); incompatible-element
         // conditionals stay on the existing fallback.
         {
-            auto const decayArray = [&](TypeId t) -> TypeId {
-                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
-                auto const elems = interner.operands(t);
-                return elems.empty() ? t : interner.pointer(elems[0]);
-            };
+            // reuses the hoisted `decayArray` (single chokepoint, above combineBinary).
             TypeId const thenD = decayArray(thenT);
             TypeId const elseD = decayArray(elseT);
             if (thenD.valid() && thenD == elseD
@@ -10175,7 +12417,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*floatSameKindNarrows=*/cfg.floatSameKindNarrows, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions, /*scalarConvertsToBool=*/cfg.scalarConvertsToBool)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,
@@ -10526,6 +12768,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: `__builtin_va_list` is the
+                // COMPILER-PROVIDED spelling of the SAME type — the Darwin SDK
+                // reaches va_list only through `typedef __builtin_va_list
+                // __darwin_va_list;` (<sys/_types/_va_list.h>), so no descriptor
+                // can supply the name. Bind the IDENTICAL TypeId (never a
+                // re-derived twin): a typedef chain through either name stays
+                // identity-equal per calling convention. Mirrored in ALL THREE
+                // strategy branches of this if/else chain.
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = vaStructTy;   // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = vaStructTy;   // c82: descriptor alias
                 s.vaListType      = vaStructTy;   // c82: adjustment exclusion
             } else if (strat == VaListStrategy::HomogeneousPointer) {
@@ -10539,6 +12798,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = charPtr;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
+                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = charPtr;      // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = charPtr;      // c82: descriptor alias
                 s.vaListType      = charPtr;      // c82: adjustment exclusion
             } else {
@@ -10580,6 +12850,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaListTy;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
+                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
+                SymbolRecord builtinVaRec;
+                builtinVaRec.name  = "__builtin_va_list";
+                builtinVaRec.scope = builtinScope;
+                builtinVaRec.tree  = InvalidTree;
+                builtinVaRec.kind  = DeclarationKind::Type;
+                builtinVaRec.type  = vaListTy;     // the SAME TypeId as `va_list`
+                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
+                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
+                                       builtinVaId);
                 vaListBuiltinType = vaListTy;     // c82: descriptor alias
                 s.vaListType      = vaListTy;     // c82: adjustment exclusion
             }
@@ -10749,26 +13030,142 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // surviving to the linker as an undefined symbol.
     std::unordered_map<std::string, SuppressedShippedSymbol>
         suppressedShippedLibraries;
+    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: one CANDIDATE per (descriptor
+    // composite, SOURCE composite) pair whose tag BOTH origins declare at file
+    // scope, carrying every descriptor SURFACE symbol typed by it (a composite
+    // member, or a typedef that denotes the tag). Recorded here — outside the
+    // injection block — because the SOURCE side is still a Pass-1 forward mint
+    // when the descriptors are read (its fields arrive at Pass 1.5), so the SHAPE
+    // COMPARISON that licenses the unification cannot run yet. NOTHING is
+    // rewritten until it has: see the verification loop just above Pass 2, which
+    // either retypes every listed surface or reports and leaves the two types
+    // DISTINCT.
+    struct ShippedTagAdoption {
+        std::string           tag;       // the struct/union tag BOTH origins declare
+        TypeId                shipped;   // the descriptor's interned composite
+        TypeId                user;      // the SOURCE declaration's composite
+        std::string           origin;    // the descriptor's header spelling (diagnostic)
+        std::vector<SymbolId> surfaces;  // descriptor symbols (members, typedefs) typed `shipped`
+    };
+    std::vector<ShippedTagAdoption> shippedTagAdoptions;
     {
         // Names any USER declaration (top-level, in any tree's own root scope)
         // claimed — the goal-2 skip set. A binding whose symbol's `tree` is the
         // root scope's own tree is a real user decl (injected cross-tree
         // bindings carry the DEFINING tree's id; builtins carry InvalidTree).
         std::unordered_set<std::string> userDeclaredNames;
+        // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+        // the subset of `userDeclaredNames` claimed by a declaration
+        // that is NOT a TYPE declaration (an object / function / prototype —
+        // anything whose kind is not DeclarationKind::Type). The goal-2 skip
+        // for a descriptor TYPEDEF keys on THIS set instead of the full one;
+        // see the typedef-injection loop below for why.
+        std::unordered_set<std::string> userNonTypeDeclaredNames;
+        // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: the SOURCE's FILE-SCOPE
+        // struct/union TAGS (tag name → the Pass-1 forward-minted composite).
+        // C 6.2.3: within ONE translation unit a struct tag names exactly ONE
+        // type, so a tag a shipped descriptor ALSO declares is the SAME type —
+        // this map is what lets the descriptor's own members adopt it below.
+        // FILE SCOPE only (these are the tree ROOT scopes): a block-scoped
+        // `struct timespec {…}` really is a DISTINCT C type and must never be
+        // unified with anything.
+        std::unordered_map<std::string, TypeId> userFileScopeTags;
         for (auto const& [treeV, scope] : treeRootScope) {
             // Across BOTH namespaces: a user declaration of `name` (object,
             // function, typedef, OR a struct/union/enum tag) blocks a
             // descriptor symbol of that name — this is a NAME-level goal-2 skip
             // (the descriptor injects ordinary names; a same-name user tag
             // still claims the spelling, preserving the pre-tag-namespace
-            // behavior). `ns` is intentionally unused here.
+            // behavior). `ns` separates the two C 6.2.3 namespaces for the tag
+            // map below; the goal-2 sets are deliberately namespace-BLIND.
             for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
-                (void)ns;
                 if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
+                    SymbolRecord const& urec = s.symbols.at(sym);
                     userDeclaredNames.insert(std::string{name});
+                    if (urec.kind != DeclarationKind::Type)
+                        userNonTypeDeclaredNames.insert(std::string{name});
+                    // A tag with a VALID type is a DEFINITION (Pass 1 forward-mints
+                    // only when the declaration opened a field scope). A bare
+                    // `struct timespec;` forward declaration carries no type and is
+                    // skipped — there is nothing to unify with, and the descriptor's
+                    // own type keeps its current meaning.
+                    else if (ns == SymbolNamespace::Tag && urec.type.valid())
+                        userFileScopeTags.try_emplace(std::string{name}, urec.type);
                 }
             }
         }
+
+        // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY — THE UNIFICATION POINT.
+        //
+        // MEASURED (arm64-macho, sqlite `os_unix.c:7731` `conchModTime =
+        // buf.st_mtimespec;` → `error[S0003] S_TypeMismatch`): a descriptor
+        // struct's member type is PRE-INTERNED when its descriptor loads, so
+        // `sys/stat.json`'s `st_mtimespec` is baked to the DESCRIPTOR's
+        // `timespec`, while `struct timespec conchModTime;` resolves the TAG —
+        // and the SOURCE declaration of that tag (here the macOS SDK's
+        // `sys/_types/_timespec.h`, reached through `sys/fcntl.h`, for which DSS
+        // ships no descriptor) SHADOWS the injected cuRoot tag. Two TypeIds for
+        // one file-scope tag ⇒ the by-value assignment is rejected. Fixing the
+        // TAG BINDING alone cannot reach this: the binding was never the wrong
+        // one — the MEMBER was.
+        //
+        // So the substitution happens exactly where a descriptor type is turned
+        // into a symbol the user can NAME: every injected composite FIELD whose
+        // type is such a tag is NOTED here and retyped — after Pass 1.5 has
+        // completed the source side and the layouts have been PROVED equal — onto
+        // the one type its tag denotes in THIS translation unit. The user's
+        // declaration wins (goal-2), so member access on it then resolves through
+        // the SOURCE's own field scope and its own member spellings.
+        //
+        // ★ THE KEY IS (tag, THIS COMPILATION) — NEVER GLOBAL. `userFileScopeTags`
+        // is rebuilt per `analyze()` call and the descriptor TypeIds it is matched
+        // against were interned into THIS CU's interner AFTER this target's
+        // `variants` selection, so the map cannot reach across targets: a `long
+        // tv_sec` timespec stays 16 bytes on LP64 and 8 on LLP64 as DISTINCT
+        // types, and the LP64/LLP64 pair is never even a candidate for
+        // unification (D-CSUBSET-DARWIN-STRUCT-LAYOUT-DISAGREEMENT does not
+        // regress).
+        //
+        // ★ FAIL LOUD, AND NOTHING MOVES BEFORE IT IS PROVED. The pair is only
+        // RECORDED here; after Pass 1.5 has completed the SOURCE side it is
+        // checked through the LAYOUT ENGINE — the same `computeLayout` `sizeof`,
+        // member-access codegen and MIR read, so there is ONE shape authority and
+        // no second comparison to drift from it. Layouts identical ⇒ the members
+        // are retyped. Layouts DIFFER ⇒ `F_ShippedTypeIdentityConflict` (the
+        // existing cross-declaration identity diagnostic, unsuppressable) and the
+        // two types STAY DISTINCT. Content-blind: a tag-name membership test over
+        // whatever the source and the descriptors happen to declare, never an
+        // `if (name == "timespec")`.
+        //
+        // ★ NO LAYOUT PARAMS, NO UNIFICATION. A direct-API / LSP / unit caller
+        // passes no `aggregateLayout`, so the engine CANNOT compute either side's
+        // layout and the verification could never license the adoption. Unifying
+        // anyway would be exactly the silent structural merge this design rejects,
+        // so the whole mechanism is gated OFF there: those callers analyze
+        // byte-identically to before and a genuine divergence still surfaces as
+        // the pre-existing loud `S_TypeMismatch` at the assignment.
+        std::unordered_map<std::uint64_t, std::size_t> adoptionIndex;   // key → row
+        auto noteTagSurface = [&](SymbolId fid, TypeId t, std::string_view origin) {
+            if (!t.valid() || !s.aggregateLayout.has_value()) return;
+            TypeInterner const& in = s.lattice.interner();
+            TypeKind const k = in.kind(t);
+            if (k != TypeKind::Struct && k != TypeKind::Union) return;
+            std::string tag{in.name(t)};
+            if (tag.empty()) return;                        // anonymous: no tag identity
+            auto const uit = userFileScopeTags.find(tag);
+            if (uit == userFileScopeTags.end()) return;     // source never declared it
+            TypeId const user = uit->second;
+            if (user.v == t.v) return;                      // already ONE type
+            if (in.kind(user) != k) return;                 // struct vs union: different tags
+            std::uint64_t const key =
+                (static_cast<std::uint64_t>(t.v) << 32) | static_cast<std::uint64_t>(user.v);
+            auto const [it, fresh] = adoptionIndex.try_emplace(key, shippedTagAdoptions.size());
+            if (fresh) {
+                shippedTagAdoptions.push_back(ShippedTagAdoption{
+                    std::move(tag), t, user, std::string{origin}, {}});
+            }
+            shippedTagAdoptions[it->second].surfaces.push_back(fid);
+        };
 
         // Dedup descriptor paths (the same `#include <stdio.h>` in two trees, or
         // twice in one tree, records the path twice) AND symbol names already
@@ -10907,6 +13304,22 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             (void)typeConsistency.add(desc->header, *desc, s.reporter);
 
             for (auto const& sym : desc->symbols) {
+                // Per-SYMBOL `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC):
+                // the EFFECTIVE per-format image map for THIS symbol is the descriptor
+                // map with the symbol's own `library` MERGED OVER it (symbol keys WIN;
+                // a format the symbol OMITS inherits the descriptor's entry — the same
+                // "a missing format key inherits" semantics the map already carries).
+                // Empty `sym.library` (almost every symbol) ⇒ a plain copy of
+                // `desc->library`, byte-identical to the pre-override image. Computed
+                // ONCE here so BOTH the goal-2 SUPPRESSED path (a user bare-proto
+                // redeclaration of an overridden symbol must bind the override too) AND
+                // the injected path carry it. AGNOSTIC: a generic map union — no
+                // name/arch/format identity branch.
+                std::unordered_map<std::string, std::string> effectiveLibrary =
+                    desc->library;
+                for (auto const& [ovFmt, ovImage] : sym.library)
+                    effectiveLibrary.insert_or_assign(ovFmt, ovImage);
+
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.
                 if (userDeclaredNames.contains(sym.name)) {
                     // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): record the
@@ -10928,7 +13341,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         || ffi::objectFormatInAvailabilitySet(
                                sym.availableObjectFormats, *s.activeFormat)) {
                         suppressedShippedLibraries.emplace(sym.name,
-                            SuppressedShippedSymbol{desc->library, sym.version});
+                            SuppressedShippedSymbol{std::move(effectiveLibrary),
+                                                    sym.version});
                     }
                     continue;
                 }
@@ -10967,11 +13381,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // at HIR->MIR to stamp the Call's MirInstFlags::ReturnsTwice (the
                 // isNoreturn-from-descriptor mirror, one line above).
                 rec.returnsTwice = sym.returnsTwice;
+                // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: mark FUNCTION symbols
+                // minted from a shipped descriptor so `checkCallAgainstSig` may
+                // (config-gated) relax integer-pointee pointer-arg compat at the
+                // DIRECT-call arg boundary (`ptr<i64>` accepting a same-representation
+                // `long long*`/`long*`-on-LP64). ONLY functions; the separate
+                // builtin/intrinsic loop leaves it false (keeps the intrinsic
+                // `int*`-pointee rejects strict).
+                rec.isShippedDescriptorFn =
+                    sym.kind == ffi::ShippedSymbolKind::Function;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
                 shippedExterns.push_back(ShippedExternSymbol{
-                    id, sym.name, sym.signature, desc->library,
+                    id, sym.name, sym.signature, std::move(effectiveLibrary),
                     sym.kind == ffi::ShippedSymbolKind::Function,
                     sym.synthesize,   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
                     sym.version});    // D-LK-ELF-SYMBOL-VERSIONING (c156)
@@ -11031,8 +13454,42 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // resolution, so a descriptor typedef is visible to a `T x;`
             // declaration. (A builtin type of the same name wins —
             // resolveTypeNode checks `builtinTypeIds` before the alias lookup.)
+            //
+            // TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION):
+            // the goal-2 skip here keys on `userNonTypeDeclaredNames`,
+            // NOT on the full `userDeclaredNames`. A user TYPEDEF of the same
+            // name is a REDECLARATION (C11 6.7p3 — legal when it denotes the
+            // same type), not a competing definition, and the full-set skip
+            // made it DELETE the shipped typedef for the WHOLE translation
+            // unit. That is wrong in a way that is invisible until it bites:
+            // `userDeclaredNames` is a WHOLE-TU, POSITION-BLIND name set, while
+            // the user's own typedef is POSITION-SENSITIVE (Pass 1.5 resolves
+            // declaration types in TREE ORDER, so its SymbolRecord::type is
+            // still InvalidType while EARLIER declarations resolve). The result
+            // was a DEAD WINDOW from the top of the TU to the user's
+            // redeclaration point in which the name resolved to NOTHING — no
+            // shipped symbol (skipped) and no user symbol (not yet typed) —
+            // even though C 6.2.1p7 puts the OUTER declaration in scope for
+            // exactly that region ("the scope of an identifier declared by a
+            // declarator begins just after the completion of its declarator").
+            // MEASURED on the SQLite corpus (arm64 macho): `sqliteInt.h` uses
+            // `int16_t`/`int8_t`/`uintptr_t` early (`typedef INT16_TYPE i16;`
+            // etc.), the platform's own `typedef short int16_t;` arrives LATER
+            // in the same TU through the SDK's `<sys/_types/_int16_t.h>`, and
+            // i16 / i8 / LogEst / ynVar ALL died with the deleted shipped
+            // typedef — 80 of the 123 S0006 on that leg (MEASURED before and
+            // after: 123 -> 43).
+            //
+            // A NON-type user claim (an object / function of that spelling)
+            // KEEPS the original skip: there the user decl really is the sole
+            // authority and a shipped typedef of the name must not compete.
+            // Injection lands in `cuRoot`, an ANCESTOR of every tree root
+            // scope, so the user's own binding SHADOWS this one wherever the
+            // user's declaration is resolvable: no duplicate binding, no
+            // S_RedeclaredSymbol (the Pass-1 collision check is same-scope
+            // only), and a typedef carries no link surface to double-bind.
             for (auto const& td : desc->typedefs) {
-                if (userDeclaredNames.contains(td.name)) continue;
+                if (userNonTypeDeclaredNames.contains(td.name)) continue;
                 if (!injectedNames.insert(td.name).second) continue;  // first wins
                 SymbolRecord rec;
                 rec.name  = td.name;
@@ -11041,6 +13498,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 rec.kind  = DeclarationKind::Type;
                 rec.type  = td.type;
                 SymbolId const id = s.symbols.mint(rec);
+                // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: a typedef that
+                // DENOTES a tag the source also declares (`typedef struct
+                // timespec ts_t;`) is the same surface as a composite member and
+                // takes the same rule — otherwise the alias and the tag would name
+                // two types in one TU. Compound spellings (`ptr<tag>`) are NOT
+                // rewritten: reaching inside a constructed type is a re-intern, not
+                // an identity choice, and leaving them alone keeps the failure LOUD
+                // (a pointer mismatch at the use) rather than half-unified.
+                noteTagSurface(id, td.type, desc->header);
                 s.scopes.injectBinding(cuRoot, td.name, id);
             }
 
@@ -11067,6 +13533,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     f.type       = st.fields[i].type;
                     f.fieldIndex = i;             // == position in the interned operands
                     SymbolId const fid = s.symbols.mint(f);
+                    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: note a
+                    // composite-typed member whose TAG the source also declares
+                    // (`stat.st_mtimespec` is the measured case) so it can adopt
+                    // the ONE type that tag names in this TU (C 6.2.3) once the
+                    // layouts have been proved equal. Every other type is untouched.
+                    noteTagSurface(fid, st.fields[i].type, desc->header);
                     s.scopes.injectBinding(fieldScope, st.fields[i].name, fid);
                 }
                 s.compositeScopeByType[st.typeId.v] = fieldScope;
@@ -11082,15 +13554,70 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 SymbolId const tagId = s.symbols.mint(tag);
                 s.scopes.injectBinding(cuRoot, st.name, tagId, SymbolNamespace::Tag);
             }
+
+            // C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): the named-member UNION
+            // sibling of the `structs` loop above. A shipped union interns as
+            // `TypeKind::Union` (every member overlaid at offset 0); here we build
+            // its member field scope + register `compositeScopeByType[un.typeId]` so
+            // `unionValue.member` resolves — the mechanism the real `Tcl_GetHashKey`
+            // macro's `h->key.oneWordValue` / `h->key.string` needs. AGNOSTIC (generic
+            // over any union-typed field/member — no name is special-cased) and
+            // FAIL-LOUD (an unknown union member misses this scope → S_UndeclaredField).
+            // Shares `injectedTags` with structs: a union and a struct occupy the ONE
+            // C 6.2.3 tag namespace, so a name collision is first-wins across both.
+            for (auto const& un : desc->unions) {
+                if (!injectedTags.insert(un.name).second) continue;   // first wins (tag ns)
+                ScopeId const memberScope =
+                    s.scopes.pushScope(cuRoot, NodeId{}, InvalidTree);
+                for (std::uint32_t i = 0; i < un.fields.size(); ++i) {
+                    SymbolRecord f;
+                    f.name       = un.fields[i].name;
+                    f.scope      = memberScope;
+                    f.tree       = InvalidTree;   // not a user decl
+                    f.kind       = DeclarationKind::Variable;
+                    f.type       = un.fields[i].type;
+                    f.fieldIndex = i;             // == position in the interned operands
+                    SymbolId const fid = s.symbols.mint(f);
+                    // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: the union sibling
+                    // of the `structs` note — one tag, one type, same rule.
+                    noteTagSurface(fid, un.fields[i].type, desc->header);
+                    s.scopes.injectBinding(memberScope, un.fields[i].name, fid);
+                }
+                s.compositeScopeByType[un.typeId.v] = memberScope;
+                // The union TAG (C 6.2.3 tag namespace) so a `union tag` reference
+                // resolves; `structScope` links it to its member scope (as structs do).
+                SymbolRecord tag;
+                tag.name        = un.name;
+                tag.scope       = cuRoot;
+                tag.tree        = InvalidTree;
+                tag.kind        = DeclarationKind::Type;
+                tag.type        = un.typeId;
+                tag.structScope = memberScope;
+                SymbolId const tagId = s.symbols.mint(tag);
+                s.scopes.injectBinding(cuRoot, un.name, tagId, SymbolNamespace::Tag);
+            }
         }
     }
 
     // Pass 1.5 per tree: resolve declaration types + function signatures.
-    for (auto const& tree : trees) {
+    for (std::size_t ti = 0; ti < trees.size(); ++ti) {
+        auto const& tree = trees[ti];
         if (!tree.root().valid()) continue;
         s.activate(tree.schema());
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): point the engine at THIS tree's
+        // `#pragma pack` stamps for the duration of the walk that composes its
+        // composite types. Index-parallel to `trees()` by construction (the
+        // builder emits one map per tree); an empty/absent map means no cap.
+        s.pragmaPack = &cu->pragmaPackFor(ti);
+        // TF-C85: and at THIS tree's `#pragma optimize` stamps. Bound at the same
+        // seam for the same reason — Pass 1.5 is the walk that resolves function
+        // signatures, so it is the only pass that can ask "was this function
+        // DEFINED inside a no-optimize region".
+        s.pragmaNoOptimize = &cu->pragmaNoOptimizeFor(ti);
         resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
     }
+    s.pragmaPack = nullptr;   // no tree is active outside the per-tree walk
+    s.pragmaNoOptimize = nullptr;
 
     // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
     // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};
@@ -11119,6 +13646,123 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                              || s.symbols.at(absorbed).isNoreturn;
                 s.symbols.at(survivor).isNoreturn = nr;
                 s.symbols.at(absorbed).isNoreturn = nr;
+            }
+            // TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE SPLIT-CONTRADICTION GATE,
+            // AND IT MUST RUN **BEFORE** EITHER INLINE-FLAG OR-MERGE BELOW.
+            // Pass-1.5's per-declaration check cannot see
+            // `__attribute__((noinline)) int f(void);` followed by
+            // `__attribute__((always_inline)) int f(void){…}` — each declaration
+            // alone is consistent, and only the merge makes the contradiction
+            // visible. But the OR-merges below write the unioned flags back to
+            // BOTH records, after which "did ONE declaration carry both?" is no
+            // longer answerable: MEASURED, running this gate after the `noInline`
+            // merge made the survivor look like it had spelled both attributes
+            // itself and the split conflict was silently suppressed. Reading both
+            // records while they are still PRISTINE is the whole correctness of
+            // the `already` test.
+            //
+            // Reported at the ABSORBED (later / redundant) declaration with a
+            // related location at the survivor — the shape the signature-compat
+            // gate below already uses. `already` suppresses a SECOND diagnostic
+            // when one declaration carried both attributes on its own: Pass-1.5
+            // already reported that, and one mistake must not yield two errors.
+            {
+                auto const& svRec = s.symbols.at(survivor);
+                auto const& abRec = s.symbols.at(absorbed);
+                bool const ai      = svRec.isAlwaysInline || abRec.isAlwaysInline;
+                bool const ni      = svRec.isNoInline     || abRec.isNoInline;
+                bool const already = (svRec.isAlwaysInline && svRec.isNoInline)
+                                  || (abRec.isAlwaysInline && abRec.isNoInline);
+                if (ai && ni && !already) {
+                    auto aTreeIt = treeById.find(abRec.tree.v);
+                    if (aTreeIt != treeById.end()) {
+                        Tree const& aTree = *aTreeIt->second;
+                        ParseDiagnostic d;
+                        d.code =
+                            DiagnosticCode::S_ConflictingInlineAttributes;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = aTree.source().id();
+                        d.span     = aTree.span(abRec.declNode);
+                        d.actual   = std::format(
+                            "'always_inline' and 'noinline' are applied to '{}' "
+                            "across its declarations — contradictory directives",
+                            abRec.name);
+                        auto sTreeIt = treeById.find(svRec.tree.v);
+                        if (sTreeIt != treeById.end()) {
+                            Tree const& sTree = *sTreeIt->second;
+                            d.related.push_back(RelatedLocation{
+                                sTree.source().id(),
+                                sTree.span(svRec.declNode),
+                                "the conflicting declaration is here",
+                            });
+                        }
+                        s.reporter.report(std::move(d));
+                    }
+                }
+            }
+            // TF-C78 (D-CSUBSET-NOINLINE): the same OR-merge, for the same
+            // reason and in the same pre-type-gate position. `noinline` is
+            // routinely spelled on the PROTOTYPE only (sqlite's SQLITE_NOINLINE
+            // sits on both, but a header/impl split that annotates just the
+            // header is ordinary C); HIR→MIR stamps the flag from the DEFINITION's
+            // symbol, so without this merge the header-only spelling would lower
+            // to a MirFunc with the bit clear and the function would be inlined.
+            {
+                bool const ni = s.symbols.at(survivor).isNoInline
+                             || s.symbols.at(absorbed).isNoInline;
+                s.symbols.at(survivor).isNoInline = ni;
+                s.symbols.at(absorbed).isNoInline = ni;
+            }
+            // TF-C81 (D-CSUBSET-ALWAYSINLINE): the same OR-merge for
+            // `always_inline`, in the same pre-type-gate position and for the
+            // identical reason — HIR→MIR stamps the flag from the DEFINITION's
+            // symbol, so a `always_inline` spelled only on the prototype would
+            // otherwise be lost. The contradiction gate that consumes these two
+            // records while they are still un-merged ran above; keep it there.
+            {
+                bool const ai = s.symbols.at(survivor).isAlwaysInline
+                             || s.symbols.at(absorbed).isAlwaysInline;
+                s.symbols.at(survivor).isAlwaysInline = ai;
+                s.symbols.at(absorbed).isAlwaysInline = ai;
+            }
+            // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same OR-merge, for the
+            // same reason as its two neighbours above — HIR→MIR stamps the flag
+            // from the DEFINITION's symbol, so `no_sanitize_thread` spelled only
+            // on the prototype (the glibc-style header/impl split) would otherwise
+            // lower to a MirFunc with the bit clear and the recorded exclusion
+            // would vanish between the two declarations. Position is free here:
+            // unlike the inline pair this axis feeds NO contradiction gate, so
+            // nothing needs the two records pristine.
+            {
+                bool const nst = s.symbols.at(survivor).isNoSanitizeThread
+                              || s.symbols.at(absorbed).isNoSanitizeThread;
+                s.symbols.at(survivor).isNoSanitizeThread = nst;
+                s.symbols.at(absorbed).isNoSanitizeThread = nst;
+            }
+            // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the
+            // inline-definition reading merges with **AND**, not OR — the one
+            // flag in this sweep that does, and the asymmetry is the standard's.
+            // 6.7.4p7 makes a definition an INLINE definition (providing NO
+            // external definition) only "if all of the file scope declarations
+            // for [the] function in a translation unit include the inline
+            // function specifier without extern". So a single plain declaration
+            // anywhere in the TU RESTORES the external definition, and ANDing is
+            // literally that quantifier. OR here would invert the result on the
+            // two commonest real shapes — MEASURED with clang, both
+            // `inline int p(int); int p(int){…}` and
+            // `int p(int); inline int p(int){…}` emit `T _p`, which an OR-merge
+            // would suppress.
+            //
+            // Pairwise ANDing composes transitively across N declarations: with
+            // pairs (def,p1) then (def,p2) the survivor ends at p1 && p2 && def,
+            // which is the quantifier over all three. Writing the result back to
+            // the absorbed record too keeps either merge ORDER equivalent, as
+            // the OR-merges above do.
+            {
+                bool const inl = s.symbols.at(survivor).isInline
+                              && s.symbols.at(absorbed).isInline;
+                s.symbols.at(survivor).isInline = inl;
+                s.symbols.at(absorbed).isInline = inl;
             }
             // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): OR-merge deprecated /
             // nodiscard across the proto/def pair, the isNoreturn precedent —
@@ -11151,7 +13795,148 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             auto const& sRec = s.symbols.at(survivor);
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;
+            // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): the absorbed side was a
+            // `maybeFnTypedefProto` CANDIDATE that Pass 1 OPTIMISTICALLY merged
+            // with a same-name GENUINE function (the survivor, kind Function) —
+            // its function-ness was unresolved then. Verify now: if the
+            // candidate's resolved type is NOT a function signature, it is a
+            // genuine object-vs-function clash (`MyInt foo; int foo(){}`), so the
+            // merge was wrong — emit the DEFERRED S_RedeclaredSymbol at the
+            // candidate (byte-identical to the Pass-1 collision this replaced) and
+            // skip the signature sweep below (which would mis-report a signature
+            // mismatch). Gated on the survivor being a real Function so two legal
+            // tentative typedef-OBJECTS (`typedef int Fn; Fn foo; Fn foo;`, both
+            // candidates, survivor stays Variable) are untouched. A candidate that
+            // DID resolve to a FnSig is a real prototype and falls through to the
+            // ordinary signature-compat check.
+            if (aRec.maybeFnTypedefProto
+                && sRec.kind == DeclarationKind::Function
+                && s.lattice.interner().kind(aRec.type) != TypeKind::FnSig) {
+                auto aTreeIt = treeById.find(aRec.tree.v);
+                if (aTreeIt != treeById.end()) {
+                    Tree const& aTree = *aTreeIt->second;
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = aTree.source().id();
+                    d.span     = aTree.span(aRec.declNode);
+                    d.actual   = aRec.name;
+                    auto sTreeIt = treeById.find(sRec.tree.v);
+                    if (sTreeIt != treeById.end()) {
+                        Tree const& sTree = *sTreeIt->second;
+                        d.related.push_back(RelatedLocation{
+                            sTree.source().id(),
+                            sTree.span(sRec.declNode),
+                            "previously declared here",
+                        });
+                    }
+                    s.reporter.report(std::move(d));
+                }
+                continue;
+            }
+            // TF-C97 (D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE, C11 6.7p3): THE
+            // VERIFICATION for the Type↔Type pair Pass 1 admitted optimistically.
+            // Runs BEFORE the generic `sRec.type.v == aRec.type.v` fast-path
+            // below because BOTH of this rule's answers differ from the generic
+            // one, in BOTH directions:
+            //   ① EQUAL IS NOT ALWAYS LEGAL. 6.7p3's permission excludes a
+            //      VARIABLY MODIFIED type ("provided that type is not a variably
+            //      modified type") — `typedef int V[n];` twice is invalid even
+            //      though it is spelled identically, because `n` would be
+            //      evaluated twice for one name (C99 6.7.7p2 evaluates a VLA
+            //      typedef's size expression exactly once, AT the typedef). The
+            //      interner has no length operand to distinguish two vlaArrays,
+            //      so their TypeIds ARE equal and the fast-path would silently
+            //      accept the one shape the standard singles out. MEASURED
+            //      against /usr/bin/clang: `error: redefinition of typedef for
+            //      variably-modified type 'int[n]'` — and clang reports that same
+            //      VM reason even when the two VM types ALSO differ
+            //      (`typedef int V[n]; typedef long V[n];`), so the carve-out is
+            //      tested FIRST here for the same reason: the repeat is forbidden
+            //      outright, which is a stronger statement than "these differ".
+            //      Reported as S_RedeclaredSymbol — the code this shape already
+            //      produced from the Pass-1 collision, so the VM case is
+            //      byte-identical in CODE and only gains a message; and it is the
+            //      honest one, since the types are the SAME and calling them
+            //      incompatible would be a lie.
+            //   ② UNEQUAL IS NEVER RELAXED. The incomplete-array relaxation below
+            //      (C 6.2.7 composite types, `extern char v[]; char v[3];`) is an
+            //      OBJECT rule — two declarations of one object compose into the
+            //      completed type. 6.7p3 asks the strictly stronger question
+            //      "does it denote the SAME type", with no composite step.
+            //      MEASURED against /usr/bin/clang: `typedef int T[3]; typedef
+            //      int T[];` is `error: typedef redefinition with different types
+            //      ('int[]' vs 'int[3]')`. Falling through would have admitted it
+            //      silently, so this arm ends in `continue` either way.
+            // Reported at the ABSORBED (later) declaration with a related location
+            // at the survivor — the shape every other gate in this sweep uses.
+            if (sRec.kind == DeclarationKind::Type
+                && aRec.kind == DeclarationKind::Type) {
+                auto const& in = s.lattice.interner();
+                auto isVariablyModified = [&in](TypeId t) {
+                    return in.isVlaArray(t) || in.typeContainsVla(t);
+                };
+                bool const variablyModified = isVariablyModified(sRec.type)
+                                           || isVariablyModified(aRec.type);
+                // The C11 permission, in full: same resolved type AND not
+                // variably modified. Anything else falls through to fail loud.
+                if (!variablyModified && sRec.type.v == aRec.type.v) continue;
+                auto aTreeIt = treeById.find(aRec.tree.v);
+                if (aTreeIt == treeById.end()) continue;
+                Tree const& aTree = *aTreeIt->second;
+                ParseDiagnostic d;
+                d.code     = variablyModified
+                                 ? DiagnosticCode::S_RedeclaredSymbol
+                                 : DiagnosticCode::S_IncompatibleRedeclaration;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = aTree.source().id();
+                d.span     = aTree.span(aRec.declNode);
+                d.actual   = variablyModified
+                    ? std::format(
+                          "'{}' — a typedef name of a VARIABLY MODIFIED type may "
+                          "not be redefined, even identically (C11 6.7p3)",
+                          aRec.name)
+                    : std::format(
+                          "'{}' — a typedef name may be redefined only to denote "
+                          "the SAME type (C11 6.7p3)", aRec.name);
+                auto sTreeIt = treeById.find(sRec.tree.v);
+                if (sTreeIt != treeById.end()) {
+                    Tree const& sTree = *sTreeIt->second;
+                    d.related.push_back(RelatedLocation{
+                        sTree.source().id(),
+                        sTree.span(sRec.declNode),
+                        "previously declared here",
+                    });
+                }
+                s.reporter.report(std::move(d));
+                continue;
+            }
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
+            // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
+            // SAME element type are compatible when ONE side is INCOMPLETE — the
+            // composite is the completed array. `extern char v[]; char v[3];` (either
+            // order) merges: one record resolves to Array<char,3>, the other to the
+            // incomplete Array<char,[]>, differing TypeIds but C-compatible. The legacy
+            // positional externDecl path folded this via the Pass-1.5 downgrade guard
+            // (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY); the c23 declarator-mode externDecl
+            // resolves each record's type independently, so the compat is recognized
+            // HERE. Two COMPLETE arrays of different size, or different element types,
+            // stay INCOMPATIBLE (the strict inequality below fires) — only an
+            // incomplete side relaxes.
+            {
+                auto& in = s.lattice.interner();
+                bool const bothArrays = in.kind(sRec.type) == TypeKind::Array
+                                     && in.kind(aRec.type) == TypeKind::Array;
+                bool const oneIncomplete = in.isIncompleteArray(sRec.type)
+                                        || in.isIncompleteArray(aRec.type);
+                if (bothArrays && oneIncomplete) {
+                    auto const sOps = in.operands(sRec.type);
+                    auto const aOps = in.operands(aRec.type);
+                    if (!sOps.empty() && !aOps.empty()
+                        && sOps[0].valid() && sOps[0].v == aOps[0].v)
+                        continue;   // same element type + one incomplete → compatible
+                }
+            }
             auto aTreeIt = treeById.find(aRec.tree.v);
             if (aTreeIt == treeById.end()) continue;
             Tree const& aTree = *aTreeIt->second;
@@ -11171,6 +13956,91 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 });
             }
             s.reporter.report(std::move(d));
+        }
+    }
+
+    // ── D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: license, then adopt ──
+    //
+    // Descriptor injection NOTED every member whose TAG the SOURCE also declares
+    // at file scope, but changed nothing: the source composite was still a Pass-1
+    // forward mint back then. Pass 1.5 has now completed it, so the decision is
+    // taken HERE — against the LAYOUT ENGINE, the SAME `computeLayout` `sizeof`,
+    // `_Alignof`, member-access codegen and MIR read. Deliberately ONE shape
+    // authority: a hand-rolled field walk beside it could drift, and the thing
+    // that must not drift is precisely "do these two declarations lay out the
+    // same bytes on THIS target".
+    //
+    // Identical layout ⇒ the two declarations describe ONE type (C 6.2.3) and
+    // every noted member is retyped onto the source's. ANY divergence — a
+    // different size, alignment, field offset, field count, field kind, or bit
+    // placement, and equally a shape the engine cannot compute (an incomplete
+    // composite) — leaves the two types DISTINCT, exactly as before this
+    // mechanism existed, and reports `F_ShippedTypeIdentityConflict`: the
+    // existing cross-declaration identity diagnostic, unsuppressable, which stops
+    // the pipeline before a single byte is emitted. There is no silent path in
+    // either direction — nothing is unified without a PROOF, and nothing is left
+    // un-unified without a DIAGNOSTIC.
+    if (!shippedTagAdoptions.empty()) {
+        TypeInterner const& in = s.lattice.interner();
+        for (auto const& ad : shippedTagAdoptions) {
+            // `aggregateLayout` is necessarily present — nothing is ever recorded
+            // without it (the injection gate above).
+            auto const shippedLay =
+                computeLayout(ad.shipped, in, *s.aggregateLayout, s.dataModel);
+            auto const userLay =
+                computeLayout(ad.user, in, *s.aggregateLayout, s.dataModel);
+            bool agree = shippedLay.has_value() && userLay.has_value()
+                      && shippedLay->size  == userLay->size
+                      && shippedLay->align == userLay->align
+                      && shippedLay->fieldOffsets == userLay->fieldOffsets
+                      && shippedLay->bitFields.size() == userLay->bitFields.size()
+                      && shippedLay->hasFlexibleArrayMember
+                             == userLay->hasFlexibleArrayMember;
+            // Same bytes AND the same members occupying them: equal offsets alone
+            // would accept `{u32,u32}` for `{i32,i32}` (a signedness swap moves no
+            // offset), so each field's KIND and bit placement is compared too.
+            if (agree) {
+                auto const a = in.operands(ad.shipped);
+                auto const b = in.operands(ad.user);
+                agree = a.size() == b.size();
+                for (std::size_t i = 0; agree && i < a.size(); ++i)
+                    if (in.kind(a[i]) != in.kind(b[i])) agree = false;
+                for (std::size_t i = 0; agree && i < shippedLay->bitFields.size(); ++i) {
+                    BitFieldPlacement const& p = shippedLay->bitFields[i];
+                    BitFieldPlacement const& q = userLay->bitFields[i];
+                    if (p.unitBytes != q.unitBytes || p.bitOffset != q.bitOffset
+                        || p.bitWidth != q.bitWidth)
+                        agree = false;
+                }
+            }
+            if (agree) {
+                // LICENSED: the descriptor's own members now denote the type the
+                // tag names in this TU, so `stat.st_mtimespec` and a source
+                // `struct timespec` are one type and the by-value assignment
+                // type-checks in Pass 2 (which has not run yet).
+                for (SymbolId fid : ad.surfaces) s.symbols.at(fid).type = ad.user;
+                continue;
+            }
+            auto const extent = [&](std::optional<StructLayout> const& l) {
+                return l.has_value()
+                           ? std::to_string(l->size) + " bytes / align "
+                                 + std::to_string(l->align.bytes())
+                           : std::string{"<no computable layout>"};
+            };
+            dss::report(
+                s.reporter, DiagnosticCode::F_ShippedTypeIdentityConflict,
+                DiagnosticSeverity::Error,
+                "shipped-lib descriptor '" + ad.origin + "' declares tag '" + ad.tag
+                    + "' (" + extent(shippedLay)
+                    + ") but this translation unit declares the SAME tag as a "
+                      "DIFFERENT layout (" + extent(userLay)
+                    + ") for this target. C 6.2.3 gives a file-scope tag exactly ONE "
+                      "type per translation unit, so the descriptor's own members of "
+                      "that tag would denote the source declaration — which is only "
+                      "sound while the two lay out identically, so they were left as "
+                      "TWO types and nothing was unified. Make the descriptor's "
+                      "declaration byte-identical for this target (per-format / "
+                      "per-dataModel `variants` when the type genuinely diverges)");
         }
     }
 
@@ -11236,6 +14106,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
         std::move(s.nullPointerConstantNodes),
+        std::move(s.ffiIntPointeeCompatNodes),
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),
         dataModel,

@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -163,6 +164,37 @@ TEST(CliArgs, MultipleTargetsAccepted) {
     EXPECT_EQ(r->targets.size(), 2u);
     EXPECT_EQ(r->targets[0], "x86_64:elf64-x86_64-linux");
     EXPECT_EQ(r->targets[1], "x86_64:pe64-x86_64-windows");
+}
+
+// SQLite-testfixture arc C3: the `-I` quote-include search path — all four
+// accepted spellings parse into `includeDirs`, in order. RED-on-disable: drop
+// any of the four -I parse arms and the corresponding entry vanishes (size != 4).
+TEST(CliArgs, IncludeDirsAllFourForms) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "-I", "spaced_dir",               // -I <dir>
+           "-Iattached_dir",                 // -I<dir> (gcc attached form)
+           "--include-dir", "long_dir",      // --include-dir <dir>
+           "--include-dir=eq_dir"};          // --include-dir=<dir>
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->includeDirs.size(), 4u);
+    EXPECT_EQ(r->includeDirs[0], "spaced_dir");
+    EXPECT_EQ(r->includeDirs[1], "attached_dir");
+    EXPECT_EQ(r->includeDirs[2], "long_dir");
+    EXPECT_EQ(r->includeDirs[3], "eq_dir");
+}
+
+// A dangling `-I` (no directory argument) fails loud, not silently dropped.
+TEST(CliArgs, IncludeDirSpacedFormRequiresValue) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "-I"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
 }
 
 TEST(CliArgs, CompileModeRejectsEmptyFileList) {
@@ -339,6 +371,8 @@ TEST(CliArgs, HelpTextContainsCoreFlags) {
     EXPECT_NE(text.find("--warnings-as-errors"), std::string::npos);
     EXPECT_NE(text.find("--suppress"), std::string::npos);
     EXPECT_NE(text.find("--lsp"), std::string::npos);
+    EXPECT_NE(text.find("--jobs"), std::string::npos);  // D-PERF-4-CU-PARALLELISM
+    EXPECT_NE(text.find("--stack-reserve"), std::string::npos);  // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH
 }
 
 // ── --transpile mode (plan 10 dispatch — fail-loud today) ────
@@ -417,6 +451,302 @@ TEST(CliArgs, ConfigRejectsInvalidValue) {
 TEST(CliArgs, CompileConfigNameRoundTrip) {
     EXPECT_EQ(compileConfigName(CompileConfig::Debug),   "debug");
     EXPECT_EQ(compileConfigName(CompileConfig::Release), "release");
+}
+
+// ── --jobs N (D-PERF-4-CU-PARALLELISM: per-CU build pool width) ─────
+
+TEST(CliArgs, JobsDefaultsToZeroAuto) {   // absent → 0 = auto (min(cores,TUs,16))
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 0u);
+}
+
+TEST(CliArgs, JobsParsesEqualsForm) {   // RED-on-disable: drop the --jobs arm → this fails
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=4"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 4u);
+}
+
+TEST(CliArgs, JobsParsesSpaceForm) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs", "8"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 8u);
+}
+
+TEST(CliArgs, JobsRejectsZero) {   // 0 is not a valid worker count — fail loud, never silent auto
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs", "0"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+}
+
+TEST(CliArgs, JobsRejectsNonNumeric) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=abc"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+    EXPECT_NE(r.error().detail.find("abc"), std::string::npos);
+}
+
+TEST(CliArgs, JobsRejectsTrailingJunk) {   // partial parse ("4x") must fail, not silently take 4
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=4x"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+}
+
+TEST(CliArgs, JobsAloneIsNoModeError) {   // --jobs with no mode flag must fail loud, not be dropped
+    Argv a{"dss-code-prime", "--jobs", "4"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+// ── --stack-reserve <bytes> (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the
+//    per-PROGRAM stack reserve the emitted image is asked to carry) ────
+//
+// Mirrors the --jobs cluster above (both spellings, positive-integer
+// validation, no-mode guard) plus the two axes that are specific to this
+// flag: the value is a std::uint64_t (a >4 GiB request must round-trip
+// EXACTLY — a narrowing to `unsigned` is a silent truncation), and RANGE /
+// ALIGNMENT are deliberately NOT checked here (the FORMAT declares those
+// bounds; the linker gate enforces them) — pinned below so a well-meaning
+// "validate early" change has to face the layering decision.
+
+TEST(CliArgs, StackReserveDefaultsToNullopt) {   // absent → nullopt = take the format's default
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_FALSE(r->stackReserveBytes.has_value())
+        << "absent --stack-reserve → nullopt; the object format's declared default stands";
+}
+
+TEST(CliArgs, StackReserveParsesEqualsForm) {   // RED-on-disable: drop the --stack-reserve arm → this fails
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=4194304"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->stackReserveBytes.has_value());
+    EXPECT_EQ(*r->stackReserveBytes, std::uint64_t{4194304});
+}
+
+TEST(CliArgs, StackReserveParsesSpaceForm) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve", "65536"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->stackReserveBytes.has_value());
+    EXPECT_EQ(*r->stackReserveBytes, std::uint64_t{65536});
+}
+
+// A >4 GiB request must round-trip EXACTLY: 8589934592 == 2^33 does not fit
+// in a 32-bit `unsigned`, so a narrowing of either the CliArgs field or the
+// from_chars target would truncate (or fail to parse) — either way RED here.
+TEST(CliArgs, StackReserveLargeValueRoundTripsExactly) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=8589934592"};   // 2^33 — above the 32-bit ceiling
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->stackReserveBytes.has_value());
+    EXPECT_EQ(*r->stackReserveBytes, std::uint64_t{8589934592});
+}
+
+TEST(CliArgs, StackReserveRejectsZero) {   // a zero-byte reserve cannot start a program — fail loud
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve", "0"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidStackReserve);
+}
+
+TEST(CliArgs, StackReserveRejectsNonNumeric) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=abc"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidStackReserve);
+    EXPECT_NE(r.error().detail.find("abc"), std::string::npos);
+}
+
+TEST(CliArgs, StackReserveRejectsTrailingJunk) {   // partial parse ("4096x") must fail, not silently take 4096
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=4096x"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidStackReserve);
+}
+
+// A negative is rejected for free: the from_chars target is UNSIGNED, so a
+// leading '-' is invalid_argument. Pins that property — a change of the parse
+// target to a signed type would let `-4096` through (and then wrap to a huge
+// u64 at the assignment), which this asserts can never happen.
+TEST(CliArgs, StackReserveRejectsNegative) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=-4096"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidStackReserve);
+}
+
+TEST(CliArgs, StackReserveAloneIsNoModeError) {   // no mode flag → the request would be silently discarded
+    Argv a{"dss-code-prime", "--stack-reserve", "4194304"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+TEST(CliArgs, StackReserveRejectedInTranspileMode) {
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--transpile` emits translated
+    // SOURCE, never an image, so nothing downstream could ever carry the
+    // request -- and unlike a compile against an incapable FORMAT (which the
+    // linker gate refuses), no gate is even reached here. Accepting it would
+    // be a silent discard, so the CLI refuses it up front.
+    Argv a{"dss-code-prime",
+           "--transpile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve", "4194304"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+    EXPECT_NE(r.error().detail.find("--stack-reserve"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("silently discarded"), std::string::npos);
+}
+
+TEST(CliArgs, StackReserveRejectedInLspMode) {
+    // Same reasoning for --lsp: a language server emits no artifact at all.
+    Argv a{"dss-code-prime", "--lsp", "--stack-reserve", "4194304"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+TEST(CliArgs, StackReserveAcceptedInEveryImageEmittingMode) {
+    // The positive control for the two rejects above -- without it, the mode
+    // gate could be satisfied by refusing EVERYTHING. All three image-emitting
+    // modes must still accept the flag and carry the exact value.
+    {
+        Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+               "--target", "x86_64:pe64-x86_64-windows-exec",
+               "--stack-reserve", "4194304"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "compile mode must accept it";
+        EXPECT_EQ(r->stackReserveBytes, std::optional<std::uint64_t>{4194304u});
+    }
+    {
+        Argv a{"dss-code-prime", "--directory", "src", "--language", "c-subset",
+               "--target", "x86_64:pe64-x86_64-windows-exec",
+               "--stack-reserve", "4194304"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "directory mode must accept it";
+        EXPECT_EQ(r->stackReserveBytes, std::optional<std::uint64_t>{4194304u});
+    }
+    {
+        Argv a{"dss-code-prime", "--project", "p.dss-project.json",
+               "--stack-reserve", "4194304"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "project mode must accept it";
+        EXPECT_EQ(r->stackReserveBytes, std::optional<std::uint64_t>{4194304u});
+    }
+}
+
+TEST(CliArgs, StackReserveMissingValueRejected) {   // `--stack-reserve` as the last argv
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve"};   // no following arg
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, StackReserveEqualsEmptyRhsRejects) {   // symmetric with every other value flag
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// LAYERING pin: the CLI validates SYNTAX only. `1` byte is far below every
+// shipped format's declared `minimumBytes` (pe64 exec: 65536) and is not a
+// multiple of any granularity — yet it must PARSE, because the bounds live in
+// the `.format.json` the parser has not resolved yet. The refusal belongs to
+// the linker gate (K_InvalidStackReserveRequest), which owns the numbers.
+// RED-on-disable: add a range check here and this goes red, forcing the
+// layering decision to be made deliberately rather than by drift.
+TEST(CliArgs, StackReserveNotRangeCheckedAtCliTier) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--stack-reserve=1"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->stackReserveBytes.has_value());
+    EXPECT_EQ(*r->stackReserveBytes, std::uint64_t{1});
+}
+
+// The error-kind NAME must round-trip (the `cliArgsErrorName` switch is what
+// every failure message prints — a missing case silently degrades to
+// "Unknown", which names nothing the user can act on).
+TEST(CliArgs, InvalidStackReserveErrorNameRoundTrip) {
+    EXPECT_EQ(cliArgsErrorName(CliArgsError::InvalidStackReserve),
+              "InvalidStackReserve");
 }
 
 // ── --target=spec equals form ───────────────────────────────

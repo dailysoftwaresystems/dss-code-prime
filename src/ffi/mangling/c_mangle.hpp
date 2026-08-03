@@ -53,6 +53,35 @@ namespace dss::ffi {
 [[nodiscard]] DSS_EXPORT std::string
 applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5) —
+// THE one rule that turns a declared
+// symbol into its ON-BINARY name, with the explicit-assembler-name case folded in:
+//
+//     linkName(canonical, asmLabel, fmt)
+//         = asmLabel.empty() ? applyCMangling(canonical, fmt) : asmLabel
+//
+// An asm label REPLACES the mangling; it is never mangled on top of. MEASURED
+// against /usr/bin/clang on arm64-darwin: `int gv __asm("myglobal");` emits
+// `myglobal` (no leading `_`) while an undecorated `caller` emits `_caller`, and
+// the macOS SDK's `__DARWIN_ALIAS` family writes its own underscore
+// (`__asm("_" __STRING(sym) …)`) precisely because the string is used verbatim.
+// The in-tree precedent for a pre-decorated, never-re-mangled name is a format
+// descriptor's `importMangledName` (macho64-arm64-darwin-exec ships `"_exit"`).
+//
+// ★ IT EXISTS AS A FUNCTION, NOT AS FOUR `if`s, BECAUSE THE FOUR CALLERS MUST
+// AGREE BYTE-FOR-BYTE. Two of them build the cross-CU merge KEY (the definition
+// side in `program.cpp` and the import side via `ExternImport::mangledName`); if
+// one honors a label and the other does not, `mir_merge`'s
+// `definedNames.count(e.mangledName)` misses, the sibling-defined extern is NOT
+// stripped, and an intra-image call is silently emitted as a dynamic import
+// against the format-default library — green build, wrong binding, no diagnostic.
+//
+// Empty label ⇒ the pre-TF-C88 behavior, byte-identical. Empty canonical name with
+// an empty label ⇒ empty (the `nameOf` "module-private" signal, unchanged).
+[[nodiscard]] DSS_EXPORT std::string
+linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
+            ObjectFormatKind format);
+
 // Inverse of `applyCMangling`: strip the per-platform decoration
 // to recover the canonical C identifier. Used by FF1 binary
 // readers when ingesting a library whose symbol names are

@@ -82,6 +82,20 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format) {
 }
 
 std::string
+linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
+            ObjectFormatKind format) {
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): an explicit assembler name
+    // REPLACES the format's C mangling. It is
+    // returned byte-for-byte — no prefix added, none stripped, no validation of
+    // its shape (an assembler name is whatever the target assembler accepts, and
+    // `$`/`.`/`@` all appear in real Darwin and ELF-versioned symbols). The label
+    // is already gated non-empty at its source (S_AsmLabelInvalid), so an empty
+    // one here can only mean "no label".
+    if (!asmLabel.empty()) return std::string{asmLabel};
+    return applyCMangling(canonicalName, format);
+}
+
+std::string
 unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format) {
     if (decoratedName.empty()) return {};
     if (addsLeadingUnderscoreFor(format)

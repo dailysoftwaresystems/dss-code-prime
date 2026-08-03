@@ -1,0 +1,26 @@
+{
+  "$comment": "TF-C49 (SQLITE_THREADSAFE=0 support): the shipped <string.h> strerror (C89 7.11.6.2, char *strerror(int)) — the symbol SQLite's unixLogErrorAtLine references under a non-threadsafe build (`#else` branch `zErr = strerror(iErrno)`; the default THREADSAFE build takes the `zErr = \"\"` branch and references NEITHER strerror nor strerror_r, why the default corpus compiled clean without it). Before TF-C49, --define SQLITE_THREADSAFE=0 on sqlite3.c failed error[S0001] got strerror. strerror is exported by libc on every format (glibc/msvcrt/libSystem `T`) so no availableObjectFormats gate. m=strerror(keep(2)) must be non-NULL + non-empty -> exit 42. RED-ON-DISABLE: delete the strerror row from src/dss-config/shippedLibs/string.json -> this example fails to COMPILE error[S0001] got strerror (the exact SQLITE_THREADSAFE=0 failure).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ]
+}

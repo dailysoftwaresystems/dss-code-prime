@@ -43,6 +43,19 @@ namespace {
     return c == ' ' || c == '\t' || c == '\r';
 }
 
+// C 6.4p1 white-space characters ALSO include VERTICAL TAB (0x0b) and FORM-FEED
+// (0x0c) — the page-break controls older Unix sources sprinkle between sections
+// (real `tcl.h` has a form-feed at every page boundary). They are treated as
+// whitespace ONLY in the MAIN scan (the dispatch loop's whitespace branch), NOT
+// in `coreKindForByte` / `isAsciiSpace` — those feed BODY-MODE classification
+// (string/comment/directive bodies), where a `\v`/`\f` is ordinary body content
+// and re-classifying it as Whitespace would drive `resolveMeaning` down the
+// synthetic path for a non-body kind (a fatal drift-guard). Universal lexical
+// whitespace, not a language choice.
+[[nodiscard]] constexpr bool isMainScanExtraSpace(char c) noexcept {
+    return c == '\v' || c == '\f';
+}
+
 // UTF-8 leading bytes are 0xC2..0xF4. Bytes 0x80..0xBF are continuation
 // bytes — only valid as the tail of a multi-byte sequence; appearing
 // at token start signals malformed UTF-8 and lands in the illegal-char
@@ -834,10 +847,72 @@ TokenizeResult Tokenizer::tokenize() && {
                 emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                 if (sawClose) {
                     // c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): an `endsAtExclusive`
-                    // style leaves the close delimiter in the stream (re-lexed as its
-                    // own token); otherwise consume it as the token-less close.
+                    // style leaves the close delimiter in the stream to be re-lexed
+                    // as its own token by the main scan — so this branch must NOT
+                    // emit one, or the delimiter would be double-counted (one token
+                    // here plus the re-lexed one). Only the CONSUMING form owns the
+                    // closer's token.
                     if (!style->endsAtExclusive) {
-                        r.advance(closeLen);       // consume close delimiter (no token)
+                        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closing
+                        // delimiter used to be advanced past WITHOUT emitting
+                        // anything, so its bytes belonged to no token's span at all.
+                        // Every downstream span join (`tree_builder`'s parent-node
+                        // span, diagnostics, the HIR source map) then reported a
+                        // literal one delimiter short — and silently, because the
+                        // opener's and body's spans still joined into something that
+                        // LOOKED contiguous. The closer now gets a real token of its
+                        // own, schema-declared kind.
+                        //
+                        // ORDER IS LOAD-BEARING. `emit` builds
+                        // `SourceSpan::of(start, r.position())` and `start` is only
+                        // assigned at the top of the dispatch loop — where it points
+                        // at the FIRST BODY BYTE. Re-anchoring `start` to the
+                        // delimiter's own offset BEFORE advancing is what makes the
+                        // emitted span exactly the delimiter bytes; emitting after a
+                        // bare `advance` would silently produce
+                        // `[bodyStart, closeEnd)`, overlapping the body token, and
+                        // the parent's span join would still "look" right.
+                        //
+                        // The kind comes from config (`defaultToken.closeToken`) —
+                        // the engine never names a delimiter kind. It is deliberately
+                        // NOT `bodyToken.kind`: a closer sharing the body's kind is
+                        // indistinguishable from body content to every by-kind child
+                        // filter, and `decodeAdjacentStringBodies`
+                        // (string_literal_decode.hpp) would decode the delimiter as a
+                        // body segment (`"abc"` → `abc"`) with both the semantic and
+                        // HIR tiers agreeing on the wrong length, so no cross-tier
+                        // guard fires. The per-codepoint path below (the
+                        // `emit(..., bodyToken.kind, ...)` right after its own
+                        // `r.advance(n)`) still HAS that anti-pattern; it is harmless
+                        // only because no C-family value-bearing literal takes that
+                        // path — every one of them is a coalesced mode. The loader
+                        // rejects `closeToken == kind` so this path can never
+                        // reintroduce it.
+                        //
+                        // `coreKindForByte` on the delimiter's first byte mirrors
+                        // exactly what the main scan stamps on the matching OPENER,
+                        // so the pair is classified consistently without the engine
+                        // assuming the delimiter is punctuation vs. operator.
+                        //
+                        // No `bodyToken.flags` here: those describe BODY CONTENT (a
+                        // comment body's `EmptySpace`). Propagating them onto an
+                        // in-grammar delimiter a shape references would make the
+                        // schema cursor skip the very slot the shape waits for — a
+                        // silent grammar mismatch. Un-flagged, a mismatch surfaces
+                        // loudly as `P_SchemaCursorDesync` instead.
+                        if (!bodyToken.closeToken.valid()) {
+                            // Unreachable via the loader (it rejects
+                            // `coalesce: true` without a `closeToken`), so this can
+                            // only mean a hand-built schema bypassed validation.
+                            // Fail loud rather than emit an invalid-kind token that
+                            // the builder would resolve to garbage.
+                            tokenizerFatal("coalesced body mode has no "
+                                           "defaultToken.closeToken — schema bug");
+                        }
+                        const CoreTokenKind closeCore = coreKindForByte(r.peek());
+                        start = static_cast<ByteOffset>(r.position());
+                        r.advance(closeLen);
+                        emit(closeCore, bodyToken.closeToken);
                     }
                     if (frames.size() <= 1) {
                         tokenizerFatal("frame stack underflow at coalesced endsAt");
@@ -954,7 +1029,7 @@ TokenizeResult Tokenizer::tokenize() && {
             }
             continue;
         }
-        if (isAsciiSpace(c)) {
+        if (isAsciiSpace(c) || isMainScanExtraSpace(c)) {
             r.advance(1);
             emit(CoreTokenKind::Whitespace, wsKind);
             continue;

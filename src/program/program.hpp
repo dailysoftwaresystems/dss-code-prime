@@ -13,6 +13,12 @@
 #include <string>
 #include <vector>
 
+// D-PERF-4-CU-PARALLELISM: forward-declare the substrate executor so the
+// injection surface below is a bare pointer member — no need to pull the
+// thread-pool header (with <thread>/<condition_variable>) into every
+// program.hpp consumer. The compile driver includes the full header.
+namespace dss::substrate { class IExecutor; }
+
 namespace dss {
 
 // Route decision for a list of source files — the SINGLE source of
@@ -160,6 +166,34 @@ public:
     [[nodiscard]] std::optional<std::filesystem::path> const&
     outputDir() const noexcept { return outputDir_; }
 
+    /// D-AP2-OUTPUT-ROUTING (project artifactName + per-platform subdir):
+    /// the OPTIONAL base NAME for the emitted binary — nullopt ⇒ the source
+    /// stem (the unchanged default). `Program::compileProject` stamps this
+    /// from the manifest's `artifactName`; the CLI path (`Program::run`)
+    /// never sets it, so `--compile` output names stay byte-identical.
+    /// Threaded to `compileOneTarget` (via `runCusToTargets`) alongside
+    /// `outputDir`, where `artifactName.value_or(sourceStem)` names the file.
+    void setArtifactName(std::optional<std::string> name) {
+        artifactName_ = std::move(name);
+    }
+    [[nodiscard]] std::optional<std::string> const&
+    artifactName() const noexcept { return artifactName_; }
+
+    /// D-AP2-OUTPUT-ROUTING (project per-platform subdir): when set, EVERY
+    /// target's artifact routes into a `<outputDir>/<formatName>/` subdir —
+    /// including a SINGLE-target build (which is otherwise flat). Multi-target
+    /// builds already subdir by formatName; this forces the same layout for
+    /// single-target project builds so a project's output is consistently
+    /// per-platform. `Program::compileProject` sets it true; the CLI path
+    /// (`Program::run`) leaves it false, so `--compile` single-target output
+    /// stays FLAT (byte-identical). Threaded to `compileOneTarget` (via
+    /// `runCusToTargets`) where the subdir decision is
+    /// `multiTargetBuild || perFormatOutputSubdir`.
+    void setPerFormatOutputSubdir(bool on) noexcept { perFormatOutputSubdir_ = on; }
+    [[nodiscard]] bool perFormatOutputSubdir() const noexcept {
+        return perFormatOutputSubdir_;
+    }
+
     /// D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): override the
     /// MIR-optimizer pipeline for the next compileFiles/Directory call.
     /// When set, replaces the JSON-loaded default at compile_pipeline
@@ -191,6 +225,15 @@ public:
         return userDefines_;
     }
 
+    /// The CLI `-I<dir>` / `--include-dir <dir>` quote-include search path
+    /// (the C 6.10.2 quote form), stamped from `CliArgs::includeDirs` by
+    /// `Program::run` before dispatch (the setUserDefines pattern). Every CU
+    /// build threads them onto the `UnitBuilder` via `addIncludeDir`.
+    void setIncludeDirs(std::vector<std::string> d) { includeDirs_ = std::move(d); }
+    [[nodiscard]] std::vector<std::string> const& includeDirs() const noexcept {
+        return includeDirs_;
+    }
+
     /// c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` binaries
     /// whose export surfaces resolve + validate this run's source-declared
     /// externs. `Program::run` stamps this from `CliArgs::resolveLibraries`;
@@ -203,12 +246,62 @@ public:
     [[nodiscard]] std::vector<std::filesystem::path> const&
     resolveLibraries() const noexcept { return resolveLibraries_; }
 
+    /// D-PERF-4-CU-PARALLELISM: inject an executor for the per-CU build loop.
+    /// The N>1 path (`compileUnits`) builds every CU's MIR concurrently; each
+    /// `buildCuMir` is a pure per-CU function (own interner/arenas/SemanticModel
+    /// + a private scratch reporter), so the jobs share no mutable state and the
+    /// driver merges their diagnostics back in CU (source) ORDER after the join
+    /// — byte-deterministic regardless of thread scheduling. Tests inject a
+    /// `SynchronousExecutor` (the single-threaded reference the pool path is
+    /// compared against) or a `ThreadPool`. nullptr (the default) ⇒ the driver
+    /// constructs an internal pool sized from `--jobs` / hardware_concurrency.
+    /// NON-OWNING: the caller owns the executor's lifetime across the compile
+    /// call (mirrors the `pipelineOverride` non-owning-injection pattern).
+    void setExecutor(substrate::IExecutor* e) noexcept { executor_ = e; }
+    [[nodiscard]] substrate::IExecutor* executor() const noexcept { return executor_; }
+
+    /// D-PERF-4-CU-PARALLELISM: the CLI `--jobs N` worker-count override for the
+    /// INTERNAL per-CU build pool (ignored when an executor is injected via
+    /// `setExecutor`). 0 (the default) ⇒ auto = min(hardware_concurrency, CU
+    /// count, 16). `Program::run` stamps this from `CliArgs::jobs`.
+    void setJobs(unsigned n) noexcept { jobs_ = n; }
+    [[nodiscard]] unsigned jobs() const noexcept { return jobs_; }
+
+    /// D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM stack reserve
+    /// this build requests of the emitted image, in BYTES. nullopt (the
+    /// default) ⇒ the object format's declared default stands.
+    ///
+    /// Sources + PRECEDENCE: `Program::run` stamps the CLI
+    /// `--stack-reserve`; `Program::compileProject` then applies the
+    /// manifest's `stackReserve` ONLY IF the CLI supplied none — i.e. the
+    /// CLI WINS. (The three flag ARRAYS merge, because appending composes;
+    /// a scalar cannot merge, so it needs an explicit precedence rule, and
+    /// "explicit command line beats committed file" is the universal one.)
+    ///
+    /// The value is carried, not honoured, at this tier: whether the target
+    /// format can express a stack reserve at all — and whether the value is
+    /// within the range that format DECLARES — is decided at the linker
+    /// gate, which REFUSES rather than drops.
+    void setStackReserveBytes(std::optional<std::uint64_t> n) noexcept {
+        stackReserveBytes_ = n;
+    }
+    [[nodiscard]] std::optional<std::uint64_t>
+    stackReserveBytes() const noexcept { return stackReserveBytes_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
+    std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
+    bool                                   perFormatOutputSubdir_ = false;  // D-AP2-OUTPUT-ROUTING: project ⇒ force <formatName>/ subdir
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define
+    std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
     std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
+    substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
+    unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
+    // `stackReserve` (nullopt = the format's declared default).
+    std::optional<std::uint64_t>           stackReserveBytes_;
 };
 
 } // namespace dss

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <set>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -314,6 +315,125 @@ TEST(TypeInterner, StructTypeOverloadRoutesToForwardCompleteNoDuplicate) {
     EXPECT_FALSE(ti.isIncompleteComposite(a));      // complete-at-once
     ASSERT_EQ(ti.operands(a).size(), 1u);
     EXPECT_EQ(ti.operands(a)[0].v, i32.v);
+}
+
+// ── D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the per-COMPOSITE alignment channel ──
+//
+// `struct S {…} __attribute__((aligned(N)))` raises the WHOLE composite's alignment.
+// That is a genuinely per-COMPOSITE fact: it is NOT `fieldAligns[0]` (which would lie
+// about member 0's own `_Alignof`, and does not exist at all for a zero-field
+// composite) and NOT `packed` (which LOWERS the per-field baseline). These pins hold
+// the channel's three interner-level obligations: it is READABLE, it participates in
+// interning IDENTITY, and an unrepresentable value fails LOUD at the sink.
+
+TEST(TypeInterner, CompositeExplicitAlignIsReadableAndDefaultsToZero) {
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1> const fields{i32};
+    // No request → 0 (the ordinary path), for BOTH the forward+complete route and
+    // the complete-at-once route.
+    const TypeId plain = ti.forwardComposite(TypeKind::Struct, "P", 1);
+    ti.completeComposite(plain, fields, /*packed=*/false);
+    EXPECT_EQ(ti.explicitCompositeAlign(plain), 0u);
+    EXPECT_EQ(ti.explicitCompositeAlign(ti.structType("Q", fields)), 0u);
+    // A request survives into the side-table and reads back EXACTLY.
+    const TypeId aligned = ti.forwardComposite(TypeKind::Struct, "A", 2);
+    ti.completeComposite(aligned, fields, /*packed=*/false, /*fieldBitWidths=*/{},
+                         /*fieldOffsets=*/{}, /*fieldAligns=*/{},
+                         /*explicitAlign=*/16u);
+    EXPECT_EQ(ti.explicitCompositeAlign(aligned), 16u);
+    // ...and it is INDEPENDENT of packed and of the per-FIELD aligns: a composite
+    // alignment must not be readable as a member override, or `_Alignof` of member 0
+    // would be wrong.
+    EXPECT_FALSE(ti.isPacked(aligned));
+    EXPECT_FALSE(ti.hasExplicitAligns(aligned));
+    EXPECT_EQ(ti.explicitFieldAlign(aligned, 0), 0u);
+    // A ZERO-FIELD composite can carry one — the case a `fieldAligns[0]` smuggle
+    // could not represent at all.
+    const TypeId empty = ti.forwardComposite(TypeKind::Struct, "E", 3);
+    ti.completeComposite(empty, {}, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/8u);
+    EXPECT_EQ(ti.explicitCompositeAlign(empty), 8u);
+    // Non-composites never report one. (An INVALID id is out of contract here, as
+    // it is for `isPacked` / `hasExplicitAligns` — the arena's range check aborts.)
+    EXPECT_EQ(ti.explicitCompositeAlign(i32), 0u);
+    EXPECT_EQ(ti.explicitCompositeAlign(ti.pointer(i32)), 0u);
+}
+
+TEST(TypeInterner, CompositeExplicitAlignIsPartOfInterningIdentity) {
+    // ★ THE IDENTITY CHARGE. Two composites differing ONLY in their explicit
+    // alignment are DIFFERENT types — they lay out to different sizes AND different
+    // alignments — so they must not collide in the intern map. The complete-at-once
+    // path derives its declSiteKey from CONTENT (`contentDeclSiteKey`), which is the
+    // one route where a collision is possible at all; this is the `packed` precedent
+    // followed exactly (packed enters that key GUARDED on true, the align GUARDED on
+    // non-zero). RED-ON-DISABLE: drop the `explicitAlign` mix from
+    // `contentDeclSiteKey` and `a16`/`a32` collapse onto `plain`'s TypeId — at which
+    // point `completeComposite` ALSO aborts on the conflicting re-completion, so the
+    // failure is loud in two independent ways rather than a silent alias.
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1> const fields{i32};
+    std::span<std::int64_t const>  const noWidths{};
+    std::span<std::uint64_t const> const noOffs{};
+    std::span<std::uint32_t const> const noAligns{};
+    const TypeId plain = ti.structType("S", fields, noWidths, noOffs, noAligns, 0u);
+    const TypeId a16   = ti.structType("S", fields, noWidths, noOffs, noAligns, 16u);
+    const TypeId a32   = ti.structType("S", fields, noWidths, noOffs, noAligns, 32u);
+    EXPECT_NE(plain.v, a16.v);
+    EXPECT_NE(plain.v, a32.v);
+    EXPECT_NE(a16.v, a32.v);
+    EXPECT_EQ(ti.explicitCompositeAlign(plain), 0u);
+    EXPECT_EQ(ti.explicitCompositeAlign(a16), 16u);
+    EXPECT_EQ(ti.explicitCompositeAlign(a32), 32u);
+    // ...while CANONICALIZATION is preserved: identical content INCLUDING the
+    // alignment still collapses to one TypeId (no per-call churn).
+    const std::size_t before = ti.size();
+    EXPECT_EQ(ti.structType("S", fields, noWidths, noOffs, noAligns, 16u).v, a16.v);
+    EXPECT_EQ(ti.size(), before);
+    // ZERO-CHURN CONTROL: `explicitAlign == 0` must hash byte-identically to the
+    // pre-channel key, so the 5-arg overload and the 6-arg-with-0 overload are the
+    // SAME TypeId. If the mix were unguarded, every existing composite's declSiteKey
+    // would shift.
+    EXPECT_EQ(ti.structType("S", fields, noWidths, noOffs, noAligns).v, plain.v);
+}
+
+TEST(TypeInternerDeathTest, CompleteCompositeUnrepresentableAlignAborts) {
+    // FAIL LOUD AT THE SINK: an alignment the layout engine could never honor (not a
+    // power of two, or beyond the `Alignment` newtype's 256 cap) is rejected where it
+    // is stored, not silently rounded/clamped/dropped downstream. The semantic
+    // ladder rejects it first with a positioned diagnostic; this is the backstop for
+    // a shipped descriptor or a future front end that bypasses that ladder.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto notPow2 = [] {
+        auto ti = makeInterner(1);
+        const TypeId n = ti.forwardComposite(TypeKind::Struct, "N", 1);
+        ti.completeComposite(n, {}, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/3u);
+    };
+    EXPECT_DEATH({ notPow2(); }, "power of two in \\[1, 256\\]");
+    auto tooBig = [] {
+        auto ti = makeInterner(1);
+        const TypeId n = ti.forwardComposite(TypeKind::Struct, "N", 1);
+        ti.completeComposite(n, {}, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/512u);
+    };
+    EXPECT_DEATH({ tooBig(); }, "power of two in \\[1, 256\\]");
+}
+
+TEST(TypeInternerDeathTest, CompositeAlignConflictingReCompletionAborts) {
+    // A re-completion that CHANGES the whole-composite alignment is a conflicting
+    // re-completion, not a benign re-resolution — the two spellings lay out to
+    // different sizes. Fail loud rather than silently keeping whichever ran first.
+    // RED-ON-DISABLE: drop `explicitAlign` from the `same` comparison in
+    // `completeComposite` and this silently accepts the first value.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto trigger = [] {
+        auto ti = makeInterner(1);
+        const TypeId i32 = ti.primitive(TypeKind::I32);
+        const TypeId n   = ti.forwardComposite(TypeKind::Struct, "N", 1);
+        std::array<TypeId, 1> const f{i32};
+        ti.completeComposite(n, f, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/16u);
+        ti.completeComposite(n, f, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/32u);
+    };
+    EXPECT_DEATH({ trigger(); }, "re-completed with different fields");
 }
 
 TEST(TypeInternerDeathTest, CompleteCompositeConflictingReCompletionAborts) {

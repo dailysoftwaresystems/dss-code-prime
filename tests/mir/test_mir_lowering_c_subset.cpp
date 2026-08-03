@@ -21,11 +21,14 @@
 #include "opt/passes/dce.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
+#include "diagnostic_count.hpp"                // dss::test_support::countCode (TF-C93)
 #include "core/types/target_schema.hpp"
+#include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -61,7 +64,18 @@ struct Lowered {
                                    // not spell `long double` at all; the f64 axis
                                    // is the pe64 / apple-arm64 shape where `long
                                    // double` and `double` share ONE core.
-                                   LongDoubleFormat ldf = LongDoubleFormat::None) {
+                                   LongDoubleFormat ldf = LongDoubleFormat::None,
+                                   // D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM: the
+                                   // active OBJECT FORMAT, by shipped name.
+                                   // Bare-`char` signedness is a (processor ×
+                                   // PLATFORM) property — the same arm64 CPU is
+                                   // SIGNED under Darwin and UNSIGNED under
+                                   // GNU/Linux — so a target name alone cannot
+                                   // express the arm64×macho arm at all. EMPTY
+                                   // (the default) ⇒ no format in play and the
+                                   // TARGET's value stands, byte-identically
+                                   // what every pre-existing fixture here got.
+                                   std::string formatName = {}) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -99,6 +113,32 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+        // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char`
+        // signedness exactly as compile_pipeline.cpp does, so the char→int
+        // promotion lowers as SExt (signed) or ZExt (unsigned). ★ Routed
+        // through the REAL production accessor and fed the SHIPPED format's own
+        // declared kind — not a re-implementation of the rule and not a
+        // hand-picked kind. That is what keeps the arm64×macho pin non-vacuous:
+        // if the resolution stopped honouring the format the pin goes red,
+        // where a hand-computed expectation here would happily agree with a
+        // broken engine.
+        //
+        // EMPTY `formatName` ⇒ ELF, the format every pre-existing fixture in
+        // this file was implicitly written against. It is spelled out rather
+        // than left to a no-arg accessor BECAUSE there is no no-arg accessor:
+        // the object format is a required argument precisely so a caller cannot
+        // silently take the processor half alone.
+        auto formatKind = ObjectFormatKind::Elf;
+        if (!formatName.empty()) {
+            auto f = ObjectFormatSchema::loadShipped(formatName);
+            if (!f) {
+                ADD_FAILURE() << "loadShipped(format) failed: " << formatName;
+                std::abort();
+            }
+            formatKind = (*f)->kind();
+        }
+        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned(formatKind);
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
@@ -140,7 +180,44 @@ struct Lowered {
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,   // VLA C1a
                                     &hir->sizeofVlaSymbol,   // VLA C2
-                                    &hir->typedefVlaOriginBySymbol);   // VLA C4b
+                                    &hir->typedefVlaOriginBySymbol,   // VLA C4b
+                                    // TF-C78: the harness threads the SAME trailing
+                                    // maps `compile_pipeline.cpp` does. It previously
+                                    // stopped here, so any map added after this point
+                                    // was invisible to every unit test in this file
+                                    // while working in the real compiler.
+                                    // ★ TF-C81: THAT TRAP FIRED AGAIN, EXACTLY AS
+                                    // WARNED. `alwaysInlineMap` worked end-to-end
+                                    // through the real CLI (probed: the over-threshold
+                                    // callee's `bl` vanished from the release binary)
+                                    // while EVERY unit test here read a nullptr map
+                                    // and saw the flag as absent. So the warning above
+                                    // is not history — it is a live hazard, and it is
+                                    // load-bearing that the tests assert the APPLIED
+                                    // FACT: a test that only checked "it compiled"
+                                    // would have passed against a dead harness and
+                                    // hidden the gap instead of exposing it.
+                                    // ★★ TF-C92: AND IT FIRED A **THIRD** TIME, WITH
+                                    // THE WARNING ABOVE ALREADY ON THE SCREEN.
+                                    // `noSanitizeThreadMap` was threaded through the
+                                    // product AND compile_pipeline.cpp, the real CLI
+                                    // accepted `no_sanitize_thread` and emitted a clean
+                                    // object file — and all FIVE form cases in this file
+                                    // still read 0, because the harness passed nothing
+                                    // here. Three cycles, three identical misses: treat
+                                    // updating these call sites as PART OF adding a map,
+                                    // never as a follow-up. THERE ARE
+                                    // FOUR `lowerToMir` CALL SITES IN THIS FILE (this
+                                    // one plus ~535, ~601, ~11459); a map added to
+                                    // only some of them fails in a shape-dependent
+                                    // subset of tests, which is harder to diagnose
+                                    // than failing in all of them. Update all four.
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap,
+                                    &hir->alwaysInlineMap,   // TF-C81
+                                    &hir->noOptimizeMap,   // TF-C85
+                                    &hir->noSanitizeThreadMap);   // TF-C92
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -481,7 +558,81 @@ namespace {
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,
                                     &hir->sizeofVlaSymbol,
-                                    &hir->typedefVlaOriginBySymbol);
+                                    &hir->typedefVlaOriginBySymbol,
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap,   // TF-C78
+                                    &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: lower a program that calls a shipped
+// descriptor's `fn(ptr<i64>)` with a real C `long long*` arg through the FULL
+// pipeline (scratch descriptor on the system path — the lowerAtomicProgram
+// discipline). Used to witness that the admitted call-arg REALIZES as a Ptr→Ptr
+// bitcast (no width op) and that the HIR verifier stays clean (admit⟺realize).
+[[nodiscard]] Lowered lowerFfiWideProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "ffi-wide-mir"};
+    std::ofstream(sysDir.path() / "ffiwide.json", std::ios::binary) << R"JSON({
+        "header": "ffiwide.h",
+        "library": { "elf": "libscratchffi.so.1", "pe": "scratchffi.dll", "macho": "/usr/lib/libscratchffi.dylib" },
+        "symbols": [
+            { "name": "ffi_take_wide", "signature": "fn(ptr<i64>) -> void", "kind": "function", "linkage": "external" }
+        ]
+    })JSON";
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.setActiveFormat(ObjectFormatKind::Elf);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol,
+                                    &hir->synthRecipeBySymbol,
+                                    &hir->returnsTwiceMap,
+                                    &hir->noInlineMap,   // TF-C78
+                                    &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -890,6 +1041,174 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
+// TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET): bare `char`'s signedness
+// is TARGET-config-driven — the char→int promotion sign-extends (SExt) on a
+// signed-char target (x86_64/pe64) and zero-extends (ZExt) on an unsigned-char
+// target (AArch64). `int f(char c) { return c; }` promotes `c` (char) to the
+// int return type via `mapCast(Char, I32)` — Finding 1's REAL decision site
+// (the former `mapCast`-local `isSignedInt`), routed through the target-aware
+// `isSignedIntKind`. This pins BOTH arms of that one predicate through the full
+// frontend. RED-ON-DISABLE: revert `isSignedIntKind(Char)` to the hard-coded
+// signed set → the arm64 config emits SExt (not ZExt) and the arm64 assertion
+// below flips (0 ZExt / 1 SExt). x86_64 is unchanged (byte-identical).
+TEST(MirLoweringCSubset, BareCharToIntPromotionIsTargetSignednessAware) {
+    constexpr char kSrc[] = "int f(char c) { return c; }";
+
+    // x86_64: bare char is SIGNED ⇒ char→int promotion is SExt (sxtb / movsx).
+    {
+        auto L = lowerCSubset(kSrc, "x86_64", "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(sexts.size(), 1u)
+            << "x86_64: bare char is signed — the char→int promotion must SExt";
+        EXPECT_EQ(zexts.size(), 0u)
+            << "x86_64: no ZExt — char is signed here";
+    }
+
+    // arm64: bare char is UNSIGNED (AArch64 ABI) ⇒ promotion is ZExt (uxtb / movzx).
+    {
+        auto L = lowerCSubset(kSrc, "arm64", "aapcs64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(zexts.size(), 1u)
+            << "arm64: bare char is UNSIGNED — the char→int promotion must ZExt";
+        EXPECT_EQ(sexts.size(), 0u)
+            << "arm64: no SExt — char is unsigned here (the TF-C56 fix)";
+    }
+}
+
+// D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM: the (processor × PLATFORM) matrix that
+// the per-processor test above CANNOT express. Same one-line program, same one
+// decision site (`isSignedIntKind(Char)` → `mapCast(Char, I32)`), now resolved
+// through the real `TargetSchema::charIsUnsigned(ObjectFormatKind)` fed the
+// shipped format's own declared kind.
+//
+// ★ THE arm64×macho ROW IS THE WHOLE POINT, and it was RED before this arc's
+// fix. `arm64.target.json` declared one flat `charIsUnsigned: true`, so every
+// arm64 leg — including Darwin — zero-extended, while clang SIGN-extends on
+// Apple arm64. MEASURED 2026-07-28 (Darwin 25.5.0 arm64, Apple clang 21.0.0,
+// /usr/bin/clang), three ways: `clang -dM -E` defines __CHAR_UNSIGNED__ for
+// aarch64-linux-gnu and NOT for arm64-apple-darwin; `_Static_assert((char)-1 <
+// 0)` passes on arm64-apple-darwin and fails on aarch64-linux-gnu; codegen is
+// `ldrsb` vs `ldrb`. The two arm64 rows below DISAGREE on purpose — that
+// disagreement is the fact a per-CPU boolean cannot hold, and the reason the
+// target's one key carries `byObjectFormat` overrides.
+//
+// RED-ON-DISABLE (two independent observables, both verified against the FINAL
+// build):
+//   (1) drop the `"macho": false` row from arm64.target.json's `charIsUnsigned`
+//       → the arm64×macho row falls back to `default: true` and emits ZExt,
+//       failing this test (the exact-set matrix in tests/core fails too);
+//   (2) make `charIsUnsigned(kind)` ignore its argument and return the default
+//       → the same row goes red, and the two arm64 rows stop disagreeing.
+TEST(MirLoweringCSubset, BareCharSignednessIsResolvedPerTargetAndFormat) {
+    constexpr char kSrc[] = "int f(char c) { return c; }";
+
+    struct Row {
+        char const* target;
+        char const* cc;
+        char const* format;
+        bool        expectSExt;   // true ⇒ signed char ⇒ SExt; false ⇒ ZExt
+        char const* why;
+    };
+    for (Row const row : {
+             // x86_64 is SIGNED on every platform it serves — the format's
+             // declaration (macho/pe) and the target default (elf) agree, so all
+             // three rows must be byte-identical to the pre-cycle behaviour.
+             Row{"x86_64", "sysv_amd64", "elf64-x86_64-linux-exec",   true,
+                 "x86_64/elf: signed — x86_64 declares no charIsUnsigned key "
+                 "at all, so every format takes the absent-key default"},
+             Row{"x86_64", "sysv_amd64", "macho64-x86_64-darwin-exec", true,
+                 "x86_64/macho: signed, same default"},
+             Row{"x86_64", "ms_x64",     "pe64-x86_64-windows-exec",   true,
+                 "x86_64/pe: signed, same default"},
+             // arm64 is where the platform axis bites: the SAME processor,
+             // OPPOSITE answers, decided by the platform.
+             Row{"arm64",  "aapcs64",    "elf64-aarch64-linux-exec",   false,
+                 "arm64/elf: no override for elf, so the AAPCS64 processor "
+                 "default (unsigned) governs — this row is CORRECT as-is and "
+                 "must never be flipped"},
+             Row{"arm64",  "aapcs64",    "macho64-arm64-darwin-exec",  true,
+                 "arm64/macho: Apple's platform ABI chose SIGNED, so the "
+                 "target's `byObjectFormat: {macho: false}` override must beat "
+                 "its own unsigned default — the miscompile this anchor was "
+                 "opened for"},
+         }) {
+        auto L = lowerCSubset(kSrc, row.target, row.cc, DataModel::Lp64,
+                              LongDoubleFormat::None, row.format);
+        ASSERT_TRUE(L.mir.ok)
+            << row.why << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const sexts = collectOps(m, MirOpcode::SExt);
+        auto const zexts = collectOps(m, MirOpcode::ZExt);
+        EXPECT_EQ(sexts.size(), row.expectSExt ? 1u : 0u) << row.why;
+        EXPECT_EQ(zexts.size(), row.expectSExt ? 0u : 1u) << row.why;
+    }
+}
+
+// D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion widens the
+// source to POINTER WIDTH per its signedness BEFORE IntToPtr — SExt a signed
+// narrower int, ZExt an unsigned one, and SKIP a source already at pointer width
+// (byte-identical bare IntToPtr). Previously IntToPtr lowered a narrower source
+// with NO extension (identity mov), so a signed `-1` zero-extended to
+// 0x0000_0000_FFFF_FFFF instead of all-ones — breaking `(u8*)(-1)` sentinels
+// (sqlite) on arm64's >4 GiB addresses. This pins the MIR shape at the combineCast
+// fix site. RED-ON-DISABLE: revert the fix → the narrower arms emit a bare IntToPtr
+// with no SExt/ZExt (the signed arm's `sexts.size()==1` fails).
+TEST(MirLoweringCSubset, IntToPtrExtendsSourceToPointerWidthBySignedness) {
+    // signed narrower (int, 32-bit) → SExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* f(int x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+            << "signed int→ptr must SIGN-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // unsigned narrower (unsigned, 32-bit) → ZExt to pointer width, then IntToPtr.
+    {
+        auto L = lowerCSubset("void* g(unsigned x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+            << "unsigned int→ptr must ZERO-extend the source to pointer width";
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u);
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+    // pointer-width source (long long, 64-bit) → bare IntToPtr, NO extension: the
+    // byte-identical skip (`fromResolved == ptrIntKind`).
+    {
+        auto L = lowerCSubset("void* h(long long x) { return (void*)x; }", "x86_64",
+                              "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+            << "a pointer-width source must NOT be extended (byte-identical skip)";
+        EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u);
+        // Pin the byte-identical invariant directly: the skip must emit NO widening
+        // op at all — not even a same-width Bitcast. Dropping the `fromResolved !=
+        // ptrIntKind` guard would make `mapCast(I64,I64)` return Bitcast → a stray
+        // GPR mov at LIR → byte-identical BREAKS for every pointer-width int→ptr on
+        // x86_64/pe64. SExt/ZExt counts alone would NOT catch that; this does.
+        EXPECT_EQ(collectOps(m, MirOpcode::Bitcast).size(), 0u)
+            << "a pointer-width source must skip cleanly (no Bitcast) — byte-identical";
+        EXPECT_EQ(collectOps(m, MirOpcode::IntToPtr).size(), 1u);
+    }
+}
+
 // CE4 end-to-end: a ternary initializer folds when cond + selected arm
 // both fold (the unselected arm doesn't need to fold). `int g = 1 ? 7 : x;`
 // — even if `x` were non-constant, cond=true picks the then-arm and the
@@ -1046,6 +1365,165 @@ TEST(MirLoweringCSubset, GlobalWithFloatArithmeticInitializerFoldsThroughCastToI
         << "HR coerce must wrap F64 init in Cast(F64→I32) for int target; "
            "CE5 must fold through that Cast";
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
+}
+
+// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — tryClassifyIntToPtrConst ──
+// An explicit integer-constant→pointer cast in a STATIC/global initializer
+// (`(void*)0x5`) folds to a PLAIN uint64 pointer leaf (core==Ptr) — an ABSOLUTE
+// address, no symbol, no relocation. const-eval refuses the cast-to-pointer, so
+// without the classifier the initializer falls to `runtimeInit`: a SCALAR becomes
+// an init-func store (UINT32_MAX literal + valid initFunc), and an AGGREGATE trips
+// the ConstructAggregate fail-loud (mir.ok == false). Each pin below is therefore
+// RED-ON-DISABLE on the exact wiring it names.
+
+// pin (i): a TOP-LEVEL scalar int→ptr cast folds to a uint64 pointer leaf == 5,
+// core==Ptr, with NO init function. RED-ON-DISABLE: the classifyGlobals scalar-
+// cascade wiring — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
+TEST(MirLoweringCSubset, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
+    auto L = lowerCSubset("static void* p = (void*)0x5;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "the int→ptr cast must fold to a const-init literal, not runtimeInit";
+    EXPECT_FALSE(m.globalInitFunc(g).valid())
+        << "an absolute-address pointer constant needs no __module_init__ store";
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value))
+        << "a folded int→ptr leaf is a plain uint64 (the encoder writes raw LE bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr) << "core==Ptr — pointer-typed, no relocation";
+}
+
+// pin (ii): an ARRAY of int→ptr — `static void* a[] = {(void*)1,(void*)2};` —
+// lowers to an aggregate const-init whose two fields are plain uint64 pointer
+// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the
+// member-loop wiring — the array aggregate would bail to runtimeInit → the
+// ConstructAggregate fail-loud (mir.ok == false).
+TEST(MirLoweringCSubset, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
+    auto L = lowerCSubset("static void* a[] = { (void*)1, (void*)2 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<MirAggregateValue>(lit.value));
+    auto const& agg = std::get<MirAggregateValue>(lit.value);
+    ASSERT_EQ(agg.fields.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[0].value));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg.fields[1].value));
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[0].value), 1u);
+    EXPECT_EQ(std::get<std::uint64_t>(agg.fields[1].value), 2u);
+    EXPECT_EQ(agg.fields[0].core, TypeKind::Ptr);
+    EXPECT_EQ(agg.fields[1].core, TypeKind::Ptr);
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[0].value))
+        << "an absolute integer element must NOT be a relocation";
+    EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[1].value));
+}
+
+// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf.
+// tryClassifyNullPointerConst claims it FIRST (it runs before the int→ptr arm at
+// both sites) and the int→ptr arm would produce the byte-identical leaf anyway, so
+// the standard null-pointer constant is preserved — order intact.
+TEST(MirLoweringCSubset, StaticNullPointerCastStillFoldsToZeroLeaf) {
+    auto L = lowerCSubset("static void* z = (void*)0;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 0u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
+}
+
+// pin (iv): the MIX — `static struct Two X = {"a",(void*)0x5};` — `.a` stays a
+// SYMBOL-ADDRESS (reloc) leaf (the string's link-time rodata address) AND `.b` is
+// a plain uint64 pointer leaf == 5. Guards against the int→ptr arm cannibalizing
+// the symbol-address arm (which runs FIRST in the member loop). RED-ON-DISABLE:
+// the member-loop wiring — `.b` would bail the aggregate to runtimeInit.
+TEST(MirLoweringCSubset, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
+    auto L = lowerCSubset(
+        "struct Two { char* a; void* b; };\n"
+        "static struct Two X = { \"a\", (void*)0x5 };\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The string literal mints its own rodata global too, so find X by its
+    // aggregate const-init rather than assuming an index.
+    MirAggregateValue const* agg = nullptr;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirAggregateValue>(lit.value)) {
+            agg = &std::get<MirAggregateValue>(lit.value);
+            break;
+        }
+    }
+    ASSERT_NE(agg, nullptr) << "X must lower to a const-init aggregate, not runtimeInit";
+    ASSERT_EQ(agg->fields.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<MirSymbolAddrValue>(agg->fields[0].value))
+        << ".a is a link-time string address — an abs64 RELOCATION leaf, not an int";
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(agg->fields[1].value))
+        << ".b is the int→ptr absolute-address leaf — a plain uint64 (raw bytes)";
+    EXPECT_EQ(std::get<std::uint64_t>(agg->fields[1].value), 5u);
+    EXPECT_EQ(agg->fields[1].core, TypeKind::Ptr);
+}
+
+// pin (v) NEGATIVE: a pure SYMBOL-ADDRESS global — `char* s = "x";` — still routes
+// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer.
+// tryClassifyAsSymbolAddr runs FIRST in the scalar cascade, and the int→ptr arm
+// would nullopt on a non-Cast operand anyway. RED if the int→ptr arm ever swallowed
+// a symbol address (an integer leaf would appear where a reloc belongs).
+TEST(MirLoweringCSubset, StaticStringPointerStaysSymbolAddressNotInteger) {
+    auto L = lowerCSubset("char* s = \"x\";\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    bool foundSymAddr = false;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (std::holds_alternative<MirSymbolAddrValue>(lit.value)) foundSymAddr = true;
+        EXPECT_FALSE(std::holds_alternative<std::uint64_t>(lit.value) &&
+                     lit.core == TypeKind::Ptr)
+            << "a symbol-address global must not be mis-folded to an absolute integer";
+    }
+    EXPECT_TRUE(foundSymAddr)
+        << "`char* s = \"x\";` must carry a symbol-address reloc leaf";
+}
+
+// pin (vi) BLOCK-SCOPE static (the design-audit's one real correction): a
+// `static void* p = (void*)0x5;` declared INSIDE a function body reaches the SAME
+// classifyGlobals path (static-duration locals lower to module globals) — it folds
+// to the identical uint64 pointer leaf, NOT a runtime store in the function body.
+TEST(MirLoweringCSubset, BlockScopeStaticIntToPtrReachesClassifyGlobals) {
+    auto L = lowerCSubset(
+        "int main(void) { static void* p = (void*)0x5; return (int)(long)p; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Exactly one module global (the block-scope static `p`); its init is the
+    // folded int→ptr leaf, and NO __module_init__ appears for it.
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "a block-scope static int→ptr must fold to a const-init literal";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(lit.value));
+    EXPECT_EQ(std::get<std::uint64_t>(lit.value), 5u);
+    EXPECT_EQ(lit.core, TypeKind::Ptr);
 }
 
 // A function writing to a module global lowers the write as
@@ -1712,6 +2190,1101 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
+// ── TF-C78 (D-CSUBSET-NOINLINE): source → MirFunc.noInline, per FORM ──
+//
+// The full chain in one assertion: the `attributeSemantics.effects` `noInline`
+// verb → `SymbolRecord.isNoInline` (FnSig-gated) → `HirNoInlineMap` →
+// `MirFunc.noInline`. The two GNU attribute POSITIONS the c-subset grammar
+// admits are separately parameterized, because they reach
+// `scanAttributeSemantics` through DIFFERENT roots (the mode-2 mid-declarator
+// slot vs. the mode-3 specifier prefix) and one can regress without the other.
+//
+// Each case asserts a diagnostic-free lowering AND an exact per-symbol flag
+// SET — the annotated function true, `main` false. A count-only assertion
+// would stay green if the flag leaked onto the wrong symbol.
+struct NoInlineFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetNoInlineForm
+    : public ::testing::TestWithParam<NoInlineFormCase> {};
+
+TEST_P(MirLoweringCSubsetNoInlineForm, ThreadsToMirFuncNoInline) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    // EXACTLY ONE function carries the flag. 0 ⇒ the form never reached the
+    // sink; 2 ⇒ it leaked onto `main`, which the source never annotated.
+    int flagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcNoInline(m.funcAt(i))) ++flagged;
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((noinline)) in the '" << c.label << "' position must "
+           "thread to EXACTLY one MirFunc.noInline — 0 means the form never "
+           "reached the sink, 2 means it leaked onto an un-annotated function";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetNoInlineForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator.
+        NoInlineFormCase{
+            "mode2-after-type",
+            "static int __attribute__((noinline)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Mode-3: the attribute sits in the specifier PREFIX, before the type.
+        NoInlineFormCase{
+            "mode3-leading-prefix",
+            "static __attribute__((noinline)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — one `noinline` config entry must cover both via
+        // the shared `stripDunder` normalization, with no second config row.
+        NoInlineFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__noinline__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY: the flag is spelled on the declaration, and the
+        // DEFINITION is what lowers. Only the post-Pass-1.5 proto/def OR-merge
+        // makes this reach MIR (RED-ON-DISABLE: delete the `isNoInline` arm of
+        // the `mergedFnDecls` sweep and this case alone goes to 0).
+        NoInlineFormCase{
+            "prototype-only",
+            "static int helper(int k) __attribute__((noinline));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+    [](::testing::TestParamInfo<NoInlineFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the whole form suite: the identical program with NO
+// attribute must leave every MirFunc.noInline CLEAR. Without this, a lowering
+// that unconditionally set the flag would satisfy every case above.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasNoInlineClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoInline(m.funcAt(i)))
+            << "an un-annotated function must never carry noInline";
+}
+
+// ── TF-C78: THE APPLIED FACT, under the SHIPPED release pipeline ──
+//
+// ★ THIS IS THE LOAD-BEARING TEST OF THE WHOLE CYCLE. Everything above proves
+// the flag ARRIVES; this proves it is OBEYED by the exact pass composition the
+// product ships — `release.pipeline.json` loaded BY NAME, not a hand-written
+// one-pass list, so the pin cannot drift from what users actually run.
+//
+// The assertion is the APPLIED FACT (the Call instruction survives in the
+// optimized module), never "it compiled".
+//
+// RED-ON-DISABLE, BOTH MEASURED end-to-end on a real arm64 binary:
+//   * delete `inlining.cpp` rule 2b → helper is spliced away, `main` folds to
+//     a single `mov x29, #0x2a` and the helper function disappears entirely;
+//   * OR keep rule 2b and drop ONLY the `funcNoInline` argument in
+//     `mir_rebuild_helper.cpp` → BYTE-IDENTICAL breakage, because Inlining runs
+//     first in each of the 4 iterations and a rebuild between them clears the
+//     flag. The two failure modes are indistinguishable in the output, which is
+//     why the propagation has its own pin in test_mir_rebuild_helper.cpp.
+TEST(MirLoweringCSubsetLinkage, NoInlineSurvivesShippedReleasePipeline) {
+    auto L = lowerCSubset(
+        "static int __attribute__((noinline)) helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u) << "pre-optimization: main calls helper once";
+
+    // The SHIPPED pipeline, loaded by name — this is the composition that ships.
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "the call to a __attribute__((noinline)) function MUST survive the "
+           "SHIPPED release pipeline — this is the applied fact the whole "
+           "chain exists to produce, not merely that the program compiled";
+
+    // …and the function is still there to be called (DCE must not have removed
+    // a callee that still has a live call site).
+    bool helperPresent = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcNoInline(m.funcAt(i))) helperPresent = true;
+    EXPECT_TRUE(helperPresent)
+        << "the noinline callee must survive out-of-line, flag intact, after "
+           "the full release pipeline";
+}
+
+// ── TF-C81 (D-CSUBSET-ALWAYSINLINE): source → MirFunc.alwaysInline, per FORM ──
+//
+// The `NoInlineFormCase` suite one axis over: the `attributeSemantics.effects`
+// `alwaysInline` verb → `SymbolRecord.isAlwaysInline` (FnSig-gated) →
+// `HirAlwaysInlineMap` → `MirFunc.alwaysInline`. Both GNU attribute POSITIONS
+// are parameterized separately because they reach `scanAttributeSemantics`
+// through different roots and one can regress without the other.
+//
+// ★ EVERY CASE ALSO ASSERTS `noInline` IS CLEAR. The two facts travel as
+// adjacent bools from `addFunction` onward, so "the right flag" is a distinct
+// claim from "a flag", and only the paired assertion can tell them apart.
+struct AlwaysInlineFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetAlwaysInlineForm
+    : public ::testing::TestWithParam<AlwaysInlineFormCase> {};
+
+TEST_P(MirLoweringCSubsetAlwaysInlineForm, ThreadsToMirFuncAlwaysInline) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    int flagged = 0;
+    int noInlineFlagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        if (m.funcAlwaysInline(m.funcAt(i))) ++flagged;
+        if (m.funcNoInline(m.funcAt(i)))     ++noInlineFlagged;
+    }
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((always_inline)) in the '" << c.label << "' position "
+           "must thread to EXACTLY one MirFunc.alwaysInline — 0 means the form "
+           "never reached the sink, 2 means it leaked onto an un-annotated "
+           "function";
+    EXPECT_EQ(noInlineFlagged, 0)
+        << "and it must NOT set noInline — the two flags are adjacent bools "
+           "from addFunction onward, so a swap must be visible here";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetAlwaysInlineForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator.
+        AlwaysInlineFormCase{
+            "mode2-after-type",
+            "static int __attribute__((always_inline)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Mode-3: the attribute sits in the specifier PREFIX, before the type.
+        AlwaysInlineFormCase{
+            "mode3-leading-prefix",
+            "static __attribute__((always_inline)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — one config entry covers both via `stripDunder`.
+        AlwaysInlineFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__always_inline__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ THE SQLITE SHAPE. `SQLITE_INLINE` expands to
+        // `__attribute__((always_inline)) inline`, so the attribute is COMBINED
+        // with the C99 `inline` function specifier TF-C79 landed. sqlite's ONE
+        // use site (btree.c:1846, `static SQLITE_INLINE int allocateSpace(…)`)
+        // is exactly this, and the two features must compose.
+        AlwaysInlineFormCase{
+            "combined-with-inline-specifier",
+            "static __attribute__((always_inline)) inline int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY: spelled on the declaration, and the DEFINITION lowers.
+        // Only the post-Pass-1.5 proto/def OR-merge makes this reach MIR
+        // (RED-ON-DISABLE: delete the `isAlwaysInline` OR-merge and this case
+        // alone goes to 0).
+        AlwaysInlineFormCase{
+            "prototype-only",
+            "static int helper(int k) __attribute__((always_inline));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+    [](::testing::TestParamInfo<AlwaysInlineFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the always_inline form suite.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasAlwaysInlineClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcAlwaysInline(m.funcAt(i)))
+            << "an un-annotated function must never carry alwaysInline";
+}
+
+namespace {
+// TF-C81: a callee whose body is deliberately far OVER the shipped release
+// pipeline's `inlineThreshold` (50). Built programmatically so the size is
+// obvious and adjustable rather than a wall of hand-written statements that
+// silently drifts under the threshold when the cost model changes.
+//
+// The parameter `k` is threaded through every statement so the callee body
+// cannot be const-folded away before the inliner sees it.
+std::string overThresholdSource(bool annotate) {
+    std::string s = annotate
+        ? "static __attribute__((always_inline)) int helper(int k) {\n"
+        : "static int helper(int k) {\n";
+    for (int i = 1; i <= 15; ++i) {
+        s += "  k = k * 3 + " + std::to_string(i) + ";";
+        s += " k = k ^ (k >> 2);";
+        s += " k = k + " + std::to_string(i * 7) + ";\n";
+    }
+    s += "  return k;\n}\n";
+    s += "int main() { return helper(37); }\n";
+    return s;
+}
+} // namespace
+
+// ── TF-C81: ★ THE LOAD-BEARING TEST OF THIS CYCLE ──────────────────
+//
+// An `always_inline` callee that EXCEEDS the shipped release pipeline's
+// `inlineThreshold` IS inlined by it — `release.pipeline.json` loaded BY NAME,
+// not a hand-written pass list, so the pin cannot drift from what users run.
+//
+// The assertion is the APPLIED FACT: the Call instruction is GONE from the
+// optimized module. Not "it compiled", and not "the flag arrived".
+//
+// The over-threshold precondition is PROVEN, not assumed, by the paired
+// `OverThresholdCalleeWithoutAlwaysInlineKeepsItsCall` below: the byte-identical
+// program without the attribute keeps its Call through the same pipeline. If the
+// callee ever drifts under the threshold that test goes red, so this one can
+// never quietly become vacuous.
+//
+// RED-ON-DISABLE (MEASURED against the final build): delete the
+// `&& !mir.funcAlwaysInline(callee)` clause from inlining.cpp rule 6 and the
+// Call reappears here.
+//
+// ★ AND THE MEASUREMENT THAT MATTERS MORE — WHAT THIS TEST CANNOT SEE. Dropping
+// the `funcAlwaysInline` argument in `mir_rebuild_helper.cpp` (the shared
+// substrate under every optimizer pass) leaves THIS TEST GREEN. `Inlining` runs
+// first in iteration 1, before any rebuild touches the module, so the splice has
+// already happened by the time a cleared flag could matter. That is the OPPOSITE
+// of TF-C78's `noinline` finding, where the same hop broke the end-to-end result
+// — a `noinline` flag must keep refusing on every iteration, an `alwaysInline`
+// flag only has to survive to the first opportunity.
+//
+// So this end-to-end pin does NOT subsume the propagation pin; it is blind to
+// that hop, and `MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` is the
+// only thing standing between that argument and silent deletion.
+TEST(MirLoweringCSubsetLinkage, AlwaysInlineBypassesThresholdInShippedRelease) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    // The callee's pre-optimization instruction count — the number rule 6
+    // compares against the threshold. Asserted so the fixture's whole premise
+    // is visible in the failure message rather than implied.
+    std::uint32_t calleeInsts = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        if (!m.funcAlwaysInline(f)) continue;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi)
+            calleeInsts += m.blockInstCount(m.funcBlockAt(f, bi));
+    }
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    ASSERT_GT(calleeInsts, loaded->inlineThreshold)
+        << "fixture precondition: the callee (" << calleeInsts << " insts) MUST "
+           "exceed the shipped release inlineThreshold ("
+        << loaded->inlineThreshold << ") — otherwise this test proves "
+           "nothing, since the callee would have been inlined anyway";
+    ASSERT_EQ(countCalls(), 1u) << "pre-optimization: main calls helper once";
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 0u)
+        << "THE APPLIED FACT: an over-threshold __attribute__((always_inline)) "
+           "callee MUST be inlined by the SHIPPED release pipeline — the Call "
+           "has to be GONE, not merely the program compiled";
+}
+
+// ══ TF-C85: the `#pragma optimize("", off)` REGION, source -> MirFunc ════════
+namespace {
+// Two functions; the FIRST sits inside a no-optimize region, the second after
+// it. `guard` lets the same fixture be built WITHOUT the pragmas for the
+// non-vacuous twin, so the only difference between the two programs is the two
+// pragma lines.
+//
+// The region is spelled UNGUARDED (no `#if defined(_MSC_VER)`) on purpose: the
+// pragma vocabulary is language config, not target config, so it must work under
+// this harness's default elf target. The PROFILE-gating half is what
+// `Preprocessor.TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows`
+// pins; conflating the two here would make this test depend on predefines it has
+// no reason to care about.
+std::string noOptimizeRegionSource(bool guard) {
+    std::string s;
+    if (guard) s += "#pragma optimize(\"\", off)\n";
+    s += "int shielded(int k) { return k * 3 + 1; }\n";
+    if (guard) s += "#pragma optimize(\"\", on)\n";
+    s += "int exposed(int k) { return k * 5 + 2; }\n";
+    s += "int main(void) { return shielded(1) + exposed(2); }\n";
+    return s;
+}
+// The `noOptimize` bit of the function whose HIR symbol name is `name`, found by
+// walking the module's symbol names.
+[[nodiscard]] std::optional<bool> noOptimizeOfNamed(Lowered const& L,
+                                                    std::string_view name) {
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        auto const* rec = L.model.recordFor(SymbolId{m.funcSymbol(f).v});
+        if (rec == nullptr || rec->name != name) continue;
+        return m.funcNoOptimize(f);
+    }
+    return std::nullopt;
+}
+} // namespace
+
+// ★★ THE END-TO-END CHAIN, SOURCE TO MIR. `#pragma optimize("", off)` in C text
+// -> preprocessor region stamps -> SymbolRecord.isNoOptimize -> HirNoOptimizeMap
+// -> MirFunc.noOptimize. Six hops, and the assertion is the APPLIED FACT at the
+// far end rather than "it compiled".
+//
+// RED-ON-DISABLE (re-verified against the FINAL build): remove the
+// `["optimize"]` row from `c-subset.lang.json` and the source stops compiling at
+// all (the pragma goes unregistered and loud); keep the row but drop the
+// `noOptimizeMap` argument at `hir_to_mir.cpp`'s `addFunction` and the first
+// EXPECT below flips to false while everything else stays green.
+TEST(MirLoweringCSubsetNoOptimize, PragmaOptimizeRegionThreadsToMirFuncNoOptimize) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+
+    EXPECT_EQ(noOptimizeOfNamed(L, "shielded"), std::optional<bool>{true})
+        << "a function DEFINED inside the region must reach MIR with the flag";
+    EXPECT_EQ(noOptimizeOfNamed(L, "exposed"), std::optional<bool>{false})
+        << "`optimize(\"\", on)` CLOSES the region — a function after it must "
+           "NOT carry the flag, or the rest of the file stops being optimized";
+    EXPECT_EQ(noOptimizeOfNamed(L, "main"), std::optional<bool>{false});
+
+    // ANTI-SWAP: three adjacent trailing bools at every addFunction copy site.
+    // The shielded function sets exactly ONE of them, so a transposition fails.
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        EXPECT_FALSE(m.funcNoInline(f))
+            << "no source here spells noinline — the flag must not be acquired";
+        EXPECT_FALSE(m.funcAlwaysInline(f))
+            << "nor always_inline";
+    }
+}
+
+// ★ THE NON-VACUOUS TWIN: the byte-identical program WITHOUT the two pragma
+// lines. Every function comes through with the flag CLEAR, so the test above is
+// a statement about the pragma rather than about the fixture.
+TEST(MirLoweringCSubsetNoOptimize, WithoutThePragmaNoFunctionCarriesTheFlag) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/false).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_GT(m.moduleFuncCount(), 0u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoOptimize(m.funcAt(i)))
+            << "no `#pragma optimize` in the source ⇒ no function is excluded";
+}
+
+// ★★ AND IT SURVIVES THE SHIPPED RELEASE PIPELINE. The flag has to be present at
+// the far end of `opt::optimize` (loaded BY NAME from `release.pipeline.json`,
+// not a hand-written pass list) or the neuter is armed for exactly one pass and
+// gone. This is the pin that catches a dropped propagation argument at ANY of
+// the copy hops the shipped pipeline actually exercises.
+TEST(MirLoweringCSubsetNoOptimize, FlagSurvivesTheShippedReleasePipeline) {
+    auto L = lowerCSubset(noOptimizeRegionSource(/*guard=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // The pre-optimization symbol of the shielded function, so the post-pipeline
+    // lookup does not depend on the semantic model surviving the move.
+    std::uint32_t shieldedSym = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcNoOptimize(f)) shieldedSym = m.funcSymbol(f).v;
+    }
+    ASSERT_NE(shieldedSym, 0u) << "fixture precondition: one function is flagged";
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value());
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    bool found = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcSymbol(f).v != shieldedSym) continue;
+        found = true;
+        EXPECT_TRUE(m.funcNoOptimize(f))
+            << "THE APPLIED FACT: the flag must still be set after the SHIPPED "
+               "release pipeline has run all 4 iterations over the module — a "
+               "flag cleared at any rebuild hop re-arms every pass on the next "
+               "iteration";
+    }
+    EXPECT_TRUE(found)
+        << "and the function must still EXIST — neutering swaps the rebuild "
+           "policy, it never skips the rebuild (skipping deletes the function)";
+}
+
+// ── The NON-VACUOUS twin, and the over-threshold PROOF ─────────────
+// The byte-identical program WITHOUT the attribute keeps its Call through the
+// same shipped pipeline. This is what establishes that the callee is genuinely
+// over the threshold: if it ever drifts under, this test fails and the bypass
+// test above is exposed as vacuous rather than silently becoming so.
+TEST(MirLoweringCSubsetLinkage,
+     OverThresholdCalleeWithoutAlwaysInlineKeepsItsCall) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/false).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        ASSERT_FALSE(m.funcAlwaysInline(m.funcAt(i)));
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value());
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "the SAME callee WITHOUT always_inline must keep its Call — this is "
+           "the proof that the fixture is genuinely over-threshold, and hence "
+           "that the bypass test measures the attribute rather than the size";
+}
+
+// ── TF-C81: the DEBUG pipeline honestly does NOTHING with the flag ──
+//
+// ★ THIS TEST PINS AN ASYMMETRY RATHER THAN A FEATURE, AND THAT IS DELIBERATE.
+// The shipped `debug` pipeline is `Identity` only — there is no Inlining pass,
+// so there is no cost model for `always_inline` to bypass and the call stays
+// out-of-line. GCC and clang honour the attribute at -O0 because their inliner
+// always runs; DSS's does not.
+//
+// The config's `attributeSemantics.effects` row says exactly this in prose. This
+// test is what stops that prose from silently becoming false in either
+// direction: if a future cycle gives `debug` an inliner, this test goes red and
+// the config comment must be updated in the same commit. The flag itself must
+// still ARRIVE (asserted below) — the attribute is parsed and lowered under
+// debug, it simply has no consumer there.
+TEST(MirLoweringCSubsetLinkage, AlwaysInlineIsInertUnderShippedDebugPipeline) {
+    auto L = lowerCSubset(overThresholdSource(/*annotate=*/true).c_str());
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    auto countCalls = [&] {
+        std::size_t n = 0;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                    if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(countCalls(), 1u);
+
+    auto loaded = opt::loadShippedPipeline("debug");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'debug' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countCalls(), 1u)
+        << "under the SHIPPED debug pipeline (Identity only) always_inline is "
+           "VACUOUS — there is no inliner to bypass a threshold in. If this "
+           "goes red because debug gained an inliner, update the "
+           "c-subset.lang.json effects row in the SAME commit: it states this "
+           "asymmetry explicitly, and it must not be allowed to become a lie";
+
+    bool flagPresent = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcAlwaysInline(m.funcAt(i))) flagPresent = true;
+    EXPECT_TRUE(flagPresent)
+        << "the flag must still ARRIVE under debug — the attribute is parsed "
+           "and lowered, it simply has no consumer in this pipeline";
+}
+
+// ══ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): source → MirFunc.noSanitizeThread ══
+//
+// The `NoInlineFormCase`/`AlwaysInlineFormCase` suites a FIFTH axis over: the
+// `attributeSemantics.effects` `noSanitizeThread` verb → `SymbolRecord.
+// isNoSanitizeThread` (FnSig-gated) → `HirNoSanitizeThreadMap` →
+// `MirFunc.noSanitizeThread` → the `nosanitizethread` keyword in `.dssir` text.
+//
+// ★★ WHY EVERY CASE ASSERTS THE **MIR TEXT**, NOT JUST THE BOOL. DSS has NO
+// sanitizer (MEASURED: `grep -rni sanitiz src/` is empty), so this axis has NO
+// behavioural consequence anywhere in codegen — there is no spliced call to look
+// for, no threshold to observe, no instruction that changes. The ONLY observable
+// property the whole chain produces is that the fact is STORED AND QUERYABLE, and
+// `appendFuncAttrs` printing `nosanitizethread` is precisely that observation. A
+// test that asserted only `funcNoSanitizeThread(...)` would pin the accessor while
+// leaving the printer — the actual sink — unguarded, which is the weak-test class
+// [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] warns about wearing a different hat.
+//
+// ★ AND EVERY CASE ASSERTS THE OTHER THREE PER-FUNCTION FLAGS ARE CLEAR. The four
+// bools are adjacent trailing arguments at every `addFunction` call site, so a
+// transposition compiles silently; "the right flag" is a distinct claim from "a
+// flag", and only the paired assertion separates them.
+struct NoSanitizeThreadFormCase {
+    char const* label;
+    char const* source;
+};
+
+class MirLoweringCSubsetNoSanitizeThreadForm
+    : public ::testing::TestWithParam<NoSanitizeThreadFormCase> {};
+
+namespace {
+// Occurrences of `needle` in `hay`. Used to assert the `.dssir` keyword appears
+// EXACTLY once — 0 means the printer never emitted it (the sink is dead), >1 means
+// it leaked onto a function the source never annotated.
+[[nodiscard]] std::size_t countSubstr(std::string const& hay,
+                                      std::string_view   needle) {
+    std::size_t n = 0;
+    for (std::size_t p = hay.find(needle); p != std::string::npos;
+         p = hay.find(needle, p + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+} // namespace
+
+TEST_P(MirLoweringCSubsetNoSanitizeThreadForm, ThreadsToMirTextNoSanitizeThread) {
+    auto const& c = GetParam();
+    SCOPED_TRACE(c.label);
+    auto L = lowerCSubset(c.source);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_GE(m.moduleFuncCount(), 2u)
+        << "every fixture defines the annotated function plus main";
+
+    int flagged = 0;
+    int noInlineFlagged = 0;
+    int alwaysInlineFlagged = 0;
+    int noOptimizeFlagged = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcNoSanitizeThread(f)) ++flagged;
+        if (m.funcNoInline(f))         ++noInlineFlagged;
+        if (m.funcAlwaysInline(f))     ++alwaysInlineFlagged;
+        if (m.funcNoOptimize(f))       ++noOptimizeFlagged;
+    }
+    // WHAT BREAKS THIS — and the FIRST item is the one that justifies the whole
+    // cycle, so read it rather than skimming the list. ★ Deleting the
+    // `no_sanitize_thread` effects row from c-subset.lang.json while leaving the two
+    // `linkageSpecifierIgnoredNames` entries in place — i.e. the "config-only,
+    // just-ignore-it" alternative — does NOT make the program fail: MEASURED, it
+    // compiles with exit 0 and ZERO diagnostics while the attribute is thrown away,
+    // because the linkage tier skips the name by NAME and no other tier claims it.
+    // `model.hasErrors()` above stays FALSE and this count drops to 0. That silent
+    // drop is [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] in the flesh, and this
+    // assertion is what makes it visible.
+    // Also breaks it: deleting the `isFnSig && attrFacts.noSanitizeThread` apply in
+    // semantic_analyzer.cpp; deleting any of the three
+    // `recordNoSanitizeThread(fn_, sym)` lowering sites (this goes to 0 for the
+    // shape that site owns); deleting the `noSanitizeThreadMap` read at the HIR→MIR
+    // mint site; dropping `&hir->noSanitizeThreadMap` in compile_pipeline.cpp; or —
+    // MEASURED THREE CYCLES RUNNING — forgetting to thread the map through the FOUR
+    // `lowerToMir` call sites in THIS FILE's own harness.
+    EXPECT_EQ(flagged, 1)
+        << "__attribute__((no_sanitize_thread)) in the '" << c.label << "' form "
+           "must thread to EXACTLY one MirFunc.noSanitizeThread — 0 means the "
+           "form never reached the sink, 2 means it leaked onto an un-annotated "
+           "function";
+    // WHAT BREAKS THIS: transposing any pair of the four trailing bools at
+    // `addFunction` — in hir_to_mir's mint call, mir_text's parse call,
+    // mir_rebuild_helper, mir_merge or inlining. Each transposition compiles
+    // silently and inverts which directive the module records.
+    EXPECT_EQ(noInlineFlagged, 0)
+        << "and it must NOT set noInline — the four per-function flags are "
+           "adjacent bools from addFunction onward, so a swap must be visible here";
+    EXPECT_EQ(alwaysInlineFlagged, 0) << "nor alwaysInline";
+    EXPECT_EQ(noOptimizeFlagged, 0)   << "nor noOptimize";
+
+    // ★ THE SINK ITSELF. `appendFuncAttrs` is the only consumer this axis has, so
+    // this is the assertion that makes the feature observable rather than merely
+    // present in a header.
+    //
+    // WHAT BREAKS THIS: deleting the `if (ns)` arm in `appendFuncAttrs`
+    // (mir_text.cpp) — the bool assertions above stay GREEN and only this one
+    // fires, which is exactly why it is written separately; or forgetting `!ns` in
+    // the all-default early-return guard just above it, which suppresses the whole
+    // `[...]` list for a function whose ONLY non-default axis is this one (the
+    // shape every fixture below deliberately produces).
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 1u)
+        << "the `.dssir` printer must surface the recorded exclusion EXACTLY "
+           "once — this is the ONLY observable effect the whole chain produces, "
+           "since DSS has no sanitizer for the flag to switch off:\n" << text;
+
+    // …and the text is re-parseable with the flag intact (the printer and parser
+    // are separate anonymous namespaces hundreds of lines apart).
+    // WHAT BREAKS THIS: deleting the `kMirTextNoSanitizeThreadAttr` arm in
+    // `parseFunction`, which makes the keyword an UNKNOWN attribute → the parse
+    // emits `malformed` and `parsed->ok` goes false. A silently-skipped keyword
+    // would instead leave the flag clear, which the EXPECT_TRUE below catches.
+    DiagnosticReporter parseRep;
+    auto parsed = parseMir(text, CompilationUnitId{1}, parseRep);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok)
+        << (parseRep.all().empty() ? "" : parseRep.all()[0].actual) << "\n" << text;
+    int reparsedFlagged = 0;
+    for (std::uint32_t i = 0; i < parsed->mir.moduleFuncCount(); ++i)
+        if (parsed->mir.funcNoSanitizeThread(parsed->mir.funcAt(i)))
+            ++reparsedFlagged;
+    EXPECT_EQ(reparsedFlagged, 1)
+        << "the exclusion must survive emit → parse:\n" << text;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Forms, MirLoweringCSubsetNoSanitizeThreadForm,
+    ::testing::Values(
+        // Mode-2: the attribute sits BETWEEN the type and the declarator
+        // (topLevelDecl's `declAttrRun` slot).
+        NoSanitizeThreadFormCase{
+            "mode2-after-type",
+            "int __attribute__((no_sanitize_thread)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ MODE-3 IS **THE SQLITE SHAPE**: the attribute sits in the specifier
+        // PREFIX between `static` and the type, so it routes through
+        // `declSpecifiers` into the topLevelDecl row. Both of sqlite's use sites
+        // (`static SQLITE_NO_TSAN void walIndexWriteHdr(Wal*)`, wal.c:942, and
+        // `static SQLITE_NO_TSAN int walIndexTryHdr(Wal*,int*)`, wal.c:2590) are
+        // exactly this, so this case is the one the provenance rests on.
+        NoSanitizeThreadFormCase{
+            "mode3-leading-prefix-sqlite-shape",
+            "static __attribute__((no_sanitize_thread)) int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // Dunder spelling — ONE `no_sanitize_thread` effects entry must cover both
+        // via the shared `stripDunder` normalization, with NO second config row.
+        // RED-ON-DISABLE: this case is the witness that the effects table is on the
+        // NORMALIZED side of the asymmetry (`linkageSpecifiers`, keyed by raw token
+        // text, is not); adding a literal `__no_sanitize_thread__` row to the config
+        // would make it pass for the wrong reason, so it must stay absent.
+        NoSanitizeThreadFormCase{
+            "dunder-spelling",
+            "static int __attribute__((__no_sanitize_thread__)) helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // PROTOTYPE-ONLY, topLevelDecl row: the attribute is spelled on the
+        // declaration and the DEFINITION is what lowers. Only the post-Pass-1.5
+        // proto/def OR-merge makes this reach MIR (RED-ON-DISABLE: delete the
+        // `isNoSanitizeThread` OR-merge arm in the `mergedFnDecls` sweep and this
+        // case alone drops to 0 while every other case stays green).
+        NoSanitizeThreadFormCase{
+            "topleveldecl-prototype-only-or-merge",
+            "static int helper(int k) __attribute__((no_sanitize_thread));\n"
+            "static int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"},
+        // ★ THE **externDecl** POSITION — the second declaration row this cycle
+        // adds the name to, on the house rule that one attribute must not mean two
+        // different things depending on where it is written. The attribute lands in
+        // `externSpecifiers`' TF-C77 repeat rather than `declSpecifiers`, which is a
+        // DIFFERENT scan root reached through a DIFFERENT `linkageSpecifierIgnored
+        // Names` array — so it can regress independently of every case above.
+        // RED-ON-DISABLE: remove `no_sanitize_thread` from the externDecl row's
+        // `linkageSpecifierIgnoredNames` and the LOADER refuses the config outright
+        // (the Clause-B drift cross-check), so this case fails at schema load rather
+        // than at the assertion — a louder failure than the one it replaces.
+        NoSanitizeThreadFormCase{
+            "externdecl-position-or-merge",
+            "extern __attribute__((no_sanitize_thread)) int helper(int k);\n"
+            "int helper(int k) { return k + 5; }\n"
+            "int main() { return helper(37); }\n"}),
+        // ★ A `gnu-namespaced-c23-spelling` case was REMOVED from this list, and the
+        // reason is worth keeping: it was left behind as an explicitly-labelled
+        // "N1 PROBE (temporary)" by a fold pass that DIED mid-task, and its own
+        // fixture misspelled the attribute (`no_sanitize_thraed`). It therefore
+        // failed for a reason that had nothing to do with the property it named —
+        // and, read carelessly, it looked like proof that `[[gnu::…]]` does not
+        // reach the sink. It is not proof of anything. Whether the C23 namespaced
+        // spelling reaches the verb is genuinely UNPINNED; see
+        // D-CSUBSET-NO-SANITIZE-THREAD, which records it as a known test gap
+        // shared with `noinline`/`always_inline` (all three headers claim the
+        // `[[gnu::…]]` spelling and none of the three tests it). Add it back as ONE
+        // parameterized case across all three attributes, with a correctly-spelled
+        // fixture AND a misspelled negative control — a misspelling inside a `gnu::`
+        // namespace is itself silently accepted today, which is worth its own pin.
+    [](::testing::TestParamInfo<NoSanitizeThreadFormCase> const& i) {
+        std::string s{i.param.label};
+        for (char& ch : s) if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+        return s;
+    });
+
+// The NEGATIVE control for the whole TF-C92 form suite: the identical program with
+// NO attribute must leave every MirFunc.noSanitizeThread CLEAR **and** must emit no
+// `nosanitizethread` keyword. Without this, a lowering that unconditionally set the
+// flag — or a printer that unconditionally emitted the word — would satisfy every
+// case above.
+TEST(MirLoweringCSubsetLinkage, UnannotatedFunctionHasNoSanitizeThreadClear) {
+    auto L = lowerCSubset(
+        "static int helper(int k) { return k + 5; }\n"
+        "int main() { return helper(37); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoSanitizeThread(m.funcAt(i)))
+            << "an un-annotated function must never carry noSanitizeThread";
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 0u)
+        << "no keyword may appear for an un-annotated program:\n" << text;
+}
+
+// ★★★ TF-C92 → **FLIPPED BY TF-C93**
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). The test was written to pin
+// the CURRENT silence with in-code instructions to flip rather than delete it; this
+// is that flip. Fixture unchanged, the `funcNoSanitizeThread` loop and the
+// `countSubstr(text, "nosanitizethread") == 0` assertion kept VERBATIM, and a
+// POSITIVE assertion added that the warning actually fired.
+//
+// ★★ `ASSERT_FALSE(hasErrors)` STILL HOLDS, AND THAT IS EXACTLY WHY THE POSITIVE
+// ASSERTION IS THE WHOLE POINT — MEASURED. The new diagnostic is a WARNING, so this
+// test stayed GREEN across the engine change: a "flip" that merely relaxed the old
+// expectation would have shipped looking verified while proving nothing about the
+// new behaviour. The code-specific `countCode` below is the assertion that can
+// actually go red, and it is by CODE rather than by count because a bare count would
+// also be satisfied by an unrelated `S_UnknownAttribute`.
+//
+// ★ WHY THE INERTNESS HALF SURVIVES THE FLIP UNTOUCHED: the gate REPORTS while the
+// `isFnSig &&` guard in the apply still REFUSES. This is the only MIR-tier pin on
+// that guard, so a diagnostic that ALSO recorded the flag — the worse bug — is
+// caught right here, at the tier where the flag would become an emitted function
+// attribute.
+//
+// WHAT BREAKS THIS: deleting the decl-kind gate loop in semantic_analyzer.cpp (the
+// `countCode` drops to 0, everything else stays green); dropping the `isFnSig &&`
+// guard (the loop and the keyword count go red while `countCode` stays 1); deleting
+// `appliesTo` from the effects row (the LOADER refuses the shipped config).
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadOnDataObjectWarnsAndStaysInert) {
+    auto L = lowerCSubset(
+        "__attribute__((no_sanitize_thread)) int gv = 7;\n"
+        "int main() { return gv; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    EXPECT_EQ(dss::test_support::countCode(
+                  L.model.diagnostics(),
+                  DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "the attribute on a data object must be LOUD (a Warning) — this is the "
+           "assertion the flip exists for: `hasErrors()` above cannot see it, so "
+           "without this line the test proves only that nothing became an error";
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        EXPECT_FALSE(m.funcNoSanitizeThread(m.funcAt(i)))
+            << "an attribute on a DATA object must not mark any function";
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 0u)
+        << "the FnSig gate must keep the flag off every record:\n" << text;
+}
+
+// ── TF-C92: THE FLAG SURVIVES THE **TWO MIR COPY PATHS** ──────────────────────
+namespace {
+// ★★ THE FIXTURE SHAPE IS THE WHOLE ARGUMENT OF THE NEXT TWO TESTS, SO IT IS
+// SPELLED OUT RATHER THAN LEFT TO BE INFERRED FROM THE SOURCE TEXT.
+//
+// `runInlining` routes EACH function to exactly ONE of two rebuilders, and the
+// router is `planHasMultiBlock` (inlining.cpp): true iff some inlinable callee has
+// `funcBlockCount(callee) != 1`. True → the caller is re-minted by the inliner's
+// OWN `MultiBlockInliner::rebuildFunction`; false → by the shared
+// `MirFunctionRebuilder` that every other rebuild pass also uses. Two DISTINCT,
+// independently-editable `addFunction` copy sites, and a flag argument dropped at
+// either one is invisible at the other.
+//
+// So the fixture is built to hit BOTH:
+//   * the CALLEE is multi-block (`if (k > 0) …`) — that inequality IS the router's
+//     predicate, which is why both tests ASSERT it on the lowered module instead of
+//     trusting the `if`. A lowering change that collapsed this body to one block
+//     would otherwise make both tests silently stop exercising the inliner's path.
+//   * the ATTRIBUTE is on the **CALLER**, because the caller is the function
+//     `MultiBlockInliner` re-mints — `src_.funcNoSanitizeThread(caller)` at
+//     inlining.cpp is the argument under test. A flag on the CALLEE would ride the
+//     shared rebuilder only: the callee is a leaf here, so its own plan is empty and
+//     it never routes to the multi-block path at all. ★ THAT IS THE MISTAKE THIS
+//     FIXTURE REPLACES — the previous version (single-block leaf callee, flag on the
+//     CALLEE) claimed to cover both paths and covered the shared one twice, leaving
+//     the inliner's copy site with NO detector in the whole suite while two comments
+//     asserted it had one.
+// The caller is `main`, so it is a DCE root and the subject cannot be deleted out
+// from under the assertions; the callee is deliberately NOT `static` for the same
+// reason (an externally-visible function survives DCE even once fully inlined).
+constexpr char kNoSanitizeThreadMultiBlockCalleeSource[] =
+    "int helper(int k) { if (k > 0) return k + 5; return -1; }\n"
+    "__attribute__((no_sanitize_thread)) int main() { return helper(37); }\n";
+
+// The MirFuncId whose bound HIR symbol is named `name` — the `noOptimizeOfNamed`
+// shape one level lower, returning the id so a caller can ask about BLOCKS (the
+// router's predicate) as well as about flags. Invalid id = no such function.
+[[nodiscard]] MirFuncId funcIdOfNamed(Lowered const& L, std::string_view name) {
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        auto const* rec = L.model.recordFor(SymbolId{m.funcSymbol(f).v});
+        if (rec != nullptr && rec->name == name) return f;
+    }
+    return MirFuncId{};
+}
+} // namespace
+
+// ── TF-C92: THE FLAG SURVIVES THE **SHIPPED RELEASE PIPELINE** ────────────────
+//
+// `release.pipeline.json` loaded BY NAME (not a hand-written pass list) so the pin
+// cannot drift from what users actually run. Its 9 passes × 4 iterations rebuild the
+// module through BOTH copy sites described above, so this is the end-to-end pin; the
+// test after it isolates the inliner's site alone so a red here can be localized.
+//
+// ★ THIS IS AS CLOSE TO AN "APPLIED FACT" AS THIS AXIS CAN GET, AND SAYING SO
+// PLAINLY IS THE POINT. Its siblings assert a Call that survives (noinline) or
+// disappears (always_inline); here nothing in codegen depends on the flag, so the
+// applied fact IS the recorded fact: after the full optimizer, the module still
+// says this function is excluded from thread-sanitizer instrumentation. That is the
+// property a future instrumentation pass would consume, and it is the property a
+// dropped propagation argument destroys.
+//
+// RED-ON-DISABLE (MEASURED against this build, both directions, one at a time):
+// drop `src_.funcNoSanitizeThread(oldFn)` in `mir_rebuild_helper.cpp` OR
+// `src_.funcNoSanitizeThread(caller)` in `inlining.cpp` and the post-optimize
+// assertion goes red while the pre-optimize one stays green — a propagation hop,
+// not lowering. Which of the two it was is what the next test answers.
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadSurvivesShippedReleasePipeline) {
+    auto L = lowerCSubset(kNoSanitizeThreadMultiBlockCalleeSource);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // FIXTURE NON-VACUITY, and it is the router's own predicate verbatim: unless the
+    // callee has more than one block, `main` never reaches `MultiBlockInliner` and
+    // this test degrades to a second copy of the shared-rebuilder pin.
+    MirFuncId const callee = funcIdOfNamed(L, "helper");
+    ASSERT_TRUE(callee.valid()) << "the fixture must define `helper`";
+    ASSERT_GT(m.funcBlockCount(callee), 1u)
+        << "`planHasMultiBlock` routes the CALLER to MultiBlockInliner only when "
+           "`funcBlockCount(callee) != 1` — a single-block callee here means the "
+           "inliner's own copy site is not exercised at all";
+
+    auto countFlagged = [&] {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+            if (m.funcNoSanitizeThread(m.funcAt(i))) ++n;
+        return n;
+    };
+    ASSERT_EQ(countFlagged(), 1) << "pre-optimization: the flag must have arrived";
+
+    auto loaded = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped 'release' pipeline must load";
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(), *loaded, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(countFlagged(), 1)
+        << "the recorded thread-sanitizer exclusion MUST survive every rebuild in "
+           "the SHIPPED release pipeline — a flag that is erased by the optimizer "
+           "is a fact the compiler cannot be said to record at all";
+
+    // And it is still OBSERVABLE in the optimized module's text.
+    DiagnosticReporter emitRep;
+    MirTextContext ctx{&L.model.lattice().interner(), nullptr};
+    std::string const text = emitMir(m, ctx, emitRep);
+    EXPECT_EQ(countSubstr(text, "nosanitizethread"), 1u)
+        << "post-optimization `.dssir` must still carry the keyword:\n" << text;
+}
+
+// ★★ TF-C92: THE INLINER'S **OWN** COPY SITE, ALONE — the direct detector for
+// `src_.funcNoSanitizeThread(caller)` at inlining.cpp's
+// `MultiBlockInliner::rebuildFunction`.
+//
+// WHY A SECOND TEST RATHER THAN TRUSTING THE PIPELINE PIN. The cycle's doctrine
+// (mir_rebuild_helper.cpp) is that each propagation hop needs its OWN direct
+// assertion, because for this axis nothing in codegen changes and the recorded fact
+// is not the best evidence, it is the ONLY evidence. The release pipeline runs both
+// copy sites, so a red there names a hop only by elimination. A hand-built ONE-PASS
+// `{Inlining}` pipeline (deliberately NOT the shipped one — hop isolation is the
+// point, so drift-proofing is not) puts exactly one rebuild between lowering and the
+// assertion, and `main` is routed to `MultiBlockInliner` by the multi-block callee.
+// Together the two localize: both red ⇒ the inliner's site; pipeline red + this one
+// green ⇒ `mir_rebuild_helper`'s.
+//
+// ANTI-VACUITY IS LOAD-BEARING HERE, in a way that is easy to get wrong. If the
+// legality gate ever refuses this splice, `planHasMultiBlock` returns false, `main`
+// falls back to `MirFunctionRebuilder` — and the flag assertion would STILL PASS,
+// via the other hop, testing nothing. So this test also pins that the splice
+// actually happened: `main` must lose its Call and gain blocks.
+//
+// RED-ON-DISABLE (MEASURED): drop `src_.funcNoSanitizeThread(caller)` at
+// inlining.cpp and this test's flag assertion goes red; drop
+// `src_.funcNoSanitizeThread(oldFn)` in mir_rebuild_helper.cpp instead and this test
+// stays GREEN (no `MirFunctionRebuilder` rebuild of `main` happens in a one-pass
+// Inlining pipeline) while the release-pipeline pin above goes red.
+TEST(MirLoweringCSubsetLinkage, NoSanitizeThreadSurvivesTheInlinersOwnRebuild) {
+    auto L = lowerCSubset(kNoSanitizeThreadMultiBlockCalleeSource);
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    MirFuncId const callee = funcIdOfNamed(L, "helper");
+    MirFuncId const caller = funcIdOfNamed(L, "main");
+    ASSERT_TRUE(callee.valid());
+    ASSERT_TRUE(caller.valid());
+    ASSERT_GT(m.funcBlockCount(callee), 1u)
+        << "the CALLEE must be multi-block or `main` never reaches "
+           "MultiBlockInliner — `planHasMultiBlock`'s predicate";
+    ASSERT_TRUE(m.funcNoSanitizeThread(caller))
+        << "the flag must be on the CALLER — that is the function the inliner "
+           "re-mints, and the only one whose flag its copy site can drop";
+    // The pre-pass symbol, so the post-pass lookup does not depend on the semantic
+    // model's ids surviving the module move.
+    std::uint32_t const callerSym = m.funcSymbol(caller).v;
+    std::uint32_t const callerBlocksBefore = m.funcBlockCount(caller);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"nosanitizethread-inline-only",
+                              {opt::PassId::Inlining}};
+    auto const result =
+        opt::optimize(m, **targetR, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    bool found = false;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        MirFuncId const f = m.funcAt(i);
+        if (m.funcSymbol(f).v != callerSym) continue;
+        found = true;
+        EXPECT_TRUE(m.funcNoSanitizeThread(f))
+            << "the CALLER's exclusion must survive the inliner's own "
+               "`addFunction` — this is the ONE hop no pass-behaviour test can "
+               "notice, since no pass reads the flag";
+        // ANTI-SWAP: the flagged caller sets exactly ONE of the four trailing bools,
+        // so a transposition at this copy site fails here rather than shipping.
+        EXPECT_FALSE(m.funcNoInline(f));
+        EXPECT_FALSE(m.funcAlwaysInline(f));
+        EXPECT_FALSE(m.funcNoOptimize(f));
+        // ANTI-VACUITY: the splice must really have run through MultiBlockInliner.
+        std::size_t calls = 0;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii)
+                if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Call) ++calls;
+        }
+        EXPECT_EQ(calls, 0u)
+            << "the call must have been spliced away — a REFUSED splice routes "
+               "`main` back through MirFunctionRebuilder and this test would then "
+               "pass via the OTHER hop, proving nothing";
+        EXPECT_GT(m.funcBlockCount(f), callerBlocksBefore)
+            << "and the caller must have GAINED blocks — the cloned callee CFG "
+               "plus its continuation, i.e. the multi-block splice ran";
+    }
+    EXPECT_TRUE(found) << "the caller must still exist after the pass";
+}
+
 // D-CSUBSET-NORETURN linkage-safety (FC16): a `noreturn` attribute co-present
 // with `static` must NOT clobber the function's internal linkage. `linkageFrom`
 // composes declaration-specifiers LAST-WINS with an UNCONDITIONAL overwrite, and
@@ -1741,6 +3314,41 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
 // (dropping linkageSpecifierIgnoredNames) and `f`'s Local binding is overwritten
 // Global by last-wins → localCount flips to 0 → RED. A silent linkage
 // externalization of `static __attribute__((noreturn)) void f` is a miscompile.
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` function DEFINITION
+// has EXTERNAL linkage (binding == Global — the C default for a function; `extern`
+// is the default external linkage, ignored-by-kind in the linkage scan), while a
+// `static` definition of the same shape has INTERNAL linkage (binding == Local).
+// Both are called by main so neither is DCE'd. RED-ON-DISABLE: if the extern
+// definition were mis-lowered with internal linkage (or as a bodyless import), the
+// Local/Global counts flip.
+TEST(MirLoweringCSubsetLinkage, ExternFunctionDefinitionHasExternalLinkage) {
+    auto L = lowerCSubset(
+        "extern int ef(int x){ return x + 1; }\n"   // external linkage (Global)
+        "static int sf(int x){ return x + 2; }\n"   // internal linkage (Local)
+        "int main(void){ return ef(0) + sf(0); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 3u) << "ef + sf + main (all reachable)";
+    // Exactly one function is Local — the `static` sf; the `extern` ef and main are
+    // both external (Global). A count != 1 means the extern definition wrongly took
+    // internal linkage (2) or failed to lower as a Function (0).
+    int localCount = 0, globalCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        auto const b = m.funcBinding(m.funcAt(i));
+        if (b == SymbolBinding::Local)  ++localCount;
+        if (b == SymbolBinding::Global) ++globalCount;
+    }
+    EXPECT_EQ(localCount, 1)
+        << "only the `static` sf is internal (Local); the extern definition is not";
+    EXPECT_EQ(globalCount, 2)
+        << "the `extern` function DEFINITION + main are external (Global)";
+}
+
 TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
     for (char const* src : {
              // `static` BEFORE the attribute.
@@ -2229,6 +3837,62 @@ TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
     EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
 }
 
+// D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field MUTATION in ANY position
+// other than statement plain-`=` — a VALUE-position `(bf.a = v)` / `(bf.a += 1)` /
+// `(bf.a++)` / `(++bf.a)` AND a STATEMENT compound / inc-dec `bf.a += 1;` /
+// `bf.a++;` / `--bf.a;` — must take the READ-MODIFY-WRITE of the allocation unit,
+// NOT a full-unit Store. Before the fix, classifyLvalue / classifyIncDecLvalue
+// bound `&(bf.a)` into a temp pointer and emitted a plain `*p` Deref target, which
+// fell to `emitScalarStore` (a bare full-unit Store — clobbering packed neighbours
+// and skipping truncation). The fix binds the CONTAINING AGGREGATE's address and
+// reconstructs `MemberAccess(Deref(p), field)`, so BOTH forms present a
+// MemberAccess to the ONE RMW chokepoint. `a` sits at bitOffset 4 (after `pad:4`)
+// so the insert MUST Shl by 4; the clear+mask are two Ands and the merge is an Or.
+// RED-ON-DISABLE: revert the classifyMemberLvalue aggregate-address reconstruction
+// and each of these functions loses its Or/Shl (a bare full-unit Store returns).
+TEST(MirLoweringCSubset, BitFieldMutationValueAndCompoundFormsAreReadModifyWrite) {
+    auto L = lowerCSubset(
+        "struct S { unsigned pad : 4; unsigned a : 3; unsigned b : 5; };\n"
+        "unsigned v_assign  (struct S* p, unsigned v){ unsigned x=(p->a =v); return x; }\n"
+        "unsigned v_compound(struct S* p)            { unsigned x=(p->a+=1); return x; }\n"
+        "unsigned v_postinc (struct S* p)            { unsigned x=(p->a++ ); return x; }\n"
+        "unsigned v_preinc  (struct S* p)            { unsigned x=(++p->a ); return x; }\n"
+        "void     s_compound(struct S* p)            { p->a += 1; }\n"
+        "void     s_postinc (struct S* p)            { p->a++;    }\n"
+        "void     s_predec  (struct S* p)            { --p->a;    }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Count an opcode across ALL blocks of a function (a value-position SeqExpr
+    // stays straight-line, but count broadly to be robust to any block split).
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        int n = 0;
+        auto const fn = m.funcAt(fnIdx);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i)
+                if (m.instOpcode(m.blockInstAt(blk, i)) == op) ++n;
+        }
+        return n;
+    };
+    char const* names[7] = {"v_assign", "v_compound", "v_postinc", "v_preinc",
+                            "s_compound", "s_postinc", "s_predec"};
+    for (std::uint32_t fn = 0; fn < 7; ++fn) {
+        EXPECT_GE(countIn(fn, MirOpcode::Or), 1)
+            << names[fn] << ": bit-field mutation must OR the inserted field (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::Shl), 1)
+            << names[fn] << ": bit-field mutation must Shl the value to bitOffset (RMW)";
+        EXPECT_GE(countIn(fn, MirOpcode::And), 2)
+            << names[fn] << ": RMW clears the field AND masks the value";
+    }
+    // The VALUE-position forms additionally read the STORED (truncated) value back
+    // via the extract path (LShr by bitOffset 4 + And mask) for the SeqExpr yield —
+    // NOT the un-truncated full unit. v_assign (fn 0) is the canonical `x=(bf.a=v)`.
+    EXPECT_GE(countIn(0, MirOpcode::LShr), 1)
+        << "value-position `=` yields the extracted (truncated) stored value";
+}
+
 // FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a bit-field on a 64-BIT BASE
 // (`unsigned long long` / `long long` → a 64-bit allocation unit) now
 // COMPILES + LOWERS end-to-end. Before FC8 the semantic analyzer
@@ -2481,6 +4145,46 @@ TEST(MirLoweringCSubset, NonStringArrayDecaysToPointerNotFailLoud) {
         << "non-string array→pointer decay (local + global) must lower, not "
            "fail loud: "
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): the sqlite getVarint32 fast-path shape —
+// an ARRAY `z` deref'd DIRECTLY (`*(z)`) as the RVALUE of the comma-LEFT
+// assignment `out = (u32)*(z)`, itself the middle operand of a ternary. Pre-fix
+// `*(z)` was a TYPELESS Deref (derefResultType has no Array arm) → H0001 at the
+// HirVerifier → the shape never reached clean MIR. This pins the MIR tier: the
+// full shape LOWERS (hir.ok + mir.ok) and BOTH the array-deref Load (of z[0]) and
+// the comma-LEFT side-effect Store (to `out`) are emitted — the structural guard,
+// on every target leg, that the decay→load lowers and the comma-LEFT side effect
+// is not dropped. The corpus witness (examples/c-subset/array_decay_deref) proves
+// the VALUES (out == 42) end-to-end. RED-ON-DISABLE: revert the combineUnaryOp
+// Deref array-decay → hir.ok flips false (H0001) and this test fails at the first
+// ASSERT.
+TEST(MirLoweringCSubset, DerefOfArrayInCommaTernaryLowersWithLoadAndSideEffectStore) {
+    auto L = lowerCSubset(
+        "typedef unsigned char u8; typedef unsigned int u32;\n"
+        "u32 getv(void) {\n"
+        "    u8 z[4];\n"
+        "    u32 out = 0;\n"
+        "    z[0] = 42;\n"
+        "    u8 n = (u8)((*(z) < (u8)0x80) ? ((out) = (u32)*(z)), 1 : 9);\n"
+        "    return out + (u32)n;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "pre-fix `*(z)` (a DIRECT array deref) was a TYPELESS Deref → H0001: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The array deref `*(z)` reads z[0] → a Load; the comma-LEFT `out = …` side
+    // effect → a Store. Both must survive (a dropped side effect or a lost deref
+    // would remove one).
+    EXPECT_FALSE(collectOps(m, MirOpcode::Load).empty())
+        << "the array-deref `*(z)` must emit a Load of z[0]";
+    EXPECT_FALSE(collectOps(m, MirOpcode::Store).empty())
+        << "the comma-LEFT `out = (u32)*(z)` side effect must emit a Store";
 }
 
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
@@ -4251,6 +5955,62 @@ TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
         << "the I64 operand's conversion to U64 must be a REAL cast inst";
 }
 
+// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (realize + verifier backstop): the
+// admitted shipped-descriptor call-arg (`long long*` into a `ptr<i64>` param)
+// REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
+// bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
+// AND the HIR verifier stays clean — because the coerce arm RETYPED the arg node to
+// the param type. If the coerce mark→bitcast arm were neutered, `L.hir->ok` would
+// go FALSE (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param
+// `ptr<i64>`) — so this pin is the automated form of that realize red-on-disable.
+//
+// The witness is at the HIR (where coerce runs): the full MIR lowering of a call to
+// an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
+// (ffiMap=nullptr) does not run, so `L.mir.ok` is not asserted here — the whole
+// program links + runs in `examples/c-subset/shipped_tcl_wideint` (the RUN witness).
+TEST(MirLoweringCSubset, FfiDescriptorIntPointeeArgRealizesAsPtrBitcast) {
+    // A `long long*` PARAMETER (no `= 0` init to add an unrelated width cast) passed
+    // straight into the descriptor's `fn(ptr<i64>)`.
+    auto L = lowerFfiWideProgram(
+        "#include <ffiwide.h>\n"
+        "void f(long long *pa){ ffi_take_wide(pa); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "the shipped-descriptor call-arg relaxation must ADMIT `long long*` "
+           "into `ptr<i64>` (LP64) — no S0003";
+    ASSERT_TRUE(L.hir->ok)
+        << "admit⟺realize: the coerce arm retyped the arg to the param type, so the "
+           "HIR verifier is clean; a missing bitcast would fire H_VerifierFailure";
+
+    // Walk the HIR for the synthetic realize Cast: a Ptr→Ptr where BOTH the result
+    // and the operand are Ptr<I64> — same representation, DISTINCT pointee TypeIds
+    // (the descriptor `ptr<i64>` vs the named `long long*`). Ptr→Ptr proves it is a
+    // bitcast, never an int↔ptr or width conversion.
+    auto const& hir = L.hir->hir;
+    auto const& in  = L.model.lattice().interner();
+    auto const isPtrToI64 = [&](TypeId t) {
+        return t.valid() && in.kind(t) == TypeKind::Ptr
+            && in.kind(in.operands(t)[0]) == TypeKind::I64;
+    };
+    bool foundRealizeCast = false;
+    std::vector<HirNodeId> stack{hir.root()};
+    while (!stack.empty()) {
+        HirNodeId const n = stack.back();
+        stack.pop_back();
+        if (hir.kind(n) == HirKind::Cast) {
+            auto const kids = hir.children(n);
+            if (!kids.empty() && isPtrToI64(hir.typeId(n))
+                && isPtrToI64(hir.typeId(kids[0]))
+                && hir.typeId(n).v != hir.typeId(kids[0]).v) {
+                foundRealizeCast = true;
+            }
+        }
+        for (HirNodeId c : hir.children(n)) stack.push_back(c);
+    }
+    EXPECT_TRUE(foundRealizeCast)
+        << "the admitted arg must realize as a Ptr<I64>→Ptr<I64> Cast (a same-rep, "
+           "distinct-identity bitcast) — never a width op";
+}
+
 // `char + 1` promotes char to int (the `alsoPromote` config row): the
 // Add computes at I32 and the char operand is widened by a REAL SExt.
 TEST(MirLoweringCSubset, CharPlusIntPromotesToI32WithSExt) {
@@ -4603,6 +6363,74 @@ TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
     EXPECT_TRUE(findFunc(plainSym).valid())
         << "plain_unused (Global/Default) must survive — externally "
            "visible symbols are linkage-protected";
+}
+
+// ── TF-C92 (D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS):
+//    `visibility("default")` reaches MIR as an APPLIED SymbolVisibility::Default
+//
+// The tier that can assert the applied FACT rather than the absence of a
+// diagnostic: `MirFunc.visibility` / `MirGlobal.visibility` are DENSE fields
+// (`funcVisibility` / `globalVisibility` read them unconditionally), unlike the
+// HIR linkage side-table, which is SPARSE and stores nothing for the
+// Global+Default pair the row produces. So this is where `default` is readable
+// at all on an ordinary declaration.
+//
+// ★★ THE FALSE COMFORT THIS PIN IS CAREFUL NOT TO BE. The visibility pin above
+// (HiddenVisibilityUnusedFunctionIsDceEliminated) already asserts
+// `funcVisibility(plainFn) == SymbolVisibility::Default` — but `plain_unused`
+// carries NO attribute, so that line exercises the ABSENCE of a row, and it stays
+// green with every `visibility:default` row deleted from the config. The
+// difference here is that the declarations DO carry the attribute: delete the
+// `topLevelDecl` row and these sources no longer LOWER (H000C
+// H_UnknownLinkageSpecifier at the HIR tier ⇒ `L.hir->ok` false), which is the
+// red this test contributes. The value assertions then add the second half: that
+// what got applied is Default and not some other facet a config typo could name.
+// Independently pinned at the HIR tier (HirLoweringCSubset.VisibilityDefault*),
+// including the two-rows-are-independent perturbation lever.
+TEST(MirLoweringCSubset, VisibilityDefaultAttributeAppliesDefaultVisibility) {
+    auto L = lowerCSubset(
+        "__attribute__((visibility(\"default\"))) int g_vd = 7;\n"
+        "__attribute__((visibility(\"default\"))) int f_vd(int v) "
+        "{ return v + g_vd; }\n"
+        "int main(void) { return f_vd(1) - 8; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok)
+        << "the attribute must LOWER — a missing `visibility:default` row makes "
+           "this H000C: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+
+    // Resolve by NAME through the semantic model so the pin is independent of
+    // minting order (the HiddenVisibility pin's shape).
+    SymbolId vdSym;
+    for (std::size_t i = 1; i < L.model.symbols().size(); ++i) {
+        if (L.model.symbols()[i].name == "f_vd") {
+            vdSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+    }
+    ASSERT_TRUE(vdSym.valid());
+    MirFuncId vdFn;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+        if (m.funcSymbol(m.funcAt(i)) == vdSym) vdFn = m.funcAt(i);
+    }
+    ASSERT_TRUE(vdFn.valid());
+    EXPECT_EQ(m.funcVisibility(vdFn), SymbolVisibility::Default)
+        << "the row's VALUE must arrive as Default — a typo naming another facet "
+           "would flip this while leaving every diagnostic count at zero";
+    EXPECT_EQ(m.funcBinding(vdFn), SymbolBinding::Global)
+        << "the visibility fold must not disturb the binding axis";
+    EXPECT_TRUE(isExternallyVisible(m.funcBinding(vdFn), m.funcVisibility(vdFn)))
+        << "Global+Default is what all three linkers consume as `exported`; a "
+           "Hidden here would hand DCE a licence to delete an exported symbol";
+
+    // The OBJECT form, through the dense MirGlobal field.
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_EQ(m.globalVisibility(g), SymbolVisibility::Default);
+    EXPECT_TRUE(
+        isExternallyVisible(m.globalBinding(g), m.globalVisibility(g)));
 }
 
 // FC7 C3 (AAPCS64/Apple x8 sret) — N-3 host-independent MIR pin. A >16-byte struct
@@ -5058,6 +6886,66 @@ vaOverflowArgAreaPayload(Mir const& m, std::uint32_t fi) {
     return false;
 }
 } // namespace
+
+namespace {
+// `sizeof` folds to a `size_t` (u64) Const, stored as the `uint64_t` literal
+// variant — `funcHasConstInt` only inspects the `int64_t` variant, so the sizeof
+// pins below need a both-variant probe (the value is small + non-negative).
+[[nodiscard]] bool funcHasConstUIntEither(Mir const& m, std::uint32_t fi,
+                                          std::uint64_t value) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::uint64_t>(lit.value)
+                && std::get<std::uint64_t>(lit.value) == value)
+                return true;
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == static_cast<std::int64_t>(value))
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: `sizeof(*a)` for `int a[10]`
+// folds to the ELEMENT size (4), NEVER the whole-array 40. Pre-fix the shared
+// `derefResultType` law had no Array arm, so the semantic tier left `*a`
+// unstamped and lowerSizeof's `resolveStampedTypeBelow` DFS-descended into the
+// leaf `a`, silently folding sizeof(int[10]) = 40. The (int) cast makes the exit
+// path read the folded size_t constant. RED-ON-DISABLE: revert the Array arm in
+// `derefResultType` — with the lowerSizeof value-form wall present the operand is
+// now UNSTAMPED, so lowering FAILS LOUD (H_UnsupportedLoweringForKind) and no
+// Const 4 is emitted (`L.mir.ok` trips / the const-4 EXPECT reds); revert the
+// wall too and the old DFS restores the silent Const 40 this pins against.
+TEST(MirLoweringCSubset, SizeofDerefArrayFoldsElementNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int a[10]; return (int)sizeof(*a); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 4))
+        << "sizeof(*a) is the element int == 4 (C 6.3.2.1p3 array-decay + 6.5.3.4)";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 40))
+        << "must NOT fold to the whole int[10] (40) — the silent DFS leaf-fallback";
+}
+
+// The 2-D companion: `sizeof(*m)` for `int m[3][4]` is the ROW `int[4]` (16),
+// never the whole 48-byte 2-D array. `*m` decays `int[3][4]` to `int(*)[4]` and
+// derefs to `int[4]`. RED-ON-DISABLE mirrors the 1-D pin above (16 <-> 48).
+TEST(MirLoweringCSubset, SizeofDerefTwoDimArrayFoldsRowNotWholeArray) {
+    auto L = lowerCSubset("int g(void) { int m[3][4]; return (int)sizeof(*m); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_TRUE(funcHasConstUIntEither(m, 0, 16))
+        << "sizeof(*m) is the row int[4] == 16";
+    EXPECT_FALSE(funcHasConstUIntEither(m, 0, 48))
+        << "must NOT fold to the whole int[3][4] (48)";
+}
 
 TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
     auto L = lowerCSubset(
@@ -9034,6 +10922,321 @@ TEST(MirLoweringCSubset, WideBitIntEasyOpsLowerGreen) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
+// ★★ D-CSUBSET-UINT128-TYPE (TF-C94) — a WIDE integer narrowed to a scalar must carry
+// the DESTINATION's DECLARED TypeId, never the canonical `interner.primitive(kind)` row
+// for its TypeKind.
+//
+// THE PREMISE, and why sub-64-bit coverage cannot substitute for this test: a TypeKind
+// does NOT determine a TypeId. C spells FOUR distinct 64-bit integer type names over
+// only TWO kinds — `long` and `long long` both I64, `unsigned long` and `unsigned long
+// long` both U64 — so the interner necessarily mints a SEPARATE TypeId per spelling and
+// the canonical primitive row is none of them. Every sub-64-bit integer kind has exactly
+// ONE C spelling, so its declared TypeId happens to BE the canonical primitive: a
+// `(int)` / `(short)` / `(unsigned)` narrowing passes even while all four 64-bit
+// spellings are broken. The test asserts that premise FIRST (the two I64 spellings
+// resolve to different TypeIds, likewise the two U64 ones) so it can never silently
+// decay into a vacuous check if the vocabulary ever collapses.
+//
+// MEASURED, before the fix: `emitScalarFromWide` typed its result from the KIND, so
+// `static unsigned long long f(...){ __uint128_t r = ...; return (unsigned long long)
+// (r>>64); }` produced a value carrying the canonical U64 row and the MIR verifier's
+// strict `vt.v != returnTy.v` identity test walled it with I_TerminatorTypeMismatch.
+// This reproduced on all four 64-bit spellings and on an `enum` target (whose declared
+// type is the nominal Enum TypeId while its kind is the underlying integer), and it was
+// NOT specific to `__int128` — the identical wall reproduced with an `unsigned
+// _BitInt(128)` and an `unsigned _BitInt(200)` source, so it had been latent since
+// D-CSUBSET-BITINT-C2-WIDE.
+//
+// RED-ON-DISABLE (run, then restored): revert `emitScalarFromWide` to type its result
+// `interner.primitive(targetKind)` and every one of the six rows below fails — four with
+// a MirVerifier I_TerminatorTypeMismatch and a declared-vs-actual TypeId mismatch, plus
+// the enum row and the `_BitInt` row. The STORE-shaped contexts (assignment, initializer,
+// compound-assign, array element, struct member, global, call argument, `*p = (u64)r`)
+// carried the SAME wrong TypeId but were NOT caught — the verifier does not identity-
+// check Store or call-argument operands — which is precisely why the return position is
+// the one pinned here.
+TEST(MirLoweringCSubset, WideIntNarrowingCarriesDeclaredTypeId) {
+    // All four 64-bit spellings in ONE unit, so the two same-kind pairs can be compared
+    // against each other. `main` returns `int`, which never collides with I64/U64.
+    Lowered L = lowerCSubset(
+        "unsigned long long fUll(__uint128_t r) { return (unsigned long long)(r >> 64); }\n"
+        "unsigned long      fUl (__uint128_t r) { return (unsigned long)(r >> 64); }\n"
+        "long long          fLl (__int128 r)    { return (long long)(r >> 64); }\n"
+        "long               fL  (__int128 r)    { return (long)(r >> 64); }\n"
+        "int main(void) {\n"
+        "  __uint128_t u = 3; __int128 s = 5;\n"
+        "  return (int)fUll(u) + (int)fUl(u) + (int)fLl(s) + (int)fL(s);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // The verifier is the fail-loud gate that blocked sqlite: interner-gated, so it
+    // must be constructed WITH the interner or the return-type rule is skipped entirely.
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(v.verify(vrep))
+        << "\na wide->64-bit narrowing in a RETURN must be verifier-clean — "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+
+    Mir const&          m  = L.mir.mir;
+    TypeInterner const& ti = L.model.lattice().interner();
+
+    // Per function: the Return operand's TypeId must EQUAL the FnSig's declared return
+    // TypeId. Collect the I64/U64-kinded ones so the premise can be asserted after.
+    std::vector<TypeId> i64Rets;
+    std::vector<TypeId> u64Rets;
+    // `moduleFuncCount()`, NOT `funcCount()` — the latter counts the arena's slot-0
+    // sentinel too, and `funcAt(moduleFuncCount())` hard-traps.
+    for (std::uint32_t fi = 0;
+         fi < static_cast<std::uint32_t>(m.moduleFuncCount()); ++fi) {
+        TypeId const sig = m.funcSignature(m.funcAt(fi));
+        if (!sig.valid()) continue;
+        auto const sigOps = ti.operands(sig);
+        if (sigOps.empty() || !sigOps[0].valid()) continue;
+        TypeId   const retTy = sigOps[0];
+        TypeKind const rk    = ti.kind(retTy);
+        if (rk != TypeKind::I64 && rk != TypeKind::U64) continue;
+
+        // Scan EVERY block, not just the entry one: a wide `>> 64` emits a limb LOOP,
+        // so the Return lands in a later block (`entryReturn` would miss it and the
+        // test would silently check nothing).
+        MirInstId ret = InvalidMirInst;
+        for (std::uint32_t bi = 0;
+             bi < m.funcBlockCount(m.funcAt(fi)) && !ret.valid(); ++bi) {
+            MirBlockId const b = m.funcBlockAt(m.funcAt(fi), bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const ix = m.blockInstAt(b, ii);
+                if (m.instOpcode(ix) == MirOpcode::Return) { ret = ix; break; }
+            }
+        }
+        ASSERT_TRUE(ret.valid()) << "the narrowing helper's Return was not found";
+        auto const retOps = m.instOperands(ret);
+        ASSERT_EQ(retOps.size(), 1u) << "a scalar return carries exactly one value";
+        EXPECT_EQ(m.instType(retOps[0]).v, retTy.v)
+            << "\nthe wide->narrow result must carry the function's DECLARED return "
+               "TypeId (" << retTy.v << "), not another row of the same TypeKind ("
+            << m.instType(retOps[0]).v << ")";
+
+        (rk == TypeKind::I64 ? i64Rets : u64Rets).push_back(retTy);
+    }
+
+    // THE PREMISE — two spellings, one kind, DIFFERENT TypeIds. Asserted last so a
+    // failure reads as "this test just went vacuous", not as a narrowing bug.
+    ASSERT_EQ(i64Rets.size(), 2u) << "`long` and `long long` are the two I64 helpers";
+    ASSERT_EQ(u64Rets.size(), 2u) << "`unsigned long`/`unsigned long long` are the U64 pair";
+    EXPECT_NE(i64Rets[0].v, i64Rets[1].v)
+        << "`long` and `long long` share TypeKind I64 but must be DISTINCT TypeIds — "
+           "if they ever collapse, this whole test stops discriminating";
+    EXPECT_NE(u64Rets[0].v, u64Rets[1].v)
+        << "`unsigned long` and `unsigned long long` share U64 but must be DISTINCT";
+}
+
+// D-CSUBSET-UINT128-TYPE (TF-C94), the two remaining broken narrowing targets, kept
+// apart from the four-spelling test because each fails for its OWN reason:
+//  - an ENUM target: the declared type is the NOMINAL Enum TypeId while the cast's kind
+//    is the enum's UNDERLYING integer, so typing from the kind can never produce the
+//    declared row (MEASURED: value type 1 vs declared 55). The non-wide `int -> enum`
+//    cast was always correct — `combineCast`'s ordinary tail already emits with `t` —
+//    which is what makes this a wide-path-only defect.
+//  - a `_BitInt(N>64)` SOURCE: proves the defect was never `__int128`-specific. The same
+//    `unsigned long long` return walled with an `unsigned _BitInt(128)` and an
+//    `unsigned _BitInt(200)` source, i.e. it had been latent since C2.
+TEST(MirLoweringCSubset, WideIntNarrowingToEnumAndFromBitIntCarriesDeclaredTypeId) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"enum E { A = 1, B = 2 };\n"
+                 "enum E toEnum(__uint128_t r) { return (enum E)r; }\n"
+                 "int main(void) { __uint128_t r = 1; return (int)toEnum(r); }\n",
+                 "wide -> enum (declared type is the nominal Enum row)"},
+             Row{"unsigned long long hi128(unsigned _BitInt(128) r)"
+                 " { return (unsigned long long)(r >> 64); }\n"
+                 "int main(void) { unsigned _BitInt(128) r = 3; return (int)hi128(r); }\n",
+                 "_BitInt(128) source -> unsigned long long (NOT __int128-specific)"},
+             Row{"unsigned long long hi200(unsigned _BitInt(200) r)"
+                 " { return (unsigned long long)(r >> 64); }\n"
+                 "int main(void) { unsigned _BitInt(200) r = 3; return (int)hi200(r); }\n",
+                 "_BitInt(200) source -> unsigned long long (4-limb, same chokepoint)"}}) {
+        Lowered L = lowerCSubset(std::string{r.src});
+        ASSERT_FALSE(L.model.hasErrors())
+            << "\n" << r.what << "\n"
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << "\n" << r.what << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << "\n" << r.what << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        DiagnosticReporter vrep;
+        MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+        EXPECT_TRUE(v.verify(vrep))
+            << "\n" << r.what
+            << ": the wide->narrow result must carry the DECLARED TypeId — "
+            << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    }
+}
+
+// ★★ D-CSUBSET-UINT128-TYPE (TF-C94) — `++` / `--` on a 128-bit integer.
+//
+// THE DEFECT THIS PINS, and why it was not a deferral. `materializeWideLiteral`'s
+// 64-bit-payload arm rejected everything that was not `std::int64_t`, and a KIND gate
+// added below that rejection refused every non-`_BitInt` wide type outright. Which arm
+// a synthetic `1` lands on is decided by `synthOne` (cst_to_hir.cpp) from the type's
+// CORE via `isSignedCore`: a SIGNED core gets `std::int64_t{1}`, an UNSIGNED one gets
+// `std::uint64_t{1}`. `isSignedCore(BitInt)` is `true` for BOTH `_BitInt` signednesses
+// (the core carries no sign), so every `_BitInt` synthetic `1` rode the int64 arm and
+// `_BitInt(128) x; x++;` always worked, while `U128` rode the uint64 arm.
+//
+// MEASURED before the fix (arm64:macho64-arm64-darwin-exec, one file per row):
+//     `__uint128_t x = 41; x++;` → H_UnsupportedLoweringForKind, "a wide _BitInt
+//         literal must be a bit-precise value or a 64-bit integer constant" — a type
+//         the source never mentions, and NO anchor at all;
+//     `__int128 x = 41; x++;`    → the anchored 128-bit-literal refusal (it cleared the
+//         int64 check, then hit the kind gate);
+//     `_BitInt(128)` and `unsigned _BitInt(128)` → clean.
+// So the two 128-bit spellings failed for DIFFERENT reasons and one of them was
+// unanchored — three symptoms of one misplaced gate.
+//
+// WHY THE REFUSAL WAS UNNECESSARY (not a relaxation of a real wall): the gate now
+// checks the PAYLOAD VARIANT, not the type. Reaching it means the value is held in a
+// 64-bit host scalar, which structurally cannot carry more than 64 bits of magnitude,
+// so "limb 0 = the value, higher limbs = the sign fill" is EXACT. A genuinely wide
+// literal never arrives here — it comes as a `BitIntValue` and is filled limb-by-limb
+// by the arm above.
+//
+// RUNTIME, MEASURED end-to-end on arm64:macho64-arm64-darwin-exec, exit 42: `__uint128_t
+// u = (__uint128_t)0xFFFFFFFFFFFFFFFFull; u++;` CARRIES into the high limb (high word 1,
+// low word 0) and `u--` BORROWS back out of it; the signed `__int128` twin does the same
+// across `-(2^64)`. The corpus example owns the exit-code form; this test owns the
+// lowering-tier pin.
+//
+// RED-ON-DISABLE (run, then restored): put the kind gate back below the int64 check —
+// i.e. reject anything that is not `std::int64_t`, then reject a non-`BitInt` kind — and
+// the four `__int128`/`__uint128_t` rows fail at `L.mir.ok` while the two `_BitInt` rows
+// stay green, reproducing the exact asymmetry above.
+TEST(MirLoweringCSubset, IncDecOnWideIntegerLowersGreenForEverySpelling) {
+    struct Row { char const* decl; char const* what; };
+    for (Row const r : {
+             Row{"__uint128_t",           "the UNSIGNED 128-bit standard kind — its "
+                                          "synthetic 1 rides the uint64 arm"},
+             Row{"__int128",              "the SIGNED 128-bit standard kind — int64 arm, "
+                                          "was blocked by the kind gate"},
+             Row{"unsigned _BitInt(128)", "the bit-precise twin — must STAY green"},
+             Row{"_BitInt(128)",          "signed bit-precise — must STAY green"},
+             Row{"unsigned _BitInt(200)", "a 4-limb width, to keep the fix from being "
+                                          "accidentally 2-limb-specific"}}) {
+        // All four ++/-- forms in one unit: post-inc, pre-inc, post-dec, pre-dec.
+        std::string const src =
+            std::string{"int main(void) { "} + r.decl + " x = 41; "
+            "x++; ++x; x--; --x; return (int)x; }\n";
+        Lowered L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors())
+            << "\n" << r.what << "\n" << src << "\n"
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << "\n" << r.what << "\n" << src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << "\n" << r.what << "\n" << src
+            << "\n++/-- on a 128-bit integer must lower — the synthetic `1` fits in 64 "
+               "bits by construction, so there is nothing here to defer\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        DiagnosticReporter vrep;
+        MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+        EXPECT_TRUE(v.verify(vrep))
+            << "\n" << r.what << "\n" << src << "\n"
+            << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    }
+}
+
+// The SUBSTANCE pin for the test above: green lowering alone would also be satisfied by
+// an arm that quietly wrote ONE limb and left the other undefined, or that sign-filled
+// where it must zero-fill. What is pinned here is the SIGN-FILL discipline —
+// `emitWideFromScalar` picks the limb fill from the source kind: an UNSIGNED wide type
+// zero-fills the limbs above the first (a `Const 0`), a SIGNED one sign-fills them (an
+// `AShr` by 63). That signedness now comes from the `wideIntIsSigned` FACADE, replacing
+// the BitInt-only `interner.bitIntIsSigned` — which ABORTED on I128/U128 and is the
+// entire reason the kind gate existed.
+//
+// ★ THE TEST SHAPE IS ITSELF A CORRECTION. The first version of this test compared
+// `__uint128_t` against `unsigned _BitInt(128)` and asserted their opcode censuses were
+// EQUAL. That was VACUOUS and was MEASURED so: hard-coding the fill signedness to
+// `TypeKind::I64` — the exact regression it was meant to catch — left the test GREEN,
+// because a uniform signedness error moves BOTH sides of an equality identically. A
+// same-vs-same comparison cannot see a same-vs-same error.
+//
+// The discriminating quantity is the SIGNED-minus-UNSIGNED delta WITHIN one family: the
+// two spellings differ by exactly the one sign-fill `AShr` that the synthetic `1`
+// contributes. The `= 41` initializer casts from a SIGNED I32 in all four rows and so
+// contributes the same AShr to each, cancelling out of every delta. Cross-family
+// equality is kept as a secondary check (the revived U128 arm must behave like the
+// shipped `_BitInt` one), but it is no longer what carries the test.
+//
+// RED-ON-DISABLE (run, then restored): replace `wideIntIsSigned(interner, t) ?
+// TypeKind::I64 : TypeKind::U64` with a hard-coded `TypeKind::I64` and both deltas
+// collapse to 0 — the unsigned rows grow the sign-fill AShr they must not have. Under
+// the vacuous first version this same edit stayed green.
+TEST(MirLoweringCSubset, IncDecOnUnsignedWideIntegerZeroFillsItsUpperLimbs) {
+    auto census = [](Lowered const& L) {
+        Mir const& m = L.mir.mir;
+        std::size_t stores = 0, ashrs = 0, total = 0;
+        for (std::uint32_t fi = 0;
+             fi < static_cast<std::uint32_t>(m.moduleFuncCount()); ++fi) {
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(m.funcAt(fi)); ++bi) {
+                MirBlockId const b = m.funcBlockAt(m.funcAt(fi), bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    ++total;
+                    switch (m.instOpcode(m.blockInstAt(b, ii))) {
+                        case MirOpcode::Store: ++stores; break;
+                        case MirOpcode::AShr:  ++ashrs;  break;
+                        default: break;
+                    }
+                }
+            }
+        }
+        return std::array<std::size_t, 3>{stores, ashrs, total};
+    };
+    // Four bodies identical but for the local's declared type. Both families are
+    // 2-limb, so every difference below is a SIGNEDNESS difference.
+    auto build = [&](char const* decl) {
+        return lowerCSubset(std::string{"int main(void) { "} + decl
+                            + " x = 41; x++; return (int)x; }\n");
+    };
+    Lowered uStd = build("__uint128_t");
+    Lowered sStd = build("__int128");
+    Lowered uBit = build("unsigned _BitInt(128)");
+    Lowered sBit = build("_BitInt(128)");
+    for (Lowered const* L : {&uStd, &sStd, &uBit, &sBit}) {
+        ASSERT_TRUE(L->mir.ok)
+            << (L->mirReporter.all().empty() ? "" : L->mirReporter.all()[0].actual);
+    }
+    auto const cUStd = census(uStd);
+    auto const cSStd = census(sStd);
+    auto const cUBit = census(uBit);
+    auto const cSBit = census(sBit);
+    // Asserted first, so a failure below reads as a real defect and not as a test that
+    // has quietly stopped measuring: the signed rows must actually contain sign-fills.
+    ASSERT_GT(cSBit[1], 0u) << "the signed _BitInt(128) reference emits no AShr at all — "
+                               "this test has stopped measuring the sign fill";
+    ASSERT_GT(cUBit[0], 0u) << "the reference emits no Store — no limbs are being filled";
+    // ★ THE DISCRIMINATOR. Signed minus unsigned, within each family, is the ONE
+    // sign-fill AShr the synthetic `1` adds. A hard-coded signedness makes both zero.
+    EXPECT_EQ(cSBit[1] - cUBit[1], 1u)
+        << "signed _BitInt(128) must emit exactly ONE more sign-fill AShr than its "
+           "unsigned twin (this is the shipped reference behaviour)";
+    EXPECT_EQ(cSStd[1] - cUStd[1], 1u)
+        << "__int128 must emit exactly ONE more sign-fill AShr than __uint128_t — an "
+           "equal count means the fill signedness is not being read from the type";
+    // Secondary: the revived 128-bit arm must otherwise behave like the shipped one.
+    EXPECT_EQ(cUStd[0], cUBit[0]) << "unsigned limb Store count must match its twin";
+    EXPECT_EQ(cUStd[2], cUBit[2]) << "unsigned total instruction count must match";
+    EXPECT_EQ(cSStd[0], cSBit[0]) << "signed limb Store count must match its twin";
+    EXPECT_EQ(cSStd[2], cSBit[2]) << "signed total instruction count must match";
+}
+
 // ── VLA C1a (D-CSUBSET-VLA): the front-end + IR pin ──────────────────────────
 //
 // A block-scope `int a[n]` lowers to a `vlaArray(int)`-typed local whose MIR
@@ -9988,6 +12191,95 @@ TEST(MirLoweringCSubset, BitCountBuiltinsLowerToDedicatedMirOps) {
     EXPECT_EQ(interner.kind(m.instType(popInst)), TypeKind::I32);
 }
 
+// D-CSUBSET-INTRINSIC-BSWAP: all SIX byte-swap spellings — the MSVC family
+// `_byteswap_{ushort,ulong,uint64}` and the GCC family `__builtin_bswap{16,32,64}`
+// — route to the SAME dedicated pure-unary MIR op (Bswap). Six NAMES, ONE verb,
+// zero extra engine code: the six c-subset.lang.json rows differ only in their
+// param/result cores.
+//
+// ★ THE `Call == 0` HALF IS THE REAL PIN, and it is not redundant with the Bswap
+// count. A mis-bound verb does NOT fail loud: an unknown `lowering` string, or a
+// row that never reaches the BuiltinLowering::Bswap arm, leaves the name a plain
+// declared FUNCTION, so the call site lowers to MirOpcode::Call against a symbol
+// that no CRT exports — `msvcrt.dll` exports no `_byteswap_*` (MEASURED, objdump
+// -p), and DSS eager-imports every descriptor symbol, so on pe that becomes a
+// LOADER failure (0xC0000139) in a binary that compiled and linked clean. Counting
+// only Bswap would go red for the three MSVC spellings and stay green for a subtler
+// half-binding; counting Calls closes it from the other side.
+//
+// ★ The RESULT TYPE is pinned per width because it is the sole carrier of the
+// semantic width W: unlike Popcount/Clz/Ctz (whose result is always the GCC `int`),
+// each Bswap's type IS its operand's type, and mir_to_lir reads exactly that back
+// to choose between a native encoding and the software expansion. A row whose
+// `result` core drifted from its `params` core would silently byte-swap the wrong
+// number of bytes.
+//
+// RED-ON-DISABLE: change any of the 6 rows' `"lowering": "bswap"` in
+// c-subset.lang.json (or delete the `case BuiltinLowering::Bswap:` arm in
+// hir_to_mir) → nBswap drops below 6 AND nCall rises above 0.
+TEST(MirLoweringCSubset, ByteSwapBuiltinsAllRouteToOneMirBswapNeverACall) {
+    auto L = lowerCSubset(
+        "typedef unsigned short     u16;\n"
+        "typedef unsigned int       u32;\n"
+        "typedef unsigned long long u64;\n"
+        "u16 ms16(u16 x){return _byteswap_ushort(x);}\n"
+        "u32 ms32(u32 x){return _byteswap_ulong(x);}\n"
+        "u64 ms64(u64 x){return _byteswap_uint64(x);}\n"
+        "u16 gc16(u16 x){return __builtin_bswap16(x);}\n"
+        "u32 gc32(u32 x){return __builtin_bswap32(x);}\n"
+        "u64 gc64(u64 x){return __builtin_bswap64(x);}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR lowering: " << (L.hirReporter.all().empty()
+            ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    int nBswap = 0, nCall = 0;
+    std::vector<MirInstId> bswaps;
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            switch (m.instOpcode(id)) {
+                case MirOpcode::Bswap: ++nBswap; bswaps.push_back(id); break;
+                case MirOpcode::Call:  ++nCall;  break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_EQ(nBswap, 6)
+        << "all 6 byte-swap spellings must lower to MirOpcode::Bswap";
+    EXPECT_EQ(nCall, 0)
+        << "a compiler intrinsic is NOT a linkable symbol — a mis-bound `lowering` "
+           "verb would silently become a Call to a name no CRT exports";
+
+    // Per-spelling structure: unary, operand = the wrapper's own Arg, result type
+    // = the operand's type (the width carrier). Functions lower in source order,
+    // so the widths are 16/32/64 twice over.
+    ASSERT_EQ(bswaps.size(), 6u);
+    constexpr TypeKind kExpected[6] = {
+        TypeKind::U16, TypeKind::U32, TypeKind::U64,   // _byteswap_*
+        TypeKind::U16, TypeKind::U32, TypeKind::U64,   // __builtin_bswap*
+    };
+    for (std::size_t i = 0; i < bswaps.size(); ++i) {
+        auto const ops = m.instOperands(bswaps[i]);
+        ASSERT_EQ(ops.size(), 1u) << "byte-swap #" << i << " must be unary";
+        EXPECT_EQ(m.instOpcode(ops[0]), MirOpcode::Arg)
+            << "byte-swap #" << i << " must consume the wrapper's Arg (single-eval)";
+        EXPECT_EQ(interner.kind(m.instType(bswaps[i])), kExpected[i])
+            << "byte-swap #" << i << " must carry its operand's own width";
+        EXPECT_EQ(interner.kind(m.instType(ops[0])), kExpected[i])
+            << "byte-swap #" << i << ": operand and result widths must agree";
+    }
+}
+
 // ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op MIR-shape pins ──
 // Each `__builtin_stdc_<op>_<T>` lowers (hir_to_mir emitStdbitOp) to a width-correct
 // BRANCHLESS composition of the 3 primitives (Popcount/Clz/Ctz) + universal ALU
@@ -10052,6 +12344,55 @@ TEST(MirLoweringCSubset, InlineAsmEmptyTemplateNoVolatileLowersToCompilerBarrier
     Mir const& m = L.mir.mir;
     auto ids = stdbitAllEntryInsts(m);
     EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1);
+}
+
+// ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──
+// The BUILTIN→OPCODE half of the fence feature, and the ONLY test that covers it:
+// every other AtomicFence pin (test_mir_to_lir's slot routing, the test_asm_* byte
+// pins, test_mir_alias's clobber walk, test_mir_opcode's shape row) BUILDS the MIR
+// op by hand, so not one of them can see the builtin bound to the wrong lowering
+// verb — only an end-to-end corpus run would otherwise catch it.
+// ★ WHY THE ZERO-CompilerBarrier HALF IS LOAD-BEARING, not decoration: the registry
+// anchor warns in capitals that routing `__sync_synchronize` to
+// `BuiltinLowering::Barrier` → `MirOpcode::CompilerBarrier` emits ZERO target
+// instructions on EVERY target (mir_to_lir's `case CompilerBarrier: return;`). That
+// rebind is a one-word JSON edit, it compiles clean, it silences the S0001, and it
+// is a SILENT UNDER-FENCE MISCOMPILE — invisible on a single-threaded corpus run,
+// and not a diagnostic. Asserting the AtomicFence count ALONE would stay green if
+// someone ADDED a barrier beside the fence; asserting 0 CompilerBarrier is what
+// makes the routing exclusive.
+// RED-ON-DISABLE: flip the `__sync_synchronize` row's `"lowering"` in
+// c-subset.lang.json to `"barrier"` (or drop the addInst in hir_to_mir's
+// `case BuiltinLowering::AtomicFence:`) → AtomicFence 1→0 AND CompilerBarrier 0→1,
+// so BOTH halves red. Re-bake the order to anything but seq_cst → the payload pin
+// reds (and mir_to_lir would fail loud on it — no silent weaker fence).
+TEST(MirLoweringCSubset, SyncSynchronizeLowersToAtomicFenceSeqCst) {
+    auto L = lowerCSubset("void f(void){ __sync_synchronize(); }");
+    // The builtin is ALWAYS-injected (c-subset.lang.json builtinFunctions), so an
+    // unbound name would surface here as a semantic S0001 rather than at MIR.
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::AtomicFence), 1)
+        << "__sync_synchronize() must lower to EXACTLY ONE MirOpcode::AtomicFence";
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 0)
+        << "the fence must NOT route through CompilerBarrier — that opcode emits "
+           "ZERO target instructions, so the rebind is a silent under-fence "
+           "miscompile that no exit-code or corpus probe can see";
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0)
+        << "a compiler intrinsic must not lower to a Call";
+    // The memory order is CONST-BAKED at seq_cst (5): the builtin declares no order
+    // parameter and GCC defines every __sync builtin as a FULL barrier, so there is
+    // nothing to fold — a wrong bake here is a weaker fence than the source promised.
+    MirInstId const fence = stdbitFirstOp(m, ids, MirOpcode::AtomicFence);
+    ASSERT_TRUE(fence.valid());
+    EXPECT_EQ(m.instPayload(fence), 5u)   // memory_order_seq_cst
+        << "__sync_synchronize is a FULL barrier — the payload must be seq_cst (5)";
+    EXPECT_EQ(m.instOperands(fence).size(), 0u)
+        << "AtomicFence is a 0-operand op — the builtin takes no arguments";
 }
 
 // leading_zeros = clz(x) − (P − W): a single Clz, NO Popcount/Ctz/Shl.
@@ -10301,7 +12642,11 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     &hir->sizeofVlaSymbol,
                                     &hir->typedefVlaOriginBySymbol,
                                     /*synthRecipeMap=*/nullptr,
-                                    &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
+                                    &hir->returnsTwiceMap,    // FC17.9(c) (D-CSUBSET-SETJMP)
+                                    &hir->noInlineMap,        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
+                                    &hir->alwaysInlineMap,  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                                    &hir->noOptimizeMap,  // TF-C85 (#pragma optimize)
+                                    &hir->noSanitizeThreadMap);  // TF-C92 (no_sanitize_thread)
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -10585,4 +12930,65 @@ TEST(MirLoweringCSubset, SameRepresentationIntegerReturnEmitsNoCast) {
     DiagnosticReporter rep;
     MirVerifier verifier{L.mir.mir, &L.model.lattice().interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "errorCount=" << rep.errorCount();
+}
+
+// ── D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8) — the ARG-SLOT pin ──────
+//
+// THE TIER THAT REPORTED THE DEFECT. `lowerFunction` compares the HIR Function's
+// param NODES against its FnSig's param TYPES and fails loud on a mismatch:
+// MEASURED, on the INLINE spelling `int g(int)`, "Function param count 1
+// mismatches FnSig param count 2" — the parameter had been classified a function
+// PROTOTYPE (its name carries a `()` suffix, the same syntax a prototype writes)
+// and CST→HIR's prototype gate emits no VarDecl, so the slot vanished. Counting
+// the emitted `Arg`s is what proves the slot survived all the way to MIR, where
+// an `Arg` IS the argument register.
+//
+// RED-ON-DISABLE: drop `&& !decl.paramAdjustments` from the `isProto` derivation
+// in semantic_analyzer.cpp's Pass-1 declarator mint → `L.mir.ok` goes false with
+// exactly that H_UnsupportedLoweringForKind.
+TEST(MirLoweringCSubset, InlineFunctionTypedParamKeepsItsArgSlot) {
+    auto L = lowerCSubset(
+        "int twice(int x) { return x + x; }\n"
+        "int apply(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(dss::test_support::countCode(
+                  L.mirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 0u)
+        << "a function-typed parameter is a supported construct — C 6.7.6.3p8 "
+           "makes it an ordinary pointer parameter";
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    bool sawApply = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        auto const* rec = L.model.recordFor(m.funcSymbol(f));
+        if (rec == nullptr || rec->name != "apply") continue;
+        sawApply = true;
+        // Both parameters reach MIR as `Arg`s, in source order, and arg 0 is a
+        // POINTER (the adjusted function type) — a bare FnSig here would be a
+        // function value in a register, which no ABI can pass.
+        std::vector<MirInstId> args;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == MirOpcode::Arg) args.push_back(id);
+            }
+        }
+        ASSERT_EQ(args.size(), 2u)
+            << "`apply` takes TWO arguments — a dropped param slot reports 1";
+        EXPECT_EQ(m.argIndex(args[0]), 0u);
+        EXPECT_EQ(m.argIndex(args[1]), 1u);
+        EXPECT_EQ(in.kind(m.instType(args[0])), TypeKind::Ptr)
+            << "arg 0 is `int (*)(int)` — the p8-adjusted parameter";
+        EXPECT_EQ(in.kind(m.instType(args[1])), TypeKind::I32);
+    }
+    EXPECT_TRUE(sawApply) << "`apply` must be lowered";
 }

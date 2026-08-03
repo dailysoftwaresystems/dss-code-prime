@@ -3,7 +3,9 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
+#include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/glob_match.hpp"  // D-AP2-SOURCES-GLOB: expand sources[] patterns
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -15,10 +17,10 @@
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
-#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
@@ -29,19 +31,23 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <latch>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -58,7 +64,7 @@ namespace {
     // bound on small files, so 4-8 workers is the sweet spot.
     const auto hw = static_cast<std::size_t>(std::thread::hardware_concurrency());
     const auto workers = std::clamp<std::size_t>(hw == 0 ? 4 : hw, 1, 8);
-    auto executor = std::make_unique<lsp::ThreadPool>(workers);
+    auto executor = std::make_unique<substrate::ThreadPool>(workers);
     lsp::LspServer server{std::move(transport), std::move(executor), cache};
     return server.run();
 }
@@ -199,16 +205,80 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     return "target spec '" + spec + "' failed to parse.";
 }
 
+// ── TF-C74 (D-PROGRAM-UNKNOWN-OBJECT-FORMAT-SILENT): ONE wording per half ──
+//
+// The two halves of a `--target <targetName>:<formatName>` spec are now
+// checked in TWO places — the pre-flight in `runCusToTargets` (which must
+// reject before the CU build) and `compileOneTarget` (the authoritative site,
+// which still checks because it is reachable on its own terms). Hoisting the
+// CHECK must not fork the MESSAGE, and the only way that survives the next
+// edit is for both sites to call the same emitter.
+//
+// Each emits TWO diagnostics and both are load-bearing: the config loader's
+// own reason (`C_InvalidTargetName` / `C_InvalidFormatName`) says WHAT it
+// could not find and is forwarded verbatim rather than swallowed; the driver's
+// `D_SchemaLoadFailed` says what that means for this build and where to look.
+// Neither is a duplicate of the other, so neither is dropped.
+void emitTargetSchemaLoadFailed(DiagnosticReporter&               rep,
+                                std::span<ConfigDiagnostic const> why,
+                                std::string const&                targetName) {
+    forwardConfigDiagnostics(why, rep);
+    emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+               "target schema '" + targetName
+               + "' could not be loaded — check that "
+                 "src/dss-config/targets/" + targetName
+               + ".target.json exists and parses cleanly.");
+}
+
+void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
+                                      std::span<ConfigDiagnostic const> why,
+                                      std::string const&                formatName) {
+    forwardConfigDiagnostics(why, rep);
+    emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+               "object-format schema '" + formatName
+               + "' could not be loaded — check that "
+                 "src/dss-config/object-formats/" + formatName
+               + ".format.json exists and parses cleanly.");
+}
+
+// D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pool
+// (only consulted when NO executor is injected). Never more workers than there
+// are CUs — extra workers would just block on the empty job queue. An explicit
+// `--jobs` (jobsOverride > 0) pins the count within that ceiling; auto (0) uses
+// min(hardware_concurrency, kMaxAutoWorkers) so a 64-core host doesn't spawn 64
+// threads for a handful of TUs. Only ever called on the N>1 path (cuCount >= 2).
+[[nodiscard]] std::size_t resolveCuPoolWidth(std::size_t cuCount,
+                                             unsigned    jobsOverride) noexcept {
+    constexpr std::size_t kMaxAutoWorkers = 16;
+    std::size_t const ceiling = std::max<std::size_t>(std::size_t{1}, cuCount);
+    if (jobsOverride > 0) {
+        return std::min<std::size_t>(jobsOverride, ceiling);
+    }
+    std::size_t const hw = std::thread::hardware_concurrency();
+    std::size_t const autoWidth =
+        std::min<std::size_t>(hw == 0 ? std::size_t{1} : hw, kMaxAutoWorkers);
+    return std::min<std::size_t>(autoWidth, ceiling);
+}
+
 // Compile one resolved (CU, target, format) triple to one artifact.
 // Returns true on success; emits via `reporter` on failure.
 //
 // `outputDir` (D-LK10-ENTRY Slice C companion): when set, the
-// emitted binary lands at `<outputDir>/<sourceStem><ext>` for
-// single-target builds, or `<outputDir>/<formatName>/<sourceStem>
-// <ext>` for multi-target builds (the multi-target qualifier
-// disambiguates same-named outputs across formats). When unset,
-// the legacy `<cwd>/target/<formatName>/<sourceStem><ext>`
-// convention applies — keeps existing call sites unchanged.
+// emitted binary lands at `<outputDir>/<name><ext>` for
+// single-target builds, or `<outputDir>/<formatName>/<name><ext>`
+// for multi-target builds (the multi-target qualifier disambiguates
+// same-named outputs across formats). When unset, the legacy
+// `<cwd>/target/<formatName>/<name><ext>` convention applies —
+// keeps existing call sites unchanged.
+//
+// The artifact base `<name>` = `artifactName.value_or(sourceStem)`: a
+// project manifest's `artifactName` overrides the source stem; nullopt
+// (the CLI path, and a project without the field) keeps the source stem
+// (unchanged). `perFormatOutputSubdir` (D-AP2-OUTPUT-ROUTING) forces the
+// `<formatName>/` subdir even for a single-target `--output` build — a
+// PROJECT build sets it so every platform's artifact is consistently
+// per-platform-subdir'd; the CLI path leaves it false, so `--compile`
+// single-target output stays flat (byte-identical).
 [[nodiscard]] bool compileOneTarget(std::span<CompilationUnit const> cus,
                                     GrammarSchema const&   grammar,
                                     std::string const&     sourceStem,
@@ -216,7 +286,25 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
                                     bool                   multiTargetBuild,
-                                    CompileOptions const&  compileOpts) {
+                                    std::optional<std::string> const& artifactName,
+                                    bool                   perFormatOutputSubdir,
+                                    CompileOptions const&  compileOpts,
+                                    // D-PERF-4-CU-PARALLELISM: the per-CU build
+                                    // executor (nullptr ⇒ an internal pool sized
+                                    // via `jobsOverride`) + the `--jobs` override.
+                                    substrate::IExecutor*  injectedExecutor,
+                                    unsigned               jobsOverride,
+                                    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the
+                                    // per-PROGRAM image knobs (stack reserve),
+                                    // forwarded verbatim to the link step. The
+                                    // linker gates them against THIS target's
+                                    // format capability — which is why the
+                                    // request travels per-target rather than
+                                    // being resolved once for the whole build:
+                                    // a multi-target project may name one
+                                    // format that can carry it and one that
+                                    // cannot, and the second must fail loud.
+                                    ImageRequest const&    imageRequest) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -226,22 +314,14 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     auto targetR = TargetSchema::loadShipped(parsed->targetName);
     if (!targetR.has_value()) {
-        forwardConfigDiagnostics(targetR.error(), reporter);
-        emitDriver(reporter, DiagnosticCode::D_SchemaLoadFailed,
-                   "target schema '" + parsed->targetName
-                   + "' could not be loaded — check that "
-                     "src/dss-config/targets/" + parsed->targetName
-                   + ".target.json exists and parses cleanly.");
+        emitTargetSchemaLoadFailed(reporter, targetR.error(),
+                                   parsed->targetName);
         return false;
     }
     auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
     if (!formatR.has_value()) {
-        forwardConfigDiagnostics(formatR.error(), reporter);
-        emitDriver(reporter, DiagnosticCode::D_SchemaLoadFailed,
-                   "object-format schema '" + parsed->formatName
-                   + "' could not be loaded — check that "
-                     "src/dss-config/object-formats/" + parsed->formatName
-                   + ".format.json exists and parses cleanly.");
+        emitObjectFormatSchemaLoadFailed(reporter, formatR.error(),
+                                         parsed->formatName);
         return false;
     }
 
@@ -300,16 +380,23 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         std::distance(span.data(), abi->cc));
 
     // Output path convention (cycle 2 v1; plan 6 owns the
-    // authoritative artifact-profile-driven scheme):
-    //   default      : <cwd>/target/<formatName>/<sourceStem><ext>
-    //   --output dir : <dir>/<sourceStem><ext>               (single target)
-    //                  <dir>/<formatName>/<sourceStem><ext>  (multi target)
-    // `formatName` already encodes machine+OS, so we don't add a
+    // authoritative artifact-profile-driven scheme). The artifact base
+    // `<name>` = `artifactName.value_or(sourceStem)` (a project manifest's
+    // `artifactName` overrides the stem; nullopt keeps it — the CLI path):
+    //   default      : <cwd>/target/<formatName>/<name><ext>
+    //   --output dir : <dir>/<name><ext>               (single target, flat)
+    //                  <dir>/<formatName>/<name><ext>  (multi target, OR any
+    //                                                   project build via
+    //                                                   perFormatOutputSubdir)
+    // A PROJECT build sets `perFormatOutputSubdir` (D-AP2-OUTPUT-ROUTING) so
+    // even its single-target output lands under `<formatName>/` — consistently
+    // per-platform. The CLI single-target path leaves it false ⇒ flat
+    // (unchanged). `formatName` already encodes machine+OS, so we don't add a
     // separate `<targetName>` subdir (redundant + bloats the path).
     auto const ext = parsed->outputExtension(**formatR);
     fs::path outDir;
     if (outputDir.has_value()) {
-        outDir = multiTargetBuild
+        outDir = (multiTargetBuild || perFormatOutputSubdir)
                    ? (*outputDir / parsed->formatName)
                    : *outputDir;
     } else {
@@ -329,7 +416,32 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                    + outDir.generic_string() + "': " + ec.message());
         return false;
     }
-    auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
+    auto const outPath =
+        outDir / (artifactName.value_or(sourceStem) + std::string{ext});
+
+    // Containment BOUNDARY (D-AP2-OUTPUT-ROUTING). The loader validates a
+    // project's `artifactName` as a bare name (it rejects '/' and '\'), but a
+    // separator DENYLIST does not prove containment — two OS-agnostic vectors
+    // still escape the routed tree:
+    //   * a differing ROOT-NAME (Windows drive-relative "D:app"): `operator/`
+    //     REPLACES `outDir` when the RHS root-name differs ⇒ the artifact lands
+    //     on another drive;
+    //   * a bare ".." (no separator ⇒ survives the loader): `outDir / ".."`
+    //     normalizes to outDir's PARENT.
+    // Enforce the real invariant here, where `outDir` is known: the resolved
+    // artifact must be a DIRECT CHILD of `outDir`. Comparing lexically-normalized
+    // paths is OS-agnostic and uniformly also catches NTFS ADS. This is a NO-OP
+    // for the CLI path — there `artifactName` is nullopt ⇒ the name is the source
+    // STEM (always a bare filename) ⇒ always a direct child ⇒ never fires.
+    if (outPath.lexically_normal().parent_path() != outDir.lexically_normal()) {
+        emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
+                   "artifact name '" + artifactName.value_or(sourceStem)
+                   + "' resolves outside the output directory '"
+                   + outDir.generic_string()
+                   + "' — it must be a bare file name (no path separators, no "
+                     "drive/root prefix, and not '.' or '..').");
+        return false;
+    }
 
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
     // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
@@ -355,16 +467,110 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
-    // its SemanticModel — the interner owner — alive). Early-return on the FIRST CU's
-    // build failure preserves the fail-fast contract (diagnostics already reported).
-    std::vector<CuMirModule> cuMirs;
-    cuMirs.reserve(cus.size());
-    for (auto const& cu : cus) {
-        auto cuMir = buildCuMir(cu, grammar, **targetR, **formatR,
-                                ccIndex, reporter, perCuOpts);
-        if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
-        cuMirs.push_back(std::move(*cuMir));
+    // its SemanticModel — the interner owner — alive).
+    //
+    // D-PERF-4-CU-PARALLELISM: for N>1, run the per-CU builds CONCURRENTLY on a thread pool.
+    // Each `buildCuMir` is a PURE per-CU function — its TypeInterner, arenas, SemanticModel,
+    // symbol table and per-CU SymbolId allocator are all private; the shipped-descriptor cache
+    // is `thread_local`; module-id counters are atomic; PhaseTimers accumulate via relaxed
+    // atomics with `thread_local` nesting. The ONE shared-mutable sink — the DiagnosticReporter
+    // — is replaced by a PER-CU scratch reporter written only by that CU's job; the scratches
+    // then drain into `reporter` in CU (index) ORDER after the join, so the diagnostic stream
+    // AND the resulting artifact are byte-deterministic regardless of thread scheduling. N==1
+    // stays INLINE (the hot single-file path: zero pool cost, diagnostics land straight in
+    // `reporter`, byte-identical + fail-FAST exactly as the pre-parallel code).
+    // D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net: snapshot the reporter's error
+    // count BEFORE the per-CU build/lower. Every genuine tier failure reports its
+    // own K_/L_/A_/S_/H_ diagnostic; if a per-CU build (`buildCuMir`) or the
+    // back-half lower (`lowerCuMirToAssembly`) returns a NULL module without any
+    // new diagnostic, that is a substrate-contract violation (the D-PERF-4
+    // buildCuMir-null contract) — emit `D_CompileUnitNullNoDiagnostic` so the
+    // driver never exits 1 with ZERO output. A no-op on the happy path and on
+    // every genuine (already-reported) failure. Mirrors the optimizer's
+    // X_OptReturnFalseWithoutDiagnostic belt-and-suspenders guard.
+    auto const errorsBeforeCuBuild = reporter.errorCount();
+    auto const emitNullNoDiagnostic = [&](char const* where) {
+        if (reporter.errorCount() == errorsBeforeCuBuild) {
+            emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                       std::string{"internal: "} + where
+                           + " returned a null module without reporting any "
+                             "diagnostic — substrate-contract violation "
+                             "(D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net).");
+        }
+    };
+    std::vector<std::optional<CuMirModule>> cuMirSlots(cus.size());
+    if (cus.size() <= 1) {
+        if (!cus.empty()) {
+            cuMirSlots[0] = buildCuMir(cus[0], grammar, **targetR, **formatR,
+                                       ccIndex, reporter, perCuOpts);
+            if (!cuMirSlots[0]) {              // front-half tier failure already reported
+                emitNullNoDiagnostic("per-CU build (buildCuMir)");
+                return false;
+            }
+        }
+    } else {
+        // Per-CU scratch reporters: inherit `reporter`'s POLICY (suppress / overrides /
+        // warningsAsErrors) but RELAX the cap/dedup axes — the run-wide cap is enforced ONCE
+        // when these drain into `reporter` below, so a per-CU cap can't asymmetrically truncate
+        // one CU's diagnostics based on which thread finished first (mirrors the per-target
+        // scratch discipline in `runCusToTargets`).
+        auto cuScratchCfg = reporter.config();
+        cuScratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+        cuScratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+        cuScratchCfg.dedupWindow    = 0;
+        std::vector<DiagnosticReporter> cuScratch;
+        cuScratch.reserve(cus.size());
+        for (std::size_t i = 0; i < cus.size(); ++i) cuScratch.emplace_back(cuScratchCfg);
+
+        // Executor: the injected one (tests / a shared pool) or a fresh internal pool sized to
+        // the CU count (+ the `--jobs` override). `std::optional<ThreadPool>::emplace` builds it
+        // in place (ThreadPool is not movable); it joins its workers at end-of-scope.
+        std::optional<substrate::ThreadPool> localPool;
+        substrate::IExecutor* executor = injectedExecutor;
+        if (executor == nullptr) {
+            localPool.emplace(resolveCuPoolWidth(cus.size(), jobsOverride));
+            executor = &*localPool;
+        }
+
+        // Submit one job per CU, writing BY INDEX `i` into its own slot + scratch — no shared
+        // container is mutated, so there is nothing to lock. A `std::latch` counts completions;
+        // the RAII guard fires `count_down()` even if `buildCuMir` throws (the ThreadPool worker
+        // then logs the throw), so a throwing job can never DEADLOCK `done.wait()` — the slot
+        // just stays nullopt and fails the compile below. `i` is captured BY VALUE so each job
+        // owns its index; everything else is captured by reference and outlives `done.wait()`.
+        std::latch done{static_cast<std::ptrdiff_t>(cus.size())};
+        for (std::size_t i = 0; i < cus.size(); ++i) {
+            executor->submit([&, i] {
+                struct CountDownGuard {
+                    std::latch& latch;
+                    ~CountDownGuard() { latch.count_down(); }
+                } const guard{done};
+                cuMirSlots[i] = buildCuMir(cus[i], grammar, **targetR, **formatR,
+                                           ccIndex, cuScratch[i], perCuOpts);
+            });
+        }
+        done.wait();
+
+        // Merge each CU's diagnostics into `reporter` in CU (index) ORDER — deterministic,
+        // independent of which CU finished first. Merge EVERY CU BEFORE the failure check so a
+        // failing build surfaces every CU's errors deterministically (not just the first-to-
+        // fail's — an improvement the parallel model makes free: every CU is always built).
+        bool allBuilt = true;
+        for (std::size_t i = 0; i < cus.size(); ++i) {
+            copyDiagnostics(cuScratch[i], reporter);
+            if (!cuMirSlots[i].has_value()) allBuilt = false;
+        }
+        if (!allBuilt) {
+            emitNullNoDiagnostic("a per-CU build (buildCuMir)");
+            return false;  // ≥1 front-half tier failure — all diagnostics reported
+        }
     }
+
+    // Collect the built modules into the in-order vector the lower/merge path below consumes
+    // (every slot is engaged here: N==1 built slot 0 inline, N>1 filled every slot + checked).
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.reserve(cuMirSlots.size());
+    for (auto& slot : cuMirSlots) cuMirs.push_back(std::move(*slot));
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): static-library output ──
     //
@@ -380,26 +586,6 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        // Bundling INPUT static archives' members into this new library (a
-        // merged "fat" archive) is unbuilt — fail loud rather than silently
-        // omit them. Dynamic `--resolve-library` libs stayed on the per-CU
-        // FFI path (a member MAY reference libc externs — resolved at the
-        // FINAL link against the library, not here).
-        if (!staticArchives.empty()) {
-            std::string names;
-            for (auto const& a : staticArchives) {
-                if (!names.empty()) names += ", ";
-                names += a.generic_string();
-            }
-            emitDriver(reporter, DiagnosticCode::D_StaticLibFatArchiveUnsupported,
-                       "building a static library (container: archive) does not "
-                       "yet bundle input `--resolve-library` static archives into "
-                       "the output (a merged/\"fat\" archive is the unbuilt "
-                       "D-FF1-STATICLIB-FAT-ARCHIVE): " + names
-                       + ". Remove the static archive(s), or link them at the "
-                         "FINAL image build instead.");
-            return false;
-        }
         std::string const memberExt =
             (*formatR)->kind() == ObjectFormatKind::Pe ? ".obj" : ".o";
         std::vector<AssembledModule> members;
@@ -420,10 +606,35 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                     ? std::string{sourceStem} + memberExt
                     : std::string{sourceStem} + "_" + std::to_string(i) + memberExt);
         }
+        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
+        // When this static-library build is also handed INPUT `--resolve-library`
+        // static archives, bundle EVERY member of each INTO this library (a
+        // merged/"fat" archive, à la `libtool -static`). A static library
+        // PACKAGES objects, so all members are carried — NOT the lazy
+        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
+        // link against this library must be able to pull any of them (dropping an
+        // unreferenced member would silently ship an incomplete library). Dynamic
+        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
+        // reference libc externs, resolved at the FINAL link against this
+        // library). Fails loud on any open / parse / member-read error (never a
+        // silent member omission). CU-derived members lead; the input archives'
+        // members follow.
+        if (!staticArchives.empty()) {
+            auto extracted = extractStaticArchiveMembers(
+                std::span<std::filesystem::path const>{staticArchives},
+                **targetR, **formatR, reporter);
+            if (!extracted) return false;  // fail-loud already reported
+            members.reserve(members.size() + extracted->modules.size());
+            memberNames.reserve(memberNames.size() + extracted->names.size());
+            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
+                members.push_back(std::move(extracted->modules[i]));
+                memberNames.push_back(std::move(extracted->names[i]));
+            }
+        }
         return linkAndWriteStaticArchive(members, memberNames,
-                                         **targetR, **formatR, outPath, reporter);
+                                         **targetR, **formatR, outPath, reporter,
+                                         imageRequest);
     }
-
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
@@ -431,13 +642,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     if (cuMirs.size() == 1) {
         auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
                                         (*formatR)->kind(), reporter);
-        if (!mod) return false;  // back-half tier failure already reported via `reporter`
+        if (!mod) {              // back-half tier failure already reported via `reporter`
+            emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
+            return false;
+        }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
         return linkAndWriteWithStaticArchives(
             std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-            **targetR, **formatR, outPath, reporter);
+            **targetR, **formatR, outPath, reporter, imageRequest);
     }
 
     // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
@@ -471,9 +685,19 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
         // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
         // `&cuMir` is safe — `cuMirs` is done growing.
+        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the DEFINITION arm routes
+        // through
+        // `linkNameFor`, which returns an explicit assembler name VERBATIM. That is
+        // what keeps this key in the SAME space as the IMPORT arm below: an
+        // extern's `mangledName` is itself built from `linkNameFor` at ingest, so a
+        // labelled definition and a labelled reference to it produce the identical
+        // string and `mir_merge` still collapses them. Honoring the label on one
+        // arm only would leave `definedNames.count(e.mangledName)` missing, the
+        // sibling-defined extern unstripped, and an intra-image call silently
+        // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
         in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
             if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
-                return dss::ffi::applyCMangling(r->name, fmtKind);
+                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind);
             }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;
@@ -553,25 +777,85 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // A no-op when the map is empty. ★ The merge's step-3c pre-registers each referenced-
     // only shim symbol with a merged id + a `symbolNames` entry (else the clone would abort
     // on a shim `GlobalAddr`), so a shim that is NOT collapsed onto a genuine user def lands
-    // here as a not-defined/not-imported vocab name and IS synthesized — multi-CU threads
-    // works (a 2-file pe64 witness runs → 42). A shim collapsed onto a real user def is a
+    // here as a not-defined/not-imported vocab name and IS synthesized — multi-CU synthesis
+    // works. ★ EVIDENCE, corrected 2026-07-25: this used to claim "a 2-file pe64 witness
+    // runs → 42" for THREADS, and no such example was ever shipped — every c11_threads /
+    // pthread / thread_local example is single-source, so the claim pointed at a witness
+    // that does not exist. The real coverage is: for <threads.h>, the unit test
+    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h>, a genuine 2-TU
+    // runtime witness, `examples/c-subset/shipped_sprintf_ucrt_crosscu` (exit 42, release
+    // arm, pe64) — which exercises THIS code path, and is red-on-disable proven: neutering
+    // the va-leaf refusal in `opt/passes/inlining.cpp` fails it (exit 50) while the
+    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry matters because
+    // this seam synthesizes PRE-optimize while compile_pipeline's synthesizes POST — see
+    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY. A shim collapsed onto a real user def is a
     // DEFINED symbol → filtered out → correctly not re-synthesized.
     {
         std::unordered_set<std::uint32_t> definedOrImported;
         for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
             definedOrImported.insert(merged->mir.funcSymbol(merged->mir.funcAt(i)).v);
         for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
-        std::unordered_map<std::uint32_t, std::string> mergedRecipes;
+        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION the reconstructed recipe map by
+        // `dss::ffi::shimFamilyOf` BEFORE calling either synth pass — the SAME split
+        // `lowerCuMirToAssembly` applies to the single-CU `threadsRecipes` map
+        // (compile_pipeline.cpp), for the identical reason: each pass fails loud on a
+        // recipe id it has no switch arm for (its own anti-vocab-drift backstop), so one
+        // pass seeing the other family's ids would abort a build that never should have
+        // failed. A `nullopt` family is an INTERNAL INVARIANT BREACH (the descriptor
+        // loader already rejects an unknown `synthesize` id at READ time via the same
+        // closed-vocab table `shimFamilyOf` reads), never a silently-dropped recipe —
+        // reported with the DRIVER-band internal-invariant code
+        // `D_SynthRecipeFamilyUnknown`, the SAME code the single-CU seam emits, and not
+        // the linker's `K_NoMatchingObjectFormat` (which would send an operator to the
+        // object-format config for what is a recipe-table defect).
+        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
             std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
-            if (dss::ffi::isKnownSynthesizeRecipe(bare)
-                && definedOrImported.find(symV) == definedOrImported.end())
-                mergedRecipes.emplace(symV, bare);
+            if (!dss::ffi::isKnownSynthesizeRecipe(bare)
+                || definedOrImported.find(symV) != definedOrImported.end()) {
+                continue;
+            }
+            auto const family = dss::ffi::shimFamilyOf(bare);
+            if (!family.has_value()) {
+                dss::report(reporter, DiagnosticCode::D_SynthRecipeFamilyUnknown,
+                            DiagnosticSeverity::Error,
+                            std::format(
+                                "synthesize recipe '{}' (symbol {{ {} }}) belongs to no "
+                                "known shim family (D-FFI-PE-CRT-UCRT-MIGRATION) — "
+                                "internal invariant breach: the descriptor loader should "
+                                "have rejected an unknown recipe id at read time "
+                                "(isKnownSynthesizeRecipe)",
+                                bare, symV));
+                return false;
+            }
+            switch (*family) {
+            case dss::ffi::ShimFamily::Threads: mergedThreadsRecipes.emplace(symV, bare); break;
+            case dss::ffi::ShimFamily::Stdio:   mergedStdioRecipes.emplace(symV, bare);   break;
+            }
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                   mergedRecipes, (*formatR)->librarySynthesis(),
+                                   mergedThreadsRecipes, (*formatR)->librarySynthesis(),
                                    fmtKind, merged->externImports, reporter)) {
             return false;  // internal invariant breach (vocab/switch drift) — reported.
+        }
+        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
+        // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
+        // `mergedStdioRecipes` is empty. The va_list strategy is read from the SAME
+        // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
+        // index was derived from — no second lookup, no format-name branch. A CC that
+        // declares no `vaListLayout` propagates as `nullopt`, NOT as a defaulted strategy:
+        // "nothing declared" must stay distinguishable from a real declaration all the way
+        // to the synth pass, which refuses it loudly (the single-CU seam threads the same
+        // optional through `CuMirModule::vaListStrategy`). Consulted only if a stdio recipe
+        // actually appears.
+        std::optional<VaListStrategy> vaListStrategy;
+        if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
+            vaListStrategy = abi->cc->vaListLayout->strategy;
+        }
+        if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
+                                 mergedStdioRecipes, vaListStrategy,
+                                 merged->externImports, reporter)) {
+            return false;  // recipe/helper-import/va-strategy mismatch — reported.
         }
     }
 
@@ -618,8 +902,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // scope) — exactly where externCallDispatch is pre-resolved from the
     // format. Empty = the format declares none (nullopt → F128 softcall fails
     // loud).
-    std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary(
-        objectFormatKindName((*formatR)->kind()));
+    std::string_view const wfLib =
+        (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
     std::optional<std::string> wideFloatSoftcallLibrary =
         wfLib.empty() ? std::nullopt
                       : std::optional<std::string>(std::string(wfLib));
@@ -629,6 +913,11 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      (*formatR)->dataImportBinding(),
+                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT
+                                     // (TF-C52): the format's extern-ADDRESS
+                                     // binding (`got` on arm64 relocatable /
+                                     // static-archive; nullopt elsewhere).
+                                     (*formatR)->externAddrBinding(),
                                      // TLS C1 (D-CSUBSET-THREAD-LOCAL): the
                                      // format's thread-local access block.
                                      (*formatR)->tlsAccess(),
@@ -642,7 +931,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // `linkAndWrite({mod})`, unchanged.
     return linkAndWriteWithStaticArchives(
         std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-        **targetR, **formatR, outPath, reporter);
+        **targetR, **formatR, outPath, reporter, imageRequest);
 }
 
 // c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
@@ -660,39 +949,279 @@ std::optional<ObjectFormatKind> formatKindOfSpec(std::string const& spec) {
     return (*formatR)->kind();
 }
 
+// ── TF-C74: what identifies ONE front-end build ───────────────────────────
+//
+// The front-end is built once per DISTINCT key and CACHED. Before TF-C74 the
+// key was the OBJECT FORMAT ALONE, which was correct only while the
+// preprocessed text depended on nothing else per-target. It now depends on the
+// TARGET's `predefinedMacros` too, and `arm64:elf64-aarch64-linux-exec` and
+// `x86_64:elf64-x86_64-linux-exec` share one object format — so a format-only
+// key would hand the second target the FIRST target's preprocessed text, with
+// the first target's architecture macros baked in. That is a silent
+// miscompile, strictly worse than a loud `#error`, so widening the key is a
+// REQUIRED CORRECTNESS CHANGE, not an optimization.
+//
+// `targetName` is a CACHE KEY and nothing else — it is compared only against
+// other target names, NEVER against a literal. Empty when the language has no
+// preprocess pass, so such a build still collapses to ONE CU for all targets.
+//
+// ── TF-C97: `formatName` joins the key, for the SAME reason `targetName` did ──
+//
+// The preprocessed text now also depends on the OBJECT FORMAT's own
+// `predefinedMacros` (`__LP64__`/`_LP64`), and those are declared per format
+// FILE, not per format KIND. `format` (the kind) cannot stand in for the file:
+// `x86_64:elf64-x86_64-linux-exec` and a hypothetical `elf32-*` file are both
+// kind `elf` while declaring DIFFERENT data models — one key, two answers, and
+// the second target would silently inherit the first's macros. That is the
+// identical silent miscompile TF-C74 widened this key to prevent, one layer
+// down, so this widening is a REQUIRED CORRECTNESS CHANGE too and not an
+// optimization. It costs nothing on the shipped matrix: within one target,
+// distinct format names already mean distinct legs.
+//
+// `formatName` is likewise a CACHE KEY and nothing else — compared only
+// against other format names, never against a literal.
+struct CuBuildKey {
+    std::string                     targetName;
+    std::string                     formatName;
+    std::optional<ObjectFormatKind> format;
+    [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
+        if (targetName != o.targetName) return targetName < o.targetName;
+        if (formatName != o.formatName) return formatName < o.formatName;
+        return format < o.format;
+    }
+};
+
 // Build N CUs' front-end (via `buildCus`), then compile them to each target — the
 // linker MERGES the N CUs into ONE image per target (LK11). Shared by
 // `compileFiles` (one CU5 multi-file CU → 1-element vector) and `compileUnits` (N
 // single-file CUs); the only difference is the `buildCus` closure each passes.
-// c9: `buildCus(kind)` is invoked ONCE PER DISTINCT object-format-kind among the
-// targets (the front-end's `__has_include` depends on the active format), so the
-// CU is rebuilt only when the format actually changes the preprocessed source; the
-// common single-kind case builds exactly once. Returns 0 on success, 1 on any error.
+// c9: `buildCus(key, …)` is invoked ONCE PER DISTINCT `CuBuildKey` among the
+// targets (the front-end's `__has_include` depends on the active format, and —
+// TF-C74 — its predefined macros depend on the target), so the CU is rebuilt only
+// when the key actually changes the preprocessed source; the common single-target
+// case builds exactly once. Returns 0 on success, 1 on any error.
 int runCusToTargets(
-    std::function<std::vector<CompilationUnit>(std::optional<ObjectFormatKind>)> buildCus,
+    std::function<std::vector<CompilationUnit>(
+        CuBuildKey const&, std::span<PredefinedMacroDef const>,
+        std::span<PredefinedMacroDef const>)> buildCus,
     GrammarSchema const&                        grammar,
     std::string const&                          sourceStem,
     std::vector<std::string> const&             targets,
     DiagnosticReporter&                         rep,
     std::optional<std::filesystem::path> const& outputDir,
+    // D-AP2-OUTPUT-ROUTING: the project artifactName override (nullopt ⇒
+    // source stem) + the force-`<formatName>/`-subdir flag, threaded verbatim
+    // to `compileOneTarget` alongside `outputDir` (the CLI path passes
+    // nullopt/false ⇒ output byte-identical).
+    std::optional<std::string> const&           artifactName,
+    bool                                        perFormatOutputSubdir,
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
-    std::vector<std::filesystem::path> const&   resolveLibraries) {
-    // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
-    // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
-    // every format (activeFormat is inert) → a single nullopt-keyed build, no
-    // waste. The COMMON case — one target, or every target sharing one kind — is
-    // exactly ONE build, as before c9.
+    std::vector<std::filesystem::path> const&   resolveLibraries,
+    // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
+    // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
+    substrate::IExecutor*                       executor,
+    unsigned                                    jobsOverride,
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM image knobs
+    // (stack reserve), threaded verbatim to `compileOneTarget` — which
+    // hands them to the link step, where the format's DECLARED capability
+    // gates them. Passed PER TARGET, not resolved once: two targets of one
+    // build can differ in whether their format can carry the request.
+    ImageRequest const&                         imageRequest) {
     bool const ppEnabled = grammar.preprocess().enabled;
-    std::map<std::optional<ObjectFormatKind>, std::vector<CompilationUnit>> cuByKey;
-    std::vector<std::optional<ObjectFormatKind>> keyPerTarget;
+
+    // ── TF-C74 (a): resolve every target — and every object format — BEFORE
+    //    the CU build ───────────────────────────────────────────────────────
+    //
+    // The CU build now needs each target's `predefinedMacros`, so target
+    // schemas must be resolved FIRST. This also repairs a LATENT ordering
+    // defect: the CU build used to run before any target schema loaded, and
+    // the `if (rep.hasErrors()) return 1;` below aborts before
+    // `compileOneTarget` ever emits the authoritative `D_SchemaLoadFailed` —
+    // so a bad `--target` surfaced as whatever the front-end happened to
+    // produce (on the sqlite corpus: a cascade of `#error architecture not
+    // supported`) instead of saying the target was wrong. Emitting here means
+    // a bad target spec is now diagnosed as a bad target spec.
+    //
+    // A target whose spec is malformed or whose schema won't load is FATAL
+    // here; the pre-TF-C74 fallback (group it under the nullopt key and let
+    // `compileOneTarget` re-diagnose it) can no longer work, because we would
+    // have no predefine list to build its CU with — and silently building it
+    // with SOME OTHER target's macros is exactly the miscompile this change
+    // exists to prevent.
+    //
+    // ── TF-C74 (D-PROGRAM-UNKNOWN-OBJECT-FORMAT-SILENT): the FORMAT half ──
+    //
+    // The OBJECT FORMAT is resolved here for the same reason the target is,
+    // and it is the same defect: the front-end's output depends on the ACTIVE
+    // FORMAT (format-gated predefines, `__has_include` of a format-gated
+    // shipped header, the per-format descriptor availability set), so an
+    // unknown format used to build a CU with NO format at all — every gated
+    // arm vanished, the source's own fail-loud `#else` fired, and the run
+    // returned at the drain below with a pile of header errors and NOT ONE
+    // WORD about the format. MEASURED before this change on a two-line arch
+    // ladder: `--target arm64:macho64-arm64-darwn-exec` (one letter dropped)
+    // produced exactly one diagnostic, `P_PreprocessorErrorDirective`, and
+    // zero mention of `macho64-arm64-darwn-exec`.
+    //
+    // The format check keys on the FORMAT NAME and nothing else: the
+    // target-name dedupe below cannot be allowed to gate it, because one
+    // target may appear with several formats (`x86_64:elf…` + `x86_64:pe…`)
+    // and a format validated behind a target-keyed skip would be silently
+    // unchecked after the first — the very failure mode being closed. (It
+    // was written ahead of a target-name dedupe `continue`; that `continue`
+    // is now a memoized lookup for the pair check's sake — see below — but
+    // the reason this check owns its own key is unchanged.) Its
+    // `formatChecked` set keeps the diagnostic one-per-distinct-format-name.
+    //
+    // The format schema is retained for the DURATION OF THIS FUNCTION (the
+    // PAIR check below needs it next to its target, and — TF-C97 — the CU-key
+    // loop reads its `predefinedMacros`), then dropped: this pass owns
+    // rejection, not caching. `compileOneTarget` remains the authoritative
+    // consumer and still loads its own, so nothing downstream depends on a
+    // copy kept alive here.
+    //
+    // ── TF-C74 (D-PROGRAM-TARGET-FORMAT-PAIR-VALIDATED-LATE): the PAIR ────
+    //
+    // FACET 3 of the same ordering defect, and the one the other two could
+    // not see: a spec's two halves can each be individually VALID while
+    // their COMBINATION is nonsense. `arm64:elf64-x86_64-linux-exec` names a
+    // real target AND a real object format, so both checks above PASS — and
+    // only `crossValidateTargetFormat` rejects it. That call still lives in
+    // `compileOneTarget`, i.e. downstream of the CU build and behind the same
+    // drain, so on a source whose headers cascade the run
+    // ended with ONLY the header `#error`. MEASURED before this change, on
+    // the arch ladder used by the witness: `--target
+    // arm64:elf64-x86_64-linux-exec` produced exactly ONE diagnostic,
+    // `P_PreprocessorErrorDirective`, and not one word about the mismatch —
+    // while the SAME spec over a header-less source printed the full
+    // `D_TargetMachineCodeMismatch`. The diagnostic was never missing, only
+    // unreachable.
+    //
+    // The CALL is hoisted, never the MESSAGE: `crossValidateTargetFormat` is
+    // already the one emitter, so both sites say the identical thing by
+    // construction — the same rule the two half-checks bought with their
+    // shared `emit*SchemaLoadFailed` helpers. `compileOneTarget` keeps its
+    // call: it is a [[nodiscard]] helper that must stay correct when invoked
+    // directly, and with all three facets now pre-flighted its copy is
+    // DEFENSE IN DEPTH rather than a live path — which is exactly why it must
+    // share the emitter instead of restating the message.
+    //
+    // ★ THE DE-DUPLICATION KEY IS THE ORDERED PAIR, and it cannot be either
+    // half. This check's verdict is a RELATION over both names, so a key that
+    // drops one half silently skips distinct pairs that happen to share the
+    // other: keyed on the TARGET, `arm64:elf64-aarch64-linux-exec` (good) +
+    // `arm64:elf64-x86_64-linux-exec` (bad) validates only the first; keyed on
+    // the FORMAT, `arm64:elf64-aarch64-linux-exec` (good) +
+    // `x86_64:elf64-aarch64-linux-exec` (bad) likewise. Both are the very
+    // silent skip being closed, and both are MEASURED red-on-disable in
+    // `TFC74PairCheckDedupeKeyIsTheOrderedPair` — each wrong key reds exactly
+    // the leg aimed at it. That is also why the target-name dedupe below is
+    // now a MEMOIZED LOOKUP instead of an early `continue`: the pair check has
+    // to run for every spec, and a `continue` keyed on one half would have
+    // re-introduced the bug one level up.
+    std::map<std::string, std::shared_ptr<TargetSchema const>> targetByName;
+    std::unordered_set<std::string>                            formatChecked;
+    std::unordered_map<std::string,
+                       std::shared_ptr<ObjectFormatSchema const>> formatByName;
+    std::set<std::pair<std::string, std::string>>              pairChecked;
+    for (auto const& spec : targets) {
+        auto parsed = TargetSpec::parse(spec);
+        if (!parsed) {
+            emitDriver(rep, DiagnosticCode::D_InvalidTargetSpec,
+                       targetSpecErrorMessage(spec, parsed.error()));
+            continue;
+        }
+        if (formatChecked.insert(parsed->formatName).second) {
+            auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
+            if (!formatR.has_value()) {
+                emitObjectFormatSchemaLoadFailed(rep, formatR.error(),
+                                                 parsed->formatName);
+                // No `continue`: a spec can be wrong in BOTH halves, and the
+                // operator deserves both names in one run rather than one
+                // recompile per typo. The drain below aborts either way.
+            } else {
+                formatByName.emplace(parsed->formatName, *formatR);
+            }
+        }
+        // Load each distinct target ONCE, memoized. (Was `if
+        // (targetByName.count(...)) continue;` — see the pair-key note above
+        // for why the `continue` had to go.) A failed load is still fatal for
+        // THIS spec: with no target schema there is no pair to validate, and
+        // the reason is already on the reporter.
+        auto targetIt = targetByName.find(parsed->targetName);
+        if (targetIt == targetByName.end()) {
+            auto targetR = TargetSchema::loadShipped(parsed->targetName);
+            if (!targetR.has_value()) {
+                emitTargetSchemaLoadFailed(rep, targetR.error(),
+                                           parsed->targetName);
+                continue;
+            }
+            targetIt = targetByName.emplace(parsed->targetName, *targetR).first;
+        }
+        auto const formatIt = formatByName.find(parsed->formatName);
+        if (formatIt != formatByName.end()
+            && pairChecked.emplace(parsed->targetName,
+                                   parsed->formatName).second) {
+            // Unlike the two half-checks, the pair message names the target
+            // and the two machine codes but NOT the format — so on a
+            // multi-target build it cannot say by itself WHICH spec was
+            // rejected. Route it through the same `[target=<spec>]` stamp the
+            // per-target loop uses, so hoisting the call costs the operator
+            // nothing the downstream path carried. Scratch config mirrors
+            // that loop's: `rep`'s POLICY axes, cap/dedup relaxed because
+            // those are enforced once at `rep` during the merge.
+            auto pairCfg = rep.config();
+            pairCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+            pairCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+            pairCfg.dedupWindow    = 0;
+            DiagnosticReporter pairScratch{pairCfg};
+            // Verdict discarded deliberately: no `continue`, for the same
+            // reason the format half has none — a spec wrong in more than one
+            // way must report every reason in ONE run. The drain aborts.
+            (void)crossValidateTargetFormat(*targetIt->second,
+                                            *formatIt->second, pairScratch);
+            mergeWithTargetContext(pairScratch, spec, rep);
+        }
+    }
+    if (rep.hasErrors()) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
+    // c9 + TF-C74 (b): build the front-end ONCE PER DISTINCT `CuBuildKey`. A
+    // language WITHOUT a preprocess pass produces identical CUs for every
+    // target (both `activeFormat` and the target predefines are inert) → the
+    // key is {"" , nullopt} for every target → a single build, no waste. The
+    // COMMON case — ONE target — is exactly one build, as before c9. What
+    // CHANGES vs c9: two targets of DIFFERENT architecture sharing one object
+    // format (arm64:elf… + x86_64:elf…) now build TWICE, because their
+    // architecture predefines differ and reusing one CU for both would splice
+    // the wrong architecture's macros into the second image.
+    std::map<CuBuildKey, std::vector<CompilationUnit>> cuByKey;
+    std::vector<CuBuildKey> keyPerTarget;
     keyPerTarget.reserve(targets.size());
     for (auto const& spec : targets) {
-        std::optional<ObjectFormatKind> const key =
-            ppEnabled ? formatKindOfSpec(spec) : std::nullopt;
+        CuBuildKey key;
+        std::span<PredefinedMacroDef const> targetPredefines;
+        std::span<PredefinedMacroDef const> formatPredefines;
+        if (ppEnabled) {
+            key.format = formatKindOfSpec(spec);
+            // The spec parsed cleanly above (we returned otherwise), so this
+            // lookup always resolves.
+            auto const parsed = TargetSpec::parse(spec);
+            key.targetName    = parsed->targetName;
+            key.formatName    = parsed->formatName;
+            targetPredefines  = targetByName.at(key.targetName)->predefinedMacros();
+            // TF-C97: the FORMAT's own predefines. `formatByName` was populated
+            // by the pre-flight above and every surviving spec's format is in
+            // it — a failed load already returned at the drain.
+            formatPredefines  = formatByName.at(key.formatName)->predefinedMacros();
+        }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
-            cuByKey.emplace(key, buildCus(key));
+            cuByKey.emplace(key,
+                            buildCus(key, targetPredefines, formatPredefines));
         }
     }
 
@@ -754,7 +1283,9 @@ int runCusToTargets(
         bool const ok = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
             grammar, sourceStem, spec, scratch,
-            outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts);
+            outputDir, /*multiTargetBuild*/ targets.size() > 1u,
+            artifactName, perFormatOutputSubdir, compileOpts,
+            executor, jobsOverride, imageRequest);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }
@@ -793,10 +1324,18 @@ int Program::run(int argc, char* argv[]) {
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
     setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
+    setIncludeDirs(args.includeDirs);  // -I<dir> quote-include path (SQLite-testfixture arc C3)
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
+    setJobs(args.jobs);  // D-PERF-4-CU-PARALLELISM: --jobs N per-CU build pool width
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--stack-reserve <bytes>` — the
+    // per-PROGRAM stack reserve the emitted image should carry. Stamped HERE,
+    // before the dispatch fork, so it applies to EVERY compile-producing mode.
+    // `compileProject` then applies a manifest `stackReserve` ONLY IF this
+    // stamp left it unset — the CLI WINS (see there).
+    setStackReserveBytes(args.stackReserveBytes);
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
     // surface to resolve + validate this run's externs. Map the CLI strings to
@@ -982,15 +1521,153 @@ int Program::compileProject(
         }
     }
 
-    // Route by source COUNT via the shared `routesToMultiUnit` threshold
-    // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
-    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒
-    // the single-CU path (`compileFiles`). The delegate validates each
-    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains
-    // `rep` at its end (runCusToTargets), so we do NOT drain here.
-    return routesToMultiUnit(pc.sources.size())
-        ? compileUnits(pc.sources, pc.language, pc.targets, rep)
-        : compileFiles(pc.sources, pc.language, pc.targets, rep);
+    // Thread the manifest's OPTIONAL compile-flag arrays onto the SAME
+    // Program state the CLI stamps in `Program::run` (setIncludeDirs `-I` /
+    // setUserDefines `--define` / setResolveLibraries `--resolve-library`),
+    // which `compileFiles`/`compileUnits` read at CU-build time. MERGE
+    // (append), not replace: `Program::run` may already have stamped the CLI
+    // flags before dispatching here, so the manifest ADDS to them (the two
+    // sources compose) rather than clobbering them. `resolveLibraries` entries
+    // are strings mapped to filesystem paths exactly as the CLI stamp does.
+    // Empty arrays (absent field, or a present `[]`) append nothing — a no-op.
+    //
+    // Contract: this APPENDS onto the PERSISTENT Program state (the setters
+    // mutate the members read at build time), matching `Program::run`'s
+    // single-use CLI-stamp contract — a Program is built fresh per invocation
+    // (`Program::run` constructs one, tests construct one per call), so the
+    // append runs exactly once. A REUSED Program passed through `compileProject`
+    // twice would double-append; that is out of contract (single-use), not a
+    // supported reuse mode.
+    {
+        std::vector<std::string> mergedIncludes = includeDirs();
+        mergedIncludes.reserve(mergedIncludes.size() + pc.includes.size());
+        mergedIncludes.insert(mergedIncludes.end(),
+                              pc.includes.begin(), pc.includes.end());
+        setIncludeDirs(std::move(mergedIncludes));
+
+        std::vector<std::string> mergedDefines = userDefines();
+        mergedDefines.reserve(mergedDefines.size() + pc.defines.size());
+        mergedDefines.insert(mergedDefines.end(),
+                             pc.defines.begin(), pc.defines.end());
+        setUserDefines(std::move(mergedDefines));
+
+        std::vector<fs::path> mergedLibs = resolveLibraries();
+        mergedLibs.reserve(mergedLibs.size() + pc.resolveLibraries.size());
+        for (auto const& s : pc.resolveLibraries) mergedLibs.emplace_back(s);
+        setResolveLibraries(std::move(mergedLibs));
+    }
+
+    // D-AP2-OUTPUT-ROUTING (artifactName + per-platform subdir): stamp the
+    // manifest's OPTIONAL `artifactName` (nullopt ⇒ the source stem names the
+    // binary — unchanged) and FORCE the per-format subdir for EVERY project
+    // build. Multi-target builds already subdir by formatName; setting this
+    // makes a SINGLE-target project build subdir the same way, so a project's
+    // output is consistently `<outputDir>/<formatName>/<artifactName-or-stem>
+    // <ext>` per platform. The CLI path (`Program::run`) sets NEITHER, so a
+    // `--compile` build's names + single-target flat layout stay byte-identical.
+    setArtifactName(pc.artifactName);
+    setPerFormatOutputSubdir(true);
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the manifest's OPTIONAL
+    // `stackReserve` (bytes).
+    //
+    // PRECEDENCE — the CLI `--stack-reserve` WINS; the manifest value applies
+    // ONLY IF `Program::run` left the stamp unset. The three flag ARRAYS above
+    // MERGE because appending composes: `-I a` + manifest `["b"]` sensibly
+    // means both. A SCALAR cannot compose — one of the two numbers must be the
+    // answer — so it needs an explicit rule, and "an explicit command-line
+    // argument overrides a committed configuration file" is the universal one
+    // (cmake, cargo, gcc). It is also the only rule that lets a user probe a
+    // different reserve (bisecting a stack overflow is exactly the motivating
+    // workflow) without editing — and risking committing — the manifest.
+    //
+    // NOTE this reads the member rather than clobbering it, so the CLI stamp
+    // survives; the manifest never overwrites a supplied flag.
+    if (!stackReserveBytes().has_value() && pc.stackReserveBytes.has_value()) {
+        setStackReserveBytes(pc.stackReserveBytes);
+    }
+
+    // D-AP2-SOURCES-GLOB: expand any glob pattern in `sources[]` into its
+    // matching files BEFORE the multi-vs-single-CU routing count is taken — so a
+    // `"src/**/*.c"` entry routes EXACTLY as if its matches had been listed
+    // literally (a 2-match glob ⇒ 2 concrete sources ⇒ count 2 ⇒ `compileUnits`).
+    // A driver pre-pass, NOT the loader: `parseProjectConfig` stays a pure JSON
+    // parser (it holds the raw pattern), the filesystem side lives here.
+    //   * LITERAL entry (no `* ? [` metacharacter) — kept VERBATIM (unchanged
+    //     behavior; a missing literal still fails DOWNSTREAM at CU build, and is
+    //     NOT newly rejected here).
+    //   * GLOB entry — expanded against the filesystem (base = the process
+    //     working directory, the same base a literal source uses; an absolute
+    //     pattern resolves directly). Matches are sorted (deterministic CU order).
+    //     ZERO matches is a FAIL-LOUD error (`D_FileNotFound` naming the pattern)
+    //     — a source pattern that names nothing is a mistake, not an empty no-op.
+    //     A mid-expansion filesystem I/O error fails loud (`D_DirectoryScanFailed`).
+    // The delegate then drains `rep` (runCusToTargets), so these early fail-loud
+    // sites drain here and return, mirroring the gate sites above.
+    std::vector<std::string> expandedSources;
+    expandedSources.reserve(pc.sources.size());
+    for (auto const& entry : pc.sources) {
+        if (!hasGlobMetacharacters(entry)) {
+            expandedSources.push_back(entry);  // literal — verbatim, unchanged
+            continue;
+        }
+        std::error_code ec;
+        std::size_t const before = expandedSources.size();
+        if (!expandGlob(entry, expandedSources, ec)) {
+            emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
+                       "project sources: filesystem error expanding glob pattern '"
+                       + entry + "': " + ec.message());
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+        if (expandedSources.size() == before) {
+            emitDriver(rep, DiagnosticCode::D_FileNotFound,
+                       "project sources: glob pattern '" + entry
+                       + "' matched no files (relative to the working directory) "
+                         "— a source pattern that matches nothing is an error; "
+                         "check the pattern and that the files exist.");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+    }
+
+    // Cross-entry de-duplication: a file matched by TWO overlapping entries — two
+    // overlapping globs (`src/*.c` + `src/**/*.c`), or a literal alongside a glob
+    // that also matches it — must compile ONCE, not once per entry. Without this,
+    // `compileUnits` would build a DUPLICATE CU per repeat ⇒ a duplicate-symbol
+    // LINK error the diagnostic can't tie back to the manifest. A redundant
+    // overlap should just work — the UNION of unique files, each compiled once —
+    // matching build-system expectations. Dedup on a NORMALIZED key
+    // (`lexically_normal().generic_string()`) because a literal is kept verbatim
+    // (`./main.c`) while glob output is already normalized (`main.c`) — the SAME
+    // file via different strings, which a plain string-dedup would miss. FIRST
+    // occurrence wins (deterministic order) and keeps its ORIGINAL string (a
+    // literal stays verbatim; only later duplicates are dropped). Absolute-vs-
+    // relative spellings of the same file is an accepted un-caught extreme edge —
+    // `lexically_normal` covers the realistic `./` / `..` / literal-vs-glob cases.
+    {
+        std::vector<std::string> deduped;
+        deduped.reserve(expandedSources.size());
+        std::unordered_set<std::string> seen;
+        seen.reserve(expandedSources.size());
+        for (auto& s : expandedSources) {
+            std::string key = fs::path{s}.lexically_normal().generic_string();
+            if (seen.insert(std::move(key)).second) {
+                deduped.push_back(std::move(s));
+            }
+        }
+        expandedSources = std::move(deduped);
+    }
+
+    // Route by the EXPANDED source COUNT via the shared `routesToMultiUnit`
+    // threshold (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
+    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒ the
+    // single-CU path (`compileFiles`). The delegate validates each
+    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains `rep` at
+    // its end (runCusToTargets), so we do NOT drain here.
+    return routesToMultiUnit(expandedSources.size())
+        ? compileUnits(expandedSources, pc.language, pc.targets, rep)
+        : compileFiles(expandedSources, pc.language, pc.targets, rep);
 }
 
 int Program::transpile(
@@ -1053,6 +1730,26 @@ void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
             if (parent == here) break;   // hit filesystem root
             here = parent;
         }
+    }
+}
+
+// SQLite-testfixture arc C3: thread the CLI `-I` dirs (the C quote-include
+// search path, `Options::includeDirs`) onto `builder` via `addIncludeDir`. Each
+// is resolved to an ABSOLUTE path (a relative dir like `.` is cwd-relative, gcc
+// semantics) so the include resolver's `dir / filename` probe is stable
+// regardless of any later cwd change; the resolver searches these AFTER the
+// including file's own directory (C 6.10.2, the quote form). A nonexistent dir
+// is added anyway (gcc parity — it simply yields no hits, and a genuinely-
+// missing header still fails loud P0016 downstream). Distinct from
+// `applySystemDirs` (the angle-form `/usr/include` analogue via `addSystemDir`).
+// AGNOSTIC: pure path plumbing — no language/target/format branch.
+void applyIncludeDirs(UnitBuilder& builder,
+                      std::vector<std::string> const& dirs) {
+    std::error_code ec;
+    for (std::string const& d : dirs) {
+        fs::path const abs = fs::absolute(fs::path{d}, ec);
+        builder.addIncludeDir(ec ? fs::path{d} : abs);
+        ec.clear();
     }
 }
 
@@ -1123,14 +1820,23 @@ int Program::compileFiles(
     // `kind` is nullopt for a non-preprocess language / undeterminable spec
     // (pure-existence, unchanged). The build still runs on the 64 MiB worker stack
     // (D-PARSE-DEEP-FRONTEND-STACK).
-    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+    auto buildCus = [&](CuBuildKey const&                   key,
+                        std::span<PredefinedMacroDef const> targetPredefines,
+                        std::span<PredefinedMacroDef const> formatPredefines)
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
-                if (kind) builder.setActiveFormat(*kind);
+                if (key.format) builder.setActiveFormat(*key.format);
+                // TF-C74: the active target's per-architecture identity macros.
+                builder.setTargetPredefinedMacros(
+                    {targetPredefines.begin(), targetPredefines.end()});
+                // TF-C97: the active format's data-model macros.
+                builder.setFormatPredefinedMacros(
+                    {formatPredefines.begin(), formatPredefines.end()});
                 builder.setUserDefines(userDefines());  // c105: --define
+                applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                 for (auto const& path : sourceFiles) {
                     builder.addFile(fs::path{path});
                 }
@@ -1146,9 +1852,12 @@ int Program::compileFiles(
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
         buildCus, *grammar, sourceStem, targets, rep,
-        outputDir_, compileConfig_,
+        outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_);
+        resolveLibraries_, executor_, jobs_,
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
+        // request (nullopt = the format default stands).
+        ImageRequest{stackReserveBytes_});
 }
 
 int Program::compileUnits(
@@ -1201,7 +1910,9 @@ int Program::compileUnits(
     // c9 (Phase-2): build N single-file CUs once per distinct object-format-kind
     // (the closure `runCusToTargets` invokes), so `__has_include` is per-target
     // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
-    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+    auto buildCus = [&](CuBuildKey const&                   key,
+                        std::span<PredefinedMacroDef const> targetPredefines,
+                        std::span<PredefinedMacroDef const> formatPredefines)
         -> std::vector<CompilationUnit> {
         std::vector<CompilationUnit> cus;
         cus.reserve(sourceFiles.size());
@@ -1213,8 +1924,15 @@ int Program::compileUnits(
                 substrate::kDeepRecursionStackBytes, [&] {
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
-                    if (kind) builder.setActiveFormat(*kind);
+                    if (key.format) builder.setActiveFormat(*key.format);
+                    // TF-C74: the active target's per-architecture identity macros.
+                    builder.setTargetPredefinedMacros(
+                        {targetPredefines.begin(), targetPredefines.end()});
+                    // TF-C97: the active format's data-model macros.
+                    builder.setFormatPredefinedMacros(
+                        {formatPredefines.begin(), formatPredefines.end()});
                     builder.setUserDefines(userDefines());  // c105: --define
+                    applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                     builder.addFile(fs::path{path});
                     return std::move(builder).finish();
                 }));
@@ -1225,9 +1943,13 @@ int Program::compileUnits(
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
         buildCus, *grammar, sourceStem,
-        targets, rep, outputDir_, compileConfig_,
+        targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
+        compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_);
+        resolveLibraries_, executor_, jobs_,
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
+        // request (nullopt = the format default stands).
+        ImageRequest{stackReserveBytes_});
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

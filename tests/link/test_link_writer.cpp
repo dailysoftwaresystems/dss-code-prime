@@ -51,6 +51,10 @@ namespace {
     img.bytes = std::move(bytes);
     img.expectedFuncCount = funcCount;
     img.resolvedFuncCount = funcCount;
+    // Simulate a CLEAN link: `linker::link()` sets this at its successful
+    // conclusion, and `ok()` (hence writeImage's precondition) now requires it.
+    // A hand-rolled "well-formed image" must set it too (D-CSUBSET-TESTTU-SILENT-EXIT1).
+    img.linkedCleanly = true;
     return img;
 }
 
@@ -141,6 +145,7 @@ TEST(LinkWriter, WritesAnyFormatBytesVerbatim) {
     image.bytes  = {'M', 'Z', 0x00, 0x00};  // PE DOS header start
     image.expectedFuncCount = 1;
     image.resolvedFuncCount = 1;
+    image.linkedCleanly = true;   // simulate a clean link (see makeImage)
 
     DiagnosticReporter rep;
     ASSERT_TRUE(linker::writeImage(image, out, rep));
@@ -181,6 +186,7 @@ TEST(LinkWriter, RejectsImageWithOkFalse) {
     image.bytes  = {0x7F, 'E', 'L', 'F'};  // valid bytes...
     image.expectedFuncCount = 3;
     image.resolvedFuncCount = 1;  // ...but parallel-index mismatch
+    image.linkedCleanly = true;   // clean link, so the MISMATCH is the sole reason ok() is false
     ASSERT_FALSE(image.ok());
 
     DiagnosticReporter rep;
@@ -203,6 +209,7 @@ TEST(LinkWriter, RejectsEmptyBytes) {
     image.format = ObjectFormatKind::Elf;
     image.expectedFuncCount = 1;
     image.resolvedFuncCount = 1;
+    image.linkedCleanly = true;   // clean link — isolates the empty-bytes guard (K_ImageEmpty)
     ASSERT_TRUE(image.ok());
     ASSERT_TRUE(image.bytes.empty());
 

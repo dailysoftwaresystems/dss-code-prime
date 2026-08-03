@@ -168,6 +168,51 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // strong definition of the same name may replace it at link.
     if (mir.funcBinding(callee) == SymbolBinding::Weak) return std::nullopt;
 
+    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE) — never inline a callee the SOURCE
+    // declared `__attribute__((noinline))`. Unlike every other rule here this
+    // one is not the optimizer protecting itself from an unsound splice; it is
+    // the optimizer OBEYING an explicit directive, so it is unconditional and
+    // has no cost-model or scope escape hatch. sqlite's `SQLITE_NOINLINE` uses
+    // it to BOUND STACK DEPTH on recursive paths — inlining anyway is a real
+    // runtime regression (deeper frames), not a missed annotation.
+    // ★ TF-C81 ORDERING NOTE: rule 2b is checked BEFORE the rule-6 threshold
+    // bypass below, so if a MirFunc somehow carries BOTH `noInline` and
+    // `alwaysInline` the REFUSAL wins. The source tier rejects that combination
+    // outright (S_ConflictingInlineAttributes), so this ordering only decides
+    // hand-built MIR and parsed `.dssir` — but it decides it conservatively, and
+    // it happens to match what clang does with the same contradiction (MEASURED:
+    // Apple clang 21 silently keeps `noinline`, in both source orders).
+    if (mir.funcNoInline(callee)) return std::nullopt;
+
+    // ★★ Rule 2c: TF-C85 — never inline ACROSS a `#pragma optimize("", off)`
+    // boundary, in EITHER direction. Both halves are load-bearing and neither
+    // subsumes the other:
+    //   * a no-optimize CALLER must not have a body spliced into it. Inlining is
+    //     an optimization APPLIED TO THE CALLER, so splicing would optimize
+    //     exactly the function the source excluded.
+    //     ★ AND THE CALLER HALF IS NEEDED FOR A REASON THAT WAS MEASURED, NOT
+    //     ASSUMED. `runInlining` has TWO caller-rebuild paths. When every target
+    //     is a SINGLE-BLOCK leaf the caller goes through `MirFunctionRebuilder`
+    //     with an `InliningPolicy` whose `tryRewrite` performs the splice — so
+    //     the `noOptimize` NEUTER already suppresses it and this clause is
+    //     redundant there (MEASURED: with a single-block callee, deleting the
+    //     caller half changed nothing). But ANY multi-block target routes the
+    //     caller through `MultiBlockInliner`, which rebuilds callers with its
+    //     OWN `addFunction` and never touches the rebuilder — and THERE this
+    //     clause is the only protection (MEASURED: with a two-block callee,
+    //     deleting the caller half lets the splice through). The test fixture
+    //     was changed to a two-block callee for exactly that reason.
+    //   * a no-optimize CALLEE must not be spliced OUT. Its body would then be
+    //     re-emitted inside a caller that IS optimized, so every pass the source
+    //     excluded would run over the copy. The directive would hold for the
+    //     out-of-line body and silently not hold for the inlined one.
+    // Checked before rule 6's threshold bypass, so an `always_inline` callee that
+    // is ALSO no-optimize is refused — the conservative resolution of a genuine
+    // conflict of intent, the same ordering discipline rule 2b uses.
+    if (mir.funcNoOptimize(caller) || mir.funcNoOptimize(callee)) {
+        return std::nullopt;
+    }
+
     // Rule 3: never inline a call WITHIN A RECURSIVE CYCLE (OPT7 cycle 3).
     // The call graph's SCCs collapse every recursive cycle to one id; a
     // call whose caller + callee share an SCC is part of a cycle, so
@@ -422,7 +467,30 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // instruction over is refused. FAIL-SAFE: a threshold below the
     // smallest callee — including 0, if constructed programmatically (the
     // loader rejects 0) — refuses everything; nothing miscompiles.
-    if (instCount > inlineThreshold) return std::nullopt;
+    //
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ AND THIS — AND ONLY THIS — IS WHAT
+    // `__attribute__((always_inline))` WAIVES. The bypass is deliberately fused
+    // into rule 6's own condition rather than written as an early `return
+    // callee` above, and that placement IS the semantics: an early return would
+    // also skip the arity/type safety scan and the no-returning-path check in
+    // the loop above, turning a performance annotation into a licence to
+    // miscompile. Placed here, an `always_inline` callee has already passed
+    // every correctness rule — Weak, same-SCC recursion, address-escape,
+    // has-a-Return, arity/type — and the attribute overrides only the
+    // PROFITABILITY veto, which is the single thing it is actually asked to
+    // override in real code (sqlite's one `SQLITE_INLINE` site,
+    // `btree.c:allocateSpace`, is a hot helper the size bound would refuse).
+    //
+    // A callee that trips one of those correctness rules is still refused, and
+    // DSS says nothing about it — GCC errors ("inlining failed in call to
+    // always_inline") and clang warns. That silence is a KNOWN, conservative
+    // divergence: the program compiles and is correct, it just keeps a call the
+    // author hoped to remove. Making it loud needs a per-CALL-SITE reachability
+    // story (the refusal is a property of the call, not the declaration), which
+    // is deliberately out of this cycle's scope.
+    if (instCount > inlineThreshold && !mir.funcAlwaysInline(callee)) {
+        return std::nullopt;
+    }
     return callee;
 }
 
@@ -770,8 +838,29 @@ public:
     [[nodiscard]] bool malformed() const noexcept { return malformed_; }
 
     void rebuildFunction(MirFuncId caller) {
+        // TF-C78 (D-CSUBSET-NOINLINE): the inliner's OWN rebuild must carry the
+        // flag too. A `noinline` function is still a CALLER (it may inline other
+        // functions INTO itself — the attribute constrains splicing it OUT, not
+        // in), so its rebuilt copy has to keep the bit or the refusal survives
+        // only until this pass' first iteration rewrites the module.
+        // TF-C81 (D-CSUBSET-ALWAYSINLINE): likewise for the cost-model bypass.
+        // An `always_inline` function is still a CALLER, and it may itself be
+        // over-threshold and inlined into someone else on a LATER iteration of
+        // this very pass — dropping the bit during this rebuild would silently
+        // end that after the first iteration.
+        // TF-C85: likewise for the optimizer opt-out. A no-optimize function
+        // reaches this rebuild only as an unmodified caller (the gate below
+        // refuses every splice INTO it), so dropping the bit here would let the
+        // NEXT pass — or the next iteration of this one — start optimizing it.
+        // TF-C92: likewise for the thread-sanitizer exclusion. This pass has its
+        // OWN rebuild (it does not go through `MirFunctionRebuilder`), so it is a
+        // second, independently-editable copy site for all four trailing flags —
+        // and the only one for which no pass-behaviour test could notice a drop.
         dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
-                         src_.funcBinding(caller), src_.funcVisibility(caller));
+                         src_.funcBinding(caller), src_.funcVisibility(caller),
+                         src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
+                         src_.funcNoOptimize(caller),
+                         src_.funcNoSanitizeThread(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

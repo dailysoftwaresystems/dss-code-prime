@@ -6,6 +6,7 @@
 // Collect-all, recoverable-diagnostic discipline (no abort); HasError nodes are
 // skipped (cascade suppression).
 
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
@@ -777,6 +778,79 @@ TEST(HirVerifier, ReturnCompletenessSkippedWithoutInterner) {
     Hir h = fnReturning(b, ti, i32, b.makeBlock({}));
     DiagnosticReporter reporter;
     EXPECT_TRUE(HirVerifier{h}.verify(reporter));   // no interner → no return-completeness check
+}
+
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY — the flat witness that pathTerminates's
+// soundness helper `subtreeContainsLabel` (src/hir/hir_verifier.hpp) walks a
+// dead-tail subtree with an ITERATIVE heap worklist, NOT host recursion.
+//
+// WHY THE HELPER WALKS THE WHOLE SUBTREE: a `goto` may target a `LabelStmt` nested
+// at ANY depth inside a dead-tail statement, so re-establishing reachability
+// (D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE — the soundness that keeps
+// GenuineFallThroughStillFailsLoudIncludingNestedLabel red) requires scanning the
+// child's ENTIRE subtree for a label. It was originally recursive (one host frame
+// per HIR level); SQLite emits deeply-nested trees (especially expressions in dead
+// code), where a recursive tree-walk has overflowed the stack before — the same
+// de-recursion discipline that flattened the parser's deep walkers,
+// resolveDeclTypes, and lowerSwitch.
+//
+// SHAPE: a non-void `()->i32` whose body is `{ return 0; <deep dead expression>; }`.
+// checkReturnCompleteness runs pathTerminates over the body — the `return` makes
+// the trailing expression statement unreachable, so pathTerminates fires
+// `subtreeContainsLabel` over its kDepth-deep, LABEL-FREE Cast spine (the FULL
+// walk). A deep EXPRESSION (not nested Blocks/Ifs) is deliberate: pathTerminates
+// IGNORES an ExprStmt (its `default` arm recurses into nothing), so the ONLY deep
+// host-recursion this input can drive is `subtreeContainsLabel` itself — a nested-
+// Block tail would instead recurse pathTerminates's own (pre-existing,
+// out-of-scope) Block arm and confound the pin. Built directly via HirBuilder
+// (LINEAR, O(N)) because the real front end types a deep expression ~quadratically
+// — far too slow to reach an overflow depth.
+//
+// BOUNDED RESERVE (mirrors DeepNestedSwitchAnalyzesFlatOnNormalStack in the
+// lowering suite): verify runs on a FIXED, deliberately-small 2 MiB stack. The
+// ITERATIVE walk keeps O(1) host frames (a handful, far under 2 MiB even under
+// ASan); a RECURSIVE walk needs ~kDepth frames (100000 × ≥80 B ≈ ≥8 MiB),
+// overflowing 2 MiB many times over. RED-ON-DISABLE (every leg, no sanitizer):
+// restore the recursive `subtreeContainsLabel` → this verify overflows the 2 MiB
+// reserve and hard-crashes the worker; the iterative form completes with
+// verify()==true and ZERO H_VerifierFailure (the dead tail does not undo the
+// `return`).
+TEST(HirVerifier, DeepDeadTailLabelScanFlatOnNormalStack) {
+    constexpr int kDepth = 100000;   // dead-tail Cast-spine depth
+    constexpr std::size_t kReserveBytes = std::size_t{2} * 1024 * 1024;
+
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    // A kDepth-deep, LABEL-FREE dead-tail expression: a Cast spine over a literal
+    // (single-child per level, so subtreeContainsLabel descends the full depth).
+    HirNodeId cur = b.makeLiteral(i32);
+    for (int i = 0; i < kDepth; ++i) cur = b.makeCast(cur, i32);
+    HirNodeId const deadStmt = b.makeExprStmt(cur);            // unreachable: follows the return
+    HirNodeId const ret      = b.makeReturn(b.makeLiteral(i32));
+    HirNodeId const body     = b.makeBlock(std::array{ret, deadStmt});
+    Hir h = fnReturning(b, ti, i32, body);
+
+    // Non-vacuity: the dead tail really IS kDepth deep, so subtreeContainsLabel is
+    // driven to full depth (a future dead-code prune must not silently hollow it).
+    HirNodeId n = deadStmt;
+    int spine = 0;
+    while (h.kind(n) != HirKind::Literal) {
+        auto const ch = h.children(n);
+        ASSERT_EQ(ch.size(), 1u) << "the ExprStmt/Cast spine must be single-child";
+        n = ch[0];
+        ++spine;
+    }
+    ASSERT_GE(spine, kDepth) << "the dead-tail Cast spine must be kDepth deep";
+
+    // Verify on the BOUNDED reserve — the flat witness. A revert to the recursive
+    // subtreeContainsLabel overflows and hard-crashes the worker HERE.
+    DiagnosticReporter reporter;
+    bool const ok = dss::substrate::callOnLargeStack(
+        kReserveBytes, [&] { return HirVerifier{h, nullptr, &ti}.verify(reporter); });
+    EXPECT_TRUE(ok) << "the deep dead tail must not spuriously fail verification";
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 0u)
+        << "the deep dead-code tail after `return 0;` must not read as fall-through";
 }
 
 // ── call argument rule (HR6, interner-gated, H_VerifierFailure) ──

@@ -85,6 +85,17 @@ enum class MirOpcode : std::uint16_t {
     // Load/Store is reordered ACROSS it. A pure compile-time ordering
     // constraint -- identical on every target/format.
     CompilerBarrier,
+    // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER: __sync_synchronize
+    // -- a standalone CPU memory fence (a C11 atomic_thread_fence in MIR terms).
+    // ZERO operands, NO result (R::None); the C11 memory_order rides `payload`
+    // (the AtomicLoad/AtomicStore 0..5 encoding -- __sync_synchronize is always
+    // seq_cst=5). Unlike CompilerBarrier (zero instructions), this emits a REAL
+    // fence instruction (x86 MFENCE, arm64 DMB ISH). hasSideEffects=TRUE (DCE
+    // keeps it, CSE/LICM never move IT) AND in the `opcodeClobbersMemory`
+    // positive list (no Load/Store is reordered ACROSS it) -- omitting the
+    // clobber membership would let CSE/LICM silently move memory ops across
+    // the fence, the exact miscompile the op exists to forbid.
+    AtomicFence,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -103,6 +114,22 @@ enum class MirOpcode : std::uint16_t {
     // `opcode(MnemonicSlot::…Native)`, never an arch identity. (arm64 has no scalar
     // GPR popcount → SWAR, runtime-witnessed on the arm64-elf example arm.)
     Popcount, Clz, Ctz,
+    // D-CSUBSET-INTRINSIC-BSWAP: reverse the BYTE order of the operand, at the
+    // OPERAND TYPE's width W∈{16,32,64} (the MSVC `_byteswap_*` family). The same
+    // pure-unary shape as the three above — but note the ONE way it differs from
+    // them, and why it needed its own op rather than an ALU composition: the
+    // bit-count trio all return a small COUNT (0..64) whose upper bits are zero
+    // at ANY width, so their MIR type may be the I32 result; Bswap's result is the
+    // operand's OWN type, so the width MUST travel on the MIR type and be read
+    // back at mir_to_lir. Lowered native-or-EXPANDED (lowerBswap): a target that
+    // declares a `bswap` encoding AT THE OPERAND'S WIDTH emits the hardware
+    // instruction (x86 BSWAP 32/64; arm64 REV16/REV/REV(X) 16/32/64), one that
+    // does not gets a byte-reversal over the universal ALU verbs. The probe is
+    // PER-WIDTH, not mnemonic-presence: x86 declares `bswap` but has NO width-16
+    // form, and a presence-only probe would emit a width-16 bswap that no variant
+    // encodes. Not const-folded / not commutative / no side effect, exactly like
+    // Popcount (so intentionally absent from those switches).
+    Bswap,
     // ── integer comparison (result = Bool/i1) ──
     ICmpEq, ICmpNe, ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
     ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
@@ -387,6 +414,11 @@ struct MirOpcodeInfo {
         // CSE'd/hoisted) + in the opcodeClobbersMemory list (a fence to
         // Load/Store motion across it). Lowers to ZERO instructions.
         case MirOpcode::CompilerBarrier: return {0, 0, 0, 0, R::None, false, true, false, "compiler_barrier"};
+        // D-CSUBSET-ATOMIC-FENCE: 0 operands, NO result (R::None), side-effecting
+        // (never DCE'd, never CSE'd/hoisted) + in the opcodeClobbersMemory list.
+        // Unlike CompilerBarrier it lowers to a REAL fence instruction; the C11
+        // memory_order rides `payload` (seq_cst=5, the sole shipped producer).
+        case MirOpcode::AtomicFence: return {0, 0, 0, 0, R::None, false, true, false, "atomic_fence"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};
@@ -417,6 +449,10 @@ struct MirOpcodeInfo {
         case MirOpcode::Popcount: return {1, 1, 0, 0, R::Value, false, false, false, "popcount"};
         case MirOpcode::Clz:      return {1, 1, 0, 0, R::Value, false, false, false, "clz"};
         case MirOpcode::Ctz:      return {1, 1, 0, 0, R::Value, false, false, false, "ctz"};
+        // D-CSUBSET-INTRINSIC-BSWAP: byte reverse. Same {1,1} pure-unary row as the
+        // trio above; its result carries the OPERAND's type (not I32), so the
+        // width rides `MirInst.type` all the way to mir_to_lir.
+        case MirOpcode::Bswap:    return {1, 1, 0, 0, R::Value, false, false, false, "bswap"};
 
         // integer comparison.
         case MirOpcode::ICmpEq:  return {2, 2, 0, 0, R::Value, false, false, false, "icmp.eq"};
@@ -644,6 +680,12 @@ struct MirOpcodeInfo {
         case MirOpcode::AtomicLoad:
         case MirOpcode::AtomicStore:
         case MirOpcode::CompilerBarrier:
+        // D-CSUBSET-ATOMIC-FENCE: a standalone CPU fence (__sync_synchronize) is
+        // a full ordering barrier -- no Load/Store may be reordered across it.
+        // ★ Membership HERE is the op's entire optimizer contract: without it
+        // CSE/LICM would move memory ops across the fence, SILENTLY (pinned by
+        // test_mir_alias's AtomicFence region-walk clobber test).
+        case MirOpcode::AtomicFence:
         // c115 SEH region boundaries: memory state must be exactly ordered at
         // SehTryBegin (the filter/handler observe fault-time memory — pre-try
         // loads may not be forwarded past it) and SehTryEnd. SehFilterReturn is

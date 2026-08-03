@@ -150,6 +150,27 @@ countOpcodeInModule(Lir const& lir, std::uint16_t op) {
 
 } // namespace
 
+// ── D-CSUBSET-TESTTU-SILENT-EXIT1: empty module is a valid success ────
+//
+// An empty module (0 functions — a declaration-only / all-preprocessed-out
+// TU) materializes to an empty result that is a VALID success: the parallel-
+// index invariant `perFunc.size() == moduleFuncCount()` holds at 0 == 0, so a
+// declaration-only TU lowers to a valid empty relocatable object rather than
+// silently rejecting the whole compile. RED-ON-DISABLE: restoring the
+// `moduleFuncCount() > 0` clause in LirCallconvResult::ok() flips this to false.
+TEST(LirCallconv, EmptyModuleIsOk) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    Lir empty{};                 // 0 functions
+    LirAllocation emptyAlloc{};   // no per-function allocations → ok()
+    ASSERT_TRUE(emptyAlloc.ok());
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(empty, **target, emptyAlloc, rep);
+    EXPECT_TRUE(result.ok());
+    EXPECT_EQ(result.perFunc.size(), 0u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
 // ── D-WIN64-LARGE-FRAME-STACK-PROBE prologue structural pins ──────────
 //
 // The ms_x64 prologue must emit a `stack_probe` op (NOT a plain `sub rsp`)
@@ -1555,6 +1576,108 @@ TEST(LirCallconvAbi, Win64VariadicCallDupsFpVarargIntoHomeGpr) {
     EXPECT_TRUE(sawDupIntoHomeGpr)
         << "a Win64 variadic call with an FP vararg must emit `movq_xmm_to_gpr` "
            "duplicating the FP vararg into its home GPR (" << cc->argGprs[1] << ")";
+}
+
+// D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE — the fpconv1 x86_64 release miscompile
+// pin. A SysV (cc index 0) VARIADIC call whose FP vararg was SPILLED by regalloc
+// reaches callconv as a `SpillSlotRef` (c77 D-AS-REGALLOC-DIRECT-ARG-RELOAD), NOT a
+// live FPR `Reg`. Two things must then hold: (1) the SysV vector-count (AL, §3.5.7)
+// MUST count that spilled FP vararg — glibc's variadic prologue does `test al,al` and
+// skips saving xmm0-7 when AL==0, so an undercount makes `va_arg(double)` read the
+// unsaved register-save area → garbage (the repro printed `0.000` for `3.125`;
+// fpconv1-2.0 red); and (2) the spilled FP vararg must be reloaded DIRECTLY into its
+// XMM arg register (xmm0). This builds the post-regalloc shape DIRECTLY — a variadic
+// call `f(fmt, <spilled double>)` with the FP vararg as a `SpillSlotRef` — so the
+// SpillSlotRef path is exercised regardless of regalloc heuristics. RED-ON-DISABLE:
+// revert step-13.4 to the residency-dependent operand re-scan (count only
+// `LirOperandKind::Reg` FPR operands) and the SpillSlotRef drops out → the rax
+// vector-count mov carries 0, failing assertion (1).
+TEST(LirCallconvAbi, SysVVariadicCountsSpilledFpVarargTowardAl) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    auto const movOp  = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(movOp.has_value());
+    auto const* cc = sch.callingConvention(0);   // SysV (cc index 0)
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
+        << "SysV must declare a variadic vector-count register (AL/rax)";
+    ASSERT_GE(cc->argGprs.size(), 1u);
+    ASSERT_GE(cc->argFprs.size(), 1u);
+    auto const raxOrd  = sch.registerByName(cc->variadicVectorCountReg->name);  // rax
+    auto const xmm0Ord = sch.registerByName(cc->argFprs[0]);                    // xmm0
+    auto const gprSrc  = sch.registerByName("r10");   // caller-saved fixed-arg source
+    ASSERT_TRUE(raxOrd.has_value() && xmm0Ord.has_value() && gprSrc.has_value());
+
+    // Post-regalloc call shape: `f(fmt, <spilled double>)`, variadic, 1 fixed operand.
+    // ops = [callee, fmt (GPR src), fpVararg (SpillSlotRef FPR, spill slot 1)].
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{91});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    LirReg const fmtSrc = makePhysicalReg(*gprSrc, LirRegClass::GPR);
+    std::array<LirOperand, 3> callOps{
+        LirOperand::makeSymbolRef(21),                  // callee (printf-like)
+        LirOperand::makeReg(fmtSrc),                    // fixed arg: format pointer
+        LirOperand::makeSpillSlotRef(                   // SPILLED FP vararg (the double)
+            /*slotV=*/1u, static_cast<std::uint8_t>(LirRegClass::FPR))};
+    std::uint32_t const payload =
+        ::dss::call_payload::encode(/*isVariadic=*/true, /*fixedOperandCount=*/1u);
+    b.addInst(*callOp, InvalidLirReg, callOps, payload);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{91};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 1;   // backs the SpillSlotRef's slot
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    bool sawCountMovRax1  = false;
+    std::int32_t raxImm   = -1;   // the AL immediate actually emitted (for diagnostics)
+    bool sawReloadIntoXmm0 = false;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = result.lir.blockInstAt(blk, i);
+                LirReg const r = result.lir.instResult(inst);
+                // (1) the vector-count `mov rax, <imm>` — the spilled FP vararg must
+                //     make this immediate 1, not 0.
+                if (result.lir.instOpcode(inst) == *movOp && r.valid()
+                    && r.isPhysical != 0 && r.id == *raxOrd) {
+                    for (auto const& op : result.lir.instOperands(inst)) {
+                        if (op.kind == LirOperandKind::ImmInt) {
+                            raxImm = op.immInt32;
+                            if (op.immInt32 == 1) sawCountMovRax1 = true;
+                        }
+                    }
+                }
+                // (2) the spilled FP vararg reloaded DIRECTLY into its XMM arg register.
+                if (r.valid() && r.isPhysical != 0 && r.id == *xmm0Ord)
+                    sawReloadIntoXmm0 = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawCountMovRax1)
+        << "SysV variadic vector-count (AL/rax) must be 1 for a SPILLED FP vararg "
+           "(a SpillSlotRef); the residency re-scan skipped it (AL emitted as "
+        << raxImm << ") — the fpconv1 release miscompile "
+           "(D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE)";
+    EXPECT_TRUE(sawReloadIntoXmm0)
+        << "the spilled FP vararg must be reloaded DIRECTLY into its XMM arg register "
+           "xmm0 (the c77 D-AS-REGALLOC-DIRECT-ARG-RELOAD mem-src move)";
 }
 
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {

@@ -687,6 +687,142 @@ TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
     EXPECT_EQ(bytes[3], 0xDA);
 }
 
+// ── D-CSUBSET-INTRINSIC-BSWAP: REV16 / REV / REV(X) ──
+//
+// The arm64 byte-reverse trio — the same data-processing 1-source shape as
+// CLZ/RBIT above (Rn bits 9:5 = source, Rd bits 4:0 = result), discriminated by
+// the opcode field (bits 15:10) and sf (bit 31). Unlike x86 (which encodes only
+// 32/64 and takes mir_to_lir's software expansion at width 16), arm64 encodes ALL
+// THREE, so `MnemonicSlot::Bswap` resolves natively at every width here.
+//
+// ★★ TWO NEGATIVE PINS, BECAUSE THE LIKELY BUG IS A MNEMONIC CONFUSION, NOT A
+// TYPO. Three AArch64 instructions live within two bits of each other and all
+// read like "reverse":
+//     REV16 Wd,Wn  0x5AC00400  opc=000001 sf=0  per-HALFWORD reverse
+//     REV   Wd,Wn  0x5AC00800  opc=000010 sf=0  reverse a 32-bit register
+//     REV32 Xd,Xn  0xDAC00800  opc=000010 sf=1  reverse WITHIN each 32-bit half
+//     REV   Xd,Xn  0xDAC00C00  opc=000011 sf=1  reverse a 64-bit register
+// `REV32` is the trap: it is X-form only and reverses each 32-bit half
+// independently — NOT a 32-bit byte swap (that is REV at sf=0).
+// ⚠ MEASURED, and it is not hypothetical: the `D-CSUBSET-INTRINSIC-BSWAP` row of
+// `.plans/_deferred-anchor-registry.md` states arm64 declares "16/32/64
+// (REV16/REV32/REV)" — i.e. it prescribes REV32 for the WIDTH-32 slot, which is
+// the wrong instruction (and, being X-form, not even a 32-bit encoding). The
+// shipped config is correct; the registry prose is not. The width-32 test below
+// therefore pins NOT-REV32 explicitly. Each wrong choice is a SILENT wrong
+// answer: same operand count, same registers, no diagnostic anywhere — only the
+// bytes differ.
+//
+// ★ PAIRED WITH A LIR-TIER SELECTION PIN: these tests resolve the `bswap`
+// mnemonic themselves, so they cannot prove `lowerBswap` SELECTED native. The
+// companion is test_mir_to_lir's BswapSelectsNativeAtAllThreeWidthsOnArm64
+// (`countLirOp(…, "bswap") == 1` at each of 16/32/64).
+namespace {
+// The CLZ/RBIT helper's width-flag sibling — `assembleArm64Unary` takes a
+// `bool width32` and so cannot reach width 16 at all.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleArm64UnaryFlags(char const* mnemonic, char const* dst, char const* src,
+                        std::uint8_t widthFlags) {
+    auto s = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(s.has_value());
+    auto const op    = (*s)->opcodeByMnemonic(mnemonic);
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    EXPECT_TRUE(op.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
+    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(rn) };
+    (void)b.addInst(*op, rd, ops, /*payload=*/0, widthFlags);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+
+// Little-endian word 0 of an assembled fixed32 function.
+[[nodiscard]] std::uint32_t firstWord(std::vector<std::uint8_t> const& bytes) {
+    EXPECT_GE(bytes.size(), 4u);
+    if (bytes.size() < 4u) return 0u;
+    return static_cast<std::uint32_t>(bytes[0])
+         | (static_cast<std::uint32_t>(bytes[1]) << 8)
+         | (static_cast<std::uint32_t>(bytes[2]) << 16)
+         | (static_cast<std::uint32_t>(bytes[3]) << 24);
+}
+} // namespace
+
+TEST(Arm64Encoder, BswapWidth16EncodesRev16WForm) {
+    // rev16 w3, w4 — 0x5AC00400 | Rn=x4(4)<<5=0x80 | Rd=x3(3) = 0x5AC00483
+    // → LE bytes: 83 04 C0 5A.
+    auto const bytes = assembleArm64UnaryFlags("bswap", "x3", "x4",
+                                               kLirInstFlagWidth16);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x04);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x5A);
+    std::uint32_t const w = firstWord(bytes);
+    EXPECT_EQ(w, 0x5AC00483u);
+    // NEGATIVE: not REV Wd,Wn (opc 000010). REV would reverse ALL FOUR bytes and
+    // land the input's bits 31:24 in the result's low byte — the silent wrong
+    // answer the x86_64/arm64 config comments both warn about.
+    EXPECT_NE(w, 0x5AC00883u)
+        << "width 16 must be REV16 (per-halfword), never REV";
+    EXPECT_EQ((w >> 10) & 0x3Fu, 0x01u) << "opcode field 000001 = REV16";
+    EXPECT_EQ(w >> 31, 0u)              << "sf=0 (W form)";
+}
+
+TEST(Arm64Encoder, BswapWidth32EncodesRevWFormNotRevX) {
+    // rev w3, w4 — 0x5AC00800 | 0x80 | 3 = 0x5AC00883 → LE: 83 08 C0 5A.
+    auto const bytes = assembleArm64UnaryFlags("bswap", "x3", "x4",
+                                               kLirInstFlagWidth32);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x08);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x5A);
+    std::uint32_t const w = firstWord(bytes);
+    EXPECT_EQ(w, 0x5AC00883u) << "REV Wd,Wn — base 0x5AC00800";
+    // ★ NEGATIVE PIN 1: NOT the 64-bit REV word (0xDAC00C00 base). Same
+    // registers, same operand count — a swap here would byte-reverse the whole
+    // X register for a u32 value, silently.
+    EXPECT_NE(w, 0xDAC00C83u)
+        << "a 32-bit byte swap must NOT encode as REV Xd,Xn";
+    // ★ And NOT REV32 Xd,Xn either — the mnemonic the deferred-anchor registry
+    // row names for THIS slot. It shares REV's opcode field (000010) and differs
+    // only in sf, so it is the single most reachable wrong answer here.
+    EXPECT_NE(w, 0xDAC00883u)
+        << "a 32-bit byte swap must NOT encode as REV32 (X-form, per-half)";
+    EXPECT_EQ((w >> 10) & 0x3Fu, 0x02u) << "opcode field 000010 = REV";
+    EXPECT_EQ(w >> 31, 0u)              << "sf=0 is what makes it the W form";
+}
+
+TEST(Arm64Encoder, BswapWidth64EncodesRevXFormNotRev32) {
+    // rev x3, x4 — 0xDAC00C00 | 0x80 | 3 = 0xDAC00C83 → LE: 83 0C C0 DA.
+    auto const bytes = assembleArm64UnaryFlags("bswap", "x3", "x4",
+                                               /*widthFlags=*/0);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x0C);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xDA);
+    std::uint32_t const w = firstWord(bytes);
+    EXPECT_EQ(w, 0xDAC00C83u) << "REV Xd,Xn — base 0xDAC00C00";
+    // ★ NEGATIVE PIN 2: NOT REV32 Xd,Xn (0xDAC00800 base, opc 000010 with sf=1),
+    // which reverses the bytes WITHIN EACH 32-BIT HALF of the register — a
+    // half-swap, not a 64-bit byte swap. This is the mnemonic the deferred-anchor
+    // registry row prescribes, so this assertion is the one that catches it.
+    EXPECT_NE(w, 0xDAC00883u)
+        << "a 64-bit byte swap must NOT encode as REV32 (per-half reversal)";
+    EXPECT_EQ((w >> 10) & 0x3Fu, 0x03u) << "opcode field 000011 = REV (X form)";
+    EXPECT_EQ(w >> 31, 1u)              << "sf=1 (X form)";
+}
+
 TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): ldaxr w0, [x1] — load-acquire
     // exclusive, the LL half of the CAS retry loop. W-form base 0x885FFC00
@@ -872,6 +1008,46 @@ TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
     EXPECT_EQ(bytes[1], 0xFC);
     EXPECT_EQ(bytes[2], 0x9F);
     EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, AtomicFenceSeqCstEncodesDmbIsh) {
+    // D-CSUBSET-ATOMIC-FENCE (__sync_synchronize): dmb ish — the STANDALONE
+    // seq_cst fence. 0xD5033BBF, MEASURED via clang -c -arch arm64 + otool -t
+    // on `__sync_synchronize()` (2026-07-30, this machine) — LE bytes:
+    // BF 3B 03 D5. Cross-check: the acquire-only dmb ishld = 0xD50339BF
+    // differs in exactly the CRm nibble (ISH=0xB vs ISHLD=0x9), so a
+    // transposed word fails at byte 1 (0x3B vs 0x39). ZERO registers, zero
+    // wires — fence + ret is the whole function, and the ret word
+    // (0xD65F03C0 → C0 03 5F D6) pins that the fixed word consumed exactly
+    // 4 bytes of the stream. NOTE the arm64 asymmetry with StoreSeqCst
+    // above: a seq_cst STORE needs no DMB (STLR is RCsc), but a store-LESS
+    // fence call site has no STLR to lean on — it must be a real DMB ISH.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fenceOp = (*s)->opcodeByMnemonic("atomic_fence_seqcst");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fenceOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    (void)b.addInst(*fenceOp, InvalidLirReg, std::span<LirOperand const>{});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xBF);  // dmb ish = 0xD5033BBF, little-endian
+    EXPECT_EQ(bytes[1], 0x3B);  // ← the ISH CRm byte (ishld would be 0x39)
+    EXPECT_EQ(bytes[2], 0x03);
+    EXPECT_EQ(bytes[3], 0xD5);
+    EXPECT_EQ(bytes[4], 0xC0);  // ret = 0xD65F03C0 immediately after
+    EXPECT_EQ(bytes[5], 0x03);
+    EXPECT_EQ(bytes[6], 0x5F);
+    EXPECT_EQ(bytes[7], 0xD6);
 }
 
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`

@@ -14,6 +14,7 @@
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/bit_int_value.hpp"          // C4b: host bignum for wb/uwb literals
 #include "core/types/integer_literal_ladder.hpp" // FC3 c1: the C 6.4.4.1 ladder (shared with the semantic tier)
+#include "core/types/literal_close_token.hpp"    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closer kind, from the schema
 #include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -162,8 +163,9 @@ uniformLibraryMap(std::string lib) {
 
 // Post-fold #8 simplifier R2 + code-reviewer I1: the
 // `decl.arraySuffix ? decl.arraySuffix->rule : RuleId{}` pattern
-// appears at lowerTopLevel (global init walk) AND lowerExternDecl
-// (extern-init reject). Stateless — lives at file scope alongside
+// appears in the legacy positional global/var init walk (an array
+// declarator's `[N]` length is part of the TYPE, not the initializer).
+// Stateless — lives at file scope alongside
 // the other anon-namespace helpers. Returns `RuleId{}` when the
 // language has no array decl form; downstream consumers gate on
 // `.valid()` to skip the rule-match.
@@ -193,7 +195,8 @@ struct Lowerer {
     // pendingSpans (shared): applied to the result's HirSourceMap after finish().
     std::vector<std::pair<HirNodeId, HirSourceLoc>>& spans;
     // FF6 Slice 2 (2026-06-02): shared accumulator for source-
-    // declared externs, one record per `lowerExternDecl` call
+    // declared externs, one record per extern node `lowerExternDeclInto`
+    // emitted (D-CSUBSET-EXTERN-MULTI-DECLARATOR: one per declarator)
     // that successfully produced an ExternFunction / ExternGlobal
     // HIR node. Consumed by `compileSingleUnit` via
     // `synthesizeFfiFromSourceDecls` to populate the
@@ -215,6 +218,41 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+    // TF-C78 (D-CSUBSET-NOINLINE): shared accumulator of (FUNCTION decl HIR node
+    // → NoInlineAttr) pairs, populated from the bound symbol's
+    // `SymbolRecord.isNoInline` at each Function lowering site (where the record
+    // is in hand) — the exact `mutability` discipline. Applied to the result's
+    // HirNoInlineMap AFTER finish(). Only ANNOTATED functions are recorded
+    // (absence ⇒ freely inlinable), so the side-table stays sparse. NOTE the
+    // asymmetry with its siblings: a MISSED entry here is not a safe default but
+    // the silent loss of an explicit directive (see `NoInlineAttr`), which is why
+    // all three Function lowering sites record it rather than just the common one.
+    std::vector<std::pair<HirNodeId, NoInlineAttr>>& noInlineAcc;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the same accumulator, one axis over —
+    // (FUNCTION decl HIR node → AlwaysInlineAttr) pairs from the bound symbol's
+    // `SymbolRecord.isAlwaysInline`, applied to the result's HirAlwaysInlineMap
+    // after finish(). Recorded at ALL THREE Function lowering sites for the same
+    // reason `noInlineAcc` is: not because a miss here is unsafe (it is not — a
+    // lost `always_inline` only restores the cost model) but because a flag that
+    // reaches MIR from only two of three sites is an intermittent, shape-
+    // dependent optimization gap that no single test would localize.
+    std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwaysInlineAcc;
+    // ★★ TF-C85: the same accumulator, a FOURTH axis over — (FUNCTION decl HIR
+    // node → NoOptimizeAttr) pairs from the bound symbol's
+    // `SymbolRecord.isNoOptimize`, applied to the result's HirNoOptimizeMap
+    // after finish(). Recorded at ALL THREE Function lowering sites for the
+    // reason its two neighbours are: a flag arriving from only two of three
+    // sites is a shape-dependent gap no single test would localize.
+    std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noOptimizeAcc;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same accumulator, a FIFTH axis
+    // over — (FUNCTION decl HIR node → NoSanitizeThreadAttr) pairs from the bound
+    // symbol's `SymbolRecord.isNoSanitizeThread`, applied to the result's
+    // HirNoSanitizeThreadMap after finish(). Recorded at ALL THREE Function
+    // lowering sites for its neighbours' reason: a flag arriving from only two of
+    // three sites is a shape-dependent gap no single test would localize — and for
+    // THIS axis that risk is sharper, because nothing in the emitted binary
+    // changes, so an intermittent miss has no behavioural symptom at all.
+    std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& noSanitizeThreadAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
     // ThreadLocalAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
@@ -400,7 +438,12 @@ struct Lowerer {
     // (sourceKind, targetKind) pair. The emitted Cast is aliased to its
     // OPERAND's source-map entry so diagnostics anchored at the synthetic
     // Cast still locate to real source.
-    [[nodiscard]] E coerce(E child, TypeId target) {
+    // `srcNode` (default InvalidNode): the CST arg-expression node, threaded ONLY by
+    // `coerceCallArg` for call-arguments (D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT).
+    // Every other caller passes InvalidNode → the node-mark-gated FFI Ptr→Ptr arm
+    // below stays inert (guarded on `srcNode.valid()`, so no UnitAttribute routing of
+    // an untagged id). It is used SOLELY to consult `model.isFfiIntPointeeCompat`.
+    [[nodiscard]] E coerce(E child, TypeId target, NodeId srcNode = {}) {
         if (!target.valid() || !child.type.valid()) return child;
         if (child.type == target) return child;
         TypeKind const ck = interner.kind(child.type);
@@ -463,7 +506,23 @@ struct Lowerer {
         // is NOT decayed here → it stays a loud mismatch at both tiers.
         if (ck == TypeKind::FnSig && tk == TypeKind::Ptr) {
             auto const ptrElem = interner.operands(target);
-            if (!ptrElem.empty() && ptrElem[0] == child.type) {
+            bool const sameSig =
+                !ptrElem.empty() && ptrElem[0] == child.type;
+            // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a bare function DESIGNATOR
+            // (FnSig) -> `void*` (the gcc/POSIX dlsym / Tcl ClientData idiom),
+            // gated on the single authoritative `allowVoidPtrFnConvert` flag —
+            // MIRRORS the isAssignable admit (admit<->realize parity). Emits the
+            // SAME synthetic FnSig->Ptr Cast as the same-signature decay: MIR
+            // `mapCast` lowers FnSig->Ptr as a representation-free Bitcast over
+            // the GlobalAddr REGARDLESS of the Ptr's pointee, so a `void*`
+            // target needs NO MIR change. Scoped to a Void pointee — a
+            // designator -> a NON-void object pointer is rejected at the
+            // semantic tier and never reaches here.
+            bool const toVoidPtr =
+                !ptrElem.empty()
+                && interner.kind(ptrElem[0]) == TypeKind::Void
+                && sem.pointerConversions.allowVoidPtrFnConvert;
+            if (sameSig || toVoidPtr) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -498,15 +557,20 @@ struct Lowerer {
             auto const toElem   = interner.operands(target);
             auto const fromLen  = interner.scalars(child.type);
             auto const toLen    = interner.scalars(target);
-            // C11/C23 6.4.5: SAME element kind on both sides (was Char-only) so a
-            // wide-string initializer `wchar_t buf[3]=L"hi"` / `char16_t b[3]=u"hi"`
-            // gets the same trailing zero-fill as a narrow `char[N]="…"`. The element
-            // KIND must match (a `char[N]` cannot be inited by a `u"…"` array — the
-            // semantic tier rejects the mismatch); the string bytes are already
-            // element-width-encoded, and the producer pads to N*sizeof(elem).
+            // C11/C23 6.4.5 + 6.2.5p15: element-type compatibility via the shared
+            // `stringLiteralArrayInitCompatible` (LOCKSTEP with the semantic admit
+            // in type_rules.hpp::isAssignable). SAME element kind on both sides
+            // carries a wide-string initializer `wchar_t buf[3]=L"hi"` /
+            // `char16_t b[3]=u"hi"`; a NARROW literal (element Char) ALSO retypes
+            // into a signed/unsigned-char array (`unsigned char z[N]="…"` — C
+            // 6.2.5p15, all three character types are 1-byte, identical bytes). A
+            // `char[N]` cannot be inited by a `u"…"` array (neither shape holds —
+            // the semantic tier already rejected it). RE-TYPING to `target` (the lhs
+            // `<c>[N]`) keeps the post-coerce verifier's child==slot equality exact.
             if (!fromElem.empty() && !toElem.empty()
                 && !fromLen.empty() && !toLen.empty()
-                && interner.kind(fromElem[0]) == interner.kind(toElem[0])
+                && detail::type_rules::stringLiteralArrayInitCompatible(
+                       interner.kind(toElem[0]), interner.kind(fromElem[0]))
                 && toLen[0] >= fromLen[0]
                 && std::holds_alternative<std::string>(
                        literals.at(builder.payload(child.id)).value)) {
@@ -554,6 +618,32 @@ struct Lowerer {
         // block — file-line citation deliberately omitted to remain
         // stable under future reformatting of the loader TU).
         if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
+            // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: the semantic analyzer marked
+            // this call-arg node (isFfiIntPointeeCompat) because it admitted a real C
+            // integer pointer into a shipped-descriptor abstract-width integer-pointee
+            // param (`ptr<i64>` vs `long long*` / `sqlite3_int64*` / `long*`-on-LP64)
+            // via `sameRepresentation`, at the call-arg boundary ONLY. REALIZE it as
+            // the SAME synthetic Ptr→Ptr Cast the void arms below emit — HIR→MIR maps
+            // Ptr→Ptr to a no-op Bitcast (no bits change), and the Cast RETYPES the
+            // node to `target` (== the param type) so the post-coerce HIR verifier's
+            // arg==param equality holds (the missing-cast backstop is H_VerifierFailure).
+            // The node-mark is the SINGLE authority — admit⟺realize by construction,
+            // NO re-derivation of the FFI/descriptor decision here (the
+            // `nullPointerConstant` "trust the semantic admission" discipline).
+            // `srcNode` is InvalidNode for every non-call-arg caller, so the
+            // `.valid()` guard keeps this arm inert everywhere else (and avoids
+            // routing an untagged NodeId through the UnitAttribute).
+            if (srcNode.valid() && model.isFfiIntPointeeCompat(srcNode)) {
+                HirNodeId const cast =
+                    builder.makeCast(child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({cast, it->second});
+                        break;
+                    }
+                }
+                return {cast, target};
+            }
             auto const fromElem = interner.operands(child.type);
             auto const toElem   = interner.operands(target);
             if (!fromElem.empty() && !toElem.empty()) {
@@ -564,11 +654,23 @@ struct Lowerer {
                 bool admit = false;
                 // T* → void* (toIsVoid && !fromIsVoid)
                 if (toIsVoid && !fromIsVoid) {
-                    admit = sem.pointerConversions.implicitToVoidPtr;
+                    // Option-B re-homing (D-LANG-VOIDPTR-FN-CONVERT): a function
+                    // pointer (`Ptr<FnSig> -> void*`) routes through the single
+                    // fn<->void* gate, MIRRORING isAssignable so admit<->realize
+                    // parity holds (else a post-coerce verifier failure). An
+                    // object pointee uses the generic `implicitToVoidPtr`.
+                    admit = interner.kind(fromElem[0]) == TypeKind::FnSig
+                        ? sem.pointerConversions.allowVoidPtrFnConvert
+                        : sem.pointerConversions.implicitToVoidPtr;
                 }
                 // void* → T* (fromIsVoid && !toIsVoid)
                 else if (fromIsVoid && !toIsVoid) {
-                    admit = sem.pointerConversions.implicitFromVoidPtr;
+                    // Option-B re-homing (mirror): `void* -> Ptr<FnSig>` routes
+                    // through the same single fn<->void* gate; an object pointee
+                    // uses the generic `implicitFromVoidPtr`.
+                    admit = interner.kind(toElem[0]) == TypeKind::FnSig
+                        ? sem.pointerConversions.allowVoidPtrFnConvert
+                        : sem.pointerConversions.implicitFromVoidPtr;
                 }
                 if (admit) {
                     HirNodeId const cast = builder.makeCast(
@@ -582,6 +684,46 @@ struct Lowerer {
                     return {cast, target};
                 }
             }
+        }
+        // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION / scalar->_Bool): a scalar
+        // (arithmetic non-Bool / Enum / pointer, incl. a `nullptr` already lowered
+        // to an integer 0 above) assigned to a `_Bool` lhs converts by the `!= 0`
+        // truthiness test (0 -> false, any nonzero -> true), NOT a value-truncating
+        // Cast — `_Bool b = 2` MUST be true, but a `Cast -> MIR Trunc(2 -> Bool)`
+        // keeps only the low bit (false). REUSE the ONE truthiness chokepoint
+        // `coerceCondition` (the exact shape `if(x)` lowers) so the assignment and
+        // condition paths cannot drift. An Enum bridges to its underlying integer
+        // first (coerceCondition's arithmetic predicate excludes Enum); a `nullptr`
+        // is already an I32 0 here, so `Ne(0,0)` -> false as C requires. The
+        // semantic tier admits this via isAssignable's `scalarConvertsToBool` arm;
+        // coerce REALIZES it. Placed BEFORE the enum / int->ptr / arithmetic-core
+        // arms so a `_Bool` target never materializes the low-bit-truncating Cast.
+        if (tk == TypeKind::Bool
+            && ((isArithmeticCore(ck) && ck != TypeKind::Bool)
+                || ck == TypeKind::Enum || ck == TypeKind::Ptr)) {
+            E scalar = child;
+            if (ck == TypeKind::Enum) {
+                auto const scals = interner.scalars(child.type);
+                if (!scals.empty())
+                    scalar = coerce(child,
+                        interner.primitive(static_cast<TypeKind>(scals[0])));
+            }
+            E const asBool = coerceCondition(scalar, NodeId{});
+            if (asBool.type.valid()
+                && interner.kind(asBool.type) == TypeKind::Bool) {
+                // Alias the synthetic truthiness node to the operand's span
+                // (coerce's provenance mechanism — coerceCondition's own track()
+                // no-ops on the invalid anchor passed here).
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({asBool.id, it->second});
+                        break;
+                    }
+                }
+                return asBool;
+            }
+            // coerceCondition declined (e.g. a Ptr under a language without the
+            // null-pointer-constant flag) — fall through so the mismatch stays LOUD.
         }
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): when
         // the source expression is an integer-literal in a pointer-
@@ -882,20 +1024,52 @@ struct Lowerer {
     // true, so this reuses the SAME synthetic decay Cast every other
     // decay site emits (a string literal materializes as a rodata
     // GlobalAddr at HIR->MIR; a named array yields its base address).
-    // The integer/float default promotions for variadic tails are the
-    // ABI arg-setup tier's width concern, NOT re-typed here; a FnSig
-    // designator already lowers to the function's address uniformly.
-    // Non-Array / valid-param behavior is byte-identical to the prior
-    // inline `coerce(arg, paramType)` / pass-through shapes.
-    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType) {
-        if (paramType.valid()) return coerce(arg, paramType);
-        if (arg.type.valid()
-            && interner.kind(arg.type) == TypeKind::Array) {
+    // The integer/float default promotions for a SCALAR variadic tail are
+    // ALSO applied here (D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION): C's default
+    // argument promotions are a TYPING operation (6.5.2.2p6), so the HIR tier —
+    // the one that owns the coerce/makeCast→SExt/ZExt/FPExt conversion machinery
+    // — is their natural home, and the ABI arg-setup tier below then sees the
+    // already-promoted width (a signed `short -1` sign-extends to int -1, NOT the
+    // pre-fix zero-filled 65535 that broke sqlite's `sqlite3_expert_new` nArg=-1).
+    // A FnSig designator still lowers to the function's address uniformly (it is
+    // a non-arithmetic kind and passes straight through). Non-Array / valid-param
+    // behavior is byte-identical to the prior inline `coerce(arg, paramType)` /
+    // pass-through shapes.
+    // `argNode` (default InvalidNode): the CST arg-expression node, forwarded to
+    // `coerce` so the D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT node-mark can drive
+    // the Ptr→Ptr bitcast realize. Only the declared-param path forwards it (a
+    // variadic-tail arg with no param type is never FFI-marked — the semantic loop
+    // checks only up to the declared arity).
+    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType, NodeId argNode = {}) {
+        if (paramType.valid()) return coerce(arg, paramType, argNode);
+        if (!arg.type.valid()) return arg;
+        TypeKind const ak = interner.kind(arg.type);
+        // Array<T,N> → Ptr<T> lvalue decay (C 6.3.2.1p3 — the c79 shape).
+        if (ak == TypeKind::Array) {
             auto const elems = interner.operands(arg.type);
             if (!elems.empty())
                 return coerce(arg, interner.pointer(elems[0]));
+            return arg;
         }
-        return arg;
+        // C 6.5.2.2p6 default argument promotions for a SCALAR variadic-tail /
+        // unprototyped arg (D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION): `float`
+        // widens to `double` (FPExt), and an integer narrower than `int` promotes
+        // to `int` — SExt for a signed source, ZExt for an unsigned one, the
+        // signedness-keyed choice being mapCast's (driven by the arg's OWN type),
+        // never re-derived here. Both reuse the ONE coerce→makeCast→mapCast
+        // conversion path every other site funnels through: the float widen via a
+        // direct `coerce` to F64, the integer promotion via the shared
+        // `promoteSubIntArith` (`integerPromotedType` + `coerce`) — NO hand-rolled
+        // rank/width logic. A wider arithmetic arg (`int`/`unsigned`/`long`/
+        // `double`/`long double`), a pointer, a struct-by-value, or a FnSig
+        // designator all pass through unchanged: `promoteSubIntArith` is a no-op on
+        // ≥int, on floats, and on non-arithmetic kinds, and a language with no
+        // `arithmeticConversions` block (every non-C shipped language) has no
+        // `arith_`, so the whole promotion is inert there — config-gated, not a
+        // language branch.
+        if (ak == TypeKind::F32)
+            return coerce(arg, interner.primitive(TypeKind::F64));
+        return promoteSubIntArith(arg);
     }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
@@ -904,6 +1078,10 @@ struct Lowerer {
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
+            std::vector<std::pair<HirNodeId, NoInlineAttr>>& noinl,
+            std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwinl,
+            std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noopt,
+            std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& nosanthr,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
@@ -913,7 +1091,10 @@ struct Lowerer {
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
+          linkage(lk), mutability(mut), noInlineAcc(noinl),
+          alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
+          noSanitizeThreadAcc(nosanthr),
+          threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
@@ -1049,24 +1230,192 @@ struct Lowerer {
         return false;
     }
 
-    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
-                                          bool* staticStorageOut = nullptr) {
-        LinkageAttr attr{};
-        if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
-        // Collect the prefix's tokens in SOURCE order (the composite-key
+    // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE — closing that row's pinned
+    // "after-declarator honoring" follow-up, which TF-C62 deferred by shipping
+    // the position as parse-and-ignore): every CST subtree
+    // of declaration `node` that may carry a linkage specifier — the SCAN ROOTS
+    // `linkageFrom` folds as ONE declaration.
+    //
+    // Root 1 is the declaration-specifier PREFIX (`declSpecifiers` — the LEADING
+    // `static` / `__attribute__((weak))` position), which used to be the only one.
+    // Roots 2..n are the AFTER-DECLARATOR attribute runs
+    // (`declarators.afterDeclaratorAttrRules` — `attrSpec`/`stdAttr` sitting between
+    // a declarator and its optional initializer, the position tcl.h and glibc
+    // actually put their attributes in).
+    //
+    // ★ WHY THIS EXISTS: measured at the pre-change HEAD, the after-declarator run
+    // was PARSE-AND-IGNORE — `int gv __attribute__((bogus_xyz));` and
+    // `int gv [[frobnicate]];` compiled SILENTLY CLEAN, and `int f(void)
+    // __attribute__((weak));` SILENTLY DROPPED the weak binding (wrong linkage at
+    // link time, no diagnostic anywhere). The run was consumed only by the
+    // init-detection skip, so `linkageFrom` never saw it. Feeding the roots into
+    // the SAME loop with the SAME last-wins merge is what makes an attribute in
+    // the trailing position behave identically to the same attribute in the
+    // leading position — two positions, one fold, no second code path to drift.
+    //
+    // GRANULARITY — the roots are PER-DECLARATOR, because that is what C means.
+    // The declaration-specifier prefix is shared by every declarator in the
+    // declaration (a storage class applies to all of them), but an
+    // after-declarator attribute belongs to the ONE declarator it follows:
+    // `int a __attribute__((weak)), b;` makes `a` weak and leaves `b` alone.
+    // Folding the trailing run at DECLARATION level would push `a`'s binding onto
+    // `b` — an over-application, and still a wrong answer even though it is less
+    // wrong than the silent drop that preceded it. So `linkagePrefixRoots` is the
+    // shared base and `linkageRootsFor` adds exactly one declarator's own run;
+    // both feed the SAME `linkageFrom` loop with the SAME last-wins merge, so a
+    // leading and a trailing spelling of one attribute still cannot diverge.
+    //
+    // ORDER IS LOAD-BEARING: the prefix root goes FIRST so the flattened token
+    // list stays in SOURCE order, which makes last-wins mean "the later spelling
+    // wins" — the trailing attribute overrides a conflicting leading one, exactly
+    // as reading the declaration left-to-right implies.
+
+    // The declaration-level (shared) scan roots: the specifier prefix, plus every
+    // declaration-level attribute SLOT the row declares.
+    //
+    // ★ TF-C77 (D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS) — THE SLOT ROOTS.
+    // Until this change the function returned the specifier prefix ALONE, so an
+    // attribute sitting in a declaration-level slot OUTSIDE that prefix was
+    // invisible to `linkageFrom`. That was harmless while the only rows declaring
+    // `declarationAttrSlotRules` had no `linkageSpecifiers` facet at all (they
+    // early-return below), but it is exactly the SILENT DROP the new mid-position
+    // slot would otherwise be: `int __attribute__((weak)) gv;` parses clean and
+    // loses its weak binding at link time with no diagnostic anywhere, and an
+    // unknown name in that position is swallowed too — `topLevelDecl` does not set
+    // `unknownStrictAttributeIsError`, so the GNU form's loudness there comes
+    // ENTIRELY from this tier's H_UnknownLinkageSpecifier gate.
+    //
+    // WHAT IT CONSUMES: the row's CONFIG-DECLARED `declarationAttrSlotRules` list
+    // and nothing else — the same list the semantic attribute scan already selects
+    // by. No rule name, attribute name, arch or format is compared to a string
+    // literal here; a language with no such slots gets an empty list and the loop
+    // does nothing. The match is on DIRECT VISIBLE children by rule id, mirroring
+    // `scanAttributeSemantics`'s slot loop, so a run nested deeper (inside a
+    // declarator) is deliberately NOT promoted to declaration-level linkage.
+    //
+    // ORDER IS LOAD-BEARING, same as for the trailing roots: the prefix root goes
+    // FIRST and the slots follow in `visibleChildren` (source) order, so the
+    // flattened token list stays source-ordered and last-wins keeps meaning "the
+    // later spelling wins".
+    //
+    // INERT FOR EVERY PRE-EXISTING SLOT ROW, verified row by row rather than
+    // assumed: `typedefDecl`, `structSpec`, `unionSpec`, `structField` and
+    // `unionField` are the only shipped rows declaring `declarationAttrSlotRules`
+    // today, and NONE of them declares `linkageSpecifiers` — so each takes the
+    // early return above the loop and never reaches it.
+    [[nodiscard]] std::vector<NodeId>
+    linkagePrefixRoots(NodeId node, DeclarationRule const& decl) {
+        std::vector<NodeId> roots;
+        // A row with NO `linkageSpecifiers` facet folds nothing at all (typedefDecl
+        // — deliberately, this cycle), so do not even locate the prefix for it.
+        if (decl.linkageSpecifiers.empty()) return roots;
+        if (NodeId const pfx = specifierPrefixChild(tree(), node, decl); pfx.valid())
+            roots.push_back(pfx);
+        if (decl.declarationAttrSlotRules.empty()) return roots;
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (RuleId sr : decl.declarationAttrSlotRules) {
+                if (tree().rule(c).v == sr.v) { roots.push_back(c); break; }
+            }
+        }
+        return roots;
+    }
+
+    // The shared prefix PLUS `declaratorNode`'s own after-declarator attribute run
+    // (`declarators.afterDeclaratorAttrRules` — `attrSpec`/`stdAttr` between a
+    // declarator and its optional initializer, the position tcl.h and glibc put
+    // their attributes in).
+    //
+    // ★ WHY THE TRAILING ROOTS EXIST AT ALL: measured at the pre-TF-C73 HEAD, the
+    // after-declarator run was PARSE-AND-IGNORE — `int gv __attribute__((bogus_xyz));`
+    // compiled SILENTLY CLEAN and `int f(void) __attribute__((weak));` SILENTLY
+    // DROPPED the weak binding (wrong linkage at link time, no diagnostic). The run
+    // was consumed only by the init-detection skip, so `linkageFrom` never saw it.
+    [[nodiscard]] std::vector<NodeId>
+    declaratorAttrRoots(DeclarationRule const& decl, NodeId declaratorNode) {
+        std::vector<NodeId> roots;
+        if (decl.linkageSpecifiers.empty() || !declaratorNode.valid()) return roots;
+        if (!sem.declarators.has_value()) return roots;
+        DeclaratorConfig const& dc = *sem.declarators;
+        if (dc.afterDeclaratorAttrRules.empty()) return roots;   // language has none
+        if (tree().kind(declaratorNode) != NodeKind::Internal) return roots;
+        // The attribute run is a DIRECT child of an `initDeclarator` (the grammar
+        // slot between the declarator and the initializer). Matching it there —
+        // rather than by a free DFS for any `attrSpec` in the declarator subtree —
+        // is what keeps a future attribute in some OTHER declarator-internal
+        // position (a param's `__attribute__((unused))`, its own open anchor) from
+        // being silently promoted to declaration-level linkage. A BARE declarator
+        // (not an `initDeclarator`) has no such slot and contributes nothing.
+        if (tree().rule(declaratorNode).v != dc.initDeclaratorRule.v) return roots;
+        for (NodeId c : visible(declaratorNode)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (RuleId ar : dc.afterDeclaratorAttrRules) {
+                if (tree().rule(c).v == ar.v) { roots.push_back(c); break; }
+            }
+        }
+        return roots;
+    }
+
+    // `base` (the shared prefix fold) with `declaratorNode`'s OWN trailing
+    // attribute run applied on top. Returns `base` untouched when that declarator
+    // carries no run — which is every declarator in every corpus program today,
+    // so the common path costs one empty-vector check and emits nothing.
+    //
+    // ★ The prefix is folded ONCE by the caller and only the TRAILING run is
+    // folded here, deliberately: re-folding the prefix per declarator would
+    // re-emit its `H_UnknownLinkageSpecifier` once per declarator, turning one
+    // typo in `__attribute__((frobnicate)) int a, b, c;` into three identical
+    // errors.
+    [[nodiscard]] LinkageAttr declaratorLinkage(LinkageAttr base,
+                                                DeclarationRule const& decl,
+                                                NodeId declaratorNode) {
+        std::vector<NodeId> const roots = declaratorAttrRoots(decl, declaratorNode);
+        if (roots.empty()) return base;
+        return linkageFrom(roots, decl, /*staticStorageOut=*/nullptr, base);
+    }
+
+    // `seed` is the linkage ALREADY folded from an earlier-in-source root set —
+    // the shared declaration prefix, when this call is folding one declarator's
+    // trailing run on top of it. Seeding rather than merging afterwards is what
+    // keeps the "no-op default clobber" hazard closed: a trailing attribute that
+    // sets NO axis leaves the seed's axes untouched, whereas merging two returned
+    // `LinkageAttr`s could not tell "specified as Global" from "never specified"
+    // and would silently overwrite a prefix `static`'s internal binding. Same
+    // last-wins rule as within one root set, just carried across two calls, so a
+    // leading and a trailing spelling of one attribute still cannot diverge.
+    [[nodiscard]] LinkageAttr linkageFrom(std::span<NodeId const> roots,
+                                          DeclarationRule const& decl,
+                                          bool* staticStorageOut = nullptr,
+                                          LinkageAttr seed = {}) {
+        LinkageAttr attr = seed;
+        if (roots.empty() || decl.linkageSpecifiers.empty()) return attr;
+        // Collect every root's tokens in SOURCE order (the composite-key
         // pairing below is order-sensitive), skipping the subtrees of any
         // `linkageSpecifierIgnoredRules` rule wholesale (FC4 c1 / D14 —
         // attribute forms the language parses but semantically ignores,
         // e.g. C23 `[[deprecated]]`: their identifiers must neither
         // resolve as linkage specifiers nor fail loud as unknown ones).
+        //
+        // TF-C73: `fromAttrArg` runs PARALLEL to `toks` and marks each token the
+        // DFS reached THROUGH an `attributeArgRule` node (nested arg groups
+        // inherit the mark). A marked token is skipped for the KEY LOOKUP but
+        // stays IN the list — see the flag's use below for why the distinction
+        // between "marked" and "removed" is the whole design.
         std::vector<NodeId> toks;
+        std::vector<char>   fromAttrArg;
         {
-            std::vector<NodeId> stack{prefixNode};
+            struct Frame { NodeId n; bool inArg; };
+            std::vector<Frame> stack;
+            stack.reserve(roots.size());
+            for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+                if (it->valid()) stack.push_back({*it, false});  // reverse → source order
             while (!stack.empty()) {
-                NodeId n = stack.back();
+                Frame const f = stack.back();
+                NodeId const n = f.n;
                 stack.pop_back();
                 if (isToken(n)) {
                     toks.push_back(n);
+                    fromAttrArg.push_back(f.inArg ? char{1} : char{0});
                     continue;
                 }
                 bool skip = false;
@@ -1095,9 +1444,18 @@ struct Lowerer {
                     }
                     continue;
                 }
+                // TF-C73: descending INTO the language's attribute-argument group
+                // marks everything below it (and `inArg` is inherited, so a NESTED
+                // arg group — `__nonnull__((1,3))` — stays marked). Config-driven:
+                // an INVALID `attributeArgRule` marks nothing, which is exactly the
+                // pre-key behavior for a language that declares no arg grammar.
+                bool const childInArg =
+                    f.inArg
+                    || (sem.attributeArgRule.valid()
+                        && tree().rule(n).v == sem.attributeArgRule.v);
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
-                    stack.push_back(*it);   // reverse-push → source order
+                    stack.push_back({*it, childInArg});   // reverse-push → source order
                 }
             }
         }
@@ -1110,10 +1468,48 @@ struct Lowerer {
         // works; an unknown composite fails loud with the composite key.
         SchemaTokenId const strStart = cfg.stringStartToken;
         SchemaTokenId const strBody  = cfg.stringBodyToken;
+        // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: a string literal's CLOSING
+        // delimiter is a token of its own, so the argument `("hidden")` is FOUR
+        // tokens (`(`, opener, body, closer) + `)`, not three. This scan must know
+        // the third string piece exactly as it already knows the first two.
+        //
+        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c-subset
+        // `linkageSpecifierIgnoredKinds` rows that also list `StringEnd` are
+        // DEFENCE-IN-DEPTH, not the mechanism — keep them (they document the
+        // closer's structural role at the config surface, and they are what a
+        // language whose closer kind the engine cannot resolve would rely on),
+        // but do not mistake them for load-bearing.
+        //
+        // MEASURED, both directions, because an earlier version of this note
+        // over-claimed in both:
+        //   • Strip `StringEnd` from ALL THREE config rows and
+        //     `visibility("hid" "den")` still fails loud with the SAME
+        //     `H_UnknownLinkageSpecifier` adjacent-concat message. The
+        //     `kind == strClose` arm below already covers it, so config alone
+        //     was never the thing standing between here and the bug.
+        //   • With the closer ignored NOWHERE (this arm removed AND the config
+        //     rows stripped) the failure is CONFUSING BUT LOUD — never silent.
+        //     `visibility("hidden")` reports `'"' is not a recognized linkage
+        //     specifier` (the outer loop reaches the closer token and takes its
+        //     TEXT as a specifier name); `visibility("hid" "den")` reports three
+        //     errors — `'visibility:hid'`, `'":den'`, `'"'`. The
+        //     adjacent-concat wall does decline (k2 lands on the closer, which
+        //     is not another opener), so the key `visibility:hid` IS formed —
+        //     but that key is not a declared facet, so the strict lookup below
+        //     rejects it. No silent path exists here in any configuration.
+        // Keying it in the ENGINE is still right: it makes the consumer correct
+        // for every language config rather than per-language-correct, and it
+        // turns a confusing multi-error cascade into no error at all.
+        SchemaTokenId const strClose =
+            closeTokenForCoalescedBody(tree().schema(), strBody);
         auto const isIgnoredKind = [&](SchemaTokenId kind) {
             for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
                 if (k == kind) return true;
-            return false;
+            // The literal's closer is structural syntax of the string ARGUMENT,
+            // never a specifier name — skipped everywhere the ignored kinds are,
+            // including the two forward scans below, so the composite pairing and
+            // its adjacent-concat wall both see through it.
+            return strClose.valid() && kind == strClose;
         };
         for (std::size_t i = 0; i < toks.size(); ++i) {
             NodeId const n = toks[i];
@@ -1144,6 +1540,41 @@ struct Lowerer {
                     if (bare == nm) { ignoredByName = true; break; }
                 if (ignoredByName) continue;
             }
+            // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP): a token that came
+            // from inside an attribute's ARGUMENT group is not a specifier NAME —
+            // skip the strict lookup for it. `__attribute__((aligned(16)))` no
+            // longer reports `16`, and `__attribute__((format(printf,1,2)))` no
+            // longer reports `printf`/`1`/`2`, as unrecognized linkage specifiers.
+            //
+            // ★★ ALL THREE PLACEMENT DETAILS BELOW ARE LOAD-BEARING AND MEASURED —
+            // this looks like it could be folded into a simpler surface, and each
+            // simplification is a different bug:
+            //
+            //  (1) NOT a wholesale `linkageSpecifierIgnoredRules` skip of the arg
+            //      subtree. That is the obvious fix and it BREAKS
+            //      `visibility("hidden")`: the composite key `<ident>:<body>` is
+            //      assembled by the FORWARD SCAN below over the flattened list, and
+            //      the string lives INSIDE the arg group — delete those tokens and
+            //      the pairing has nothing to pair with, so the bare `visibility`
+            //      misses the strict map. MEASURED on a patched config: it reports
+            //      `'visibility' is not a recognized linkage specifier` on legal C.
+            //      Hence: marked, NOT removed.
+            //
+            //  (2) Checked AFTER the by-name skip, not before. The two are not
+            //      commutative in intent: an ignored NAME must consume its clause
+            //      identifier at the ordinary identifier position regardless of
+            //      where the flag lands, and keeping this second preserves the
+            //      existing by-name semantics unchanged.
+            //
+            //  (3) Deliberately NOT added to `isIgnoredKind`, and deliberately NOT
+            //      applied inside the forward scan. Those two surfaces are what the
+            //      composite pairing walks, and an ignored-by-name clause
+            //      identifier sitting in the list is precisely what stops one
+            //      clause's name from pairing with a LATER clause's string. Widen
+            //      either surface and cross-clause mispairing returns — a wrong
+            //      linkage facet resolved silently, which is worse than the loud
+            //      arg soup this fix removes.
+            if (i < fromAttrArg.size() && fromAttrArg[i] != 0) continue;
             // Composite probe: the next non-ignored token opens a string
             // literal → pair this specifier with the decoded body.
             if (strStart.valid() && strBody.valid()) {
@@ -1190,8 +1621,211 @@ struct Lowerer {
             }
             auto it = decl.linkageSpecifiers.find(key);
             if (it != decl.linkageSpecifiers.end()) {
-                if (it->second.binding)    attr.binding    = *it->second.binding;
-                if (it->second.visibility) attr.visibility = *it->second.visibility;
+                if (it->second.binding) {
+                    // ★★ THE BINDING AXIS IS NOT LAST-WINS. Every other axis
+                    // here is (a later spelling refines an earlier one), and
+                    // making binding an exception is deliberate and MEASURED.
+                    //
+                    // `static int x __attribute__((weak));` folds `static`
+                    // (Local) and then `weak` (Weak) over the SAME axis. Under
+                    // last-wins the `static` simply DISAPPEARS: the symbol was
+                    // emitted `V x` — a weak GLOBAL, name unmangled, escaping
+                    // the TU — with ZERO diagnostics, where the same
+                    // declaration without the attribute emits `d sym_N`, a
+                    // TU-local. Silent wrong linkage, the worst outcome
+                    // available: the program links against a DIFFERENT
+                    // definition than the source asked for.
+                    //
+                    // GROUND TRUTH is real clang on this Mac, which HARD-ERRORS
+                    // `weak declaration cannot have internal linkage` — and does
+                    // so in BOTH orders (`static __attribute__((weak)) int x;`
+                    // and `__attribute__((weak)) static int x;`). So the rule is
+                    // SYMMETRIC — a conflict, not a "trailing must not clobber
+                    // leading" precedence — and this test is symmetric to match:
+                    // it fires wherever the second, differing binding is folded,
+                    // in one root set or across the seed boundary.
+                    //
+                    // Sparse-by-construction: `Global` IS the unspecified state
+                    // (`recordLinkage` stores nothing for it), so
+                    // `attr.binding != Global` is exactly "a binding was already
+                    // specified" and re-folding the SAME binding (`static
+                    // constexpr`, both Local; a repeated `weak`) stays silent.
+                    // Source-agnostic: no specifier NAME is hardcoded — the
+                    // conflict is between two config-declared binding VALUES, so
+                    // any language whose `linkageSpecifiers` table can express
+                    // two bindings gets the same protection for free.
+                    if (attr.binding != SymbolBinding::Global
+                        && *it->second.binding != attr.binding) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              std::format(
+                                  "'{}' specifies '{}' binding, which conflicts "
+                                  "with the '{}' binding already specified for "
+                                  "this declaration",
+                                  key, symbolBindingName(*it->second.binding),
+                                  symbolBindingName(attr.binding)));
+                        // ★ THE RESIDUE OF A REJECTED CONFLICT IS THE CONFINING
+                        // BINDING, and it is NOT "whichever came first". Plain
+                        // first-wins is order-dependent in the one direction that
+                        // matters: `__attribute__((weak)) static int x;` folds
+                        // Weak before Local, so first-wins leaves the rejected
+                        // declaration marked Weak — a symbol that ESCAPES the TU
+                        // even though the source said `static`. MEASURED: the
+                        // symmetric pin caught exactly that, reading Weak on the
+                        // leading order while the trailing order read Local.
+                        //
+                        // The diagnostic already fails the build, so no artifact
+                        // is produced from either order — but `Local` is the only
+                        // residue that cannot BECOME a wrong export if any
+                        // consumer ever reads the attribute past the error, and
+                        // making the two orders agree keeps the rule symmetric in
+                        // its VALUE as well as in when it fires. `Local` is an
+                        // engine-level concept (`recordLinkage` already treats
+                        // `Global` as the unspecified state, and the
+                        // `prototypeSynthesizesExtern` gate already asks
+                        // specifically about `Local`), not a C specifier name —
+                        // no language vocabulary is hardcoded here.
+                        if (*it->second.binding == SymbolBinding::Local)
+                            attr.binding = SymbolBinding::Local;
+                        continue;
+                    }
+                    attr.binding = *it->second.binding;
+                }
+                if (it->second.visibility) {
+                    // ★★ THE VISIBILITY AXIS IS NOT LAST-WINS EITHER — TF-C93,
+                    // closing the VISIBILITY half of
+                    // D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS
+                    // (the BINDING half above closed at TF-C73 and is the
+                    // precedent this mirrors).
+                    //
+                    // MEASURED at HEAD 199fe7d, `--target
+                    // arm64:macho64-arm64-darwin-dylib`, both orders, ZERO
+                    // diagnostics and RC=0 in each:
+                    //   `__attribute__((visibility("hidden")))
+                    //    __attribute__((visibility("default"))) int dv4 = 1;`
+                    //     → `dyld_info -exports` lists `_dv4` (EXPORTED)
+                    //   the same two specifiers SWAPPED
+                    //     → `_dv4` absent from the export trie (HIDDEN)
+                    // The dynamic export table of the shipped image flips on
+                    // SOURCE ORDER while the user is told nothing. GROUND TRUTH
+                    // is real clang on this Mac, which HARD-ERRORS both orders
+                    // with `visibility does not match previous declaration` and
+                    // emits no object; GCC is documented to warn and keep the
+                    // EARLIER value. Plain last-wins is NEITHER behaviour.
+                    //
+                    // ★★★ KEYED ON AN EXPLICIT `visibilitySpecified` BIT, NOT ON
+                    // `attr.visibility != Default`, AND THAT IS THE WHOLE
+                    // CORRECTION. Copying the binding guard's shape verbatim
+                    // would ship an ORDER-ASYMMETRIC guard: the binding trick
+                    // works only because `SymbolBinding::Global` is UNWRITABLE
+                    // from config (MEASURED: zero `"binding": "global"` rows), so
+                    // `!= Global` really does mean "already specified".
+                    // `SymbolVisibility::Default = 0` is BOTH the unspecified
+                    // sentinel AND a writable value (`visibility:default`, added
+                    // TF-C92 for tcl.h's `DLLEXPORT`), so a `!= Default` mirror
+                    // fires on `hidden`→`default` and SILENTLY FOLDS
+                    // `default`→`hidden` to Hidden — half a fix, and the half it
+                    // keeps silent is the one that REMOVES a symbol from the
+                    // export table. ★ NOT a hypothetical: MEASURED by BUILDING
+                    // that exact mirror and running the pins — all four
+                    // `hidden`-first arms passed while all four `default`-first
+                    // arms (two-specifier, one-clause-list, cross-seed, and
+                    // `externDecl`) went SILENT, and the count pin plus the
+                    // negative controls stayed GREEN throughout, so only a
+                    // both-orders loop can see it. See
+                    // `LinkageAttr::visibilitySpecified` and the
+                    // `VisibilityConflictFailsLoudAndKeepsConfiningVisibility`
+                    // pin's RED-ON-DISABLE note (variant iii).
+                    //
+                    // Re-folding the SAME value stays silent (idempotent
+                    // `hidden`,`hidden`), and the two axes are independent:
+                    // `visibility("hidden")` + `weak` touches two different axes
+                    // and produces no visibility diagnostic. Source-agnostic: no
+                    // specifier NAME is hardcoded — the conflict is between two
+                    // config-declared visibility VALUES, so any language whose
+                    // `linkageSpecifiers` table can express two visibilities gets
+                    // the same protection for free.
+                    //
+                    // ★ H000C's MESSAGE-SHAPE COUNT IS NOW **FIVE**, and that
+                    // cost is accepted deliberately rather than overlooked:
+                    // adjacent-concat (`:1601`), malformed-string (`:1614`),
+                    // binding conflict (`:1659`), unrecognized key (`:1697`), and
+                    // this one. Only the fourth is literally "unknown specifier".
+                    // A DEDICATED code for the visibility half was REJECTED
+                    // because the binding half already reuses this code for
+                    // exactly this purpose, so a new row would make the two
+                    // halves of ONE anchor diverge in how they report — and the
+                    // corpus cost of ERROR severity was MEASURED at zero.
+                    if (attr.visibilitySpecified
+                        && *it->second.visibility != attr.visibility) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              std::format(
+                                  "'{}' specifies '{}' visibility, which "
+                                  "conflicts with the '{}' visibility already "
+                                  "specified for this declaration",
+                                  key,
+                                  symbolVisibilityName(*it->second.visibility),
+                                  symbolVisibilityName(attr.visibility)));
+                        // ★ THE RESIDUE IS THE CONFINING VISIBILITY — the
+                        // REASONING of the binding half above (keep `Local`),
+                        // NOT its literal. A flat `Hidden` would be WRONG:
+                        // `SymbolVisibility` is 4-valued and restrictiveness is
+                        // NOT numeric order — `Protected(2)` IS externally
+                        // visible while `Hidden(1)` is not. So the confining
+                        // candidate is derived from the SHIPPED predicate
+                        // `isExternallyVisible` (symbol_attrs.hpp), the same
+                        // source of truth DCE and all three object emitters
+                        // consult: keep whichever candidate that predicate calls
+                        // NOT externally visible.
+                        //
+                        // ★★ `SymbolBinding::Global` IS PASSED DELIBERATELY, NOT
+                        // `attr.binding`, and this is load-bearing. The predicate
+                        // SHORT-CIRCUITS to false on `Local`, so feeding it the
+                        // real binding would make both candidates compare equal
+                        // under a co-present `static` and collapse the rule to
+                        // "keep the incumbent" — whose answer then depends on
+                        // whether `static` was folded BEFORE or AFTER the
+                        // visibility pair, i.e. it would reintroduce order
+                        // dependence through an UNRELATED axis. `Global` isolates
+                        // the visibility question: it makes the call a pure
+                        // function of visibility ({Hidden, Internal} confine;
+                        // {Default, Protected} export).
+                        //
+                        // ★ PINNED BY EXACTLY ONE TEST, AND IT HAD TO BE WRITTEN
+                        // FOR IT (TF-C93). Every arm of the three position pins
+                        // declares no storage class, so `attr.binding` is already
+                        // `Global` there and the literal is indistinguishable from
+                        // the field — MEASURED: swapping it leaves all NINE of them
+                        // GREEN. `StaticVisibilityConflictResidueIsBindingIndependent`
+                        // adds `static` + a conflicting visibility pair in BOTH
+                        // orders; RED-ON-DISABLE, BUILT AND RUN: under
+                        // `attr.binding` its `default`→`hidden` arm reads residue
+                        // `Default` (both candidates non-exporting ⇒ keep the
+                        // incumbent) while its `hidden`→`default` arm still passes,
+                        // which is why that pin loops both orders.
+                        //
+                        // When both candidates agree under the predicate
+                        // (Hidden vs Internal, Default vs Protected) the
+                        // incumbent stands: the diagnostic already fails the
+                        // build, so no artifact is produced from either order,
+                        // and there is no confining choice to make.
+                        bool const incumbentExports = isExternallyVisible(
+                            SymbolBinding::Global, attr.visibility);
+                        bool const candidateExports = isExternallyVisible(
+                            SymbolBinding::Global, *it->second.visibility);
+                        if (!candidateExports && incumbentExports)
+                            attr.visibility = *it->second.visibility;
+                    } else {
+                        attr.visibility          = *it->second.visibility;
+                        attr.visibilitySpecified = true;
+                    }
+                    // ★ NO `continue` HERE (unlike the binding guard). A
+                    // rejected visibility must not also DROP an orthogonal axis
+                    // the same key might carry: no shipped row pairs
+                    // `visibility` with `staticStorage` today, so this is inert
+                    // in c-subset, but a `continue` would make a future pairing
+                    // silently lose the storage fact — the exact class this
+                    // anchor exists to close.
+                }
                 if (it->second.staticStorage && staticStorageOut != nullptr)
                     *staticStorageOut = true;
             } else {
@@ -1208,6 +1842,50 @@ struct Lowerer {
         if (attr.binding != SymbolBinding::Global
             || attr.visibility != SymbolVisibility::Default)
             linkage.push_back({node, attr});
+    }
+    // TF-C78 (D-CSUBSET-NOINLINE): record the inliner opt-out for a lowered
+    // Function node from its bound symbol's `SymbolRecord.isNoInline` (sparse:
+    // only annotated functions are stored; absence ⇒ freely inlinable). `sym`
+    // must be the function's declared symbol. The `recordMutability` shape.
+    void recordNoInline(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isNoInline)
+            noInlineAcc.push_back({node, NoInlineAttr{/*isNoInline=*/true}});
+    }
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): the `recordNoInline` mirror — record the
+    // inliner cost-model bypass for a lowered Function node from its bound
+    // symbol's `SymbolRecord.isAlwaysInline` (sparse: only annotated functions
+    // are stored; absence ⇒ the size threshold applies as usual).
+    void recordAlwaysInline(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isAlwaysInline)
+            alwaysInlineAcc.push_back(
+                {node, AlwaysInlineAttr{/*isAlwaysInline=*/true}});
+    }
+    // ★★ TF-C85: the same shape again — record the optimizer opt-out for a
+    // lowered Function node from its bound symbol's `SymbolRecord.isNoOptimize`
+    // (sparse: only functions inside a `#pragma optimize("", off)` region are
+    // stored; absence ⇒ optimize normally, i.e. every function before TF-C85).
+    void recordNoOptimize(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isNoOptimize)
+            noOptimizeAcc.push_back(
+                {node, NoOptimizeAttr{/*isNoOptimize=*/true}});
+    }
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same shape a fifth time — record
+    // the thread-sanitizer exclusion for a lowered Function node from its bound
+    // symbol's `SymbolRecord.isNoSanitizeThread` (sparse: only annotated functions
+    // are stored; absence ⇒ no recorded exclusion, which is every function before
+    // TF-C92).
+    void recordNoSanitizeThread(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isNoSanitizeThread)
+            noSanitizeThreadAcc.push_back(
+                {node, NoSanitizeThreadAttr{/*isNoSanitizeThread=*/true}});
     }
     // Record const-ness for a lowered Global node from its bound symbol's
     // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
@@ -1578,10 +2256,20 @@ struct Lowerer {
     // natural home near `classifyLvalue` — so the `AssignCtx` below can embed it.)
     struct Lvalue {
         bool                   simple = true;
-        TypeId                 type{};       // the lvalue's value type
+        TypeId                 type{};       // the lvalue's value type (member: field access type)
         SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
-        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
-        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
+        TypeId                 ptrType{};    // via-ptr only: interner.pointer(member ? container : type)
+        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue-or-aggregate> ]
+        // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field-safe MEMBER lvalue.
+        // When `member`, the temp pointer addresses the CONTAINING AGGREGATE (not
+        // the bit-field sub-unit), and `lvRead`/`lvWrite` reconstruct
+        // `MemberAccess(Deref(ptr), memberFieldIdx)` so the MIR bit-field
+        // read-modify-write chokepoint (`bitfieldPlacementOf`) fires for the
+        // compound/inc-dec/value forms too — not just statement plain-`=`. The
+        // Deref re-types to `containerType`; the reconstructed node's type is `type`.
+        bool                   member = false;
+        std::uint32_t          memberFieldIdx = 0;
+        TypeId                 containerType{};  // the aggregate type (the Deref's result type)
     };
 
     // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
@@ -2090,7 +2778,13 @@ struct Lowerer {
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
                     // c79: variadic-tail args (invalid paramType) array-decay
                     // via the shared funnel (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
-                    HirNodeId const a = coerceCallArg(result, paramType).id;
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: pass the in-flight
+                    // arg's CST node (fresh index access — callCtxs may have grown)
+                    // so a shipped-descriptor int-pointee admission realizes its
+                    // Ptr→Ptr bitcast.
+                    HirNodeId const a =
+                        coerceCallArg(result, paramType,
+                                      callCtxs[ctxIdx].argNodes[k]).id;
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
@@ -3016,7 +3710,9 @@ struct Lowerer {
                     // c79: same call-arg funnel as the other three sites
                     // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY); declared params
                     // coerce byte-identically, Array-typed tail args decay.
-                    E const coerced = coerceCallArg(arg, paramType);
+                    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: `a` is the CST arg
+                    // node → realizes a shipped-descriptor int-pointee bitcast.
+                    E const coerced = coerceCallArg(arg, paramType, a);
                     argNode = coerced.id;
                 }
                 args.push_back(argNode);
@@ -3386,6 +4082,14 @@ struct Lowerer {
         // semantics) — each non-Bool scalar operand takes the truthiness
         // `Ne(operand, 0)` test (C99 6.5.13p3 / 6.5.14p3 "compares
         // unequal to 0"), never a value-truncating Cast.
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): the RESULT type here is the i1/Bool SSA CARRIER (a
+        // machine detail, widened to int on any arithmetic use). C's LANGUAGE
+        // result type is `int` (6.5.13p3 / 6.5.14p3) and the SEMANTIC type-oracle
+        // (subtreeType, D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports exactly that
+        // for sizeof/auto/_Generic. The two are different PROPERTIES by design —
+        // like char→i32; flipping this carrier to a full int would reintroduce the
+        // rejected global-flip codegen cost with no language-visible gain.
         if (e.target == "LogicalAnd" || e.target == "LogicalOr") {
             E const lb = coerceCondition(lhs, anchor);
             E const rb = coerceCondition(rhs, anchor);
@@ -3590,6 +4294,12 @@ struct Lowerer {
         // alias (`long` on LP64, `long long` on LLP64), declared per data model
         // in `semantics.synthesizedTypes`. The historic bare I64 was ANONYMOUS,
         // so it matched NEITHER named entry in a `_Generic`.
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): a relational/equality result is the i1/Bool SSA
+        // CARRIER here (a machine detail, widened on use). C's LANGUAGE result
+        // type is `int` (6.5.8p6 / 6.5.9p3); the SEMANTIC type-oracle
+        // (subtreeType, D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports `int` for
+        // sizeof/auto/_Generic. Different PROPERTIES by design — like char→i32.
         TypeId const result = isComparison(*op) ? boolType()
                             : ptrSub      ? synthesizedType(sem.pointerDifferenceType,
                                                             TypeKind::I64)
@@ -3732,6 +4442,33 @@ struct Lowerer {
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
         if (e.target == "Deref") {
+            // c-TF (D-CSUBSET-ARRAY-DECAY-IN-DEREF): C 6.3.2.1p3 — unary `*` is
+            // NOT one of the decay exceptions (sizeof / _Alignof / unary &), so an
+            // ARRAY operand decays to Ptr<elem> FIRST. `*(arrayName)` then
+            // dereferences the first element — identical to `*(arrayName + 0)` (the
+            // c59 additive-decay path) and to `arrayName[0]` (Index, whose
+            // `indexResultType` already types an Array base directly). The shared
+            // `derefResultType` law now types an Array operand directly too (→ elem,
+            // the sibling of `indexResultType`), so the TYPE is covered either way —
+            // but the CODEGEN still needs this call-site decay: it materializes the
+            // Array→Ptr as an actual `coerce` Cast so MIR gets a real POINTER VALUE
+            // to load through (a lone type change would leave the Deref loading from
+            // an array aggregate). Without it, sqlite `getVarint32(zBuf,…)` — whose
+            // macro derefs the `unsigned char zBuf[100]` array directly, `(*(A)<(u8)
+            // 0x80)?((B)=(u32)*(A)),1:…` — lost its pointer value. Reuses the ONE
+            // `coerce` Array→Ptr decay funnel (the c59/c91/cast pattern) so the FnSig
+            // fold + `derefResultType` below read the DECAYED Ptr. An array of
+            // function pointers `T(*a[])(…)` decays to `Ptr<Ptr<FnSig>>` → the fold
+            // (which requires operand[0] == FnSig) correctly does NOT fire and the
+            // deref yields the function pointer. A degenerate elementless Array
+            // (unreachable) falls through un-decayed → derefResultType InvalidType →
+            // still fails LOUD via H0001 (never a silent typed-wrong Deref).
+            if (operand.type.valid()
+                && interner.kind(operand.type) == TypeKind::Array) {
+                auto const elems = interner.operands(operand.type);
+                if (!elems.empty())
+                    operand = coerce(operand, interner.pointer(elems[0]));
+            }
             // FC4 c2 — C 6.5.3.2p4 designator decay as a lattice law:
             // `*` applied to a function pointer yields the function
             // DESIGNATOR, which (outside sizeof/&) immediately decays
@@ -3832,6 +4569,12 @@ struct Lowerer {
                 promotedTy = p;
             }
         }
+        // D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE (DELIBERATE — do NOT
+        // "align the tiers"): logical `!` (`(E == 0)`) results in the i1/Bool SSA
+        // CARRIER here (a machine detail, widened on use). C's LANGUAGE result type
+        // is `int` (6.5.3.3p5); the SEMANTIC type-oracle (subtreeType,
+        // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports `int` for sizeof/auto/
+        // _Generic. `-`/`~` (Neg/BitNot) keep `promotedTy` — the promoted operand.
         TypeId const result = (*op == HirOpKind::Not) ? boolType() : promotedTy;
         return {track(builder.addParent(HirKind::UnaryOp, std::array{unOperand.id},
                                         result, encodeOp(*op)), node), result};
@@ -4245,12 +4988,26 @@ struct Lowerer {
         return {idxNode, result};
     }
 
-    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
-    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
-    // inline `MemberAccess`/`MemberAccessThruPtr` arm. The follower (field-name
-    // subtree) is re-extracted from `node` exactly as `lowerPostfix` built `rest`:
-    // skip the first non-token (the base) and the op token, collect the remainder.
-    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
+    // The resolved FIELD of a member-access postfix node: its declaration-order
+    // `fieldIndex` (the MemberAccess payload), its SymbolRecord (for the anon-
+    // member path + field volatility), and its type. See `resolveMemberField`.
+    struct ResolvedMember {
+        SymbolRecord const* frec = nullptr;
+        std::uint32_t       fieldIndex = 0;
+        TypeId              fieldType{};
+    };
+    // Resolve a member-access postfix node's FIELD. NON-EMITTING and pure: the
+    // SINGLE field-resolution source shared by `combineMember` (the rvalue/
+    // statement member path) and `classifyMemberLvalue` (the bit-field-safe
+    // MUTATION-lvalue path, D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION), so the two
+    // can never disagree on which field / index a member names. The follower
+    // (field-name subtree) is re-extracted from `node` exactly as `lowerPostfix`
+    // built `rest`: skip the first non-token (the base) and the op token, collect
+    // the remainder. Returns nullopt on any miss (no follower leaf, unresolved
+    // symbol, missing record, or a non-field binding) — the caller decides whether
+    // that is a diagnostic (combineMember) or a silent fall-through to the generic
+    // lvalue path (classifyMemberLvalue).
+    [[nodiscard]] std::optional<ResolvedMember> resolveMemberField(NodeId node) {
         std::vector<NodeId> rest;
         {
             bool baseSeen = false;
@@ -4260,6 +5017,43 @@ struct Lowerer {
                 rest.push_back(c);
             }
         }
+        // Locate the field-name token inside the follower subtree (c-subset's
+        // `memberFollower = {sequence: [Identifier]}`). Robust against a future
+        // schema that wraps the name: scan for a real token first, fall back to
+        // the first visible child if the follower is all Internal.
+        NodeId const followerN = rest.empty() ? NodeId{} : rest.front();
+        NodeId fieldNameN{};
+        if (followerN.valid()) {
+            for (NodeId c : visible(followerN)) {
+                if (isToken(c)) { fieldNameN = c; break; }
+                if (!fieldNameN.valid()) fieldNameN = c;
+            }
+        }
+        if (!fieldNameN.valid()) return std::nullopt;
+        SymbolId const fieldSym = model.symbolAt(fieldNameN);
+        if (!fieldSym.valid()) return std::nullopt;
+        auto const* frec = model.recordFor(fieldSym);
+        if (frec == nullptr) return std::nullopt;
+        // Defensive: the resolved symbol must be a field of a composite type.
+        // Pass 2's member-access path always binds to a field (struct-scope
+        // lookup), but a future Pass-2 recovery path that falls back to
+        // enclosing-scope lookup could mis-bind to a non-field symbol whose
+        // `fieldIndex` is just declaration-order noise. Reject it here rather than
+        // emit a structurally-valid but semantically-wrong MemberAccess.
+        if (!frec->scope.valid() || frec->kind != DeclarationKind::Variable)
+            return std::nullopt;
+        // Field type: prefer the semantic-phase-propagated type on the field-name
+        // node; fall back to the symbol record's type.
+        TypeId fieldType = model.typeAt(fieldNameN);
+        if (!fieldType.valid()) fieldType = frec->type;
+        return ResolvedMember{frec, frec->fieldIndex, fieldType};
+    }
+
+    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
+    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
+    // inline `MemberAccess`/`MemberAccessThruPtr` arm; the field resolution now
+    // lives in the shared `resolveMemberField`.
+    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
         // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
         // already resolved the field's SymbolId (via the `memberAccesses`
         // facet) and propagated its type to both the field-name leaf and
@@ -4270,48 +5064,16 @@ struct Lowerer {
         // handles both forms, downstream MIR sees uniform GEP-after-load
         // patterns.
         if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
-            // Locate the field-name token inside the follower subtree
-            // (c-subset's `memberFollower = {sequence: [Identifier]}`). Robust
-            // against a future schema that wraps the name (e.g. bracketed
-            // identifiers): scan for a real token first, fall back to the
-            // first visible child if the follower is all Internal.
-            NodeId followerN = rest.empty() ? NodeId{} : rest.front();
-            NodeId fieldNameN{};
-            if (followerN.valid()) {
-                for (NodeId c : visible(followerN)) {
-                    if (isToken(c)) { fieldNameN = c; break; }
-                    if (!fieldNameN.valid()) fieldNameN = c;
-                }
+            auto const rf = resolveMemberField(node);
+            if (!rf) {
+                return exprError(node, "member access did not resolve to a field "
+                                       "(missing field-name leaf, unresolved "
+                                       "symbol, no record, or a non-field binding "
+                                       "— a semantic-phase miss)");
             }
-            if (!fieldNameN.valid()) {
-                return exprError(node, "member access has no field-name leaf");
-            }
-            SymbolId const fieldSym = model.symbolAt(fieldNameN);
-            if (!fieldSym.valid()) {
-                return exprError(node, "member access field did not resolve "
-                                       "to a symbol (semantic phase miss)");
-            }
-            auto const* frec = model.recordFor(fieldSym);
-            if (frec == nullptr) {
-                return exprError(node, "member access field SymbolId has no record");
-            }
-            // Defensive: the resolved symbol must be a field of a composite
-            // type. Pass 2's member-access path always binds to a field
-            // (struct-scope lookup), but a future Pass-2 recovery path that
-            // falls back to enclosing-scope lookup could mis-bind to a
-            // non-field symbol whose `fieldIndex` is just declaration-order
-            // noise. Catch it here rather than emitting a structurally-valid
-            // but semantically-wrong MemberAccess with a bogus index.
-            if (!frec->scope.valid()
-                || frec->kind != DeclarationKind::Variable) {
-                return exprError(node, "member access resolved to a non-field "
-                                       "symbol (semantic-phase mis-binding)");
-            }
-            std::uint32_t const fieldIndex = frec->fieldIndex;
-            // Field type: prefer the semantic-phase-propagated type on the
-            // field-name node; fall back to the symbol record's type.
-            TypeId fieldType = model.typeAt(fieldNameN);
-            if (!fieldType.valid()) fieldType = frec->type;
+            std::uint32_t const fieldIndex = rf->fieldIndex;
+            TypeId const fieldType = rf->fieldType;
+            SymbolRecord const* const frec = rf->frec;
             HirNodeId object = base.id;
             // The CONTAINER's resolved type — the object whose member is taken.
             // `s.a` ⇒ `base.type`; `p->a` ⇒ the Deref's pointee type. Carries the
@@ -4627,6 +5389,78 @@ struct Lowerer {
             // ── TERMINAL / synchronous forms (no nested child statement) ──────
             if (k == "VarDecl")     { stmtResult = lowerVarDecl(n); return; }
             if (k == "TypeDecl")    { stmtResult = lowerTypeDecl(n); return; }
+            // D-CSUBSET-BLOCK-SCOPE-EXTERN (C89 6.7.1): a block-scope `extern`
+            // declaration statement — `extern int f(int);` (function prototype) OR
+            // `extern T *p;` (object reference), incl. the c23 MULTI-DECLARATOR form
+            // `extern int a, b;` (D-CSUBSET-EXTERN-MULTI-DECLARATOR) — inside a function
+            // body. It reuses the FILE-scope externDecl lowering WHOLESALE:
+            // `lowerExternDeclInto` mints N ExternFunction/ExternGlobal HIR nodes (one
+            // per declarator) AND records each import row. We route EACH node to the
+            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
+            // SCOPE-PROTOTYPE pattern) — NEVER a statement-position push (lowerStmtNode
+            // has no ExternFunction/ExternGlobal arm → it would fail-loud) — and lower
+            // the STATEMENT itself to a no-op (an empty Block, the `Skip` precedent
+            // below), since the extern emits no code in the body. Pass-1 bound each
+            // symbol into the enclosing BLOCK scope (C 6.2.2p4 name scope; NOT re-homed
+            // to file scope the way the bare proto is — the isProto re-home is suppressed
+            // for a non-defining extern — so a block extern OBJECT or FUNCTION that
+            // shadows an outer local reads the extern), and collectExterns registers the
+            // symbol so a block use resolves via GlobalAddr — identical to a file-scope
+            // extern. An absorbed extern (a same-scope in-TU definition won the Pass-1
+            // merge) emits no node for that declarator, mirroring the
+            // top-level `lowerDeclInto` ExternDecl arm.
+            if (k == "ExternDecl") {
+                // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a
+                // FUNCTION DEFINITION (`extern int f(void){…}`) is valid ONLY at file
+                // scope — here it would be a NESTED function (not valid C; DSS does
+                // not synthesize one). Reject it fail-loud (never a silent hoist to
+                // module scope). Detected by the SAME kindByChild body-block
+                // discriminator the file-scope path uses; a plain block-scope extern
+                // DECLARATION (proto/object, EndStatement tail) passes through.
+                if (auto dit = declMap_.find(tree().rule(n).v);
+                    dit != declMap_.end()) {
+                    DeclarationRule const& edecl = sem.declarations[dit->second];
+                    if (edecl.kindByChild) {
+                        NodeId const disc = descendVisibleDecl(
+                            tree(), n, edecl.kindByChild->childPath, edecl);
+                        if (disc.valid()
+                            && tree().kind(disc) == NodeKind::Internal
+                            && tree().rule(disc).v
+                                   == edecl.kindByChild->whenRule.v) {
+                            stmtResult = reportedError(n,
+                                "a function definition may not appear in block scope "
+                                "— `extern` on a function definition is a nested "
+                                "function (not valid C); move it to file scope");
+                            return;
+                        }
+                    }
+                }
+                // D-CSUBSET-EXTERN-MULTI-DECLARATOR: a block-scope extern lowers to N
+                // ExternGlobal/ExternFunction nodes (one per declarator, or none when
+                // absorbed). They carry no runtime code, so route EACH to the module-
+                // decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
+                // SCOPE-PROTOTYPE pattern — a statement-position push would fail loud
+                // in lowerStmtNode, which has no Extern* arm) and lower the STATEMENT
+                // to a no-op empty Block (the Skip precedent).
+                std::vector<HirNodeId> externs;
+                lowerExternDeclInto(n, externs);
+                if (!externs.empty()) {
+                    if (moduleDecls_ != nullptr) {
+                        for (HirNodeId e : externs) moduleDecls_->push_back(e);
+                    } else {
+                        // Mirrors the block-proto / static-local MF-3 guard: a
+                        // block-scope extern reached with no module-decls accumulator
+                        // (outside a module tree walk) is a bug — a loud error, never a
+                        // silent drop of the import row.
+                        stmtResult = reportedError(n,
+                            "block-scope extern synthesized with no module-decls "
+                            "accumulator (outside a module tree walk)");
+                        return;
+                    }
+                }
+                stmtResult = track(builder.makeBlock({}), n);
+                return;
+            }
             if (k == "ExprStmt")    { stmtResult = lowerExprStmt(n); return; }
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
@@ -5301,7 +6135,12 @@ struct Lowerer {
             Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
             return lv;
         }
-        E target = lowerExpr(peelToCore(operandN));
+        NodeId const core = peelToCore(operandN);
+        // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a member ++/-- (`bf.a++`,
+        // `--p->a`) routes through the aggregate-address + MemberAccess
+        // reconstruction so a bit-field inc/dec is a read-modify-write.
+        if (auto m = classifyMemberLvalue(core)) return m;
+        E target = lowerExpr(core);
         // An addressable lvalue lowers to Deref (`*p`), Index (`a[i]`), or
         // MemberAccess (`s.f`/`s->f`). Anything else — Literal, BinaryOp, UnaryOp,
         // Call, Cast, SeqExpr — is an rvalue with no modifiable object.
@@ -5520,7 +6359,9 @@ struct Lowerer {
         if (isBraceInitList(core)) {
             return lowerBraceInit(core, paramType);
         }
-        return coerceCallArg(lowerExpr(argNode), paramType).id;
+        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: forward the CST `argNode` so a
+        // shipped-descriptor int-pointee admission realizes its Ptr→Ptr bitcast.
+        return coerceCallArg(lowerExpr(argNode), paramType, argNode).id;
     }
 
     // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
@@ -5649,19 +6490,46 @@ struct Lowerer {
     [[nodiscard]] E lowerSizeof(NodeId node) {
         // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
         // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
-        // stamped size_t. Descend to the form, then scan its children for the
-        // operand's stamped type — skipping the form's own size_t stamp.
+        // stamped size_t. Descend to the form, then recover the operand's type —
+        // skipping the form's own size_t stamp.
         NodeId form{};
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
         }
         NodeId const scan = form.valid() ? form : node;
+        // D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK: the VALUE form (`sizeof e`)
+        // sizes the OPERAND EXPRESSION's OWN result type — the type the semantic
+        // tier stamps DIRECTLY on the operand node (its `subtreeType`; e.g. the
+        // element type of `*arr` after C 6.3.2.1p3 array-decay, or an identifier /
+        // literal token's Pass-2 stamp). Read that DIRECT stamp and NEVER descend:
+        // `resolveStampedTypeBelow` DFS-descends past an UNSTAMPED operator node
+        // into a CHILD's stamp — a SILENT WRONG GUESS (for `sizeof(*arr)` an
+        // unstamped `*arr` fell through to `arr`'s ARRAY type: 40, not the element
+        // 4). If the operand carries no direct type, the semantic tier failed to
+        // type it — FAIL LOUD rather than mis-size by guessing at a sub-expression.
+        // The TYPE form (`sizeof(T)`) keeps the descent: its stamp legitimately
+        // lives on a leaf token below the (unstamped) type-ref wrapper.
         TypeId sized = InvalidType;
-        for (NodeId c : visible(scan)) {
-            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
-        }
-        if (!sized.valid()) {
-            return exprError(node, "sizeof operand did not resolve to a type");
+        bool const valueForm =
+            form.valid() && sem.sizeofValueRule.valid()
+            && tree().rule(form).v == sem.sizeofValueRule.v;
+        if (valueForm) {
+            for (NodeId c : visible(form)) {
+                if (TypeId t = model.typeAt(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node,
+                    "sizeof value-operand was not typed by the semantic analyzer "
+                    "(refusing to descend into a sub-expression and silently "
+                    "mis-size the operand)");
+            }
+        } else {
+            for (NodeId c : visible(scan)) {
+                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node, "sizeof operand did not resolve to a type");
+            }
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // D-LANG-TYPE-IDENTITY-VOCABULARY: C's `size_t` — the NAMED entry the
@@ -6662,27 +7530,139 @@ struct Lowerer {
 
     // (`struct Lvalue` is defined up near `ExprFrame`/`AssignCtx`, which embeds it.)
 
-    [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) {
+    // The HIR node denoting the lvalue itself — used as a fresh rvalue READ or as
+    // an assign TARGET. `simple` → `Ref(sym)`. via-ptr non-member → `Deref(ptr)`.
+    // via-ptr MEMBER → `MemberAccess(Deref(ptr), fieldIdx)` reconstructed so the
+    // MIR bit-field chokepoint fires (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION); a
+    // NON-bit-field member reconstructs to the SAME MemberAccess a plain `s.x = v`
+    // uses, i.e. a plain scalar store/load — unaffected. Each call mints FRESH
+    // nodes (HIR is a strict single-parent tree), all referencing the ONE temp
+    // pointer bound in `prep`, so the base's side effects run exactly once.
+    [[nodiscard]] HirNodeId lvNode(Lvalue const& lv) {
         if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
-        return builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
+        HirNodeId const base = builder.makeDeref(
+            builder.makeRef(lv.ptrType, lv.sym.v),
+            lv.member ? lv.containerType : lv.type, HirFlags::Synthetic);
+        if (!lv.member) return base;
+        return builder.makeMemberAccess(base, lv.memberFieldIdx, lv.type, HirFlags::Synthetic);
     }
+    [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) { return lvNode(lv); }
     [[nodiscard]] HirNodeId lvWrite(Lvalue const& lv, HirNodeId value) {
-        HirNodeId target = lv.simple
-            ? builder.makeRef(lv.type, lv.sym.v)
-            : builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
-        return builder.makeAssignStmt(target, value);
+        return builder.makeAssignStmt(lvNode(lv), value);
     }
 
-    // Classify an lvalue CST. A plain variable → simple (no prep). Anything else
-    // (index / deref) → via a temp pointer bound in `prep`. nullopt when the
-    // lvalue can't be lowered (no resolved type / not an addressable form).
+    // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: classify a MEMBER lvalue so a
+    // bit-field MUTATION in any position other than statement plain-`=` (a
+    // value-position `(bf.a = v)`, a compound `bf.a += 1`, an inc/dec `bf.a++`)
+    // reaches the MIR bit-field read-modify-write chokepoint (`bitfieldPlacementOf`
+    // → `emitBitfieldInsert`/`emitBitfieldExtract`), which only fires when the
+    // store/load TARGET is a `MemberAccess` node. The generic complex-lvalue path
+    // binds `&(bf.a)` (a sub-unit address) into a temp pointer and emits a plain
+    // `*p` Deref — losing the MemberAccess, so the unit takes a full-width store
+    // that clobbers packed neighbours and skips truncation. This classifier binds
+    // the CONTAINING AGGREGATE's address instead (`p = &base` for `.`, or the base
+    // pointer itself for `->`; the struct IS addressable, a bit-field sub-unit is
+    // NOT) and marks the lvalue so `lvRead`/`lvWrite` reconstruct
+    // `MemberAccess(Deref(p), field)` — routing BOTH statement and value forms
+    // through the ONE existing RMW chokepoint. A NON-bit-field member reconstructs
+    // to the SAME MemberAccess a plain `s.x = v` uses (a plain scalar store) — so
+    // it is behaviour-preserving. The base is lowered EXACTLY once, so its side
+    // effects (`arr[i++].a`, `f()->a`) run once. Returns nullopt (→ the generic
+    // path, whose behaviour is unchanged) for a non-member lvalue, an anonymous-
+    // member field (which needs intermediate hops the single-MemberAccess
+    // reconstruction cannot synthesize), an array-arrow base, or an unresolved
+    // member — none of which regress. Field resolution + the container-volatility
+    // qualification mirror `combineMember` EXACTLY (shared `resolveMemberField` +
+    // `volatileQualifiedAccess`), so the reconstructed node is byte-identical to
+    // the rvalue/statement member access.
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: FAIL LOUD when a BIT-FIELD is
+    // mutated (compound / inc-dec / value position) through a base the single-field
+    // reconstruction cannot address — an anonymous-member hop chain or an array-arrow
+    // decay. Returning nullopt into the generic via-ptr path would silently
+    // full-unit-store (clobber neighbours + skip truncation); the emitted error makes
+    // the HIR tier unclean so the compile aborts (`tierClean`, compile_pipeline.cpp)
+    // — never a wrong binary. NON-bit-field members through the same bases stay on the
+    // (correct) generic scalar-store path; statement plain-`=` never routes here.
+    [[nodiscard]] std::optional<Lvalue> bitfieldBaseUnsupported(NodeId core) {
+        emitH(DiagnosticCode::S_BitfieldMutationUnsupportedBase, core,
+              "bit-field compound-assignment / increment / value-position mutation "
+              "through an anonymous member or an array-arrow base is not yet "
+              "supported (the read-modify-write cannot address the packed allocation "
+              "unit here) — use a named member, or a plain `=` statement");
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<Lvalue> classifyMemberLvalue(NodeId core) {
+        NodeId baseN{}, subscriptN{};
+        HirOperatorEntry const* e = nullptr;
+        if (postfixFlattenPlan(core, baseN, subscriptN, e) != PostfixFlatten::Member)
+            return std::nullopt;
+        auto const rf = resolveMemberField(core);
+        if (!rf) return std::nullopt;                       // unresolved → generic (fail-loud there)
+        // D5.1: a bit-field field carries a resolved `: width` on its record — the
+        // detector for the fail-loud residual below (container-independent, so it
+        // works through an anonymous-member chain the generic path can't reconstruct).
+        bool const isBitfield = rf->frec->bitFieldWidth.has_value();
+        if (!rf->frec->anonAncestorPath.empty())            // anon-member hop chain
+            return isBitfield ? bitfieldBaseUnsupported(core) : std::nullopt;
+        bool const thruPtr = (e->target == "MemberAccessThruPtr");
+        E const base = lowerExpr(baseN);                    // the aggregate / pointer, lowered ONCE
+        if (!base.type.valid()) return std::nullopt;
+        TypeId containerType{}, ptrType{};
+        HirNodeId aggPtr{};
+        if (thruPtr) {
+            // `p->field`: the aggregate pointer IS the base value. An ARRAY-arrow
+            // base (c82 arrow-decay) can't be addressed by this reconstruction: a
+            // bit-field there FAILS LOUD (else a silent full-unit store), a
+            // non-bit-field defers to the (correct) generic path.
+            if (interner.kind(base.type) != TypeKind::Ptr
+                || interner.operands(base.type).empty()
+                || !interner.operands(base.type)[0].valid()) {
+                if (isBitfield && interner.kind(base.type) == TypeKind::Array)
+                    return bitfieldBaseUnsupported(core);
+                return std::nullopt;
+            }
+            containerType = interner.operands(base.type)[0];
+            ptrType       = base.type;                      // Ptr<container>
+            aggPtr        = base.id;
+        } else {
+            // `obj.field`: bind the CONTAINING AGGREGATE's address.
+            containerType = base.type;
+            ptrType       = interner.pointer(containerType);
+            aggPtr        = builder.makeAddressOf(base.id, ptrType, HirFlags::Synthetic);
+        }
+        // The field ACCESS type — container-volatility-qualified EXACTLY as
+        // combineMember computes it (so `volatileFlagForType` at the MIR site flags
+        // a `volatile`-container member's RMW). A `volatile`-declared FIELD's own
+        // storage rides `fieldType`'s top-level VolatileQual through this too.
+        TypeId const accessType = volatileQualifiedAccess(rf->fieldType, containerType);
+        if (!accessType.valid()) return std::nullopt;
+        Lvalue lv;
+        lv.simple         = false;
+        lv.member         = true;
+        lv.type           = accessType;
+        lv.containerType  = containerType;
+        lv.memberFieldIdx = rf->fieldIndex;
+        lv.ptrType        = ptrType;
+        lv.sym            = freshSymbol();
+        lv.prep.push_back(builder.makeVarDecl(ptrType, lv.sym.v, aggPtr, HirFlags::Synthetic));
+        return lv;
+    }
+
+    // Classify an lvalue CST. A plain variable → simple (no prep). A MEMBER access
+    // → the aggregate-address + MemberAccess reconstruction (bit-field-safe; see
+    // `classifyMemberLvalue`). Anything else (index / deref) → via a temp pointer
+    // bound in `prep`. nullopt when the lvalue can't be lowered (no resolved type /
+    // not an addressable form).
     [[nodiscard]] std::optional<Lvalue> classifyLvalue(NodeId exprCst) {
         if (auto s = simpleLvalue(exprCst)) {
             Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
             if (!lv.type.valid()) return std::nullopt;
             return lv;
         }
-        E target = lowerExpr(peelToCore(exprCst));
+        NodeId const core = peelToCore(exprCst);
+        if (auto m = classifyMemberLvalue(core)) return m;
+        E target = lowerExpr(core);
         if (!target.type.valid()) return std::nullopt;
         Lvalue lv;
         lv.simple  = false;
@@ -6780,9 +7760,19 @@ struct Lowerer {
     // ADDRESS-TAKEABLE, so `(cond ? die : other)(1)` is legal C; firstNameToken
     // would resolve that to `die` and wrongly wrap it → eliding `other`'s return
     // path = a MISCOMPILE. A ternary / deref / cast callee lowers to a NON-Ref node
-    // → false (safe, conservative); a function-POINTER object `fp(1)` lowers to
-    // Ref(fp) whose record has isNoreturn==false → false (safe). Only a bare direct
-    // call to a noreturn callee is wrapped.
+    // → false (safe, conservative). Only a bare direct call to a noreturn callee is
+    // wrapped.
+    //
+    // ★ TF-C94 — A FUNCTION-POINTER OBJECT NOW REACHES THIS PREDICATE FOR REAL.
+    // `fp(1)` has ALWAYS lowered its callee to `Ref(fp)`; what changed is that
+    // `SymbolRecord.isNoreturn` can now be TRUE for such a symbol, because Pass 1's
+    // noreturn apply admits a `Ptr<FnSig>` declarator (GNU binds the attribute to
+    // the pointee's function type, and host clang honors it there). This comment
+    // previously asserted the pointer case was "isNoreturn==false → false (safe)"
+    // as a standing property; it was only ever true because nothing SET the flag on
+    // a pointer, and that is exactly the shape of claim that rots. The wrap is
+    // correct here for the same reason it is correct for a direct call: the
+    // declaration says the callee does not return.
     [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
         if (builder.kind(id) != HirKind::Call) return false;
         auto const kids = builder.children(id);
@@ -7380,8 +8370,21 @@ struct Lowerer {
     // declarator (`int x = 1, *p = q;` → two nodes). Appends to `out` so
     // multi-node consumers (lowerTopLevelInto's module globals) stay flat;
     // single-node statement consumers wrap via `lowerVarLike` below.
+    // `originsOut`, when non-null, receives ONE entry per HirNodeId appended to
+    // `out` by this call — the CST declarator that produced it, or the declaration
+    // node for the whole-declaration arms. It exists because the number of emitted
+    // nodes is NOT the number of declarators (a prototype that declines extern
+    // synthesis emits nothing), so a caller that needs per-declarator linkage
+    // cannot recover the mapping by index arithmetic. The two vectors are kept in
+    // lockstep by routing EVERY push through `pushOut` below — do not add a bare
+    // `out.push_back` to this function.
     void lowerVarLikeInto(NodeId node, bool asGlobal,
-                          std::vector<HirNodeId>& out) {
+                          std::vector<HirNodeId>& out,
+                          std::vector<NodeId>* originsOut = nullptr) {
+        auto const pushOut = [&](HirNodeId h, NodeId origin) {
+            out.push_back(h);
+            if (originsOut != nullptr) originsOut->push_back(origin);
+        };
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl =
             (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
@@ -7394,7 +8397,15 @@ struct Lowerer {
         bool staticStorage = false;
         LinkageAttr staticLinkage{};
         if (!asGlobal && decl != nullptr) {
-            staticLinkage = linkageFrom(specifierPrefixChild(tree(), node, *decl),
+            // PREFIX-ONLY, deliberately. The storage-class specifiers that set
+            // `staticStorage` (`static` / `thread_local` / `constexpr`) can appear
+            // ONLY in the declaration-specifier prefix — C has no trailing
+            // storage-class syntax — so a declarator's after-declarator attribute
+            // run can never contribute to this axis. Scanning prefix-only is
+            // therefore not a simplification but the exact rule, and it keeps this
+            // declaration-level fact declaration-level while the per-declarator
+            // linkage below varies per declarator.
+            staticLinkage = linkageFrom(linkagePrefixRoots(node, *decl),
                                         *decl, &staticStorage);
         }
         if (decl == nullptr || !decl->isDeclaratorMode()
@@ -7403,12 +8414,12 @@ struct Lowerer {
             // path (no shipped non-declarator language admits `static` locals).
             // Never silently lower it as an automatic local on the legacy path.
             if (staticStorage) {
-                out.push_back(reportedError(node,
+                pushOut(reportedError(node,
                     "static-storage-duration local declarations require "
-                    "declarator-mode lowering"));
+                    "declarator-mode lowering"), node);
                 return;
             }
-            out.push_back(lowerVarLikeLegacy(node, asGlobal, decl));
+            pushOut(lowerVarLikeLegacy(node, asGlobal, decl), node);
             return;
         }
         DeclaratorConfig const& dc = *sem.declarators;
@@ -7436,8 +8447,8 @@ struct Lowerer {
                 && interner.kind(slotTy) == TypeKind::Void) {
                 return;
             }
-            out.push_back(track(
-                builder.makeVarDecl(slotTy, 0, std::nullopt), node));
+            pushOut(track(
+                builder.makeVarDecl(slotTy, 0, std::nullopt), node), node);
         };
         if (!carrier.has_value() || *carrier >= vis.size()) {
             if (singleMode) emitAbstractSlot();
@@ -7518,10 +8529,29 @@ struct Lowerer {
             //   * neither ⇒ the empty-library import survives to the LINKER,
             //     which rejects it LOUD as an undefined symbol naming the
             //     symbol (ld's behavior).
-            // ONLY an external-linkage proto synthesizes: a `static` (Local)
-            // or weak proto must never bind another TU's public symbol
-            // (C 6.2.2p3) — those keep the pre-c86 loud H0009 at the first
-            // call. The node needs NO param children (the FnSig carries the
+            // ONLY an INTERNAL-linkage proto declines: a `static` prototype
+            // (Local) names a TU-private function, so binding it to another
+            // TU's public definition would be a wrong binding (C 6.2.2p3) —
+            // it keeps the pre-c86 loud H0009 at the first call.
+            //
+            // ★ WEAK IS NOT INTERNAL, and an earlier revision of this gate had
+            // that factually wrong (it tested `== Global`, so a Weak proto
+            // declined too). C 6.2.2 has no `weak` at all: `weak` is a GNU
+            // BINDING attribute that changes how the LINKER resolves a symbol,
+            // not a linkage class — a weak DECLARATION still has EXTERNAL
+            // linkage and binds a sibling TU's definition normally. GROUND
+            // TRUTH, real clang on this Mac, two TUs
+            // (`int f(void) __attribute__((weak)); int main(){return f();}`
+            // + `int f(void){return 42;}`): links, runs, exit 42 — in BOTH the
+            // leading `__attribute__((weak)) int f(void);` spelling and the
+            // trailing one. Testing `== Global` refused to synthesize the
+            // extern, so the call had nothing to bind and the whole program
+            // failed H0009 with no binary — legal C rejected. The RULE, not
+            // one spelling of it, is what the `!= Local` test fixes: the
+            // leading spelling reached this gate through the specifier prefix
+            // long before the after-declarator roots existed and was broken
+            // exactly the same way (MEASURED at the pre-TF-C73 HEAD).
+            // The node needs NO param children (the FnSig carries the
             // param types — the shipped-descriptor synthesis precedent). A
             // BLOCK-scope proto (re-homed to file scope per
             // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE) routes to the MODULE decls via
@@ -7535,26 +8565,41 @@ struct Lowerer {
                 // The proto's linkage: LOCALS reuse the entry-scan result
                 // (`staticLinkage` — already computed for !asGlobal, so no
                 // re-scan and no duplicated unknown-specifier diagnostics);
-                // GLOBALS re-scan ONLY when a specifier prefix exists (the
-                // bare sqlite3.h proto has none ⇒ zero extra scans; a
-                // prefix with an UNKNOWN specifier may re-emit its loud
-                // H_UnknownLinkageSpecifier — rare, never silent).
+                // GLOBALS re-scan ONLY when the declaration actually HAS a
+                // linkage-bearing subtree (the bare sqlite3.h proto has neither
+                // a specifier prefix nor an after-declarator attribute run ⇒
+                // the roots are empty ⇒ zero extra scans, exactly as
+                // when this gate read `pfx.valid()`; a root with an UNKNOWN
+                // specifier may re-emit its loud H_UnknownLinkageSpecifier —
+                // rare, never silent).
+                // TF-C73: routing this through the declarator's own roots is
+                // what lets a TRAILING `static`-equivalent binding reach the
+                // gate at all. It does NOT change the answer for `weak` — see
+                // the `!= Local` gate below and the paragraph above it: a weak
+                // proto has EXTERNAL linkage and must synthesize.
+                // PER-DECLARATOR (`d`), not per-declaration: the gate below asks
+                // whether THIS prototype has internal linkage, and a sibling
+                // declarator's binding attribute must not answer for it.
                 auto protoLinkage = [&]() -> LinkageAttr {
                     if (!asGlobal) return staticLinkage;
-                    NodeId const pfx =
-                        specifierPrefixChild(tree(), node, *decl);
-                    return pfx.valid() ? linkageFrom(pfx, *decl)
-                                       : LinkageAttr{};
+                    return declaratorLinkage(
+                        linkageFrom(linkagePrefixRoots(node, *decl), *decl),
+                        *decl, d);
                 };
                 if (decl->prototypeSynthesizesExtern
                     && pr->isProtoDeclaration && !pr->isAbsorbedProto
                     && pr->kind == DeclarationKind::Function
                     && pr->type.valid()
-                    && protoLinkage().binding == SymbolBinding::Global) {
+                    && protoLinkage().binding != SymbolBinding::Local) {
                     HirNodeId const ef = track(
                         builder.makeExternFunction(pr->type, sym.v, {}), d);
                     auto const* shipped =
                         model.suppressedShippedSymbolFor(pr->name);
+                    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a bare-prototype
+                    // cross-TU reference carries the
+                    // prototype's own asm label (set below), so a labelled
+                    // prototype resolves against the labelled definition in the
+                    // sibling TU rather than against its C name.
                     externDecls.push_back(HirExternRecord{
                         ef, pr->name,
                         shipped != nullptr
@@ -7566,19 +8611,21 @@ struct Lowerer {
                         // prototype's synthesized import, else the versioned
                         // symbol misbinds unversioned (the realpath@GLIBC_2.2.5
                         // silent bug the descriptor path fixes).
-                        shipped != nullptr ? shipped->version : std::string{}});
+                        shipped != nullptr ? shipped->version : std::string{},
+                        /*isEagerImport=*/false,
+                        pr->asmName});   // TF-C88 (asm label)
                     if (asGlobal) {
-                        out.push_back(ef);
+                        pushOut(ef, d);
                     } else if (moduleDecls_ != nullptr) {
                         moduleDecls_->push_back(ef);
                     } else {
                         // Mirrors the static-local MF-3 guard: a block-scope
                         // proto outside a module tree walk is a bug — never a
                         // silent drop.
-                        out.push_back(reportedError(d,
+                        pushOut(reportedError(d,
                             "bare-prototype extern synthesized with no "
                             "module-decls accumulator (outside a module "
-                            "tree walk)"));
+                            "tree walk)"), d);
                     }
                 }
                 continue;
@@ -7592,6 +8639,7 @@ struct Lowerer {
                 for (NodeId c : visible(d)) {
                     if (isToken(c)) continue;
                     if (tree().rule(c).v == dc.declaratorRule.v) continue;
+                    if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62
                     init = lowerExprOrBraceInit(c, type);
                     break;
                 }
@@ -7608,9 +8656,9 @@ struct Lowerer {
                 // MF-3: the module-decls accumulator is set at lowerTree entry;
                 // a static seen outside a tree walk is a bug — fail loud.
                 if (moduleDecls_ == nullptr) {
-                    out.push_back(reportedError(d,
+                    pushOut(reportedError(d,
                         "static local lowered with no module-decls accumulator "
-                        "(outside a module tree walk)"));
+                        "(outside a module tree walk)"), d);
                     continue;
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
@@ -7689,7 +8737,7 @@ struct Lowerer {
                         || isPtrToVla))
                     captureVlaSize(d, sym);
             }
-            out.push_back(lowered);
+            pushOut(lowered, d);
         }
     }
 
@@ -7763,7 +8811,19 @@ struct Lowerer {
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
 
-    HirNodeId lowerTypeDecl(NodeId node) {
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): a type declaration lowers to ONE
+    // `TypeDecl` PER NAMED DECLARATOR — `typedef mach_port_t vm_map_t,
+    // vm_map_read_t, vm_map_inspect_t;` emits three. The `Into` shape is the
+    // `lowerExternDeclInto` / `lowerVarLikeInto` pattern: the caller owns the
+    // container, so a top-level list appends flat and a statement-position list
+    // wraps once (see `lowerTypeDecl` below for why the wrap must exist).
+    //
+    // ★ WHY N NODES AND NOT ONE. A TypeDecl emits no code for an ordinary alias, so
+    // "just lower the first" would look green — but a VLA typedef's TypeDecl is
+    // where HIR→MIR FREEZES that alias's runtime size slots (C99 6.7.7p2 evaluates
+    // the bound once, when the typedef is REACHED). Dropping the 2nd..Nth node
+    // would silently leave those aliases' sizes unfrozen while every test passed.
+    void lowerTypeDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
         // Strip-aware for the same reason as `lowerVarLike` above: no shipped
@@ -7772,6 +8832,11 @@ struct Lowerer {
         auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
+        // TF-C88: true once the per-declarator loop has emitted at least one node,
+        // which is what tells the tail below NOT to fall through to the single-node
+        // anon-composite path (`enum {V=16};` — a row with NO named declarator at
+        // all, whose type is stamped on the declaration node itself).
+        bool emittedPerDeclarator = false;
         // FC4 c1: declarator-mode type rows (c-subset typedefDecl) carry the
         // declared name inside the declarator — the shared walk finds it.
         if (decl && decl->isDeclaratorMode() && sem.declarators.has_value()) {
@@ -7785,8 +8850,13 @@ struct Lowerer {
                 for (NodeId d : declarators) {
                     NodeId const nameNode =
                         declaratorNameNode(tree(), d, *sem.declarators);
+                    // An ABSTRACT declarator mints no symbol; Pass-1's
+                    // `requireNamedDeclarators` already erred
+                    // (S_DeclarationDeclaresNothing) on this row, so skipping is a
+                    // reported, not a silent, outcome.
                     if (!nameNode.valid()) continue;
-                    sym = model.symbolAt(nameNode);
+                    sym  = model.symbolAt(nameNode);
+                    type = InvalidType;
                     if (auto const* rec = model.recordFor(sym)) type = rec->type;
                     // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
                     // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
@@ -7819,13 +8889,21 @@ struct Lowerer {
                                 "a typedef that aliases a variable-length-array "
                                 "typedef is not yet supported");
                     }
-                    break;   // typedefs declare a single declarator
+                    // TF-C88: emit THIS alias's node, then continue to the next
+                    // slot. The `break` that used to sit here (commented "typedefs
+                    // declare a single declarator") was true only because the
+                    // GRAMMAR admitted one; it is the second half of the
+                    // multi-declarator unit.
+                    out.push_back(track(builder.makeTypeDecl(
+                        type.valid() ? type : model.typeAt(node), sym.v), d));
+                    emittedPerDeclarator = true;
                 }
             }
         } else if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl->nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        if (emittedPerDeclarator) return;
         // D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: an ANONYMOUS composite specifier
         // (tagless `enum {…}` / `struct {…}` / `union {…}`) binds its interned type
         // on the SPECIFIER node ITSELF (Pass-1.5 stamps `nodeToType[specNode]`), NOT
@@ -7837,7 +8915,22 @@ struct Lowerer {
         // HIR verifier even though the enum type resolved fine (the NAMED form is
         // clean because vis[nameChild] is the tag Identifier, where the symbol binds).
         if (!type.valid()) type = model.typeAt(node);
-        return track(builder.makeTypeDecl(type, sym.v), node);
+        out.push_back(track(builder.makeTypeDecl(type, sym.v), node));
+    }
+
+    // TF-C88: the SINGLE-node statement-context wrapper — the exact `lowerVarLike`
+    // shape. One declarator lowers to its bare TypeDecl (byte-identical to every
+    // single-declarator program before this cycle); a multi-declarator typedef
+    // statement wraps its N TypeDecls in a Block, because a statement position
+    // holds exactly one node AND the order must be preserved (a VLA typedef's size
+    // freeze happens AT its TypeDecl, so hoisting the extras out of the body — the
+    // block-scope-extern trick — would move the evaluation). Zero named declarators
+    // yield an empty Block, never silence: Pass-1 already erred.
+    HirNodeId lowerTypeDecl(NodeId node) {
+        std::vector<HirNodeId> out;
+        lowerTypeDeclInto(node, out);
+        if (out.size() == 1) return out[0];
+        return track(builder.makeBlock(out), node);
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
@@ -7950,6 +9043,149 @@ struct Lowerer {
         return sem.identifierToken.valid() && tk == sem.identifierToken;
     }
 
+    // FC4 c1 / D-CSUBSET-EXTERN-FN-DEFINITION: lower a DECLARATOR-MODE function
+    // DEFINITION (the kindByChild discriminator matched a body block) to a real
+    // HIR Function. SHARED by `lowerTopLevelInto` (a plain/`static` definition)
+    // and `lowerExternDeclInto` (an `extern int f(void){…}` definition) so the
+    // two never drift — the ONLY difference between them is the declaration row
+    // (which carries the linkage) and it is threaded in via `decl`/`linkAttr`.
+    // `discNode` is the matched kindByChild node (the body block when bodyPath is
+    // empty — the declarator-mode convention: params live in the declarator's fn
+    // suffix, the matched block IS the body). Degrades to an Error node when the
+    // semantic tier already rejected the declarator (no named declarator).
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): a file-scope
+    // function DEFINITION every one of whose declarations spelled `inline`
+    // without `extern` is an INLINE DEFINITION — it "does not provide an
+    // external definition for the function", so this translation unit emits NO
+    // body for it and the call resolves against some other TU's external
+    // definition. Returns true (with `outNode` set to the replacement HIR node,
+    // or invalid when the language synthesizes nothing) when it CLAIMED the
+    // declaration; false leaves the ordinary definition path untouched.
+    //
+    // ★ THE SUPPRESSION AND THE REPLACEMENT ARE ONE DECISION, deliberately in
+    // one function. Suppressing the body without leaving a declaration behind
+    // makes a sibling CU's definition win SILENTLY — same program, different
+    // bytes, no diagnostic — which is the sharpest failure this feature can
+    // have. Emitting the `ExternFunction` in the same breath keeps the outcome
+    // observable: it resolves against a sibling CU (the LK11 merge strips the
+    // import and calls direct) or fails LOUD K_SymbolUndefined naming the
+    // symbol, exactly as a bare prototype does.
+    //
+    // ★ ONLY A `Global` BINDING IS CLAIMED. 6.7.4p7 constrains functions with
+    // EXTERNAL linkage; a `static inline` has internal linkage (6.7.4p6 admits
+    // any internal-linkage function as inline) and MUST still be emitted, as
+    // must a `weak` one — MEASURED, clang emits `t _p` for `static inline`.
+    [[nodiscard]] bool
+    lowerInlineDefinitionAsDeclaration(NodeId node, DeclarationRule const& decl,
+                                       DeclaratorConfig const& dc,
+                                       LinkageAttr linkAttr,
+                                       HirNodeId& outNode) {
+        outNode = HirNodeId{};
+        if (linkAttr.binding != SymbolBinding::Global) return false;
+        auto vis = declRoleChildren(tree(), node, decl);
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        if (!carrier.has_value() || *carrier >= vis.size()) return false;
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        NodeId fnName{};
+        for (NodeId d : declarators) {
+            fnName = declaratorNameNode(tree(), d, dc);
+            if (fnName.valid()) break;
+        }
+        if (!fnName.valid()) return false;
+        SymbolId const sym = model.symbolAt(fnName);
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr || !rec->isInline || !rec->type.valid()) return false;
+        if (!decl.prototypeSynthesizesExtern) return true;
+        HirNodeId const ef =
+            track(builder.makeExternFunction(rec->type, sym.v, {}), node);
+        auto const* shipped = model.suppressedShippedSymbolFor(rec->name);
+        externDecls.push_back(HirExternRecord{
+            ef, rec->name,
+            shipped != nullptr ? shipped->library
+                               : std::unordered_map<std::string, std::string>{},
+            /*noLibraryBinding=*/shipped == nullptr,
+            shipped != nullptr ? shipped->version : std::string{},
+            /*isEagerImport=*/false,
+            rec->asmName});   // TF-C88 (asm label)
+        outNode = ef;
+        return true;
+    }
+
+    [[nodiscard]] HirNodeId
+    lowerDeclaratorModeFunction(NodeId node, DeclarationRule const& decl,
+                                DeclaratorConfig const& dc, NodeId discNode,
+                                LinkageAttr linkAttr) {
+        auto vis = declRoleChildren(tree(), node, decl);
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        std::vector<NodeId> declarators;
+        if (carrier.has_value() && *carrier < vis.size())
+            collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        // The function = the sole named declarator (the semantic tier
+        // enforces exactly-one / named / fn-suffix / no-init via
+        // S_InvalidFunctionDeclarator + S_DeclarationDeclaresNothing;
+        // lowering degrades to an Error node when those fired).
+        NodeId fnName{};
+        for (NodeId d : declarators) {
+            fnName = declaratorNameNode(tree(), d, dc);
+            if (fnName.valid()) break;
+        }
+        if (!fnName.valid()) return errorNode(node);
+        SymbolId const sym = model.symbolAt(fnName);
+        TypeId sig = InvalidType;
+        if (auto const* rec = model.recordFor(sym)) sig = rec->type;
+        // Params live in the fn suffix attached to the NAME's direct
+        // declarator (`int (*f(int a))(int b)` — f's params are `a`;
+        // the outer suffix shapes the return type only).
+        std::vector<HirNodeId> params;
+        NodeId const direct = tree().parent(fnName);
+        if (direct.valid() && tree().kind(direct) == NodeKind::Internal
+            && tree().rule(direct).v == dc.directRule.v) {
+            for (NodeId c : visible(direct)) {
+                if (tree().kind(c) == NodeKind::Internal
+                    && isFnSuffixRule(tree().rule(c), dc)) {
+                    collectParams(c, params);
+                    break;
+                }
+            }
+        }
+        NodeId const bodyNode =
+            (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
+                ? descend(discNode, decl.kindByChild->bodyPath)
+                : discNode;
+        TypeId const savedReturn = currentReturnType_;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
+        auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
+        if (bodyNode.valid()) prescanLabels(bodyNode);
+        HirNodeId body = bodyNode.valid()
+            ? lowerStmt(bodyNode)
+            : track(builder.makeBlock({}), node);
+        labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
+        currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
+        HirNodeId const fn_ =
+            track(builder.makeFunction(sig, sym.v, params, body), node);
+        recordLinkage(fn_, linkAttr);
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
+        return fn_;
+    }
+
     // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
     // discriminator matched the block tail) or one Global PER named
     // declarator. Appends to `out` (module decls are a flat list — a
@@ -7968,8 +9204,11 @@ struct Lowerer {
         }
         DeclaratorConfig const& dc = *sem.declarators;
         auto vis = declRoleChildren(tree(), node, decl);
-        LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+        // The SHARED base: the declaration-specifier prefix, folded once. Each
+        // declarator folds its OWN after-declarator run on top of this below, so
+        // `int a __attribute__((weak)), b;` weakens `a` alone.
+        LinkageAttr const prefixLink =
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         // Function iff the kindByChild discriminator matches (the block
         // tail). bodyPath empty ⇒ the matched node IS the body (the
         // declarator-mode convention — params live in the declarator).
@@ -7990,65 +9229,23 @@ struct Lowerer {
         collectDeclarators(tree(), vis[*carrier], dc, declarators);
 
         if (isFn) {
-            // The function = the sole named declarator (the semantic tier
-            // enforces exactly-one / named / fn-suffix / no-init via
-            // S_InvalidFunctionDeclarator + S_DeclarationDeclaresNothing;
-            // lowering degrades to an Error node when those fired).
-            NodeId fnName{};
-            for (NodeId d : declarators) {
-                fnName = declaratorNameNode(tree(), d, dc);
-                if (fnName.valid()) break;
-            }
-            if (!fnName.valid()) {
-                out.push_back(errorNode(node));
+            // A definition has exactly one declarator, so "the declarator's run"
+            // is unambiguous here. (A trailing attribute on a DEFINITION is
+            // rejected upstream today; wiring it anyway means this path needs no
+            // revisit when that gap closes.)
+            LinkageAttr const fnLink =
+                declaratorLinkage(prefixLink, decl,
+                                  declarators.empty() ? NodeId{} : declarators[0]);
+            // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
+            // definition provides no external definition — lower it as a
+            // DECLARATION and emit no body.
+            if (HirNodeId ef; lowerInlineDefinitionAsDeclaration(
+                                  node, decl, dc, fnLink, ef)) {
+                if (ef.valid()) out.push_back(ef);
                 return;
             }
-            SymbolId const sym = model.symbolAt(fnName);
-            TypeId sig = InvalidType;
-            if (auto const* rec = model.recordFor(sym)) sig = rec->type;
-            // Params live in the fn suffix attached to the NAME's direct
-            // declarator (`int (*f(int a))(int b)` — f's params are `a`;
-            // the outer suffix shapes the return type only).
-            std::vector<HirNodeId> params;
-            NodeId const direct = tree().parent(fnName);
-            if (direct.valid() && tree().kind(direct) == NodeKind::Internal
-                && tree().rule(direct).v == dc.directRule.v) {
-                for (NodeId c : visible(direct)) {
-                    if (tree().kind(c) == NodeKind::Internal
-                        && isFnSuffixRule(tree().rule(c), dc)) {
-                        collectParams(c, params);
-                        break;
-                    }
-                }
-            }
-            NodeId const bodyNode =
-                (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
-                    ? descend(discNode, decl.kindByChild->bodyPath)
-                    : discNode;
-            TypeId const savedReturn = currentReturnType_;
-            TypeId const retType =
-                sig.valid() ? interner.fnResult(sig) : InvalidType;
-            currentReturnType_ = retType;
-            auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
-            auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
-            std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
-            labelOrdinals_.clear();
-            caseLabelOrdinals_.clear();
-            nextLabelOrdinal_ = 0;
-            if (bodyNode.valid()) prescanLabels(bodyNode);
-            HirNodeId body = bodyNode.valid()
-                ? lowerStmt(bodyNode)
-                : track(builder.makeBlock({}), node);
-            labelOrdinals_ = std::move(savedLabels);
-            caseLabelOrdinals_ = std::move(savedCaseLabels);
-            nextLabelOrdinal_ = savedNextOrd;
-            currentReturnType_ = savedReturn;
-            body = maybeAppendImplicitReturnZero(node, body, sym, retType,
-                                                 decl);
-            HirNodeId const fn_ =
-                track(builder.makeFunction(sig, sym.v, params, body), node);
-            recordLinkage(fn_, linkAttr);
-            out.push_back(fn_);
+            out.push_back(
+                lowerDeclaratorModeFunction(node, decl, dc, discNode, fnLink));
             return;
         }
 
@@ -8100,11 +9297,35 @@ struct Lowerer {
             return;
         }
 
-        // Globals — one per named declarator, each with the decl's linkage.
+        // Globals — one per named declarator, each with the SHARED prefix
+        // linkage plus THAT declarator's own after-declarator attribute run.
+        // `origins` carries the node→declarator mapping because the emitted-node
+        // count is not the declarator count (a prototype that declines extern
+        // synthesis emits nothing), so index arithmetic would silently misalign.
+        //
+        // ★ EVERY declarator is folded here, INCLUDING ones that emit no node.
+        // That fold is not just how the attribute is applied — it is also the
+        // VALIDATION that makes an unknown trailing attribute fail loud. Folding
+        // only the emitted nodes silently skipped the absorbed prototype in
+        // `int f(void) __attribute__((frobnicate)); int f(void){…}` (the proto is
+        // superseded by the definition, so it emits nothing), and the typo went
+        // back to being accepted in silence — MEASURED, this exact regression.
+        std::vector<LinkageAttr> perDeclarator;
+        perDeclarator.reserve(declarators.size());
+        for (NodeId d : declarators)
+            perDeclarator.push_back(declaratorLinkage(prefixLink, decl, d));
+
         std::size_t const before = out.size();
-        lowerVarLikeInto(node, /*asGlobal=*/true, out);
+        std::vector<NodeId> origins;
+        lowerVarLikeInto(node, /*asGlobal=*/true, out, &origins);
         for (std::size_t i = before; i < out.size(); ++i) {
-            recordLinkage(out[i], linkAttr);
+            NodeId const from = (i - before) < origins.size()
+                                    ? origins[i - before] : NodeId{};
+            LinkageAttr attr = prefixLink;
+            for (std::size_t k = 0; k < declarators.size(); ++k) {
+                if (declarators[k].v == from.v) { attr = perDeclarator[k]; break; }
+            }
+            recordLinkage(out[i], attr);
         }
     }
 
@@ -8125,7 +9346,7 @@ struct Lowerer {
         // prefix, attached below to the lowered Function/Global node and threaded
         // to MIR for DCE protection.
         LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
@@ -8253,8 +9474,10 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) sig = rec->type;
         }
+        // LEGACY positional path: no declarator vocabulary, so no
+        // after-declarator attribute slot exists — the prefix is the whole story.
         LinkageAttr const linkAttr =
-            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -8286,220 +9509,271 @@ struct Lowerer {
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         recordLinkage(fn_, linkAttr);
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
         return fn_;
     }
 
-    // extern function / global (no body). The FnSig/var type comes from the
-    // symbol the semantic phase minted (FFI linkage metadata is plan 11).
-    HirNodeId lowerExternDecl(NodeId node) {
+    // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): lower an extern
+    // declaration to N ExternGlobal/ExternFunction nodes — ONE per NAMED declarator
+    // (`extern int a, b;` → two ExternGlobals; `extern int f(int), g;` → an
+    // ExternFunction f + an ExternGlobal g). externDecl is a DECLARATOR-MODE row
+    // (head:0/declaratorList:1), so Pass-1 minted one `nonDefiningDeclaration`
+    // symbol per declarator; each declarator's TYPE (its own pointer/array/fn suffix
+    // folded onto the shared head base type) rides its bound symbol's `rec->type`.
+    // Mirrors lowerVarLikeInto's declarator loop; the emitted nodes append to `out`
+    // (the top-level dispatch pushes them into the module decls directly; a
+    // block-scope extern routes each to the module-decls accumulator). Emits NOTHING
+    // for an absorbed extern (an in-TU definition won the Pass-1 merge).
+    void lowerExternDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         auto it = declMap_.find(tree().rule(node).v);
-        if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
+        if (it == declMap_.end()) {
+            out.push_back(reportedError(node, "extern decl has no semantics rule"));
+            return;
+        }
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declRoleChildren(tree(), node, decl);
-        SymbolId sym{};
-        TypeId type = InvalidType;
-        if (decl.nameChild && *decl.nameChild < vis.size()) {
-            sym = model.symbolAt(vis[*decl.nameChild]);
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
-        }
-        // D-CSUBSET-EXTERN-DEFINITION-MERGE: an `extern` declaration that an in-TU
-        // DEFINITION superseded (`isAbsorbedProto` set by the Pass-1 merge — the
-        // definition won the binding) emits NO HIR node and registers NO extern
-        // import row. The definition carries the symbol (a Function body or a
-        // Global with storage); emitting an ExternFunction/ExternGlobal here would
-        // create a spurious duplicate import for a symbol defined locally. Returns
-        // an invalid HirNodeId; the dispatch (lowerDecl) skips pushing it. Mirrors
-        // the topLevelDecl proto-skip (`isProtoDeclaration || isAbsorbedProto`),
-        // here on the extern-lowering path.
-        if (auto const* rec = model.recordFor(sym);
-            rec != nullptr && rec->isAbsorbedProto) {
-            return HirNodeId{};
-        }
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
-        // 2026-06-02): scan the tail subtree (varDeclTail or
-        // externFuncTail) for an optional trailing `stringLiteralExpr`
-        // node — when present, decode its body as the per-symbol
-        // import-library override. Source-language agnostic by rule
-        // name (any grammar that produces a child rule named
-        // `stringLiteralExpr` populates the override the same way).
-        // The decoder uses `decodeStringLiteralBody` (the same path
-        // string-literal-arg uses), so all C-family escapes work in
-        // the override string body.
-        auto extractLibraryOverride = [&]() -> std::string {
-            if (!decl.kindByChild) return {};
-            // Strip-aware: `childPath` is authored against the declaration's
-            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
-            // no-op today — externDecl declares no specifierPrefix.
-            NodeId disc = descendVisibleDecl(tree(), node,
-                                             decl.kindByChild->childPath, decl);
-            if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
-                return {};
-            }
-            // Match by rule-name to stay source-agnostic. Any language
-            // whose grammar wraps the override in a rule named
-            // `stringLiteralExpr` (StringStart + StringLiteral body)
-            // gets per-symbol library routing for free.
-            RuleId const stringLitRule =
-                tree().schema().rules().find("stringLiteralExpr");
-            if (!stringLitRule.valid()) return {};
-            SchemaTokenId const stringLitTok =
-                tree().schema().schemaTokens().find("StringLiteral");
-            if (!stringLitTok.valid()) return {};
-            for (auto const& c : tree().children(disc)) {
-                if (tree().kind(c) != NodeKind::Internal) continue;
-                if (isEmptySpace(tree().flags(c))) continue;
-                if (tree().rule(c).v != stringLitRule.v) continue;
-                // The override body is the inner StringLiteral token(s). Route
-                // through the SAME chokepoint string-literal lowering uses so an
-                // adjacent-concatenated override (`extern void f() "lib" ".dll";`,
-                // C 5.1.1.2 phase 6) decodes its WHOLE byte sequence — reading
-                // only the first body child would silently drop the rest.
-                auto decoded =
-                    decodeAdjacentStringBodies(tree(), c, stringLitTok);
-                if (decoded.has_value()) return std::move(*decoded);
-                // F4 audit fix (6-agent 2nd-order, step 13.3a): fail-loud on a
-                // malformed escape rather than silently falling back to the
-                // format-level default — pre-fix a user-typed `extern void f()
-                // "k\xZZ.dll";` would silently link against msvcrt.dll with no
-                // breadcrumb pointing at the malformed override.
-                // H_ExternDeclMalformed is already used for malformed extern
-                // declarations. The span points at the whole stringLiteralExpr
-                // node `c` (the offending override), since the failing segment
-                // is no longer singled out by the loop.
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::H_ExternDeclMalformed;
-                d.severity = DiagnosticSeverity::Error;
-                d.buffer   = tree().source().id();
-                d.span     = tree().span(c);
-                d.actual   = std::string{tree().text(c)};
-                reporter.report(std::move(d));
-                return {};
-            }
-            return {};
-        };
-
-        // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
-        // the extern for FFI synthesis. The canonical name comes
-        // from the SymbolRecord (unmangled identifier as declared
-        // in source). Empty name when the semantic phase couldn't
-        // resolve the symbol — synthesize() then fails loud with
-        // F_FfiIngestEmptyCanonical PROVIDED the language has a
-        // per-format library entry; if the language config has no
-        // entry the upstream F_FfiNoImportLibraryForFormat fires
-        // FIRST and short-circuits before the per-extern guard.
-        // Both surfaces are unsuppressable + upstream-of-link.
-        auto recordExtern = [&](HirNodeId h) {
-            // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14, design-audit
-            // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
-            // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
-            // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
-            // A no-op today (externDecl declares no specifierPrefix →
-            // specifierPrefixChild returns invalid → linkageFrom early-returns);
-            // structural for the day an extern gains specifiers.
-            recordLinkage(h, linkageFrom(specifierPrefixChild(tree(), node, decl),
-                                         decl));
-            auto const* rec = model.recordFor(sym);
-            // Model 3: the source `"libname"` override is format-independent →
-            // project it under every object-format key so the compile-pipeline
-            // fold yields it for whatever the active target's format is.
-            externDecls.push_back({h,
-                                   rec ? rec->name : std::string{},
-                                   uniformLibraryMap(extractLibraryOverride())});
-        };
-        if (decl.kindByChild) {
-            // Strip-aware: `childPath` is authored against the declaration's
-            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
-            // no-op today — externDecl declares no specifierPrefix.
-            NodeId disc = descendVisibleDecl(tree(), node,
-                                             decl.kindByChild->childPath, decl);
-            if (disc.valid() && tree().kind(disc) == NodeKind::Internal
-                && tree().rule(disc).v == decl.kindByChild->whenRule.v) {
-                std::vector<HirNodeId> params;
-                NodeId paramsNode = descend(disc, decl.kindByChild->paramsPath);
-                if (paramsNode.valid()) collectParams(paramsNode, params);
-                HirNodeId const n =
-                    track(builder.makeExternFunction(type, sym.v, params), node);
-                recordExtern(n);
-                return n;
-            }
-        }
-        // D-FF2-3: reject `extern int x = 5;` (and `= y`, `= {}`, etc.).
-        // An extern announces a symbol whose storage lives in another
-        // translation unit; an initializer would either redefine the
-        // symbol locally (contradicting `extern`) or be silently dropped
-        // at lowering.
-        //
-        // SHAPE-based detection (post-fold #7 silent-failure F4): the
-        // varDeclTail subtree's visible children are at most {
-        // arrayDeclSuffix, AssignOp + initValue, EndStatement }. Any
-        // internal child that isn't arrayDeclSuffix IS the initValue
-        // subtree — even when its contents are empty (`= {}`) or
-        // contain no expression nodes. Pre-fix the check walked for
-        // `isExprNode` descendants which missed empty-brace inits.
-        //
-        // Post-fold #8 silent-failure H1 + post-fold #9 H2 split:
-        // distinguish "engine-config error" (kindByChild absent → the
-        // language hasn't told the engine HOW to navigate the extern's
-        // tail) from "parse-recovery shape" (kindByChild IS configured
-        // but `descend` returned invalid/non-Internal for THIS
-        // particular CST). Different audiences, different remediations,
-        // different codes:
-        //   - H_UnsupportedLoweringForKind: grammar-author config bug
-        //   - H_ExternDeclMalformed: incomplete/malformed user source
-        // Pre-split both arms collapsed into UnsupportedLoweringForKind
-        // and blamed the grammar config for what could be a recovery
-        // shape. No shipped grammar trips either arm today (c-subset
-        // configures kindByChild + the `if (model.hasErrors()) return`
-        // short-circuit in FF2/lowering paths catches malformed
-        // input upstream), but defensive split prevents either future
-        // surface from re-opening the D-FF2-3 silent-drop.
-        if (!decl.kindByChild) {
+        // Config contract: the shipped externDecl row IS declarator-mode with a
+        // declaratorList carrier + the `declarators` vocabulary. A language that
+        // maps ExternDecl WITHOUT them is a grammar-author config bug — fail loud,
+        // never a silent drop of the import row.
+        if (!decl.isDeclaratorMode() || !decl.declaratorListChild.has_value()
+            || !sem.declarators.has_value()) {
             emitH(DiagnosticCode::H_UnsupportedLoweringForKind, node,
-                  "externDecl rule has no kindByChild configuration — "
-                  "the engine cannot locate the varDeclTail-equivalent "
-                  "subtree to check for an initializer. Configure "
-                  "`kindByChild` in the language's semantics so this "
-                  "extern shape can be lowered safely");
-            return errorNode(node);
+                  "externDecl rule is not declarator-mode (missing "
+                  "head/declaratorList roles or the `declarators` vocabulary) — "
+                  "the engine cannot locate the declarator list to lower the "
+                  "extern; configure the externDecl semantics row");
+            out.push_back(errorNode(node));
+            return;
         }
-        // Strip-aware for the same reason as the two `disc` probes above.
-        NodeId const varDeclTail =
-            descendVisibleDecl(tree(), node, decl.kindByChild->childPath, decl);
-        if (!varDeclTail.valid()
-            || tree().kind(varDeclTail) != NodeKind::Internal) {
-            // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
-            // names the user-source problem ("incomplete declaration")
-            // not the engine internals ("kindByChild->childPath",
-            // "Internal node", "CST"). The diagnostic infrastructure
-            // already carries the source span for the user to inspect.
+        DeclaratorConfig const& dc = *sem.declarators;
+        auto vis = declRoleChildren(tree(), node, decl);
+        // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+        // DEFINITION (`extern int f(void){…}`) — the kindByChild discriminator
+        // matched a body block (childPath [2,0] resolves to the externDeclTail's
+        // block child). Lower it as a real Function with EXTERNAL linkage (the
+        // externDecl row ignores `extern` by kind, so linkageFrom yields the global
+        // default — external, the C default for a function), reusing the SAME
+        // declarator-mode function lowering topLevelDecl's definition arm uses (a
+        // body is EMITTED — NOT an ExternFunction import). Reached ONLY at file
+        // scope: a block-scope extern function definition (a nested function, not
+        // valid C) is rejected fail-loud upstream (lowerStmtNode's ExternDecl
+        // guard), never routed here.
+        NodeId discNode{};
+        bool isFn = false;
+        if (decl.kindByChild) {
+            discNode = descendVisibleDecl(tree(), node,
+                                          decl.kindByChild->childPath, decl);
+            isFn = discNode.valid()
+                && tree().kind(discNode) == NodeKind::Internal
+                && tree().rule(discNode).v == decl.kindByChild->whenRule.v;
+        }
+        if (isFn) {
+            // A DEFINITION has exactly one declarator; fold that declarator's own
+            // trailing run on top of the shared prefix so this arm matches the
+            // file-scope one rather than quietly disagreeing with it.
+            std::vector<NodeId> fnDeclarators;
+            if (decl.declaratorListChild.has_value()
+                && *decl.declaratorListChild < vis.size()) {
+                collectDeclarators(tree(), vis[*decl.declaratorListChild], dc,
+                                   fnDeclarators);
+            }
+            LinkageAttr const fnLink = declaratorLinkage(
+                linkageFrom(linkagePrefixRoots(node, decl), decl), decl,
+                fnDeclarators.empty() ? NodeId{} : fnDeclarators[0]);
+            out.push_back(lowerDeclaratorModeFunction(node, decl, dc, discNode,
+                                                      fnLink));
+            return;
+        }
+        // D-CSUBSET-EXTERN-FN-DEFINITION fail-loud: a body block on the tail that
+        // was NOT classified as a definition means the pathological
+        // `extern int f(void) "lib" { … }` — a per-declaration library override AND
+        // a body. The preceding stringLiteralExpr shifted the kindByChild childPath
+        // off the tail (isFn false), so the block would otherwise be SILENTLY
+        // DROPPED by the declaration lowering below. Reject it loud (never a silent
+        // body-drop). The externDeclTail is the LAST role child; a body child is the
+        // config's kindByChild `whenRule` (agnostic — no hardcoded `block`).
+        if (decl.kindByChild && !vis.empty()
+            && tree().kind(vis.back()) == NodeKind::Internal) {
+            for (NodeId c : visible(vis.back())) {
+                if (tree().kind(c) == NodeKind::Internal
+                    && tree().rule(c).v == decl.kindByChild->whenRule.v) {
+                    emitH(DiagnosticCode::H_ExternDeclMalformed, node,
+                          "an extern function definition cannot carry a library "
+                          "override — remove the \"…\" library name (a definition "
+                          "supplies its own body; the override is declaration-only)");
+                    out.push_back(errorNode(node));
+                    return;
+                }
+            }
+        }
+        if (*decl.declaratorListChild >= vis.size()) {
+            // A recovery shape (a malformed extern whose list child is absent).
+            // Distinct from the config-bug arm above (D-FF2 H1/H2 split).
             emitH(DiagnosticCode::H_ExternDeclMalformed, node,
-                  "extern declaration is incomplete or malformed at "
-                  "this position — the declaration's body structure "
-                  "could not be located; check that the declaration "
-                  "is complete (e.g. `extern int x;` without an "
-                  "initializer, or `extern int f(int);` for a "
-                  "function declaration)");
-            return errorNode(node);
+                  "extern declaration is incomplete or malformed — the declarator "
+                  "list could not be located; check the declaration is complete "
+                  "(e.g. `extern int x;` / `extern int f(int);`)");
+            out.push_back(errorNode(node));
+            return;
         }
-        RuleId const skipRule = arraySuffixSkipRule(decl);
-        for (NodeId c : visible(varDeclTail)) {
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*decl.declaratorListChild], dc, declarators);
+        // The specifier prefix (`externSpecifiers`) is per-DECLARATION — shared by
+        // every declarator — so resolve its linkage ONCE. D-CSUBSET-LINKAGE-UNKNOWN-
+        // SPECIFIER-DIAGNOSTIC: route through the SAME linkageFrom chokepoint as
+        // lowerTopLevel/lowerFunctionDecl so specifier validation is by-construction.
+        // TF-C73: an AFTER-DECLARATOR attribute is per-DECLARATOR, so it is folded
+        // on top of this base inside `recordExtern`, not here.
+        LinkageAttr const externPrefixLink =
+            linkageFrom(linkagePrefixRoots(node, decl), decl);
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
+        // `stringLiteralExpr` after the declarator list is a DSS per-declaration
+        // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
+        // — examples/c-subset/hello_writefile). Decode it ONCE and apply the same
+        // map to EVERY declarator's import row (a source override is format-
+        // independent → projected under every object-format key by uniformLibraryMap;
+        // the compile-pipeline fold reads the active format's key). Absent → empty
+        // map → the FFI synthesize stage uses the language default / cross-TU merge /
+        // a shipped descriptor. Source-language agnostic (matched by rule name).
+        std::unordered_map<std::string, std::string> const libraryOverride =
+            uniformLibraryMap(externLibraryOverride(node, decl));
+        // FF6 Slice 2: record one FFI-synthesis import row per emitted extern node.
+        // The canonical name is the SymbolRecord's unmangled identifier.
+        auto recordExtern = [&](HirNodeId h, SymbolId sym, NodeId fromDeclarator) {
+            recordLinkage(h,
+                          declaratorLinkage(externPrefixLink, decl, fromDeclarator));
+            auto const* rec = model.recordFor(sym);
+            HirExternRecord row{h, rec ? rec->name : std::string{},
+                                libraryOverride};
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
+            // DECLARATOR by
+            // Pass-1 and lives on the SymbolRecord, so this producer just carries
+            // it — no second parse, no chance of the two tiers disagreeing about
+            // which declarator owns which label. Empty for every extern declared
+            // without one, which makes the import rail byte-identical there.
+            if (rec != nullptr) row.asmName = rec->asmName;
+            externDecls.push_back(std::move(row));
+        };
+        for (NodeId d : declarators) {
+            NodeId const nameNode = declaratorNameNode(tree(), d, dc);
+            // Abstract declarator (`extern int *;`): Pass-1's requireNamedDeclarators
+            // already erred (S_DeclarationDeclaresNothing) — mint nothing here.
+            if (!nameNode.valid()) continue;
+            SymbolId const sym = model.symbolAt(nameNode);
+            auto const* rec = model.recordFor(sym);
+            if (rec == nullptr) continue;
+            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an extern superseded by an in-TU
+            // DEFINITION (the Pass-1 merge set isAbsorbedProto — the definition won
+            // the binding) emits NO node + NO import row (the definition carries the
+            // symbol; a duplicate import would be spurious). Per-declarator.
+            if (rec->isAbsorbedProto) continue;
+            TypeId const type = rec->type;
+            // A FUNCTION declarator (`extern int f(int);` — its name carries an
+            // fnSuffix → Pass-1 set isProtoDeclaration) → ExternFunction. The FnSig
+            // (rec->type) is the load-bearing signature (HIR→MIR reads it); the param
+            // CHILDREN are informational (the HIR-text representation). Collect them
+            // from the declarator's fn-suffix paramList — collectParams recurses the
+            // declarator to each `param` (VarDecl) leaf — to keep the ExternFunction
+            // node byte-identical to the pre-c23 single-declarator lowering.
+            if (rec->isProtoDeclaration) {
+                std::vector<HirNodeId> params;
+                collectParams(d, params);
+                HirNodeId const ef =
+                    track(builder.makeExternFunction(type, sym.v, params), d);
+                recordExtern(ef, sym, d);
+                out.push_back(ef);
+                continue;
+            }
+            // An OBJECT declarator → ExternGlobal. D-FF2-3: reject `extern int x = 5;`
+            // LOUD — an extern announces storage in another TU; an initializer would
+            // either redefine it locally (contradicting `extern`) or be silently
+            // dropped. An initializer shows up as the initDeclarator carrying a
+            // non-declarator visible child (the `= initValue`); check per-declarator.
+            if (initDeclaratorHasInitializer(d, dc)) {
+                emitH(DiagnosticCode::H_ExternHasInitializer, d,
+                      "extern declarations cannot carry an initializer — storage "
+                      "lives in another translation unit; remove the initializer");
+                out.push_back(errorNode(d));
+                continue;
+            }
+            HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
+            recordExtern(g, sym, d);
+            // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
+            // record's flag rides the intra-module global side-table so HIR→MIR's
+            // extern-data pre-pass stamps ExternImport.isThreadLocal.
+            recordThreadLocal(g, sym);
+            out.push_back(g);
+        }
+    }
+
+    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): decode the OPTIONAL trailing
+    // `stringLiteralExpr` library-override on an extern declaration (`extern void
+    // f() "lib";`) — the per-declaration import-library name. Scans the declaration's
+    // role children (the stringLiteralExpr sits after the initDeclaratorList, before
+    // EndStatement). Returns "" when absent. Decodes through the SAME
+    // decodeAdjacentStringBodies chokepoint string literals use (so an adjacent-
+    // concatenated override `"lib" ".dll"` joins its whole byte sequence + C escapes
+    // work); a MALFORMED escape fails LOUD (H_ExternDeclMalformed) rather than
+    // silently defaulting to the format-level library. Source-language agnostic —
+    // any grammar wrapping the override in a `stringLiteralExpr` gets it for free.
+    [[nodiscard]] std::string
+    externLibraryOverride(NodeId node, DeclarationRule const& decl) {
+        RuleId const stringLitRule =
+            tree().schema().rules().find("stringLiteralExpr");
+        if (!stringLitRule.valid()) return {};
+        SchemaTokenId const stringLitTok =
+            tree().schema().schemaTokens().find("StringLiteral");
+        if (!stringLitTok.valid()) return {};
+        for (NodeId c : declRoleChildren(tree(), node, decl)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
-            if (skipRule.valid()
-                && tree().rule(c).v == skipRule.v) continue;
-            emitH(DiagnosticCode::H_ExternHasInitializer, c,
-                  "extern declarations cannot carry an "
-                  "initializer — storage lives in another "
-                  "translation unit; remove the initializer");
-            return errorNode(node);
+            if (tree().rule(c).v != stringLitRule.v) continue;
+            auto decoded = decodeAdjacentStringBodies(tree(), c, stringLitTok);
+            if (decoded.has_value()) return std::move(*decoded);
+            // Fail loud on a malformed escape (`extern void f() "k\xZZ.dll";`) — a
+            // silent fallback to the format default would hide the bad override.
+            emitH(DiagnosticCode::H_ExternDeclMalformed, c,
+                  std::string{tree().text(c)});
+            return {};
         }
-        HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
-        recordExtern(g);
-        // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
-        // record's flag rides the same side-table as intra-module globals so
-        // HIR→MIR's extern-data pre-pass stamps ExternImport.isThreadLocal
-        // (the linker-side surviving-extern handling is slice C).
-        recordThreadLocal(g, sym);
-        return g;
+        return {};
+    }
+
+    // True iff `d` (a declarator/initDeclarator from collectDeclarators) carries an
+    // initializer — an initDeclarator with a visible Internal child that is NOT the
+    // declarator (the `= initValue` subtree). Used to reject an extern-with-
+    // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
+    // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) + TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): is `c` an
+    // AFTER-DECLARATOR DECORATION rather than the initializer? The init-detection
+    // scans read "the first visible Internal child that is not the declarator" as
+    // the init value, so every decoration the grammar may put in that slot must be
+    // skipped here — an attribute, else `void f(void) __attribute__((noreturn));`
+    // type-checks the attribute against the function type (S_TypeMismatch); an asm
+    // label, else `int gv __asm("myglobal") = 7;` lowers the LABEL as the
+    // initializer expression (MEASURED before this delegation: H0009 "expression
+    // form has no hirLowering mapping" on the label's string).
+    //
+    // Delegates to the SHARED `isDeclaratorDecorationNode` (declarator_walk.hpp) so
+    // this tier and the semantic tier cannot disagree about what a decoration is.
+    // NOTE it is deliberately WIDER than `declaratorAttrRoots` below, which reads
+    // `afterDeclaratorAttrRules` directly and must stay attribute-only — feeding an
+    // asm label to the linkage fold would fire a bogus H_UnknownLinkageSpecifier.
+    [[nodiscard]] bool isAfterDeclaratorAttr(NodeId c, DeclaratorConfig const& dc) {
+        return isDeclaratorDecorationNode(tree(), dc, c);
+    }
+
+    [[nodiscard]] bool
+    initDeclaratorHasInitializer(NodeId d, DeclaratorConfig const& dc) {
+        if (tree().rule(d).v != dc.initDeclaratorRule.v) return false;
+        for (NodeId c : visible(d)) {
+            if (isToken(c)) continue;
+            if (tree().rule(c).v == dc.declaratorRule.v) continue;
+            if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62: not the init
+            return true;   // a non-declarator internal child = the initializer
+        }
+        return false;
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
@@ -8530,6 +9804,10 @@ struct Lowerer {
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
         recordLinkage(fn_, linkAttr);
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
+        recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
         return fn_;
     }
 
@@ -8610,12 +9888,16 @@ struct Lowerer {
         if (m->hirKind == "Skip")       return;
         if (m->hirKind == "Decl")       { lowerTopLevelInto(core, out); return; }
         if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
-        if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
+        // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): N declarators → N TypeDecl
+        // nodes, appended FLAT to the module decls (the `ExternDecl` arm below is
+        // the precedent). No Block wrapper here — module scope is already a list.
+        if (m->hirKind == "TypeDecl")   { lowerTypeDeclInto(core, out); return; }
         if (m->hirKind == "ExternDecl") {
-            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an absorbed extern (superseded by
-            // an in-TU definition) returns an invalid node — push nothing.
-            HirNodeId const e = lowerExternDecl(core);
-            if (e.valid()) out.push_back(e);
+            // D-CSUBSET-EXTERN-MULTI-DECLARATOR: N declarators → N extern nodes
+            // (each an ExternGlobal/ExternFunction; an absorbed extern — superseded
+            // by an in-TU definition — contributes nothing). Appends directly to the
+            // module-decls `out`.
+            lowerExternDeclInto(core, out);
             return;
         }
         // A `var`-style declaration at module scope is a Global (the same rule
@@ -8673,6 +9955,19 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
+    // TF-C78 (D-CSUBSET-NOINLINE): shared (Function decl node → NoInlineAttr)
+    // accumulator, moved onto result->noInlineMap after finish().
+    std::vector<std::pair<HirNodeId, NoInlineAttr>> noInlineAcc;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): shared (Function decl node →
+    // AlwaysInlineAttr) accumulator, moved onto result->alwaysInlineMap after
+    // finish().
+    std::vector<std::pair<HirNodeId, AlwaysInlineAttr>> alwaysInlineAcc;
+    // TF-C85: the `#pragma optimize("", off)` region flag accumulator.
+    std::vector<std::pair<HirNodeId, NoOptimizeAttr>> noOptimizeAcc;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): shared (Function decl node →
+    // NoSanitizeThreadAttr) accumulator, moved onto result->noSanitizeThreadMap
+    // after finish().
+    std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>> noSanitizeThreadAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
@@ -8706,7 +10001,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
+            mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
+            noSanitizeThreadAcc,
+            threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
 
@@ -8761,9 +10058,18 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         // selects the ACTIVE target's format entry; an empty map OR a map
         // missing that format ⇒ FF5 falls back to the language's
         // `externLibraryByFormat[format]` default.
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: producer C is the ONLY eager
+        // producer — a shipped-descriptor symbol is imported even when the TU
+        // never references it (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). The
+        // eager bit rides to the linker's reference gate, which keeps this row
+        // unconditionally. INVARIANT (holds by construction here): eager ⟹
+        // library-bound — a descriptor always ships a per-format `library` map
+        // (`noLibraryBinding=false` above). Producers A (~8815) and B (~7943)
+        // leave the bit FALSE, so their unreferenced imports drop like gcc's.
         externDecls.push_back(HirExternRecord{
             node, ext.name, ext.library, /*noLibraryBinding=*/false,
-            ext.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            /*isEagerImport=*/true});
     }
 
     HirNodeId const root = builder.makeModule(decls);
@@ -8773,6 +10079,14 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
+    for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE)
+        result->noInlineMap.set(id, attr);
+    for (auto& [id, attr] : alwaysInlineAcc)   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+        result->alwaysInlineMap.set(id, attr);
+    for (auto& [id, attr] : noOptimizeAcc)     // TF-C85 (#pragma optimize)
+        result->noOptimizeMap.set(id, attr);
+    for (auto& [id, attr] : noSanitizeThreadAcc)   // TF-C92 (no_sanitize_thread)
+        result->noSanitizeThreadMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1

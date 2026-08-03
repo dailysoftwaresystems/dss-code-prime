@@ -147,6 +147,21 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): a BARE-declarator LIST —
+    // `declarator (',' declarator)*`, no per-slot wrapper. Collect each
+    // `declaratorRule` child (commas skipped), in source order. Structurally
+    // this is the `listRule` arm minus the `initDeclaratorRule` alternative,
+    // kept as its OWN arm rather than folded in because a language may declare
+    // both shapes and they must not alias each other's slot grammar. Guarded on
+    // the OPTIONAL role (a language without it never matches).
+    if (dc.plainListRule.has_value() && r == *dc.plainListRule) {
+        for (NodeId c : v.children(node)) {
+            if (!v.isVisible(c)) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (v.rule(c) == dc.declaratorRule) out.push_back(c);
+        }
+        return;
+    }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member
     // declarator LIST — collect each per-slot `memberDeclaratorRule` child
     // (commas skipped), in source order. The downstream name/type walks
@@ -198,6 +213,72 @@ inline void collectDeclarators(Tree const& tree, NodeId node,
                                DeclaratorConfig const& dc,
                                std::vector<NodeId>& out) {
     collectDeclarators(TreeDeclaratorView{tree}, node, dc, out);
+}
+
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — THE shared "this child is a
+// decoration, not the initializer" predicate.
+//
+// Every init-detection scan in the compiler reads an init-declarator's initializer
+// as "the first visible INTERNAL child that is not the declarator". That idiom is
+// correct only if every OTHER thing the grammar may put between the declarator and
+// its `= init` is skipped. Before TF-C88 that set was one member —
+// `afterDeclaratorAttrRules` — and each of the six scan sites open-coded the loop
+// (TF-C62 had to fix all six at once). The asm label is the second member, and
+// open-coding it a seventh time is how the sites drift: a scan that misses it reads
+// `int f(void) __asm("_x");` as an initializer and type-checks a string against a
+// function type. One predicate, one place to extend.
+//
+// ★ WIDER THAN `isAfterDeclaratorAttrNode` ON PURPOSE. That predicate stays
+// attribute-ONLY because it also gates the LINKAGE/attribute FOLDS, which must not
+// be handed an asm label. This one gates the INIT scans, which must skip both.
+[[nodiscard]] inline bool isDeclaratorDecorationRule(DeclaratorConfig const& dc,
+                                                    RuleId r) noexcept {
+    for (RuleId ar : dc.afterDeclaratorAttrRules)
+        if (r.v == ar.v) return true;
+    return dc.asmLabelRule.has_value() && r.v == dc.asmLabelRule->v;
+}
+
+[[nodiscard]] inline bool isDeclaratorDecorationNode(Tree const& tree,
+                                                     DeclaratorConfig const& dc,
+                                                     NodeId c) {
+    if (!c.valid() || tree.kind(c) != NodeKind::Internal) return false;
+    return isDeclaratorDecorationRule(dc, tree.rule(c));
+}
+
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — the asm-label node attached to
+// declarator carrier `dNode`, or an invalid
+// NodeId when there is none. `dNode` is a carrier from `collectDeclarators` (an
+// `initDeclaratorRule` node or a bare `declaratorRule` node); only the former can
+// carry a label, because the run lives in the init-declarator slot. Returns the
+// FIRST one — a declarator with two labels (`int x __asm("a") __asm("b");`) is
+// rejected by the caller rather than silently resolved to one of them.
+[[nodiscard]] inline NodeId asmLabelNodeOf(Tree const& tree, NodeId dNode,
+                                           DeclaratorConfig const& dc) {
+    if (!dc.asmLabelRule.has_value()) return {};
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return {};
+    for (NodeId c : tree.children(dNode)) {
+        if (isEmptySpace(tree.flags(c))) continue;
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == dc.asmLabelRule->v) return c;
+    }
+    return {};
+}
+
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — how many asm labels `dNode`
+// carries (0, 1, or the over-decorated case
+// the caller must reject loud). Cheap: only ever walks one declarator's direct
+// children, and returns 0 immediately for a language with no asm-label role.
+[[nodiscard]] inline std::size_t asmLabelCountOf(Tree const& tree, NodeId dNode,
+                                                 DeclaratorConfig const& dc) {
+    if (!dc.asmLabelRule.has_value()) return 0;
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return 0;
+    std::size_t n = 0;
+    for (NodeId c : tree.children(dNode)) {
+        if (isEmptySpace(tree.flags(c))) continue;
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == dc.asmLabelRule->v) ++n;
+    }
+    return n;
 }
 
 } // namespace dss

@@ -14,11 +14,15 @@
 
 ```jsonc
 {
-  "language":        "c-subset",                       // required — resolves to a shipped .lang.json
-  "artifactProfile": "cli",                            // required — one profile (see §3)
-  "targets":         ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
-  "sources":         ["src/main.c"],                   // required — ≥1 source path (literal; no glob yet)
-  "output":          "dist/myprog"                     // optional — see §6 (parsed, not yet routed)
+  "language":         "c-subset",                       // required — resolves to a shipped .lang.json
+  "artifactProfile":  "cli",                            // required — one profile (see §3)
+  "targets":          ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
+  "sources":          ["src/**/*.c"],                   // required — ≥1 source path OR glob pattern (§2)
+  "output":           "dist/myprog",                    // optional — see §6 (parsed, not yet routed)
+  "artifactName":     "myapp",                          // optional — binary base NAME (no ext / path sep); see §5
+  "includes":         ["vendor/include"],               // optional — quote-include dirs   (mirrors CLI -I)
+  "defines":          ["NDEBUG", "MAX=64"],             // optional — NAME[=VALUE] macros   (mirrors CLI --define)
+  "resolveLibraries": ["dist/libfoo.so"]                // optional — extern-resolving libs (mirrors CLI --resolve-library)
 }
 ```
 
@@ -34,11 +38,64 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `language` | **yes** | non-empty string | The shipped language to compile (`src/dss-config/sources/<language>.lang.json`). |
 | `artifactProfile` | **yes** | non-empty string | The **single** output shape to produce (§3). Singular — the language declares a *set*, the project picks *one*. |
 | `targets` | **yes** | non-empty array of non-empty strings | Each entry is a `"<targetName>:<formatName>"` spec (e.g. `"x86_64:elf64-x86_64-linux-exec"`). One artifact is produced per target. |
-| `sources` | **yes** | non-empty array of non-empty strings | The source files. Literal paths today (no glob — `D-AP2-SOURCES-GLOB`). Resolved relative to the process working directory. |
+| `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). Resolved relative to the process working directory (an absolute entry resolves directly). |
 | `output` | no | non-empty string when present | A user output hint. **Parsed + type-validated, but its path routing is not yet wired** (`D-AP2-OUTPUT-ROUTING`) — artifacts currently land at the per-target convention (§5). |
+| `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag (or the default `<cwd>/target`). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
+| `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
+| `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). |
+| `resolveLibraries` | no | array of non-empty strings | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>` (`Program::setResolveLibraries`). |
+
+**The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
+empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
+that is not an array, or an entry that is not a non-empty string, fails loud (`C_MalformedJson`). At build time
+`Program::compileProject` **appends** these onto the Program's current state — so a manifest value **adds to**
+(never replaces) any flag `Program::run` already stamped from the command line. The two sources compose.
 
 **Unknown top-level keys are rejected** (`C_MalformedJson`) — a typo like `"ouput"` fails loud rather
 than being silently ignored, matching the grammar/target/format loaders.
+
+### 2.1 `sources[]` glob expansion (`D-AP2-SOURCES-GLOB`)
+
+A `sources[]` entry may be a **glob pattern**. The loader keeps each entry **verbatim** (a glob string
+is just a non-empty source string — no filesystem access at parse time); `Program::compileProject` then
+**expands** any entry containing a glob metacharacter into its matching files — as a driver pre-pass,
+**before** the source-count routing decision (§5) — so a pattern routes exactly as if its matches had
+been listed literally. The matcher lives in `core/types/glob_match.hpp` (language / target / format
+agnostic — pure path-text matching + a filesystem walk).
+
+- **Literal vs glob.** An entry with **no** metacharacter (`*`, `?`, `[`) is a literal path, kept
+  **verbatim** — unchanged behavior (a missing literal still fails downstream at CU build; it is *not*
+  newly rejected here). An entry with **any** metacharacter is expanded against the filesystem.
+- **Syntax** (standard glob):
+  - `*` — any run of characters **within one path segment** (does **not** cross `/`);
+  - `**` — a whole segment matching **zero or more** segments (recursive: `a/**/b` matches `a/b`,
+    `a/x/b`, `a/x/y/b`; `**/*.c` matches `x.c` *and* `sub/x.c`);
+  - `?` — exactly one character within a segment;
+  - `[...]` — a character class (ranges `a-z`, negation `[!...]` / `[^...]`).
+- **Base directory.** Patterns resolve relative to the **process working directory** (the same base a
+  literal source uses); an **absolute** pattern resolves directly. Only the subtree under the pattern's
+  literal leading prefix is walked (`src/**/*.c` never scans a sibling `build/`).
+- **Determinism.** Matches are **sorted lexicographically**, so the compilation-unit order is stable
+  and reproducible across platforms.
+- **Overlap composes.** Entries that overlap — two globs matching a shared file, or a literal alongside
+  a glob that also matches it — yield the **union of unique files**: each file is compiled **once**
+  (cross-entry de-duplication on the normalized path, first occurrence wins). A redundant overlap just
+  works; it never produces a duplicate compilation unit.
+- **Separator + case.** Patterns are matched on **forward-slash (`/`) segments** — a hand-written
+  Windows manifest must use `/` (a backslash `src\*.c` is out of contract; JSON authors and generated
+  manifests use `/`). Matching is **case-sensitive** (the POSIX glob default) even on a
+  case-insensitive filesystem.
+- **Zero match fails loud.** A glob pattern that matches **no files** is an error (`D_FileNotFound`,
+  naming the unmatched pattern) — a source pattern that names nothing is a mistake, not an empty
+  no-op. (A *literal* entry that matches nothing is **not** rejected here — see above.)
+- **I/O failure fails loud.** A directory that cannot be read during expansion fails loud
+  (`D_DirectoryScanFailed`) rather than being silently skipped.
+
+Example — `"sources": ["src/**/*.c"]` matching `src/a.c` and `src/lib/b.c` expands to two concrete
+sources ⇒ count `2` ⇒ the multi-CU route (§5), exactly as `["src/a.c", "src/lib/b.c"]` would.
+
+> The CLI `--compile <files>` path takes explicit files and is **not** glob-expanded — globbing is a
+> project-manifest convenience only.
 
 ---
 
@@ -83,11 +140,29 @@ is not project-buildable.
 
 - **Source count routing** (shared `routesToMultiUnit`, identical to the CLI dispatcher): `>1`
   source ⇒ N independent compilation units the linker merges (`compileUnits`, `cc a.c b.c`
-  semantics); `≤1` ⇒ the single-CU path (`compileFiles`).
-- **Output path** (today): `<cwd>/target/<formatName>/<sourceStem><ext>`, where `<ext>` comes from
-  `ObjectFormatKind × objectType` (e.g. ELF/Mach-O executable ⇒ no extension; PE executable ⇒
-  `.exe`; relocatable ⇒ `.o`). The `output` field does **not** yet redirect this
-  (`D-AP2-OUTPUT-ROUTING`).
+  semantics); `≤1` ⇒ the single-CU path (`compileFiles`). The count is taken **after** glob
+  expansion (§2.1) — a 2-match glob routes as two sources, exactly as two literal entries would.
+- **Output path.** A **project build** routes each target's artifact to
+  `<base>/<formatName>/<artifactName-or-stem><ext>`:
+  - `<base>` — the `--output` directory when given, else the default `<cwd>/target`.
+  - `<formatName>/` — the **per-platform subdir**, applied to **every** project build
+    (single- *and* multi-target), so a project's artifacts never collide across platforms and
+    the on-disk layout is uniform. `<formatName>` already encodes machine + OS.
+  - `<artifactName-or-stem>` — the manifest's `artifactName` when present, else the source stem
+    (the unchanged default). The router enforces **containment**: the resolved artifact must be a
+    direct child of the output dir. A name that would escape it — a `..` component, or a differing
+    drive/root prefix that `std::filesystem`'s path join would let slip past the loader's separator
+    check — fails loud (`D_ArtifactNameEscapesOutputDir`), never silently writing outside `--output`.
+  - `<ext>` — from `ObjectFormatKind × objectType` (ELF/Mach-O executable ⇒ no extension; PE
+    executable ⇒ `.exe`; relocatable ⇒ `.o`).
+
+  The `output` field does **not** yet redirect `<base>` (`D-AP2-OUTPUT-ROUTING`, §7) — use
+  `--output`.
+
+  > **The CLI `--compile` path is unchanged.** A non-project compile keeps the legacy layout:
+  > single-target is **flat** at `<output>/<stem><ext>` (no `<formatName>/` subdir), and only a
+  > multi-target compile subdir's by `<formatName>`. The forced per-platform subdir + the
+  > `artifactName` override apply to **project builds only**.
 
 ---
 
@@ -95,11 +170,13 @@ is not project-buildable.
 
 | Code | When |
 |---|---|
-| `D_FileNotFound` | the project file can't be opened, or a hard I/O error occurs mid-read. |
-| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key; a field of the wrong type; a non-string / empty array entry; an empty `output` string. |
+| `D_FileNotFound` | the project file can't be opened, or a hard I/O error occurs mid-read; **or** a `sources[]` **glob** pattern matched no files (§2.1) — the message names the unmatched pattern. |
+| `D_DirectoryScanFailed` | a directory could not be read while expanding a `sources[]` glob pattern (§2.1). |
+| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key; a field of the wrong type; a non-string / empty array entry; an empty `output` string; an empty `artifactName`, or one containing a path separator (`/` or `\`). |
 | `C_MissingField` | a required field (`language` / `artifactProfile` / `targets` / `sources`) is absent, an empty string, or an empty array. |
 | `D_ArtifactProfileNotSupported` (`D0010`) | the language gate (§4). |
 | `D_ArtifactProfileFormatMismatch` (`D0011`) | the format gate (§4). |
+| `D_ArtifactNameEscapesOutputDir` (`D0015`) | a project `artifactName` resolved to a path **outside** the routed output directory (a `..` component, or a drive/root prefix) — the routing containment boundary (§5). Remediation-distinct from `D_OutputDirCreateFailed` (mkdir I/O): fix the `artifactName` to a plain filename. |
 | `D_InvalidTargetSpec` / `D_SchemaLoadFailed` | a `targets[]` entry that doesn't parse as `<name>:<format>`, or names a format that won't load — emitted by the delegated compile (the gates skip such a target rather than double-report). |
 
 ---
@@ -111,8 +188,8 @@ does not over-promise:
 
 | Anchor | Gap |
 |---|---|
-| `D-AP2-SOURCES-GLOB` | `sources[]` are literal paths — no glob expansion (`"src/**/*.c"` is one literal "file" today). |
-| `D-AP2-OUTPUT-ROUTING` | `output` is parsed + validated but not yet routed; the per-target convention (§5) applies. |
+| `D-AP2-SOURCES-GLOB` | **Realized** (§2.1). `sources[]` entries with a glob metacharacter (`* ? [`) are expanded against the filesystem in `Program::compileProject` before routing; literals are kept verbatim, zero-match fails loud. |
+| `D-AP2-OUTPUT-ROUTING` | **Partially addressed.** The `artifactName` field (binary base name) **and** the per-platform `<formatName>/` subdir for project builds are now wired (§5). Still deferred: the **`output` field as an output directory** — it is parsed + validated but does not yet redirect the base dir; use `--output` to set it. |
 | `D-AP2-TARGET-NAME-DEFAULT-FORMAT` | `targets[]` require the explicit `:<formatName>` half; bare names (`"linux-x86_64"`) with an inferred default format aren't resolved yet. |
 | `D-AP2-COMPILATION-CONTEXT` | the resolved profile is **not** threaded to codegen (entry-symbol / subsystem / extension); deferred until a profile drives a codegen difference its `(target:format)` doesn't already encode (e.g. `gui`). |
 

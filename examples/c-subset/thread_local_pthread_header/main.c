@@ -15,10 +15,10 @@
  *   static alias:  the workers share main's object (6) -> sum becomes
  *                  106+206 = 312 (or a torn interleave), main ends 206.
  *
- * pthread_create's shipped 3rd parameter is ptr<void> (the neutral
- * descriptor keeps the opaque-buffer API pointer-typed), so the
- * function name is passed via an explicit (void *) cast — the bare
- * name does not implicitly convert fn -> void* in the c-subset.
+ * pthread_create's shipped 3rd parameter is now the PRECISE start-routine
+ * fn-ptr ptr<fn(ptr<void>) -> ptr<void>> (tightened from the old loose
+ * ptr<void>), so the bare `worker` function designator decays directly to
+ * it — no (void *) cast needed (a ptr<void> is now correctly rejected there).
  *
  * x86_64-linux only until TLS C2/C3/C4 land the other legs. Exit 42.
  */
@@ -40,8 +40,8 @@ int main(void) {
     pthread_t t1;
     pthread_t t2;
     counter = counter + 1;        /* main's copy: 5 -> 6 */
-    if (pthread_create(&t1, 0, (void *)worker, 0) != 0) return 1;
-    if (pthread_create(&t2, 0, (void *)worker, 0) != 0) return 2;
+    if (pthread_create(&t1, 0, worker, 0) != 0) return 1;
+    if (pthread_create(&t2, 0, worker, 0) != 0) return 2;
     if (pthread_join(t1, 0) != 0) return 3;
     if (pthread_join(t2, 0) != 0) return 4;
     if (sum != 210) return 5;     /* 105 + 105 — each worker saw the TEMPLATE */

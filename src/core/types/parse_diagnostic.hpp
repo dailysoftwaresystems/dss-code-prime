@@ -101,6 +101,124 @@ enum class DiagnosticCode : std::uint16_t {
     // every non-bare-quote-filename shape emits THIS code -- never a silent drop
     // and never a silent partial embed.
     P_PreprocessorEmbed           = 0x001D,
+    // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5): the translation unit contains
+    // an `#error` directive that the conditional-inclusion state REACHED. C23
+    // 6.10.5p1 makes this a CONSTRAINT: the implementation shall produce a
+    // diagnostic message that includes the directive's `pp-tokens` (which are
+    // NOT macro-expanded -- gcc/clang agree, and the operand is deliberately
+    // prose). Severity Error (unlike its `#warning` twin) and a member of the
+    // unsuppressable closed table: an `#error` is the header author's authored
+    // ABORT, so silencing it silently builds the configuration they declared
+    // invalid. The operand is OPTIONAL (`pp-tokens_opt`): a bare `#error` is
+    // well-formed and still fires.
+    //
+    // ★ REACHABILITY INVARIANT (the whole feature): C 6.10p1 -- a group skipped
+    // by conditional inclusion is parsed ONLY far enough to track nesting, so an
+    // `#error` inside a NOT-TAKEN branch must be entirely SILENT. This is not a
+    // nicety: the Apple SDK headers use `#error` as the unsupported-config guard
+    // INSIDE branches that a supported target skips, so an implementation firing
+    // on every LEXED `#error` cannot compile a single macOS translation unit.
+    // The emit site is therefore placed BELOW `handleDirective`'s
+    // `if (!stackActive()) return end;` gate -- structurally incapable of firing
+    // in a dead branch -- exactly like the `#pragma`/`#embed`/`#line` arms.
+    P_PreprocessorErrorDirective  = 0x001E,
+    // D-CPP-ERROR-WARNING (`#warning`; C23 6.10.6): the reached-directive twin of
+    // `P_PreprocessorErrorDirective`, at Warning severity. C23 6.10.6p1 (the
+    // long-standing gcc/clang extension standardised by C23): the implementation
+    // produces a diagnostic including the directive's `pp-tokens` and translation
+    // CONTINUES -- so this must never bump `errorCount()`. Deliberately NOT in the
+    // unsuppressable closed table (its `#error` sibling is): a warning ships no
+    // wrong bytes and hides no build failure, so `--suppress` must be able to
+    // silence exactly this advisory class (the S_DeprecatedSymbolUsed posture).
+    // The SAME reachability invariant applies verbatim -- a `#warning` in an
+    // elided branch is silent.
+    P_PreprocessorWarningDirective = 0x001F,
+    // TF-C82 (D-PP-PRAGMA-REGISTRY; `#pragma` C 6.10.6 / `_Pragma` C 6.10.9):
+    // a REACHED pragma whose leading word(s) match NO `preprocess.pragmaEffects`
+    // row (and the language set `unknownPragmaIsError`), a pragma whose row says
+    // `unsupported`, or a MALFORMED operand of a row DSS does implement (a
+    // `pack(...)` form outside the measured-and-built set, a non-power-of-two
+    // operand, a `pack(pop)` with nothing pushed, a `_Pragma` operand that is not
+    // a single string literal).
+    //
+    // ★ WHY A REACHED-PRAGMA ERROR IS THE CONSERVATIVE CHOICE, NOT THE NOISY ONE.
+    // C 6.10.6p2 lets an implementation ignore a pragma it does not recognize, and
+    // DSS leaned on that from FC15c to TF-C82 to drop EVERY pragma in silence. The
+    // license is real but it is about IGNORING, not about pretending: MEASURED, the
+    // sqlite corpus reaches 40 `#pragma pack` lines, and the `sys/fcntl.h`
+    // `pack(4)` region makes `struct log2phys` 20/4 where DSS computed 24/8 — a
+    // wrong-ABI struct on a live `fcntl(F_LOG2PHYS)` path. An unrecognized pragma
+    // is indistinguishable at the point of recognition from one that silently
+    // relayouts memory, so the unknown case is loud and the ignorable cases are
+    // ignorable BY A REGISTRY ROW THAT SAYS SO.
+    //
+    // ★ REACHABILITY, NOT RECOGNITION. The emit sites sit BELOW `handleDirective`'s
+    // `if (!stackActive()) return end;` gate — the `#error`/`#embed`/`#line`
+    // parity — so a pragma in a NOT-TAKEN `#if` branch is entirely silent (C
+    // 6.10p1). Load-bearing: the Apple SDK headers park pragmas inside
+    // unsupported-configuration branches by the hundred.
+    //
+    // In the unsuppressable closed table, on the `#error` argument: the whole
+    // point of the code is that a pragma with real translation semantics must not
+    // be silenceable into shipping the wrong layout.
+    P_PreprocessorPragma          = 0x0020,
+
+    // P_PreprocessorOperatorNameNotDefinable: TF-C86
+    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named one of the
+    // language's CONDITIONAL-INCLUSION OPERATORS — the `#if`-only
+    // `__has_include` / `__has_embed` / `__has_c_attribute` spellings the
+    // grammar declares (`isConditionalInclusionOperator`). C23 6.10.1 reserves
+    // those identifiers to the implementation, and DSS IMPLEMENTS them, so a
+    // program cannot take the name over.
+    //
+    // Why an ERROR and not a silent accept: honoring the redefinition makes
+    // `#include <h>` and `__has_include(<h>)` answer DIFFERENTLY about the same
+    // header — the header gets textually spliced while the guard that decides
+    // whether to splice it reads 0. That is a silent miscompile, and it is
+    // exactly the shape that produced the TF-C86 `F001A` cascade before the
+    // operators became `defined`.
+    //
+    // ★ THIS ARM IS A BELT, NOT A BREAK. The ubiquitous portability shim
+    //       #ifndef __has_include
+    //       #define __has_include(x) 0
+    //       #endif
+    //   (Apple SDK `sys/cdefs.h:91`, glibc, musl, ...) is now DEAD code on DSS
+    //   — `#ifndef __has_include` is false because the operator IS defined — so
+    //   the `#define` inside it never executes and this code never fires for
+    //   it. MEASURED: zero occurrences of an UNGUARDED `#define`/`#undef` of
+    //   these three names across the 189-TU sqlite corpus. What remains for
+    //   this code to catch is a program that really does try to shadow the
+    //   operator outright.
+    //
+    // Member of `kUnsuppressableCodes`: suppressing it would restore precisely
+    // the silent include/`__has_include` disagreement it exists to prevent.
+    // Remediation: guard the shim with `#ifndef`, or stop shadowing the name.
+    P_PreprocessorOperatorNameNotDefinable = 0x0021,
+
+    // P_PreprocessorIncludeReentryRefused: TF-C87
+    // (D-PP-INCLUDE-REENTRY-GUARD-AWARE). An `#include` of a header ALREADY ON
+    // THE INCLUDE STACK was refused because the header carries no include-once
+    // mechanism this implementation can honour.
+    //
+    // ★ WHY THIS NEEDED ITS OWN CODE RATHER THAN A REWORDED MESSAGE.
+    // `P_PreprocessorIncludeError` (0x0016) is FOUR-WAY OVERLOADED: target not
+    // found, target unreadable, this refusal, and the NESTING-DEPTH backstop.
+    // The last two are the ones that must never be confused, and the reason is
+    // structural, not cosmetic. Re-entry is now gated on GUARD DETECTION, so a
+    // refusal has two possible causes with opposite remedies:
+    //   (a) the user's header really has no guard  -> fix the header;
+    //   (b) the guard detector failed to recognise a LEGAL guard -> a COMPILER
+    //       BUG, and one whose only symptom is this diagnostic.
+    // A reader (or a census, or any tooling filtering by code) that cannot tell
+    // this refusal from the depth-cap backstop cannot tell (b) from "your
+    // includes nest too deeply", which is the failure mode this whole cycle
+    // exists to remove. The depth cap deliberately KEEPS 0x0016: it is a genuine
+    // resource/structure limit, not a claim about guards.
+    //
+    // The message additionally states outright that a guarded header reaching
+    // this code is a detector gap — the code makes it MACHINE-separable, the
+    // message makes it HUMAN-actionable, and neither substitutes for the other.
+    P_PreprocessorIncludeReentryRefused = 0x0022,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
@@ -232,6 +350,23 @@ enum class DiagnosticCode : std::uint16_t {
     // unknown TOKEN-name field still routes to `C_UnknownToken`, a missing
     // required string to `C_MissingField`.
     C_InvalidPreprocess           = 0xC037,
+    // TF-C74: ONE predefined-macro name declared by BOTH the language config
+    // (`preprocess.predefinedMacros` in `<lang>.lang.json`) AND the target
+    // config (`predefinedMacros` in `<arch>.target.json`). Neither declaration
+    // may silently win: the language's `_WIN32` and a target's `_WIN32` are two
+    // different authors' intentions, and picking either one quietly is a
+    // wrong-value miscompile with no diagnostic. Detected when the two lists
+    // are MERGED (at preprocess time — the pairing does not exist earlier),
+    // BEFORE the per-format filter, so a `["pe"]`-gated language entry still
+    // collides with an ungated target entry of the same name (the collision is
+    // about the NAME being owned twice, not about which formats happen to see
+    // it). The message names BOTH declaring config paths.
+    //
+    // Distinct from `C_InvalidPreprocess` (scoped to the language `preprocess`
+    // block — this fault belongs to neither block alone) and from
+    // `C_ConflictingField` (single-document semantics — this is a
+    // CROSS-document conflict between two independently valid configs).
+    C_ConflictingPredefinedMacro  = 0xC038,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -922,6 +1057,167 @@ enum class DiagnosticCode : std::uint16_t {
     // to turn a dropped `asm(...)` into a silent non-emission. Renders error[S0057].
     S_InlineAsmNonEmptyTemplate = 0xE057,
 
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: a bit-field MUTATION in a
+    // compound / inc-dec / value position through a base form the single-field
+    // reconstruction cannot address — a field reached via an ANONYMOUS struct/union
+    // member (needs the intermediate MemberAccess hop chain) or an ARRAY-arrow base
+    // (`sarr->bf`, C 6.3.2.1p3 decay). The bit-field-safe `classifyMemberLvalue`
+    // reconstruction (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->`
+    // bases only; these residual bases would otherwise fall to the generic via-ptr
+    // path, whose full-unit store CLOBBERS packed neighbours + skips truncation — a
+    // silent miscompile. FAIL LOUD instead (statement plain-`=` stays correct via
+    // `lowerAssign`; use a named member, or split the mutation). NON-bit-field
+    // members through the same bases are unaffected (they take the correct generic
+    // scalar store). Renders error[S0058].
+    S_BitfieldMutationUnsupportedBase = 0xE058,
+
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the `inline` function
+    // specifier appears on a declaration whose declared type is NOT a function
+    // (C99 6.7.4p1 — "shall be used only in the declaration of a function").
+    // Loud rather than inert BECAUSE the specifier has a real sink: on a
+    // function it decides whether the definition is emitted at all (6.7.4p7),
+    // so accepting it on an object would be a specifier the compiler parsed and
+    // then honored nowhere — D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP at the
+    // declaration tier. Reported by the semantic tier (the only place that
+    // knows the declared type), never by the linkage scan, which sees the
+    // keyword but not the type. Renders error[S0059].
+    S_InlineNonFunction = 0xE059,
+
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): one function carries BOTH
+    // `__attribute__((always_inline))` and `__attribute__((noinline))` — on a
+    // single declaration, or split across a prototype/definition pair that the
+    // redeclaration sweep merges. The two directives are exact contradictions:
+    // one forbids splicing the callee into a caller, the other exists solely to
+    // force splicing past the cost model. There is no reading under which both
+    // are honored.
+    //
+    // ★ THIS IS A DELIBERATE DIVERGENCE FROM CLANG, AND THE MEASUREMENT DROVE IT.
+    // Apple clang 21.0.0 was probed on four shapes (both attributes on one
+    // declaration, both inside one `__attribute__((a, b))` clause, and each
+    // order of the proto/def split) at `-fsyntax-only -Wall -Wextra` and at
+    // `-O2 -Weverything`: it emits NO diagnostic whatsoever and SILENTLY resolves
+    // the conflict in favour of `noinline` (the emitted LLVM function carries
+    // `noinline`, never `alwaysinline`, in BOTH source orders). Silently picking
+    // a winner is precisely the last-writer-wins outcome this project refuses:
+    // the author wrote two directives, exactly one can take effect, and which one
+    // is invisible at the source. DSS reports it instead. If corpus pressure ever
+    // demands clang source-compatibility here, the fallback is the MEASURED clang
+    // behaviour (noinline wins, downgraded to a warning) — which is ALSO already
+    // the MIR-tier precedence, because `inlining.cpp`'s rule-2b refusal is
+    // ordered before the rule-6 threshold bypass.
+    //
+    // Reported by the semantic tier, which is the only place that sees both
+    // attribute facts and the declared type. Renders error[S005A].
+    S_ConflictingInlineAttributes = 0xE05A,
+
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): a composite specifier whose LEADING
+    // TOKEN was emitted by the preprocessor under TWO DIFFERENT `#pragma pack`
+    // caps — i.e. the composite is defined inside a macro replacement list that
+    // is expanded under more than one cap. The token's source position therefore
+    // does not determine its layout, and the two candidate layouts have different
+    // sizes and different field offsets.
+    //
+    // ★ WHY THIS IS A SEMANTIC CODE AND NOT A PREPROCESSOR ONE, MEASURED. The
+    // first implementation raised the conflict in the PREPROCESSOR, at the moment
+    // a token was stamped twice — and that fires on perfectly legal C: a shared
+    // MEMBER macro (`#define MEMS unsigned a; long long b;`) used inside two
+    // different pack regions stamps its own tokens under both caps, while every
+    // composite that uses it is anchored on an UNAMBIGUOUS `struct` keyword and
+    // lays out correctly. MEASURED: DSS refused a program clang compiles. Only
+    // the semantic tier knows which offsets are actually used as a composite's
+    // layout key, so that is where the ambiguity can be judged instead of merely
+    // detected. The preprocessor records the ambiguity (a sentinel cap) and says
+    // nothing; this fires only if a composite really lands on one.
+    //
+    // Unsuppressable, on the `P_PreprocessorPragma` argument: the alternative to
+    // erroring is picking one of two layouts silently.
+    S_PragmaPackAmbiguous = 0xE05B,
+
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5): an asm label whose payload the
+    // compiler cannot turn into a usable assembler name — the label decoded to
+    // ZERO bytes (`__asm("")`), or its string carries a malformed escape so
+    // `decodeAdjacentStringBodies` returned nothing.
+    //
+    // ★ WHY IT IS AN ERROR AND NOT A SILENT FALL-BACK TO THE C NAME. An asm label
+    // is a RENAME: the whole point is that the emitted symbol differs from the
+    // declared identifier. Falling back to the C name on a bad label produces a
+    // clean-compiling program that references the WRONG symbol, and the failure
+    // then surfaces (if at all) as a foreign linker's "undefined reference" with
+    // no line number. Worse, an empty name reaching the definition rail is
+    // indistinguishable from "this symbol is module-private" at
+    // `compile_pipeline`'s `nameOf` — which SILENTLY DROPS the symbol-table row
+    // and lets the object writer fall back to a synthetic `sym_<id>`. Loud here
+    // is the only place the programmer can act on it.
+    S_AsmLabelInvalid = 0xE05C,
+
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): TWO asm labels on ONE declarator (`int x __asm("a") __asm("b");`).
+    // The grammar's `{repeat}` admits the run — deliberately, so an attribute and
+    // a label may interleave in any order — so the arity constraint is enforced
+    // here rather than by a grammar shape that would also forbid the legal
+    // interleavings. Never resolved by first-wins or last-wins: which symbol the
+    // programmer meant is genuinely unknown, and guessing renames the symbol to
+    // one of two names with no diagnostic.
+    S_AsmLabelDuplicate = 0xE05D,
+
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME, WARNING): an asm label on an
+    // AUTOMATIC block-scope variable. Such an
+    // object has no assembler symbol to rename — it lives in a stack slot — so the
+    // label cannot be honored.
+    //
+    // ★ A WARNING, NOT AN ERROR, AND THE CHOICE IS MEASURED. `/usr/bin/clang`
+    // accepts `int f(void){ int x __asm("mylocal"); … }` and emits exactly this
+    // diagnostic ("ignored asm label 'mylocal' on automatic variable"). Erroring
+    // would refuse C that every real toolchain compiles — the TF-C77 lesson that a
+    // gate which refuses valid C is worse than the silence it replaces. Staying
+    // SILENT is not an option either: the programmer wrote a rename that did not
+    // happen. So: honored where a symbol exists (file scope, `static` locals,
+    // externs), loudly ignored where none does.
+    S_AsmLabelOnAutomaticVariable = 0xE05E,
+
+    // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT, WARNING): ONE
+    // SHARED code for "this attribute was written on a kind of entity the
+    // language's own config says it does not appertain to, so the compiler
+    // DISCARDED it". Emitted by the single decl-kind gate in
+    // `semantic_analyzer.cpp`, which walks the matched
+    // `attributeSemantics.effects` row's `appliesTo` set against the effective
+    // `DeclarationKind` of the declarator. NAMES NO ATTRIBUTE AND NO EFFECT VERB
+    // — one code covers every present and future verb, which is the whole reason
+    // it is shared rather than per-attribute.
+    //
+    // WHAT IT REPLACED: total silence. MEASURED at `199fe7d` with the shipped
+    // CLI, all four axes, exit 0 and ZERO diagnostics while the attribute was
+    // thrown away — `__attribute__((no_sanitize_thread)) int gv = 7;`,
+    // `__attribute__((noinline)) int gv2 = 7;`,
+    // `__attribute__((always_inline)) …`, and
+    // `int gw1 __attribute__((warn_unused_result)) = 1;`.
+    //
+    // ★★ A WARNING, NOT AN ERROR, AND THE GROUNDS ARE MEASURED — READ THEM
+    // BEFORE PROMOTING IT. (1) Host clang treats `noinline`/`always_inline` on a
+    // data object as `-Wignored-attributes` WARNINGS, so erroring would refuse C
+    // that every real toolchain compiles (the TF-C77 lesson). (2) The registry
+    // row itself prescribes "ONE shared warning". (3) A warning adds ZERO errors
+    // to the corpus, so the fix cannot regress a passing program. (4)
+    // `--warnings-as-errors` already exists for a strict posture, so the strict
+    // reading is available without making it the default.
+    // ★ NOT justified by "an error would mask the HIR-tier diagnostic" — that is
+    // true but proves too much: it would equally forbid the shipped
+    // `S_AlignasInvalidContext` error two codes up.
+    //
+    // ★ A DELIBERATE, RECORDED DIVERGENCE: clang HARD-ERRORS
+    // `no_sanitize_thread` on a data object (`'no_sanitize_thread' attribute
+    // only applies to functions`) where DSS warns. The divergence is uniform
+    // across the four axes on purpose — one code, one severity, no per-attribute
+    // severity table — and it is recorded here and in the config row rather than
+    // left to be discovered.
+    //
+    // SUPPRESSIBLE, deliberately: it is the `S_AsmLabelOnAutomaticVariable`
+    // posture (a loudly-ignored annotation the program does not depend on for
+    // correct bytes), NOT the `S_AlignasInvalidContext` posture (a layout
+    // constraint whose silence is a miscompile). Do NOT add it to
+    // `unsuppressable_codes.cpp`.
+    S_AttributeIgnoredForDeclarationKind = 0xE05F,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1055,6 +1351,59 @@ enum class DiagnosticCode : std::uint16_t {
     // member's extern FFI surface — are still accepted; only INPUT static
     // archives hit this.)
     D_StaticLibFatArchiveUnsupported = 0xD013,
+    // D_CompileUnitNullNoDiagnostic: the driver's fail-loud belt-and-
+    //   suspenders guard fired — a per-CU build (`buildCuMir`) OR the back-half
+    //   lower (`lowerCuMirToAssembly`) returned a null module WITHOUT any tier
+    //   having reported a diagnostic. Every real tier failure reports its own
+    //   K_/L_/A_/S_/H_ code; a null-with-silent-reporter is a substrate-contract
+    //   violation (the D-PERF-4 buildCuMir-null contract). Mirrors the
+    //   optimizer's X_OptReturnFalseWithoutDiagnostic guard so a future silent
+    //   tier-reject surfaces loudly here instead of exiting 1 with no output
+    //   (the D-CSUBSET-TESTTU-SILENT-EXIT1 class of silent-exit-1 bug).
+    D_CompileUnitNullNoDiagnostic = 0xD014,
+    // D_ArtifactNameEscapesOutputDir (Cycle B, D-AP2-OUTPUT-ROUTING): a project
+    //   manifest's `artifactName` — validated by the loader as a bare name (it
+    //   rejects '/' and '\') — nonetheless RESOLVED to a path OUTSIDE the routed
+    //   output directory when joined onto it. The loader's separator denylist is
+    //   necessary but NOT sufficient for containment; two OS-agnostic vectors
+    //   slip past it:
+    //     * a differing ROOT-NAME (e.g. Windows drive-relative "D:app"):
+    //       `outDir / "D:app"` — std::filesystem::path::operator/ REPLACES the
+    //       left operand when the right has a different root-name, so the
+    //       artifact lands on another drive, outside --output;
+    //     * a `..` component (no separator ⇒ survives the loader): `outDir / ".."`
+    //       lexically-normalizes to outDir's PARENT.
+    //   The routing site (`compileOneTarget`) enforces the real invariant — the
+    //   resolved artifact must be a DIRECT CHILD of the output dir — and fails
+    //   loud here. Remediation-distinct from `D_OutputDirCreateFailed` (0xD00A):
+    //   that is an I/O mkdir failure (fix disk/permissions); this is a
+    //   name-containment violation (fix the manifest's `artifactName` to a plain
+    //   filename). The CLI `--compile` path never trips it — there the name is
+    //   the source STEM (always a bare filename), always a direct child.
+    D_ArtifactNameEscapesOutputDir = 0xD015,
+    // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
+    //   D-FFI-PE-CRT-UCRT-MIGRATION): the driver's shim-synthesis seam
+    //   partitions the one `synthesize` recipe map by `ffi::shimFamilyOf`
+    //   before handing each family's entries to its own synth pass — and a
+    //   recipe id came back with NO family. That is an INTERNAL INVARIANT
+    //   BREACH, never a user error: `readShippedLibDescriptor` already
+    //   rejects an unknown `synthesize` id at READ time
+    //   (F_ShippedLibDescriptorMalformed) from the SAME closed `kRecipes`
+    //   table `shimFamilyOf` reads, so an unfamilied id here means the
+    //   loader's guard and the family split have drifted out of lockstep —
+    //   a code defect, remediated in `shipped_lib_descriptor.cpp`, not in
+    //   any user file. Same class as `D_CompileUnitNullNoDiagnostic` /
+    //   `X_OptReturnFalseWithoutDiagnostic`: a substrate-contract guard
+    //   that should be unreachable and must be deafening if reached.
+    //   Remediation-distinct from `K_NoMatchingObjectFormat` (0x8xxx),
+    //   which BOTH seams previously borrowed: that is the LINKER's
+    //   format-walker dispatch invariant and points an operator at the
+    //   object-format config — the wrong end of the pipeline for a recipe
+    //   table drift. Both seams (compile_pipeline.cpp single-CU +
+    //   program.cpp merged) emit THIS code. Unsuppressable (see
+    //   `unsuppressable_codes.cpp`): a suppressed table drift would let the
+    //   recipe fall out of both passes and ship a silently-undefined shim.
+    D_SynthRecipeFamilyUnknown = 0xD016,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -1169,10 +1518,17 @@ enum class DiagnosticCode : std::uint16_t {
     // token that is neither a declared structural-syntax kind
     // (`linkageSpecifierIgnoredKinds` — e.g. `__attribute__`, parens) nor a
     // recognized entry in the language's `linkageSpecifiers` map — a typo
-    // (`__attribute__((wek))`) or an unsupported attribute (`((noinline))`). Fail
-    // loud rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
+    // (`__attribute__((wek))`) or an attribute DSS has no sink for. Fail loud
+    // rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
     // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
     // per-language config; the engine never hardcodes a specifier identity.
+    //   ★ The old example here was `((noinline))`, which has been WRONG since
+    //   TF-C78 gave noinline a real sink (and TF-C81 always_inline, TF-C92
+    //   no_sanitize_thread). Corrected TF-C92 — a stale "unsupported" example is
+    //   worse than none, because it invites re-adding a name that is already
+    //   honored. If a fresh example is ever wanted, pick one by CHECKING the
+    //   shipped `linkageSpecifiers`/`attributeSemantics` tables first, not from
+    //   memory. See D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS.
     H_UnknownLinkageSpecifier     = 0xF00C,
     // H_UnreachableCode: a statement following an unconditional terminator
     //   (Return / Unreachable / Break / Continue) within a Block — control can
@@ -1701,7 +2057,8 @@ enum class DiagnosticCode : std::uint16_t {
     //
     // Per-format codes join the family alongside their LK* cycles.
     //
-    // K_NoMatchingObjectFormat fires in four scenarios:
+    // K_NoMatchingObjectFormat is the general format-capability
+    // fail-loud. The four format-DISPATCH scenarios are:
     //   1. The linker engine's format-dispatch switch reaches
     //      `ObjectFormatKind::Unknown` (the invalid sentinel was
     //      not initialized by the format schema's loader path).
@@ -1719,6 +2076,14 @@ enum class DiagnosticCode : std::uint16_t {
     //      ShStrtab — any missing row fires this code; PE and
     //      Mach-O writers only require SectionKind::Text since
     //      their symbol/string tables don't carry section headers).
+    // Beyond dispatch, it ALSO fires when a walker is correctly
+    // matched but cannot FAITHFULLY EMIT a specific symbol shape it
+    // received — degrading which would be a silent miscompile. The
+    // standing instance is a WEAK DEFINED symbol on a format whose
+    // weak machinery is not wired: the Mach-O MH_DYLIB export arm
+    // (D-LK3-DYLIB-WEAK-EXPORT) and the PE/COFF + Mach-O RELOCATABLE
+    // writers (D-LK-OBJECT-WEAK-DEF-RELOCATABLE, TF-C54) fail loud
+    // here rather than emit the def strong and lose weak semantics.
     // K_FormatLacksImportSupport: a format walker received an
     //   AssembledModule with non-empty `externImports` but its
     //   image-side arm doesn't yet emit import tables. The three
@@ -1911,7 +2276,29 @@ enum class DiagnosticCode : std::uint16_t {
     //   the GNU `/SYM64/` 64-bit-armap case, out of scope, see
     //   D-FF1-AR-BSD-VARIANT). Fail loud rather than truncate a field.
     K_ArchiveFieldOverflow         = 0x8018,
-    // K-NEXT-SLOT: 0x8019 — grep this marker before adding a K_* code.
+    // K_FormatLacksStackReserveControl (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH):
+    //   the build requested a per-PROGRAM stack reserve (project manifest
+    //   `stackReserve` / CLI `--stack-reserve`) but the chosen object format
+    //   declares NO `stackReserveControl` capability, so nothing in the
+    //   emitted image can carry the request. Fires from the linker's
+    //   pre-walker gate (and, defensively, from a walker reached directly).
+    //   Fail loud rather than drop: an image whose stack is silently NOT what
+    //   the program asked for crashes at a depth the user cannot diagnose --
+    //   the motivating case is a 1000-deep trigger recursion overflowing the
+    //   Windows 1 MiB default. Suppressing it would restore the silent drop,
+    //   so the code is unsuppressable.
+    K_FormatLacksStackReserveControl = 0x8019,
+    // K_InvalidStackReserveRequest (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH): the
+    //   format CAN carry a stack reserve, but the requested value violates
+    //   the range the format DECLARED (below `minimumBytes`, above
+    //   `maximumBytes`, not a multiple of `granularityBytes`) or would break
+    //   an image invariant the walker enforces (PE: SizeOfStackCommit must
+    //   not exceed SizeOfStackReserve). Distinct remediation from the code
+    //   above -- "pick a legal value" vs "this format cannot do it at all".
+    //   Never silently clamped or rounded: a rounded reserve is a knob that
+    //   lies about the number it was given.
+    K_InvalidStackReserveRequest   = 0x801A,
+    // K-NEXT-SLOT: 0x801B — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -2204,27 +2591,23 @@ enum class DiagnosticCode : std::uint16_t {
     //   fully-specify / de-duplicate each variant's `when.format`.
     //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
     F_ShippedMacroVariantAmbiguous = 0x5021,
-    // F_FfiResolveLibrarySymbolAbsent: under the `--resolve-library <path>`
-    //   driver surface (c162, D-FF1-READER-CONSUMER), compile_pipeline routed
-    //   a source-declared "binary-governed" extern (no per-symbol library
-    //   override, not a bare no-library reference) to the live `ingest()`
-    //   binary-reader consumer, and it matched NO row in ANY named binary's
-    //   real export table -- AND the symbol is NOT a known system symbol
-    //   (absent from every shipped-library descriptor too). So it is a
-    //   GENUINE typo or a missing library (e.g. `dss_lib_answr` for
-    //   `dss_lib_answer`), not a bare-`extern`'d libc call the user forgot to
-    //   #include. Failing loud NOW -- naming the symbol + the searched
-    //   libraries -- catches an own-library typo at compile time (reading a
-    //   real export table is proof the symbol exists) instead of letting it
-    //   mis-bind to the format-default library and fail at link/load. A
-    //   governed extern that IS a known system symbol falls through to its
-    //   format-default library (gcc implicit-libc), NOT this diagnostic, so a
-    //   legitimate `bare extern puts + --resolve-library ownlib` program is
-    //   never wrongly rejected. The extern TYPE still comes from the inline
-    //   declaration -- the reader supplies existence + binding only. Fail-loud:
-    //   a SILENT-DANGLING-IMPORT guard (unsuppressable). Remediation: fix the
-    //   spelling, #include the header that declares it, or add the defining
-    //   library to `--resolve-library`. (D-FF1-READER-CONSUMER, c162.)
+    // F_FfiResolveLibrarySymbolAbsent: RETIRED (TF-C66) -- kept for
+    //   diagnostic-name/code stability, no longer emitted. Under the
+    //   `--resolve-library <path>` surface (c162, D-FF1-READER-CONSUMER),
+    //   compile_pipeline used to fail loud PER-CU when a binary-governed
+    //   extern matched no named binary's export table and no shipped
+    //   descriptor. That verdict was UNSOUND for a multi-TU build: per-CU it
+    //   cannot see a SIBLING TU's definition (sqlite's own API surface
+    //   false-positived 2770 times in the 185-TU testfixture compile).
+    //   TF-C66 routes the unmatched extern UNBOUND (empty library) to the
+    //   LINK tier, whose existing gate (rejectOrDropUnreferencedExterns,
+    //   c143/c150) judges it soundly with the merged picture: a sibling-TU
+    //   definition resolves it, an unreferenced declaration drops, and a
+    //   referenced-undefined symbol (the genuine typo) rejects LOUD with
+    //   K_SymbolUndefined on any exec-flavor image -- the same tier every C
+    //   toolchain reports undefined symbols from. The typo protection is
+    //   preserved, one tier later and false-positive-free.
+    //   (D-FF1-READER-CONSUMER c162; retired by TF-C66.)
     F_FfiResolveLibrarySymbolAbsent = 0x5022,
     // F_ShippedTypeIdentityConflict: two shipped descriptors resolved for the
     //   SAME compile target declare the same struct/union TAG NAME (or the same
@@ -2245,6 +2628,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   type genuinely diverges). Member of `kUnsuppressableCodes`.
     //   (D-LANG-TYPE-IDENTITY-VOCABULARY, 2026-07-20.)
     F_ShippedTypeIdentityConflict = 0x5023,
+    // F_ShippedSymbolUnavailableForTarget: the per-SYMBOL sibling of
+    //   F_ShippedHeaderUnavailableForTarget (0x501D). Under the
+    //   `--resolve-library` surface (c162, D-FF1-READER-CONSUMER) an unbound
+    //   binary-governed extern is tested against the shipped-descriptor
+    //   "is this a known system symbol" ORACLE; a KNOWN name falls through to
+    //   the target's FORMAT-DEFAULT library (gcc implicit-libc semantics).
+    //   This code fires when the name IS declared by some shipped descriptor
+    //   but NOT for the ACTIVE object format — the union of every declaring
+    //   row's `availableObjectFormats` excludes it (e.g. `fdatasync`, declared
+    //   elf-only in unistd.json, referenced by a macho build). Binding such a
+    //   name to the format default is PROVABLY WRONG: the config states the
+    //   symbol does not exist there, so the image links clean and then DIES AT
+    //   LOAD with no diagnostic at all (MEASURED: exit 255, dyld cannot resolve
+    //   `_fdatasync` in libSystem). Fail-loud converts that silent loader death
+    //   into a compile-time error. DISTINCT from "never heard of this symbol":
+    //   a name in NO descriptor still routes UNBOUND to the link tier (TF-C66),
+    //   where a sibling-TU definition resolves it and a genuine typo rejects
+    //   K_SymbolUndefined. The message names the symbol, the active format, and
+    //   the format(s) the descriptors DO declare it for. Remediation: guard the
+    //   reference per platform, use the format's own spelling of the facility,
+    //   or declare the symbol for this format in its descriptor if it really
+    //   exists there. Member of `kUnsuppressableCodes` (a silent-loader-death
+    //   guard). (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS, 2026-07-30.)
+    F_ShippedSymbolUnavailableForTarget = 0x5024,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

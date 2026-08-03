@@ -213,6 +213,236 @@ TEST(Cse, LoadCsedAcrossNoStore) {
     EXPECT_EQ(res.instructionsCsed, 1u);
 }
 
+// ── TF-C58 (D-OPT-CSE-LOAD-BACKEDGE-TAIL) ────────────────────────────
+// PRIMARY red-on-disable pin. A loop body's Load must NOT be CSE'd against a
+// PREHEADER Load when the body STORES to the same location AFTER that Load:
+// execution wraps through the back edge, so the tail Store clobbers the NEXT
+// iteration's Load. The three original slices (canonical tail / strictly-between
+// / use head) never scan the use block's TAIL, which is exactly this store.
+// Deliberately a SELF-LOOP so the strictly-between region is EMPTY and ONLY the
+// wrap-around slice can refuse the CSE.
+// RED-ON-DISABLE: delete slice (d) in cse.cpp → instructionsCsed becomes 1.
+// This is the shape that silently miscompiled sqlite's balance_nonroot copy loop
+// (the loop-carried pointer never advanced → page overrun → select1.test SEGV).
+TEST(Cse, LoadNotCsedFromPreheaderIntoLoopBodyTailStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const body  = mb.createBlock();
+    MirBlockId const exit  = mb.createBlock();
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const st0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ldPre = mb.addInst(MirOpcode::Load, lops, i32);   // canonical
+    mb.addBr(body);
+
+    mb.beginBlock(body);
+    MirInstId const ldBody = mb.addInst(MirOpcode::Load, lops, i32);  // candidate
+    MirLiteralValue one; one.value = std::int64_t{1}; one.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(one, i32);
+    MirInstId const inc[] = {ldBody, c1};
+    MirInstId const next = mb.addInst(MirOpcode::Add, inc, i32);
+    MirInstId const stTail[] = {next, slot};
+    (void)mb.addInst(MirOpcode::Store, stTail, InvalidType);          // TAIL store
+    MirInstId const cmp[] = {next, ldPre};
+    MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+    mb.addCondBr(cond, body, exit);                                   // SELF-LOOP
+
+    mb.beginBlock(exit);
+    mb.addReturn(ldPre);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "the body Load must NOT be CSE'd against the preheader Load — the "
+           "body's TAIL Store clobbers it on the next iteration via the back edge";
+}
+
+// TF-C58 PRECISION pin (counterpart to the red-on-disable above). When the
+// canonical AND the candidate sit in the SAME self-looping block with the Store
+// AFTER both, the CSE is SOUND and must STILL happen: a block is entered only at
+// index 0, so any wrap re-executes the canonical first and refreshes the value.
+// This guards against "fixing" the bug by widening the same-block scan to the
+// whole block, which would kill a provably-sound class.
+TEST(Cse, LoadCsedSameBlockInLoopDespiteTailStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const body  = mb.createBlock();
+    MirBlockId const exit  = mb.createBlock();
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const st0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+    mb.addBr(body);
+
+    mb.beginBlock(body);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);   // canonical
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);   // candidate
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const acc = mb.addInst(MirOpcode::Add, sum, i32);
+    MirInstId const stTail[] = {acc, slot};
+    (void)mb.addInst(MirOpcode::Store, stTail, InvalidType);        // store AFTER both
+    MirLiteralValue lim; lim.value = std::int64_t{9}; lim.core = TypeKind::I32;
+    MirInstId const c9 = mb.addConst(lim, i32);
+    MirInstId const cmp[] = {acc, c9};
+    MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+    mb.addCondBr(cond, body, exit);                                 // SELF-LOOP
+
+    mb.beginBlock(exit);
+    mb.addReturn(c0);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "same-block canonical+candidate with the Store after BOTH is sound: a "
+           "wrap re-executes the canonical first, so this CSE must still happen";
+}
+
+// TF-C58 MULTI-BLOCK red-on-disable (the shape that ACTUALLY miscompiled sqlite;
+// found missing by the independent code-audit). The self-loop test above returns
+// from `blockReachesItselfAvoiding` on the FIRST successor, so the worklist, the
+// `seen` marking and the step-cap are never executed there — gutting the walk's
+// loop to `return false` leaves that test GREEN while the real bug returns. Here
+// the loop is entry → body → latch → body, so reaching `body` from `body`
+// REQUIRES popping `latch` off the worklist.
+// RED-ON-DISABLE: gut the `while (!work.empty())` walk → instructionsCsed 0 → 1.
+TEST(Cse, LoadNotCsedFromPreheaderIntoMultiBlockLoopTailStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const body  = mb.createBlock();
+    MirBlockId const latch = mb.createBlock();
+    MirBlockId const exit  = mb.createBlock();
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const st0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ldPre = mb.addInst(MirOpcode::Load, lops, i32);   // canonical
+    mb.addBr(body);
+
+    mb.beginBlock(body);
+    MirInstId const ldBody = mb.addInst(MirOpcode::Load, lops, i32);  // candidate
+    MirLiteralValue one; one.value = std::int64_t{1}; one.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(one, i32);
+    MirInstId const inc[] = {ldBody, c1};
+    MirInstId const next = mb.addInst(MirOpcode::Add, inc, i32);
+    MirInstId const stTail[] = {next, slot};
+    (void)mb.addInst(MirOpcode::Store, stTail, InvalidType);          // TAIL store
+    mb.addBr(latch);
+
+    mb.beginBlock(latch);                                             // no clobber
+    MirInstId const cmp[] = {next, ldPre};
+    MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+    mb.addCondBr(cond, body, exit);                                   // BACK EDGE
+
+    mb.beginBlock(exit);
+    mb.addReturn(ldPre);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "the body Load must NOT be CSE'd against the preheader Load — the wrap "
+           "body→latch→body carries the tail Store into the next iteration";
+}
+
+// TF-C58 PRECISION pin for the `avoid` parameter (found missing by the code-audit).
+// Canonical in the loop HEADER, candidate + tail Store in the body: every wrap from
+// the body back to itself passes through the HEADER, which RE-EXECUTES the canonical
+// and refreshes the value — so this CSE is SOUND and must be admitted. That is
+// exactly what `avoid = canonicalBlock` encodes.
+// RED-ON-DISABLE for the precision half: delete the `avoid` skip in
+// `blockReachesItselfAvoiding` → the walk finds body→header→body → refuses → 1 → 0.
+// Without this pin, "simplifying" the primitive to blockReachesItself(B) would
+// silently degrade Load CSE to "never across any later clobber", invisibly.
+TEST(Cse, LoadCsedFromLoopHeaderIntoBodyDespiteTailStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock();
+    MirBlockId const body   = mb.createBlock();
+    MirBlockId const exit   = mb.createBlock();
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const st0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+    mb.addBr(header);
+
+    mb.beginBlock(header);
+    MirInstId const lops[] = {slot};
+    MirInstId const ldH = mb.addInst(MirOpcode::Load, lops, i32);     // canonical
+    mb.addBr(body);
+
+    mb.beginBlock(body);
+    MirInstId const ldB = mb.addInst(MirOpcode::Load, lops, i32);     // candidate
+    MirLiteralValue one; one.value = std::int64_t{1}; one.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(one, i32);
+    MirInstId const inc[] = {ldB, c1};
+    MirInstId const next = mb.addInst(MirOpcode::Add, inc, i32);
+    MirInstId const stTail[] = {next, slot};
+    (void)mb.addInst(MirOpcode::Store, stTail, InvalidType);          // TAIL store
+    MirInstId const cmp[] = {next, ldH};
+    MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+    mb.addCondBr(cond, header, exit);                        // wraps VIA the header
+
+    mb.beginBlock(exit);
+    mb.addReturn(ldH);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "every wrap re-enters the canonical's own block (the header), which "
+           "re-executes the canonical Load — this CSE is sound and must be kept";
+}
+
 // Negative pin: a may-aliasing Store between two identical Loads
 // blocks CSE. The Store writes through the SAME Alloca pointer the
 // Loads read — Rule 1 (same SSA) says Yes, so admission MUST refuse.

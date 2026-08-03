@@ -1,0 +1,29 @@
+{
+  "$comment": "D-CSUBSET-PACKED-BITFIELD-INTERACTION (TF-C97): `#pragma pack(N)` applies to a struct that CONTAINS a bit-field, not just to one that does not. Before the fix the cap was read only on the non-bit-field layout path, so adding one `unsigned b:1;` silently dropped it — struct A came out 16/8 instead of 12/4 and struct B 4/4 instead of 3/1, with no diagnostic. `_Static_assert` pins size AND `_Alignof` for all three shapes (struct C has the SAME 12 bytes either way and differs only in alignment, so size alone would miss it); the runtime half indexes a global array through a `volatile` index so the stride is a real address computation carrying the laid-out size, not a foldable `sizeof`, and then writes through arr[1] to prove the neighbour is not clobbered. exit = stride(12) + sizeof B(3) + _Alignof A(4) + offsetof C.a(4) + sizeof C(12) + _Alignof B(1) + _Alignof C(4) + 2 = 42. All members are fixed-width (no pointer, no `long`), so every value is data-model independent and the one exit code holds on all four targets; MEASURED with clang -arch arm64 AND -arch x86_64 (identical), at -O0 and -O2.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "$targetGating": "GNU-ABI targets only — the PE leg is deliberately absent, not forgotten. `#pragma pack` + bit-fields is the exact point where the two shipped bit-field strategies diverge: for `struct B` gnu_packed flows the 9-bit field into the byte after `c` (sizeof 3) while msvc_straddle gives it its own full 4-byte declared-type unit at offset 1 (sizeof 5). Both are correct for their ABI, so no single exitCode covers both. `struct A` and `struct C` agree at 12/4 under both strategies. The msvc_straddle cap is implemented from MSVC's documented `pack(n)` semantics and clang's MicrosoftRecordLayoutBuilder, but is NOT cl.exe-measured in this repo — pinning a PE exit code here would pin a guess.",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

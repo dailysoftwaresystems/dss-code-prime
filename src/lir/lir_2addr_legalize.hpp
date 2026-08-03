@@ -46,13 +46,19 @@ struct DSS_EXPORT LirTwoAddrLegalizeResult {
     // `requires2Address` opcode) is NOT guaranteed to hold.
     bool        allFunctionsLegalized = false;
 
-    // Mirrors `LirCallconvResult::ok()` discipline: shape-consistency
-    // is the success channel. Empty input legitimately produces
-    // `ok() == false` (no functions to legalize → caller distinguishes
-    // via expectedFuncCount).
+    // Mirrors `LirCallconvResult::ok()` discipline: shape-consistency is
+    // the success channel. The pass must have rebuilt exactly as many
+    // functions as it started with (`moduleFuncCount() == expectedFuncCount`)
+    // and every one must have legalized (`allFunctionsLegalized`). An EMPTY
+    // module (0 functions — a declaration-only / all-preprocessed-out TU) is
+    // a VALID success: 0 == 0 with nothing to legalize, `allFunctionsLegalized`
+    // vacuously true. gcc/clang likewise emit a valid empty relocatable object
+    // for such a TU; the pre-fix `expectedFuncCount > 0` clause wrongly forced
+    // `ok() == false` here, silently rejecting the whole compile
+    // (D-CSUBSET-TESTTU-SILENT-EXIT1). A genuine shape failure (expected N>0
+    // but the rebuild dropped functions) is still caught by the count mismatch.
     [[nodiscard]] bool ok() const noexcept {
-        return expectedFuncCount > 0
-            && lir.moduleFuncCount() == expectedFuncCount
+        return lir.moduleFuncCount() == expectedFuncCount
             && allFunctionsLegalized;
     }
 };

@@ -77,6 +77,35 @@ struct DSS_EXPORT ScopeRecord {
 // initializer-inference runs.
 struct DSS_EXPORT SymbolRecord {
     std::string name;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5 "Controlling Names Used in
+    // Assembler Code"): the EXPLICIT assembler name written on this symbol's
+    // declarator — `int f(void) __asm("_myname");`. EMPTY (the overwhelmingly
+    // common case) means "no label; derive the on-binary name from `name` the
+    // usual way".
+    //
+    // THE CONTRACT, MEASURED against /usr/bin/clang on arm64-darwin: when set,
+    // this string IS the on-binary symbol name, VERBATIM — the format's C
+    // mangling (`applyCMangling`) is BYPASSED, not applied on top. `int gv
+    // __asm("myglobal");` emits `myglobal`, not `_myglobal`; that is exactly why
+    // the macOS SDK's `__DARWIN_ALIAS` family writes its own leading underscore
+    // (`__asm("_" __STRING(sym) …)`). The in-tree precedent for a pre-decorated,
+    // never-re-mangled name is a format descriptor's `importMangledName`
+    // (macho64-arm64-darwin-exec.format.json ships `"_exit"` and
+    // entry_trampoline.cpp uses it verbatim).
+    //
+    // ★ IT LIVES ON THE SYMBOL, NOT ON HIR, AND THAT IS FORCED. The two rails
+    // that turn a symbol into an emitted name — `compile_pipeline`'s `nameOf`
+    // and `program.cpp`'s cross-CU merge key — read `SemanticModel`, never HIR.
+    // A HIR side-table (the `HirLinkageMap` / `HirAlignmentMap` shape) would be
+    // structurally INVISIBLE to both, and a label that never reaches them is a
+    // parse-and-ignore rename: clean compile, wrong symbol, no diagnostic.
+    //
+    // ★ IT SURVIVES THE REDECLARATION MERGE. MEASURED: a label on a PROTOTYPE
+    // renames the later DEFINITION (`int deffn(int) __asm("mydeffn"); int
+    // deffn(int x){…}` emits `mydeffn`), so `mergeOrCollideRedeclaration` carries
+    // a non-empty label from the absorbed declaration onto the survivor.
+    std::string asmName;
     ScopeId     scope{};
     NodeId      declNode{};         // the declaration's name node (or the rule node if no name child)
     NodeId      declRuleNode{};     // the declaration rule node itself (for diagnostic spans)
@@ -160,6 +189,23 @@ struct DSS_EXPORT SymbolRecord {
     // function POINTER (`int (*fp)(int)`) does NOT set this — its suffix sits on
     // the outer declarator, not the name's direct declarator. Default false.
     bool            isProtoDeclaration = false;
+    // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): TRUE iff this symbol was minted from a
+    // bare, UNDECORATED-name object declaration whose head is a TYPE-NAME reference
+    // (a potential typedef) — e.g. `Fn foo;` / `Tcl_ObjCmdProc foo;`. Such a
+    // declaration IS a function PROTOTYPE (C 6.7 / 6.9.1p2: `T x;` where T is a
+    // function type declares a function) WHEN that type-name resolves to a function
+    // type — but the function-ness is unknowable in Pass 1 (a shipped-descriptor
+    // typedef is not injected until AFTER Pass 1, and user typedefs resolve their
+    // type only in Pass 1.5). So Pass 1 marks the declaration a CANDIDATE: it is
+    // treated as Function-category for a same-name redeclaration merge (so a proto +
+    // its definition MERGE instead of colliding), and Pass 1.5 upgrades it to a real
+    // Function proto once the type resolves to a FnSig. The post-1.5 sweep VERIFIES:
+    // if the resolved type is NOT a function (a genuine object-vs-function clash such
+    // as `MyInt foo; int foo(){}`), the deferred S_RedeclaredSymbol fires there.
+    // Distinct from `isProtoDeclaration` (a SYNTACTIC `name()` proto, known in
+    // Pass 1); only ever set on an object-declaration row (never a struct field or a
+    // parameter). Default false.
+    bool            maybeFnTypedefProto = false;
     // D-CSUBSET-FN-PROTOTYPE: a proto / redundant function redeclaration that a
     // SURVIVING declaration superseded (proto→def: the proto is absorbed and the
     // definition wins the binding; def→proto / proto→proto: the new redundant
@@ -261,6 +307,133 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
+    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff this FUNCTION symbol is declared
+    // `__attribute__((noinline))` (GNU; no C11/C23 standard spelling). Set at
+    // Pass-1.5 declarator resolution from the `attributeSemantics` table's
+    // `noInline` effect verb — NOT from a hardcoded name test — gated on the
+    // declared type being a FnSig (the `isNoreturn` discipline: the attribute on
+    // a non-function is inert rather than wrongly recorded). OR-merged across a
+    // proto/definition pair by the post-1.5 `mergedFnDecls` sweep, so a call —
+    // which resolves to the DEFINITION — still sees a flag only the PROTOTYPE
+    // spelled (sqlite declares `SQLITE_NOINLINE` on both, but glibc-style headers
+    // often annotate the prototype alone).
+    //
+    // Projected onto the `HirNoInlineMap` side-table at CST→HIR lowering and
+    // stamped onto `MirFunc.noInline` at HIR→MIR, where the inliner's §2.9
+    // legality gate refuses to splice the callee.
+    //
+    // ★ A DROPPED FLAG IS NOT A SAFE MISS HERE — unlike `isNoreturn` (whose loss
+    // yields a loud H_VerifierFailure), losing this one means the function gets
+    // INLINED, silently, which is exactly what the source forbade. That is why it
+    // is propagated through every MirFunc copy/rebuild path rather than only the
+    // lowering that mints it. Default false.
+    bool            isNoInline = false;
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): TRUE iff this FUNCTION symbol is declared
+    // `__attribute__((always_inline))` (GNU; no C11/C23 standard spelling). The
+    // exact structural mirror of `isNoInline` above — set at Pass-1.5 declarator
+    // resolution from the `attributeSemantics` table's `alwaysInline` effect verb
+    // (never a hardcoded name test), FnSig-gated, OR-merged across a proto/
+    // definition pair by the post-1.5 `mergedFnDecls` sweep, projected onto
+    // `HirAlwaysInlineMap` and stamped onto `MirFunc.alwaysInline`.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY: the inliner's §2.9 gate skips its
+    // SIZE-BASED cost model (rule 6) for this callee. It does NOT override any
+    // correctness refusal, and it does nothing at all under a pipeline with no
+    // `Inlining` pass. A DROPPED flag is therefore a PERFORMANCE miss, never a
+    // miscompile — the opposite direction from `isNoInline`, whose loss is a
+    // silent violation of the source's directive. It is nevertheless propagated
+    // through every MirFunc copy/rebuild path, because a half-landed flag and no
+    // flag are indistinguishable in the emitted binary (TF-C78's finding).
+    //
+    // ★ MUTUALLY EXCLUSIVE WITH `isNoInline` AT THE SOURCE TIER: a declaration —
+    // or a proto/definition pair — carrying both is a LOUD
+    // S_ConflictingInlineAttributes, so both bits are never set together on a
+    // record that survives semantic analysis. Default false.
+    bool            isAlwaysInline = false;
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): TRUE iff this FUNCTION symbol is
+    // declared `__attribute__((no_sanitize_thread))` (GNU; no C11/C23 standard
+    // spelling). The structural twin of `isNoInline` above — set at Pass-1.5
+    // declarator resolution from the `attributeSemantics` table's
+    // `noSanitizeThread` effect verb (never a hardcoded name test), FnSig-gated,
+    // OR-merged across a proto/definition pair by the post-1.5 `mergedFnDecls`
+    // sweep, projected onto `HirNoSanitizeThreadMap` and stamped onto
+    // `MirFunc.noSanitizeThread`.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY AND WITHOUT INVENTING A CONSUMER: the fact
+    // is RECORDED and stays queryable through the whole tier stack, surfacing in
+    // `.dssir` MIR text as the `nosanitizethread` function attribute. DSS has NO
+    // sanitizer — MEASURED, `grep -rni sanitiz src/` returns nothing — so there is
+    // no instrumentation pass for the flag to switch off today, and this record is
+    // deliberately NOT described as suppressing one. It exists so the day such a
+    // pass lands it has a per-function input instead of a discarded attribute.
+    //
+    // ★ WHY OR-MERGED LIKE `isNoInline` AND NOT PER-DECLARATION LIKE
+    // `isNoOptimize`: this is an ATTRIBUTE ON THE DECLARATION, not a lexical
+    // preprocessor region, so the ordinary C shape — annotate the prototype in a
+    // header, define plainly in the .c — must reach the DEFINITION's symbol,
+    // which is the one HIR→MIR stamps from. (sqlite's own two sites annotate the
+    // definition directly, so the merge is not what makes sqlite work; it is what
+    // makes the glibc-style split work.)
+    //
+    // ★ NOT MUTUALLY EXCLUSIVE WITH ANYTHING. Unlike the inline pair above there
+    // is no contradicting partner attribute to gate — `no_sanitize_thread`
+    // composes freely with `noinline`, `always_inline` and the pragma-borne
+    // `isNoOptimize`. Default false.
+    bool            isNoSanitizeThread = false;
+    // ★★ TF-C85: TRUE iff this FUNCTION symbol's declaration sits inside an MSVC
+    // `#pragma optimize("", off)` region. Its two neighbours above come from an
+    // ATTRIBUTE on the declaration; this one comes from a LEXICALLY SCOPED
+    // PREPROCESSOR REGION, so it is set from the token-offset stamps
+    // (`State::noOptimizeAtOffset`, keyed on the declaration's leftmost EMITTED
+    // token) rather than from the `attributeSemantics` fold. Everything DOWNSTREAM
+    // of this record is identical to `isNoInline`'s route: projected onto
+    // `HirNoOptimizeMap` at CST→HIR and stamped onto `MirFunc.noOptimize` at
+    // HIR→MIR, where the optimizer's rebuild seams read it.
+    //
+    // ★ WHAT IT BUYS, STATED NARROWLY AND HONESTLY. Every pass in the shipped
+    // release pipeline is semantics-PRESERVING, so this flag changes performance,
+    // never behavior — MEASURED, nothing in this tree can perturb float
+    // arithmetic (integer-only const-fold maps, no reassociation, no FMA/fast-math,
+    // `double` is SSE2 at exactly 64 bits). It exists because the source states a
+    // directive and DSS should honor what it records, and because it is what lets
+    // the pe64 corpus leg stop failing on an unclaimed pragma. It is NOT a fix for
+    // a live floating-point miscompile and must never be described as one.
+    //
+    // ★ NOT merged across a proto/definition pair, unlike its two neighbours, and
+    // deliberately: MSVC's pragma applies to functions DEFINED in the region, so a
+    // PROTOTYPE that happens to fall inside one says nothing about where the
+    // definition lives. Leaving each record to answer for its own declaration
+    // means a stray prototype cannot silently de-optimize a definition compiled
+    // elsewhere in the file — and in the shape where both land in the region (the
+    // sqlite case) both records carry it anyway. Default false.
+    bool            isNoOptimize = false;
+    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4): TRUE iff THIS
+    // declaration of a FUNCTION symbol spells the `inline` specifier WITHOUT
+    // `extern` — 6.7.4p7's exact clause, not merely "the word inline appears".
+    // Set at Pass-1.5 declarator resolution from `cfg.inlineKeywordToken` /
+    // `cfg.inlineExternSpecifierTokens` — never a hardcoded spelling — gated on
+    // the declared type being a FnSig (the `isNoInline` discipline); the
+    // non-function case is a 6.7.4p1 constraint violation reported loud as
+    // S_InlineNonFunction rather than recorded here.
+    //
+    // ★ **AND**-MERGED across a proto/definition pair by the post-1.5
+    // `mergedFnDecls` sweep — the one flag on this record that is not OR-merged,
+    // and the asymmetry is the C standard's, not a preference. 6.7.4p7 makes a
+    // definition an INLINE definition (providing NO external definition) only
+    // when ALL of the file-scope declarations spell inline-without-extern, so a
+    // single plain `int f(int);` beside `inline int f(int){…}` restores the
+    // external definition. OR-merging would decide the opposite on exactly the
+    // two commonest shapes (an inline prototype with a plain definition, and a
+    // plain prototype with an inline definition) — MEASURED, clang emits `T _f`
+    // for both.
+    //
+    // Read at CST→HIR: a file-scope function DEFINITION whose symbol carries
+    // this flag with a Global binding is lowered as an `ExternFunction`
+    // DECLARATION instead of a `Function`, so nothing is emitted for it and the
+    // reference resolves against a sibling CU (or fails loud K_SymbolUndefined).
+    // A `static inline` keeps its Local binding and IS emitted — 6.7.4p7
+    // constrains external linkage only. Default false.
+    bool            isInline = false;
     // FC17.9(c) (D-CSUBSET-SETJMP): TRUE iff this FUNCTION symbol "returns more than
     // once" (C11 7.13.1.1 — `setjmp`/`_setjmp`: a matching `longjmp` makes the setjmp
     // call appear to return a SECOND time). There is NO source syntax for it (unlike
@@ -275,6 +448,19 @@ struct DSS_EXPORT SymbolRecord {
     // (determinate cases already work — a Call is a memory barrier and longjmp restores
     // callee-saved+SP), never a silent miscompile. Default false.
     bool            returnsTwice = false;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: TRUE iff this FUNCTION symbol was
+    // MINTED from a resolved shipped-library FFI descriptor (tcl.json, stdio.json,
+    // …) — the descriptor-injection sibling of `isNoreturn`/`returnsTwice`. Set
+    // ONLY in the shipped-lib injection loop for `kind==Function`; the SEPARATE
+    // builtin/intrinsic injection loop deliberately leaves it FALSE (both loops use
+    // `tree==InvalidTree`, so that field cannot distinguish them — this flag is the
+    // discriminator that keeps `_InterlockedCompareExchange`'s `int*`-pointee reject
+    // pinned). Read ONLY by `checkCallAgainstSig` at the DIRECT-symbol call site to
+    // decide whether the config-gated integer-pointee pointer-arg relaxation
+    // (`ptr<i64>` accepting a same-representation `long long*`/`long*`-on-LP64) may
+    // fire AT THE CALL-ARG BOUNDARY (never native C-to-C, never init/assign/return).
+    // Default false → every non-shipped callee stays strict.
+    bool            isShippedDescriptorFn = false;
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's
@@ -437,6 +623,7 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
+                  UnitAttribute<bool>                    ffiIntPointeeCompatNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -453,6 +640,7 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
+          ffiIntPointeeCompatNodes_(std::move(ffiIntPointeeCompatNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -527,6 +715,21 @@ public:
         return nullPointerConstantNodes_.has(id);
     }
 
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
+    // node the analyzer admitted via the shipped-FFI-descriptor integer-pointee
+    // pointer relaxation (a real C integer pointer — `long long*` etc. — passed to
+    // a descriptor `ptr<i64>`-style param whose pointee is same-REPRESENTATION but
+    // distinct-IDENTITY). The CST→HIR `coerce()` reads this to realize the Ptr→Ptr
+    // bitcast that retypes the arg to the param type (admit⟺realize parity, the
+    // `isNullPointerConstant` precedent). False for every other node — the mark is
+    // set ONLY when the relaxation was WHAT admitted the arg (strict-fail-then-relax-
+    // succeed), so a strictly-compatible arg is never marked. Callers MUST guard
+    // `id.valid()` before calling (the UnitAttribute routes by arenaTag; an untagged
+    // InvalidNode is ambiguous in a multi-tree CU).
+    [[nodiscard]] bool isFfiIntPointeeCompat(NodeId id) const {
+        return ffiIntPointeeCompatNodes_.has(id);
+    }
+
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
@@ -594,6 +797,12 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
+    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
+    // admitted via the shipped-descriptor integer-pointee pointer relaxation. The
+    // CST→HIR lowerer reads `isFfiIntPointeeCompat` to materialize the Ptr→Ptr
+    // bitcast retyping the arg to the param type. TREE-KEYED UnitAttribute for the
+    // same cross-tree-aliasing reason as `nullPointerConstantNodes_`.
+    UnitAttribute<bool>                                   ffiIntPointeeCompatNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

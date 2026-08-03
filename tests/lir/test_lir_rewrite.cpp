@@ -799,3 +799,106 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
     DiagnosticReporter verifyRep;
     EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, sch, verifyRep));
 }
+
+TEST(LirRewrite, SpilledDefBeforeArgOpScratchAvoidsLiveIncomingArgRegisters) {
+    // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: the arm64 release-only
+    // sqlite miscompile. The sibling D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75)
+    // assumed the arg ops sit contiguously at the entry-block head, so ONLY a
+    // spilled arg-op RESULT could clobber a still-live incoming arg register.
+    // The RELEASE optimizer falsifies that: it reorders a spilled local/zero-init
+    // def AHEAD of the `arg` materialization. `pickScratchRegs` orders the pool
+    // by register-table ordinal, so pool[0] = argGprs[0] = x0 on AAPCS64; pre-fix
+    // the reordered def stages through x0 (`mov x0,#0; str x0,[sp]`), clobbering
+    // the incoming param before its `arg` op captures it (arg0 read as 0 → deref
+    // 0x10 → SEGV; argc read as 0 → the shell sees no arguments).
+    //
+    // Hand-build that dangerous order — a spilled `mov #0` def BEFORE two `arg`
+    // ops, all in the entry block (the deterministic form of the optimizer
+    // reorder) — and pin the OUTPUT-ORDER PROPERTY: no instruction preceding an
+    // `arg` op writes that arg op's still-live incoming register. Host-blind
+    // (pure LIR shape); runs on every leg. RED-ON-DISABLE: reverting the
+    // pendingArgOrdinals forbid makes the def's frame-store scratch = pool[0] =
+    // x0 = the occupied arg0 ordinal → both the property loop and the concrete
+    // `NE(scratch, arg0)` pin below go red (demonstrated by reverting the fix).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    auto const movOp  = sch.opcodeByMnemonic("mov");
+    auto const argOpM = sch.opcodeByMnemonic("arg");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && argOpM.has_value() && retOp.has_value());
+    auto const* cc = sch.callingConvention(0);  // aapcs64
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->argGprs.size(), 2u);
+    auto const arg0Ord = sch.registerByName(cc->argGprs[0]);
+    auto const arg1Ord = sch.registerByName(cc->argGprs[1]);
+    ASSERT_TRUE(arg0Ord.has_value() && arg1Ord.has_value());
+
+    // mov v3, #0 (spilled def, FIRST) → arg v1<-x0 → arg v2<-x1 → ret.
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const p0V  = b.newVReg(LirRegClass::GPR);  // vreg 1 (param0 home)
+    LirReg const p1V  = b.newVReg(LirRegClass::GPR);  // vreg 2 (param1 home)
+    LirReg const defV = b.newVReg(LirRegClass::GPR);  // vreg 3 (the spilled def)
+    std::array<LirOperand, 1> const movOps{LirOperand::makeImmInt32(0)};
+    b.addInst(*movOp, defV, movOps, 0u);                          // def FIRST
+    b.addInst(*argOpM, p0V, std::span<LirOperand const>{}, 0u);   // arg0 <- x0
+    b.addInst(*argOpM, p1V, std::span<LirOperand const>{}, 1u);   // arg1 <- x1
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    LirFuncId const fn = lir.funcAt(0);
+
+    // Alloc: params homed in callee-saved regs (so x0/x1 stay UNASSIGNED →
+    // pool[0]=x0); the def is SPILLED (so its store pulls scratch = pool[0]).
+    LirAllocation alloc;
+    LirFuncAllocation fa;
+    fa.fn = fn;
+    fa.originalSymbol = SymbolId{1};
+    fa.assignments.resize(4);  // slot 0 sentinel; vregs 1..3
+    fa.assignments[1] =
+        LirRegAssignment::makePhys(p0V, makePhysicalReg(19, LirRegClass::GPR));
+    fa.assignments[2] =
+        LirRegAssignment::makePhys(p1V, makePhysicalReg(20, LirRegClass::GPR));
+    fa.assignments[3] = LirRegAssignment::makeSpill(defV, LirSpillSlot{1});
+    fa.numSpillSlots          = 1;
+    fa.ok                     = true;
+    fa.callingConventionIndex = 0;  // aapcs64
+    alloc.perFunc.push_back(std::move(fa));
+
+    DiagnosticReporter rep;
+    auto rewritten = rewriteWithAllocation(lir, sch, alloc, rep);
+    ASSERT_TRUE(rewritten.ok)
+        << "the incoming-arg forbid must not exhaust the pool (x2.. remain)";
+
+    // Walk the rewritten entry block tracking still-pending incoming-arg
+    // ordinals; assert no instruction WRITES one before its `arg` op retires it.
+    Lir const& dst = rewritten.lir;
+    LirBlockId const blk = dst.funcBlockAt(dst.funcAt(0), 0);
+    std::unordered_set<std::uint32_t> pending{*arg0Ord, *arg1Ord};
+    bool sawDef = false;
+    for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+        LirInstId const inst = dst.blockInstAt(blk, i);
+        std::uint16_t const opc = dst.instOpcode(inst);
+        LirReg const res = dst.instResult(inst);
+        if (res.valid() && res.isPhysical == 1) {
+            EXPECT_EQ(pending.count(res.id), 0u)
+                << "output inst " << i << " writes physical ordinal " << res.id
+                << " which still holds a live incoming param — the clobber";
+            if (opc == *movOp) {
+                sawDef = true;
+                // Concrete pin: the reordered def's scratch is NOT arg0 (x0).
+                EXPECT_NE(res.id, *arg0Ord)
+                    << "the spilled def's frame-store scratch is arg0 (x0)";
+                EXPECT_NE(res.id, *arg1Ord);
+            }
+        }
+        if (opc == *argOpM) {
+            pending.erase(dst.instPayload(inst) == 0u ? *arg0Ord : *arg1Ord);
+        }
+    }
+    EXPECT_TRUE(sawDef) << "the spilled mov def must survive to the output";
+    DiagnosticReporter verifyRep2;
+    EXPECT_TRUE(verifyLirPostRegalloc(dst, sch, verifyRep2));
+}

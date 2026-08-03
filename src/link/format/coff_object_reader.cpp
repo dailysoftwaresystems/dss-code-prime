@@ -86,6 +86,29 @@ constexpr std::uint16_t kSymDtypeFunction = 0x20u;
 // exemption; the section KIND is resolved from the schema name map.
 constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 
+// IMAGE_SCN_LNK_COMDAT: this section participates in COMDAT
+// duplicate-resolution. A real cl.exe/clang-cl `.obj` places each
+// function-level-linked (`/Gy`) / `__declspec(selectany)` / inline / template
+// body in its OWN COMDAT section; the duplicate-resolution policy lives in the
+// section-definition auxiliary record's Selection byte (decoded below --
+// D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION). DSS's own writer emits NO COMDAT
+// sections, so this bit is only ever set by a FOREIGN object
+// (D-LK-COFF-READER-FOREIGN-OBJECT).
+constexpr std::uint32_t kScnLnkComdat = 0x00001000u;
+
+// IMAGE_COMDAT_SELECT_* -- the COMDAT Selection byte (aux format 5, offset 14).
+// Maps to the universal SymbolBinding the format-blind merge already resolves.
+constexpr std::uint8_t kComdatSelNoDuplicates = 1;  // -> Strong (Global)
+constexpr std::uint8_t kComdatSelAny          = 2;  // -> Weak
+constexpr std::uint8_t kComdatSelSameSize     = 3;  // -> Weak
+constexpr std::uint8_t kComdatSelExactMatch   = 4;  // -> Weak
+// ASSOCIATIVE(5) / LARGEST(6) / 0 / unknown -> FAIL LOUD (see the decode).
+
+// Section-definition auxiliary record (aux format 5) field offset: the
+// Selection byte sits at offset 14 of the 18-byte aux record (after Length[4],
+// NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2]).
+constexpr std::size_t kAuxSectionDefSelectionOff = 14;
+
 // Is this target-schema reloc formula a FUNCTION CALL / BRANCH (as opposed
 // to a data-address computation)? The AGNOSTIC "extern is a function"
 // signal a call/branch reloc would give. PE x86_64 declares NO such
@@ -370,11 +393,23 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
     for (auto& sec : sections) {
-        if (auto it = nameToKind.find(sec.name); it != nameToKind.end()) {
+        // GATE 1 (D-LK-COFF-READER-FOREIGN-OBJECT): COFF `$`-grouped section
+        // names. A real cl.exe/clang-cl object emits `.text$mn` / `.rdata$r` /
+        // `.xdata` -- the `$<suffix>` groups contributions the FINAL linker
+        // concatenates within the base section (`$` is the COFF group
+        // separator, the analog of ELF's `.` in `.text.<fn>`). Truncate at the
+        // FIRST `$` to the BASE name, then route the BASE through the EXISTING
+        // two-map reloc-presence logic. DSS emits ungrouped names (no `$`), so
+        // this is a strict superset -- a `$`-less name is its own base. We do
+        // NOT clone ELF's single-kind longest-prefix resolver: the two
+        // header-identical `.rdata` rows (rodata vs relro) are disambiguated
+        // ONLY by reloc-presence, which the longest-prefix collapse would lose.
+        std::string const base = sec.name.substr(0, sec.name.find('$'));
+        if (auto it = nameToKind.find(base); it != nameToKind.end()) {
             sec.kind = it->second;
         }
         if (sec.relocCount > 0u) {
-            if (auto it = nameToRelroKind.find(sec.name); it != nameToRelroKind.end()) {
+            if (auto it = nameToRelroKind.find(base); it != nameToRelroKind.end()) {
                 sec.kind = it->second;  // reloc-bearing const -> the relro row
             }
         }
@@ -436,6 +471,103 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             auxSlot[i + a] = true;
         }
         i += static_cast<std::size_t>(1) + numAux;
+    }
+
+    // -- (5.5) GATE 3: COMDAT selection -> the section's external-symbol binding.
+    //
+    // (D-LK-COFF-READER-FOREIGN-OBJECT.) A real cl.exe/clang-cl `.obj` places
+    // each `/Gy` / `__declspec(selectany)` / inline / template body in its OWN
+    // IMAGE_SCN_LNK_COMDAT section. COFF encodes the duplicate-resolution policy
+    // NOT on the symbol but in the section-definition AUXILIARY record (aux
+    // format 5) of the section's STATIC section symbol: the `Selection` byte.
+    // We map it to the universal SymbolBinding the merge already resolves, so
+    // the EXISTING all-weak dedup (resolveCrossCuDefs lowest-key-wins +
+    // linker.cpp isShadowedDuplicate body-drop) folds cross-object COMDAT
+    // duplicates with ZERO merge change. The selection switch is a TOTAL
+    // enumeration -- every kind-resolved COMDAT section maps to a binding or
+    // FAILS LOUD; a selection is never silently defaulted (a wrong default
+    // silently mis-dedups).
+    std::unordered_map<std::uint16_t, SymbolBinding> comdatBindingBySection;
+    for (std::uint16_t si = 0; si < numSections; ++si) {
+        Section const& sec = sections[si];
+        if ((sec.chars & kScnLnkComdat) == 0u) continue;  // not a COMDAT section
+        // Only a COMDAT section whose KIND resolved (real code/data --
+        // `.text$mn`/`.data`/`.rdata`) reconstructs a BODY whose external
+        // symbol we lift + whose wrong-size selection is a miscompile risk. A
+        // COMDAT section with UNRESOLVED kind is unmodeled metadata -- a real
+        // `/Gy` object marks its `.pdata`/`.xdata` COMDAT with
+        // ASSOCIATIVE(5) selection tying them to the function COMDAT -- which
+        // reconstructs NO body + has NO external defined symbol to lift, and is
+        // SKIPPED whole by Gate 2 (D-LK-COFF-FOREIGN-UNWIND-DROP). Reading its
+        // selection would fail loud on ASSOCIATIVE for a section we drop anyway
+        // (blocking every `/Gy`-compiled object). Gate 3 owns kind-RESOLVED
+        // COMDAT (the miscompile surface); Gate 2 owns the kind-UNRESOLVED
+        // metadata -- the same kind split both gates key on.
+        if (!sec.kind.has_value()) continue;
+        std::uint16_t const ordinal = static_cast<std::uint16_t>(si + 1u);
+        // The section-definition symbol: a STATIC symbol naming THIS ordinal
+        // with an auxiliary record (its FIRST aux is the format-5 section
+        // definition, PE/COFF spec 5.5.5). Its Selection byte is the policy.
+        std::optional<std::uint8_t> selection;
+        for (std::uint32_t k = 0; k < numSymbols; ++k) {
+            if (auxSlot[k]) continue;                          // an aux slot, not a symbol
+            Sym const& s = syms[k];
+            if (s.storage != kSymClassStatic || s.sectNum != ordinal) continue;
+            std::size_t const auxIdx = static_cast<std::size_t>(k) + 1u;
+            if (auxIdx >= numSymbols || !auxSlot[auxIdx]) continue;  // no aux -> not the section symbol
+            // The aux record sits at symtab index auxIdx; [ao, ao+18) is in
+            // bounds (auxIdx < numSymbols, and the symbol table [symTabPtr,
+            // +18*numSymbols) was proven file-backed in (1)).
+            std::size_t const ao =
+                static_cast<std::size_t>(symTabPtr) + auxIdx * kSymbolSz;
+            selection = bytes[ao + kAuxSectionDefSelectionOff];
+            break;
+        }
+        if (!selection.has_value()) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: section '" + sec.name + "' is flagged "
+                "IMAGE_SCN_LNK_COMDAT but carries no section-definition auxiliary "
+                "record (aux format 5) to read its COMDAT Selection from -- "
+                "refusing to default a selection (a wrong default would silently "
+                "mis-dedup). D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION.");
+        }
+        switch (*selection) {
+            case kComdatSelNoDuplicates:
+                // NODUPLICATES: a genuine duplicate IS an error. Keep the
+                // symbol STRONG (Global) so the existing all-strong merge fires
+                // K_SymbolRedefinedAcrossUnits on a duplicate -- which IS the
+                // NODUPLICATES contract.
+                comdatBindingBySection.emplace(ordinal, SymbolBinding::Global);
+                break;
+            case kComdatSelAny:
+            case kComdatSelSameSize:
+            case kComdatSelExactMatch:
+                // ANY / SAME_SIZE / EXACT_MATCH: duplicates are legal; the
+                // linker keeps one and drops the rest. Lift to WEAK so the
+                // existing all-weak merge dedup keeps one body + drops the
+                // shadow (ZERO merge change).
+                comdatBindingBySection.emplace(ordinal, SymbolBinding::Weak);
+                break;
+            default:
+                // LARGEST(6) / ASSOCIATIVE(5) / 0 / unknown -> FAIL LOUD.
+                // Lifting LARGEST to Weak would be a SILENT WRONG-SIZE
+                // MISCOMPILE: cuId is minted in PULL order (compile_pipeline.cpp
+                // readArchiveMemberModule), NOT size order, so weak lowest-key
+                // -wins can keep the SMALLER copy. ASSOCIATIVE ties a section's
+                // liveness to another section, which the symbol-atomic model
+                // does not represent. Both are C++ selectany/RTTI/vtable
+                // constructs essentially absent from C/SQLite -- fail-loud is
+                // the correct best-long-term stance for this target (the
+                // size-aware successor is D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: section '" + sec.name + "' has "
+                    "COMDAT Selection " + std::to_string(*selection)
+                    + " (LARGEST / ASSOCIATIVE / unknown), which the format-blind "
+                    "all-weak merge cannot honor without size-aware selection: "
+                    "cuId is minted in PULL order, not size order, so a weak lift "
+                    "could keep the smaller copy (a silent wrong-size "
+                    "miscompile). D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION.");
+        }
     }
 
     // -- (6) Reconstruct externs, then stage defined symbols per section --
@@ -500,9 +632,17 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // Value is ALREADY section-relative (the COFF convention -- NO
         // subtraction, unlike Mach-O's flat n_value).
         if (isExt) {
-            // Externally-visible defined symbol -> an atom boundary.
+            // Externally-visible defined symbol -> an atom boundary. GATE 3:
+            // a COMDAT section lifts the binding per its Selection policy (Weak
+            // for ANY/SAME_SIZE/EXACT_MATCH so the all-weak dedup folds
+            // duplicates; Global for NODUPLICATES / a non-COMDAT section).
+            SymbolBinding extBinding = SymbolBinding::Global;
+            if (auto it = comdatBindingBySection.find(s.sectNum);
+                it != comdatBindingBySection.end()) {
+                extBinding = it->second;
+            }
             defsBySection[s.sectNum].push_back(
-                DefSym{i, s.value, s.name, SymbolBinding::Global,
+                DefSym{i, s.value, s.name, extBinding,
                        SymbolVisibility::Default});
         } else if (!s.name.empty()) {
             // A STATIC (local) defined symbol -- an interior `&&label` /
@@ -653,16 +793,37 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         bool const patchesText = (fIt != funcIntervalsBySec.end() && !fIt->second.empty());
         bool const patchesData = (dIt != dataIntervalsBySec.end() && !dIt->second.empty());
         if (!patchesText && !patchesData) {
-            // A reloc-bearing section that reconstructed NO atom. DSS output
-            // has none -- every reloc it emits patches a `.text` function or a
-            // data item. Fail loud rather than `continue` (silent-failure
-            // fold): a foreign section-relative shape is diagnosed, not
-            // silently dropped.
+            // GATE 2 (D-LK-COFF-READER-FOREIGN-OBJECT): a reloc-bearing section
+            // that reconstructed NO atom. The skip is gated on KIND-UNRESOLVED,
+            // never atom-absence.
+            if (!sec.kind.has_value()) {
+                // An UNMODELED metadata section whose BASE name is absent from
+                // the schema (`.pdata` / `.xdata` / `.debug$S` / `.debug$T` /
+                // `.drectve` / `.chks64`) -- kind stayed nullopt. These carry
+                // their OWN relocations (`.pdata`/`.xdata` are 0x40000040, NOT
+                // discardable -- so the DISCARDABLE bit alone cannot gate this)
+                // but hold no reconstructable code/data body the AssembledModule
+                // models. SKIP the section AND its reloc table: DSS has no
+                // representation for CodeView / SEH-unwind / linker-directive
+                // metadata. Dropping `.pdata`/`.xdata` drops unwind for a
+                // foreign function (fine for a leaf/exit-42 link; a general
+                // limitation -- D-LK-COFF-FOREIGN-UNWIND-DROP).
+                continue;
+            }
+            // A KIND-RESOLVED section (a real `.rdata`/`.data`/`.text`) that
+            // reconstructed NO atom -- e.g. an ANONYMOUS `.rdata` string-literal
+            // section owned by no symbol. COFF has NO gap-atom analog to the ELF
+            // c167 reconstruction, so its relocations cannot be attached. FAIL
+            // LOUD rather than skip: skipping a resolved-kind section's relocs
+            // would be a SILENT DROP (the never-silently-drop contract). The
+            // closing work is COFF gap atoms -- D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS.
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "pe::readRelocatableObject: section '" + sec.name + "' carries "
                 + std::to_string(sec.relocCount) + " relocation(s) but "
-                "reconstructed no atom to attach them to -- refusing to "
-                "silently drop a section's relocations.");
+                "reconstructed no atom to attach them to (its kind resolved, so "
+                "it is real code/data, not skippable metadata) -- refusing to "
+                "silently drop a section's relocations. "
+                "D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS.");
         }
         std::vector<Interval> const& ivs = patchesText ? fIt->second : dIt->second;
 

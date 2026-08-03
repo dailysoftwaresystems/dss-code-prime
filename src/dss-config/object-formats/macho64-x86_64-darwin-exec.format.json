@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: Mach-O CAN express a per-program stack reserve -- `LC_MAIN.stacksize` is a genuine equivalent of the PE optional header's SizeOfStackReserve -- but NO DSS walker arm writes it yet, so this schema deliberately declares no `stackReserveControl` and a request is REFUSED. Shipping the capability without the walker would let a request be accepted and silently dropped; declaring the gap keeps it VISIBLE. TRACKED as [[D-LK-MACHO-STACK-RESERVE-LC-MAIN]] -- and that registry row is the point: unlike the other three reason verbs (`runtime-controlled`, `loader-ignores-field`, `no-image-field`), which state PERMANENT facts about a platform, this one names a gap that is OURS and is CLOSABLE, so it carries a trigger and defined closing work in the backlog rather than only a well-written comment (the comment tells whoever HITS it; the row is what keeps it from being forgotten). When the macho walker arm lands, this key is replaced by a `stackReserveControl` block with a `macho-lc-main` vehicle and this format moves to the positive side of the linker gate's coverage sweep.",
+
+  "stackReserveUnsupportedReason": "walker-not-implemented",
+
   "format": {
     "name": "macho64-x86_64-darwin-exec",
     "version": "1.0",
@@ -11,6 +15,12 @@
 
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
+  "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
+  "predefinedMacros": [
+    { "name": "__LP64__", "kind": "constant", "value": "1" },
+    { "name": "_LP64",    "kind": "constant", "value": "1" }
+  ],
+
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: macOS x86_64 generic LSB-first bit-field allocation == gnu_packed (Apple does not diverge from generic AAPCS64 on bit-field packing). Byte-ABI-exact to clang. See macho64-x86_64-darwin for the divergence-list rationale.",
   "bitFieldStrategy": "gnu_packed",

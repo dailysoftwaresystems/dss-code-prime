@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace dss;
@@ -50,6 +52,19 @@ namespace {
     fs::path const p = dir.path() / name;
     std::ofstream(p, std::ios::binary) << content;
     return p;
+}
+
+// True iff SOME reported diagnostic's text contains `needle`. The descriptor
+// reader packs its whole message into `ParseDiagnostic::actual` (see
+// `emitMalformed` → `dss::report`). Used by the sentinel pins below: they all
+// share ONE code (`F_ShippedLibDescriptorMalformed`), so `hasErrors()` alone
+// cannot tell the intended rejection from an unrelated one in the same fixture.
+[[nodiscard]] bool anyDiagMentions(DiagnosticReporter const& rep,
+                                   std::string_view needle) {
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
 }
 
 // ── Happy path: structural FnSig inspection ──────────────────────────────────
@@ -255,6 +270,130 @@ TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());   // malformed → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── c156: per-symbol `version` (D-LK-ELF-SYMBOL-VERSIONING) ───────────────────
+
+// ── per-symbol `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC) ──────
+
+// A symbol carrying its own `library` map decodes the RAW per-symbol override
+// (pe->ucrtbase) onto `ShippedSymbol.library`; a sibling with no `library` field
+// gets an EMPTY map (it inherits the descriptor's at injection). The descriptor-
+// level `library` is unchanged — this layer stores the RAW override, and the
+// merge is the semantic injector's job. RED-ON-DISABLE: drop the per-symbol
+// `library` decode (or the field) and the override symbol's map goes empty.
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideDecodesRawMap) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "time_like.json", R"JSON({
+        "header": "time.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "strftime", "signature": "fn() -> i32", "library": { "pe": "ucrtbase.dll" } },
+            { "name": "time",     "signature": "fn() -> i64" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 2u);
+    // The override symbol carries its RAW per-symbol map (pe->ucrtbase). The
+    // descriptor-level map is NOT merged in here (that is the injector's job).
+    EXPECT_EQ(desc->symbols[0].name, "strftime");
+    ASSERT_EQ(desc->symbols[0].library.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].library.at("pe"), "ucrtbase.dll");
+    // The sibling declares no override → empty map (inherits at injection).
+    EXPECT_EQ(desc->symbols[1].name, "time");
+    EXPECT_TRUE(desc->symbols[1].library.empty());
+    // The descriptor-level map is untouched by the per-symbol override.
+    EXPECT_EQ(desc->library.at("pe"), "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"), "libc.so.6");
+}
+
+// An unknown per-symbol `library` object-format KEY fails loud (the SAME closed
+// `objectFormatKindFromName` vocabulary the descriptor-level `library` map uses —
+// the shared `decodeLibraryMap` chokepoint).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideUnknownFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "bogus": "x.dll" } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // unknown format key → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE SENTINEL VARIANT of the test above. "bogus" fails the name lookup;
+// "unknown" PASSES it — it is a row in `kObjectFormatKindTable` — and the
+// library then resolves for no real format, so the symbol reaches the link with
+// no import library. Same outcome as the typo, reached by a correctly-spelled
+// word, which is why only an explicit selectability check can catch it.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `decodeLibraryMap` and the read succeeds with a dead `unknown` entry.
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinel_sym_lib.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "unknown": "x.dll" } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"))
+        << "the diagnostic must say WHY 'unknown' is refused — 'unknown "
+           "object-format key' would be a confusing lie for a name that IS in "
+           "the table";
+}
+
+// A per-symbol `library` VALUE that is not a string fails loud (mirrors the
+// descriptor-level map's non-string-value rejection via `decodeLibraryMap`).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideNonStringValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib2.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": { "pe": 123 } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // non-string value → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A per-symbol `library` that is not an OBJECT fails loud (a shape error — the
+// `decodeLibraryMap` non-object branch, which skips the symbol; the read then
+// fails via the "declares nothing"/errorCount delta).
+TEST(ShippedLibDescriptor, SymbolLibraryOverrideNonObjectFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_lib3.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "library": "msvcrt.dll" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // non-object library → whole read fails
     EXPECT_TRUE(rep.hasErrors());
 }
 
@@ -505,6 +644,199 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     EXPECT_TRUE(macros->empty());      // no `macros` key -> nothing injected
 }
 
+// ── D-FFI-DESCRIPTOR-INCLUDES: the transitive shipped-header `#include` graph ──
+//
+// A descriptor may declare `"includes": ["stdio.h"]` — the sibling headers it
+// transitively `#include`s. `readShippedLibDescriptor` populates `.includes`, the
+// interner-free `readShippedLibIncludes` returns the same (lock-step), and
+// `forEachDescriptorInClosure` walks the closure cycle-safe.
+
+// (a) `includes` decodes on BOTH the interned full read AND the interner-free read.
+// RED-ON-DISABLE: drop the `decodeShippedIncludes` call in readShippedLibDescriptor
+// (or the readShippedLibIncludes impl) → `.includes` empty / nullopt.
+TEST(ShippedLibDescriptor, IncludesSurfaceDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "parent.json", R"JSON({
+        "header": "parent.h",
+        "includes": ["stdio.h", "sys/uio.h"],
+        "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->includes.size(), 2u);
+    EXPECT_EQ(desc->includes[0], "stdio.h");
+    EXPECT_EQ(desc->includes[1], "sys/uio.h");
+    // Interner-FREE read returns the identical list (the walker's source).
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_FALSE(rep2.hasErrors());
+    ASSERT_EQ(inc->size(), 2u);
+    EXPECT_EQ(inc->at(0), "stdio.h");
+    EXPECT_EQ(inc->at(1), "sys/uio.h");
+}
+
+// Absent `includes` ⇒ empty (back-compat — every existing descriptor untouched).
+TEST(ShippedLibDescriptor, IncludesAbsentIsEmpty) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "noinc.json", R"JSON({
+        "header": "noinc.h", "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_TRUE(desc->includes.empty());
+    DiagnosticReporter rep2;
+    auto inc = readShippedLibIncludes(path, rep2);
+    ASSERT_TRUE(inc.has_value());
+    EXPECT_TRUE(inc->empty());
+}
+
+// (a') A malformed `includes` field FAILS LOUD (F_ShippedLibDescriptorMalformed) on
+// BOTH reads — a non-array shape AND a non-string / empty entry. RED-ON-DISABLE:
+// drop the shape validation in decodeShippedIncludes → the malformed field is
+// silently accepted.
+TEST(ShippedLibDescriptor, IncludesMalformedFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // Non-array.
+    {
+        auto const path = writeTemp(dir, "badinc1.json", R"JSON({
+            "header": "b.h", "includes": "stdio.h",
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+        // The interner-free read stays in lock-step (same code, nullopt).
+        DiagnosticReporter rep2;
+        auto inc = readShippedLibIncludes(path, rep2);
+        EXPECT_FALSE(inc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep2, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+    // Non-string entry.
+    {
+        auto const path = writeTemp(dir, "badinc2.json", R"JSON({
+            "header": "b.h", "includes": [123],
+            "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+        })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+}
+
+// (b) ★ CYCLE SAFETY (the correctness must): two temp descriptors a.json(includes:[b])
+// + b.json(includes:[a]) — a CYCLE. forEachDescriptorInClosure must visit each
+// EXACTLY ONCE and TERMINATE (a broken visited-set would infinite-loop / OOM).
+TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h", "includes": ["b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "includes": ["a.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    // Terminated (we got here) + each descriptor visited exactly once.
+    ASSERT_EQ(order.size(), 2u);
+    EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
+    EXPECT_EQ(order[1], "b");   // then its include
+    EXPECT_TRUE(unresolved.empty());
+}
+
+// (b') DIAMOND (a→b, a→c, b→d, c→d): the shared leaf `d` is visited ONCE, and every
+// descriptor is visited parent-before-child.
+TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const aPath = writeTemp(dir, "da.json", R"JSON({
+        "header": "da.h", "includes": ["db.h", "dc.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "db.json", R"JSON({
+        "header": "db.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dc.json", R"JSON({
+        "header": "dc.h", "includes": ["dd.h"],
+        "symbols": [ { "name": "cf", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "dd.json", R"JSON({
+        "header": "dd.h", "symbols": [ { "name": "df", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    forEachDescriptorInClosure(
+        aPath, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const&) {});
+    ASSERT_EQ(order.size(), 4u);        // each of a/b/c/d visited exactly once
+    EXPECT_EQ(order[0], "da");          // parent first (the DFS root)
+    // The shared leaf `dd` appears exactly once (the diamond dedup — this is the
+    // load-bearing property; a broken visited-set would visit it twice).
+    EXPECT_EQ(std::count(order.begin(), order.end(), std::string{"dd"}), 1);
+    // Parent-before-child holds for every TRAVERSED edge (a DFS: `dd` is reached
+    // through `db`'s descent, so `dd` is visited BEFORE `dc` even starts — the
+    // `dc→dd` edge is pruned by the visited-set, NOT re-traversed. So the honest
+    // invariants are: da precedes every other node, and db precedes dd).
+    auto idx = [&](std::string const& s) {
+        return std::find(order.begin(), order.end(), s) - order.begin();
+    };
+    EXPECT_LT(idx("da"), idx("db"));
+    EXPECT_LT(idx("da"), idx("dc"));
+    EXPECT_LT(idx("da"), idx("dd"));
+    EXPECT_LT(idx("db"), idx("dd"));   // dd is db's child, reached first via db
+}
+
+// (c) FAIL-LOUD: an `includes` entry that resolves to NO descriptor on systemDirs
+// invokes `onUnresolvedInclude` with the offending header name (the import resolver
+// turns this into a positioned F_ShippedHeaderNotFound). RED-ON-DISABLE: drop the
+// `if (!childPath) onUnresolvedInclude(...)` arm → a typo'd include is silently
+// swallowed.
+TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "typo.json", R"JSON({
+        "header": "typo.h", "includes": ["stdioo.h"],
+        "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
+    })JSON");
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> order;
+    std::vector<std::string> unresolved;
+    forEachDescriptorInClosure(
+        path, systemDirs, visited,
+        [&](fs::path const& p) { order.push_back(p.stem().string()); },
+        [&](std::string const& h) { unresolved.push_back(h); });
+    ASSERT_EQ(order.size(), 1u);        // only the parent (the typo has no descriptor)
+    EXPECT_EQ(order[0], "typo");
+    ASSERT_EQ(unresolved.size(), 1u);   // the unresolvable entry was surfaced
+    EXPECT_EQ(unresolved[0], "stdioo.h");
+}
+
 // ── structs surface (named-field aggregate; the struct-body mechanism) ────────
 
 // A `structs` entry decodes into a ShippedStruct with named fields + an interned
@@ -593,6 +925,261 @@ TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── unions surface (named-member union; the union-body mechanism, C34b) ───────
+//
+// A `unions` entry decodes into a ShippedUnion with named members + an interned
+// UNION TypeId (TypeKind::Union — every member overlaid at offset 0). The SIBLING
+// of `structs`: member names live HERE because the hir-text `union "N" { T,… }`
+// spelling carries member TYPES positionally but no names.
+// (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+TEST(ShippedLibDescriptor, UnionsSurfaceParsed) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "u.json", R"JSON({
+        "header": "u.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" },
+                { "name": "words",        "type": "arr<i32, 1>" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    EXPECT_EQ(desc->unions[0].name, "keyU");
+    ASSERT_EQ(desc->unions[0].fields.size(), 3u);
+    EXPECT_EQ(desc->unions[0].fields[0].name, "oneWordValue");
+    EXPECT_EQ(desc->unions[0].fields[1].name, "string");
+    EXPECT_EQ(desc->unions[0].fields[2].name, "words");
+    ASSERT_TRUE(desc->unions[0].typeId.valid());
+    // The interned type is a UNION (member-overlay semantics), not a struct.
+    EXPECT_EQ(interner.kind(desc->unions[0].typeId), TypeKind::Union);
+    auto const ops = interner.operands(desc->unions[0].typeId);
+    ASSERT_EQ(ops.size(), 3u);
+    EXPECT_EQ(interner.kind(ops[0]), TypeKind::Ptr);   // ptr<void>
+}
+
+// A unions-ONLY descriptor is VALID — the ≥1-surface check counts unions.
+// RED-ON-DISABLE: without `out.unions.empty()` (+ !declaredUnions) in the gate,
+// this fails-loud as "declares nothing".
+TEST(ShippedLibDescriptor, UnionsOnlyDescriptorIsValid) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uo.json", R"JSON({
+        "header": "uo.h",
+        "unions": [ { "name": "u", "fields": [ { "name": "a", "type": "i32" } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+}
+
+// A union member must NOT carry an explicit `offset` — every member overlays at 0
+// by union semantics (an explicit-offset overlapping layout is the c107 `structs`
+// channel). RED-ON-DISABLE: drop the offset-reject loop and the `@4` member is
+// silently accepted (then laid out at 0 anyway — a wrong-but-runs surface).
+TEST(ShippedLibDescriptor, UnionMemberOffsetFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubad.json", R"JSON({
+        "header": "ub.h",
+        "unions": [ { "name": "u", "fields": [
+            { "name": "a", "type": "i32" },
+            { "name": "b", "type": "i32", "offset": 4 } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// A union member with an undecodable type fails loud (the F_ShippedLibUnsupportedType
+// path, shared with structs via decodeStructFieldList).
+TEST(ShippedLibDescriptor, UnionMemberBadTypeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ubt.json",
+        R"({ "header": "ub.h", "unions": [ { "name": "u",
+             "fields": [ { "name": "a", "type": "not_a_type" } ] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// Option C: a `unions` entry PUBLISHES its name so a later `structs` FIELD spells
+// the union BY NAME (`Entry.key : "keyU"`) — the field resolves to the SAME
+// interned union TypeId (so a member scope on that union resolves `entry.key.member`).
+// RED-ON-DISABLE: drop the mergedNamedTypes publish in the unions decode and the
+// struct field's `keyU` fails to decode (F_ShippedLibUnsupportedType).
+TEST(ShippedLibDescriptor, UnionReferencedByNameInStructField) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "uref.json", R"JSON({
+        "header": "ur.h",
+        "unions": [
+            { "name": "keyU", "fields": [
+                { "name": "oneWordValue", "type": "ptr<void>" },
+                { "name": "string",       "type": "ptr<char>" } ] }
+        ],
+        "structs": [
+            { "name": "Entry", "fields": [
+                { "name": "clientData", "type": "ptr<void>" },
+                { "name": "key",        "type": "keyU" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->unions.size(), 1u);
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[0].fields[1].name, "key");
+    EXPECT_EQ(desc->structs[0].fields[1].type, desc->unions[0].typeId)
+        << "the by-name union field must intern to the same union TypeId";
+    EXPECT_EQ(interner.kind(desc->structs[0].fields[1].type), TypeKind::Union);
+}
+
+// ── BY-NAME composite struct FIELDS (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME) ────
+//
+// The `structs` loop PUBLISHES each injected struct's tag name (the typedef /
+// union Option-C mirror), so a LATER entry may spell an EARLIER one as a field
+// type BY NAME instead of restating its body — the whole point being that an
+// inner struct's per-format widths then live in exactly ONE place.
+
+// IDENTITY, not merely same-shape: the by-name field must resolve to the very
+// TypeId the referenced entry interned, because injection is first-wins BY NAME
+// and only the winner carries a member field scope — a second, equal-looking
+// type would strand `outer.inner.member`.
+// RED-ON-DISABLE: delete the `mergedNamedTypes` publish in the structs decode →
+// `Inner` no longer resolves as a field type → F_ShippedLibUnsupportedType.
+TEST(ShippedLibDescriptor, StructReferencedByNameInLaterStructField) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sref.json", R"JSON({
+        "header": "sr.h",
+        "structs": [
+            { "name": "Inner", "fields": [
+                { "name": "a", "type": "i64" },
+                { "name": "b", "type": "i32" } ] },
+            { "name": "Outer", "fields": [
+                { "name": "first",  "type": "Inner" },
+                { "name": "second", "type": "Inner" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->structs.size(), 2u);
+    EXPECT_EQ(desc->structs[0].name, "Inner");
+    EXPECT_EQ(desc->structs[1].name, "Outer");
+    ASSERT_EQ(desc->structs[1].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[1].fields[0].type, desc->structs[0].typeId)
+        << "the by-name struct field must be the IDENTICAL interned TypeId";
+    EXPECT_EQ(desc->structs[1].fields[1].type, desc->structs[0].typeId);
+    EXPECT_EQ(interner.kind(desc->structs[1].fields[0].type), TypeKind::Struct);
+    // And the embedded composite lays out by value (16 = i64 + i32 + tail pad).
+    auto inner = computeLayout(desc->structs[0].typeId, interner,
+                               AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                               DataModel::Lp64);
+    auto outer = computeLayout(desc->structs[1].typeId, interner,
+                               AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                               DataModel::Lp64);
+    ASSERT_TRUE(inner.has_value());
+    ASSERT_TRUE(outer.has_value());
+    EXPECT_EQ(inner->size, 16u);
+    EXPECT_EQ(outer->size, 32u);
+    ASSERT_EQ(outer->fieldOffsets.size(), 2u);
+    EXPECT_EQ(outer->fieldOffsets[0], 0u);
+    EXPECT_EQ(outer->fieldOffsets[1], 16u);
+}
+
+// SOURCE ORDER IS THE DEPENDENCY ORDER, and a violation is LOUD. `Outer` names
+// `Inner` BEFORE `Inner` is declared: publication happens as the loop walks, so
+// the name is unresolved there and the read FAILS — never a silently empty or
+// half-built composite. The same path catches a plain typo (a name declared
+// nowhere), which is why the message must quote the offending name.
+TEST(ShippedLibDescriptor, ForwardStructNameInStructFieldFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "fwd.json", R"JSON({
+        "header": "fw.h",
+        "structs": [
+            { "name": "Outer", "fields": [ { "name": "first", "type": "Inner" } ] },
+            { "name": "Inner", "fields": [ { "name": "a", "type": "i64" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+    EXPECT_TRUE(anyDiagMentions(rep, "unknown type 'Inner'"))
+        << "the type decoder must NAME the unresolved type";
+    EXPECT_TRUE(anyDiagMentions(rep, "field type 'Inner' failed to decode"))
+        << "and the descriptor reader must say WHICH field carried it";
+}
+
+// The DEPENDENCY GATE. `Inner` carries elf-only `variants`, so on any other
+// target ZERO match and it is not injected — and `Outer`, which embeds one BY
+// NAME, cannot exist there either. The reader SKIPS the dependent exactly as it
+// skips the dependency; it must NOT fail the read, because every shipped
+// descriptor is read on EVERY format (the all-descriptor sweeps + the nullopt
+// direct-API/LSP path), and one unavailable inner struct would otherwise take a
+// whole header down. Fail-loud is untouched: only a name declared EARLIER in
+// THIS descriptor can suppress an entry (the forward/typo pin above still red).
+TEST(ShippedLibDescriptor, StructByNameUnselectedDependencySkipsDependent) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "dep.json", R"JSON({
+        "header": "dp.h",
+        "structs": [
+            { "name": "Inner", "variants": [
+                { "when": { "format": "elf" },
+                  "fields": [ { "name": "a", "type": "i64" } ] } ] },
+            { "name": "Outer", "fields": [ { "name": "first", "type": "Inner" } ] }
+        ]
+    })JSON");
+
+    auto readFor = [&](std::optional<ObjectFormatKind> fmt) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        std::vector<std::string> names;
+        if (desc)
+            for (auto const& s : desc->structs) names.push_back(s.name);
+        return names;
+    };
+
+    EXPECT_EQ(readFor(ObjectFormatKind::Elf),
+              (std::vector<std::string>{"Inner", "Outer"}))
+        << "elf selects Inner's variant, so the by-name dependent lands too";
+    EXPECT_TRUE(readFor(ObjectFormatKind::Pe).empty())
+        << "no Inner variant matches pe → Outer is unavailable there, and the "
+           "read must still be CLEAN (not a hard error)";
+    EXPECT_TRUE(readFor(std::nullopt).empty())
+        << "the unknown-format read selects no variant at all — same verdict";
 }
 
 // ── per-target struct VARIANTS (per-target byte layout; plan 25) ─────────────
@@ -977,6 +1564,35 @@ TEST(ShippedLibDescriptor, StructVariantUnknownFormatValueFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ★ THE SENTINEL VARIANT of the test above, and by that test's OWN stated
+// rationale: `"unknown"` would never match either, so the struct variant would
+// silently vanish on every target — identical consequence, but it survives the
+// name lookup because it IS a table row.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
+// `when.format` decode and this read succeeds with a variant that never fires.
+TEST(ShippedLibDescriptor, StructVariantSentinelFormatValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinelfmt.json", R"JSON({
+        "header": "bf.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "x86_64", "format": "unknown" },
+                  "fields": [ { "name": "x", "type": "i32" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"));
+}
+
 // BACK-COMPAT (gate 8; closure gate 8). An existing flat-`fields` struct decodes
 // BYTE-IDENTICALLY whether activeTarget is nullopt (direct-API/LSP/test) or set (a
 // real per-target compile) — the flat path never consults the selector, so the
@@ -1105,6 +1721,28 @@ TEST(ShippedLibDescriptor, AvailabilityUnknownFormatFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE SENTINEL VARIANT of the test above. "bogus" fails the name lookup;
+// "unknown" passes it and then narrows availability to a format no image can
+// have — the header goes silently unavailable EVERYWHERE, which is the first
+// failure mode that test names.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `decodeShippedAvailability` and "unknown" decodes as a live format.
+TEST(ShippedLibDescriptor, AvailabilitySentinelFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sentinelav.json", R"JSON({
+        "header": "h.h", "availableObjectFormats": ["elf", "unknown"],
+        "typedefs": [ { "name": "t", "type": "i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "sentinel"));
 }
 
 // readShippedLibAvailability: interner-FREE (the front-end gate's path — neither
@@ -1426,6 +2064,125 @@ TEST(ShippedLibDescriptor, ConstantsAndTypedefsDecode) {
     ASSERT_EQ(desc->typedefs.size(), 1u);
     EXPECT_EQ(desc->typedefs[0].name, "my_size_t");
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::U64);
+}
+
+// ── Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION): a descriptor spells its
+// OWN typedef BY NAME ────────────────────────────────────────────────────────────
+//
+// The reader resolves a descriptor's typedefs FIRST and threads each resolved
+// `name -> TypeId` into the `namedTypes` span used for the REST of that
+// descriptor's signature / struct-field / constant / later-typedef parses. So a
+// signature can spell `ptr<Widget>` where `Widget` is a typedef the SAME descriptor
+// declares, instead of re-inlining `Widget`'s full struct body at every use (the
+// Tcl_Obj ~45-site ripple this closes). GENERIC + content-blind: no name is
+// special-cased. Pinned on a SYNTHETIC descriptor (independent of tcl.json): a
+// typedef `Widget` = a 2-field struct, a SECOND typedef `WidgetPair` spelling
+// `ptr<Widget>` BY NAME, a `structs` field `ptr<Widget>`, and a symbol
+// `fn(ptr<Widget>) -> i32` — all four must land the ONE interned `Widget` struct.
+// RED-ON-DISABLE: drop the typedef-name threading (pass the bare caller
+// `namedTypes` again) → every by-name `Widget` becomes "unknown type" → read fails.
+TEST(ShippedLibDescriptor, OptionCDescriptorTypedefReferencedByName) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "widget.json", R"({
+        "header": "widget.h",
+        "typedefs": [
+            { "name": "Widget",     "type": "struct \"Widget\" { i32, ptr<char> }" },
+            { "name": "WidgetPair", "type": "struct \"WidgetPair\" { ptr<Widget>, ptr<Widget> }" }
+        ],
+        "structs": [
+            { "name": "Holder", "fields": [ { "name": "w", "type": "ptr<Widget>" } ] }
+        ],
+        "symbols": [
+            { "name": "widget_id", "signature": "fn(ptr<Widget>) -> i32" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value())
+        << "a descriptor referencing its OWN typedef by name must decode";
+    EXPECT_FALSE(rep.hasErrors());
+
+    ASSERT_EQ(desc->typedefs.size(), 2u);
+    ASSERT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
+    TypeId const widget = desc->typedefs[0].type;         // Widget
+    EXPECT_EQ(interner.name(widget), "Widget");
+
+    // WidgetPair's fields are `ptr<Widget>` — the pointee is the SAME interned Widget.
+    ASSERT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
+    auto const pairFields = interner.operands(desc->typedefs[1].type);
+    ASSERT_EQ(pairFields.size(), 2u);
+    ASSERT_EQ(interner.kind(pairFields[0]), TypeKind::Ptr);
+    auto const pairPointee = interner.operands(pairFields[0]);
+    ASSERT_EQ(pairPointee.size(), 1u);
+    EXPECT_EQ(pairPointee[0].v, widget.v)
+        << "a later typedef spelling ptr<Widget> by name must land the same Widget";
+
+    // The symbol signature `fn(ptr<Widget>) -> i32` — the param pointee is Widget.
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->symbols[0].signature), TypeKind::FnSig);
+    auto const params = interner.fnParams(desc->symbols[0].signature);
+    ASSERT_EQ(params.size(), 1u);
+    ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+    auto const symPointee = interner.operands(params[0]);
+    ASSERT_EQ(symPointee.size(), 1u);
+    EXPECT_EQ(symPointee[0].v, widget.v)
+        << "a signature spelling ptr<Widget> by name must land the same Widget";
+
+    // The `structs`-surface field `ptr<Widget>` too — ONE Widget across every surface.
+    ASSERT_EQ(desc->structs.size(), 1u);
+    ASSERT_EQ(desc->structs[0].fields.size(), 1u);
+    ASSERT_EQ(interner.kind(desc->structs[0].fields[0].type), TypeKind::Ptr);
+    auto const holderPointee = interner.operands(desc->structs[0].fields[0].type);
+    ASSERT_EQ(holderPointee.size(), 1u);
+    EXPECT_EQ(holderPointee[0].v, widget.v);
+}
+
+// Fail-loud is PRESERVED under Option C: threading the descriptor's OWN typedefs
+// adds ONLY those declared names — it does NOT turn every bare identifier into a
+// valid type. A signature spelling `ptr<Nonesuch>`, where no such typedef exists,
+// still FAILS the read (the identifier fallback is the LAST resort before the
+// unknown-type reject). RED-ON-DISABLE of fail-loud: were the fallback to swallow
+// an unknown name, this malformed descriptor would wrongly decode.
+TEST(ShippedLibDescriptor, OptionCUnknownTypeNameStillFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json", R"({
+        "header": "bad.h",
+        "typedefs": [ { "name": "Widget", "type": "struct \"Widget\" { i32 }" } ],
+        "symbols": [ { "name": "f", "signature": "fn(ptr<Nonesuch>) -> i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value())
+        << "an unknown type name must still fail loud under Option C";
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// TF-C65 (D-FFI-SHIPPED-LIBS-OS-ONLY, user-directed 2026-07-24): shipped-lib
+// descriptors are for OS/platform surfaces ONLY (libc, syscalls, Win32, the C
+// runtime — ABIs that ARE the platform contract). A THIRD-PARTY library the
+// user builds and links (Tcl, zlib, and anything like them) must be consumed
+// by PARSING ITS REAL HEADERS (`-I`) and resolving its real binary
+// (`--resolve-library`) — a hand-transcribed descriptor can silently drift
+// from the installed library's ABI, whereas parsing the actual header is
+// self-correcting by construction. tcl.json + zlib.json were DELETED once the
+// front end parsed real tcl.h/zlib.h clean (TF-C62/63/64) and the end-to-end
+// witness ran: real tcl.h parsed + libtcl8.6.so resolved + Tcl_Eval("expr
+// 40 + 2") returned 42 with NO descriptor. This tombstone keeps the policy
+// enforced: re-adding a third-party descriptor turns it red and forces the
+// discussion back to "make the front end parse the real header".
+TEST(ShippedLibDescriptor, ThirdPartyDescriptorsStayDeleted) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    EXPECT_FALSE(fs::exists(root / "tcl.json"))
+        << "tcl.json must stay deleted — Tcl is a third-party library: parse "
+           "its real headers (D-FFI-SHIPPED-LIBS-OS-ONLY)";
+    EXPECT_FALSE(fs::exists(root / "zlib.json"))
+        << "zlib.json must stay deleted — zlib is a third-party library: parse "
+           "its real headers (D-FFI-SHIPPED-LIBS-OS-ONLY)";
 }
 
 // MF-2: an unsigned constant at the TOP of its range (ULLONG_MAX) round-trips
@@ -1795,6 +2552,7 @@ TEST(ShippedLibDescriptor, RealWindowsExceptionRecordLayout) {
            "must intern to the same TypeId as the standalone struct — the "
            "p->ExceptionRecord->member resolution depends on it";
 }
+
 
 // c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
 // windows.json ships the 47 kernel32 file/heap/mmap/library/error/sysinfo/time
@@ -2630,6 +3388,185 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 // the struct is not injected → the structs.size() assert fails; flatten the
 // struct back to a single field list → the macho width assert fails. The
 // runtime witness is the shipped_timeval_macho corpus on the macos-latest CI leg.
+// ── TF-C90 (D-CSUBSET-SYS-TYPES-BSD-SPELLING-GROUP-ABSENT): the <sys/types.h>
+//    BSD-COMPAT SPELLING GROUP, per OBJECT FORMAT ─────────────────────────────
+//
+// `u_char` / `u_short` / `u_int` / `u_long` / `quad_t` / `u_quad_t` / `caddr_t` /
+// `fixpt_t` / `segsz_t` — the family every unix <sys/types.h> ships together and
+// the WINDOWS one ships not at all. Each is declared with `variants` and NO flat
+// `type`, so PER-ENTRY AVAILABILITY IS WHICH VARIANTS EXIST (0 matching variants
+// ⇒ `selected == false` ⇒ the typedef is not injected — the `off64_t` mechanism).
+//
+// ✔MEASURED availability, per name, against three reference header sets rather
+// than asserted: musl (emsdk sysroot sys/types.h:63-69) and bionic (Android NDK
+// sysroot sys/types.h:54,136-139) declare the first seven; mingw-w64 x86_64
+// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h:84-128
+// declares all nine. So the split pinned here is elf+macho for the seven,
+// macho-ONLY for `fixpt_t`/`segsz_t` (absent from BOTH linux libcs), and NONE on
+// pe.
+//
+// The assertions are TWO-SIDED on every axis, because a one-sided "is it there?"
+// cannot see the defect that matters here — a name leaking onto a format that
+// does not have it:
+//   * PRESENT-side: the exact TypeKind, AND the vocabulary tag (`u_long` must be
+//     the C `unsigned long`, and must NOT carry some other spelling — a bare
+//     kind check cannot tell u64 from u64-"unsigned long long").
+//   * ABSENT-side: `fixpt_t`/`segsz_t` must be MISSING on elf, and all nine
+//     MISSING on pe.
+//   * ANTI-VACUITY POSITIVE CONTROL: on the very same pe/elf reads, `mode_t`
+//     (a flat, format-independent entry) must still be PRESENT. Without it, a
+//     descriptor that failed to load — or a `typedefs` array that silently
+//     decoded to empty — would satisfy every ABSENT assertion and the test would
+//     pass while measuring nothing.
+// RED-ON-DISABLE: add a `pe` variant to any of the nine → its pe ABSENT assert
+// fails; add an `elf` variant to `fixpt_t`/`segsz_t` → their elf ABSENT assert
+// fails; delete any elf/macho variant → that name's PRESENT assert fails;
+// retag `u_long` (or drop its tag) → the vocabulary assert fails; swap a kind
+// (u32→i32) → the kind assert fails. Runtime witnesses: the
+// shipped_sys_types_bsd (elf+macho RUN) and shipped_sys_types_bsd_macho
+// (macho RUN) corpora, plus the shipped_sys_types_bsd_absent_elf error manifest.
+//
+// ★ THIS TEST IS THE *ONLY* WITNESS FOR THE pe ABSENCE, ON PURPOSE, and the reason
+// is a measured pair of blockers in the harness rather than anything about this
+// group — recorded here because a reader will otherwise ask why the elf absence
+// has a corpus twin and the pe absence does not:
+//   (1) D-DIAG-PE-SPAN-LINE-MAPPING-SYNTHETIC-LINES — on the pe64 target a
+//       source-spanned diagnostic's reported LINE is SHIFTED.
+//       ✔MEASURED with a 4-line file (`int a; int b; nosuchtype_t c; int main…`):
+//       pe reports source line 3 as 5, and as 8 once one `#include <stdio.h>` is
+//       added, while elf and macho report 3 in both. The compiler renders the
+//       CORRECT source text at the WRONG line, so only the line MAPPING is off.
+//       Worse, the in-process examples runner and the CLI harness then disagree on
+//       the COLUMN for the same diagnostic (31:11 vs 31:1) — there is no honest
+//       line:col to put in a manifest.
+//   (2) D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING — `positioned:false`
+//       is not an escape hatch. The integrated CLI arm matches a
+//       code-only expectation by grepping for the SYMBOLIC rendering
+//       `error[S_UnknownType]`, and the CLI emits that spelling ONLY for
+//       SPAN-LESS diagnostics — a spanned one renders `error[S0006]`
+//       (D-DIAG-TWO-CODE-RENDERINGS). So `positioned:false` is today usable only
+//       for genuinely span-less codes, an undocumented coupling.
+// A pe corpus arm lands when those are fixed; until then the pe axis is pinned
+// HERE, strictly, and it does red alone (add a pe variant to any of the nine).
+TEST(ShippedLibDescriptor, RealSysTypesBsdSpellingGroupPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "types.json";
+
+    // Read the REAL descriptor for one (arch, format) and hand the caller both
+    // the interner and the decoded typedef list, so kind AND vocabulary tag can
+    // be inspected structurally (never a string compare of the JSON).
+    struct Read {
+        TypeInterner                interner{CompilationUnitId{1}};
+        TypeRegistry                typeReg;
+        DiagnosticReporter          rep;
+        std::optional<ShippedLibDescriptor> desc;
+    };
+    auto readFor = [&](std::string_view arch, ObjectFormatKind fmt,
+                       Read& out) {
+        out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg,
+                                            out.rep, DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(out.desc.has_value())
+            << "sys/types.json failed to load for arch=" << arch;
+        ASSERT_FALSE(out.rep.hasErrors())
+            << "sys/types.json emitted diagnostics for arch=" << arch;
+    };
+    auto findTypedef = [](Read const& r, std::string_view name) -> TypeId {
+        for (auto const& td : r.desc->typedefs)
+            if (td.name == name) return td.type;
+        return {};
+    };
+
+    // The seven shared names, with the kind each MUST decode to, and the
+    // vocabulary tag each MUST carry ("" = deliberately untagged).
+    struct Shared { char const* name; TypeKind kind; char const* vocab; };
+    static constexpr std::array<Shared, 7> kShared{{
+        {"u_char",   TypeKind::U8,  ""},
+        {"u_short",  TypeKind::U16, ""},
+        {"u_int",    TypeKind::U32, ""},
+        // The ONE tagged member: every reference libc spells u_long exactly
+        // `unsigned long`, and the typedef name IS that spelling.
+        {"u_long",   TypeKind::U64, "unsigned long"},
+        // UNTAGGED on purpose: glibc spells quad_t `long int` while musl and
+        // Darwin spell it `long long`, so a tag would be a one-sided claim.
+        {"quad_t",   TypeKind::I64, ""},
+        {"u_quad_t", TypeKind::U64, ""},
+        {"caddr_t",  TypeKind::Ptr, ""},
+    }};
+    // BSD-only: present on macho, ABSENT on elf.
+    struct BsdOnly { char const* name; TypeKind kind; };
+    static constexpr std::array<BsdOnly, 2> kBsdOnly{{
+        {"fixpt_t", TypeKind::U32},
+        {"segsz_t", TypeKind::I32},
+    }};
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        // ── macho: all nine PRESENT ──
+        {
+            Read m;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::MachO, m));
+            EXPECT_TRUE(findTypedef(m, "mode_t").valid())
+                << "positive control: mode_t must be present (arch=" << arch << ")";
+            for (auto const& s : kShared) {
+                TypeId const t = findTypedef(m, s.name);
+                ASSERT_TRUE(t.valid())
+                    << s.name << " must be injected on macho (arch=" << arch << ")";
+                EXPECT_EQ(m.interner.kind(t), s.kind) << s.name << " kind on macho";
+                EXPECT_EQ(m.interner.vocabularyName(t), std::string_view{s.vocab})
+                    << s.name << " vocabulary tag on macho";
+            }
+            // caddr_t is `char *`, not a bare pointer to anything.
+            TypeId const ca = findTypedef(m, "caddr_t");
+            ASSERT_TRUE(ca.valid());
+            auto const caOps = m.interner.operands(ca);
+            ASSERT_EQ(caOps.size(), 1u);
+            EXPECT_EQ(m.interner.kind(caOps[0]), TypeKind::Char)
+                << "caddr_t must be ptr<char>";
+            for (auto const& b : kBsdOnly) {
+                TypeId const t = findTypedef(m, b.name);
+                ASSERT_TRUE(t.valid())
+                    << b.name << " must be injected on macho (arch=" << arch << ")";
+                EXPECT_EQ(m.interner.kind(t), b.kind) << b.name << " kind on macho";
+            }
+        }
+        // ── elf: the seven PRESENT, the two BSD-only ABSENT ──
+        {
+            Read e;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::Elf, e));
+            EXPECT_TRUE(findTypedef(e, "mode_t").valid())
+                << "positive control: mode_t must be present (arch=" << arch << ")";
+            for (auto const& s : kShared) {
+                TypeId const t = findTypedef(e, s.name);
+                ASSERT_TRUE(t.valid())
+                    << s.name << " must be injected on elf (arch=" << arch << ")";
+                EXPECT_EQ(e.interner.kind(t), s.kind) << s.name << " kind on elf";
+                EXPECT_EQ(e.interner.vocabularyName(t), std::string_view{s.vocab})
+                    << s.name << " vocabulary tag on elf";
+            }
+            for (auto const& b : kBsdOnly)
+                EXPECT_FALSE(findTypedef(e, b.name).valid())
+                    << b.name << " is BSD-only (absent from glibc/musl/bionic) and "
+                       "must NOT be injected on elf (arch=" << arch << ")";
+        }
+        // ── pe: ALL NINE ABSENT, header itself still usable ──
+        {
+            Read p;
+            ASSERT_NO_FATAL_FAILURE(readFor(arch, ObjectFormatKind::Pe, p));
+            EXPECT_TRUE(findTypedef(p, "mode_t").valid())
+                << "positive control: mode_t must still be present on pe — without "
+                   "it every ABSENT assert below would pass vacuously (arch="
+                << arch << ")";
+            for (auto const& s : kShared)
+                EXPECT_FALSE(findTypedef(p, s.name).valid())
+                    << s.name << " must NOT be injected on pe (mingw-w64 "
+                       "<sys/types.h> declares none of this group) (arch=" << arch << ")";
+            for (auto const& b : kBsdOnly)
+                EXPECT_FALSE(findTypedef(p, b.name).valid())
+                    << b.name << " must NOT be injected on pe (arch=" << arch << ")";
+        }
+    }
+}
+
 TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
@@ -2644,10 +3581,15 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
                                              DataModel::Lp64, arch, fmt);
         ASSERT_TRUE(desc.has_value()) << "arch=" << arch;
         EXPECT_FALSE(rep.hasErrors()) << "arch=" << arch;
-        ASSERT_EQ(desc->structs.size(), 1u)
-            << "timeval variant not injected for arch=" << arch;
+        // TWO structs since itimerval landed (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME):
+        // timeval FIRST (source order is the dependency order — itimerval names it),
+        // itimerval second. Still an exact count, not a floor: an entry that
+        // silently stopped being injected must stay red here.
+        ASSERT_EQ(desc->structs.size(), 2u)
+            << "timeval/itimerval not both injected for arch=" << arch;
         auto const& tv = desc->structs[0];
         EXPECT_EQ(tv.name, "timeval");
+        EXPECT_EQ(desc->structs[1].name, "itimerval");
         ASSERT_EQ(tv.fields.size(), 2u) << "arch=" << arch;
         EXPECT_EQ(tv.fields[0].name, "tv_sec");
         EXPECT_EQ(tv.fields[1].name, "tv_usec");
@@ -2666,6 +3608,247 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     for (std::string_view arch : {"x86_64", "arm64"}) {
         checkFor(arch, ObjectFormatKind::Elf,   TypeKind::I64);
         checkFor(arch, ObjectFormatKind::MachO, TypeKind::I32);
+    }
+}
+
+// REAL <sys/time.h> `struct itimerval` — the FIRST by-name composite consumer
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). xnu sys/proc.h's `struct extern_proc`
+// embeds one BY VALUE, so while itimerval was missing DSS left extern_proc
+// incomplete, which left kinfo_proc's kp_proc incomplete: 4 S0026 across sqlite
+// test1.c + mem1.c from this ONE hole.
+//
+// The load-bearing assertion is IDENTITY: each member's type must be the very
+// TypeId the `timeval` entry interned FOR THIS FORMAT, which is what makes the
+// tv_usec width single-sourced — itimerval declares no `variants` and still
+// comes out right on both. Layout is MEASURED natively (arm64 Darwin, offsetof):
+// sizeof 32, it_interval@0, it_value@16; glibc LP64 agrees at 32/0/16 with a
+// WIDER inner tv_usec, so a restated body would have had to get both right.
+// RED-ON-DISABLE: drop the structs-loop name publish → `"type": "timeval"` stops
+// resolving → sys/time.json fails to read at all.
+TEST(ShippedLibDescriptor, RealSysTimeItimervalByNameComposite) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    auto checkFor = [&](std::string_view arch, ObjectFormatKind fmt) {
+        SCOPED_TRACE(std::string{arch} + "/" + std::string{objectFormatKindName(fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->structs.size(), 2u);
+        auto const& tv = desc->structs[0];
+        auto const& it = desc->structs[1];
+        ASSERT_EQ(tv.name, "timeval");
+        ASSERT_EQ(it.name, "itimerval");
+        ASSERT_EQ(it.fields.size(), 2u);
+        EXPECT_EQ(it.fields[0].name, "it_interval");
+        EXPECT_EQ(it.fields[1].name, "it_value");
+        // IDENTITY with the timeval entry of the SAME read — not just same shape.
+        EXPECT_EQ(it.fields[0].type, tv.typeId)
+            << "it_interval must BE the shipped timeval, not a look-alike";
+        EXPECT_EQ(it.fields[1].type, tv.typeId);
+        EXPECT_EQ(interner.kind(it.fields[0].type), TypeKind::Struct);
+        auto layout = computeLayout(it.typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 32u);            // MEASURED: sizeof(struct itimerval)
+        ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u);  // it_interval @ 0
+        EXPECT_EQ(layout->fieldOffsets[1], 16u); // it_value    @ 16
+    };
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        checkFor(arch, ObjectFormatKind::Elf);
+        checkFor(arch, ObjectFormatKind::MachO);
+    }
+}
+
+// REAL <sys/stat.h> macho `st_mtimespec` — the second by-name consumer
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c:7731 assigns the WHOLE
+// member (`conchModTime = buf.st_mtimespec;`), so it must be a by-value composite,
+// and it OVERLAYS the flat st_mtim_sec/st_mtim_nsec pair the st_mtime macro still
+// maps onto — hence the c107 explicit-offset channel for this variant.
+//
+// The invariant that matters most: NOTHING MOVED. Every offset asserted here is
+// the value natural derivation produced before the overlay landed, MEASURED
+// natively (arm64 Darwin, offsetof) — and the total is still 144, the number the
+// shipped_stat_macho corpus and libSystem's own fstat() agree on.
+// The invariant that is NOT free: with all 25 offsets stated explicitly the
+// variant stops DERIVING its layout, so a wrong field WIDTH moves no offset and
+// changes no total — offsets and size alone are vacuous against it (MEASURED,
+// see the width block). Hence the per-field width table below.
+// RED-ON-DISABLE: drop st_mtimespec → the member lookup fails; mistype ONE
+// offset → that assert (or the size) goes red; narrow ONE field's type →
+// its kind/width assert goes red (MEASURED with st_uid u32 → u16, which is
+// green against offsets+size alone).
+TEST(ShippedLibDescriptor, RealSysStatMachoMtimespecOverlay) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const statPath = root / "sys" / "stat.json";
+
+    // Index of a named field in a named struct, or npos-ish failure.
+    auto indexOf = [](ShippedStruct const& s, std::string_view fname) -> std::size_t {
+        for (std::size_t i = 0; i < s.fields.size(); ++i)
+            if (s.fields[i].name == fname) return i;
+        return static_cast<std::size_t>(-1);
+    };
+    auto structNamed = [](ShippedLibDescriptor const& d,
+                          std::string_view sname) -> ShippedStruct const* {
+        for (auto const& s : d.structs)
+            if (s.name == sname) return &s;
+        return nullptr;
+    };
+    auto readFor = [&](TypeInterner& interner, TypeRegistry& typeReg,
+                       ObjectFormatKind fmt) {
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(statPath, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        return desc;
+    };
+
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = readFor(interner, typeReg, ObjectFormatKind::MachO);
+        ASSERT_TRUE(desc.has_value());
+        auto const* ts = structNamed(*desc, "timespec");
+        auto const* st = structNamed(*desc, "stat");
+        ASSERT_NE(ts, nullptr) << "sys/stat.json must declare timespec BEFORE stat";
+        ASSERT_NE(st, nullptr);
+        std::size_t const iSpec = indexOf(*st, "st_mtimespec");
+        ASSERT_NE(iSpec, static_cast<std::size_t>(-1))
+            << "the macho variant must carry st_mtimespec";
+        // BY-NAME IDENTITY: the member IS the shipped timespec, so a whole-struct
+        // assignment from `struct timespec` type-checks.
+        EXPECT_EQ(st->fields[iSpec].type, ts->typeId);
+        EXPECT_EQ(interner.kind(st->fields[iSpec].type), TypeKind::Struct);
+        auto specLayout = computeLayout(ts->typeId, interner, kNatural16,
+                                        DataModel::Lp64);
+        ASSERT_TRUE(specLayout.has_value());
+        EXPECT_EQ(specLayout->size, 16u);   // {tv_sec i64, tv_nsec i64}
+
+        auto layout = computeLayout(st->typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 144u) << "Darwin struct stat is 144 bytes — UNCHANGED";
+        auto offOf = [&](std::string_view fname) -> std::uint64_t {
+            std::size_t const i = indexOf(*st, fname);
+            EXPECT_NE(i, static_cast<std::size_t>(-1)) << fname;
+            if (i == static_cast<std::size_t>(-1) || i >= layout->fieldOffsets.size())
+                return static_cast<std::uint64_t>(-1);
+            return layout->fieldOffsets[i];
+        };
+        // THE OVERLAY: three members, the same 16 bytes (Darwin's own
+        // `#define st_mtime st_mtimespec.tv_sec`, modeled honestly).
+        EXPECT_EQ(offOf("st_mtimespec"), 48u);
+        EXPECT_EQ(offOf("st_mtim_sec"),  48u);
+        EXPECT_EQ(offOf("st_mtim_nsec"), 56u);
+        // NOTHING MOVED — the pre-existing offsets, both sides of the overlay.
+        EXPECT_EQ(offOf("st_dev"), 0u);
+        EXPECT_EQ(offOf("st_mode"), 4u);
+        EXPECT_EQ(offOf("st_nlink"), 6u);
+        EXPECT_EQ(offOf("st_ino"), 8u);
+        EXPECT_EQ(offOf("st_uid"), 16u);
+        EXPECT_EQ(offOf("st_gid"), 20u);
+        EXPECT_EQ(offOf("st_rdev"), 24u);
+        EXPECT_EQ(offOf("st_atim_sec"), 32u);
+        EXPECT_EQ(offOf("st_ctim_sec"), 64u);
+        EXPECT_EQ(offOf("st_birthtim_sec"), 80u);
+        EXPECT_EQ(offOf("st_size"), 96u);        // the corpus's own witness
+        EXPECT_EQ(offOf("st_blocks"), 104u);
+        EXPECT_EQ(offOf("st_blksize"), 112u);
+        EXPECT_EQ(offOf("st_qspare1"), 136u);
+
+        // ★★ WIDTHS — EVERY FIELD, because the EXPLICIT-OFFSET channel makes the
+        // offset pins above BLIND to a width slip. MEASURED, not inferred: with
+        // `st_uid` narrowed u32 → u16 in a copy of this descriptor, every
+        // assertion above stayed GREEN. It has to: the offsets are read verbatim
+        // from the config so nothing moves, and the explicit arm's size is
+        // `align.alignUp(max field extent)` = alignUp(136 + 8) = 144 no matter
+        // what the other 24 fields are — narrowing even the LAST field keeps 144
+        // (alignUp(136 + 2) is still 144). A derived-offset variant self-corrects
+        // and the offset pins catch it; this one does not, so the width is only
+        // pinned where it is written down. Pinned by TypeKind, which fixes
+        // SIGNEDNESS too — a u32 → i32 swap is a different miscompile at the same
+        // 4 bytes — AND by the laid-out byte size, which is what the composite
+        // overlay member needs (`st_mtimespec` is a struct, not a scalar kind).
+        // Every width MEASURED natively (arm64 Darwin, `sizeof(((struct stat*)0)
+        // ->f)`, EVERY row): 4/2/2/8/4/4/4 then the four 16-byte timespecs, then
+        // 8/8/4/4/4/4 and the 16-byte `st_qspare` — which is Darwin's
+        // `int64_t[2]`, modeled here as the two i64 rows qspare0/qspare1.
+        struct FieldWidth { char const* name; TypeKind kind; std::uint64_t bytes; };
+        static constexpr std::array<FieldWidth, 25> kMachoStatWidths{{
+            {"st_dev",           TypeKind::I32,    4},
+            {"st_mode",          TypeKind::U16,    2},
+            {"st_nlink",         TypeKind::U16,    2},
+            {"st_ino",           TypeKind::U64,    8},
+            {"st_uid",           TypeKind::U32,    4},
+            {"st_gid",           TypeKind::U32,    4},
+            {"st_rdev",          TypeKind::I32,    4},
+            {"__pad0",           TypeKind::I32,    4},
+            {"st_atim_sec",      TypeKind::I64,    8},
+            {"st_atim_nsec",     TypeKind::I64,    8},
+            // THE OVERLAY TRIO: the whole `struct timespec` and the two flat i64
+            // halves it overlays must keep the SAME total 16 bytes at 48 — a
+            // narrowed half would leave the composite reading bytes no flat
+            // member names, which is exactly the by-name/flat divergence
+            // D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME exists to keep honest.
+            {"st_mtim_sec",      TypeKind::I64,    8},
+            {"st_mtim_nsec",     TypeKind::I64,    8},
+            {"st_mtimespec",     TypeKind::Struct, 16},
+            {"st_ctim_sec",      TypeKind::I64,    8},
+            {"st_ctim_nsec",     TypeKind::I64,    8},
+            {"st_birthtim_sec",  TypeKind::I64,    8},
+            {"st_birthtim_nsec", TypeKind::I64,    8},
+            {"st_size",          TypeKind::I64,    8},
+            {"st_blocks",        TypeKind::I64,    8},
+            {"st_blksize",       TypeKind::I32,    4},
+            {"st_flags",         TypeKind::U32,    4},
+            {"st_gen",           TypeKind::U32,    4},
+            {"st_lspare",        TypeKind::I32,    4},
+            {"st_qspare0",       TypeKind::I64,    8},
+            {"st_qspare1",       TypeKind::I64,    8},
+        }};
+        // EXHAUSTIVE by construction: the table covers the variant field-for-field,
+        // so a field ADDED to this explicit-offset variant without a width pin (and
+        // without the offset every field here must state) fails HERE rather than
+        // slipping in unpinned.
+        EXPECT_EQ(st->fields.size(), kMachoStatWidths.size())
+            << "the macho struct stat variant has 25 explicitly-offset fields; a "
+               "new one needs its offset AND its width pinned in this table";
+        for (auto const& w : kMachoStatWidths) {
+            std::size_t const i = indexOf(*st, w.name);
+            ASSERT_NE(i, static_cast<std::size_t>(-1)) << w.name << " is missing";
+            TypeId const ft = st->fields[i].type;
+            ASSERT_TRUE(ft.valid()) << w.name;
+            EXPECT_EQ(interner.kind(ft), w.kind) << w.name << " kind/signedness";
+            auto const fl = computeLayout(ft, interner, kNatural16, DataModel::Lp64);
+            ASSERT_TRUE(fl.has_value()) << w.name;
+            EXPECT_EQ(fl->size, w.bytes) << w.name << " WIDTH — an explicit-offset "
+                                            "variant cannot self-correct this";
+        }
+    }
+    // ABSENT elsewhere: st_mtimespec is a Darwin member. elf keeps the glibc
+    // flattening, pe the MSVC record — neither may grow it.
+    for (ObjectFormatKind const fmt : {ObjectFormatKind::Elf, ObjectFormatKind::Pe}) {
+        SCOPED_TRACE(std::string{objectFormatKindName(fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = readFor(interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        auto const* st = structNamed(*desc, "stat");
+        ASSERT_NE(st, nullptr) << "struct stat must still be injected here";
+        EXPECT_EQ(indexOf(*st, "st_mtimespec"), static_cast<std::size_t>(-1))
+            << "st_mtimespec must stay macho-only";
+        // The timespec row is FLAT on purpose: a format-gated dependency would
+        // make the whole `stat` entry unavailable here (the gate skips a
+        // dependent whose by-name referent is not selected).
+        EXPECT_NE(structNamed(*desc, "timespec"), nullptr);
     }
 }
 
@@ -3103,6 +4286,56 @@ TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
     EXPECT_TRUE(el);
 }
 
+// SQLite testfixture test_syscall.c: errno.json ships ENOMEM + EDEADLK as REAL
+// constants the test_syscall.c error-name map consumes. ENOMEM AGREES across all
+// three formats (12 — flat, in the low block); EDEADLK DIVERGES (elf 35 / macho
+// 11 / pe 36 — Linux asm-generic/errno.h vs Darwin sys/errno.h vs ucrt errno.h),
+// so it carries per-format `variants` that must decode to the ACTIVE format's
+// number. RED-ON-DISABLE: remove ENOMEM (or either EDEADLK variant), or perturb a
+// value, and the matching per-format EXPECT below fails — a wrong errno number is
+// a silent interop miscompile in the test corpus.
+TEST(ShippedLibDescriptor, RealErrnoEnomemEdeadlkPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto constFor = [&](ObjectFormatKind fmt, char const* name,
+                        std::int64_t& valueOut, TypeKind& kindOut) -> bool {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "errno.json", interner, typeReg, fmt);
+        if (!desc) return false;
+        for (auto const& c : desc->constants) {
+            if (c.name == name) {
+                valueOut = c.value;
+                kindOut  = interner.kind(c.type);
+                return true;
+            }
+        }
+        return false;
+    };
+    struct Case { ObjectFormatKind fmt; char const* name; std::int64_t edeadlk; };
+    Case const cases[] = {
+        { ObjectFormatKind::Elf,   "elf",   35 },
+        { ObjectFormatKind::MachO, "macho", 11 },
+        { ObjectFormatKind::Pe,    "pe",    36 },
+    };
+    for (auto const& tc : cases) {
+        std::int64_t v = -1;
+        TypeKind     k = TypeKind::Void;
+        // ENOMEM: flat, 12 on every format.
+        ASSERT_TRUE(constFor(tc.fmt, "ENOMEM", v, k))
+            << "ENOMEM missing for format " << tc.name;
+        EXPECT_EQ(v, 12) << "ENOMEM for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "ENOMEM type for " << tc.name;
+        // EDEADLK: per-format variant.
+        v = -1;
+        k = TypeKind::Void;
+        ASSERT_TRUE(constFor(tc.fmt, "EDEADLK", v, k))
+            << "EDEADLK missing for format " << tc.name;
+        EXPECT_EQ(v, tc.edeadlk) << "EDEADLK for " << tc.name;
+        EXPECT_EQ(k, TypeKind::I32) << "EDEADLK type for " << tc.name;
+    }
+}
+
 // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): windows.json models ULARGE_INTEGER as an
 // explicit-offset OVERLAP struct {QuadPart u64@0, LowPart u32@0, HighPart u32@4} —
 // the FILETIME→time idiom (shell.c writes the two u32 halves, reads the u64 whole).
@@ -3211,6 +4444,213 @@ TEST(ShippedLibDescriptor, SynthesizeNameMismatchFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `shimFamilyOf`, the recipe→pass split ──
+//
+// There is ONE recipe map but MORE THAN ONE synthesis pass, and each pass fails loud on
+// a recipe it has no arm for — deliberately, as its own anti-vocab-drift backstop. So
+// both driver seams (compile_pipeline.cpp single-CU, program.cpp multi-CU) PARTITION the
+// map by `shimFamilyOf` before calling either pass. That makes the partition load-bearing
+// in a way the loader's own vocabulary check is not: a recipe the split sends to the
+// WRONG pass turns a build that should succeed into a hard failure, and a recipe the
+// split cannot classify at all is treated by both seams as an internal invariant breach.
+//
+// The documented contract is a BICONDITIONAL — `shimFamilyOf(id) == nullopt` ⇔
+// `!isKnownSynthesizeRecipe(id)` — held "by construction" because both functions scan the
+// same `kRecipes` table. "By construction" is exactly the kind of claim that stops being
+// true the day someone gives one of them a fast path, an early-out or a second table, so
+// it is asserted here over EVERY id rather than sampled.
+
+namespace {
+
+// THE PINNED RECIPE VOCABULARY, id → family. This is the test's independent model of
+// `kRecipes` (which is file-local to shipped_lib_descriptor.cpp and cannot be enumerated
+// from outside), and it is cross-checked in BOTH directions below:
+//   * forwards — every id here must be known AND map to this family;
+//   * backwards — `EveryShippedSynthesizeTagIsPinnedToItsFamily` walks the REAL shipped
+//     descriptors and requires the set of `synthesize` tags they declare to be EXACTLY
+//     this set, so adding a recipe to `kRecipes` + a descriptor without updating this
+//     table reds, and so does deleting one.
+// The residual blind spot is honest and inert: a row added to `kRecipes` that NO shipped
+// descriptor declares is invisible here — but it is also unreachable, since the only way
+// a recipe id reaches a synthesis pass is a descriptor's `synthesize` tag.
+struct RecipeExpectation {
+    char const* id;
+    ShimFamily  family;
+};
+constexpr RecipeExpectation kPinnedRecipes[] = {
+    // <threads.h> over kernel32 (win32) / libSystem (pthread) — 18 non-trampoline …
+    {"mtx_init", ShimFamily::Threads},      {"mtx_lock", ShimFamily::Threads},
+    {"mtx_unlock", ShimFamily::Threads},    {"mtx_trylock", ShimFamily::Threads},
+    {"mtx_destroy", ShimFamily::Threads},   {"cnd_init", ShimFamily::Threads},
+    {"cnd_signal", ShimFamily::Threads},    {"cnd_broadcast", ShimFamily::Threads},
+    {"cnd_wait", ShimFamily::Threads},      {"cnd_destroy", ShimFamily::Threads},
+    {"tss_create", ShimFamily::Threads},    {"tss_get", ShimFamily::Threads},
+    {"tss_set", ShimFamily::Threads},       {"tss_delete", ShimFamily::Threads},
+    {"thrd_current", ShimFamily::Threads},  {"thrd_yield", ShimFamily::Threads},
+    {"thrd_exit", ShimFamily::Threads},     {"thrd_detach", ShimFamily::Threads},
+    // … + the 3 trampolines.
+    {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
+    {"call_once", ShimFamily::Threads},
+    // <stdio.h> printf family over the UCRT __stdio_common_v* cores. `sprintf` is the
+    // ONLY one: the increment deliberately ships one recipe with a runtime witness rather
+    // than four speculative bodies. snprintf/fprintf/vfprintf appear in the NEGATIVE list
+    // below precisely so re-adding a body without re-pinning it here reds.
+    {"sprintf", ShimFamily::Stdio},
+};
+
+// Ids that must NOT be recipes. Three groups, each catching a different regression:
+//   * the RETIRED stdio ids — a speculative body sneaking back into `kRecipes` reds here;
+//   * DEFERRED threads ids (thrd_sleep + the timed waits stay elf-FFI-only) — promoting
+//     one to a synth recipe without a body reds here;
+//   * ordinary near-misses: plain libc names, a typo, case variants, the empty string.
+constexpr char const* kNonRecipes[] = {
+    "snprintf", "fprintf", "vfprintf",                       // retired stdio arms
+    "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
+    "printf", "sscanf", "puts", "fputs", "__stdio_common_vsprintf",
+    "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
+};
+
+} // namespace
+
+// EXHAUSTIVE forward pin: every id in the vocabulary is known, maps to its declared
+// family, and the two predicates AGREE. Sampling two ids (as the pre-existing
+// `SynthesizeTagDecodesForKnownRecipe` does for `isKnownSynthesizeRecipe`) cannot catch a
+// family typo on the 19th row; walking the whole table costs nothing and does.
+//
+// RED-ON-DISABLE: flip any one `kRecipes` row's family tag (e.g. make `sprintf` Threads)
+// and this reds on that id alone — and the corresponding real build breaks, because the
+// threads pass would then be handed a recipe it has no arm for.
+TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
+    std::size_t threads = 0, stdio = 0;
+    for (auto const& r : kPinnedRecipes) {
+        EXPECT_TRUE(isKnownSynthesizeRecipe(r.id))
+            << "pinned recipe '" << r.id << "' vanished from the closed vocabulary";
+        auto const fam = shimFamilyOf(r.id);
+        ASSERT_TRUE(fam.has_value())
+            << "pinned recipe '" << r.id << "' belongs to NO family — the driver seams "
+               "treat that as an internal invariant breach and abort the build";
+        EXPECT_EQ(*fam, r.family)
+            << "recipe '" << r.id << "' is routed to the WRONG synthesis pass";
+        (r.family == ShimFamily::Threads ? threads : stdio) += 1;
+    }
+    // The shape of the vocabulary itself, so a silent addition/removal is visible.
+    EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
+    EXPECT_EQ(stdio, 1u)
+        << "the <stdio.h> family ships EXACTLY `sprintf` — one recipe with a runtime "
+           "witness, not four speculative bodies";
+}
+
+// THE LOCKSTEP INVARIANT, asserted as the biconditional the header documents rather than
+// as two independent spot-checks: over every pinned id, every deliberate non-recipe, AND a
+// systematically generated mutation neighbourhood (each id truncated by one character and
+// each id with a character appended), `shimFamilyOf(id).has_value()` must EQUAL
+// `isKnownSynthesizeRecipe(id)`.
+//
+// RED-ON-DISABLE: give either function an early-out the other lacks — e.g. make
+// `shimFamilyOf` return `ShimFamily::Stdio` for anything starting with "s", or have
+// `isKnownSynthesizeRecipe` short-circuit true on a prefix — and the mutation sweep reds
+// even though every hand-written sample would still pass.
+TEST(ShippedLibDescriptor, ShimFamilyOfAndIsKnownRecipeStayInLockstep) {
+    std::unordered_set<std::string> const known = [] {
+        std::unordered_set<std::string> s;
+        for (auto const& r : kPinnedRecipes) s.insert(r.id);
+        return s;
+    }();
+
+    auto biconditional = [](std::string_view id) {
+        EXPECT_EQ(shimFamilyOf(id).has_value(), isKnownSynthesizeRecipe(id))
+            << "lockstep broken for '" << id
+            << "': shimFamilyOf and isKnownSynthesizeRecipe disagree";
+    };
+
+    for (auto const& r : kPinnedRecipes) biconditional(r.id);
+
+    for (auto const* n : kNonRecipes) {
+        biconditional(n);
+        EXPECT_FALSE(isKnownSynthesizeRecipe(n))
+            << "'" << n << "' must NOT be a synth recipe";
+        EXPECT_FALSE(shimFamilyOf(n).has_value())
+            << "'" << n << "' must belong to NO shim family";
+    }
+
+    // The generated neighbourhood: one character off in each direction. Skip a mutation
+    // that happens to collide with a real recipe (none do today; the guard keeps the
+    // sweep correct if the vocabulary later grows a pair like `tss_get`/`tss_gets`).
+    for (auto const& r : kPinnedRecipes) {
+        std::string const id{r.id};
+        std::string const shorter = id.substr(0, id.size() - 1);
+        std::string const longer  = id + "x";
+        for (auto const& m : {shorter, longer}) {
+            biconditional(m);
+            if (known.find(m) == known.end()) {
+                EXPECT_FALSE(isKnownSynthesizeRecipe(m))
+                    << "a one-character mutation of '" << id << "' ('" << m
+                    << "') must not be admitted by the CLOSED vocabulary";
+            }
+        }
+    }
+}
+
+// BACKWARD pin, against the REAL shipped descriptors: the set of `synthesize` tags any
+// descriptor under src/dss-config/shippedLibs declares must be EXACTLY `kPinnedRecipes`,
+// and each must resolve to the family pinned there. This is what makes the forward table
+// self-maintaining — ship a new recipe and this reds until it is pinned; retire one and
+// this reds until the pin is removed.
+//
+// Reads through the REAL `readShippedLibDescriptor` (never a text scrape), mirroring
+// `AllShippedDescriptorsDecode`'s sweep + va_list binding.
+TEST(ShippedLibDescriptor, EveryShippedSynthesizeTagIsPinnedToItsFamily) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+
+    std::unordered_set<std::string> declared;
+    for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const namedTypes = sysvVaListBinding(interner);
+        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                             DataModel::Lp64, std::nullopt,
+                                             std::nullopt, namedTypes);
+        ASSERT_TRUE(desc.has_value())
+            << "shipped descriptor failed to load: " << entry.path().generic_string();
+        for (auto const& s : desc->symbols) {
+            if (s.synthesize.empty()) continue;
+            declared.insert(s.synthesize);
+            // The loader already rejects an unknown id at READ time; this asserts the
+            // SECOND half — that the id is also CLASSIFIABLE, which is what the driver
+            // seams need and what the loader does not check.
+            auto const fam = shimFamilyOf(s.synthesize);
+            ASSERT_TRUE(fam.has_value())
+                << "shipped recipe '" << s.synthesize << "' in "
+                << entry.path().generic_string() << " belongs to no shim family";
+            bool pinned = false;
+            for (auto const& r : kPinnedRecipes) {
+                if (s.synthesize == r.id) {
+                    pinned = true;
+                    EXPECT_EQ(*fam, r.family)
+                        << "shipped recipe '" << s.synthesize << "' changed family";
+                }
+            }
+            EXPECT_TRUE(pinned)
+                << "shipped recipe '" << s.synthesize
+                << "' is not pinned in kPinnedRecipes — add it (with its family) so the "
+                   "vocabulary stays covered";
+        }
+    }
+
+    EXPECT_EQ(declared.size(), std::size(kPinnedRecipes))
+        << "the shipped descriptors and kPinnedRecipes must declare the SAME recipe set";
+    for (auto const& r : kPinnedRecipes) {
+        EXPECT_TRUE(declared.find(r.id) != declared.end())
+            << "pinned recipe '" << r.id
+            << "' is declared by NO shipped descriptor — it is unreachable, so either "
+               "ship it or retire it from the vocabulary";
+    }
 }
 
 // ── FC17.9(c) (D-CSUBSET-SETJMP): setjmp.json descriptor decode ───────────────
@@ -3564,6 +5004,724 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
     EXPECT_TRUE(rep.hasErrors())
         << "an unknown data-model name must fail LOUD (it could never match)";
     EXPECT_FALSE(desc.has_value());
+}
+
+// ── TF-C92: the real <sys/ioctl.h> request-ENCODING macros, per format ────────
+//
+// sqlite/src/os_unix.c uses this header's macros at TWO measured sites — macho
+// os_unix.c:2986 `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed at :3013 by
+// `fsctl`), and elf os_unix.c:392-396 `_IO` x4 + `_IOR` x1 under `#ifdef
+// __linux__`. Because an angle include resolves to DESCRIPTORS ONLY (the real
+// <sys/ioccom.h> text is never read), a missing row let `_IOWR` reach the parser
+// as a call whose 3rd argument is a TYPE-NAME: `error[P0009] … got 'struct'` at
+// os_unix.c:2986:56 — MEASURED as the sole diagnostic in that TU, and MEASURED to
+// come back the instant the `_IOWR` row (or just its macho variant) is removed.
+//
+// The two OSes disagree on the DIRECTION FIELD ENTIRELY — Darwin gives each
+// direction its own bit high in the word (VOID 0x20000000, OUT 0x40000000,
+// IN 0x80000000, INOUT 0xc0000000) and masks the size to 13 bits; Linux
+// asm-generic packs a 2-bit direction CODE at bit 30 (NONE 0, WRITE 1, READ 2,
+// so _IOWR is 3) and does not mask. So this pins the exact per-format
+// replacement TEXT, not just that some replacement exists: a copy-paste between
+// the two arms would compute a plausible-looking but WRONG ioctl number, and a
+// wrong request number is silent at every layer below the syscall.
+//
+// RED-ON-DISABLE: drop a row → its EXPECT_TRUE(has …) fails; swap either arm's
+// direction constant or shift → the exact-text EXPECT fails; add `_IOC` or the
+// IOC_*/_IOC_* direction vocabulary → the deliberate-omission EXPECTs fail (that
+// line is a decision recorded in the descriptor's `$comment`, not an oversight,
+// so re-crossing it must be a conscious edit). The VALUE side is pinned
+// end-to-end by `examples/c-subset/shipped_ioctl_iowr_macho/`, which
+// `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
+// against the real SDK sys/ioccom.h.
+TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    fs::path const path = root / "sys" / "ioctl.json";
+    ASSERT_TRUE(fs::exists(path)) << path.generic_string();
+
+    // Read through the interner-FREE preprocessor path — the tier that actually
+    // splices these as synthetic `#define`s at include resolution.
+    auto macrosFor = [&](ObjectFormatKind fmt) {
+        DiagnosticReporter rep;
+        auto m = readShippedLibMacros(path, rep, fmt);
+        EXPECT_FALSE(rep.hasErrors()) << "sys/ioctl.json must read clean";
+        EXPECT_TRUE(m.has_value());
+        return m.value_or(std::vector<ShippedMacro>{});
+    };
+    auto find = [](std::vector<ShippedMacro> const& ms, std::string_view name)
+        -> ShippedMacro const* {
+        for (auto const& m : ms)
+            if (m.name == name) return &m;
+        return nullptr;
+    };
+
+    auto const macho = macrosFor(ObjectFormatKind::MachO);
+    auto const elf   = macrosFor(ObjectFormatKind::Elf);
+
+    // Exactly the four PORTABLE encoding macros, on BOTH formats — one row per
+    // name with a variant per format, so neither format is silently short.
+    std::vector<std::string> const expected{"_IO", "_IOR", "_IOW", "_IOWR"};
+    ASSERT_EQ(macho.size(), expected.size());
+    ASSERT_EQ(elf.size(), expected.size());
+    for (auto const& name : expected) {
+        EXPECT_NE(find(macho, name), nullptr) << name << " missing on macho";
+        EXPECT_NE(find(elf, name), nullptr) << name << " missing on elf";
+    }
+
+    // ARITY: `_IO` takes (group, num); the three sized ones take (group, num,
+    // type). `params` PRESENT (not nullopt) is what makes them FUNCTION-LIKE —
+    // an object-like row would not consume `('z', 23, struct T)` at all.
+    auto expectArity = [&](std::vector<ShippedMacro> const& ms,
+                           std::string_view name, std::size_t arity,
+                           char const* fmtName) {
+        auto const* m = find(ms, name);
+        ASSERT_NE(m, nullptr) << name << " on " << fmtName;
+        ASSERT_TRUE(m->params.has_value())
+            << name << " must be FUNCTION-like on " << fmtName;
+        EXPECT_EQ(m->params->size(), arity) << name << " on " << fmtName;
+        EXPECT_FALSE(m->variadic) << name << " is not variadic";
+        EXPECT_FALSE(m->replacement.empty()) << name << " must have a body";
+    };
+    expectArity(macho, "_IO",   2u, "macho");
+    expectArity(macho, "_IOR",  3u, "macho");
+    expectArity(macho, "_IOW",  3u, "macho");
+    expectArity(macho, "_IOWR", 3u, "macho");
+    expectArity(elf,   "_IO",   2u, "elf");
+    expectArity(elf,   "_IOR",  3u, "elf");
+    expectArity(elf,   "_IOW",  3u, "elf");
+    expectArity(elf,   "_IOWR", 3u, "elf");
+
+    // EXACT per-format replacement text. macho ← the SDK sys/ioccom.h layout;
+    // elf ← the musl/asm-generic layout. Every direction literal carries `u`:
+    // on elf that is LOAD-BEARING (`2 << 30` overflows a signed int, and DSS and
+    // clang were measured to widen that UB differently — 0x80000000 vs
+    // 0xffffffff80000000 — so a signed spelling computes a request number no
+    // native consumer of the same header agrees with).
+    auto expectBody = [&](std::vector<ShippedMacro> const& ms,
+                          std::string_view name, char const* body,
+                          char const* fmtName) {
+        auto const* m = find(ms, name);
+        ASSERT_NE(m, nullptr) << name << " on " << fmtName;
+        EXPECT_EQ(m->replacement, body) << name << " on " << fmtName;
+    };
+    expectBody(macho, "_IO",
+               "(0x20000000u | (((0u) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOR",
+               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOW",
+               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(macho, "_IOWR",
+               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+    expectBody(elf, "_IO",
+               "(((0u) << 30) | ((g) << 8) | (n) | ((0u) << 16))", "elf");
+    expectBody(elf, "_IOR",
+               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+    expectBody(elf, "_IOW",
+               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+    expectBody(elf, "_IOWR",
+               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+
+    // The per-format VARIANT SELECTION really diverged — if the selector ever
+    // handed one format the other's arm, these would compare equal. This is the
+    // property the `$comment`'s agnosticism claim rests on.
+    for (auto const& name : expected) {
+        auto const* m = find(macho, name);
+        auto const* e = find(elf, name);
+        ASSERT_NE(m, nullptr);
+        ASSERT_NE(e, nullptr);
+        EXPECT_NE(m->replacement, e->replacement)
+            << name << ": the macho and elf encodings are NOT the same layout";
+    }
+
+    // No `sizeof` in `_IO` (len is a literal 0 on both formats), and `sizeof(t)`
+    // present in each sized one — the type-name-through-a-macro-parameter
+    // mechanism the c92 defect proved untested.
+    for (auto const* ms : {&macho, &elf}) {
+        auto const* io = find(*ms, "_IO");
+        ASSERT_NE(io, nullptr);
+        EXPECT_EQ(io->replacement.find("sizeof"), std::string::npos)
+            << "_IO encodes no parameter length";
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*ms, name);
+            ASSERT_NE(sized, nullptr) << name;
+            EXPECT_NE(sized->replacement.find("sizeof(t)"), std::string::npos)
+                << name << " must take its length from sizeof(t)";
+        }
+    }
+
+    // DELIBERATE OMISSIONS (no-over-ship line, justified in the `$comment`):
+    // `_IOC` and the per-OS direction-bit vocabulary are NOT the portable
+    // interface and no corpus site names them; their absence is LOUD (an
+    // undeclared identifier), never a silent wrong number.
+    for (auto const* ms : {&macho, &elf})
+        for (auto const& name : {"_IOC", "IOC_VOID", "IOC_OUT", "IOC_IN",
+                                 "IOC_INOUT", "IOCPARM_MASK", "_IOC_NONE",
+                                 "_IOC_WRITE", "_IOC_READ"})
+            EXPECT_EQ(find(*ms, name), nullptr)
+                << name << " is deliberately NOT shipped — see the $comment";
+
+    // The macros ride ALONGSIDE the pre-existing link surface; `ioctl`'s request
+    // parameter is the u64 these encodings widen into, so the two halves of this
+    // descriptor have to keep agreeing.
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(path, interner, typeReg, ObjectFormatKind::MachO);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].name, "ioctl");
+    EXPECT_EQ(desc->macros.size(), expected.size())
+        << "the full read must select the same four macros as the pp read";
+    // No `constants` surface: the numerics are inlined into each macro body so
+    // every row is self-contained (adding IOC_* constants would be a new claim).
+    EXPECT_TRUE(desc->constants.empty())
+        << "sys/ioctl.json ships no constant surface by design";
+}
+
+// ── D-CSUBSET-DARWIN-BSD-SYMBOL-CLUSTER: the Darwin/BSD vocabulary sqlite
+//    os_unix.c's proxy/AFP-locking region consumes ────────────────────────────
+//
+// strlcpy/strlcat (<string.h>), random/srandomdev (<stdlib.h>), futimes
+// (<sys/time.h>), fsctl + the uuid_t typedef (<unistd.h>). Every consumer lives
+// inside sqlite os_unix.c's `#if defined(__APPLE__) &&
+// SQLITE_ENABLE_LOCKING_STYLE` region (strlcpy first at :7434, strlcat :7443,
+// random :3197, srandomdev :6169, futimes :7883, fsctl :3013, uuid_t
+// :7600/:7607/:7791), and every name lives in a REAL SDK header the shipped
+// descriptor SHADOWS totally (an angle-include never reads the SDK text) — so
+// the descriptor row is the ONLY possible source, and each name is S0001
+// (uuid_t: S0006) without it. Hence the macho-ONLY gates: no elf/pe consumer
+// exists (the no-over-ship rule), and srandomdev/fsctl/uuid_t do not even
+// exist off Darwin.
+//
+// THE PRESENCE+ABSENCE PAIRS BELOW *ARE* THE RED-ON-DISABLE: delete any of the
+// six symbol rows and its PRESENT assert fails; widen a row's
+// availableObjectFormats beyond ["macho"] (or drop the set) and its exact-set +
+// gate asserts fail; delete the uuid_t macho variant (or add an elf one) and
+// the typedef PRESENT/ABSENT asserts fail. Runtime witnesses: the
+// shipped_strlcpy_strlcat_macho and shipped_bsd_random_futimes_uuid_macho
+// corpora on the darwin CI leg.
+//
+// TWO DIFFERENT ABSENCE MECHANISMS, each asserted the way its architecture
+// actually works:
+//   * SYMBOLS: decode keeps EVERY row regardless of the requested format (the
+//     c106 pin-shape lesson — see RealStdlibAtexitPerFormatAvailabilitySplit);
+//     the per-symbol gate filters at semantic INJECTION. So the elf ABSENCE is
+//     pinned via the exact availability set + the injector's own
+//     `objectFormatInAvailabilitySet` predicate — the atexit-test idiom — not
+//     via row disappearance.
+//   * TYPEDEFS: there is no per-typedef availableObjectFormats key (closed key
+//     set {name,type,variants}); availability IS which `variants` exist, and
+//     selection happens AT DECODE — zero matches ⇒ the typedef is not in
+//     `desc->typedefs` at all (the sys/types fixpt_t/segsz_t mechanism), so
+//     the elf ABSENCE is a straight lookup miss.
+
+// One (arch, format) read of a REAL descriptor for the cluster tests: the
+// interner rides along so signatures/typedefs can be inspected STRUCTURALLY
+// (never a string compare of raw JSON).
+struct DarwinBsdClusterRead {
+    TypeInterner       interner{CompilationUnitId{1}};
+    TypeRegistry       typeReg;
+    DiagnosticReporter rep;
+    std::optional<ShippedLibDescriptor> desc;
+};
+
+static void readDarwinBsdCluster(fs::path const& path, std::string_view arch,
+                                 ObjectFormatKind fmt, DarwinBsdClusterRead& out) {
+    out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg, out.rep,
+                                        DataModel::Lp64, arch, fmt);
+    ASSERT_TRUE(out.desc.has_value())
+        << path.generic_string() << " failed to load for arch=" << arch;
+    ASSERT_FALSE(out.rep.hasErrors())
+        << path.generic_string() << " emitted diagnostics for arch=" << arch;
+}
+
+static ShippedSymbol const* findDarwinBsdSymbol(DarwinBsdClusterRead const& r,
+                                                std::string_view name) {
+    for (auto const& s : r.desc->symbols)
+        if (s.name == name) return &s;
+    return nullptr;
+}
+
+// PRESENT side of one macho-only symbol: exact decoded FnSig shape
+// (result + params, param pointees where the param is a pointer) + the exact
+// ["macho"] availability set + the injector gate excluding elf/pe.
+//
+// `retPointee` is the RESULT's pointee, asserted only when engaged — the
+// trailing-optional keeps every pre-existing caller byte-identical while
+// letting a pointer-RETURNING row (the malloc-zone cluster: four of the seven
+// hand back `malloc_zone_t *`/`void *`) pin `ptr<void>` rather than settle for
+// "some Ptr", which alone would not distinguish it from `ptr<char>`.
+static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view name,
+                              TypeKind ret,
+                              std::vector<TypeKind> const& params,
+                              std::vector<std::optional<TypeKind>> const& pointees,
+                              std::optional<TypeKind> retPointee = std::nullopt) {
+    ASSERT_EQ(params.size(), pointees.size()) << "test-table shape";
+    auto const* sym = findDarwinBsdSymbol(r, name);
+    ASSERT_NE(sym, nullptr) << name << " row absent (RED-ON-DISABLE: this is "
+                               "the delete-the-row red)";
+    ASSERT_EQ(r.interner.kind(sym->signature), TypeKind::FnSig) << name;
+    EXPECT_EQ(r.interner.kind(r.interner.fnResult(sym->signature)), ret)
+        << name << " return kind";
+    if (retPointee.has_value()) {
+        auto relem = r.interner.operands(r.interner.fnResult(sym->signature));
+        ASSERT_EQ(relem.size(), 1u) << name << " result pointee";
+        EXPECT_EQ(r.interner.kind(relem[0]), *retPointee)
+            << name << " result pointee kind";
+    }
+    auto ps = r.interner.fnParams(sym->signature);
+    ASSERT_EQ(ps.size(), params.size()) << name << " arity";
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        EXPECT_EQ(r.interner.kind(ps[i]), params[i]) << name << " param " << i;
+        if (pointees[i].has_value()) {
+            auto elem = r.interner.operands(ps[i]);
+            ASSERT_EQ(elem.size(), 1u) << name << " param " << i << " pointee";
+            EXPECT_EQ(r.interner.kind(elem[0]), *pointees[i])
+                << name << " param " << i << " pointee kind";
+        }
+    }
+    EXPECT_EQ(sym->availableObjectFormats, (std::vector<std::string>{"macho"}))
+        << name << " must be gated macho-ONLY: its only consumers are inside "
+           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and "
+           "DSS eager-imports every DECLARED shipped extern";
+    EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                              ObjectFormatKind::MachO)) << name;
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf)) << name;
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Pe)) << name;
+}
+
+TEST(ShippedLibDescriptor, RealStringJsonStrlcpyStrlcatMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "string.json";
+
+    using K = TypeKind;
+    // BSD semantics make the RESULT the load-bearing kind: both return the
+    // length of the string they TRIED to create (a size_t/u64), NOT the dest
+    // pointer strcpy/strcat return — a Ptr result here would silently break
+    // the corpus exit arithmetic (5*8+2).
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        for (auto const* name : {"strlcpy", "strlcat"})
+            expectMachoOnlyFn(m, name, K::U64,
+                              {K::Ptr, K::Ptr, K::U64},
+                              {K::Char, K::Char, std::nullopt});
+    }
+
+    // (x86_64, Elf) read: the rows are STILL in the decode (symbol gating
+    // filters at injection, not at decode — the c106 pin-shape lesson), and the
+    // availability set is format-invariant, so the elf ABSENCE asserted above
+    // (gate == false) is the whole story. Positive control: strlen (ungated)
+    // must carry an EMPTY set — without it a decode that dropped every
+    // availability set would pass the exact-set asserts vacuously... it cannot,
+    // but the control also proves THIS read decoded a real symbol surface.
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"strlcpy", "strlcat"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr)
+            << name << " must still DECODE on an elf read (gating is at "
+               "injection); its absence on elf is the gate assert above";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf)) << name;
+    }
+    auto const* strlen_ = findDarwinBsdSymbol(e, "strlen");
+    ASSERT_NE(strlen_, nullptr) << "positive control: strlen must be present";
+    EXPECT_TRUE(strlen_->availableObjectFormats.empty())
+        << "positive control: strlen ships ungated (every format)";
+}
+
+TEST(ShippedLibDescriptor, RealStdlibJsonRandomSrandomdevMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "stdlib.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // `long random(void)` — the i64 result is the LP64 C `long`; a FLAT
+        // signature is correct because the [macho] gate means only LP64
+        // targets can ever select this row (asserted right below).
+        expectMachoOnlyFn(m, "random", K::I64, {}, {});
+        expectMachoOnlyFn(m, "srandomdev", K::Void, {}, {});
+    }
+
+    // Elf read: rows persist in the decode; the gate is the absence (same
+    // rationale as the string.json test). Positive control: rand (ungated).
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"random", "srandomdev"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf)) << name;
+    }
+    auto const* rand_ = findDarwinBsdSymbol(e, "rand");
+    ASSERT_NE(rand_, nullptr) << "positive control: rand must be present";
+    EXPECT_TRUE(rand_->availableObjectFormats.empty())
+        << "positive control: rand ships ungated (every format)";
+}
+
+// D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the seven Darwin ZONE
+// ALLOCATOR externs sqlite mem1.c's SQLITE_SYSTEM_MALLOC Darwin arm references
+// on the DEFAULT macho path. libsystem_malloc owns them; they reach the program
+// re-exported through the libSystem umbrella, so the honest existence check is
+// dlopen+dlsym, NOT libSystem.B.dylib's own export trie (that trie lists six
+// symbols total and reports all seven absent — a false negative).
+//
+// DELIBERATELY NO malloc_zone_t MODELLING: mem1.c uses it only as an opaque
+// pointer plus calls through its function-pointer members, so every
+// `malloc_zone_t *` is ptr<void> here and the REAL type keeps arriving from the
+// SDK malloc/malloc.h via D-INCLUDE-ANGLE-SOURCE-FALLBACK. That fallback is
+// also why these rows live in stdlib.json instead of a new malloc/malloc.json:
+// a descriptor SHADOWS its header totally, so a partial malloc/malloc.json
+// would delete mem1.c's access to the real malloc_zone_t and REGRESS a TU that
+// compiles today.
+//
+// The size_t/vm_size_t params are asserted U64 exactly. A flat u64 is correct
+// ONLY because the ["macho"] gate narrows these rows to LP64 (all eight
+// macho64-* formats declare dataModel LP64) — an ungated row would have needed
+// an LLP64 arm, so the availability assert below is load-bearing for the
+// SIGNATURE's correctness and not merely for the no-over-ship rule.
+TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "stdlib.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // malloc/malloc.h:390 `malloc_zone_t *malloc_default_zone(void)`
+        expectMachoOnlyFn(m, "malloc_default_zone", K::Ptr, {}, {}, K::Void);
+        // :394 `malloc_zone_t *malloc_create_zone(vm_size_t, unsigned)` —
+        // vm_size_t is 8-byte unsigned, `unsigned flags` is u32.
+        expectMachoOnlyFn(m, "malloc_create_zone", K::Ptr, {K::U64, K::U32},
+                          {std::nullopt, std::nullopt}, K::Void);
+        // :509 `void malloc_set_zone_name(malloc_zone_t *, const char *)` —
+        // the ptr<char> name param is what distinguishes it from a zone ptr.
+        expectMachoOnlyFn(m, "malloc_set_zone_name", K::Void, {K::Ptr, K::Ptr},
+                          {K::Void, K::Char});
+        // :457 `size_t malloc_size(const void *)` — the U64 RESULT is the
+        // load-bearing kind: mem1.c uses it as the allocation-size oracle, so
+        // an i32 result would silently truncate a >2GB block's size.
+        expectMachoOnlyFn(m, "malloc_size", K::U64, {K::Ptr}, {K::Void});
+        // :403 / :447 / :450 — the zone-scoped malloc/free/realloc trio.
+        expectMachoOnlyFn(m, "malloc_zone_malloc", K::Ptr, {K::Ptr, K::U64},
+                          {K::Void, std::nullopt}, K::Void);
+        expectMachoOnlyFn(m, "malloc_zone_free", K::Void, {K::Ptr, K::Ptr},
+                          {K::Void, K::Void});
+        expectMachoOnlyFn(m, "malloc_zone_realloc", K::Ptr,
+                          {K::Ptr, K::Ptr, K::U64},
+                          {K::Void, K::Void, std::nullopt}, K::Void);
+    }
+
+    // Elf read: rows persist in the decode; the gate predicate IS the elf
+    // absence. Positive control: malloc (ungated) — it also proves this read
+    // decoded a real symbol surface rather than an empty one.
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"malloc_default_zone", "malloc_create_zone",
+                             "malloc_set_zone_name", "malloc_size",
+                             "malloc_zone_malloc", "malloc_zone_free",
+                             "malloc_zone_realloc"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf))
+            << name << " must NOT be injected on elf: glibc has no zone "
+                       "allocator at all, so declaring it there would plant an "
+                       "undefined import that kills the loader";
+    }
+    auto const* malloc_ = findDarwinBsdSymbol(e, "malloc");
+    ASSERT_NE(malloc_, nullptr) << "positive control: malloc must be present";
+    EXPECT_TRUE(malloc_->availableObjectFormats.empty())
+        << "positive control: malloc ships ungated (every format)";
+}
+
+TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's
+        // sole call passes NULL, so no layout knowledge rides on the param).
+        expectMachoOnlyFn(m, "futimes", K::I32,
+                          {K::I32, K::Ptr},
+                          {std::nullopt, K::Void});
+    }
+
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    auto const* sym = findDarwinBsdSymbol(e, "futimes");
+    ASSERT_NE(sym, nullptr) << "futimes must still decode on elf";
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    auto const* utimes = findDarwinBsdSymbol(e, "utimes");
+    ASSERT_NE(utimes, nullptr) << "positive control: utimes must be present";
+    EXPECT_TRUE(utimes->availableObjectFormats.empty())
+        << "positive control: utimes rides the header-level [elf,macho] gate "
+           "with no per-symbol set";
+}
+
+TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // SDK unistd.h:785 `int fsctl(const char *, unsigned long, void *,
+        // unsigned int)` — the FULL 4-param shape must decode: the u64 request
+        // param is the one the sys/ioctl.json _IOWR encoding widens into at
+        // sqlite os_unix.c:3013, so a truncated/reordered decode here would
+        // corrupt that call's request value silently.
+        expectMachoOnlyFn(m, "fsctl", K::I32,
+                          {K::Ptr, K::U64, K::Ptr, K::U32},
+                          {K::Char, std::nullopt, K::Void, std::nullopt});
+    }
+
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    auto const* sym = findDarwinBsdSymbol(e, "fsctl");
+    ASSERT_NE(sym, nullptr) << "fsctl must still decode on elf";
+    EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    auto const* close_ = findDarwinBsdSymbol(e, "close");
+    ASSERT_NE(close_, nullptr) << "positive control: close must be present";
+    EXPECT_TRUE(close_->availableObjectFormats.empty())
+        << "positive control: close ships with no per-symbol set";
+}
+
+// D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the five Darwin filesystem/
+// sysctl externs sqlite's DEFAULT macho path references (os_unix.c: flock,
+// statfs, fstatfs; test1.c: sysctl; mem1.c: sysctlbyname). Unlike the AFP
+// cluster above these are NOT behind SQLITE_ENABLE_LOCKING_STYLE, so each was a
+// hard K_SymbolUndefined at link until its row existed — DSS imports only
+// DECLARED shipped externs.
+//
+// Every signature is asserted EXACTLY (arity, each param kind, each pointee),
+// not merely "the name decodes": these are raw syscall wrappers whose args are
+// pointers to caller-owned buffers, so a silently wrong width or a dropped
+// param is an ABI defect that still links and still runs. The two that would
+// bite hardest are sysctl/sysctlbyname, where `size_t *oldlenp` is an IN-OUT
+// buffer-length cell — decode it as ptr<u32> and the callee writes 8 bytes into
+// a 4-byte view of the caller's stack slot.
+TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    using K = TypeKind;
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        // SDK sys/fcntl.h:616 `int flock(int, int)` — NOT sys/file.h, whose
+        // __BEGIN_DECLS block is EMPTY (it only re-includes sys/fcntl.h).
+        expectMachoOnlyFn(m, "flock", K::I32, {K::I32, K::I32},
+                          {std::nullopt, std::nullopt});
+        // SDK sys/mount.h:460/:442. `struct statfs *` keeps the fsctl/futimes
+        // opaque ptr<void> spelling — no consumer needs its layout, and the
+        // real type still reaches mem1.c/os_unix.c through the SDK header.
+        expectMachoOnlyFn(m, "statfs", K::I32, {K::Ptr, K::Ptr},
+                          {K::Char, K::Void});
+        expectMachoOnlyFn(m, "fstatfs", K::I32, {K::I32, K::Ptr},
+                          {std::nullopt, K::Void});
+        // SDK sys/sysctl.h:800 `int sysctl(int *, u_int, void *, size_t *,
+        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h:30),
+        // size_t/size_t* are 8-byte unsigned on every macho64 format (all eight
+        // declare dataModel LP64), which is exactly why the row may ship a FLAT
+        // signature with no signatureByDataModel.
+        expectMachoOnlyFn(m, "sysctl", K::I32,
+                          {K::Ptr, K::U32, K::Ptr, K::Ptr, K::Ptr, K::U64},
+                          {K::I32, std::nullopt, K::Void, K::U64, K::Void,
+                           std::nullopt});
+        // SDK sys/sysctl.h:802 — same tail, name-keyed head.
+        expectMachoOnlyFn(m, "sysctlbyname", K::I32,
+                          {K::Ptr, K::Ptr, K::Ptr, K::Ptr, K::U64},
+                          {K::Char, K::Void, K::U64, K::Void, std::nullopt});
+    }
+
+    // Elf read: rows persist in the decode (gating is at injection, not decode);
+    // the gate predicate IS the elf absence. Positive control: close (ungated).
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    for (auto const* name : {"flock", "statfs", "fstatfs", "sysctl",
+                             "sysctlbyname"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
+                                                   ObjectFormatKind::Elf))
+            << name << " must NOT be injected on elf: glibc exports no "
+                       "sysctlbyname, and declaring it there would plant an "
+                       "undefined import (DSS eager-imports every shipped extern)";
+    }
+    auto const* closeCtl = findDarwinBsdSymbol(e, "close");
+    ASSERT_NE(closeCtl, nullptr) << "positive control: close must be present";
+    EXPECT_TRUE(closeCtl->availableObjectFormats.empty())
+        << "positive control: close ships with no per-symbol set";
+}
+
+TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "unistd.json";
+
+    auto findTypedef = [](DarwinBsdClusterRead const& r,
+                          std::string_view name) -> TypeId {
+        for (auto const& td : r.desc->typedefs)
+            if (td.name == name) return td.type;
+        return {};
+    };
+
+    // ── macho (both arches): uuid_t PRESENT as Array of U8, length 16 ──
+    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h:89) — the
+    // 16 is load-bearing: sqlite os_unix.c:7607 asserts PROXY_HOSTIDLEN ==
+    // sizeof(uuid_t), and the shipped_bsd_random_futimes_uuid_macho corpus
+    // exit arithmetic IS sizeof(uuid_t).
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        TypeId const t = findTypedef(m, "uuid_t");
+        ASSERT_TRUE(t.valid())
+            << "uuid_t must be injected on macho (arch=" << arch << ") — "
+               "RED-ON-DISABLE: deleting the macho variant reds this";
+        ASSERT_EQ(m.interner.kind(t), TypeKind::Array) << "uuid_t is an ARRAY";
+        auto const ops = m.interner.operands(t);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(m.interner.kind(ops[0]), TypeKind::U8)
+            << "uuid_t element is unsigned char (u8)";
+        auto const lens = m.interner.scalars(t);
+        ASSERT_EQ(lens.size(), 1u);
+        EXPECT_EQ(lens[0], 16) << "uuid_t is 16 bytes (PROXY_HOSTIDLEN)";
+        // The whole shape in one interned identity (kind+element+length).
+        EXPECT_EQ(t, m.interner.array(m.interner.primitive(TypeKind::U8), 16))
+            << "uuid_t must BE arr<u8, 16>";
+    }
+
+    // ── elf: ABSENT — typedef variants select AT DECODE (unlike symbols), so
+    // zero matching variants means uuid_t is simply not in desc->typedefs.
+    // Positive control on the SAME read: the `close` symbol must be present,
+    // so a descriptor that failed to load (or a typedefs array that silently
+    // decoded to empty-everything) cannot satisfy this vacuously. ──
+    DarwinBsdClusterRead e;
+    ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, "x86_64",
+                                                 ObjectFormatKind::Elf, e));
+    EXPECT_FALSE(findTypedef(e, "uuid_t").valid())
+        << "uuid_t is Darwin-only (__darwin_uuid_t) and must NOT be injected "
+           "on elf — RED-ON-DISABLE: adding an elf variant reds this";
+    EXPECT_NE(findDarwinBsdSymbol(e, "close"), nullptr)
+        << "positive control: the elf read must still decode the symbol "
+           "surface (guards vacuous ABSENT passes)";
+}
+
+
+// ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): two DESCRIPTORS, one
+// ── `timespec` — the PREMISE this cycle had to measure before it could design
+//
+// The anchor was opened on the inferred claim that `time.json` and
+// `sys/stat.json` declare a textually identical `timespec` and "intern DISTINCT
+// TypeIds". MEASURED here, into ONE interner exactly as a real compile does:
+// they intern the SAME TypeId. The complete-at-once composite path derives its
+// `declSiteKey` from the FIELD CONTENT, so two byte-identical rows collapse —
+// and had they NOT, `ShippedTypeConsistency` would have reported
+// F_ShippedTypeIdentityConflict on the second read rather than letting a second
+// type through silently.
+//
+// So this pin is a GUARD, not the fix's witness: the day someone re-spells one
+// of the two rows `i64 "long"` (the exact `struct timeval` divergence this
+// project has already shipped three times), the identity splits and this goes
+// RED — one file above the place the user would otherwise meet it, as an
+// unexplained assignment error. The cross-ORIGIN half of the anchor (a SOURCE
+// declaration of the same tag shadowing the injected one) is not visible at this
+// tier at all; it is pinned in
+// tests/analysis/semantic/test_semantic_analyzer_c_subset.cpp.
+//
+// RED-ON-DISABLE (MEASURED by demonstration): change either descriptor's
+// `tv_sec` to `i64 "long"` and both the tag EQ and the member EQ go red.
+TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    auto structNamed = [](ShippedLibDescriptor const& d,
+                          std::string_view sname) -> ShippedStruct const* {
+        for (auto const& s : d.structs)
+            if (s.name == sname) return &s;
+        return nullptr;
+    };
+    auto fieldNamed = [](ShippedStruct const& s,
+                         std::string_view fname) -> ShippedField const* {
+        for (auto const& f : s.fields)
+            if (f.name == fname) return &f;
+        return nullptr;
+    };
+
+    // ONE interner + ONE registry — the arrangement the semantic phase uses, so
+    // the identity measured here is the identity a compile sees.
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto timeDesc = readShippedLibDescriptor(
+        root / "time.json", interner, typeReg, rep, DataModel::Lp64,
+        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+    auto statDesc = readShippedLibDescriptor(
+        root / "sys" / "stat.json", interner, typeReg, rep, DataModel::Lp64,
+        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+    ASSERT_TRUE(timeDesc.has_value());
+    ASSERT_TRUE(statDesc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    auto const* fromTime = structNamed(*timeDesc, "timespec");
+    auto const* fromStat = structNamed(*statDesc, "timespec");
+    ASSERT_NE(fromTime, nullptr) << "time.json must declare struct timespec";
+    ASSERT_NE(fromStat, nullptr) << "sys/stat.json must declare struct timespec";
+
+    // THE DIRECT IDENTITY ASSERTION — exact TypeIds, not "compatible".
+    EXPECT_EQ(fromTime->typeId, fromStat->typeId)
+        << "two descriptors declaring a byte-identical `timespec` must intern "
+           "ONE TypeId; a split here is the cross-file identity defect at the "
+           "descriptor tier";
+
+    // And the MEMBER — the surface that actually breaks when identity splits.
+    auto const* st = structNamed(*statDesc, "stat");
+    ASSERT_NE(st, nullptr);
+    auto const* mtimespec = fieldNamed(*st, "st_mtimespec");
+    ASSERT_NE(mtimespec, nullptr) << "the macho variant must carry st_mtimespec";
+    EXPECT_EQ(mtimespec->type, fromTime->typeId)
+        << "`stat.st_mtimespec` must denote the SAME timespec `struct timespec "
+           "x;` resolves to — this is the assignment sqlite os_unix.c:7731 makes";
+
+    // Positive control: the shared type is the real 16-byte {i64,i64}, so the
+    // EQ above cannot pass vacuously on two invalid/empty ids.
+    EXPECT_TRUE(fromTime->typeId.valid());
+    auto const layout = computeLayout(fromTime->typeId, interner, kNatural16,
+                                      DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 16u);
+    EXPECT_EQ(interner.kind(fromTime->typeId), TypeKind::Struct);
 }
 
 } // namespace

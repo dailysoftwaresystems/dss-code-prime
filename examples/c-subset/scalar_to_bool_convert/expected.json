@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-NULLPTR-BOOL-CONVERSION (C 6.3.1.2): the scalar -> _Bool implicit assignment conversion. A scalar (arithmetic / pointer / nullptr) assigned to a _Bool yields 0 if it compares equal to 0 else 1 — realized by coerce() as the `!= 0` truthiness test (the same shape `if(x)` lowers), NOT a low-bit-truncating Cast (so `_Bool b = 2` is TRUE). Admitted at the semantic tier by isAssignable's scalarConvertsToBool arm. Closes the gap the D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE fix unmasked (`_Bool b = (a<b)` — a comparison now types int). Rows: comparison->bool (true), nonzero-int->bool (true), zero->bool (false), 2->bool (TRUE — the low-bit-Trunc catch), non-null-ptr->bool (true), null-ptr->bool (false), nullptr->bool (false), plus two arithmetic round-trips of the stored 0/1 bytes -> 42. RED-ON-DISABLE: revert the isAssignable scalarConvertsToBool arm -> every `_Bool b = <scalar>` fails S0003 and the example does not compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

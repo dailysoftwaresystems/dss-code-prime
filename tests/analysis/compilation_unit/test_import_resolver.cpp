@@ -15,7 +15,6 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -32,33 +31,13 @@ using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
 // RAII temp directory for the c-subset include tests: files must share a
-// directory so same-directory `#include` resolution finds them.
-class TempDir {
-public:
-    TempDir() {
-        static std::atomic<unsigned> counter{0};
-        dir_ = std::filesystem::temp_directory_path() /
-               ("dss_cu4_" + std::to_string(counter.fetch_add(1)));
-        std::filesystem::create_directories(dir_);
-    }
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(dir_, ec);
-    }
-    TempDir(TempDir const&)            = delete;
-    TempDir& operator=(TempDir const&) = delete;
-
-    std::filesystem::path write(std::string const& name, std::string const& content) const {
-        auto path = dir_ / name;
-        std::ofstream(path, std::ios::binary) << content;
-        return path;
-    }
-
-    [[nodiscard]] std::filesystem::path const& path() const noexcept { return dir_; }
-
-private:
-    std::filesystem::path dir_;
-};
+// directory so same-directory `#include` resolution finds them. The facade —
+// and the reason its unique-path scheme is NOT reimplemented locally, defect
+// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
+// identical here and in test_type_name_oracle.cpp. The GROUP below is this
+// suite's own, so its scratch tree stays separate from that sibling's.
+constexpr char kScratchGroup[] = "cu4-import-resolver";
+using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
 // Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
 // `src/dss-config/sources/` directory — mirrors GrammarSchema::loadShipped's
@@ -150,14 +129,25 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
         << "transitive quote include must be recursively inlined";
 }
 
-TEST(ImportResolver, CSubsetQuoteIncludeCycleTerminates) {
-    // FC13: a circular quote-`#include` chain is broken by the preprocessor's
-    // include-stack guard, which emits P_PreprocessorIncludeError on the
-    // back-edge instead of looping forever. The parse still produces one tree.
+// ★ TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) REWROTE THIS TEST, and the old
+// version WAS THE BUG. As `CSubsetQuoteIncludeCycleTerminates` it built an
+// UNGUARDED a.h <-> b.h pair, asserted `P_PreprocessorIncludeError`, and called
+// that the whole contract — so it read as if EVERY include back-edge were an
+// error. It is not. A back-edge into a GUARDED header is legal, conforming C
+// that a real cpp terminates via the guard, and DSS was rejecting it: MEASURED
+// on the macho corpus leg, `mach/mach_types.h -> mach/task_policy.h ->
+// mach/mach_types.h` produced 4 `F_ShippedHeaderNotFound` plus the spurious
+// refusal. The pair below pins BOTH halves, because the value is entirely in
+// the CONTRAST — either test alone can be satisfied by a compiler that gets the
+// other one wrong.
+
+TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
+    // No include guard anywhere, so the back-edge really is an infinite cycle:
+    // refused on sight, LOUDLY, and the parse still produces one tree.
     //
-    // RED-ON-DISABLE: removing the `std::find(includeStack...)` cycle guard in
-    // preprocessor.cpp SynthBuilder::build either hangs (infinite recursion) or
-    // overflows the depth guard -- either way this test stops passing cleanly.
+    // RED-ON-DISABLE: removing the `std::find(includeStack...)` test in
+    // preprocessor.cpp `SynthBuilder::build` either hangs or runs to the depth
+    // backstop -- either way this stops passing cleanly.
     TempDir dir;
     auto a = dir.write("a.h", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"a.h\"\nint b() { return 0; }\n");
@@ -167,14 +157,59 @@ TEST(ImportResolver, CSubsetQuoteIncludeCycleTerminates) {
     auto cu = std::move(builder).finish();
 
     ASSERT_EQ(cu.trees().size(), 1u);              // terminates, one tree
-    // The back-edge of the cycle is reported (on the tree's reporter, remapped
-    // to the originating header).
-    bool sawCycleDiag = false;
+    bool sawRefusal = false, sawGenericIncludeError = false;
     for (auto const& d : cu.trees()[0].diagnostics().all()) {
-        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawCycleDiag = true;
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeReentryRefused) {
+            sawRefusal = true;
+        }
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) {
+            sawGenericIncludeError = true;
+        }
     }
-    EXPECT_TRUE(sawCycleDiag)
-        << "a circular quote-include must emit P_PreprocessorIncludeError";
+    EXPECT_TRUE(sawRefusal)
+        << "an UNGUARDED include cycle must be refused under the refusal's own "
+           "code — `P_PreprocessorIncludeError` is shared with the nesting-depth "
+           "backstop, so reporting it there leaves the two indistinguishable";
+    EXPECT_FALSE(sawGenericIncludeError)
+        << "and must NOT also fire the generic include error: one root cause, "
+           "one diagnostic";
+}
+
+TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
+    // ★ THE HALF THAT WAS BROKEN. The same a.h <-> b.h shape, with ordinary
+    // include guards. A real cpp terminates this via the guard and reports
+    // NOTHING; so must DSS. Both bodies must land exactly once — 0 means a
+    // header was dropped, 2 means the guard failed to empty the re-entered copy.
+    TempDir dir;
+    auto a = dir.write("a.h",
+                       "#ifndef A_H\n#define A_H\n#include \"b.h\"\n"
+                       "int a() { return 0; }\n#endif\n");
+    dir.write("b.h",
+              "#ifndef B_H\n#define B_H\n#include \"a.h\"\n"
+              "int b() { return 0; }\n#endif\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addFile(a);
+    auto cu = std::move(builder).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "a GUARDED include cycle is legal C that terminates via the guard — "
+           "diagnosing it rejects conforming code (MEASURED: this is what cost "
+           "the macho corpus leg 4 F001A on mach/mach_types.h)";
+    std::string const text{cu.trees()[0].source().text()};
+    EXPECT_NE(text.find("int b()"), std::string::npos)
+        << "b.h must really have been spliced — a 'no errors' that came from "
+           "silently dropping the header would be worse than the diagnostic";
+    // ★ WHY THERE IS NO "EXACTLY ONCE" COUNT HERE, deliberately. `source()` is
+    // the SYNTH BUFFER, and the re-entered copy of a.h is present in it as DEAD
+    // BYTES — the guard elides it from the TOKEN STREAM, not from the text (the
+    // preprocessor copies non-directive bytes verbatim and lets the
+    // authoritative conditional pass decide what is live). So a raw-text count
+    // legitimately reads 2 here and would be pinning a retention detail, not the
+    // contract. The real "spliced exactly once" property is pinned where the
+    // post-elision stream is observable: `Preprocessor.Tf87Reentry*` count the
+    // emitted LEXEMES.
 }
 
 TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {
@@ -330,6 +365,101 @@ TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
 }
 
+// D-FFI-DESCRIPTOR-INCLUDES: an angle `#include <parent.h>` whose descriptor
+// declares `includes:["child.h"]` records a ShippedDescriptorRef for BOTH the
+// parent AND the transitively-included child (parent-FIRST), so the semantic phase
+// injects the child's typed surface too — the flat-descriptor FILE §B fix, exercised
+// host-portably (no libtcl/elf; just the recorded refs). RED-ON-DISABLE: revert the
+// closure walk to a single-ref push → only parent.json is recorded → the child's
+// symbols never inject (test_md5's FILE class stays S0001).
+TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <parent.h>\nint main() { return 0; }\n");
+    auto parent = sysDir.write("parent.json",
+        R"({ "header": "parent.h", "includes": ["child.h"],
+             "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
+    auto child = sysDir.write("child.json",
+        R"({ "header": "child.h",
+             "symbols": [ { "name": "cfn", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 2u)
+        << "the parent's `includes` must record the transitive child ref too";
+    std::error_code ec;
+    auto const got0 = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
+    auto const got1 = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[1].path, ec);
+    EXPECT_EQ(got0, std::filesystem::weakly_canonical(parent, ec))
+        << "parent recorded FIRST (parent-wins on a name collision)";
+    EXPECT_EQ(got1, std::filesystem::weakly_canonical(child, ec))
+        << "the transitively-included child recorded second";
+    // Both refs carry the SAME `#include <parent.h>` directive span+buffer (so a
+    // deferred per-target diagnostic points at the user's include line).
+    EXPECT_EQ(cu.shippedLibDescriptors()[0].buffer.v,
+              cu.shippedLibDescriptors()[1].buffer.v);
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES fail-loud: an `includes` entry that resolves to NO
+// descriptor is the SAME hard F_ShippedHeaderNotFound as a direct miss, positioned
+// on the parent `#include` line (the import resolver is the ONLY tier with
+// systemDirs to catch it). RED-ON-DISABLE: drop the onUnresolvedInclude arm → a
+// typo'd transitive include is silently swallowed.
+TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <parent.h>\nint main() { return 0; }\n");
+    // parent resolves, but its `includes` names a header with NO descriptor.
+    sysDir.write("parent.json",
+        R"({ "header": "parent.h", "includes": ["stdioo.h"],
+             "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+        << "an unresolvable `includes` entry must fire F_ShippedHeaderNotFound";
+    // The parent still records its own ref (the closure records the parent before
+    // hitting the unresolvable child).
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "the parent is still recorded; only the missing transitive child errors";
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES cycle-safety at the CU level: parent<->child mutual
+// `includes` records each descriptor EXACTLY ONCE and TERMINATES (the CU-wide
+// visited-set). RED-ON-DISABLE: drop the visited-set guard → infinite recursion.
+TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <pa.h>\nint main() { return 0; }\n");
+    sysDir.write("pa.json",
+        R"({ "header": "pa.h", "includes": ["pb.h"],
+             "symbols": [ { "name": "af", "signature": "fn() -> i32" } ] })");
+    sysDir.write("pb.json",
+        R"({ "header": "pb.h", "includes": ["pa.h"],
+             "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+    // Terminated (we got here) + each descriptor recorded exactly once.
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 2u)
+        << "a cyclic includes graph records each descriptor exactly once + terminates";
+}
+
 // The quote form does NOT search the system dir, and the angle form does
 // NOT search includeDirs — the two paths are distinct (config-driven by
 // pathToken vs systemPathToken, no language branch).
@@ -351,7 +481,7 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
+    ASSERT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
     // The quote-include failure is reported ONCE, by the preprocessor.
     bool sawPPInclude = false;
     for (auto const& d : cu.trees()[0].diagnostics().all()) {
@@ -363,6 +493,149 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     // Not double-reported by the resolver, and NOT the angle-form hard error.
     EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 0u);
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+}
+
+// ── D-INCLUDE-ANGLE-SOURCE-FALLBACK: angle `#include <h>` real-header fallback ──
+//
+// When an angle header has NO shipped `<stem>.json` descriptor but DOES exist as
+// a real source file on the -I includeDirs, the PP falls back to textually
+// splicing it (byte-for-byte like a quote include), so SQLite ext TUs that
+// angle-include `<sqlite3.h>` / `<sqlite3ext.h>` resolve instead of fataling
+// F_ShippedHeaderNotFound. Descriptors stay first-choice; the fallback fires
+// ONLY on a descriptor miss. The full-CU-pipeline (preprocess+parse+resolve)
+// contract, complementing the PP-surface pins in test_preprocessor.cpp.
+
+// P1: angle `<foo.h>`, NO descriptor, `foo.h` on the -I path -> resolves via the
+// source fallback (textual splice): ONE tree (inlined), the header's symbol
+// present, NO F_ShippedHeaderNotFound, NO descriptor recorded. RED-ON-DISABLE:
+// revert the fallback -> the PP leaves the angle include verbatim -> the
+// post-parse resolver's descriptor lookup misses -> F_ShippedHeaderNotFound.
+TEST(ImportResolver, CSubsetAngleSourceFallbackResolves) {
+    TempDir srcDir;
+    TempDir incDir;   // the -I path (NOT the including file's own dir)
+    auto main = srcDir.write("main.c",
+        "#include <foo.h>\nint main() { return foo(); }\n");
+    incDir.write("foo.h", "int foo(void) { return 7; }\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addIncludeDir(incDir.path());   // -I: the angle source-fallback path
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                         DiagnosticCode::F_ShippedHeaderNotFound))
+        << "an angle header present on the -I path must resolve via the source "
+           "fallback, not fatal F_ShippedHeaderNotFound";
+    // Textual splice: ONE tree (header inlined, not a 2nd tree / a descriptor).
+    ASSERT_EQ(cu.trees().size(), 1u)
+        << "a source-fallback angle include is inlined into the one TU";
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "the includer + inlined header must compile clean";
+    EXPECT_TRUE(cu.crossRefs().empty())
+        << "a textual splice is not a cross-tree edge";
+    EXPECT_TRUE(cu.shippedLibDescriptors().empty())
+        << "a source fallback records NO descriptor (it is not a descriptor)";
+}
+
+// P2: BOTH a `baz.json` descriptor on the systemDir AND a `baz.h` source on the
+// -I path -> the DESCRIPTOR wins (funnel descriptor-first). The descriptor path
+// is recorded; the source decoy is NEVER inlined. RED-ON-DISABLE: flip the funnel
+// to source-first -> no descriptor recorded + the invalid decoy is spliced (tree
+// errors).
+TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
+    TempDir srcDir;
+    TempDir sysDir;
+    TempDir incDir;
+    auto main = srcDir.write("main.c",
+        "#include <baz.h>\nint main() { return 0; }\n");
+    auto descPath = sysDir.write("baz.json",
+        R"({ "library": { "pe": "lib.dll" },
+             "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
+    // A DECOY source header with the same stem on the -I path: it is INVALID C,
+    // so a wrong source-first splice would surface loudly as a tree error.
+    incDir.write("baz.h", "@@@ this is not valid c and must never be inlined @@@\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addIncludeDir(incDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                         DiagnosticCode::F_ShippedHeaderNotFound));
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "descriptor-first: <baz.h> must resolve to baz.json, not the decoy source";
+    std::error_code ec;
+    EXPECT_EQ(std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec),
+              std::filesystem::weakly_canonical(descPath, ec))
+        << "the recorded path must be the descriptor, proving descriptor-first";
+    ASSERT_EQ(cu.trees().size(), 1u)
+        << "the descriptor is NOT inlined as source (no 2nd tree, decoy ignored)";
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+        << "the invalid decoy baz.h must never be spliced (the descriptor won)";
+}
+
+// P3 (C 6.10.2p2): the angle form does NOT search the including file's OWN
+// directory (only the -I includeDirs), UNLIKE quote. A `qux.h` present ONLY in
+// main.c's own dir (not on any -I) is NOT found by `#include <qux.h>` -> hard
+// F_ShippedHeaderNotFound; the SAME header via a QUOTE `#include "qux.h"` DOES
+// resolve. RED-ON-DISABLE: if the fallback wrongly searched the including dir the
+// angle form would resolve and the hard error would vanish.
+TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
+    // Angle: qux.h only in the including file's own dir -> NOT found.
+    {
+        TempDir srcDir;
+        auto main = srcDir.write("main.c",
+            "#include <qux.h>\nint main() { return qux(); }\n");
+        srcDir.write("qux.h", "int qux(void) { return 1; }\n");  // self-dir ONLY
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        // NO addIncludeDir -> the angle form has no -I on which to find qux.h.
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                            DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+            << "angle <qux.h> must NOT search the including dir (C 6.10.2p2)";
+    }
+    // Quote contrast: the SAME self-dir header via "qux.h" DOES resolve.
+    {
+        TempDir srcDir;
+        auto main = srcDir.write("main.c",
+            "#include \"qux.h\"\nint main() { return qux(); }\n");
+        srcDir.write("qux.h", "int qux(void) { return 1; }\n");
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                             DiagnosticCode::F_ShippedHeaderNotFound))
+            << "quote \"qux.h\" DOES search the including dir -> resolves (contrast)";
+        ASSERT_EQ(cu.trees().size(), 1u);
+        EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+            << "the quote include inlines qux.h cleanly";
+    }
+}
+
+// P4: an angle `<none.h>` absent on the systemDir AND every -I includeDir is a
+// hard, unsuppressable F_ShippedHeaderNotFound (fail-loud — never silently
+// accepted). An -I dir IS present but does not contain the header.
+TEST(ImportResolver, CSubsetAngleSourceFallbackTotalMissHardError) {
+    TempDir srcDir;
+    TempDir incDir;   // present but does NOT contain none.h
+    auto main = srcDir.write("main.c",
+        "#include <none.h>\nint main() { return 0; }\n");
+    incDir.write("other.h", "int other(void);\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addIncludeDir(incDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+        << "a total angle miss (no descriptor, no source on any -I) must fail loud";
 }
 
 // ── tsql-subset: cross-statement table-name matching ─────────────────────────
@@ -474,7 +747,7 @@ TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
     // FC13: main.c's quote include is INLINED by the preprocessor (no edge),
     // and the explicitly-added helper.h is its own (separately parsed) tree.
     // So there are TWO trees but ZERO cross-refs -- the include is textual.
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // main.c's tree carries the inlined helper text.
     EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int helper()"),
@@ -495,7 +768,7 @@ TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
     // FC13: each TU inlines its own copy of common.h. Two trees (a.c, b.c),
     // zero cross-refs, and BOTH trees carry the header text. (A shared header
     // is recompiled per TU -- standard C textual-include semantics.)
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int common()"),
               std::string::npos);
@@ -527,7 +800,7 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
     builder.addInMemory("#include \"dep.h\"\nint main() { return 0; }\n", "main.c");
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // FC13 (Fix 3): with no include dir, `dep.h` cannot be resolved. The
     // PREPROCESSOR owns the failed quote include and reports it ONCE as
@@ -563,7 +836,7 @@ TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
     builder.addFile(mainPath);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 2u);
     EXPECT_TRUE(cu.crossRefs().empty());
     // main.c is tree[1] (the in-memory helper was added first as tree[0]). Its
     // inlined include text is the ON-DISK helper, proving the preprocessor

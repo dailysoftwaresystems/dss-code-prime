@@ -1,0 +1,47 @@
+# TF-C85 — the CHECKED-IN expected reached pragma vocabulary, per predefine class.
+# Regenerate with `scripts/pragma-profile-census/pragma-profile-census.sh --update` (read the diff first).
+# Format: <class> <pragma-leading-word> <count>.   `#` lines are documentation.
+#
+# ★★ THIS IS A FLOOR, NOT A TOTAL, AND THE DIFF IS EXPECTED TO MOVE. A reached-set
+# depends on the manifest's defines, on the predefine class, and on HOW FAR EACH TU
+# GETS before a hard error stops it. All three change as other cycles land.
+#
+# MEASURED 2026-07-29 against ~/src/sqlite (189 TUs, the harness's own recipe), with
+# `preprocess.pragmaEffects` disarmed so every reached pragma names itself:
+#
+#   * `pe` totals 2135 and partitions EXACTLY as the TF-C85 regression did
+#     (warning 1685 = msvc.h:19-33 x112 + mutex_w32.c x3 + totype.c x2;
+#      intrinsic 448 = sqliteInt.h:312-315 x112; optimize 2 = totype.c:440,505).
+#   * `elf` reaches NOTHING — it declares neither `_MSC_VER` nor `__APPLE__`.
+#   * ★ `macho` reaches only 20, FAR below the 112 TF-C82 recorded for the same
+#     corpus. The instruments differ, and the difference is the point: TF-C82
+#     censused with `clang -E`, which has the real Apple SDK and preprocesses every
+#     TU to completion. THIS censuses with DSS, and DSS currently stops many macho
+#     TUs early on missing shipped-header descriptors (F001A: stdbool.h, mach/*),
+#     so their pragmas are never reached. Closing those blockers will RAISE this
+#     number. Do not read a low count as "few pragmas there".
+#
+# ★ TF-C86 UPDATE (2026-07-29) — AND THIS IS THE PREDICTION ABOVE COMING TRUE.
+#   TF-C86 made the conditional-inclusion operators DEFINED names, which stopped
+#   `sys/cdefs.h`'s `#ifndef __has_include` shim from shadowing `__has_include`,
+#   which un-blocked the `mach/*` + `malloc/*` include chain, and shipped a
+#   `stdbool.json` descriptor. macho TUs consequently get FURTHER, and the macho
+#   reached set grew EXACTLY as this file warned it would:
+#       macho pack   8 -> 22   (+14)
+#       macho mark   -  ->  4   (new prefix, first time reached)
+#   REVIEWED, and NEITHER needs a new `pragmaEffects` row: `pack` is already
+#   claimed as `structPacking` (TF-C82 implements it for real) and `mark` is
+#   already claimed as `annotationOnly` (an Xcode editor-navigation marker with no
+#   translation semantics). So the armed build gains ZERO new `P0020` from this —
+#   the growth is reach, not new unclaimed vocabulary. `macho` total 20 -> 38.
+#
+# MEASURED corollary of the same effect: `ext/rtree/rtree.c` carries two more
+# `#pragma intrinsic` lines and contributes ZERO on every class, because the whole
+# file body sits in a not-taken `#if !defined(SQLITE_CORE) || defined(...RTREE)`
+# branch and C 6.10p1 makes an elided pragma entirely silent.
+macho clang 12
+macho mark 4
+macho pack 22
+pe intrinsic 448
+pe optimize 2
+pe warning 1685

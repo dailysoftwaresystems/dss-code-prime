@@ -107,6 +107,26 @@ struct DSS_EXPORT DefaultTokenSpec {
     // emission (the off-grammar comment/string-char behavior). Set per body
     // mode that backs a value-bearing literal (char / string).
     bool          coalesce = false;
+    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. The token kind the tokenizer emits
+    // for the body's CLOSE delimiter (`"` / `'` / `>`) when `coalesce` is true.
+    // Loaded from `lexerModes.<name>.defaultToken.closeToken` — REQUIRED
+    // whenever `coalesce` is true (the loader rejects `coalesce: true` with no
+    // `closeToken` rather than defaulting one) and left invalid otherwise: a
+    // per-codepoint mode already emits its closer through the ordinary body
+    // path, so a `closeToken` there would be a knob that lies.
+    //
+    // Why it cannot simply reuse `kind`: the closer is a DELIMITER, not body
+    // content. Every consumer that filters a literal's children BY KIND —
+    // `decodeAdjacentStringBodies` (string_literal_decode.hpp) is the load-
+    // bearing one — would otherwise fold the delimiter bytes into the decoded
+    // value (`"abc"` → `abc"`) with the semantic and HIR tiers agreeing on the
+    // same wrong length, so no cross-tier guard could catch it. The loader
+    // rejects `closeToken == kind` for exactly that reason.
+    //
+    // The kind is IN-grammar (a shape names it as a real slot), so the loader
+    // records it in `Data::modeIntroducedKinds` — NOT in `bodyDefaultTokenKinds`,
+    // which is the off-grammar cursor-skip set.
+    SchemaTokenId closeToken;
 };
 
 // Metadata for a single named lexer mode. Construct via `make(name, id,

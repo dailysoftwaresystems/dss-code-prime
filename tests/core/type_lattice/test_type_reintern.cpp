@@ -420,6 +420,75 @@ TEST(TypeReintern, PackedFlagSurvivesReintern) {
     EXPECT_EQ(l->fieldOffsets[1], 1u);
 }
 
+// ★★ D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE explicit alignment
+// must SURVIVE re-intern. This is the pin the whole channel hangs on: dropping the
+// value here is the exact silent miscompile the cycle exists to kill — a
+// `__attribute__((aligned(16)))` struct crosses a CU / static-link merge / text
+// round-trip and comes back UNDER-ALIGNED with its size quietly SHRUNK (16 → 5 for
+// the packed witness below), with no diagnostic anywhere.
+//
+// It also stands in for a guarantee `packed` gets from the compiler and this channel
+// cannot: `completeComposite`'s `packed` parameter is non-defaulted, so forgetting it
+// fails to COMPILE. `explicitAlign` must be defaulted (an undefaulted parameter
+// cannot follow the already-defaulted spans, and moving it earlier would break
+// `completeComposite` call sites in files this change does not own), so this test IS
+// the guard. RED-ON-DISABLE: drop `src.explicitCompositeAlign(srcId)` from the
+// reintern `completeComposite` call — the host reads 0 and the layout falls to 5 / 1.
+TEST(TypeReintern, CompositeExplicitAlignSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    // struct S { char a; int b; } __attribute__((packed, aligned(16)));
+    // clang (MEASURED, compiled and run on arm64 macOS): sizeof 16, _Alignof 16.
+    std::array<TypeId, 2> const fields{src.primitive(TypeKind::Char),
+                                       src.primitive(TypeKind::I32)};
+    const TypeId s = src.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/9);
+    src.completeComposite(s, fields, /*packed=*/true, /*fieldBitWidths=*/{},
+                          /*fieldOffsets=*/{}, /*fieldAligns=*/{},
+                          /*explicitAlign=*/16u);
+    ASSERT_EQ(src.explicitCompositeAlign(s), 16u);
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hs = reinternType(src, s, host, remap);
+
+    ASSERT_TRUE(hs.valid());
+    EXPECT_EQ(hs.arenaTag, 2u);                       // host-stamped
+    ASSERT_EQ(hi.kind(hs), TypeKind::Struct);
+    EXPECT_EQ(hi.explicitCompositeAlign(hs), 16u)
+        << "the whole-composite alignment must NOT be dropped through re-intern";
+    EXPECT_TRUE(hi.isPacked(hs));                     // the packed channel too
+    // ...and so must the resulting LAYOUT — the value being carried is only worth
+    // anything if the bytes come out the same on the far side.
+    constexpr AggregateLayoutParams params{ScalarAlignmentRule::Natural, 16};
+    auto const l = computeLayout(hs, hi, params, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->align.bytes(), 16u);   // RED-ON-DISABLE (packed alone → 1)
+    EXPECT_EQ(l->size, 16u);            // RED-ON-DISABLE (packed alone → 5)
+    ASSERT_EQ(l->fieldOffsets.size(), 2u);
+    EXPECT_EQ(l->fieldOffsets[1], 1u);  // packed placement preserved as well
+}
+
+// A composite with NO alignment request must reintern with NO request — the channel
+// is sparse, and a reintern that invented a value (or copied a neighbour's) would
+// change the layout of every ordinary struct that crosses a CU boundary.
+TEST(TypeReintern, CompositeWithoutExplicitAlignReinternsWithout) {
+    TypeInterner src{CompilationUnitId{1}};
+    std::array<TypeId, 2> const fields{src.primitive(TypeKind::Char),
+                                       src.primitive(TypeKind::I32)};
+    const TypeId s = src.structType("Plain", fields);
+    ASSERT_EQ(src.explicitCompositeAlign(s), 0u);
+
+    TypeLattice host{CompilationUnitId{2}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hs = reinternType(src, s, host, remap);
+    EXPECT_EQ(host.interner().explicitCompositeAlign(hs), 0u);
+    constexpr AggregateLayoutParams params{ScalarAlignmentRule::Natural, 16};
+    auto const l = computeLayout(hs, host.interner(), params, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->align.bytes(), 4u);
+    EXPECT_EQ(l->size, 8u);
+}
+
 // D-LANG-TYPE-IDENTITY-VOCABULARY: a primitive's VOCABULARY TAG must survive
 // re-intern. RED-ON-DISABLE: the reintern primitive arm is
 // `dst.primitive(kind, src.name(srcId))`; reverting it to `dst.primitive(kind)`

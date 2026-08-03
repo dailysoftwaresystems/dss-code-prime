@@ -96,6 +96,51 @@ bool readRequiredStringArray(json const& doc,
     return true;
 }
 
+// Read an OPTIONAL array of non-empty strings. Mirrors
+// `readRequiredStringArray` EXCEPT the required-ness: an ABSENT field
+// leaves `out` empty and returns true (no diagnostic), and a
+// present-but-EMPTY `[]` is allowed (⇒ empty list, no "must contain at
+// least one entry" error). A present value that is NOT an array, or an
+// entry that is not a non-empty string, still fails loud C_MalformedJson
+// (never a silent drop). Used for the OPTIONAL compile-flag arrays
+// (`includes` / `defines` / `resolveLibraries`).
+bool readOptionalStringArray(json const& doc,
+                             char const* key,
+                             std::vector<std::string>& out,
+                             std::string_view label,
+                             DiagnosticReporter& rep) {
+    out.clear();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) {
+        return true;  // absent ⇒ empty (the caller left `out` empty); no error
+    }
+    json const& v = doc.at(key);
+    if (!v.is_array()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         std::string{"field '"} + key + "' must be an array of strings");
+        return false;
+    }
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        json const& e = v[i];
+        if (!e.is_string()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] must be a string");
+            return false;
+        }
+        std::string s = e.get<std::string>();
+        if (s.empty()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] must be a non-empty string");
+            return false;
+        }
+        out.push_back(std::move(s));
+    }
+    // A present-but-empty `[]` is ALLOWED (the one difference from
+    // readRequiredStringArray) — no "at least one entry" check here.
+    return true;
+}
+
 } // namespace
 
 std::optional<ProjectConfig>
@@ -125,6 +170,8 @@ parseProjectConfig(std::string_view jsonText,
     // less-actionable "missing required field 'language'".
     static constexpr std::string_view kKnownKeys[] = {
         "language", "artifactProfile", "targets", "sources", "output",
+        "artifactName", "includes", "defines", "resolveLibraries",
+        "stackReserve",
     };
     for (auto it = doc.begin(); it != doc.end(); ++it) {
         std::string const& key = it.key();
@@ -135,7 +182,9 @@ parseProjectConfig(std::string_view jsonText,
         if (!known) {
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                              "unknown field '" + key + "' (recognized fields: "
-                             "language, artifactProfile, targets, sources, output)");
+                             "language, artifactProfile, targets, sources, output, "
+                             "artifactName, includes, defines, resolveLibraries, "
+                             "stackReserve)");
             return std::nullopt;
         }
     }
@@ -148,6 +197,19 @@ parseProjectConfig(std::string_view jsonText,
     if (!readRequiredStringArray(doc, "targets", pc.targets, sourceLabel, rep))
         return std::nullopt;
     if (!readRequiredStringArray(doc, "sources", pc.sources, sourceLabel, rep))
+        return std::nullopt;
+
+    // The OPTIONAL compile-flag arrays (the file-driven counterparts of the
+    // CLI `-I` / `--define` / `--resolve-library`). Absent ⇒ empty (no error);
+    // present must be an array of non-empty strings (else C_MalformedJson); a
+    // present-but-empty `[]` is allowed. `Program::compileProject` threads
+    // these (merge/append) onto the Program's current state.
+    if (!readOptionalStringArray(doc, "includes", pc.includes, sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalStringArray(doc, "defines", pc.defines, sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalStringArray(doc, "resolveLibraries", pc.resolveLibraries,
+                                 sourceLabel, rep))
         return std::nullopt;
 
     // `output` is an OPTIONAL user-authored hint: validate its type when
@@ -168,6 +230,80 @@ parseProjectConfig(std::string_view jsonText,
             return std::nullopt;
         }
         pc.output = std::move(o);
+    }
+
+    // `artifactName` is an OPTIONAL base NAME for the emitted binary (the
+    // per-platform-subdir routing in Program::compileProject reads it). Validate
+    // when present, fail loud on a malformed value (never a silent no-op):
+    //   * wrong type / empty string            → C_MalformedJson
+    //   * contains a path separator ('/' or '\') → C_MalformedJson — it is a
+    //     bare NAME, not a path; the DIRECTORY comes from `--output` (+ the
+    //     per-format subdir). This is an EARLY, clear parse-time guard for the
+    //     common `"dist/app"` mistake.
+    // NOTE: this separator check is NOT the containment boundary — a denylist of
+    // two chars cannot prove a name stays inside the output dir (a bare ".." has
+    // no separator, and a Windows drive-relative "D:app" has none either, yet
+    // both escape once joined onto the output dir). The REAL boundary is a
+    // lexically-normalized parent-path check at the ROUTING site
+    // (compileOneTarget → D_ArtifactNameEscapesOutputDir), where the output dir
+    // is known. This loader check just fails the common case earlier + clearer.
+    // Absent ⇒ nullopt ⇒ the source stem names the artifact (unchanged).
+    if (doc.contains("artifactName")) {
+        json const& v = doc.at("artifactName");
+        if (!v.is_string()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a string");
+            return std::nullopt;
+        }
+        std::string a = v.get<std::string>();
+        if (a.empty()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a non-empty string when present");
+            return std::nullopt;
+        }
+        if (a.find('/') != std::string::npos || a.find('\\') != std::string::npos) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'artifactName' must be a bare file name (no path separators)");
+            return std::nullopt;
+        }
+        pc.artifactName = std::move(a);
+    }
+
+    // `stackReserve` (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) is an OPTIONAL
+    // per-PROGRAM stack-reserve request, in BYTES — the file-driven twin of
+    // the CLI `--stack-reserve`. It belongs in the MANIFEST because the
+    // number is a property of THIS program's deepest call chain (the
+    // motivating case: 1000 levels of nested SQL trigger recursion overflow
+    // the Windows 1 MiB default), so it travels with the project rather than
+    // with an invocation.
+    //
+    // Validated for SHAPE only here — a positive integer byte count.
+    // `is_number_unsigned()` rejects a negative and a float in one check
+    // (nlohmann types `-1` as a SIGNED integer and `4.5` as a float), so a
+    // `-1` can never wrap into a huge u64. RANGE and ALIGNMENT are NOT
+    // decided here: those bounds are declared by the chosen OBJECT FORMAT
+    // (`stackReserveControl` in its `.format.json`) and enforced at the
+    // linker gate, which also REFUSES a request outright on a format that
+    // declares no such capability. Absent ⇒ nullopt ⇒ the format's declared
+    // default stands (unchanged behavior).
+    if (doc.contains("stackReserve")) {
+        json const& v = doc.at("stackReserve");
+        if (!v.is_number_unsigned()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'stackReserve' must be a non-negative "
+                             "integer byte count (e.g. 4194304 for 4 MiB)");
+            return std::nullopt;
+        }
+        std::uint64_t const n = v.get<std::uint64_t>();
+        if (n == 0) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             "field 'stackReserve' must be greater than zero "
+                             "when present — a zero-byte stack reserve cannot "
+                             "start a program. Omit the field to take the "
+                             "object format's declared default.");
+            return std::nullopt;
+        }
+        pc.stackReserveBytes = n;
     }
 
     return pc;

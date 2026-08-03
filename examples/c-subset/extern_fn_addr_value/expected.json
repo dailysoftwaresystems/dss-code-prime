@@ -1,0 +1,14 @@
+{
+  "$comment": "TF-C52 (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT): the address of an undefined extern FUNCTION taken as a LIVE value, then called INDIRECTLY through it. The arm64 RELOCATABLE .o materializes that address via the GOT (R_AARCH64_ADR_GOT_PAGE + LD64_GOT_LO12_NC) so a foreign default-PIE link accepts it -- witnessed structurally by test_elf_writer's GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64 pin + the foreign gcc-PIE/qemu probe. THIS runnable example proves the SOURCE->binary->run chain on each shipped target: the taken address is the real `abs`, so g(1-argc-42) = abs(-42) = 42 -> exit 42. A `volatile` function-pointer blocks devirtualization + DCE so the `release` arm genuinely exercises the address materialization (not a masked no-op); `argc` (runtime) blocks const-folding. RED-ON-DISABLE: a wrong materialized address makes the indirect call land elsewhere -> not 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

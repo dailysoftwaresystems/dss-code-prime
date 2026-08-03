@@ -1,0 +1,27 @@
+{
+  "$comment": "TF-C66 (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture recipe): C99 <inttypes.h> — an OS/libc surface, so it legitimately ships a descriptor. NEED-DRIVEN (the tcl.json growth discipline): the sqlite full-source testfixture TU set uses exactly FOUR of its format macros (PRIi64 x6 / PRIu32 x2 / PRIi32 x2 / PRIu64 x1, e.g. wal.c's \"%.3x:%\" PRIi64 adjacent-string concat via sqliteInt.h's `#ifdef HAVE_INTTYPES_H #include <inttypes.h>` under the configure-produced sqlite_cfg.h); nothing uses the imax*/strto*max functions or intmax_t, so none are modeled. Each replacement is a STRING-LITERAL FRAGMENT (quotes INCLUDED — the TCL_VERSION \"8.6\" precedent) that adjacent-string-concats into the caller's format string. ★ The 64-bit prefixes are #47-class PER-FORMAT divergent: glibc LP64 defines int64_t as `long` -> PRI[iu]64 = \"l\"-prefix; Apple arm64 and Windows LLP64 define int64_t as `long long` -> \"ll\"-prefix. A wrong prefix is a SILENT printf ABI mismatch at runtime (varargs reads the wrong width), so the per-format `variants` arms are load-bearing, not cosmetic. The 32-bit pair is `int` everywhere -> flat. C99 7.8p1: <inttypes.h> includes <stdint.h> — the `includes` closure mirrors that so int64_t/uint32_t resolve wherever only <inttypes.h> is spelled.",
+  "header": "inttypes.h",
+  "standard": "C99",
+  "availableObjectFormats": ["elf", "macho", "pe"],
+  "includes": ["stdint.h"],
+  "macros": [
+    {
+      "name": "PRIi64",
+      "variants": [
+        { "when": { "format": "elf" },   "replacement": "\"li\"" },
+        { "when": { "format": "macho" }, "replacement": "\"lli\"" },
+        { "when": { "format": "pe" },    "replacement": "\"lli\"" }
+      ]
+    },
+    {
+      "name": "PRIu64",
+      "variants": [
+        { "when": { "format": "elf" },   "replacement": "\"lu\"" },
+        { "when": { "format": "macho" }, "replacement": "\"llu\"" },
+        { "when": { "format": "pe" },    "replacement": "\"llu\"" }
+      ]
+    },
+    { "name": "PRIi32", "replacement": "\"i\"" },
+    { "name": "PRIu32", "replacement": "\"u\"" }
+  ]
+}

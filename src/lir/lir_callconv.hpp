@@ -288,13 +288,29 @@ struct DSS_EXPORT FrameLayout {
 struct DSS_EXPORT LirCallconvResult {
     Lir                       lir{};
     std::vector<FrameLayout>  perFunc;  // 1:1 with src.funcAt(i)
+    // True iff `materializeCallingConvention` ran to its successful conclusion.
+    // Set ONLY at the final return, so EVERY failure early-return (a config /
+    // per-function / SEH / VLA-verifier reject — each returns an empty or
+    // partial result) leaves it false. Mirrors `LirTwoAddrLegalizeResult::
+    // allFunctionsLegalized`. It is load-bearing: a FAILURE that returns an
+    // empty module is shape-indistinguishable from a genuinely EMPTY module by
+    // the count check alone (both 0 == 0), so the completion flag is what keeps
+    // a failed pass fail-loud.
+    bool                      allFunctionsLaidOut = false;
 
-    // Derived: true iff the output module is non-empty AND every
-    // function got a layout. Matches cycle-3a's `LirAllocation::ok()`
-    // discipline (computed on access; cannot drift from per-function
-    // results).
+    // Derived: true iff the pass COMPLETED and every function got a FrameLayout
+    // (the parallel-index invariant `perFunc.size() == moduleFuncCount()`).
+    // Matches cycle-3a's `LirAllocation::ok()` discipline (computed on access;
+    // cannot drift from per-function results). An EMPTY module (0 functions —
+    // a declaration-only / all-preprocessed-out TU) is a VALID success: the
+    // pass completes (allFunctionsLaidOut = true) with 0 == 0, so it lowers to
+    // a valid empty relocatable object rather than being silently rejected
+    // (D-CSUBSET-TESTTU-SILENT-EXIT1). The earlier `moduleFuncCount() > 0`
+    // clause wrongly forced ok()==false for the empty case; but merely dropping
+    // it would make a FAILURE that returns an empty module read as ok (0 == 0),
+    // hence the explicit completion flag.
     [[nodiscard]] bool ok() const noexcept {
-        return lir.moduleFuncCount() > 0
+        return allFunctionsLaidOut
             && perFunc.size() == lir.moduleFuncCount();
     }
 

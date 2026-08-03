@@ -346,6 +346,20 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                     // Load admission gate (unchanged): a Load is
                     // hoist-eligible only when no Store in the loop
                     // body may alias its pointer.
+                    //
+                    // ★ KNOWN GAP — `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`:
+                    // this gate proves the loaded VALUE is invariant, NOT
+                    // that the load is SAFE to execute speculatively. There
+                    // is no guaranteed-to-execute test and no
+                    // dereferenceability test, so a conditionally-executed
+                    // dereference — `for (…) if (q) x = *p;` — is hoisted
+                    // into the preheader and runs even when the guard is
+                    // false or the loop body never executes. `isTrapEligible`
+                    // covers only division (`D-OPT6-LICM-TRAP-SAFE-HOIST`).
+                    // Generalize it before trusting this pass on pointers
+                    // that may be null. (TF-C58's own soundness argument
+                    // cites the whole-body clobber scan below, which IS
+                    // sufficient for that purpose and is unaffected.)
                     if (op == MirOpcode::Load) {
                         auto const lops = src_.instOperands(id);
                         if (lops.empty()) {

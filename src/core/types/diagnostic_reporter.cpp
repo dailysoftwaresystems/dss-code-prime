@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <iterator>
 #include <numeric>
@@ -265,6 +267,20 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
 
 namespace {
 
+// TF-C80: house-style fail-loud sink for the renderer (see `bufferFatal` in
+// source_buffer.cpp). Deliberately NOT <cassert> — this must fire identically
+// in release builds, where the crash it replaces was observed.
+[[noreturn]] void lineSliceFatal(std::size_t srcSize,
+                                 std::uint32_t lineStart,
+                                 std::uint32_t lineEnd) {
+    std::fputs("dss::DiagnosticReporter fatal: line slice out of range "
+               "(the diagnostic renderer computed an inconsistent line "
+               "window; this is a compiler bug, not a source error)\n", stderr);
+    std::fprintf(stderr, "  buffer size = %zu, lineStart = %u, lineEnd = %u\n",
+                 srcSize, lineStart, lineEnd);
+    std::abort();
+}
+
 // Return the text of the single line containing `byteOffset`, plus its
 // 1-based line number, *without* the trailing newline.
 struct LineView {
@@ -273,14 +289,60 @@ struct LineView {
     std::string_view text;
 };
 
+// TF-C80. The renderer's ONE substring cut, bounds-checked and fail-LOUD.
+//
+// This replaces a raw `src.substr(lineStart, lineEnd - lineStart)`. A raw
+// `std::string_view::substr` with `pos > size()` throws `std::out_of_range`,
+// and nothing on the diagnostic-rendering path catches it — so the compiler
+// died via `libc++abi: terminating due to uncaught exception` / SIGABRT with
+// NO diagnostic text at all. That silently bypassed the project's fail-loud
+// discipline: the operator saw an "Abort trap: 6", not an error report.
+//
+// A diagnostic renderer must never be the thing that kills the compile, so the
+// contract is enforced HERE with a named, greppable message instead of an
+// anonymous libc++ abort. Reaching `lineSliceFatal` means a CALLER computed an
+// inconsistent line window — a compiler bug — and the operator gets told which
+// invariant broke and with what numbers, not a bare trap.
+[[nodiscard]] std::string_view checkedLineSlice(std::string_view src,
+                                                std::uint32_t lineStart,
+                                                std::uint32_t lineEnd) {
+    if (lineStart > lineEnd || lineEnd > src.size()) {
+        lineSliceFatal(src.size(), lineStart, lineEnd);
+    }
+    return src.substr(lineStart, lineEnd - lineStart);
+}
+
 LineView extractLine(SourceBuffer const& buf, std::uint32_t byteOffset) {
     const auto lc = buf.lineCol(byteOffset);
     const auto src = buf.text();
-    // Find the line's start: walk back from byteOffset to the previous '\n'
+
+    // TF-C80: CLAMP BEFORE THE WALK. `byteOffset` is NOT guaranteed to be a
+    // real offset into `buf`: the preprocessor deliberately mints macro-
+    // expansion PRODUCT tokens whose spans start at `buf.text().size() +
+    // productOffset` — past end-of-buffer by construction (see
+    // preprocessor.cpp `sbTextOf` / `text(Token const&)`, which decode that
+    // encoding). When such a token is the subject of a parse error, its span
+    // reaches this renderer verbatim.
+    //
+    // Unclamped, the backward walk below read `src[lineStart - 1]` for
+    // lineStart > size() — a HEAP OVER-READ of (byteOffset - size()) bytes
+    // past the buffer (MEASURED: up to 67 bytes past a 50-byte file for
+    // `#include <_stdio.h>`). It then threw `std::out_of_range:
+    // string_view::substr` — an UNCAUGHT exception, i.e. SIGABRT with no
+    // diagnostic — whenever a `'\n'` (0x0A) happened to sit in that recycled-
+    // heap window, making the abort NON-DETERMINISTIC run to run.
+    //
+    // `SourceBuffer::lineCol` above ALREADY clamps (`std::min(byteOffset,
+    // size())`); this line restores the parity that was missing here, so a
+    // past-end span renders the last line rather than corrupting memory.
+    const std::uint32_t off = std::min<std::uint32_t>(
+        byteOffset, static_cast<std::uint32_t>(src.size()));
+
+    // Find the line's start: walk back from `off` to the previous '\n'
     // (or position 0). The lineCol() column already tells us how far in we
     // are within the line, but we still need the byte index of the line
     // start to slice the source.
-    std::uint32_t lineStart = byteOffset;
+    std::uint32_t lineStart = off;
     while (lineStart > 0 && src[lineStart - 1] != '\n') {
         --lineStart;
     }
@@ -291,7 +353,7 @@ LineView extractLine(SourceBuffer const& buf, std::uint32_t byteOffset) {
     return LineView{
         .line   = lc.line,
         .column = lc.column,
-        .text   = src.substr(lineStart, lineEnd - lineStart),
+        .text   = checkedLineSlice(src, lineStart, lineEnd),
     };
 }
 

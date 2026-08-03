@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-VARIADIC-DEFAULT-ARG-PROMOTION witness: C 6.5.2.2p6 default argument promotions for a SCALAR variadic tail. A signed short -1 and signed char -1 must reach va_arg(ap,int) as -1 (sign-extended), NOT 65535/255 (the pre-fix zero-filled miscompile that broke sqlite3_expert_new nArg=-1); an unsigned short 65535 is the control that must stay 65535 (zero-extended); a float -1.5f must widen to double -1.5. All operands derive from the volatile `one` so the optimizer cannot const-fold the promotion; the va_start-bearing checkers are not inlined, so the `release` arm exercises the real call-site promotion. exit 42 iff all correct. RED-ON-DISABLE: revert the scalar promotion in coerceCallArg -> `a`==65535 -> exit 1, not 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

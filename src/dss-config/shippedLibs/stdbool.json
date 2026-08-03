@@ -1,0 +1,20 @@
+{
+  "$comment": "Neutral shipped <stdbool.h> (C23 §7.18) — TF-C86 (D-CSUBSET-STDARG-F001A). ★ WHY THIS DESCRIPTOR EXISTS AT ALL: <stdbool.h> is a COMPILER-PROVIDED header, not an SDK one — MEASURED, it is absent from the macOS SDK's /usr/include entirely and lives only in clang's private resource dir (/Library/Developer/CommandLineTools/usr/lib/clang/*/include/stdbool.h). So no amount of -I on a real SDK ever resolves it, and every `#include <stdbool.h>` on the sqlite corpus was a hard F001A (`F_ShippedHeaderNotFound`). It is reached transitively, not by sqlite's own source: the macOS SDK's `malloc/_platform.h:30` pulls it in on the way to `malloc/malloc.h`, which `src/mem1.c` includes for `malloc_size`. THE C23 CONTENT, MEASURED not assumed (`clang -std=c2x -dM -E` diffed against the same command with no include): exactly TWO macros — `__STDBOOL_H` (the header's own include guard, which clang leaks into the macro table and which portable code does test) and `__bool_true_false_are_defined` = 1. NOTHING ELSE. The C17 header additionally defined `bool`/`false`/`true` as macros (the same diff under `-std=c17` shows all three); C23 promoted them to KEYWORDS and dropped the macros, and c-subset.lang.json is a C23 language (`__STDC_VERSION__` = 202311L) whose grammar already carries `bool`/`true`/`false`/`_Bool` as keywords — so defining them here as macros would SHADOW the keywords and is exactly wrong. `__bool_true_false_are_defined` stays because C23 kept it (deprecated, not removed) and because it is the token real code tests to decide whether it may say `bool`. NO `symbols`, NO `library`: <stdbool.h> declares no function and links against nothing — a macro-only descriptor, the same shape as assert.json. `availableObjectFormats` [elf, pe, macho]: the header is part of the C language on every hosted implementation, so it is available on every format DSS emits — unlike a POSIX or Microsoft-CRT header, there is no platform on which `#include <stdbool.h>` should fail loud.",
+  "header": "stdbool.h",
+  "standard": "c23",
+  "availableObjectFormats": [
+    "elf",
+    "pe",
+    "macho"
+  ],
+  "macros": [
+    {
+      "name": "__STDBOOL_H",
+      "replacement": "1"
+    },
+    {
+      "name": "__bool_true_false_are_defined",
+      "replacement": "1"
+    }
+  ]
+}

@@ -229,6 +229,17 @@ public:
         lastLivenessNs_ = 0;
     }
 
+    // ★★ TF-C85: Mem2Reg is the ONE policy in the tree with state that outlives
+    // the rebuild — `analyze` PLANS the IDF phis, `onBlockBegin` EMITS them, and
+    // the pass driver's `finalizePhiIncomings` WIRES them afterwards. When the
+    // rebuilder neuters the policy for a `noOptimize` function the middle step
+    // never happens, so the plan must be discarded or the finalize step trips
+    // its own (correct, load-bearing) "incomings but no emitted phi" abort.
+    // MEASURED: without this override the real pe64 sqlite corpus aborts there.
+    // Dropping the plan is exactly right — a verbatim function keeps its allocas
+    // and needs no phis.
+    void onFunctionNeutered(MirFuncId /*oldFn*/) override { resetPerFunction(); }
+
 private:
     [[nodiscard]] MirInstId resolveToNewId(
         ReachingValue rv,

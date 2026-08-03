@@ -1,0 +1,38 @@
+{
+  "$comment": "TF-C74 (per-ARCHITECTURE identity predefined macros): `src/dss-config/targets/<arch>.target.json` now carries a `predefinedMacros` root key whose rows are merged with the language config's `preprocess.predefinedMacros`, format-filtered exactly ONCE, and fail loud on a name collision. This is the runnable end-to-end pin, on every shipped (architecture x object-format) leg: preprocess -> parse -> lower -> codegen -> LINK -> spawn -> stdout + exit code. STRUCTURE: four independently falsifiable compile-time legs (exhaustiveness / mutual exclusion / platform gate BOTH directions / value-not-just-definedness) plus a runtime arm. The three source routes are arithmetically compensated to the SAME exit code (4 spellings * 6 + 18 == 2 spellings * 12 + 18 == 42), so the exit code alone cannot tell them apart -- each route therefore also `puts` a distinct tag, pinned per target below, and THAT is what discriminates arm64-Apple / arm64-non-Apple / x86_64 at run time. CLANG GROUND TRUTH (MEASURED 2026-07-28, `clang -dM -E -x c /dev/null -target <triple>`): __aarch64__=1 and __ARM_ARCH_ISA_A64=1 on BOTH arm64-apple-darwin and aarch64-linux-gnu -> correctly UNGATED; __arm64__=1 and __arm64=1 on arm64-apple-darwin ONLY, absent on aarch64-linux-gnu -> correctly availableObjectFormats [macho]; __x86_64__/__x86_64/__amd64__/__amd64 all =1 identically on x86_64-linux-gnu, x86_64-apple-darwin AND x86_64-pc-windows-msvc -> correctly UNGATED. `clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path) main.c` is CLEAN (rc 0), the source is syntax-clean under all four target triples, and the clang-built native binary on this arm64-darwin host prints `arch=aarch64-apple` and exits 42 -- byte-for-byte the behaviour DSS produces for arm64:macho64. DELIBERATELY NOT USED as the runtime ARCHITECTURE cross-check: bare-`char` signedness. THE CONSTRAINT STANDS; ITS REASON HAS CHANGED (TF-C75). It used to be that DSS was WRONG on the macho leg -- bare `char` resolved to UNSIGNED on both arm64 platforms while clang defines __CHAR_UNSIGNED__ only for aarch64-linux-gnu -- so building the exit code on it would have baked a known divergence into a green test. That is fixed: signedness is now resolved per (architecture x object-format) pair and DSS matches clang on all four shipped legs (MEASURED 2026-07-28). The constraint survives its original reason because bare-`char` signedness is not an ARCHITECTURE fact at all -- it is (architecture x platform), so an example using it to identify a CPU asserts something untrue and breaks on the next platform added for that CPU. The identity-macro VALUES carry the arithmetic here instead. The ONE sanctioned use is examples/c-subset/char_signedness_macro_coherence, which cross-checks the two observable faces of that single fact rather than using it to identify a machine. RED-ON-DISABLE MATRIX -- every row OBSERVED, never asserted, by compiling this example against a PATCHED COPY of src/dss-config reached through DSS_CONFIG_ROOT (the live checkout stayed byte-identical, verified by sha256 before and after): [LEG 1] `predefinedMacros` deleted from BOTH target files -> error[P001E] `got #error: TF-C74 leg 1 ...`, no artifact, on ALL FOUR targets. [LEG 2] arm64's rows unioned with x86_64's (and vice versa) -> error[P001E] `got #error: TF-C74 leg 2 ...`, no artifact, on ALL FOUR targets. [LEG 3a] availableObjectFormats on the two Apple-only rows flipped [macho]->[elf] -> arm64:macho64 fires error[P001E] leg 3a (__APPLE__ without __arm64__) and, in the same patch, arm64:elf64 fires error[P001E] leg 3b (__arm64__ leaked onto a non-Apple format); both x86_64 targets stay rc 0, proving the patch is arm64-local. [LEG 3b] availableObjectFormats deleted (rows ungated) -> arm64:elf64 fires error[P001E] leg 3b, while arm64:macho64 stays GREEN (exit 42, `arch=aarch64-apple`) and both x86_64 targets stay rc 0 -- the gate falsified in exactly ONE direction. [LEG 4] `value` changed 1 -> 2 on __aarch64__ and __x86_64__ -> error[P001E] `got #error: TF-C74 leg 4 ...` on the arm64 pair and `... leg 4 (x86_64) ...` on the x86_64 pair, no artifact. VARIANT: deleting the `value` key outright never reaches the source at all -- the target schema refuses to load: error[C_MissingField] at /predefinedMacros/0/value: a 'constant' predefinedMacros entry requires 'value', followed by error[D_SchemaLoadFailed]. KNOWN BLIND SPOT, reported not papered over: the CU-build-key axis. Handing arm64.target.json x86_64's rows verbatim -- the exact effect a format-only CuBuildKey would have on arm64:elf64 once x86_64:elf64 claimed the shared `elf` slot -- leaves EVERY `#if` leg silent and the program still exiting 42, because each route's arithmetic is self-contained and no C source can observe which target compiled it. The per-target stdout tag is what catches it (under that patch arm64:macho64 printed `arch=x86_64` instead of `arch=aarch64-apple`). Note also that the examples harness calls Program::compileFiles with a SINGLE-element target vector per target row, so the multi-target CU cache is never exercised by any corpus example; the key was verified separately at the CLI -- one invocation carrying BOTH elf targets produced artifacts byte-identical to the solo per-target builds. FOLD-RESISTANCE: a `volatile` seed keeps the identity sum a runtime value and all three operands cross a real call boundary, so the baseline arm keeps a live multiply-add instead of one folded immediate; the optimizedPipelines `release` arm runs the SHIPPED release pipeline over the same source, so the optimizer x feature composition is witnessed rather than assumed.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "arch=x86_64\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "arch=x86_64\r\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "arch=x86_64\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "arch=aarch64\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "arch=aarch64-apple\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

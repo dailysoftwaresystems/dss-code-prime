@@ -467,6 +467,161 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
            "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
 }
 
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got` extern-address
+// format (arm64 ELF relocatable / static-archive member), taking the ADDRESS
+// of an undefined extern as a LIVE code-form VALUE (here `return &abs;` — a
+// function pointer value, NOT a call) must materialize through the arm64
+// GOT-address macro `lea_extern_got` (adrp:got: + ldr:got_lo12: →
+// R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC), NOT the absolute
+// ADRP+ADD `[symbol]` lea (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) a foreign
+// default-PIE link REJECTS ("may bind externally … when making a shared
+// object"). TWO-DIRECTIONAL: (1) the GOT macro IS emitted for the symbol AND
+// (2) NO absolute lea is. RED-ON-DISABLE: revert the `externAddrGotSymbols_`
+// routing arm in `lowerGlobalAddr` → the plain lea path re-emits the absolute
+// `[symbol]` lea (direction 2 fails) and the GOT macro vanishes (direction 1
+// fails). Always-on structural guard for the arm64 libsqlite3.a codegen
+// (runtime witness = the qemu-arm64 default-PIE gcc link of the abs .o).
+TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    // `void* f(void) { return &abs; }` — GlobalAddr(abs) used as a VALUE
+    // (its sole use is the Return, so neither the direct-call fold nor the
+    // riprel-load fold fires; the value-form GOT arm is reached).
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(callerSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    SymbolId const absSym{200};
+    MirInstId const ga = mb.addGlobalAddr(absSym, ptrT);  // &abs
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const leaOp = (*target)->opcodeByMnemonic("lea");
+    auto const gotOp = (*target)->opcodeByMnemonic("lea_extern_got");
+    ASSERT_TRUE(leaOp.has_value());
+    ASSERT_TRUE(gotOp.has_value())
+        << "arm64 must declare the lea_extern_got GOT-address macro (TF-C52).";
+
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = absSym;
+    ei.mangledName = "abs";
+    ei.libraryPath = "libc.so.6";
+    ei.isData      = false;  // a FUNCTION extern whose ADDRESS is taken
+    externs.push_back(ei);
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt,
+                           /*dataImportBinding=*/std::nullopt,
+                           /*tlsAccess=*/std::nullopt,
+                           /*sehScopes=*/{},
+                           /*wideFloatSoftcallLibrary=*/std::nullopt,
+                           /*externAddrBinding=*/ExternAddrBinding::Got);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGotForAbs = false, sawAbsoluteLeaForAbs = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        bool namesAbs = false;
+        for (auto const& o : ops) {
+            if (o.kind == LirOperandKind::SymbolRef && o.symbolV == absSym.v) {
+                namesAbs = true;
+            }
+        }
+        if (!namesAbs) continue;
+        if (op == *gotOp) sawGotForAbs = true;
+        if (op == *leaOp && ops.size() == 1
+            && ops[0].kind == LirOperandKind::SymbolRef) {
+            sawAbsoluteLeaForAbs = true;
+        }
+    }
+    // Direction 1: the GOT macro IS emitted for the address-taken extern.
+    EXPECT_TRUE(sawGotForAbs)
+        << "an &extern VALUE under a `got` format must materialize via the "
+           "lea_extern_got macro (adrp:got:+ldr:got_lo12:) — TF-C52.";
+    // Direction 2: NO absolute [symbol] lea is emitted for it (the reloc a
+    // foreign default-PIE link rejects).
+    EXPECT_FALSE(sawAbsoluteLeaForAbs)
+        << "the absolute ADRP+ADD [symbol] lea (ADR_PREL_PG_HI21 + "
+           "ADD_ABS_LO12_NC) must NOT be emitted for a GOT-address extern — a "
+           "foreign PIE link rejects it. RED-ON-DISABLE: revert the "
+           "externAddrGotSymbols_ routing arm → the absolute lea reappears.";
+}
+
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52) NEUTRALITY: with NO
+// externAddrBinding declared (nullopt — the DSS-linked exec / x86_64 shape),
+// the SAME `&abs` value materializes via the ORDINARY absolute `[symbol]` lea
+// and NEVER the GOT macro. Pins that the GOT routing is gated STRICTLY on the
+// capability (nullopt ⇒ byte-identical to the pre-TF-C52 lowering) — a
+// regression that fired the GOT arm unconditionally would flip this red.
+TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(callerSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    SymbolId const absSym{200};
+    MirInstId const ga = mb.addGlobalAddr(absSym, ptrT);
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const leaOp = (*target)->opcodeByMnemonic("lea");
+    auto const gotOp = (*target)->opcodeByMnemonic("lea_extern_got");
+    ASSERT_TRUE(leaOp.has_value());
+    ASSERT_TRUE(gotOp.has_value());
+
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = absSym;
+    ei.mangledName = "abs";
+    ei.libraryPath = "libc.so.6";
+    ei.isData      = false;
+    externs.push_back(ei);
+    // externAddrBinding OMITTED (defaults to nullopt).
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGot = false, sawAbsoluteLea = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        bool namesAbs = false;
+        for (auto const& o : ops) {
+            if (o.kind == LirOperandKind::SymbolRef && o.symbolV == absSym.v) {
+                namesAbs = true;
+            }
+        }
+        if (!namesAbs) continue;
+        if (op == *gotOp) sawGot = true;
+        if (op == *leaOp && ops.size() == 1
+            && ops[0].kind == LirOperandKind::SymbolRef) {
+            sawAbsoluteLea = true;
+        }
+    }
+    EXPECT_TRUE(sawAbsoluteLea)
+        << "with no externAddrBinding the &extern value takes the ordinary "
+           "absolute [symbol] lea.";
+    EXPECT_FALSE(sawGot)
+        << "the GOT macro must NOT fire without externAddrBinding==Got "
+           "(capability-gated, not unconditional).";
+}
+
 // ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
 
 namespace {
@@ -1251,6 +1406,22 @@ namespace {
     return std::move(mb).finish();
 }
 
+// D-CSUBSET-ATOMIC-FENCE: fn() -> int { AtomicFence(order); return 0; } —
+// the standalone-fence shape (__sync_synchronize): 0 operands, no result, the
+// C11 order in the payload (seq_cst=5 from the sole shipped producer).
+[[nodiscard]] Mir buildAtomicFenceFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    (void)mb.addInst(MirOpcode::AtomicFence, {}, InvalidType, order);
+    MirLiteralValue lv; lv.value = std::int64_t{0}; lv.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(lv, i32));
+    return std::move(mb).finish();
+}
+
 // Count LIR insts (fn 0, block 0) whose opcode is `mnemonic` on `sch`.
 [[nodiscard]] int countLirMnemonic(Lir const& lir, TargetSchema const& sch,
                                    std::string_view mnemonic) {
@@ -1403,6 +1574,112 @@ TEST(MirToLirAtomic, AcquireLoadFailsLoudWhenLoadAcquireSlotMissing) {
     }
     EXPECT_TRUE(sawDiag)
         << "the fail-loud diagnostic must name the missing 'load_acquire' slot.";
+}
+
+// ── D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): the standalone
+// seq_cst fence (__sync_synchronize → MIR AtomicFence). Unlike CompilerBarrier
+// (zero instructions) it must emit EXACTLY ONE real fence instruction via the
+// atomic_fence_seqcst slot; a non-seq_cst payload (no shipped producer) and a
+// missing slot both FAIL LOUD — never a silent no-op or under-fence. ──────────
+
+TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnX86) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
+        << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
+           "(MFENCE) instruction — zero is a dropped fence, two is a double fence.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "a standalone fence must not borrow the fused store_seqcst (xchg) slot.";
+}
+
+TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnArm64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
+        << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
+           "(DMB ISH) instruction on arm64 (bytes pinned in test_asm_arm64).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+}
+
+TEST(MirToLirAtomic, FenceNonSeqCstOrderFailsLoud) {
+    // The audit-mandated arm: NO producer emits a non-seq_cst standalone fence
+    // today (__sync_synchronize is always seq_cst=5), and the registry row's
+    // "weaker orders → 0 instructions" would be a SILENT UNDER-FENCE one config
+    // edit away (atomic_thread_fence via the existing explicit-order const-fold
+    // machinery). So EVERY payload 0..4 must FAIL the lowering with a diagnostic
+    // NAMING the numeric order — never emit nothing, never guess a weaker fence.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (std::uint32_t order = 0; order <= 4; ++order) {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicFenceFnMir(order, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+        EXPECT_FALSE(lirR.ok)
+            << "AtomicFence payload " << order
+            << " (non-seq_cst) must FAIL the lowering — no producer emits it.";
+        bool sawDiag = false;
+        std::string const needle = "memory order " + std::to_string(order);
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+                && d.actual.find("AtomicFence") != std::string::npos
+                && d.actual.find(needle) != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << "the fail-loud diagnostic for payload " << order
+            << " must carry L_UnsupportedLoweringForOpcode naming AtomicFence "
+               "and the exact '" << needle << "'.";
+    }
+}
+
+TEST(MirToLirAtomic, FenceSeqCstFailsLoudWhenAtomicFenceSeqCstSlotMissing) {
+    // The I2 fail-loud belt on BOTH shipped targets: a target that declares NO
+    // atomic_fence_seqcst realization must FAIL LOUD (reportMissingOpcode) on a
+    // seq_cst AtomicFence — never silently lower __sync_synchronize to nothing
+    // (that would be the CompilerBarrier no-op, an under-fence on a real CPU).
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+            targetName, {"atomic_fence_seqcst"});
+        ASSERT_TRUE(mutated.has_value())
+            << targetName
+            << ": removing the OPTIONAL atomic_fence_seqcst opcode must not "
+               "fail the loader.";
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+        EXPECT_FALSE(lirR.ok)
+            << targetName
+            << ": a seq_cst fence with no atomic_fence_seqcst slot MUST fail "
+               "the lowering — never a silent no-op fence.";
+        bool sawDiag = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+                && d.actual.find("atomic_fence_seqcst") != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << targetName
+            << ": the fail-loud diagnostic must name the missing "
+               "'atomic_fence_seqcst' slot.";
+    }
 }
 
 // ── FC3.5 sweep-c1: capability-driven shift lowering ────────────────────
@@ -3124,18 +3401,17 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
 
     auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
-    // D-LK4-RODATA-PRODUCER (2026-06-02): GlobalAddr now lowers to
-    // `lea result, SymbolRef` (RIP-relative form) instead of the
-    // prior `mov result, SymbolRef`. The lea encoding has a real
-    // 1-operand variant on the assembler side; the prior `mov`
-    // shape tripped `A_NoMatchingEncodingVariant` at assemble time
-    // for any non-call-peepholed use of a GlobalAddr.
-    // The 2nd function `g` must contain:
-    //   - lea result, symbolRef(f)   ← GlobalAddr(f)
-    //   - call calleeReg, argReg     ← the actual Call
+    // D-ML7-2.9 (dead-callee-LEA suppression): a DIRECT call's callee is modeled
+    // as a standalone GlobalAddr(f). `lowerCall` folds f's SymbolId straight into
+    // the `call` (a SymbolRef operand) and NEVER reads the GlobalAddr's lea vreg,
+    // so `globalAddrFoldsIntoDirectCall` now SUPPRESSES that lea (previously it was
+    // emitted and immediately abandoned — a dead def whose bytes + relocs survived
+    // to the object; on arm64 those were an absolute adrp+add that broke a foreign
+    // PIE link against an undefined extern). So `g` must contain the `call` with
+    // the callee folded in, and NO `lea result, symbolRef(f)`.
     LirFuncId const gFn = lir.funcAt(1);
     LirBlockId const entry = lir.funcEntry(gFn);
-    bool foundGlobalAddrLea = false, foundCall = false;
+    bool foundGlobalAddrLea = false, foundCall = false, callFoldsCalleeSymbol = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         auto const op = lir.instOpcode(inst);
@@ -3145,13 +3421,21 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
                 foundGlobalAddrLea = true;
             }
         }
-        if (op == callOp) foundCall = true;
+        if (op == callOp) {
+            foundCall = true;
+            for (auto const& o : lir.instOperands(inst)) {
+                if (o.kind == LirOperandKind::SymbolRef) callFoldsCalleeSymbol = true;
+            }
+        }
     }
-    EXPECT_TRUE(foundGlobalAddrLea)
-        << "GlobalAddr must emit `lea result, symbolRef(symId)` "
-           "(RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02)";
-    EXPECT_TRUE(foundCall)
-        << "Call must emit the `call` opcode";
+    // RED-ON-DISABLE: revert `globalAddrFoldsIntoDirectCall` → the dead callee lea
+    // reappears → this EXPECT_FALSE fails.
+    EXPECT_FALSE(foundGlobalAddrLea)
+        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-ML7-2.9) — "
+           "lowerCall folds the symbol straight into the direct call";
+    EXPECT_TRUE(foundCall) << "Call must emit the `call` opcode";
+    EXPECT_TRUE(callFoldsCalleeSymbol)
+        << "the direct call folds the callee symbol into a SymbolRef operand";
 }
 
 // ── D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold opcode-selection pins ─
@@ -6696,4 +6980,286 @@ TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
         << "the SWAR popcount masks with 0x55/0x33/0x0F";
     EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
         << "the SWAR popcount's x -= (x>>1)&m1 step";
+}
+
+// ── D-CSUBSET-INTRINSIC-BSWAP: native-or-EXPANDED byte reversal ───────────────
+//
+// `lowerBswap` probes the target's declared `bswap` encoding AT THE SEMANTIC WIDTH
+// W (`opcodeWithWidth`), not by mnemonic PRESENCE. That distinction is the whole
+// design, and it is invisible to any test that only asks "did a bswap come out?":
+//
+//   x86_64 declares `bswap` at widths 32 and 64 ONLY (0F C8+rd; `bswap r16` is
+//     architecturally undefined and GAS refuses it), so width 16 MUST take the
+//     universal-ALU expansion — a DESIGNED outcome, not a gap.
+//   arm64 declares all three (REV16 / REV / REV(X)), so no width expands there.
+//
+// ★ These are also the LIR-tier COMPANIONS to the encoder byte-pins in
+// test_asm_x86_variable (`0f c8` / `48 0f c8` / the r15 `+rd` form) and
+// test_asm_arm64 (the three REV words). A byte-pin alone cannot prove NATIVE was
+// SELECTED: rename the `bswap` mnemonic in both target configs and every byte-pin
+// still passes (it resolves the mnemonic itself) while every byte-swap in the
+// compiler silently routes through the expansion — correct results, no diagnostic,
+// no native instruction. `countLirOp(..., "bswap")` is what closes that hole.
+namespace {
+// One byte-swap wrapper per width; a per-width program keeps every count exact.
+constexpr char const* kBswapSrc16 =
+    "unsigned short f(unsigned short x){ return _byteswap_ushort(x); }\n";
+constexpr char const* kBswapSrc32 =
+    "unsigned int f(unsigned int x){ return _byteswap_ulong(x); }\n";
+constexpr char const* kBswapSrc64 =
+    "unsigned long long f(unsigned long long x){ return _byteswap_uint64(x); }\n";
+
+// The universal-ALU expansion of an n-byte reversal is
+//     OR over i∈[0,n) of ((x >> 8i) & 0xFF) << 8(n-1-i)
+// with the zero shift at each end skipped, so its op counts are FIXED by n:
+//   `and` = n (one mask per byte), `shl` = `shr_l` = n-1, `or` = n-1.
+// Pinning the exact counts (not `>= 1`) is what makes a degraded expansion —
+// e.g. one that masks only the final result instead of each intermediate, the
+// dirty-upper-bits miscompile — visible here rather than only at runtime.
+void expectBswapExpansionShape(Lir const& lir, TargetSchema const& sch,
+                               int nBytes, char const* what) {
+    EXPECT_EQ(countLirOp(lir, sch, "and"), nBytes)
+        << what << ": one 0xFF mask per byte";
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), nBytes - 1)
+        << what << ": one place-shift per byte, the last skipped";
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), nBytes - 1)
+        << what << ": one extract-shift per byte, the first skipped";
+    EXPECT_EQ(countLirOp(lir, sch, "or"), nBytes - 1)
+        << what << ": one OR per byte after the first";
+}
+} // namespace
+
+TEST(MirToLir, BswapSelectsNativeOnX86AtWidth32) {
+    auto L = lowerCSubsetToLir(kBswapSrc32);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1)
+        << "x86 declares bswap at width 32 — exactly one native BSWAP";
+    // And NOTHING of the expansion: a native hit must not also emit the ALU form.
+    EXPECT_EQ(countLirOp(lir, sch, "or"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0);
+}
+
+TEST(MirToLir, BswapSelectsNativeOnX86AtWidth64) {
+    auto L = lowerCSubsetToLir(kBswapSrc64);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1)
+        << "x86 declares bswap at width 64 (REX.W 0F C8+rd) — one native BSWAP";
+    EXPECT_EQ(countLirOp(lir, sch, "or"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shl"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0);
+}
+
+// ★ THE WIDTH-16 FALLBACK IS A DESIGNED BEHAVIOUR — pin it, do not let it drift
+// into a fail-loud. If the probe were mnemonic-presence instead of per-width, a
+// width-16 `bswap` LIR inst would be emitted here and then die at the assembler
+// with A_NoMatchingEncodingVariant; `_byteswap_ushort` (sqlite's `get2byteAligned`)
+// would simply never compile on x86.
+TEST(MirToLir, BswapWidth16TakesTheSoftwareExpansionOnX86) {
+    auto L = lowerCSubsetToLir(kBswapSrc16);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the width-16 expansion must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    // The mnemonic IS declared — this is a per-WIDTH miss, not an absent verb.
+    EXPECT_TRUE(sch.opcodeByMnemonic("bswap").has_value())
+        << "precondition: x86_64 declares `bswap` (just not at width 16)";
+    EXPECT_EQ(countLirOp(lir, sch, "bswap"), 0)
+        << "x86 has NO width-16 BSWAP — emitting one would die at the assembler";
+    expectBswapExpansionShape(lir, sch, /*nBytes=*/2, "x86 width-16 expansion");
+}
+
+// arm64 declares all three widths as single-word REVs, so the SAME lowering arm
+// that expands on x86 at width 16 selects native here — capability probing, no
+// arch identity anywhere. This is also the LIR companion to test_asm_arm64's three
+// REV word pins (see the note above).
+TEST(MirToLir, BswapSelectsNativeAtAllThreeWidthsOnArm64) {
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    struct Case { char const* src; char const* what; };
+    for (Case const c : {Case{kBswapSrc16, "arm64 width 16 (REV16 Wd,Wn)"},
+                         Case{kBswapSrc32, "arm64 width 32 (REV Wd,Wn)"},
+                         Case{kBswapSrc64, "arm64 width 64 (REV Xd,Xn)"}}) {
+        auto L = lowerCSubsetToLir(c.src, *arm);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << c.what << ": " << (L.lirReporter.all().empty()
+                ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        Lir const& lir = L.lir.lir;
+        EXPECT_EQ(countLirOp(lir, sch, "bswap"), 1) << c.what;
+        // No expansion anywhere — arm64 never needs one for a byte swap.
+        EXPECT_EQ(countLirOp(lir, sch, "or"), 0)    << c.what;
+        EXPECT_EQ(countLirOp(lir, sch, "shl"), 0)   << c.what;
+        EXPECT_EQ(countLirOp(lir, sch, "shr_l"), 0) << c.what;
+    }
+}
+
+// ── RED-ON-DISABLE, LEVEL 1: delete the whole `bswap` mnemonic ────────────────
+//
+// Every width must fall back to the expansion — NOT fail loud, NOT emit a bswap.
+// This is the `PopcountFallsBackToSwarWhenNoNativeMnemonic` shape: it proves the
+// expansion is a REAL, reachable realization rather than dead code that only the
+// x86 width-16 arm happens to touch.
+TEST(MirToLir, BswapFallsBackToExpansionAtEveryWidthWhenMnemonicAbsent) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"bswap"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(x86_64, -bswap) failed";
+    EXPECT_FALSE((*mutated)->opcodeByMnemonic("bswap").has_value())
+        << "the mnemonic really was removed";
+    struct Case { char const* src; int nBytes; char const* what; };
+    for (Case const c : {Case{kBswapSrc16, 2, "width 16, no native bswap"},
+                         Case{kBswapSrc32, 4, "width 32, no native bswap"},
+                         Case{kBswapSrc64, 8, "width 64, no native bswap"}}) {
+        auto L = lowerCSubsetToLir(c.src, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << c.what << " must lower cleanly, NOT fail loud: "
+            << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        Lir const& lir = L.lir.lir;
+        EXPECT_EQ(countLirOp(lir, sch, "bswap"), 0) << c.what;
+        expectBswapExpansionShape(lir, sch, c.nBytes, c.what);
+    }
+}
+
+// ── RED-ON-DISABLE, LEVEL 2: delete a SINGLE WIDTH VARIANT ────────────────────
+//
+// ★ WITHOUT THIS ONE, `opcodeWithWidth`'s per-width scan is unpinned. Level 1
+// above removes the mnemonic entirely, so a regression that degraded the probe
+// back to mnemonic-PRESENCE would still pass it (absent verb ⇒ miss either way).
+// Here the verb is present and only its width-16 VARIANT is gone: a presence-only
+// probe would emit a width-16 `bswap` that matches no variant and dies at the
+// assembler, while the correct per-width probe expands at 16 and stays native at
+// 32/64. arm64 is the right target for this because it is the only one that
+// declares a width-16 form to remove.
+TEST(MirToLir, BswapPerWidthProbeFallsBackOnlyForTheDeletedWidthOnArm64) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "bswap") continue;
+                auto& variants = op["encoding"]["variants"];
+                variants.erase(
+                    std::remove_if(
+                        variants.begin(), variants.end(),
+                        [](nlohmann::json const& v) {
+                            return v.contains("guard")
+                                && v["guard"].value("width", 0) == 16;
+                        }),
+                    variants.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "stripping ONE bswap width variant must not fail the loader";
+    // The verb is STILL declared — only the width-16 variant is gone.
+    ASSERT_TRUE((*mutated)->opcodeByMnemonic("bswap").has_value())
+        << "precondition: the mnemonic must survive, or this degenerates into "
+           "the level-1 test above";
+    auto const* info =
+        (*mutated)->opcodeInfo(*(*mutated)->opcodeByMnemonic("bswap"));
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->encoding.variants.size(), 2u)
+        << "arm64 ships 3 bswap width variants; exactly one was removed";
+
+    // Width 16 — the removed variant — now expands.
+    {
+        auto L = lowerCSubsetToLir(kBswapSrc16, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok)
+            << "the deleted width must EXPAND, not fail loud: "
+            << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+        auto const& sch = *L.target;
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "bswap"), 0)
+            << "no width-16 variant remains — a presence-only probe would emit "
+               "a bswap here that no variant can encode";
+        expectBswapExpansionShape(L.lir.lir, sch, /*nBytes=*/2,
+                                  "arm64 width-16 after variant deletion");
+    }
+    // Widths 32 and 64 — untouched variants — stay NATIVE.
+    for (char const* src : {kBswapSrc32, kBswapSrc64}) {
+        auto L = lowerCSubsetToLir(src, *mutated);
+        assertUpstreamClean(L);
+        ASSERT_TRUE(L.lir.ok);
+        auto const& sch = *L.target;
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "bswap"), 1)
+            << "deleting the width-16 variant must not disturb 32/64";
+        EXPECT_EQ(countLirOp(L.lir.lir, sch, "or"), 0);
+    }
+}
+
+// ── TF-C94 (D-CSUBSET-INT128-LIR-WIDTH): a 128-bit MEMORY access fails loud ──
+//
+// MEASURED at HEAD 57eae7b, before this gate: `reprKind` was IDENTITY for
+// I128/U128, so `widthFlagsForType` and `memAccessWidthFlags` both fell to their
+// `default: return 0` — the 64-bit width. A Store of a 128-bit value therefore
+// emitted an 8-BYTE write of a 16-BYTE value with ZERO diagnostics. The end-to-end
+// witness was a `jmp_buf` element access (shippedLibs/setjmp.json declares
+// `jmp_buf` as `arr<u128,16>` on the pe leg), which compiled clean and produced a
+// 3072-byte .exe whose every access touched half the element.
+//
+// The COMPUTE tier (Add/ICmp/…) was already gated and already loud. The gap was
+// the MEMORY/PLUMBING tier — Load, Store, Const, Bitcast — which this pins.
+TEST(MirToLir, Int128MemoryAccessFailsLoud) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const u128  = interner.primitive(::dss::TypeKind::U128);
+    auto const pU128 = interner.pointer(u128);
+    auto const fnSig =
+        interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    // A 128-bit slot, and a 128-bit STORE into it — the exact shape `env[0] = 1`
+    // lowers to. Neither the Const nor the Store is an ALU op, so the pre-existing
+    // compute gate never saw them.
+    ::dss::MirInstId const slot = mb.addInst(::dss::MirOpcode::Alloca, {}, pU128);
+    ::dss::MirLiteralValue lv;
+    lv.value = static_cast<std::int64_t>(1);
+    lv.core  = ::dss::TypeKind::U128;
+    ::dss::MirInstId const val = mb.addConst(lv, u128);
+    std::array<::dss::MirInstId, 2> stOps{val, slot};
+    mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero;
+    zero.value = static_cast<std::int64_t>(0);
+    zero.core  = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "red-on-disable: remove the 128-bit memory arms from "
+           "requireNativeIntWidth (and reprKind's wall) and this lowers CLEAN — "
+           "an 8-byte access of a 16-byte value, exactly the measured HEAD bug";
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-CSUBSET-INT128-LIR-WIDTH") != std::string::npos) {
+            sawAnchor = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "the 128-bit width refusal must carry its OWN anchor — the generic "
+           "32-bit-ALU-forms message shares the same DiagnosticCode, so an "
+           "error-count assertion alone would not be red-on-disable";
 }

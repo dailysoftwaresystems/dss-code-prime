@@ -1,5 +1,5 @@
 {
-  "$comment": "c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): array-of-T parameters — sized, unsized `[]`, and multi-dim `[][3]` — adjust to pointer-to-T at the param symbol (sizeof==8, caller-visible writes) AND in the FnSig (decayed args type-check). sumSized(10) + sumUnsized(5) + pick(20) + bump-writeback(6) + 1 = 42. RED-ON-DISABLE: drop `arrayToPointer` from the c-subset `param` row -> S000B on `int a[]` + S0003 on the pointer args (compile failure, not exit 42). gcc -std=c17 cross-checked, same source exits 42.",
+  "$comment": "c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): array-of-T parameters — sized, unsized `[]`, and multi-dim `[][3]` — adjust to pointer-to-T at the param symbol (sizeof==8, caller-visible writes) AND in the FnSig (decayed args type-check). sumSized(10) + sumUnsized(5) + pick(20) + bump-writeback(6) + 1 = 42. RED-ON-DISABLE: drop `paramAdjustments` from the c-subset `param` row -> S000B on `int a[]` + S0003 on the pointer args (compile failure, not exit 42). gcc -std=c17 cross-checked, same source exits 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,

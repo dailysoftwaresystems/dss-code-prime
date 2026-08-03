@@ -1,0 +1,34 @@
+{
+  "$comment": "Runtime witness for stdio.json's pe `sprintf` COMPILER-SYNTHESIZED shim (D-FFI-PE-CRT-UCRT-MIGRATION, P3 first increment), baseline AND the `release` shippedPipeline arm. WHY IT EXISTS: pe's `sprintf` row now carries `synthesize: \"sprintf\"` instead of importing a concrete CRT symbol -- the modern UCRT (`ucrtbase.dll`) exports NO concrete `sprintf`, only the common core `__stdio_common_vsprintf` (bound via a transitional per-symbol `library` override to ucrtbase.dll while the rest of stdio.json is still msvcrt.dll). Neither half of that shim had ever been exercised end-to-end before this example: the descriptor change alone proves nothing about whether the synthesized body's `_Options`/`_BufferCount` constants and its variadic marshalling (the ms_x64 shadow-register dup for FP/int varargs) actually produce byte-correct output at runtime -- a wrong mask or a dropped argument fails SILENTLY (wrong digit, wrong padding, truncated string), never as a link or compile error. This example is that proof: a positive int, a negative int, a string, a char, unsigned hex, a 64-bit `long long` past INT32_MAX, and width/flag combinations (zero-pad, '+', left-justify) are each formatted through sprintf and compared byte-for-byte with strcmp against the literal a correct libc sprintf produces, plus one check that the returned character count is the real count rather than garbage. ★ That return check does NOT pin the `_Options` bit, and saying otherwise would be an overclaim: measured against the real ucrtbase core, `_Options` 0, 1 (LEGACY_VSPRINTF_NULL_TERMINATION) and 2 (STANDARD_SNPRINTF_BEHAVIOR) produce byte-identical output AND an identical return once `_BufferCount` is `(size_t)-1`, since no truncation is reachable — so a wrong bit is invisible to every check except 13 (which catches a LEGACY_THREE_DIGIT_EXPONENTS contamination through the exponent width). Pinning `_Options` in general needs a bounded-buffer consumer (`snprintf`), not yet shipped. ★ The two FP checks are the ones no integer case can substitute for: on Win64 a variadic call must ALSO spill each xmm-passed `double` into its positional home slot, because the callee reads varargs through a va_list carrying no type information -- and this shim forwards precisely that home area as `ap`. A lost or mis-indexed spill is INVISIBLE to every integer check (integer varargs travel in the registers the home area already mirrors), so a `double` alone (%.2f) and a `double` INTERLEAVED with ints (%d|%.1f|%d|%.1f -- the positional-ordering case a contiguous-spill bug still passes the first check on) are both exercised. Values are exactly representable with no rounding tie, so the expected text is identical under UCRT, glibc and Darwin libc. All operands are read through mutable globals, never literals, so the `release` arm's constant-folding cannot precompute the formatted strings and turn this into a no-op. elf/macho keep importing the real libc `sprintf` unchanged (the descriptor split is [elf,macho] plain-FFI vs [pe] synthesize), so the SAME source exercised on all four hosted targets is also a cross-target agreement check -- every target must produce IDENTICAL strings for identical inputs. exit = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

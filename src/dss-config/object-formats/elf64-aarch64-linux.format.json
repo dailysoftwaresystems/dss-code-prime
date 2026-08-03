@@ -3,6 +3,10 @@
 
   "dssObjectFormatVersion": 1,
 
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: ELF has NO image field for a stack SIZE on ANY flavor -- PT_GNU_STACK encodes stack EXECUTABILITY, not size. The kernel sizes the initial thread's stack from the process limit (`ulimit -s` / setrlimit RLIMIT_STACK) and further threads from pthread_attr_setstacksize, so nothing the linker writes can change it. A `stackReserve` / `--stack-reserve` request is therefore REFUSED with that remedy rather than silently dropped -- which is also why the sqlite full tier passes on Linux (8 MiB by default) and overflowed on Windows at 1 MiB.",
+
+  "stackReserveUnsupportedReason": "runtime-controlled",
+
   "format": {
     "name": "elf64-aarch64-linux",
     "version": "1.0",
@@ -11,6 +15,12 @@
 
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
+  "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
+  "predefinedMacros": [
+    { "name": "__LP64__", "kind": "constant", "value": "1" },
+    { "name": "_LP64",    "kind": "constant", "value": "1" }
+  ],
+
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Linux arm64 (AAPCS64) uses the generic LSB-first bit-field allocation — identical to SysV/GNU gnu_packed for little-endian — so it shares the strategy. Byte-ABI-exact (the qemu arm64-ELF corpus is self-consistent under it; the CI cross-compile-compare confirms against the native compiler).",
   "bitFieldStrategy": "gnu_packed",
@@ -20,6 +30,12 @@
 
   "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE + D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a relocatable object carries data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` + a section-relative `.symtab` entry the FINAL linker binds. Same machine-NEUTRAL elf.cpp ET_REL writer as elf64-x86_64-linux (it reads section names/flags + reloc nativeIds from THIS schema, never hardcoding a machine); arch differs only via config — the abs64 data reloc is R_AARCH64_ABS64 (257) here vs R_X86_64_64 (1) on x86_64. A reloc-bearing CONST global (`relro`) emits `.rela.data.rel.ro`; a reloc-bearing MUTABLE pointer emits `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$externCallDispatchComment": "D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH (mirrors x86_64's D-LK-OBJECT-EXTERN-CALL-RELOCATABLE c141): extern FUNCTION calls in a RELOCATABLE object lower to a PLAIN DIRECT `BL` + a branch relocation against the UNDEFINED extern symbol — the SAME call-site shape as the arm64 exec `direct-plt`, except the FINAL (foreign) linker synthesizes the PLT/veneer and resolves the symbol, not DSS. So `direct-plt` is the right dispatch here too; the machine-NEUTRAL elf.cpp ET_REL writer emits the extern as an SHN_UNDEF `.symtab` entry + a `.rela.text` reloc rather than a DSS-synthesized stub. The undefined-extern CALL reloc is R_AARCH64_CALL26 (283) — and, UNLIKE x86_64 (which needs the PC32→PLT32 `pltNativeId` swap so a foreign `-pie` link routes through a linker PLT), AArch64 has NO distinct PLT-variant branch reloc: `R_AARCH64_CALL26` against an undefined symbol is exactly what gcc/clang emit for `bl printf` in a `.o`, and the linker inserts the veneer/PLT transparently. So the CALL26 reloc row deliberately carries NO `pltNativeId` (the writer emits its plain `nativeId` 283). The arm64 EXEC + macho-arm64-relocatable formats prove this `direct-plt`+CALL26-without-pltNativeId shape.",
+  "externCallDispatch": "direct-plt",
+
+  "$externAddrBindingComment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): taking the ADDRESS of an undefined/preemptible extern (function OR data) as a LIVE code-form VALUE -- an argument, an automatic's initializer, a returned function pointer (NOT a call, NOT a static-data-item initializer) -- must materialize THROUGH a GOT slot the FINAL (foreign) linker synthesizes: arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,[x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). This relocatable `.o` is linked by a foreign DEFAULT-PIE toolchain (aarch64-linux-gnu-gcc with no -no-pie); an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC) against a symbol that may bind externally is REJECTED ('relocation R_AARCH64_ADR_PREL_PG_HI21 against symbol ... which may bind externally can not be used when making a shared object'). sqlite3.c -> arm64 .o has 3 such residuals (dlsym / sqlite3_search_count / stdout). The GOT indirection is exactly what gcc/clang emit for `&extern` in a default-PIE `.o`. DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) and to the DSS-linked arm64 EXEC (it uses `dataImportBinding: copy-relocation` for data + a direct address for functions) and to the arm64 PIE/dyn formats (the c117 DSS-local __got slot) -- so ONLY the relocatable + static-archive formats declare it. Consumed by MIR->LIR `lowerGlobalAddr`'s value-form arm (keyed on the capability-derived symbol set, never a format/arch identity branch).",
+  "externAddrBinding": "got",
 
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
@@ -147,6 +163,18 @@
       "name": "R_AARCH64_ABS64",
       "kind": 4,
       "nativeId": 257
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry page (ADRP of `:got:sym`). ELF type R_AARCH64_ADR_GOT_PAGE = 311. `kind` = 7 matches arm64.target.json's `adr_got_page` row (the ADRP word of the `lea_extern_got` macro). Emitted only into this relocatable object; the foreign linker synthesizes the GOT slot + patches the ADRP page-delta. DSS never applies it (the exec_reloc_apply kernel arm fail-loud-refuses).",
+      "name": "R_AARCH64_ADR_GOT_PAGE",
+      "kind": 7,
+      "nativeId": 311
+    },
+    {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-entry low-12 scaled offset (LDR of `[x,:got_lo12:sym]`). ELF type R_AARCH64_LD64_GOT_LO12_NC = 312. `kind` = 8 matches arm64.target.json's `ld64_got_lo12` row (the LDR word of the `lea_extern_got` macro). Paired with R_AARCH64_ADR_GOT_PAGE against the same symbol; the foreign linker patches the scaled GOT-slot offset.",
+      "name": "R_AARCH64_LD64_GOT_LO12_NC",
+      "kind": 8,
+      "nativeId": 312
     }
   ]
 }

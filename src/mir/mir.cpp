@@ -422,7 +422,11 @@ void MirBuilder::closeFunction_() {
 
 MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
                                   SymbolBinding    binding,
-                                  SymbolVisibility visibility) {
+                                  SymbolVisibility visibility,
+                                  bool             noInline,
+                                  bool             alwaysInline,
+                                  bool             noOptimize,
+                                  bool             noSanitizeThread) {
     // `symbol` MAY be invalid (0): synthetic/anonymous functions (thunks the
     // backend generates) have no source symbol. The signature, however, is always
     // required — codegen sizes the ABI from it.
@@ -439,6 +443,10 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
     f.blockCount = 0;
     f.binding    = binding;
     f.visibility = visibility;
+    f.noInline   = noInline;
+    f.alwaysInline = alwaysInline;   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+    f.noOptimize   = noOptimize;     // TF-C85 (#pragma optimize region)
+    f.noSanitizeThread = noSanitizeThread;   // TF-C92 (no_sanitize_thread)
     MirFuncId const id = funcArena_.addNode(f);
     openFunc_ = id;
     return id;

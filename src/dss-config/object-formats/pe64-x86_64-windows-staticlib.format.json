@@ -1,6 +1,9 @@
 {
   "$comment": "STATIC LIBRARY (`ar` archive of relocatable members) for pe64-x86_64-windows. c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING). IDENTICAL to the `pe64-x86_64-windows` relocatable format -- its COFF x86_64 relocatable .obj members are written by the SAME relocatable writer + the same sections[]/relocations[] rows -- PLUS exactly `container: \"archive\"` + `artifactProfiles: [\"staticlib\"]` + the `-staticlib` name. The archive framing itself is FORMAT-BLIND (src/link/format/ar.cpp): the SysV `.a` armap for ELF/Mach-O, the Microsoft `.lib` 2nd linker member for PE (flavor threaded from kind() in linkAndWriteStaticArchive). No writer code is format-specific to the archive. Kept in sync with the relocatable sibling by hand: any section/reloc change there must mirror here.",
   "dssObjectFormatVersion": 1,
+  "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: this artifact form has NO image header field for a stack size (a relocatable object / static archive is an INPUT to a later link, not a loadable program), so a `stackReserve` / `--stack-reserve` request against it is REFUSED with an actionable remedy -- request the reserve on the build that produces the final EXECUTABLE image -- rather than silently dropped.",
+  "stackReserveUnsupportedReason": "no-image-field",
+
   "format": {
     "name": "pe64-x86_64-windows-staticlib",
     "version": "1.0",
@@ -14,6 +17,7 @@
   ],
   "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LLP64",
+  "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): THIS FORMAT DELIBERATELY DECLARES NO `predefinedMacros`, and the absence is an ANSWER rather than an omission -- it is the whole reason the channel lives on the FORMAT and not on the target. `dataModel` above is LLP64, so `__LP64__`/`_LP64` must NOT be defined here: MEASURED 2026-07-30, `/usr/bin/clang -dM -E -x c /dev/null -target x86_64-pc-windows-msvc` (Apple clang 21.0.0) defines NEITHER, while the SAME clang defines BOTH on x86_64-unknown-linux-gnu and x86_64-apple-darwin -- the same CPU, differing only by object format, which is precisely why a target-side row would be a lie on this leg. Adding either spelling here would make the Windows headers take their LP64 arms against a 32-bit `long`. Pinned in the NEGATIVE direction by tests/link/test_object_format_schema.cpp.",
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing (byte-ABI-exact to cl.exe). The strategy is OS/format-determined (x86_64 serves both PE and ELF), so it lives on the format, not the target. See pe64-x86_64-windows-exec for the full rule.",
   "bitFieldStrategy": "msvc_straddle",
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c-subset `long double` row to F64. See pe64-x86_64-windows-exec for the full rationale.",

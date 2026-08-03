@@ -175,7 +175,14 @@ jobs:
           NEEDRESTART_SUSPEND: '1'
         run: |
           set -e
-          PKGS=(ninja-build llvm lld "${{ matrix.cc }}" "${{ matrix.cxx }}")
+          # libtcl8.6: REPO-SPECIFIC addition (not in the DSS.DevOps template).
+          # The examples/c-subset/shipped_tcl_eval RUN witness (SQLite testfixture
+          # arc, D-FFI-TCL-DESCRIPTOR) compiles a DSS binary that links
+          # libtcl8.6.so and evaluates a real TCL expression at load; the x86_64
+          # ubuntu legs execute it, so the runtime lib must be present. (The
+          # native-arm64 leg cross-compiles the x86_64-elf target and arch-gates
+          # the run, so it needs no libtcl; windows/macos are compile-only.)
+          PKGS=(ninja-build llvm lld libtcl8.6 "${{ matrix.cc }}" "${{ matrix.cxx }}")
           case "${{ matrix.cc }}" in
             clang-*)
               VER="${{ matrix.cc }}"; VER="${VER#clang-}"
@@ -342,12 +349,24 @@ jobs:
           # surface in stdout but ctest still reports success.
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        # `--parallel 4` runs the 620-case suite concurrently (the build step is
-        # already parallel). Verified parallel-safe (isolated per-test temp dirs)
-        # + 620/620 at -j4; cuts the wall time ~4x, which keeps the instrumented
-        # ASan+UBSan leg (previously ~35-40 min single-threaded) well under the
-        # 30-min budget. `4` is portable across the Linux/Windows/macOS matrix
-        # (unlike a shell `$(nproc)`).
+        # `--parallel 4` runs the suite concurrently (the build step is already
+        # parallel). Verified parallel-safe (isolated per-test temp dirs) at -j4;
+        # cuts the wall time ~4x. `4` is portable across the Linux/Windows/macOS
+        # matrix (unlike a shell `$(nproc)`), and on the ubuntu-latest runner it
+        # also happens to BE the core count — this repo is public, so the standard
+        # hosted runner is 4-core. MEASURED on run 30815752993, linux-gcc-release:
+        # 301.8 s of summed per-test time in 75.68 s wall = 3.99x, i.e. -j4 already
+        # saturates the box and there is no headroom to reclaim by raising it.
+        #
+        # ⚠ THE "WELL UNDER THE 30-MIN BUDGET" CLAIM THAT USED TO SIT HERE WAS
+        # MEASURED AT 620 CASES AND WENT STALE. At 773 cases the ASan+UBSan leg
+        # needed ~31.5 min and was KILLED at 687/773 (every test that ran passed),
+        # costing 86 examples/c-subset fixtures all of their sanitizer coverage.
+        # The repair was NOT a bigger budget: the shuffle arms were 44% of the leg
+        # while being the weaker instrument on it, and now scale per-leg at the
+        # dss_add_shuffle_arm chokepoint in tests/CMakeLists.txt. Projected ~20.2 min.
+        # See D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG. If this leg approaches
+        # ~25 min again, re-measure the arms FIRST — that is where the cost hides.
         run: ctest ${{ '--output-on-failure --no-tests=error --parallel 4' }}
         timeout-minutes: 30
 

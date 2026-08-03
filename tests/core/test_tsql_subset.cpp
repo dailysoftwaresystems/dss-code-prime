@@ -36,11 +36,26 @@ namespace {
 
 // Pull body-mode tokens of `bodyKind` until the body pops.
 // HR10 — the SQL string body modes COALESCE: the whole body is ONE
-// in-grammar `StringLiteral` token (the close delimiter is consumed on
-// mode-pop, not emitted). The pins below assert that single-token
+// in-grammar `StringLiteral` token. The pins below assert that single-token
 // granularity directly on the stream, far clearer than rebuilding a tree
 // by hand. The body span is the RAW (undecoded) bytes the lowering later
 // decodes (escapes / doubled-delimiter resolved in char_decode.hpp).
+//
+// ★ D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: this note used to add "(the close
+// delimiter is consumed on mode-pop, not emitted)". That is no longer true —
+// tsql's `single-string` / `unicode-string` modes declare
+// `defaultToken.closeToken: StringEnd`, so the closing `'` IS emitted, as its
+// own token after the body. What the coalescing claim above still means, and
+// all it ever meant for these pins, is that the BODY is one token rather than
+// one-per-codepoint; the body's span is unchanged and still excludes both
+// delimiters. (tsql's `bracket-id` is the remaining NON-coalesced body mode
+// and declares no `closeToken` — but its `]` is NOT token-less. The
+// per-codepoint path consumes the closing delimiter and emits it carrying the
+// BODY kind, so `[col name]` lexes as ten tokens: `BracketIdStart` + eight
+// `BracketIdChar`s + a ninth `BracketIdChar` for the `]`. That is exactly what
+// TsqlBracketIdScansToClosingBracket pins — in tests/tokenizer/test_tokenizer.
+// cpp, not here — asserting every token after the opener is a `BracketIdChar`.
+// What `bracket-id` lacks is a DISTINCT closer KIND, not a closer token.)
 std::vector<Token> collectTokens(TokenStream& s) {
     std::vector<Token> out;
     while (!s.isAtEnd()) out.push_back(s.advance());

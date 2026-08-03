@@ -3,10 +3,13 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <format>
@@ -673,6 +676,49 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
 
+    // ── closed root-key vocabulary (TF-C74) ───────────────────────────────
+    //
+    // The TARGET loader had NO closed root-key vocabulary: every root key was
+    // read through a bare `doc.contains(…)` and an unknown key was silently
+    // ignored. MEASURED consequence for THIS cycle: a misspelled
+    // `"predefindMacros"` would have loaded perfectly clean and the whole
+    // per-architecture-identity feature would have silently no-op'd — the new
+    // key would have been a knob that LIES. The language family closed this in
+    // TF-C72 (`kDocumentKeys`); the target family closes it here, with the same
+    // helper (`DSS_CHECK_KEY_VOCABULARY`) and the same `C_MalformedJson` code.
+    //
+    // The `$`-prefix carve-out is MANDATORY, not decorative: both shipped
+    // target files use `$comment` / `$…Comment` heavily (MEASURED: 12 such
+    // keys in arm64.target.json, 10 in x86_64.target.json), so without it the
+    // guard would reject every shipped target on its first load.
+    //
+    // Every name here is a key the loader genuinely reads.
+    static constexpr std::array<std::string_view, 14> kTargetDocumentKeys{
+        // identity + loader gates
+        "dssTargetVersion", "target",
+        // per-target LANGUAGE-affecting semantics
+        "charIsUnsigned", "predefinedMacros", "aggregateLayout", "tls",
+        // machine description
+        "opcodes", "registers", "registerClassOps", "relocations",
+        "condCodeEncoding",
+        // ABI / softcall surface
+        "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
+        "callingConventions"};
+    DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (detail::isDocumentationKey(it.key())) continue;
+        bool known = false;
+        for (auto const& k : kTargetDocumentKeys) {
+            if (it.key() == k) { known = true; break; }
+        }
+        if (!known) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/{}", it.key()),
+                      std::format("unknown top-level key '{}' (typo "
+                                  "discriminator)", it.key()));
+        }
+    }
+
     // ── dssTargetVersion ──
     if (!doc.contains("dssTargetVersion")
      || !doc.at("dssTargetVersion").is_number_integer()) {
@@ -1098,6 +1144,173 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // layout/sizeof site asserts `aggregateLayoutLoaded()` and emits a loud
     // diagnostic if a target is asked to lay out an aggregate without declaring
     // its params — a silent wrong-layout is thereby still impossible.
+
+    // ── charIsUnsigned (TF-C56 D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET
+    //     + TF-C75 D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM) ────────────────
+    //
+    // THE SINGLE SOURCE OF TRUTH for bare-`char` signedness — the whole
+    // (processor × platform) fact in ONE key on the ONE file that owns it:
+    //
+    //     "charIsUnsigned": {
+    //       "default": true,
+    //       "byObjectFormat": { "macho": false, "pe": false }
+    //     }
+    //
+    // `default` is the PROCESSOR's answer; `byObjectFormat` overrides it for
+    // the platforms that fix the answer for every CPU they serve (Darwin and
+    // Windows both chose SIGNED). OPTIONAL as a whole; ABSENT ⇒ default false
+    // = signed everywhere, which is the C-common answer and is CORRECT on
+    // every format x86_64 serves (x86_64.target.json therefore omits the key,
+    // exactly as before this cycle).
+    //
+    // ★ WHEN PRESENT THE KEY MUST BE THE OBJECT FORM — a bare boolean is
+    // REJECTED, not accepted as a shorthand. This is deliberate and is the
+    // point of the reshape: `"charIsUnsigned": true` READS as "char is
+    // unsigned on this target, full stop", and that sentence is exactly the
+    // falsehood TF-C75 exists to delete (it was true for aarch64-linux and
+    // silently wrong for arm64-darwin). `{"default": true}` reads as "unsigned
+    // unless a format says otherwise", which is what the value actually means.
+    // Accepting both shapes would also leave the bare-bool form with ZERO
+    // shipped users — accepted config surface nothing exercises.
+    //
+    // ★ `default` is REQUIRED inside the object. An object carrying only
+    // `byObjectFormat` would leave every unlisted format resolving to an
+    // implicit `false` that no file states — a silent fallback on the one axis
+    // whose two answers are opposite high-bit extensions.
+    //
+    // ★ EVERY `byObjectFormat` KEY IS VALIDATED through
+    // `objectFormatKindFromName`. The nearby `wideFloatSoftcallLibraryByFormat`
+    // precedent does NOT do this (it stores arbitrary strings), and inheriting
+    // that hole here would be fatal: `"machO"` would silently mean NO ENTRY →
+    // silent fallback to the default → the exact miscompile this cycle closes.
+    // The sentinel spelling `"unknown"` is likewise rejected — it SPELLS
+    // correctly, so the name lookup succeeds, but it selects no real format
+    // (the shared `kObjectFormatKindSentinelRejection` discipline, identical
+    // to `wideFloatSoftcallLibraryByFormat` below).
+    if (doc.contains("charIsUnsigned")) {
+        auto const& cu = doc.at("charIsUnsigned");
+        if (!cu.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/charIsUnsigned",
+                      "'charIsUnsigned' must be an OBJECT — "
+                      R"({"default": <bool>, "byObjectFormat": {"macho": <bool>, …}}. )"
+                      "A bare boolean is rejected on purpose: it asserts one "
+                      "signedness for every platform this processor serves, "
+                      "which is the claim that made bare `char` sign-extend "
+                      "wrongly on Apple arm64. Write {\"default\": <bool>} if "
+                      "the answer really is uniform.");
+        } else {
+            // Closed inner-key vocabulary: a misspelled `"defualt"` would
+            // otherwise leave the required-key check firing on a file that
+            // plainly meant to declare one, or (worse, once `default` is
+            // present) silently drop a `"byObjectFormt"` override map.
+            static constexpr std::array<std::string_view, 2>
+                kCharIsUnsignedKeys{"default", "byObjectFormat"};
+            DSS_CHECK_KEY_VOCABULARY(kCharIsUnsignedKeys);
+            for (auto it = cu.begin(); it != cu.end(); ++it) {
+                if (detail::isDocumentationKey(it.key())) continue;
+                bool known = false;
+                for (auto const& k : kCharIsUnsignedKeys) {
+                    if (it.key() == k) { known = true; break; }
+                }
+                if (!known) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/charIsUnsigned/{}", it.key()),
+                              std::format("unknown key '{}' in 'charIsUnsigned' "
+                                          "(expected 'default' / "
+                                          "'byObjectFormat')", it.key()));
+                }
+            }
+
+            if (!cu.contains("default")) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/charIsUnsigned/default",
+                          "'charIsUnsigned' must state its 'default' — the "
+                          "processor's answer for every object format that "
+                          "declares no override. Omitting it would leave those "
+                          "formats resolving to a signedness no file states.");
+            } else if (!cu.at("default").is_boolean()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/charIsUnsigned/default",
+                          "'default' must be a boolean (true = bare `char` is "
+                          "UNSIGNED)");
+            } else {
+                data.charIsUnsignedDefault = cu.at("default").get<bool>();
+            }
+
+            if (cu.contains("byObjectFormat")) {
+                auto const& byFmt = cu.at("byObjectFormat");
+                if (!byFmt.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/charIsUnsigned/byObjectFormat",
+                              "'byObjectFormat' must be an object mapping "
+                              "object-format kind names to booleans");
+                } else {
+                    for (auto it = byFmt.begin(); it != byFmt.end(); ++it) {
+                        if (detail::isDocumentationKey(it.key())) continue;
+                        auto const path = std::format(
+                            "/charIsUnsigned/byObjectFormat/{}", it.key());
+                        auto const kind = objectFormatKindFromName(it.key());
+                        if (!kind.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format(
+                                          "'{}' is not a recognized "
+                                          "object-format kind (expected one of "
+                                          "'elf' / 'pe' / 'macho' / 'wasm' / "
+                                          "'spirv'). An unrecognized name would "
+                                          "declare an override that never "
+                                          "fires, silently leaving the default "
+                                          "in place.", it.key()));
+                            continue;
+                        }
+                        if (!isSelectableObjectFormatKind(*kind)) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::string{
+                                          kObjectFormatKindSentinelRejection});
+                            continue;
+                        }
+                        if (!it.value().is_boolean()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      "override must be a boolean (true = bare "
+                                      "`char` is UNSIGNED on this format)");
+                            continue;
+                        }
+                        auto const idx = static_cast<std::size_t>(*kind);
+                        data.charIsUnsignedByFormat[idx] =
+                            it.value().get<bool>();
+                        data.charIsUnsignedByFormatDeclared[idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── predefinedMacros (TF-C74 — per-architecture identity macros) ──
+    // The macros that identify this CPU ARCHITECTURE to the preprocessor
+    // (`__aarch64__`, `__x86_64__`, …). Declared HERE, next to the other
+    // per-target language-affecting semantics (`charIsUnsigned` above,
+    // `aggregateLayout`, `tls`, `callingConventions`) — never on the
+    // language, which must not enumerate CPU architectures.
+    //
+    // The per-entry grammar is the SHARED parser the language loader uses
+    // (`parsePredefinedMacroArray`), so the closed `kind` verb set, the
+    // Constant⇒`value` rule, the function-like `params` checks and the
+    // `availableObjectFormats` validation are inherited rather than
+    // re-implemented. OPTIONAL; absent ⇒ no target predefines ⇒ the
+    // preprocessor's effective list is byte-identical to today's.
+    // Malformed entries emit `C_MalformedJson` (this family's code for a
+    // structurally-wrong value, as `charIsUnsigned`/`tls` above do);
+    // MISSING required fields emit the universal `C_MissingField`.
+    if (doc.contains("predefinedMacros")) {
+        json const& pms = doc.at("predefinedMacros");
+        if (!pms.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/predefinedMacros",
+                      "'predefinedMacros' must be an array");
+        } else {
+            detail::parsePredefinedMacroArray(
+                pms, "/predefinedMacros", DiagnosticCode::C_MalformedJson,
+                coll, data.predefinedMacros);
+        }
+    }
 
     // ── tls identity (TLS C1, D-CSUBSET-THREAD-LOCAL — optional) ──
     // The target's static-TLS layout convention: `"tls": { "variant":
@@ -1642,26 +1855,77 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     // ── wideFloatSoftcallLibraryByFormat (LD-2 — optional) ─────────
-    // Flat object-format-key → DT_NEEDED library string (e.g.
+    // Object-format-kind key → DT_NEEDED library string (e.g.
     // {"elf":"libgcc_s.so.1"}). The LIR lowerer resolves the ACTIVE format's
-    // entry and binds each minted softcall extern to it. Mirrors the
-    // condCodeEncoding object-of-scalars shape (arbitrary keys here).
+    // entry and binds each minted softcall extern to it.
+    //
+    // ★ EVERY KEY IS VALIDATED through `objectFormatKindFromName`, and the
+    // parsed value is stored under the resolved KIND (an
+    // `ObjectFormatKind`-indexed array), not under the raw string. This key
+    // used to accept ARBITRARY strings — it was the precedent the
+    // `charIsUnsigned.byObjectFormat` reshape deliberately did NOT follow, and
+    // it left exactly the hole that reshape exists to delete: a misspelled
+    // `"elff"` / a mis-cased `"ELF"` loaded perfectly clean, the accessor's
+    // lookup missed, and the F128 softcall path reported that the format
+    // declares no softcall library. Long-double arithmetic degraded or failed
+    // on a PURE TYPO, with no diagnostic naming the config.
+    //
+    // Three rejections, each closing one way the old shape could lie:
+    //   * an unrecognized name — the typo case, and the diagnostic NAMES it;
+    //   * the `unknown` sentinel — it SPELLS correctly so the name lookup
+    //     succeeds, but it selects no real format (the shared
+    //     `kObjectFormatKindSentinelRejection` discipline);
+    //   * an EMPTY library string — indistinguishable at the accessor from an
+    //     absent key, i.e. the same silent fallback one layer down.
     if (doc.contains("wideFloatSoftcallLibraryByFormat")) {
         auto const& lib = doc.at("wideFloatSoftcallLibraryByFormat");
         if (!lib.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/wideFloatSoftcallLibraryByFormat",
-                      "must be an object mapping object-format key → library string");
+                      "must be an object mapping object-format kind name "
+                      "('elf' / 'pe' / 'macho' / 'wasm' / 'spirv') → library "
+                      "string");
         } else {
             for (auto it = lib.begin(); it != lib.end(); ++it) {
-                if (!it.value().is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/wideFloatSoftcallLibraryByFormat/{}", it.key()),
-                              "library value must be a string");
+                if (detail::isDocumentationKey(it.key())) continue;
+                auto const path = std::format(
+                    "/wideFloatSoftcallLibraryByFormat/{}", it.key());
+                auto const kind = objectFormatKindFromName(it.key());
+                if (!kind.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is not a recognized object-format kind "
+                                  "(expected one of 'elf' / 'pe' / 'macho' / "
+                                  "'wasm' / 'spirv'). An unrecognized name "
+                                  "would declare a softcall library that never "
+                                  "resolves, silently leaving the F128 softcall "
+                                  "path with no runtime library.", it.key()));
                     continue;
                 }
-                data.wideFloatSoftcallLibraryByFormat.emplace(
-                    it.key(), it.value().get<std::string>());
+                if (!isSelectableObjectFormatKind(*kind)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::string{kObjectFormatKindSentinelRejection});
+                    continue;
+                }
+                if (!it.value().is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "library value must be a string (the DT_NEEDED "
+                              "library the minted softcall externs bind to)");
+                    continue;
+                }
+                auto value = it.value().get<std::string>();
+                if (value.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "library value must be non-empty — an empty "
+                              "string is indistinguishable from declaring no "
+                              "library at all, so it would read as a silent "
+                              "'this format has none' instead of the "
+                              "declaration it looks like. Omit the key "
+                              "instead.");
+                    continue;
+                }
+                data.wideFloatSoftcallLibraryByFormat[
+                    static_cast<std::size_t>(*kind)] = std::move(value);
             }
         }
     }

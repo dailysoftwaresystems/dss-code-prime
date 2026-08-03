@@ -9,6 +9,7 @@
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "scratch_dir.hpp"
 
@@ -16,6 +17,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -37,11 +39,13 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
-    // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
-    // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
-    // 5 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
-    // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
+    // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
+    // (`__va_list_tag` + `va_list` + the `__builtin_va_list` alias,
+    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) injected into every c-subset CU's builtin
+    // scope (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
+    // 6 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
+    // CU-wide builtins scope): TF-C95 `__sync_synchronize` (D-CSUBSET-ATOMIC-FENCE)
+    // + c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
     // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
     // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 6 FC17.9(b)
@@ -56,13 +60,19 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // `atomic_store_explicit`, always-injected builtins; D-CSUBSET-ATOMIC).
     // FC17.9(f) (D-CSUBSET-COMPLEX): + the 4 complex builtins __builtin_complex/
     // __builtin_creal/__builtin_cimag/__builtin_conj (always-injected like the rest).
-    ASSERT_EQ(model.symbols().size() - 1, 79u)
-        << "main + x + __va_list_tag + va_list + __umulh + "
-           "_InterlockedCompareExchange + _ReadWriteBarrier + "
+    // D-CSUBSET-INTRINSIC-BSWAP: + the 6 byte-swap builtins (`_byteswap_ushort`/
+    // `_byteswap_ulong`/`_byteswap_uint64` + their GCC spellings
+    // `__builtin_bswap16`/`__builtin_bswap32`/`__builtin_bswap64` — six NAMES over
+    // ONE `lowering: "bswap"` verb, always-injected like every other builtin).
+    ASSERT_EQ(model.symbols().size() - 1, 87u)
+        << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
+           "_InterlockedCompareExchange + _ReadWriteBarrier + __sync_synchronize + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
-           "creal/cimag/conj complex builtins + __func__ + __FUNCTION__";
+           "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
+           "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
+           "__builtin_bswap16/32/64) + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -70,6 +80,143 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     ASSERT_NE(xRec, nullptr);
     ASSERT_TRUE(xRec->type.valid()) << "the int builtin must resolve to a TypeId";
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
+}
+
+// D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture): a file-scope
+// `extern` declaration whose type-specifier is a struct/union/enum aggregate now
+// PARSES (typeBase gained the structSpec/unionSpec/enumSpec arms — the extern path
+// via externDecl→typeRef→typeBase previously omitted them, so `extern struct Foo g;`
+// P0009'd while `static struct`/plain/typedef all worked) AND resolves the extern
+// symbol to the aggregate TypeId, exactly like a `static struct Foo g;` (the type
+// resolver dispatches on the composite node's own rule, not on externDecl — zero
+// semantic change). This is the dominant sqlite-testfixture compile blocker
+// (sqliteInt.h `extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`).
+// RED-ON-DISABLE: revert typeBase's alt list to {typeSpecifierSeq, Identifier,
+// typeofSpecifier} and `assertNoBuilderErrors` fails on the P0009 parse error for
+// every `extern struct/union/enum` line below. The enum form is covered ONLY here
+// (its GLOBAL codegen is a separate pre-existing gap, D-CSUBSET-ENUM-GLOBAL-CODEGEN,
+// so the runtime example extern_aggregate omits it); struct/union/const/pointer are
+// additionally witnessed end-to-end by that example.
+TEST(SemanticAnalyzerCSubset, ExternAggregateSpecifiersParse) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int v; };\n"
+        "union U { int a; };\n"
+        "enum E { EV = 1 };\n"
+        "extern struct S gS;\n"          // extern + struct tag  (was P0009 "got struct")
+        "extern union U gU;\n"           // extern + union tag   (was P0009 "got union")
+        "extern enum E gE;\n"            // extern + enum tag    (was P0009 "got enum")
+        "extern const struct S gC;\n"    // extern + const struct
+        "extern struct S *gP;\n"         // extern + pointer-to-struct
+        "extern struct SB { int w; } gB;\n"  // extern + struct DEFINITION (inline body form)
+    });
+    assertNoBuilderErrors(*cu);          // red-on-disable hook: every extern line above must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"gS", "gU", "gE", "gC", "gP", "gB"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "extern aggregate symbol '" << n << "' was not minted";
+        ASSERT_TRUE(r->type.valid()) << "extern aggregate symbol '" << n << "' has no resolved type";
+    }
+    EXPECT_EQ(in.kind(rec("gS")->type), TypeKind::Struct);
+    EXPECT_EQ(in.kind(rec("gU")->type), TypeKind::Union);
+    EXPECT_EQ(in.kind(rec("gE")->type), TypeKind::Enum);
+    EXPECT_EQ(in.kind(rec("gC")->type), TypeKind::Struct);  // const is a qualifier bit; base kind stays Struct
+    EXPECT_EQ(in.kind(rec("gP")->type), TypeKind::Ptr);     // pointer-to-struct decays to Ptr
+    EXPECT_EQ(in.kind(rec("gB")->type), TypeKind::Struct);  // inline struct-definition-in-extern (body form)
+}
+
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: a MULTI-declarator `extern` mints ONE
+// nonDefiningDeclaration symbol PER declarator, each with its OWN per-declarator
+// pointer/array suffix folded onto the shared head base type — `extern int a, b;`
+// mints a AND b (both int); `extern int *p, arr[3];` mints p (int*) and arr
+// (int[3]). RED-ON-DISABLE: reverting externDecl to the single-declarator spine
+// P0009's on the comma, so `assertNoBuilderErrors` fails (the decl won't parse);
+// a shared-head star (the retired `typeRef` spine) would type `arr`/`b` as Ptr too.
+TEST(SemanticAnalyzerCSubset, ExternMultiDeclaratorMintsPerDeclaratorSymbols) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int a, b;\n"          // two objects, ONE extern declaration
+        "extern int *p, arr[3];\n"    // per-declarator pointer (p) + array (arr)
+    });
+    assertNoBuilderErrors(*cu);       // red-on-disable: the multi-declarator externs must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"a", "b", "p", "arr"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "multi-declarator extern symbol '" << n
+                              << "' was not minted (one symbol per declarator)";
+        ASSERT_TRUE(r->type.valid()) << "extern symbol '" << n << "' has no type";
+        EXPECT_TRUE(r->isExternDeclaration)
+            << "extern symbol '" << n << "' must be a non-defining declaration";
+    }
+    // Per-declarator TYPES: the pointer/array suffix binds to its OWN declarator.
+    EXPECT_EQ(in.kind(rec("a")->type), TypeKind::I32);
+    EXPECT_EQ(in.kind(rec("b")->type), TypeKind::I32);   // NOT a pointer (no shared-head star)
+    EXPECT_EQ(in.kind(rec("p")->type), TypeKind::Ptr);   // `*p` — a pointer
+    EXPECT_EQ(in.kind(rec("arr")->type), TypeKind::Array); // `arr[3]` — an array, not int/ptr
+}
+
+// D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an `extern` on a FUNCTION
+// DEFINITION (`extern int f(int){…}`) mints a DEFINING Function (a body present),
+// NOT a non-defining declaration — despite externDecl's `nonDefiningDeclaration`
+// default. The kindByChild body-block discriminator upgrades effectiveKind to
+// Function, and the engine suppresses isExtern for a Function-kind declarator. It
+// contrasts with a bare `extern` PROTOTYPE (Variable-kind, isProto, isExtern — a
+// non-defining declaration) and mirrors a `static` DEFINITION (also Function-kind,
+// defining — the linkage difference is a MIR-tier concern, pinned separately).
+// RED-ON-DISABLE: revert externDeclTail's block arm -> `extern int efd(int x){…}`
+// P0009s (assertNoBuilderErrors fails); revert the isExtern-Function guard -> efd
+// becomes isExternDeclaration (this test's EXPECT_FALSE reds).
+TEST(SemanticAnalyzerCSubset, ExternFunctionDefinitionMintsDefiningFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int efd(int x){ return x + 1; }\n"   // extern DEFINITION (a body)
+        "extern int eproto(void);\n"                 // extern PROTOTYPE (no body)
+        "static int sfd(int x){ return x + 1; }\n"   // static DEFINITION (contrast)
+    });
+    assertNoBuilderErrors(*cu);   // red-on-disable: the extern DEFINITION must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    // The extern function DEFINITION: a DEFINING Function (a body present), NOT a
+    // non-defining declaration and NOT a syntactic prototype.
+    auto const* efd = rec("efd");
+    ASSERT_NE(efd, nullptr) << "the extern function definition must mint a symbol";
+    EXPECT_EQ(efd->kind, DeclarationKind::Function)
+        << "`extern int efd(int){…}` is a function DEFINITION (Function-kind)";
+    EXPECT_FALSE(efd->isExternDeclaration)
+        << "a definition is DEFINING — never a non-defining extern declaration";
+    EXPECT_FALSE(efd->isProtoDeclaration)
+        << "a definition (a body) is not a bare prototype";
+    // The bare extern PROTOTYPE: a NON-DEFINING declaration. Pass-1.5 upgrades a
+    // proto's kind to Function (D-CSUBSET-FN-PROTOTYPE) exactly as for a topLevel
+    // proto, so BOTH efd and eproto are Function-kind — the def-vs-declaration
+    // distinction is isProto/isExtern (below), NOT the kind. This is the contrast
+    // that matters: efd is defining (isExtern=false), eproto is not (isExtern=true).
+    auto const* eproto = rec("eproto");
+    ASSERT_NE(eproto, nullptr);
+    EXPECT_TRUE(eproto->isProtoDeclaration)
+        << "the bare `extern int eproto(void);` is a syntactic proto";
+    EXPECT_TRUE(eproto->isExternDeclaration)
+        << "the bare extern prototype is a NON-defining declaration (unlike the "
+           "extern DEFINITION efd, which is defining)";
+    // The `static` DEFINITION: also a DEFINING Function (contrast — same defining
+    // shape at the semantic tier; the internal-vs-external linkage lives at MIR).
+    auto const* sfd = rec("sfd");
+    ASSERT_NE(sfd, nullptr);
+    EXPECT_EQ(sfd->kind, DeclarationKind::Function);
+    EXPECT_FALSE(sfd->isExternDeclaration);
 }
 
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
@@ -827,6 +974,33 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
            "c-subset (only void* gets the universal-pointer pass).";
 }
 
+// D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: `pointer - arrayName` (C 6.5.6p9 + 6.3.2.1p3) —
+// the array operand decays to Ptr<elem> FIRST, so the result is ptrdiff_t (an INTEGER),
+// not a pointer. Used UNCAST in an integer context (the FTS5 `zOut - aBuf` shape, a
+// token length passed as an int), it must be admitted. The semantic type-oracle
+// (subtreeType/combineBinary) previously required BOTH operands already Ptr and never
+// decayed an Array → `z - a` typed Ptr<char> → the int init failed isAssignable →
+// S_TypeMismatch. (The pointer_minus_array example only ever CAST the result
+// `(int)(t - arr)`, so the explicit cast masked this semantic gap.) Now the semantic arm
+// decays the array first, mirroring the HIR combineBinary c65 that already lowers it.
+// RED-ON-DISABLE: revert the semantic pointer-sub array-decay → the two UNCAST sites
+// (`z - a`, `a - z`) type Ptr/Array in an int context → this count becomes 2.
+TEST(SemanticAnalyzerCSubset, PointerMinusArrayTypesAsPointerDifferenceInt) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void){ char a[32]; char *z = a + 5;\n"
+        "  int p = z - a;\n"          // ptr - array   (uncast, integer context)
+        "  int q = a - z;\n"          // array - ptr
+        "  int r = (int)(z - a);\n"   // the CAST control — clean either way
+        "  return p + q + r; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
+           "decays first), not a pointer → S_TypeMismatch, in an uncast int context";
+}
+
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
 //    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
 //
@@ -1244,7 +1418,8 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsInit) {
 // BEHAVIOR (float-zero rejects), NOT the gate in isolation — removing the gate
 // leaves it green via the const-fold backstop. The gate is defense-in-depth that
 // additionally excludes a Char/Bool-typed fold the const-fold step would otherwise
-// fold to 0 (consistent with DSS typing comparisons as Bool, not C's int).
+// fold to 0 (e.g. a bare `_Bool`/`char`-typed constant — NOT a comparison, which
+// now types as C's int per D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE).
 TEST(SemanticAnalyzerCSubset, FloatZeroRejectsAsPointerArg) {
     auto cu = buildShippedUnit("c-subset", {
         "extern void f(void* p);\n"
@@ -1512,6 +1687,217 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ── TF-C101 — two INDEPENDENT C11 gaps that compose in Tcl 9.0's tclDecls.h ──
+//
+// The witness is `tclDecls.h:4046`'s TCLBOOLWARNING, which writes
+//   `(void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int), "…");
+//                          int dummy;}))`
+// and needs BOTH of these, each legal C11 on its own and each previously a hard
+// parse error (MEASURED at HEAD before this change: `P0001 expected 'ParenClose'
+// — got '{'` for (i); `P0009 … got '_Static_assert'` for (ii)):
+//
+//   (i)  6.7.7p1 + 6.5.3.4p2 — a struct-or-union-specifier WITH a member list is a
+//        legal specifier-qualifier-list, so an anonymous struct DEFINITION (not
+//        merely a tag reference) is a legal `sizeof` type-name operand. Fixed at
+//        the ONE type-name chokepoint, `castTypeBase`, by routing its composite
+//        arms through the c25 UNIFIED `structSpec`/`unionSpec`/`enumSpec` instead
+//        of the ref-only `structTypeRef`/`unionTypeRef`/`enumTypeRef`.
+//   (ii) 6.7.2.1p1 — `struct-declaration` has TWO productions, and the second is
+//        `static_assert-declaration`. Fixed in `structBody`/`unionBody` by making
+//        the member repeat an inline 2-way alt.
+//
+// The pins below assert them SEPARATELY before the composed form, because the two
+// halves were separately broken and a single composed test would not say which.
+//
+// ★ EVERY POSITIVE PIN HERE IS PAIRED WITH A FALSE TWIN, and that pairing is the
+// point rather than symmetry for its own sake: a `_Static_assert` that PARSES but
+// is never EVALUATED would make every positive pin pass while the construct was
+// silently inert — and the assertion in the real macro is load-bearing (it is what
+// enforces `sizeof(*boolPtr) <= sizeof(int)`). The false twins are what prove the
+// condition actually reaches `constIntExpr`. They also pin the FOLDED VALUE: a
+// `sizeof` that folded to the wrong number would flip both counts.
+
+// (i) alone — an anonymous struct DEFINITION as the sizeof type-name operand. The
+// static_assert here is only the oracle: it reports what the sizeof folded to.
+TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(struct { int dummy; }) == 4, \"anon struct is 4\");\n"
+        "_Static_assert(sizeof(struct { int a; int b; }) == 8, \"anon struct is 8\");\n"
+        "_Static_assert(sizeof(union { int a; double b; }) == 8, \"anon union is 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof over an INLINE anonymous struct/union definition must parse "
+           "(C 6.7.7p1) and lay the body out through the aggregateLayout engine";
+}
+
+// The false twin of (i): proves the size is really COMPUTED from the inline body,
+// not rubber-stamped. Both assertions must fail — 2, not 1, not 0.
+TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionWrongSizeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(struct { int dummy; }) == 99, \"not 99\");\n"
+        "_Static_assert(sizeof(struct { int a; int b; }) == 4, \"not 4\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 2u)
+        << "a WRONG size over an inline anonymous struct must fail loud — the "
+           "positive pin above must not be passing on a rubber-stamped fold";
+}
+
+// REGRESSION PIN for the castTypeBase swap. Replacing the ref-only arms with the
+// unified specifiers must NOT disturb the pre-existing tag-REFERENCE reading in a
+// type-name position — `sizeof(struct S)` / `sizeof(union U)` / `sizeof(enum E)`
+// all still resolve their tag (body-absent ⇒ the `isTagReference` arm). This is
+// the test that would have caught the swap breaking what already worked.
+TEST(SemanticAnalyzerCSubset, SizeofNamedCompositeTagStillResolvesAfterUnify) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "union  U { int a; double b; };\n"
+        "enum   E { E0, E1 };\n"
+        "_Static_assert(sizeof(struct S) == 8, \"S is 8\");\n"
+        "_Static_assert(sizeof(union U) == 8, \"U is 8\");\n"
+        "_Static_assert(sizeof(enum E) == 4, \"E is 4\");\n"
+        "int main(void){ return (int)sizeof(struct S); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a body-ABSENT composite in a type-name is still a tag reference";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u)
+        << "the unified specifier must resolve the tag exactly as the ref-only "
+           "rule it replaced did";
+}
+
+// (ii) alone — `_Static_assert` as a struct-declaration (C 6.7.2.1p1), TRUE arm.
+TEST(SemanticAnalyzerCSubset, StaticAssertAsStructMemberParses) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(sizeof(int) <= sizeof(long), \"int fits in long\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "union V {\n"
+        "  static_assert(sizeof(int) == 4);\n"
+        "  int dummy;\n"
+        "};\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a static_assert is a legal struct-declaration in BOTH composite bodies "
+           "and in BOTH spellings (reserved + C23 1-arg)";
+}
+
+// ★ THE LOAD-BEARING NEGATIVE. Admitting the construct without EVALUATING it would
+// be a silent hole: the grammar change alone makes the true pin above pass. These
+// three assertions are false and MUST each fail loud, from struct-member position,
+// union-member position, and through the aggregateLayout fold.
+TEST(SemanticAnalyzerCSubset, StaticAssertFalseInStructMemberFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(1 == 2, \"struct member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "union V {\n"
+        "  _Static_assert(sizeof(int) == 99, \"union member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "struct T {\n"
+        "  _Static_assert(sizeof(struct S) == 77, \"layout-folded member assert\");\n"
+        "  int dummy;\n"
+        "};\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 3u)
+        << "a FALSE static assertion in member position must fail loud — parsing "
+           "it and skipping the check would be a silent hole";
+}
+
+// A static_assert is a DECLARATION, not a member: it must mint no field and must
+// not perturb the layout. The oracle is the enclosing struct's own size — a
+// mistakenly-minted field would change it and this would fail loud.
+TEST(SemanticAnalyzerCSubset, StaticAssertStructMemberMintsNoField) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S {\n"
+        "  _Static_assert(1, \"leading\");\n"
+        "  int a;\n"
+        "  _Static_assert(1, \"middle\");\n"
+        "  int b;\n"
+        "  _Static_assert(1, \"trailing\");\n"
+        "};\n"
+        "_Static_assert(sizeof(struct S) == 8, \"asserts mint no field\");\n"
+        "int main(void){ struct S s; s.a = 1; s.b = 2; return s.a + s.b; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "static_assert declarations in leading/middle/trailing member position "
+           "must not add storage — sizeof(struct S) stays 8";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "the real fields around the assertions must still resolve";
+}
+
+// (i)+(ii) COMPOSED — the literal tclDecls.h:4046 TCLBOOLWARNING shape, in both
+// polarities. `int *boolPtr` ⇒ 4 <= 4 holds; the false twin uses `long long *`
+// ⇒ 8 <= 4, which is exactly the misuse the real macro exists to catch.
+TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormHolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  int b = 0;\n"
+        "  int *boolPtr = &b;\n"
+        "  (void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int),"
+        " \"sizeof(boolPtr) too large\");int dummy;}));\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the composed Tcl 9 macro must compile clean for a correctly-sized "
+           "pointee";
+}
+
+TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormCatchesOversizedPointee) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  long long b = 0;\n"
+        "  long long *boolPtr = &b;\n"
+        "  (void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int),"
+        " \"sizeof(boolPtr) too large\");int dummy;}));\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "an 8-byte pointee must trip the macro's assertion — this is the check "
+           "the construct exists to perform, and admitting it inertly would lose it";
 }
 
 // ── C11/C23 6.5.3.4 _Alignof — the alignof-folding requirement ───────────────
@@ -1848,6 +2234,57 @@ TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
     EXPECT_TRUE(model.hasErrors());
 }
 
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` AMBIGUITY pair. These two
+// tests exist together because the FIRST implementation had only the second half
+// and MEASURED it refused a program clang compiles.
+//
+// (1) LEGITIMATE, must compile: a shared MEMBER macro expanded under TWO
+// different caps. Its replacement tokens really are stamped twice, but every
+// composite using it is anchored on its own unambiguous `struct` keyword, so
+// both layouts are fully determined. Raising the conflict where it is DETECTED
+// (in the preprocessor) rejects this; raising it where it is USED does not.
+TEST(SemanticAnalyzerCSubset, PragmaPackSharedMemberMacroAcrossCapsIsFine) {
+    auto cu = buildShippedUnit("c-subset", {
+        "#define MEMS unsigned a; long long b;\n"
+        "#pragma pack(4)\n"
+        "struct A { MEMS };\n"
+        "#pragma pack(2)\n"
+        "struct B { MEMS };\n"
+        "#pragma pack()\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PragmaPackAmbiguous), 0u)
+        << "the composites are anchored on unambiguous `struct` keywords — "
+           "clang compiles this, and MEASURED, so must DSS";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (2) GENUINELY AMBIGUOUS, must fail loud: the COMPOSITE ITSELF is minted by a
+// macro expanded under two different caps, so its layout key carries both. The
+// two candidate layouts differ in size AND in every field offset past the first;
+// picking one silently is the miscompile this whole cycle is about. ONE
+// diagnostic per affected composite, and the code is unsuppressable.
+TEST(SemanticAnalyzerCSubset, PragmaPackAmbiguousCompositeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "#define DEFS(n) struct n { unsigned a; long long b; };\n"
+        "#pragma pack(4)\n"
+        "DEFS(P)\n"
+        "#pragma pack(2)\n"
+        "DEFS(Q)\n"
+        "#pragma pack()\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PragmaPackAmbiguous), 2u)
+        << "both P and Q land on an ambiguous layout key";
+    EXPECT_TRUE(model.hasErrors());
+}
+
 // FAIL-LOUD: a TYPO in the GNU `__attribute__` packed slot → S_UnknownTypeAttribute
 // (typo protection, like H_UnknownLinkageSpecifier — a `pakced` typo must not
 // silently leave the struct unpacked).
@@ -1878,58 +2315,136 @@ TEST(SemanticAnalyzerCSubset, UnknownC23AttributeIsIgnored) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION (F-1): the AFTER-KEYWORD packed position
-// `struct __attribute__((packed)) S {…}` is DEFERRED — only the TRAILING/suffix form
-// (`struct S {…} __attribute__((packed))`) is honored. That deferral's fail-loud
-// contract REQUIRES the after-keyword form to be LOUDLY REJECTED — NEVER a silent
-// tag-drop / accept-as-unpacked. The grammar admits `compositeAttrList` only as a
-// TRAILING element, so `struct __attribute__((packed))` parses (cleanly, no
-// tree-builder error) as an ANONYMOUS, body-less struct specifier — the attribute is
-// consumed as ITS trailing list — and the tag `S { … }` is then mis-read as a
-// function definition, failing loud S_InvalidFunctionDeclarator at SEMANTIC analysis
-// (verified: this is a semantic, not a parse, error). The pin is PHASE-AGNOSTIC
-// (tree parse-error OR semantic-model error) so a future shift between channels stays
-// green; ONLY a silent accept-as-unpacked — the regression F-1 guards against, an
-// after-keyword slot added WITHOUT fixing the ~6 positional tag readers — turns it
-// red. RED-ON-REGRESSION.
-TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedFailsLoudNotSilent) {
+// ── D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION — DEFERRAL CLOSED (TF-C73) ───────
+//
+// ★★ THESE TWO PINS WERE INVERTED ON 2026-07-28. They shipped as
+// `PackedAfterKeywordTaggedFailsLoudNotSilent` / `…AnonymousFailsLoudNotSilent`
+// and asserted that `struct __attribute__((packed)) S {…}` must be LOUDLY
+// REJECTED. That was the CORRECT reading of the fail-loud contract for exactly
+// as long as the position was DEFERRED: a deferred construct must never be
+// accepted-as-unpacked, so while the grammar admitted `compositeAttrList` only
+// as a TRAILING element, rejection WAS the safety property. The position has
+// since LANDED (`compositeAttrLead` in `shapes`, wired through the
+// structSpec/unionSpec rows' `declarationAttrSlotRules`) and is HONORED, so the
+// safety property is now satisfied by HONORING, not by rejecting — the struct
+// is correctly PACKED rather than silently unpacked. The old assertion no
+// longer guards anything; it merely pins the absence of a feature that exists.
+// The pins are kept, and kept HERE, because their real subject was never the
+// diagnostic — it was the POSITIONAL SYMMETRY between the after-keyword slot
+// and the trailing slot, and that intent survives the inversion intact.
+//
+// ★★ WHY THESE ASSERT A LAYOUT FACT AND NOT A DIAGNOSTIC COUNT. Post-landing,
+// EVERY regression mode of this feature is SILENT — there is no diagnostic to
+// count in either direction, so a count pin here would be permanently dead.
+// MEASURED, not argued (shipped CLI, arm64 macho, `--target
+// arm64:macho64-arm64-darwin-exec`, probe returning `sizeof*10 + _Alignof`):
+//
+//     shipped config                                   -> 51   (sizeof 5, align 1)
+//     scratch config, `declarationAttrSlotRules`
+//       ["compositeAttrLead"] deleted from the
+//       structSpec + unionSpec rows                     -> 84   (sizeof 8, align 4)
+//     diagnostics emitted by that broken build          -> 0
+//
+// Zero. The regression compiles clean and produces a WRONG ABI. Only an
+// applied-layout assertion — `isPacked`, the computed size/align, the field
+// OFFSETS — can see it, which is what these two now assert.
+//
+// ★★ CLANG GROUND TRUTH, measured not assumed
+// (`clang -isysroot $(xcrun --show-sdk-path) -std=c17 -Wall -Wextra`, zero
+// errors, zero warnings, binary run):
+//     struct __attribute__((packed)) S { char a; int b; };
+//         -> sizeof 5, _Alignof 1, offsetof(b) == 1
+//     struct __attribute__((packed))   { char a; int b; } v;   (anonymous)
+//         -> sizeof 5,             offsetof(b) == 1
+// DSS agrees on both, end to end through the shipped CLI, and the
+// attribute-deleted control diverges in BOTH compilers identically (sizeof 8).
+// The member order is `char` FIRST deliberately: with `int a; char b;` the two
+// field offsets are 0/4 whether or not packing ran, so the offsets would be
+// vacuous. `char a; int b;` moves all three observables at once (5 vs 8, 1 vs
+// 4, offset 1 vs 4) — one shape, three independent ways to catch a silent drop.
+//
+// ★ WHAT GUARDS THE BEHAVIOR NOW, i.e. what these pins actually hold down:
+//   * the lead surface REACHES the semantic tier at all — the config key
+//     `declarationAttrSlotRules: ["compositeAttrLead"]`, deleted above to
+//     produce the 84;
+//   * `scanCompositePacked` stays surface-COUNT-agnostic. It once selected the
+//     FIRST `compositeAttrList` child and `break`ed, which is precisely why an
+//     earlier cut of this grammar was reverted UNSHIPPED: a lead slot under a
+//     distinct rule name was invisible to it and `packed` — known-and-inert in
+//     the effects table — was dropped in silence;
+//   * the tag stays at visible-child 2. `compositeAttrLead` is a named rule
+//     over a lone `{repeat}`, so it emits its node even when EMPTY and the
+//     index cannot shift with or without a decoration. (That index has its own
+//     red-on-disable note on the structSpec row; it fails as a downstream
+//     S000D at the USE site, not as an unknown tag.)
+// The TRAILING position keeps its own coverage in the pins above
+// (`PackedStructHasAlignmentOneEndToEnd` and siblings); the positional-symmetry
+// claim is the pair of them, which is why these two stay adjacent to it.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedIsHonoredNotSilentlyUnpacked) {
     auto cu = buildShippedUnit("c-subset", {
-        "struct __attribute__((packed)) S { int a; };\n"
+        "struct __attribute__((packed)) S { char a; int b; };\n"
+        "struct S v;\n"
         "int main(void){ return 0; }\n",
     });
-    bool sawParseError = false;
-    for (auto const& t : cu->trees()) {
-        for (auto const& d : t.diagnostics().all()) {
-            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
-        }
-    }
+    assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
-    EXPECT_TRUE(sawParseError || model.hasErrors())
-        << "after-keyword packed (`struct __attribute__((packed)) S {…}`) must fail "
-           "LOUD (parse or semantic) — never a silent tag-drop / accept-as-unpacked "
-           "(the D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION deferral's fail-loud contract)";
+    EXPECT_FALSE(model.hasErrors())
+        << "the after-keyword composite attribute position LANDED — it must parse "
+           "and analyze cleanly (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION, closed)";
+    // The tag must survive the lead slot: `struct S v;` resolving to a Struct is
+    // the guard on `structSpec`'s name index staying at visible-child 2.
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr) << "the TAG was discarded — the lead slot shifted the "
+                             "name index off the identifier";
+    ASSERT_TRUE(v->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(v->type), TypeKind::Struct);
+    // THE APPLIED LAYOUT FACT. `packed` reached the layout sink, not merely the
+    // parser: clang-measured 5 / 1 / offset 1; a silent drop gives 8 / 4 / 4.
+    EXPECT_TRUE(ti.isPacked(v->type))
+        << "after-keyword `packed` parsed but never marked the composite — the "
+           "silent-unpack regression (MEASURED as sizeof 8 vs clang's 5)";
+    auto const layout = computeLayout(v->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 5u)          << "clang: sizeof == 5 (unpacked would be 8)";
+    EXPECT_EQ(layout->align.bytes(), 1u) << "clang: _Alignof == 1 (unpacked would be 4)";
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[0], 0u);
+    EXPECT_EQ(layout->fieldOffsets[1], 1u)
+        << "clang: offsetof(b) == 1 — the inter-field padding is gone (unpacked: 4)";
 }
 
-// The ANONYMOUS after-keyword variant is likewise LOUDLY REJECTED:
-// `struct __attribute__((packed)) { int a; } v;` — the anonymous, body-less struct
-// specifier consumes the attribute as its trailing list, then `{ int a; } v;` cannot
-// bind and fails loud (S_UnknownType on `v` today). Cheap sibling; same fail-loud
-// boundary, phase-agnostic.
-TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousFailsLoudNotSilent) {
+// The ANONYMOUS half of the positional-symmetry claim: the same lead slot on a
+// TAGLESS composite. Not redundant with the tagged pin — the tagged one also
+// exercises the tag-index guard, and this one exercises the path where
+// `anonymousNameAllowed` synthesizes the name while child 2 is a `structBody`
+// rather than an Identifier. Same clang-measured layout (5 / offset 1); DSS
+// end-to-end MEASURED at exit 42 on the runtime probe and at exit 1 with the
+// attribute deleted, in DSS and clang alike.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousIsHonoredNotSilentlyUnpacked) {
     auto cu = buildShippedUnit("c-subset", {
-        "struct __attribute__((packed)) { int a; } v;\n"
+        "struct __attribute__((packed)) { char a; int b; } v;\n"
         "int main(void){ return 0; }\n",
     });
-    bool sawParseError = false;
-    for (auto const& t : cu->trees()) {
-        for (auto const& d : t.diagnostics().all()) {
-            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
-        }
-    }
+    assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
-    EXPECT_TRUE(sawParseError || model.hasErrors())
-        << "anonymous after-keyword packed must also fail LOUD (parse or semantic), "
-           "never a silent accept-as-unpacked";
+    EXPECT_FALSE(model.hasErrors())
+        << "anonymous after-keyword packed must parse + analyze cleanly";
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(v->type), TypeKind::Struct);
+    EXPECT_TRUE(ti.isPacked(v->type))
+        << "the lead slot must be honored on an ANONYMOUS composite too — never a "
+           "silent accept-as-unpacked";
+    auto const layout = computeLayout(v->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 5u)          << "clang: sizeof == 5 (unpacked would be 8)";
+    EXPECT_EQ(layout->align.bytes(), 1u);
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[1], 1u)
+        << "clang: offsetof(b) == 1 (unpacked: 4)";
 }
 
 // ZERO: `alignas(0) int x;` is a NO-OP (6.7.5p3) — NO diagnostic, NO override.
@@ -2493,6 +3008,206 @@ TEST(SemanticAnalyzerCSubset, Aapcs64VariadicCalleeAnalyzesClean) {
         << "the __va_list struct ap operand must pass isVaList for AAPCS64";
 }
 
+// D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME (sqlite os_unix.c/mem1.c/test1.c, always via
+// the Darwin SDK's `<sys/_types/_va_list.h>` `typedef __builtin_va_list
+// __darwin_va_list;`): `__builtin_va_list` is a COMPILER-PROVIDED type name — no
+// shipped descriptor can supply it — injected beside `va_list` in the builtin scope
+// at all THREE VaListStrategy branches, bound to the IDENTICAL per-strategy TypeId.
+// These pins fold sizeof(__builtin_va_list) into an array dimension exactly like the
+// sizeof(va_list) fixtures above; matching the SAME constant per strategy proves the
+// alias selects the SAME strategy-typed injection (a missed branch would leave the
+// name undefined on exactly that calling convention). RED-ON-DISABLE: reverting the
+// three `__builtin_va_list` injections reproduces S0006/S_UnknownType on
+// `typedef __builtin_va_list x;` (the sqlite trigger) — every positive test in this
+// group references `__builtin_va_list` in analyzed source, so each IS the
+// red-on-disable witness (the fold/identity below cannot succeed without them).
+TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderSysV) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(__builtin_va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // SysVRegisterSave: __builtin_va_list = va_list = __va_list_tag[1] (24B).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::SysVRegisterSave);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 24)
+        << "sizeof(__builtin_va_list) under SysV = sizeof(va_list) = 24";
+}
+
+TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderWin64) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(__builtin_va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // HomogeneousPointer (Win64 + Apple arm64): __builtin_va_list = char* (8B).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::HomogeneousPointer);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 8)
+        << "sizeof(__builtin_va_list) under Win64 = sizeof(va_list) = 8";
+}
+
+TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderAapcs64) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(__builtin_va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // Aapcs64DualCursor: __builtin_va_list = va_list = __va_list (32B struct).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::Aapcs64DualCursor);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 32)
+        << "sizeof(__builtin_va_list) under AAPCS64 = sizeof(va_list) = 32";
+}
+
+// D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the contract is TypeId IDENTITY, not a size
+// coincidence — the injected `__builtin_va_list` SymbolRecord carries the SAME
+// TypeId variable as `va_list` in every strategy branch. Identity is what makes a
+// typedef chain through either name interchangeable (typedef resolution returns the
+// aliased symbol's `.type` verbatim) and what routes a `__builtin_va_list`-typed
+// param through the c82 va_list param-adjustment exclusion (a pure `TypeId ==`
+// compare) and the va_arg isVaList shape check.
+TEST(SemanticAnalyzerCSubset, BuiltinVaListTypeIdIsIdenticalToVaListPerStrategy) {
+    for (auto const strat : {VaListStrategy::SysVRegisterSave,
+                             VaListStrategy::HomogeneousPointer,
+                             VaListStrategy::Aapcs64DualCursor}) {
+        auto cu = buildShippedUnit("c-subset", {
+            "int main(void) { return 0; }\n",
+        });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                             strat);
+        // The builtin scope holds exactly one record per name in this plain TU.
+        SymbolRecord const* vaRec      = nullptr;
+        SymbolRecord const* builtinRec = nullptr;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            if (model.symbols()[i].name == "va_list")
+                vaRec = &model.symbols()[i];
+            if (model.symbols()[i].name == "__builtin_va_list")
+                builtinRec = &model.symbols()[i];
+        }
+        ASSERT_NE(vaRec, nullptr);
+        ASSERT_NE(builtinRec, nullptr)
+            << "__builtin_va_list must be injected under strategy "
+            << static_cast<int>(strat);
+        EXPECT_EQ(builtinRec->kind, DeclarationKind::Type);
+        ASSERT_TRUE(vaRec->type.valid());
+        ASSERT_TRUE(builtinRec->type.valid());
+        EXPECT_EQ(builtinRec->type.v, vaRec->type.v)
+            << "ONE TypeId under both names (strategy "
+            << static_cast<int>(strat) << ")";
+    }
+}
+
+// ★ THE DARWIN CHAIN — the REAL sqlite shape: the SDK typedefs
+// `__builtin_va_list` -> `__darwin_va_list` -> `va_list`, where the LAST typedef
+// REDECLARES the name `va_list` that is already bound in the builtin scope. The
+// file-scope typedef legally SHADOWS the builtin-scope binding (bind() collides
+// same-scope only; the tree root is a CHILD of the builtin scope) with the SAME
+// TypeId, so `va_list v;` resolves through the user chain to the identical
+// per-strategy type and sizeof(v) folds to the strategy's pin.
+TEST(SemanticAnalyzerCSubset, DarwinVaListTypedefChainShadowsBuiltinPerStrategy) {
+    struct Row { VaListStrategy strat; int size; };
+    for (auto const& row : {Row{VaListStrategy::SysVRegisterSave, 24},
+                            Row{VaListStrategy::HomogeneousPointer, 8},
+                            Row{VaListStrategy::Aapcs64DualCursor, 32}}) {
+        auto cu = buildShippedUnit("c-subset", {
+            "typedef __builtin_va_list __darwin_va_list;\n"
+            "typedef __darwin_va_list va_list;\n"
+            "va_list v;\n"
+            "int a[sizeof(v)];\n",
+        });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                             row.strat);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_UnknownType), 0u)
+            << "every link of the Darwin chain must resolve (strategy "
+            << static_cast<int>(row.strat) << ")";
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_RedeclaredSymbol), 0u)
+            << "the user `va_list` typedef shadows the builtin binding, never "
+               "collides";
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_NonConstantArrayLength), 0u);
+        EXPECT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        SymbolRecord const* aRec = nullptr;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+        ASSERT_NE(aRec, nullptr);
+        ASSERT_TRUE(aRec->type.valid());
+        ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+        ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+        EXPECT_EQ(ti.scalars(aRec->type)[0], row.size)
+            << "sizeof through the Darwin chain must match the strategy pin";
+    }
+}
+
+// Round-trip: a `__builtin_va_list`-typedef'd PARAMETER consumed by va_arg (the c63
+// D-CSUBSET-VA-LIST-PARAM-SLOT shape under the alias name). The va_arg machinery is
+// TypeId-driven — `my_va ap` carries the SAME TypeId as `va_list ap`, so isVaList
+// accepts it under every strategy and the analysis is clean end-to-end.
+TEST(SemanticAnalyzerCSubset, BuiltinVaListTypedefParamRoundTripsThroughVaArg) {
+    for (auto const strat : {VaListStrategy::SysVRegisterSave,
+                             VaListStrategy::HomogeneousPointer,
+                             VaListStrategy::Aapcs64DualCursor}) {
+        auto cu = buildShippedUnit("c-subset", {
+            "typedef __builtin_va_list my_va;\n"
+            "int f(int n, my_va ap) { return va_arg(ap, int); }\n",
+        });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                             strat);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_TypeMismatch), 0u)
+            << "`my_va ap` must pass isVaList — same TypeId as va_list (strategy "
+            << static_cast<int>(strat) << ")";
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_UnknownType), 0u);
+        EXPECT_FALSE(model.hasErrors());
+    }
+}
+
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });
@@ -2541,18 +3256,22 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
-    // main (function) + two distinct `x` symbols (one per block scope) + the 2
-    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
+    // main (function) + two distinct `x` symbols (one per block scope) + the 3
+    // FC12a-core builtin TYPES (__va_list_tag + va_list + the __builtin_va_list
+    // alias, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6
+    // _ReadWriteBarrier + TF-C95 __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
+    // _exception_code + _exception_info) + the 6
     // FC17.9(b) bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
     // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
     // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
-    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap
+    // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
+    // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 80u);
+    EXPECT_EQ(model.symbols().size() - 1, 88u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2567,17 +3286,21 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
-    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
-    // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
-    // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
+    // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
+    // (__va_list_tag + va_list + the __builtin_va_list alias,
+    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the 6 intrinsic builtins (c103 __umulh +
+    // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + TF-C95
+    // __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
     // _exception_code + _exception_info) + the 6 FC17.9(b) bit-count builtins
     // (__builtin_{popcount,clz,ctz}{,ll}, D-CSUBSET-BITCOUNT-INTRINSICS) + the 56
     // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
     // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
-    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap
+    // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
+    // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 79u);
+    ASSERT_EQ(model.symbols().size() - 1, 87u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -2902,6 +3625,37 @@ TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// GROUP 10 — GROUPED declarators (D-CSUBSET-GROUPED-DECLARATOR-CONST closed with
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION): the object-forming pointer
+// layer hides inside redundant parens, so declaratorObjectIsConst must DESCEND
+// the group to find it. Each pin flips under revert (drop the group descent):
+// the grouped const-pointer stops violating; the grouped pointer-to-const starts
+// spuriously violating (the head-scan over-approximation returns).
+// `char (* const p)` ≡ `char * const p` — a const POINTER object → `p += 1`
+// violates. RED-ON-DISABLE: without the group descent the layer is invisible,
+// the object falls to the head scan (no const in `char`) → 0 violations.
+TEST(SemanticAnalyzerCSubset, GroupedConstPointerParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char (* const p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const char (*p)` ≡ `const char *p` — a MUTABLE pointer to const → `p += 1`
+// clean. RED-ON-DISABLE: without the group descent the object falls to the head
+// scan, which sees the head `const` and wrongly marks p const → a spurious
+// S_ConstViolation (the pre-fix over-approximation). This is the exact
+// D-CSUBSET-GROUPED-DECLARATOR-CONST closing pin (`const char (*p); p = 0;`).
+TEST(SemanticAnalyzerCSubset, GroupedPointerToConstParamIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char (*p)){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
@@ -3719,16 +4473,26 @@ TEST(SemanticAnalyzerCSubset, BreakAfterLoopIsOutsideLoop) {
 // closes GAP F and proves the FC13 splice handles a spaced directive: one
 // tree, zero cross-refs, header text present.
 TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
-    namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_gapF_include_test";
-    fs::create_directories(dir);
+    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the one site in this file that had
+    // drifted: the include dir came from a CONSTANT name under
+    // `temp_directory_path()`, so two concurrent instances of this binary shared
+    // it and the first one's `remove_all` deleted `x.h` while the second was
+    // preprocessing (MEASURED: "cannot open .../dss_gapF_include_test/x.h" and
+    // "quote include not found: x.h"). Every other scratch site in this file
+    // already uses `ScratchDir`, where the pid is only a SEED and the actual
+    // guarantee is the atomic claim — SINGULAR `create_directory`, which returns
+    // true only for the caller that created the slot — so this one now matches
+    // its neighbours. `dss::test_support::` is spelled out because the `using`
+    // declarations for it appear further down, in the FF11 block.
+    dss::test_support::ScratchDir incDir{
+        dss::test_support::Location::Temp, "gapF-include"};
     {
-        std::ofstream(dir / "x.h", std::ios::binary)
+        std::ofstream(incDir.path() / "x.h", std::ios::binary)
             << "int helper() { return 1; }\n";
     }
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
-    builder.addIncludeDir(dir);
+    builder.addIncludeDir(incDir.path());
     builder.addInMemory("# include \"x.h\"\nint main() { return helper(); }\n", "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
@@ -3738,8 +4502,8 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
     EXPECT_NE(std::string{cu->trees()[0].source().text()}.find("int helper()"),
               std::string::npos)
         << "a spaced `# include` must still be recognized + inlined";
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    // No manual `remove_all` — `incDir`'s dtor owns the cleanup (and warns loudly
+    // on stderr if it cannot, so a leak stays visible).
 }
 
 // ── FF11: angle-include resolves a NEUTRAL JSON DESCRIPTOR + injects its ──────
@@ -3832,6 +4596,52 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     EXPECT_EQ(model.lattice().interner().kind(ext.signature), TypeKind::FnSig);
 }
 
+// Per-SYMBOL `library` OVERRIDE (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC): a symbol
+// that carries its own `library` map has THAT map MERGED OVER the descriptor's at
+// injection (symbol keys WIN; a format the symbol OMITS inherits the descriptor's
+// entry), while a SIBLING with no override binds the descriptor default unchanged.
+// This is the mechanism the pe `strftime`->ucrtbase.dll date4 fix uses — bind ONE
+// symbol to a different image than its header default without moving the whole
+// descriptor. RED-ON-DISABLE: revert the injector to pass `desc->library` instead
+// of the merged `effectiveLibrary`, and the override symbol's `pe` entry reverts
+// to the descriptor default (msvcrt.dll) → the `over->library.at("pe")` assertion
+// flips from "ucrtbase.dll" to "msvcrt.dll".
+TEST(SemanticAnalyzerCSubset, ShippedPerSymbolLibraryOverrideMergesOverDescriptor) {
+    ScratchDir sysDir{Location::Temp, "ff11-symlib"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "tt.json",
+        R"JSON({ "header": "tt.h", "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+             "symbols": [
+                 { "name": "over",  "signature": "fn() -> i32", "library": { "pe": "ucrtbase.dll" } },
+                 { "name": "plain", "signature": "fn() -> i32" } ] })JSON",
+        "#include <tt.h>\nint main() { return over() + plain(); }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "both descriptor symbols must resolve";
+
+    ASSERT_EQ(model.shippedExterns().size(), 2u);
+    ShippedExternSymbol const* over  = nullptr;
+    ShippedExternSymbol const* plain = nullptr;
+    for (auto const& ext : model.shippedExterns()) {
+        if (ext.name == "over")  over  = &ext;
+        if (ext.name == "plain") plain = &ext;
+    }
+    ASSERT_NE(over,  nullptr);
+    ASSERT_NE(plain, nullptr);
+    // The OVERRIDE symbol: `pe` is the override image (ucrtbase.dll — symbol wins),
+    // `elf` INHERITS the descriptor default (libc.so.6 — the omitted-key semantics,
+    // NOT dropped). Both entries present → the merge, not a replace.
+    ASSERT_EQ(over->library.size(), 2u);
+    EXPECT_EQ(over->library.at("pe"),  "ucrtbase.dll");
+    EXPECT_EQ(over->library.at("elf"), "libc.so.6");
+    // The SIBLING with no override binds the descriptor default on EVERY format —
+    // byte-identical to the pre-override behavior.
+    ASSERT_EQ(plain->library.size(), 2u);
+    EXPECT_EQ(plain->library.at("pe"),  "msvcrt.dll");
+    EXPECT_EQ(plain->library.at("elf"), "libc.so.6");
+}
+
 // ── Item 1: shipped-header CONSTANTS + TYPEDEFS via the neutral descriptor ────
 
 // A shipped CONSTANT injects + folds in CONSTANT-EXPRESSION position (an array
@@ -3880,6 +4690,62 @@ TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
         << "my_int_t must resolve via the injected descriptor typedef";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// C34b (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION): a shipped struct with a
+// UNION-typed field → `e.key.member` resolves to the member type. The union's
+// member NAMES get a `compositeScopeByType` field scope injected (the NEW mechanism
+// mirroring struct-field injection), so the nested `structValue.unionField.member`
+// access resolves — the exact shape of the real `Tcl_GetHashKey` macro's
+// `h->key.oneWordValue` / `h->key.string`. RED-ON-DISABLE: remove the `desc->unions`
+// injection loop in semantic_analyzer.cpp and `e.key.oneWordValue` fails
+// S_NotAComposite (the union value has no member scope).
+TEST(SemanticAnalyzerCSubset, ShippedUnionFieldMemberResolves) {
+    ScratchDir sysDir{Location::Temp, "c34b-union"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk.json",
+        R"JSON({ "header": "hk.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" },
+                 { "name": "Ent",  "type": "struct \"Ent\" { ptr<void>, KeyU }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ],
+             "structs": [ { "name": "Ent", "fields": [
+                 { "name": "cd",  "type": "ptr<void>" },
+                 { "name": "key", "type": "KeyU" } ] } ] })JSON",
+        "#include <hk.h>\n"
+        "int main(void) { Ent e; void *p = e.key.oneWordValue; char *q = e.key.str;"
+        " return (p != 0) + (q != 0); }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "e.key (a union value) must have a member scope so .oneWordValue resolves";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "oneWordValue/str resolve as union members";
+}
+
+// The fail-loud pin: an UNKNOWN union member is rejected. The union member scope IS
+// registered (so this is NOT a non-composite miss), but the member name is absent →
+// S_UndeclaredIdentifier, never a silent wrong-but-runs access.
+TEST(SemanticAnalyzerCSubset, ShippedUnknownUnionMemberFailsLoud) {
+    ScratchDir sysDir{Location::Temp, "c34b-union-bad"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "hk2.json",
+        R"JSON({ "header": "hk2.h",
+             "typedefs": [
+                 { "name": "KeyU", "type": "union \"KeyU\" { ptr<void>, ptr<char> }" } ],
+             "unions": [ { "name": "KeyU", "fields": [
+                 { "name": "oneWordValue", "type": "ptr<void>" },
+                 { "name": "str",          "type": "ptr<char>" } ] } ] })JSON",
+        "#include <hk2.h>\n"
+        "int main(void) { KeyU u; void *p = u.noSuchMember; return p != 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "KeyU IS a composite (union member scope registered) — not a non-composite miss";
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "an unknown union member must fail loud";
 }
 
 // GOAL-2: a user decl of a name WINS over a descriptor constant of the same
@@ -3992,8 +4858,15 @@ TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
         "#include <io.h>\n"
         "int main() { puts(\"hi\"); return 0; }\n");
     ASSERT_EQ(cu->trees().size(), 1u);
-    // Two directives → two recorded descriptor paths (deduped at injection).
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 2u);
+    // Two directives resolving to the SAME descriptor → ONE recorded path
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups at RECORD time — a descriptor reached twice, whether transitively or,
+    // as here, directly-included-twice, is recorded once). The semantic injection
+    // loop's own canonical-path `readDescriptors` dedup already collapsed the
+    // second ref pre-change, so injections + diagnostics are byte-identical; only
+    // the redundant ref is no longer stored. RED-ON-DISABLE of the whole path stays
+    // the injection assertions below (puts minted exactly once).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);
@@ -4037,8 +4910,12 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
         "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     ASSERT_EQ(cu->trees().size(), 1u) << "descriptors are not parsed Trees";
-    // Six directives → six recorded paths (dup repeated); deduped at injection.
-    EXPECT_EQ(cu->shippedLibDescriptors().size(), 6u);
+    // Six directives, but `dup` is included TWICE → FIVE distinct recorded paths
+    // (D-FFI-DESCRIPTOR-INCLUDES: the import resolver's CU-wide closure visited-set
+    // dedups the repeated `dup` at RECORD time; the semantic loop's canonical-path
+    // dedup already collapsed it pre-change, so the injection result below is
+    // byte-identical — only the redundant `dup` ref is no longer stored).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 5u);
     assertNoBuilderErrors(*cu);
 
     auto model = analyze(cu);
@@ -4670,6 +5547,187 @@ TEST(SemanticAnalyzerCSubset, AtomicOnScalarNotRejectedNonLockFree) {
         << "a lock-free scalar _Atomic must be accepted (the supported case)";
 }
 
+// ★ D-CSUBSET-UINT128-TYPE (TF-C94): `_Atomic __int128` / `_Atomic unsigned __int128`
+// must FAIL LOUD with the SAME S_AtomicNonLockFree the aggregate sibling above emits.
+// This is not a new rule — it is the generalization of `isByValueClass` reaching the
+// 128-bit kinds. A 128-bit integer is MEMORY-RESIDENT (multi-limb, reached by ADDRESS),
+// so `_Atomic` on one has exactly the aggregate's problem: the qualifier is a
+// TRANSPARENT skin, the wrapped value reaches codegen, the limb emitters decompose it
+// into per-limb Load/Store, and the result is a SILENT non-atomic access that no
+// type-based belt can see. `_BitInt(128)` is included as the third row — the SAME
+// predicate decides all three, so if one is admitted they all are.
+//
+// ★ THE MEASURED ASYMMETRY, recorded because it looks like a hole and is not:
+// `_Atomic long double` compiles with ZERO diagnostics on this same build. That is
+// CORRECT under the current predicate, not an oversight — `isByValueClass` is the gate,
+// and F80/F128 are NOT `isByValueClass` (they are scalars in one FPR/x87 slot, not
+// multi-limb memory-resident values), so a `long double` never reaches the reject.
+// MEASURED, arm64:macho64-arm64-darwin-exec, one file per row:
+//     `_Atomic __int128 x;`               → 1 × S0055 (S_AtomicNonLockFree)
+//     `_Atomic unsigned __int128 y;`      → 1 × S0055
+//     `_Atomic unsigned _BitInt(128) w;`  → 1 × S0055
+//     `_Atomic long double z;`            → 0 diagnostics
+//     `_Atomic long long q;`              → 0 diagnostics
+// Whether a 16-byte `long double` genuinely IS lock-free is a separate question owned by
+// the long-double arc (D-CSUBSET-LONG-DOUBLE); it is NOT silently in scope here, and
+// changing it must be a deliberate edit to `isByValueClass`'s membership, not a
+// side-effect. Recorded so a future reader does not "fix" the asymmetry by accident.
+TEST(SemanticAnalyzerCSubset, AtomicOnWideIntegerFailsLoudNonLockFree) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"_Atomic __int128 x;\n",              "_Atomic __int128"},
+             Row{"_Atomic unsigned __int128 y;\n",     "_Atomic unsigned __int128"},
+             Row{"_Atomic unsigned _BitInt(128) w;\n", "_Atomic unsigned _BitInt(128)"}}) {
+        auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AtomicNonLockFree), 1u)
+            << "\n" << r.what << " is memory-resident (multi-limb) — _Atomic on it must "
+               "fail loud, exactly as _Atomic on an aggregate does";
+    }
+}
+
+// The NEGATIVE control that pins the MEASURED asymmetry above as a deliberate boundary
+// rather than an accident: a 16-byte `long double` is NOT `isByValueClass`, so it does
+// NOT trip the wide-integer reject. If a future edit broadened the gate from
+// "by-value class" to "bigger than a register", THIS is what would turn red first —
+// and it should, because that would be a real scope change to the long-double arc.
+TEST(SemanticAnalyzerCSubset, AtomicOnLongDoubleNotRejectedNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic long double z;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 0u)
+        << "MEASURED: _Atomic long double compiles with ZERO diagnostics — F80/F128 are "
+           "not isByValueClass, so the wide-integer reject must NOT reach them";
+}
+
+// ★★ D-CSUBSET-INT128-CONSTFOLD (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
+//
+// THE DEFECT THIS PINS. `cst_const_eval.cpp`'s Cast fold gained a 128-bit arm that
+// routes `(__int128)`/`(__uint128_t)` casts through the bignum instead of narrowing
+// them into an int64. It shipped DEAD: `semantic_analyzer.cpp`'s `resolveCastTarget`
+// had no I128/U128 row, so a 128-bit cast target fell to its `default: nullopt`, the
+// whole cast was non-foldable, and EVERY 128-bit integer constant expression refused —
+// not merely the wide ones. MEASURED before the fix (arm64:macho64-arm64-darwin-exec,
+// one file per row), each S0029 "static assertion condition is not an integer constant
+// expression":  `(__uint128_t)5 == 5`, `((__uint128_t)5 + 1) == 6`,
+// `(int)((__uint128_t)5) == 5`. Plain `5 == 5` was clean, and the `_BitInt(128)` twin
+// of the first row was ALREADY clean — that asymmetry is the whole bug.
+//
+// ★★ WHY THE DEFECT SHIPPED, and what this test does about it — THE TEST-DESIGN
+// LESSON, not a footnote. `_Static_assert` reports BOTH of its failure modes under the
+// SAME code, `S_StaticAssertFailed` (S0029): a FALSE assertion and a NON-CONSTANT
+// condition differ only in the message text. So a positive/negative `_Static_assert`
+// pair produces the IDENTICAL code in both arms, and identical outcomes were read as
+// proof that the fold worked when in fact NOTHING folded. This test therefore never
+// discriminates on S0029 alone. Its three arms have three DIFFERENT outcomes:
+//     positive  → ZERO diagnostics of any code;
+//     false     → S_StaticAssertFailed whose message says "static assertion failed"
+//                 and, asserted explicitly, does NOT say "not an integer constant
+//                 expression";
+//     truncation→ S_NonConstantArrayLength — a DIFFERENT diagnostic code entirely.
+//
+// RED-ON-DISABLE (run, then restored): delete the `case TypeKind::I128:` /
+// `case TypeKind::U128:` rows from `resolveCastTarget` and this test fails with 4
+// unexpected S_StaticAssertFailed — while `Int128WideConstantNeverTruncates...` below
+// STAYS GREEN, because a fold that never happens also never truncates. Neither test
+// alone is sufficient; that is why both exist.
+TEST(SemanticAnalyzerCSubset, Int128ConstantExpressionFolds) {
+    // Every row is TRUE, so a correct build emits nothing at all. The `__int128` rows
+    // are present because signedness is a separate resolver field (`intSigned`) from
+    // width, and a row that set the width but not the sign would still pass the
+    // unsigned rows.
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert((__uint128_t)5 == 5, \"cast to unsigned __int128\");\n"
+        "_Static_assert(((__uint128_t)5 + 1) == 6, \"arithmetic on the folded value\");\n"
+        "_Static_assert((__int128)-1 < 0, \"a signed __int128 compares SIGNED\");\n"
+        "_Static_assert(!((__uint128_t)-1 < 0), \"an unsigned one compares UNSIGNED\");\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a 128-bit integer constant expression must fold — the `_BitInt(128)` twin "
+           "of the first row already did, and the two must not disagree";
+}
+
+// The NEGATIVE control for the test above, and the reason it cannot be vacuous: a
+// 128-bit assertion that is FALSE must still FAIL, and must fail as a false assertion
+// rather than as a non-constant one. Without this row, "fold everything to true" would
+// pass the positive test.
+//
+// The message check is load-bearing, NOT decoration: both failure modes carry
+// S_StaticAssertFailed, so the code alone cannot tell "the fold ran and the answer was
+// false" from "nothing folded". Asserting the message text is the only available
+// discriminator at this tier.
+TEST(SemanticAnalyzerCSubset, Int128FalseConstantExpressionStillFailsAsAssertion) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert((__uint128_t)5 == 6, \"deliberately false\");\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const all = model.diagnostics().all();
+    std::size_t saCount = 0;
+    std::string text;
+    for (auto const& d : all) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++saCount;
+        text = d.actual;
+    }
+    ASSERT_EQ(saCount, 1u) << "a false 128-bit assertion must fail exactly once";
+    EXPECT_NE(text.find("static assertion failed"), std::string::npos)
+        << "must report a FALSE assertion; got: " << text;
+    EXPECT_EQ(text.find("is not an integer constant expression"), std::string::npos)
+        << "the condition DID fold — reporting it as non-constant would mean the "
+           "128-bit cast arm is dead again; got: " << text;
+}
+
+// ★★ THE DISQUALIFYING CASE, pinned: a 128-bit constant WIDER THAN 64 BITS must never
+// reach a 64-bit ICE slot as a truncated value. It must FAIL LOUD instead.
+//
+// This is the property that makes activating the 128-bit cast arm safe rather than a
+// hazard. The folded value rides a 128-bit `BitIntValue`, and `asInt64` nullopts for
+// `width() > 64`, so `asInt64Bridge` — the array-dimension / static-assert / enumerator
+// bridge — refuses it. MEASURED: `int a[(__uint128_t)1 << 100];` reports
+// S_NonConstantArrayLength; it never becomes a truncated bound (mod 2^64 of 2^100 is
+// ZERO, so a truncating fold would have produced a zero-length array, silently).
+//
+// The width-3 row is deliberate and is NOT redundant: it records that the refusal is
+// keyed on the value's WIDTH, not on its magnitude, so a 128-bit constant that WOULD
+// fit in 64 bits is refused too. That is exact parity with `_BitInt(128)`, which has
+// behaved this way since C4b (MEASURED: `int a[(_BitInt(128))5];` →
+// S_NonConstantArrayLength on this same build), and matching the shipped sibling is the
+// point — the residual "clang folds `(__int128)2+1` as an array bound, we do not" gap
+// belongs to `asInt64`'s width rule and is shared by BOTH 128-bit families, not
+// introduced here.
+//
+// NOTE the code: S_NonConstantArrayLength, NOT the S_StaticAssertFailed the two tests
+// above use. Different mechanism, different code — so no arm of this trio can be
+// mistaken for another.
+TEST(SemanticAnalyzerCSubset, Int128WideConstantNeverTruncatesIntoA64BitSlot) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"int a[(__uint128_t)1 << 100];\n",
+                 "2^100 — mod 2^64 is ZERO, so a truncating fold means a silent "
+                 "zero-length array"},
+             Row{"int a[(__uint128_t)3];\n",
+                 "a 128-bit value that WOULD fit in 64 bits is still refused — the "
+                 "rule is the value's WIDTH, exactly as for _BitInt(128)"},
+             Row{"int a[(__int128)3];\n",
+                 "the signed spelling refuses identically"}}) {
+        auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_NonConstantArrayLength), 1u)
+            << "\n" << r.what;
+    }
+}
+
 // The user-named combination: `_Atomic volatile int` must set BOTH bits in the ONE
 // shared skin (cycle 1a's `qualified` merges {V}+{A}). Order-independent: the
 // reverse spelling `volatile _Atomic int` resolves to the SAME interned type.
@@ -5069,20 +6127,28 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
         "int main() { int a = 2; int b = 3; a * b; return a; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
-    // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
-    // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6 FC17.9(b)
+    // main + a + b + the 3 FC12a-core builtin TYPES (__va_list_tag + va_list + the
+    // __builtin_va_list alias, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the
+    // 6 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
+    // _ReadWriteBarrier + TF-C95 __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
+    // _exception_code + _exception_info) + the 6 FC17.9(b)
     // bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
     // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.9(d) atomic
     // accessors (atomic_load_explicit + atomic_store_explicit, D-CSUBSET-ATOMIC) +
+    // the 4 FC17.9(f) complex builtins (__builtin_complex/creal/cimag/conj,
+    // D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap builtins
+    // (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + __builtin_bswap16/32/64) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 80u)
-        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
+    EXPECT_EQ(model.symbols().size() - 1, 88u)
+        << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
+           "the 6 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
+           "the 6 byte-swap builtins (_byteswap_ushort/_byteswap_ulong/"
+           "_byteswap_uint64 + __builtin_bswap16/32/64) + "
            "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 
@@ -5487,6 +6553,135 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
         << "the prototype is upgraded to a callable Function symbol";
 }
 
+// ── C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE) — a `T x;` where T is a function TYPE
+// (via a typedef) declares a function PROTOTYPE (C 6.7 / 6.9.1p2). This is
+// SQLite test_thread.c's `static Tcl_ObjCmdProc sqlthread_proc;` shape. ──
+//
+// (g) A bare function-typedef declaration + its definition MERGE — exactly like a
+// syntactic `int f(int);` proto. Zero diagnostics, one surviving Function symbol
+// (the definition; the typedef proto absorbed). RED-ON-DISABLE: revert the Pass-1
+// candidate flag + the Pass-1.5 upgrade → the bare `static Fn foo;` is minted an
+// OBJECT → S_InvalidFunctionDeclarator (S0018) at the proto AND, because the
+// object-category clashes with the Function definition, S_RedeclaredSymbol (S0002)
+// at the definition → hasErrors() flips true and countSurvivingFns drops.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "static int foo(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a function-typedef prototype + its definition must merge (C 6.9.1p2)";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u)
+        << "exactly one surviving Function symbol for foo (the definition)";
+}
+
+// (h) The test_thread shape end-to-end: the bare function-typedef proto is
+// forward-CALLED before its definition (as Tcl_CreateObjCommand takes
+// `sqlthread_proc` above its body). Zero diagnostics; the call resolves to the
+// upgraded Function symbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefPrototypeForwardCallResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "static Fn foo;\n"
+        "int use(void){return foo(41);}\n"
+        "static int foo(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward call through a function-typedef prototype is legal";
+    EXPECT_EQ(countSurvivingFns(model, "foo"), 1u);
+}
+
+// (i) FAIL-LOUD: a bare typedef-headed object whose type is NOT a function still
+// collides with a same-name function definition. `MyInt foo;` (a real object) then
+// `int foo(int){…}` is a genuine object-vs-function clash — the Pass-1 optimistic
+// merge is a CANDIDATE only; the post-1.5 sweep sees `foo`'s type is not a FnSig
+// and emits the DEFERRED, PRECISE S_RedeclaredSymbol. RED-ON-DISABLE: drop the
+// post-1.5 non-FnSig re-check → the clash STILL fails loud, but via the generic
+// type-compat check as S_IncompatibleRedeclaration instead — so the specific
+// S_RedeclaredSymbol count drops to 0 and this assertion flips red. Exactly one
+// S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, FnTypedefObjectVsFunctionCollisionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyInt;\n"
+        "MyInt foo;\n"
+        "int foo(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef-OBJECT redeclared as a function must fail loud (S0002), not "
+           "be silently accepted as a prototype";
+}
+
+// (j) FAIL-LOUD (no over-broadening): a function-TYPED struct FIELD is not a
+// prototype (a field can never be a function) — it still rejects with
+// S_InvalidFunctionDeclarator. Pass 1 flags ONLY object-declaration rows as
+// candidates, never a struct field, so the S0018 fail-loud is preserved.
+TEST(SemanticAnalyzerCSubset, FnTypedefFunctionTypedStructFieldRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "struct S { Fn f; };\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u)
+        << "a function-typed struct field is not a prototype and must fail loud";
+}
+
+// (k) A function-POINTER OBJECT (`Fn *fp;` — a decorated declarator) is NOT a
+// prototype candidate: its declared type is Ptr<FnSig>, not FnSig. It stays a data
+// object, so a same-name function is a genuine (immediate) collision. Pins that the
+// candidate detection excludes decorated declarators (a star), never treating a
+// function-pointer global as a function.
+TEST(SemanticAnalyzerCSubset, FnTypedefPointerObjectIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn *fp;\n"
+        "int fp(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a function-pointer object redeclared as a function is a collision";
+}
+
+// (l) FAIL-LOUD (F2 hardening): an illegal function-returning-function whose
+// fn-suffix hides behind a redundant-paren group (`Fn (f)(int);` — C 6.7.6.3p1) is
+// NOT a bare prototype. The multi-level UPWARD walk in `declaratorIsUndecoratedName`
+// sees the group-enclosing `directRule`'s `(int)` suffix and rejects the candidate,
+// so the declaration takes the normal path and fails loud
+// (S_InvalidFunctionDeclarator). RED-ON-DISABLE: revert the walk to the single-level
+// check → the group-wrapped suffix escapes → `f` is mis-flagged a candidate, upgraded
+// to a Function proto, and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
+TEST(SemanticAnalyzerCSubset, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (f)(int);\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an illegal function-returning-function (fn-suffix behind a group) must "
+           "fail loud, never be silently accepted as a prototype";
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u);
+}
+
+// (m) A redundant grouping paren that adds NO suffix (`Fn (g);` ≡ `Fn g;`) is still
+// an undecorated bare declarator, so it remains a valid function-typedef prototype
+// and MERGES with its definition. Pins that the upward walk ADMITS pure grouping
+// (rejecting only a group that CARRIES a decoration, as in (l)) — a walk that
+// blanket-rejected any group would spuriously fail this legal proto.
+TEST(SemanticAnalyzerCSubset, FnTypedefRedundantParenGroupIsAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "Fn (g);\n"
+        "int g(int x){return x + 1;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a redundant-paren bare declarator is still a prototype (no suffix)";
+    EXPECT_EQ(countSurvivingFns(model, "g"), 1u);
+}
+
 // FC16 (D-CSUBSET-NORETURN): the surviving Function symbol named `name` is
 // noreturn (its `isNoreturn` bit). Mirrors `countSurvivingFns` — the `!isAbsorbedProto`
 // filter isolates the single callable record a call resolves to.
@@ -5519,6 +6714,989 @@ TEST(SemanticAnalyzerCSubset, NoreturnProtoMergesIntoDefinition) {
     EXPECT_EQ(countSurvivingFns(model, "die"), 1u);
     EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
         << "the _Noreturn on the proto must OR-merge into the surviving definition";
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the surviving Function symbol
+// named `name` carries the C99 6.7.4p7 inline-definition reading. The
+// `survivingFnIsNoreturn` mirror — the `!isAbsorbedProto` filter isolates the
+// single callable record CST→HIR consults when it decides whether to emit a
+// body at all.
+[[nodiscard]] inline bool
+survivingFnIsInline(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            return r.isInline;
+        }
+    }
+    return false;
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the C99 6.7.4p7 truth table at
+// the APPLIED-FACT tier — one case per DECLARATION SHAPE, each asserting the
+// bit CST→HIR actually reads rather than "the file compiled".
+//
+// ★ EVERY EXPECTATION BELOW IS GROUND TRUTH FROM A REAL TOOLCHAIN, not from
+// reading the standard. Each row was MEASURED with
+// `/usr/bin/clang -std=c99 -O0 -c <case>.c` followed by `nm`: an inline
+// definition shows `_p` UNDEFINED, an external definition shows `T _p`, and an
+// internal one shows `t _p`. `isInline == true` is exactly the `U _p` column.
+//
+// ★★ ROWS (c) AND (d) ARE THE AND-MERGE PINS, and they are why this table
+// exists as a table. 6.7.4p7 quantifies over ALL file-scope declarations —
+// "if ALL of the file scope declarations ... include the inline function
+// specifier without extern" — so the proto/def merge is an AND. Every other
+// flag on SymbolRecord merges with OR, and an OR here would invert BOTH of
+// these rows while leaving (a), (b) and (g) green: the two commonest real
+// shapes would silently stop being emitted. Row (e) is the same quantifier
+// reached through `extern` instead of through a missing `inline`, and row (f)
+// pins the scanner's own without-extern clause.
+TEST(SemanticAnalyzerCSubset, InlineDefinitionFollowsC99Quantifier) {
+    // (a) the lone inline definition — no other declaration to cancel it.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "a lone `inline` definition IS an inline definition (clang: U _p)";
+    }
+    // (b) every declaration inline — the quantifier still holds.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "all-inline declarations keep the inline definition (clang: U _p)";
+    }
+    // (c) ★ inline PROTOTYPE + plain definition — the quantifier fails.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"inline int p(int x);\n"
+                                     "int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "one plain declaration restores the external definition "
+               "(clang: T _p) — an OR-merge would wrongly report true here";
+    }
+    // (d) ★ plain prototype + inline definition — the same, other order.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "declaration ORDER must not change the quantifier (clang: T _p)";
+    }
+    // (e) ★ an `extern` declaration cancels it — the silent-halfway-state pin.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"extern int p(int x);\n"
+                                     "inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "a co-present extern declaration promotes the definition "
+               "(clang: T _p) — losing this is the one SILENT failure mode";
+    }
+    // (f) ★ `extern inline` on the definition itself — 6.7.4p7's exemption,
+    // caught by the scanner's own without-extern clause rather than by a merge.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"extern inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << "`extern inline` DOES provide the external definition "
+               "(clang: T _p)";
+    }
+    // (g) `static inline` — the flag is set; internal linkage is what keeps the
+    // body emitted (6.7.4p6), and that gate lives at the HIR binding check, not
+    // here. Pinning true rather than false keeps the two concerns separable.
+    {
+        auto model = analyzeShipped("c-subset",
+                                    {"static inline int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << "static inline records the specifier; the Local binding is what "
+               "keeps it emitted (clang: t _p)";
+    }
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): `inline`, `__inline` and
+// `__inline__` are ONE token kind and therefore one meaning.
+//
+// The synonym claim is not a style assertion — it is the reason the keyword
+// table maps three words to a single kind instead of forking a GNU dialect.
+// MEASURED: `/usr/bin/clang -std=c99 -O0 -c` gives `__inline int p(int){…}` the
+// same `U _p` symbol state as the C99 spelling. RED-ON-DISABLE: give `__inline`
+// its own kind and it stops reaching `semantics.inline.keywordToken`, so these
+// two flip to false while the `inline` row above stays green — exactly the
+// silent split the single kind exists to prevent.
+TEST(SemanticAnalyzerCSubset, InlineGnuSpellingsAreSynonyms) {
+    for (std::string_view spelling : {"__inline", "__inline__"}) {
+        auto model = analyzeShipped(
+            "c-subset", {std::string(spelling) + " int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors()) << spelling;
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << spelling << " must mean exactly what `inline` means";
+    }
+}
+
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): C99 6.7.4p1 confines the
+// specifier to "the declaration of a function", so `inline` on an OBJECT is a
+// constraint violation and must be LOUD.
+//
+// ★ WHY LOUD RATHER THAN INERT, unlike a stray `_Noreturn`. On a function this
+// specifier decides whether the definition is emitted at all; silently ignoring
+// it on a non-function would be a specifier the compiler parsed and honored
+// nowhere — D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP at the declaration tier.
+// The LINKAGE tier cannot raise it (it sees the keyword but not the declared
+// type), which is why the keyword is ignored-by-kind there and reported here.
+TEST(SemanticAnalyzerCSubset, InlineOnNonFunctionIsLoud) {
+    auto model = analyzeShipped("c-subset", {"inline int gv = 5;\n"});
+    EXPECT_TRUE(model.hasErrors())
+        << "`inline` on an object must not be silently ignored";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineNonFunction), 1u);
+}
+
+// ── TF-C81 (D-CSUBSET-ALWAYSINLINE): the CONTRADICTION gate ───────
+//
+// `always_inline` and `noinline` on one function are exact opposites: one
+// forbids splicing the callee, the other exists solely to force splicing past
+// the cost model. Exactly one can take effect and which one is invisible at the
+// source, so DSS FAILS LOUD instead of picking.
+//
+// ★ THIS IS A DELIBERATE DIVERGENCE FROM CLANG, AND IT IS MEASURED, NOT
+// ASSUMED. Apple clang 21.0.0 was probed on all four shapes at
+// `-fsyntax-only -Wall -Wextra` AND at `-O2 -Weverything`: it emits NO
+// diagnostic whatsoever and SILENTLY resolves the conflict to `noinline` (the
+// emitted LLVM function carries `noinline`, never `alwaysinline`, in BOTH source
+// orders). That silent resolution is exactly the last-writer-wins outcome this
+// project refuses. The MIR tier keeps clang's answer as a conservative backstop
+// (inlining.cpp checks the noinline refusal before the threshold bypass), but a
+// source program that states both never gets that far.
+//
+// Diagnostic SETS, never bare counts: each case asserts the conflict code fires
+// exactly once AND that no unrelated error rides along.
+TEST(SemanticAnalyzerCSubset, AlwaysInlineWithNoInlineOnOneDeclarationIsLoud) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"static __attribute__((always_inline)) __attribute__((noinline)) "
+         "int f(int x){return x+1;}\n"
+         "int main(void){return f(41);}\n"});
+    EXPECT_TRUE(model.hasErrors())
+        << "two contradictory inline directives must not be silently resolved";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConflictingInlineAttributes), 1u);
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "exactly ONE diagnostic — the conflict, and nothing else";
+}
+
+// The same contradiction SPLIT across a prototype and its definition. Each
+// declaration alone is consistent; only the post-Pass-1.5 `mergedFnDecls` sweep
+// can see it.
+//
+// ★ RED-ON-DISABLE, AND THIS ONE ACTUALLY FIRED DURING THE CYCLE: the gate was
+// first written AFTER the `noInline` OR-merge, which had already written the
+// unioned flag into BOTH records — so the survivor looked like it had spelled
+// both attributes itself, the "already reported" suppression triggered, and the
+// split conflict was silently accepted (MEASURED: exit 0, no diagnostic). Moving
+// the gate ABOVE both OR-merges, where the two records are still pristine, is
+// what makes it fire. Reordering it back below them turns this test red.
+TEST(SemanticAnalyzerCSubset, AlwaysInlineWithNoInlineAcrossDeclarationsIsLoud) {
+    for (auto const* src : {
+             // noinline on the prototype, always_inline on the definition
+             "static __attribute__((noinline)) int f(int x);\n"
+             "static __attribute__((always_inline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // …and the opposite order, which must be equally loud
+             "static __attribute__((always_inline)) int f(int x);\n"
+             "static __attribute__((noinline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_TRUE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 1u)
+            << "the split contradiction must fire EXACTLY once, in either "
+               "declaration order";
+        EXPECT_EQ(model.diagnostics().all().size(), 1u);
+    }
+}
+
+// One mistake, one diagnostic: a declaration carrying BOTH attributes that ALSO
+// has a prototype must not be reported twice (once at the declarator, once at
+// the merge). This is what the `already` suppression in the merge sweep buys.
+TEST(SemanticAnalyzerCSubset, ConflictingInlineAttributesReportedExactlyOnce) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"static int f(int x);\n"
+         "static __attribute__((always_inline)) __attribute__((noinline)) "
+         "int f(int x){return x+1;}\n"
+         "int main(void){return f(41);}\n"});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConflictingInlineAttributes), 1u)
+        << "the declarator check and the merge check must not BOTH fire for a "
+           "single mistake";
+    EXPECT_EQ(model.diagnostics().all().size(), 1u);
+}
+
+// The NEGATIVE control for the whole conflict suite: each attribute ALONE, and
+// both present on DIFFERENT functions, must be completely clean. Without this a
+// gate that fired on the mere presence of either attribute would pass every
+// test above.
+TEST(SemanticAnalyzerCSubset, EitherInlineAttributeAloneIsClean) {
+    for (auto const* src : {
+             "static __attribute__((always_inline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             "static __attribute__((noinline)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // both attributes present, but on DIFFERENT functions
+             "static __attribute__((always_inline)) int a(int x){return x+1;}\n"
+             "static __attribute__((noinline)) int b(int x){return x+2;}\n"
+             "int main(void){return a(1)+b(2);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "a single inline directive — or two on DIFFERENT functions — "
+               "is not a conflict";
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 0u);
+    }
+}
+
+// ══ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the SYMBOL-TIER facts ═══════════════
+//
+// The downstream hops (HirNoSanitizeThreadMap → MirFunc → `.dssir` text) are pinned
+// in tests/mir; these three pin the SOURCE-TIER contract at the record itself, where
+// a failure is localized to the fold/apply/merge rather than to lowering.
+//
+// ★ THE OR-MERGE IS ASSERTED ON **BOTH** RECORDS, and that is not belt-and-braces.
+// A call resolves to the DEFINITION (the survivor), so the load-bearing direction is
+// INTO the survivor — but the merge writes both, and `mergedFnDecls` order is not a
+// property a test should depend on. Asserting both makes the pin order-independent.
+//
+// RED-ON-DISABLE: delete the `isNoSanitizeThread` OR-merge block from the
+// `mergedFnDecls` sweep in semantic_analyzer.cpp and the prototype-only case below
+// leaves the DEFINITION's record false — which is exactly the shape that would ship
+// a silently unrecorded exclusion for the ordinary header/impl split.
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOrMergesAcrossPrototypeAndDefinition) {
+    for (auto const* src : {
+             // spelled on the PROTOTYPE only — the glibc-style header/impl split
+             "static int f(int x) __attribute__((no_sanitize_thread));\n"
+             "static int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n",
+             // …and on the DEFINITION only, which must merge the other way
+             "static int f(int x);\n"
+             "static __attribute__((no_sanitize_thread)) int f(int x){return x+1;}\n"
+             "int main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "the attribute alone is not an error: "
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        int marked = 0;
+        int named  = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            if (model.symbols()[i].name != "f") continue;
+            ++named;
+            if (model.symbols()[i].isNoSanitizeThread) ++marked;
+        }
+        ASSERT_GT(named, 0) << "the fixture must declare `f`";
+        EXPECT_EQ(marked, named)
+            << "EVERY record for `f` must carry the exclusion after the "
+               "proto/definition OR-merge — the definition is what HIR→MIR stamps "
+               "from, so a merge that only marks the spelling side loses the fact";
+    }
+}
+
+// ★★★ TF-C92 → **FLIPPED BY TF-C93**
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT). This test was written to PIN
+// THE SILENCE while naming it wrong, with in-code instructions to flip rather than
+// delete it. That is what happened: the fixture is byte-identical, the
+// records-nothing loop is VERBATIM, and only the diagnostic expectation moved from
+// "nothing at all" to "exactly one `S_AttributeIgnoredForDeclarationKind` Warning".
+//
+// ★★ THE FLIP HAD TO BE ASSERTED POSITIVELY, AND THAT IS THE POINT OF THE TEST —
+// MEASURED. The new diagnostic is a WARNING, so `EXPECT_FALSE(model.hasErrors())`
+// still passes with it present: this test STAYED GREEN through the entire engine
+// change. A "flip" that only relaxed the old assertion would have shipped looking
+// verified while proving nothing. Hence the exact-code assertion below, and hence
+// the severity assertion beside it: a count-only check would also pass if
+// `S_UnknownAttribute` or `S_InlineNonFunction` fired instead, and a code-only check
+// would pass if a later cycle quietly promoted the code to an Error.
+//
+// ★ THE `EXPECT_FALSE(isNoSanitizeThread)` LOOP IS KEPT VERBATIM ON PURPOSE. The
+// gate REPORTS; the `isFnSig &&` guard in the apply still REFUSES. A diagnostic that
+// ALSO recorded the flag would be a WORSE bug than the silence — a data-object
+// symbol carrying a codegen directive no consumer can honor — so both halves are
+// asserted together, in one test, and neither can be satisfied by breaking the
+// other.
+//
+// WHAT BREAKS THIS: deleting `appliesTo` from the `no_sanitize_thread` effects row
+// (the LOADER refuses the config, so the whole suite goes red — the coupling is
+// mechanical); deleting the decl-kind gate loop in semantic_analyzer.cpp (the
+// diagnostic count drops to 0 while the loop below stays green); dropping the
+// `isFnSig &&` guard from the apply (the loop below goes red while the diagnostic
+// stays).
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadOnDataObjectWarnsAndRecordsNothing) {
+    auto model = analyzeShipped(
+        "c-subset",
+        {"__attribute__((no_sanitize_thread)) int gv = 7;\n"
+         "int main(void){return gv;}\n"});
+    EXPECT_FALSE(model.hasErrors())
+        << "the decl-kind gate is a WARNING, not an error — clang treats the "
+           "sibling axes as -Wignored-attributes warnings and "
+           "--warnings-as-errors is the strict posture: "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "exactly ONE ignored-for-kind diagnostic, asserted BY CODE — a bare "
+           "count would also pass if S_UnknownAttribute or S_InlineNonFunction "
+           "fired instead, and `hasErrors()` cannot see a Warning at all";
+    std::size_t warnings = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+            continue;
+        if (d.severity == DiagnosticSeverity::Warning) ++warnings;
+        EXPECT_NE(d.actual.find("no_sanitize_thread"), std::string::npos)
+            << "the message must NAME the attribute the author has to move: "
+            << d.actual;
+        EXPECT_NE(d.actual.find("variable"), std::string::npos)
+            << "…and the KIND it was found on, so the author can see why: "
+            << d.actual;
+    }
+    EXPECT_EQ(warnings, 1u)
+        << "the severity is part of the contract, not incidental — see the "
+           "measured grounds on S_AttributeIgnoredForDeclarationKind";
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        EXPECT_FALSE(model.symbols()[i].isNoSanitizeThread)
+            << "no symbol may carry the flag when the only annotated declaration "
+               "is a data object — symbol '" << model.symbols()[i].name << "'";
+    }
+}
+
+// ── ★★★ TF-C93: THE DECL-KIND MATRIX — ALL FOUR AXES × EVERY ENTITY KIND ──────
+//
+// (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT.) The registry row called this
+// a SYSTEMIC class and asked for ONE shared gate rather than a per-attribute fix, so
+// the evidence has to be a MATRIX rather than one probe per cycle: a table-driven
+// sweep is the only shape in which "we forgot an axis" is visible.
+//
+// ★ THE SQLITE CORPUS PROVES NOTHING HERE — MEASURED, ZERO corpus impact (the
+// attribute appears in sqlite only in the FUNCTION position, which is exactly the
+// position that must stay silent). These tests are the sole evidence.
+//
+// ★★ THE CLASS MEMBERSHIP IS **FOUR** AXES ACROSS **FIVE** CONFIG ROWS, AND NOT THE
+// FOUR THE REGISTRY ROW FIRST NAMED. Among the attribute-EFFECT verbs, exactly
+// `noInline`, `alwaysInline` and `noSanitizeThread` discard on `isFnSig &&` (that
+// grep also finds `isFnSig` gates for `noreturn`, `inline` and `isNoOptimize`, which
+// are SPECIFIER scans, not rows of this table — membership is decided per axis by
+// whether the row's own sink discards on kind, never by counting grep hits).
+// `aligned` is NOT a member — no such gate, its sink discriminates by kind itself,
+// and it is the NEGATIVE CONTROL here. The `warnOnDiscard` axis IS a member and was
+// missed: MEASURED at HEAD 199fe7d, `int gw1 __attribute__((warn_unused_result)) = 1;`
+// compiled clean with ZERO diagnostics where clang warns, because the apply has no
+// kind gate at all and the flag landed on an object `checkCall` can never consult.
+//
+// ★ THAT AXIS IS **TWO ROWS**, WHICH IS WHY THE ROW COUNT EXCEEDS THE AXIS COUNT.
+// `nodiscard` and `warn_unused_result` share the verb but NOT the applicable-kind
+// set — the standard spelling is function-only per C23 6.7.13.3, the GNU spelling
+// also applies to typedefs per clang's own applicability text. Collapsing them into
+// one row is what produced this cycle's false positive; see `kDeclKindAxes`.
+namespace {
+// ★★ ONE ROW OF THE MATRIX — AND IT DECLARES THE **KIND SET**, NOT A PER-TEST
+// VERDICT. Each position test below DERIVES its expectation from this set: the
+// shared gate warns exactly when the position's `DeclarationKind` is ABSENT from the
+// row's `appliesTo`. One per-axis fact therefore drives all three position tests,
+// every column is READ, and a config change that is not mirrored here goes RED.
+//
+// ⚠ THIS SHAPE IS A CORRECTION, AND THE SHAPE IT REPLACES BENT THE CONFIG — recorded
+// because a test that manufactures the fact it checks is the failure mode this whole
+// file exists to prevent. The first draft carried a single `bool appliesToFn`, set on
+// all nine rows and NEVER READ, while the typedef pin below (then named
+// `…MatrixTypedefWarns`, renamed `…MatrixTypedefWarnsPerAxis` because the old name
+// asserted the fiction) demanded a warning from ALL NINE axes — i.e. UNIFORMITY
+// instead of truth per axis. `appliesTo` for `warn_unused_result` was then narrowed
+// to `["function"]` to satisfy it, and DSS began emitting `warning[S005F]` on
+// `typedef __attribute__((warn_unused_result)) int T;` — MEASURED clang-clean. A
+// matrix may assert uniformity ONLY where the axes are genuinely uniform; everywhere
+// else the expectation has to travel with the row.
+struct DeclKindAxis {
+    char const* attr;          // the spelling written into the fixture
+    bool        appliesToVar;  // is `variable` in this row's `appliesTo`?
+    bool        appliesToFn;   // …`function`?
+    bool        appliesToType; // …`type`?
+};
+
+// The four axes, in BOTH the bare and the dunder spelling. The effects table is
+// dunder-normalized (ONE row covers both), and that is asserted rather than assumed
+// — a future revision that keyed on raw text would silently lose every `__x__` form.
+//
+// ★ `warn_unused_result` IS THE ONE AXIS THAT DIFFERS, AND IT DIFFERS FROM ITS OWN
+// C23 SIBLING. clang's applicability text ENUMERATES typedefs among the valid
+// positions for the GNU spelling (MEASURED: zero diagnostics on all three typedef
+// forms), while C23 6.7.13.3 confines `nodiscard` to a function / struct / union /
+// enum declaration and clang refuses the object form for both. Two names, ONE
+// effect, TWO applicability sets — which is why the shipped config gives them
+// SEPARATE rows and why this column has to exist.
+constexpr DeclKindAxis kDeclKindAxes[] = {
+    //  spelling                    var    fn    type
+    {"noinline",                   false, true, false},
+    {"__noinline__",               false, true, false},
+    {"always_inline",              false, true, false},
+    {"__always_inline__",          false, true, false},
+    {"no_sanitize_thread",         false, true, false},
+    {"__no_sanitize_thread__",     false, true, false},
+    {"warn_unused_result",         false, true, true },
+    {"__warn_unused_result__",     false, true, true },
+    {"nodiscard",                  false, true, false},
+};
+
+// Exactly-one-warning-of-this-code, with the severity checked. Returns the count so
+// the caller can `EXPECT_EQ` — no `ASSERT_*` in a non-void helper (CI hazard).
+[[nodiscard]] std::size_t ignoredForKindWarnings(SemanticModel const& m) {
+    std::size_t n = 0;
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_AttributeIgnoredForDeclarationKind
+            && d.severity == DiagnosticSeverity::Warning) {
+            ++n;
+        }
+    }
+    return n;
+}
+} // namespace
+
+// AXIS × FUNCTION — every one of the four must stay SILENT where the attribute
+// genuinely applies. This is the anti-over-broad half, and it is what a gate written
+// as "warn whenever the flag is dropped" would fail: the function position is the one
+// sqlite actually uses (`wal.c:942`, `:2590`).
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixFunctionPositionStaysSilent) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        // Definition AND prototype: the two function shapes reach the gate by
+        // different routes (`isFunctionForm` vs `isFnSig`), and the extracted
+        // effective-kind predicate has to answer `Function` for both.
+        for (auto const* shape : {"static __attribute__(({})) int f(int x)"
+                                  "{{return x+1;}}\nint main(void){{return f(1);}}\n",
+                                  "__attribute__(({})) int f(int);\n"
+                                  "int f(int x){{return x+1;}}\n"
+                                  "int main(void){{return f(1);}}\n"}) {
+            auto const src = std::vformat(
+                shape, std::make_format_args(ax.attr));
+            SCOPED_TRACE(src);
+            auto m = analyzeShipped("c-subset", {src});
+            EXPECT_FALSE(m.hasErrors())
+                << (m.diagnostics().all().empty()
+                        ? "" : m.diagnostics().all()[0].actual);
+            EXPECT_EQ(ignoredForKindWarnings(m),
+                      ax.appliesToFn ? 0u : 1u)
+                << "the FUNCTION position is where these attributes BELONG — a "
+                   "gate that fires here refuses valid C (and, for the three "
+                   "FnSig-gated verbs, the exact shape sqlite writes). Derived "
+                   "from the row's declared kind set, so this stays honest if a "
+                   "future axis is NOT function-applicable";
+        }
+    }
+}
+
+// AXIS × DATA OBJECT — the defect. Every axis must WARN, exactly once, and the flag
+// must still NOT be recorded (report-and-refuse, never report-and-accept).
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixDataObjectWarns) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        auto const src = std::vformat(
+            "__attribute__(({})) int gv = 7;\nint main(void){{return gv;}}\n",
+            std::make_format_args(ax.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << "a WARNING, so no program that compiled before stops compiling: "
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m),
+                  ax.appliesToVar ? 0u : 1u)
+            << "MEASURED silent at HEAD 199fe7d — exactly one warning now. NO axis "
+               "declares `variable`, so every row is expected loud here; the "
+               "expectation is still DERIVED so that adding an object-applicable "
+               "axis cannot silently turn this into a false positive";
+        for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+            EXPECT_FALSE(m.symbols()[i].isNoInline)
+                << "the report must not also RECORD the flag: " << ax.attr;
+            EXPECT_FALSE(m.symbols()[i].isAlwaysInline) << ax.attr;
+            EXPECT_FALSE(m.symbols()[i].isNoSanitizeThread) << ax.attr;
+        }
+    }
+}
+
+// AXIS × TYPEDEF — the position `linkageFrom` never reached (a `typedefDecl`
+// declares no `linkageSpecifiers`, so the loud linkage gate early-returns), which is
+// why it was silent for every axis and is asserted separately from the object case.
+//
+// ★★ THIS IS THE TEST THAT USED TO ASSERT A FICTION, AND THE SPLIT IS WHAT IT
+// MEASURES NOW. It previously demanded a warning from ALL NINE axes; that uniformity
+// is FALSE, and satisfying it is what narrowed `warn_unused_result`'s `appliesTo`
+// until DSS diagnosed clang-clean C. The expectation is now DERIVED per axis:
+//   • the six FnSig-gated spellings + `nodiscard`  → LOUD (typedef is out of bounds)
+//   • `warn_unused_result` / `__warn_unused_result__` → SILENT, because clang's own
+//     applicability list names typedefs and MEASURED emits nothing there.
+// The silent arm is the load-bearing one: re-narrow that row and this test goes RED
+// rather than quietly re-blessing the false positive.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixTypedefWarnsPerAxis) {
+    for (auto const& ax : kDeclKindAxes) {
+        SCOPED_TRACE(ax.attr);
+        auto const src = std::vformat(
+            "typedef __attribute__(({})) int T;\n"
+            "int main(void){{T x = 0; return x;}}\n",
+            std::make_format_args(ax.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        std::size_t const want = ax.appliesToType ? 0u : 1u;
+        EXPECT_EQ(ignoredForKindWarnings(m), want)
+            << (ax.appliesToType
+                    ? "this spelling IS typedef-applicable (clang enumerates "
+                      "typedefs and MEASURED emits nothing) — a warning here is "
+                      "the FALSE POSITIVE this row's split exists to remove"
+                    : "the typedef position must warn for this spelling — the gate "
+                      "reads the effective DeclarationKind (Type here), not just "
+                      "'is it a FnSig'");
+        if (want == 0u) continue;
+        for (auto const& d : m.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+                continue;
+            EXPECT_NE(d.actual.find("type"), std::string::npos)
+                << "and it must SAY 'type', so the author is not left guessing "
+                   "which entity the compiler thinks it saw: " << d.actual;
+        }
+    }
+}
+
+// ★★ THE TYPEDEF SILENCE IS **NOT** VACUOUS — the two spellings must diverge on the
+// SAME declaration shape, or the arm above could pass because the gate stopped
+// working for typedefs altogether. This pins the DIVERGENCE itself: one row's name
+// silent, the other's loud, same position, same fixture shape. It is also the
+// red-on-disable witness for the row split — merge the two rows back under either
+// `appliesTo` and exactly one of these two expectations fails.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindTypedefSplitsTheTwoDiscardSpellings) {
+    struct Case { char const* attr; std::size_t want; char const* why; };
+    for (Case const c : {
+             Case{"warn_unused_result", 0u,
+                  "the GNU spelling applies to a typedef (clang: zero diagnostics "
+                  "on all three typedef forms, MEASURED)"},
+             Case{"nodiscard", 1u,
+                  "C23 6.7.13.3 confines the standard spelling to a function / "
+                  "struct / union / enum declaration, so a typedef is out of "
+                  "bounds and must stay loud"}}) {
+        SCOPED_TRACE(c.attr);
+        auto const src = std::vformat(
+            "typedef __attribute__(({})) int T;\n"
+            "int main(void){{T x = 0; return x;}}\n",
+            std::make_format_args(c.attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), c.want) << c.why;
+    }
+    // …and the OBJECT position stays loud for BOTH, so the split narrowed exactly
+    // one position and did not quietly disarm the axis it was meant to keep.
+    for (auto const* attr : {"warn_unused_result", "nodiscard"}) {
+        SCOPED_TRACE(attr);
+        auto const src = std::vformat(
+            "int gw __attribute__(({})) = 1;\nint main(void){{return gw;}}\n",
+            std::make_format_args(attr));
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "clang warns -Wignored-attributes on the object form for BOTH "
+               "spellings (MEASURED) — widening either row to `variable` would "
+               "silence a real misuse";
+    }
+}
+
+// ★★ THE NEGATIVE CONTROL — `aligned(16)`. It is NOT a member of the class and the
+// shared gate must stay SILENT for it in every position, because its own sink is the
+// SOLE authority on that axis and already discriminates by kind:
+//   * FUNCTION  → already LOUD, `error[S002F]` (S_AlignasInvalidContext, and that
+//                 code is UNSUPPRESSABLE). If `appliesTo` omitted "function" the one
+//                 mistake would DOUBLE-REPORT: this cycle's warning PLUS that error.
+//   * OBJECT    → SILENT and HONORED (`explicitAlignment` is set) — correct C, and
+//                 the case that proves the gate is not a blanket "attribute on an
+//                 object" warning.
+//   * TYPEDEF   → a GRADED judgement, unchanged by this cycle.
+// Its `appliesTo` therefore lists every kind its sink judges, which is a deliberate
+// statement about the SINK, not about the attribute's C semantics.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixAlignedIsTheNegativeControl) {
+    {   // OBJECT: silent, honored.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((aligned(16))) int ga = 7;\n"
+             "int main(void){return ga;}\n"});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "`aligned` on an object is CORRECT C and is honored — a warning "
+               "here means the gate widened into 'any attribute on an object'";
+        bool honored = false;
+        for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+            if (m.symbols()[i].name == "ga"
+                && m.symbols()[i].explicitAlignment.has_value()
+                && *m.symbols()[i].explicitAlignment == 16u) {
+                honored = true;
+            }
+        }
+        EXPECT_TRUE(honored)
+            << "and the value must still REACH the symbol — the negative control "
+               "is worthless if the attribute stopped working";
+    }
+    {   // FUNCTION: the shipped unsuppressable error, and ONLY it.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((aligned(16))) int fa(void);\n"
+             "int main(void){return fa();}\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_AlignasInvalidContext), 1u)
+            << "the shipped S002F refusal is the sole authority on this axis";
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "and it must not be JOINED by the shared warning — one mistake, "
+               "one diagnostic. This is what `appliesTo` listing 'function' buys";
+    }
+    {   // EXTERN position: MEASURED reachable, same single-diagnostic property.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"extern int fe1(void) __attribute__((aligned(16)));\n"
+             "int main(void){return 0;}\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_AlignasInvalidContext), 1u)
+            << "the externDecl row is REACHABLE for this axis (MEASURED) — it is "
+               "not a position the gate may quietly skip";
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u);
+    }
+}
+
+// ★★ A FUNCTION-POINTER OBJECT — `dk == Variable` while `isFnSig == false`, because
+// the declared type is `Ptr<FnSig>` and not `FnSig`. This is the exact distinction
+// D-CSUBSET-NORETURN's F1 pin exists for, and it is the case where a gate written as
+// "warn when `!isFnSig`" and a gate written as "warn when the effective kind is not
+// in `appliesTo`" happen to agree — so it is pinned to keep them agreeing after the
+// next reshape of the effective-kind predicate.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindFunctionPointerObjectWarns) {
+    auto m = analyzeShipped(
+        "c-subset",
+        {"typedef int(*fp)(int);\n"
+         "__attribute__((no_sanitize_thread)) fp g = 0;\n"
+         "int main(void){return g == 0;}\n"});
+    EXPECT_FALSE(m.hasErrors())
+        << (m.diagnostics().all().empty()
+                ? "" : m.diagnostics().all()[0].actual);
+    EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+        << "a POINTER to function is an OBJECT — the attribute cannot apply to it, "
+           "and `Ptr<FnSig>` is not `FnSig`";
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+            continue;
+        EXPECT_NE(d.actual.find("variable"), std::string::npos) << d.actual;
+    }
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        EXPECT_FALSE(m.symbols()[i].isNoSanitizeThread)
+            << "…and nothing records the flag";
+}
+
+// ★★ THE SAME `Ptr<FnSig>` SHAPE, THE `warn_unused_result` SPELLING — AND HERE THE
+// WARNING IS A **FALSE POSITIVE**. This test PINS A KNOWN DIVERGENCE FROM CLANG; it
+// is NOT an assertion that the behaviour is correct.
+//
+//   [[D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT]]
+//
+// ⚠ READ THE CONTRAST WITH THE TEST DIRECTLY ABOVE BEFORE TOUCHING EITHER. Both feed
+// a function-POINTER OBJECT (`dk == Variable`, `isFnSig == false`). They differ in the
+// REFERENCE behaviour, MEASURED with `/usr/bin/clang -std=c23 -Wall -Wextra`:
+//   * `no_sanitize_thread` on that shape → clang HARD-ERRORS ("'no_sanitize_thread'
+//     attribute only applies to functions"), so the test above asserts a warning DSS
+//     is RIGHT to emit;
+//   * `warn_unused_result` on that shape → clang is **SILENT**, and it does not merely
+//     tolerate the attribute, it HONORS it: through a call on such a pointer clang
+//     warns `-Wunused-result` while DSS says nothing at the call. clang's own
+//     applicability text — quoted verbatim in the shipped row — lists "function
+//     pointers" among the valid positions.
+// So DSS is wrong in BOTH directions on this one shape: a false positive at the
+// declaration AND a false negative at the call. Both halves are pinned below.
+//
+// ⚠⚠ NOT FIXABLE BY WIDENING `appliesTo`, WHICH IS WHY THIS IS A PIN AND NOT A FIX.
+// A function-pointer object is `DeclarationKind::Variable` — the SAME kind as the
+// plain `int gw1 __attribute__((warn_unused_result)) = 1;` that clang genuinely DOES
+// warn about (MEASURED, `-Wignored-attributes`). Adding `variable` to the row would
+// silence the CORRECT case along with the incorrect one, so the 4-value
+// `DeclarationKind` vocabulary cannot express clang's rule at all; closing it needs a
+// 5th spelling (e.g. `functionPointer`). Asserting BOTH cases side by side in one test
+// is what makes that inexpressibility OBSERVABLE rather than merely argued.
+//
+// ★ WHEN THE REGISTRY ROW CLOSES, **FLIP** THESE EXPECTATIONS — do not delete the
+// test. A silent fix is as bad as a silent regression here: the whole point of the pin
+// is that today's answer cannot change without a test turning red.
+TEST(SemanticAnalyzerCSubset,
+     AttributeDeclKindFunctionPointerObjectWarnUnusedResultIsAKnownDivergence) {
+    // The three spellings, each MEASURED clang-SILENT and DSS-loud.
+    for (auto const* src : {
+             "extern __attribute__((warn_unused_result)) int (*fp)(void);\n"
+             "int main(void){ return 0; }\n",
+             "extern int (*fp)(void) __attribute__((warn_unused_result));\n"
+             "int main(void){ return 0; }\n",
+             "extern __attribute__((__warn_unused_result__)) int (*fp)(void);\n"
+             "int main(void){ return 0; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "TODAY'S BEHAVIOUR, pinned as a KNOWN DIVERGENCE — clang compiles "
+               "this silently AND honors the attribute. If this now reads 0 the "
+               "divergence was CLOSED: update "
+               "D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT and flip "
+               "this expectation deliberately, rather than deleting the pin";
+        for (auto const& d : m.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_AttributeIgnoredForDeclarationKind)
+                continue;
+            EXPECT_NE(d.actual.find("variable"), std::string::npos) << d.actual;
+        }
+    }
+    {   // THE FALSE-NEGATIVE HALF — clang warns AT THE CALL, DSS does not.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"extern __attribute__((warn_unused_result)) int (*fp)(void);\n"
+             "int main(void){ fp(); return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "TODAY'S BEHAVIOUR: the flag landed on a VARIABLE's SymbolRecord "
+               "while `checkCall`'s discard check consults the CALLEE's, so the "
+               "discarded result goes unreported — where clang warns "
+               "-Wunused-result (MEASURED). Same root as the typedef miss below";
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "…and the declaration still carries the false positive, so the two "
+               "halves of this divergence are independent and both must be flipped";
+    }
+    {   // THE CASE THAT MAKES WIDENING THE ROW IMPOSSIBLE: a PLAIN data object is
+        // the SAME DeclarationKind, and there the warning is CORRECT.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"int gw1 __attribute__((warn_unused_result)) = 1;\n"
+             "int main(void){ return gw1; }\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "clang warns -Wignored-attributes here (MEASURED), so THIS warning "
+               "is right — and it is `DeclarationKind::Variable`, exactly like the "
+               "function-pointer object above. That is the inexpressibility: one "
+               "kind, two required answers, so no `appliesTo` value can be correct";
+    }
+}
+
+// ★★ THE SECOND MISS ON THE SAME ROOT — `warn_unused_result` ON A TYPEDEF IS NOT
+// PROPAGATED TO THE CALL SITE. Also a PIN ON A KNOWN DIVERGENCE, not an endorsement.
+//
+//   [[D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT]] (second miss)
+//
+// The shipped row declares `type` in its `appliesTo`, which correctly STOPS the
+// decl-kind gate from firing on a typedef — clang accepts every typedef shape at the
+// DECLARATION. But `appliesTo` only silences the gate; it does not ROUTE the fact.
+// RE-MEASURED 2026-07-30, `/usr/bin/clang -std=c23 -Wall -Wextra` against the shipped
+// CLI, a DISCARDED call in each of the four shapes — and it is a 3-of-4 agreement, NOT
+// the 4-of-4 the shipped row's own comment claimed until this cycle corrected it:
+//   (1) `typedef __attribute__((warn_unused_result)) int T;` + `T g(void)` + `g();`
+//       → clang WARNS ("ignoring return value of type 'T' …" [-Wunused-value]) while
+//         DSS emits NOTHING.  ← THE DIVERGENCE
+//   (2) leading fn-pointer typedef   → clang silent, DSS silent.  AGREEMENT
+//   (3) trailing fn-pointer typedef  → clang silent, DSS silent.  AGREEMENT
+//   (4) function-type typedef        → clang silent, DSS silent.  AGREEMENT
+// Shape (1) is the one where the typedef names the RETURN TYPE rather than the callee:
+// clang propagates the attribute from the return type onto the call expression, DSS
+// does not, because the flag lands on the TYPE's record while `checkCall` reads the
+// CALLEE's. Same root as the function-pointer-object miss above.
+//
+// ★ THE CONTROL IS WHAT MAKES THIS NON-VACUOUS. The DIRECT function form DOES warn
+// (`warning[S003E]` S_NodiscardResultDiscarded, MEASURED, matching clang), so the
+// discard checker is demonstrably ALIVE and shape (1)'s silence is specifically a
+// missing ALIAS propagation — not a dead check that would make every `0u` below pass
+// for the wrong reason.
+//
+// ★ WHEN THIS CLOSES, FLIP shape (1) to 1u; the three AGREEMENT shapes must STAY 0u,
+// or the fix over-fired into C that every real toolchain compiles clean.
+TEST(SemanticAnalyzerCSubset,
+     AttributeDeclKindTypedefReturnTypePropagationIsAKnownDivergence) {
+    {   // THE CONTROL — the direct function form, where DSS and clang agree.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((warn_unused_result)) int g(void){return 1;}\n"
+             "int main(void){ g(); return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 1u)
+            << "the discard checker must be ALIVE, or every 0u below passes for the "
+               "wrong reason and this whole test becomes decoration";
+    }
+    {   // SHAPE (1) — the divergence.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"typedef __attribute__((warn_unused_result)) int T;\n"
+             "T g(void){return 1;}\n"
+             "int main(void){ g(); return 0; }\n"});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "the DECLARATION is correctly silent — clang accepts the typedef "
+               "position for the GNU spelling, which is exactly what `type` in "
+               "`appliesTo` buys";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "TODAY'S BEHAVIOUR, pinned as a KNOWN DIVERGENCE: clang WARNS here "
+               "('ignoring return value of type T', MEASURED) and DSS does not — it "
+               "does not propagate the attribute through the alias. If this now "
+               "reads 1 the miss was CLOSED: update the registry row and flip this";
+    }
+    // SHAPES (2)–(4) — clang-SILENT and DSS-silent. Pinned as AGREEMENT so a future
+    // propagation fix cannot over-fire into C every real toolchain accepts.
+    for (auto const* src : {
+             "typedef __attribute__((warn_unused_result)) int (*FP)(void);\n"
+             "extern FP fp;\nint main(void){ fp(); return 0; }\n",
+             "typedef int (*FP)(void) __attribute__((warn_unused_result));\n"
+             "extern FP fp;\nint main(void){ fp(); return 0; }\n",
+             "typedef int FT(void) __attribute__((warn_unused_result));\n"
+             "extern FT g;\nint main(void){ g(); return 0; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_EQ(ignoredForKindWarnings(m), 0u)
+            << "clang accepts these typedef shapes silently (MEASURED) — a warning "
+               "here is the false positive the row split exists to prevent";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+            << "and clang does NOT warn at the call in these three, so DSS's "
+               "silence is AGREEMENT — a propagation fix must not fire here";
+    }
+}
+
+// ★★ ONE DIAGNOSTIC PER OFFENDING SPELLING, not one per DECLARATOR — AND READ THE
+// CAVEAT, because half of this test is NOT a pin on the gate's latch.
+//
+// The gate sits inside the per-declarator loop while the declaration-level attribute
+// facts are folded ONCE and COPIED into every declarator, so `int a, b, c;` reaches
+// `report()` three times and the gate carries a clause-node latch for it.
+//
+// ⚠ MEASURED, AND IT REFUTES THE OBVIOUS RED-ON-DISABLE: deleting that latch leaves
+// the FIRST case below GREEN. `DiagnosticReporter`'s `dedupWindow` (default 4) drops
+// a report whose (code, buffer, span, ruleContext, `actual`) matches a recent one,
+// and all three repeats match exactly. So case 1 pins the OBSERVABLE property —
+// which is what a user experiences, and what a future change to either mechanism
+// must preserve — not the latch specifically.
+//
+// ★ AND THE WINDOW IS **ALWAYS** 4 ON THIS PATH — do not reach for the "some driver
+// sets `dedupWindow = 0`" argument, which an earlier write-up used and which is
+// FALSE for this diagnostic: it reports into `EngineState::reporter`, a
+// default-constructed reporter that `analyzeImpl` never reconfigures and then moves
+// whole into the `SemanticModel`. The latch is kept for the OTHER reason — the dedup
+// key includes `actual`, so the day this message names the declarator the window
+// stops collapsing the repeats. See the gate's own comment.
+//
+// ★ CASE 2 **DOES** DISCRIMINATE, and it is what rules out the cheaper fix: a bare
+// bool latch would collapse TWO DIFFERENT misplaced attributes on one declaration
+// into one diagnostic — a fresh silent drop in the cycle whose whole purpose is to
+// remove one — and the reporter's dedup would NOT have masked it (differing `actual`
+// ⇒ differing key). Keying on the clause node is what makes both cases hold at once.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindWarnsOncePerSpellingNotPerDeclarator) {
+    {   // THREE declarators, ONE spelling ⇒ ONE diagnostic.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((noinline)) int a, b, c;\n"
+             "int main(void){return a+b+c;}\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "one erroneous specifier is one mistake — three declarators must "
+               "not mean three diagnostics. (Held by the gate's clause-node latch "
+               "AND, independently, by the reporter's dedup window — see the "
+               "measured caveat above; this asserts the OBSERVABLE property)";
+    }
+    {   // ONE declarator, TWO distinct spellings ⇒ TWO diagnostics.
+        auto m = analyzeShipped(
+            "c-subset",
+            {"__attribute__((noinline)) __attribute__((warn_unused_result)) "
+             "int gv = 1;\nint main(void){return gv;}\n"});
+        EXPECT_EQ(ignoredForKindWarnings(m), 2u)
+            << "two DIFFERENT misplaced attributes are two mistakes — a bare "
+               "bool latch would swallow the second, which is exactly the silent "
+               "drop this cycle exists to remove";
+    }
+}
+
+// ★★ POSITIONS THE GATE COVERS THAT THE PLAN EXPECTED IT TO MISS — STATED BECAUSE
+// SILENTLY EXCEEDING A SPEC IS AS HARD TO REVIEW AS SILENTLY MISSING IT.
+//
+// The plan listed block-scope locals as out of scope, on the reading that `varDecl`
+// ignores `attrSpec`/`stdAttr` wholesale. MEASURED with the shipped CLI: that
+// wholesale ignore belongs to the LINKAGE scan (`linkageSpecifierIgnoredRules`)
+// only — the SEMANTIC attribute scan runs on block-scope declarations in BOTH the
+// leading and the mid positions, so both WARN. That is strictly more fail-loud than
+// planned and is pinned here so it cannot regress into the predicted silence
+// unnoticed.
+//
+// STILL out of scope, and genuinely so: a struct member in the LEADING attribute
+// position does not PARSE (P0009), so there is no declaration for the gate to judge.
+TEST(SemanticAnalyzerCSubset, AttributeDeclKindBlockScopeLocalAlsoWarns) {
+    for (auto const* src : {
+             "int main(void){ __attribute__((noinline)) int x = 1; return x; }\n",
+             "int main(void){ int __attribute__((noinline)) x = 1; return x; }\n"}) {
+        SCOPED_TRACE(src);
+        auto m = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(m.hasErrors())
+            << (m.diagnostics().all().empty()
+                    ? "" : m.diagnostics().all()[0].actual);
+        EXPECT_EQ(ignoredForKindWarnings(m), 1u)
+            << "MEASURED: block scope reaches the semantic attribute scan in both "
+               "positions, so both warn — the plan predicted silence here";
+    }
+}
+
+// TF-C92: the NEGATIVE control for the symbol-tier suite — an un-annotated program
+// must leave every record clear. Without it, an apply that unconditionally set the
+// flag would satisfy the OR-merge test above.
+//
+// ★ AND THE COMPOSITION CLAIM, in the same test because it is the same shape: this
+// axis contradicts NOTHING, so `no_sanitize_thread` together with `noinline` (and
+// with `always_inline`) must be clean — no `S_ConflictingInlineAttributes`, unlike
+// the inline pair. A future contradiction gate written by analogy to that pair would
+// turn this red, which is the intent.
+TEST(SemanticAnalyzerCSubset, NoSanitizeThreadComposesAndDefaultsClear) {
+    {
+        auto model = analyzeShipped(
+            "c-subset",
+            {"static int f(int x){return x+1;}\nint main(void){return f(41);}\n"});
+        EXPECT_FALSE(model.hasErrors());
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            EXPECT_FALSE(model.symbols()[i].isNoSanitizeThread)
+                << "an un-annotated program records no exclusion";
+    }
+    for (auto const* src : {
+             "static __attribute__((no_sanitize_thread)) __attribute__((noinline)) "
+             "int f(int x){return x+1;}\nint main(void){return f(41);}\n",
+             "static __attribute__((no_sanitize_thread)) "
+             "__attribute__((always_inline)) "
+             "int f(int x){return x+1;}\nint main(void){return f(41);}\n"}) {
+        SCOPED_TRACE(src);
+        auto model = analyzeShipped("c-subset", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "no_sanitize_thread composes with either inline directive — it is "
+               "an orthogonal axis, not a third member of a mutually exclusive set: "
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingInlineAttributes), 0u);
+        int marked = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == "f"
+                && model.symbols()[i].isNoSanitizeThread) ++marked;
+        EXPECT_EQ(marked, 1)
+            << "and the exclusion is still recorded alongside the inline directive";
+    }
 }
 
 // (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
@@ -5807,6 +7985,235 @@ TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
                         DiagnosticCode::S_RedeclaredSymbol), 1u)
         << "extern object (Variable) then typedef (Type) of the same name — "
            "different categories, must collide in either order";
+}
+
+// ── TF-C97 D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE (C11 6.7p3) — "a typedef name may be
+//    redefined to denote the same type as it currently does, provided that type is
+//    not a variably modified type". A typedef is neither a proto nor an extern nor
+//    a tentative, so BOTH sides rank as definitions and the Pass-1 merge gate
+//    (`!bothDefinitions`) rejected even a LEGAL repeat as S_RedeclaredSymbol. The
+//    fix admits the Type↔Type both-definitions pair into the merge and VERIFIES it
+//    after Pass 1.5 against the two RESOLVED TypeIds — never against spellings.
+
+// Every SymbolRecord named `name` whose kind is Type — absorbed OR surviving. The
+// C11 rule is about the two DECLARATIONS agreeing, so the assertions below must be
+// able to see BOTH records, which `countSurvivingSymbols` (absorbed-filtering) hides.
+[[nodiscard]] inline std::vector<SymbolRecord const*>
+typedefRecords(SemanticModel const& model, std::string_view name) {
+    std::vector<SymbolRecord const*> out;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Type) out.push_back(&r);
+    }
+    return out;
+}
+
+// (1) THE RULE, positive: an IDENTICAL same-scope repeat is legal C11 and must
+// analyze clean — AND the two declarations must resolve to the SAME TypeId, which
+// is the property the whole merge exists to guarantee (a clean analysis with two
+// unrelated types would be a silent miscompile waiting at the first use site).
+// RED-ON-DISABLE: drop `|| typedefRepeat` from the Pass-1 merge gate and the pair
+// falls into the bothDefinitions collision arm -> this S_RedeclaredSymbol count
+// becomes 1 and the EXPECT_FALSE(hasErrors) flips red. MEASURED, not predicted.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefSameTypeIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct S SS;\n"
+        "typedef struct S SS;\n"
+        "struct S { int a; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "C11 6.7p3 permits a typedef name to be redefined to the same type";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u);
+    auto const recs = typedefRecords(model, "SS");
+    ASSERT_EQ(recs.size(), 2u) << "both typedef declarations must mint a record";
+    ASSERT_TRUE(recs[0]->type.valid());
+    ASSERT_TRUE(recs[1]->type.valid());
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "the two spellings of one typedef must resolve to the SAME TypeId — "
+           "identical TypeIds are what makes the merge sound";
+}
+
+// (2) THE REGRESSION WITNESS — the real macOS SDK shape, and the reason this rule
+// had to close for the arm64-macho sqlite leg to reach zero. Two DIFFERENT headers
+// typedef ONE tag: `$SDK/usr/include/malloc/_malloc_type.h:79` names the
+// forward-declared `struct _malloc_zone_t`, then `malloc/malloc.h:246` typedefs the
+// SAME tag AT ITS COMPLETION (`typedef struct _malloc_zone_t { … } malloc_zone_t;`).
+// After the preprocessor flattens the TU they are two same-scope typedefs of one
+// name — MEASURED in sqlite's mem1.c, and MEASURED again here by extracting the two
+// declarations verbatim from `clang -E` output. A synthetic-only test would miss
+// this: the two spellings differ (one is a bare tag reference, the other completes
+// the tag), so only comparing RESOLVED types can accept it.
+// RED-ON-DISABLE: revert the Pass-1 admission -> exactly one S0002 on
+// `malloc_zone_t`, which is the sqlite failure this closes.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefAcrossHeadersCompletingTagIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        // "header A" — the tag is forward-declared, then aliased.
+        "struct _mz_t;\n"
+        "typedef struct _mz_t mz_t;\n"
+        // "header B" — the SAME tag, completed, aliased again under one name.
+        "typedef struct _mz_t { int version; int size; } mz_t;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the malloc_zone_t shape — one tag, two headers — is legal C11";
+    auto const recs = typedefRecords(model, "mz_t");
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "the forward-declared tag and its completion are ONE type — the alias "
+           "minted before the body must not be a second, distinct type";
+}
+
+// (3) THE RULE, negative: two DIFFERENT types under one typedef name stay LOUD.
+// The specific code is S_IncompatibleRedeclaration — the deferred post-1.5 verdict
+// the merged-decl sweep already emits for every other type-mismatched merge pair —
+// NOT a vague "some error". RED-ON-DISABLE: drop the post-1.5 Type↔Type arm and the
+// pair merges silently (count 0) with the FIRST type winning every later use.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefDifferentTypeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "typedef long T;\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "`typedef int T; typedef long T;` is a real C11 error and must stay one";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "exactly ONE diagnostic for one mistake — not a collision AND a mismatch";
+}
+
+// (4) The negative that the OBJECT composite rule must not leak into: C 6.2.7 lets
+// `extern char v[]; char v[3];` compose into the completed array, but 6.7p3 asks the
+// strictly stronger "does it denote the SAME type". MEASURED against /usr/bin/clang:
+// `typedef int T[3]; typedef int T[];` is `error: typedef redefinition with
+// different types ('int[]' vs 'int[3]')`. RED-ON-DISABLE: let the Type↔Type pair
+// fall through to the incomplete-array relaxation below it and this count drops to
+// 0 — the mismatch is silently accepted.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefIncompleteVsSizedArrayFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[3];\n"
+        "typedef int T[];\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "a sized and an incomplete array are not the SAME type — the OBJECT "
+           "composite-type relaxation must not reach a typedef repeat";
+}
+
+// (5) THE C11 CARVE-OUT: 6.7p3's permission excludes a VARIABLY MODIFIED type, so an
+// IDENTICALLY spelled VLA typedef repeat is still invalid (C99 6.7.7p2 evaluates the
+// size expression exactly once, AT the typedef — repeating the name would demand it
+// twice). The interner has no length operand on a vlaArray, so the two TypeIds are
+// EQUAL and a plain same-TypeId check would silently accept precisely the shape the
+// standard singles out. MEASURED against /usr/bin/clang: `error: redefinition of
+// typedef for variably-modified type 'int[n]'`. Reported as S_RedeclaredSymbol — the
+// code this shape already produced from the Pass-1 collision, so the carve-out is
+// byte-identical in CODE and only gains a message. RED-ON-DISABLE: drop the
+// `variablyModified` term and the same-TypeId fast path accepts it — count 0.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefVariablyModifiedFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "int main(void) { typedef int V[n]; typedef int V[n]; return 0; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a variably-modified typedef may not be repeated, even identically";
+}
+
+// (6) The carve-out dominates: when the repeat is BOTH variably modified AND of a
+// different type, the VM verdict is the one reported — the repeat is forbidden
+// outright, which is a stronger statement than "these two differ". MEASURED against
+// /usr/bin/clang, which reports `redefinition of typedef for variably-modified type
+// 'long[n]'` (not its different-types diagnostic) for exactly this source.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefVariablyModifiedAndDifferentReportsVM) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "int main(void) { typedef int V[n]; typedef long V[n]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "the variably-modified carve-out is tested first and wins";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "one mistake, one diagnostic — never both verdicts";
+}
+
+// (7) SCOPE PIN, positive: an INNER-scope typedef SHADOWING an outer one is legal C
+// and untouched — `mergeOrCollideRedeclaration` runs only when `s.scopes.bind`
+// returns a prior in the SAME scope, so a shadow never reaches this rule at all.
+// This guards that the admission did not widen scope handling: the two typedefs
+// here differ in type, and the ONLY reason that is legal is the scope boundary.
+TEST(SemanticAnalyzerCSubset, TypedefShadowingInInnerScopeStaysLegal) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "int main(void) { typedef long T; return (int)sizeof(T); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "a shadowing typedef in an INNER scope is not a redefinition";
+}
+
+// (8) SCOPE PIN, negative mirror: the SAME two typedefs in ONE (inner) scope ARE a
+// redefinition and stay loud. Together with (7) this pins that the rule follows the
+// SCOPE, not the nesting depth — the file-scope pair in (3) and this block-scope
+// pair must behave identically.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefDifferentTypeInBlockScopeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { typedef int T; typedef long T; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "same-scope is same-scope — a block scope obeys 6.7p3 exactly as file "
+           "scope does";
+}
+
+// (9) THE ADMISSION IS Type↔Type ONLY. A typedef repeating a NON-typedef name is a
+// different KIND of symbol (clang: "redefinition of 'x' as different kind of
+// symbol") and must still collide S_RedeclaredSymbol — the `category()` guard, not
+// the definedness rank, is what rejects it, and the new gate is conjoined with
+// `sameCategory` so it can never reach a cross-category pair. RED-ON-DISABLE: widen
+// `typedefRepeat` to drop its `category(...) == Type` term and this becomes 0 — an
+// object would be silently absorbed into a typedef.
+TEST(SemanticAnalyzerCSubset, ObjectThenTypedefStillCollidesAfterRepeatAdmission) {
+    auto model = analyzeShipped("c-subset", {
+        "int x;\n"
+        "typedef int x;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "an object and a typedef of one name are different kinds of symbol — "
+           "the Type↔Type admission must not reach them";
+}
+
+// (10) A FUNCTION-TYPE typedef repeat is legal too (MEASURED: /usr/bin/clang accepts
+// `typedef int F(void);` twice), and it must route through the SAME resolved-TypeId
+// check rather than the sweep's FnSig-candidate arm — that arm is gated on the
+// SURVIVOR being a real Function, which a typedef is not. Guards the interaction
+// between this rule and D-CSUBSET-FN-TYPEDEF-PROTOTYPE.
+TEST(SemanticAnalyzerCSubset, RepeatTypedefFunctionTypeIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int F(void);\n"
+        "typedef int F(void);\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    auto const recs = typedefRecords(model, "F");
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0]->type.v, recs[1]->type.v)
+        << "two identical function-type typedefs are ONE interned FnSig";
 }
 
 // ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
@@ -7280,14 +9687,32 @@ TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 }
 
-// `bool b = nullptr;` is rejected — nullptr→bool is DEFERRED (the c-subset has no
-// scalar→bool conversion; D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it stays consistent
-// with `bool b = 0;` (also a mismatch) rather than admit-then-fail-at-codegen.
-TEST(SemanticAnalyzerCSubset, NullptrToBoolFailsLoud) {
+// `bool b = nullptr;` now CONVERTS to false — C23 6.3.2.3.2 (nullptr -> bool =
+// false), realized once the general scalar->bool conversion landed
+// (D-CSUBSET-NULLPTR-BOOL-CONVERSION closed via `scalarConvertsToBool`). Was a
+// DEFERRED S_TypeMismatch; the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]] fix (a
+// comparison now types `int`) forced the general scalar->bool arm, and
+// nullptr->bool falls out as the NullptrT case.
+TEST(SemanticAnalyzerCSubset, NullptrToBoolConverts) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "nullptr -> bool converts to false (C23 6.3.2.3.2), no longer deferred";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// `bool b = 0;` (a scalar zero) CONVERTS to false via the general scalar->bool
+// conversion (C 6.3.1.2). Pre-D-CSUBSET-NULLPTR-BOOL-CONVERSION this was itself an
+// S_TypeMismatch (the c-subset had NO scalar->bool path — the very inconsistency
+// that kept nullptr->bool deferred); now both assign.
+TEST(SemanticAnalyzerCSubset, ScalarZeroToBoolConverts) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = 0; return b; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "scalar 0 -> bool converts to false (C 6.3.1.2)";
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // The fail-loud operator gate: nullptr in arithmetic (`nullptr + 1`) is rejected —
@@ -7494,6 +9919,29 @@ TEST(SemanticAnalyzerCSubset, EnumUnderlyingStructFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
         << "a struct underlying type must fail loud S_InvalidEnumUnderlyingType";
+}
+
+// TF-C101 — the pin that keeps `enumUnderlyingBase` SEPARATE from `castTypeBase`.
+// The clause's base is followed immediately by the enumerator-list `{`, so it must
+// stay REF-ONLY: routing it through the definition-admitting type-name base makes
+// `structSpec`'s greedy `{optional structBody}` swallow `{ A }`, the struct body
+// then desyncs on `A`, the speculative clause rolls back whole, and the single
+// precise diagnostic above becomes a nine-entry parse cascade (MEASURED). This test
+// is the TYPEDEF spelling of the same constraint violation — it reaches the check
+// through the Identifier arm, with no brace binding in play — so the two together
+// pin the constraint from both directions and neither can be satisfied by a parse
+// error standing in for the analysis.
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingTypedefStructFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Foo { int x; };\n"
+        "typedef struct Foo FooT;\n"
+        "enum E : FooT { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a typedef'd struct underlying type must fail loud by CONSTRAINT, at the "
+           "semantic tier — not as a parse cascade";
 }
 
 TEST(SemanticAnalyzerCSubset, EnumeratorValueOutOfRangeFailsLoud) {
@@ -8118,6 +10566,198 @@ TEST(SemanticAnalyzerCSubset, DeprecatedMessageIncluded) {
     }
 }
 
+// ★ THE TF-C62 REGRESSION PIN: the GNU `__attribute__((deprecated("m")))` form
+// must carry its message exactly like the C23 form. TF-C62 moved the GNU
+// argument out of a direct `stringLiteralExpr` child down into an `attrArgs`
+// subtree (`attrArgs > attrArgList > attrArgItem > attrArgAtom >
+// stringLiteralExpr` after TF-C72); the clause extractor still read the FIRST
+// Internal child, handing the decode chokepoint a node with no body children →
+// it returned "" (NOT nullopt) and the message was SILENTLY dropped. MEASURED at
+// the defect: `warning[S003D] got f` — the message simply gone. The bug survived
+// because the GNU form was pinned only by diagnostic COUNTS; this asserts TEXT.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use g\"))) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f: use g")
+                << "the GNU form's message must survive the attrArgs nesting";
+    }
+}
+
+// The GNU and C23 spellings are the SAME attribute: identical source message ⇒
+// identical diagnostic text. The parity assertion is the regression wall for the
+// C23 path (which worked throughout the defect) AND for the GNU path together —
+// a future reshape of EITHER argument grammar breaks this before it ships.
+TEST(SemanticAnalyzerCSubset, DeprecatedMessageSameForGnuAndC23) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use g\"))) int f(void);\n"
+        "[[deprecated(\"use g\")]] int h(void);\n"
+        "int f(void) { return 1; }\n"
+        "int h(void) { return 2; }\n"
+        "int main(void) { return f() + h(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u);
+    std::string gnuText;    // the GNU-declared f
+    std::string stdText;    // the C23-declared h
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        if (diag.actual.rfind("f", 0) == 0) gnuText = diag.actual;
+        if (diag.actual.rfind("h", 0) == 0) stdText = diag.actual;
+    }
+    EXPECT_EQ(gnuText, "f: use g") << "GNU form";
+    EXPECT_EQ(stdText, "h: use g") << "C23 form";
+}
+
+// C 5.1.1.2 phase 6: `deprecated("use " "g")` is ONE argument (adjacent literals
+// concatenate), not two — the subtree search STOPS at the `stringLiteralExpr`
+// node and hands the whole run to the shared `decodeAdjacentStringBodies`
+// chokepoint, so the pieces JOIN rather than reading as an ambiguous pair.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedAdjacentConcatMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated(\"use \" \"g\"))) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an adjacent-concatenated message is ONE argument, never ambiguous";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f: use g");
+    }
+}
+
+// `__attribute__((deprecated))` with NO argument is legal and has NO message —
+// the `.actual` is the BARE symbol name, with no `: ` separator and no crash.
+// A REGRESSION WALL (green before and after the attrArgs-descent fix), not a
+// red-on-disable pin: the extractor's nullopt-vs-"" distinction is real at the
+// EXTRACTION boundary, but MEASURED it cannot be observed here — making "found
+// nothing" yield "" instead of nullopt leaves this test GREEN, because
+// `AttributeSemanticsFacts`/`SymbolRecord` store the message as a `std::string`
+// merged first-NON-EMPTY-wins and the render site omits the `: ` separator for an
+// empty message. So `deprecated("")` and no-argument are indistinguishable
+// DOWNSTREAM today; carrying the distinction further is a separate change.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedNoArgumentHasNoMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((deprecated)) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "f")
+                << "no argument ⇒ no message, NOT an empty one";
+}
+
+// FAIL LOUD: a MODELLED attribute whose clause carries TWO string arguments has
+// no unambiguous message — picking the first would be a fresh silent drop of the
+// second (the `linkageFrom` adjacent-concat fail-loud posture). S_UnknownTypeAttribute
+// at Error severity, and the deprecation warning stays MESSAGE-LESS: the engine
+// never guesses which string was meant.
+// RED-ON-DISABLE: drop the ambiguity branch and take the first string → no error
+// and `.actual` becomes "x: a".
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedTwoStringArgumentsFailLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated(\"a\", \"b\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an ambiguous attribute message must never compile silently";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnknownTypeAttribute) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Error);
+            EXPECT_EQ(diag.actual,
+                      "attribute 'deprecated' carries more than one string argument");
+        }
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "x")
+                << "the ambiguous message must be DROPPED, never guessed";
+    }
+}
+
+// FAIL LOUD, second door: the shared decode chokepoint returns nullopt on a
+// MALFORMED escape (C 5.1.1.2 phase 5). Unreported that is the SAME silent
+// message drop as the attrArgs-nesting defect — MEASURED before this gate:
+// `deprecated("bad\uZZZZ")` warned a bare `x`, the message quietly gone.
+// RED-ON-DISABLE: drop the `!out.message.has_value()` fail-loud → no error and
+// the deprecation warning silently loses its message again.
+TEST(SemanticAnalyzerCSubset, GnuDeprecatedMalformedEscapeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated(\"bad\\uZZZZ\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "an undecodable attribute message must never be dropped silently";
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_UnknownTypeAttribute)
+            EXPECT_EQ(diag.actual,
+                      "attribute 'deprecated' has a malformed escape in its "
+                      "string argument");
+}
+
+// A COMMA-separated sibling clause (`attrClauseTail`) is a DIFFERENT attribute —
+// its string is not this clause's message. The subtree search skips wholesale any
+// nested node carrying its OWN name identifier, which is precisely the "the name
+// is a direct identifier child" clause model applied recursively.
+// RED-ON-DISABLE: drop that skip → `deprecated` adopts the sibling's "hidden"
+// and `.actual` becomes "x: hidden" (a silently WRONG message).
+TEST(SemanticAnalyzerCSubset, GnuSiblingClauseStringIsNotThisClausesMessage) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((deprecated, __visibility__(\"hidden\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all())
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "x")
+                << "a LATER clause's string must never become this one's message";
+}
+
+// The ambiguity gate is scoped to attributes the language MODELS. A real SDK-header
+// shape the effect table does not model — `__availability__(macos, message="a",
+// replacement="b")`, TF-C72's motivating case — carries two strings legitimately and
+// must stay exactly as inert as before: parsed, ignored, NEVER newly rejected.
+// RED-ON-DISABLE: drop the `row != nullptr` gate → this errors S_UnknownTypeAttribute
+// and every macOS SDK header using the availability form stops compiling.
+TEST(SemanticAnalyzerCSubset, UnmodelledGnuMultiStringAttributeStaysInert) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((__availability__(macos, message=\"a\","
+        " replacement=\"b\"))) int x = 0;\n"
+        "    return x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an unmodelled multi-string GNU attribute must not be rejected";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+}
+
 // A `[[deprecated]]` PROTOTYPE + an unflagged definition: the flag OR-merges
 // into the surviving definition (the isNoreturn mergedFnDecls precedent), so a
 // call — which resolves to the survivor — still warns. RED-ON-DISABLE for the
@@ -8398,6 +11038,53 @@ TEST(SemanticAnalyzerCSubset, AutoInfersIntPass15Visible) {
         << "typeof(x) at the NEXT declaration's Pass-1.5 visit must see the "
            "inferred type (y has no initializer — the backfill cannot type it)";
     EXPECT_EQ(model.lattice().interner().kind(y->type), TypeKind::I32);
+}
+
+// D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION (the PRIMARY red-on-disable
+// pin): a file-scope ARRAY whose ELEMENTS are const pointers — the direct-
+// declarator spelling `int (*const ops[N])(int)` — is a const object (C 6.7.3p9
+// so-qualifies the element; gcc/clang park such a fn-ptr table in relocated-read-
+// only `.data.rel.ro`). Its `SymbolRecord.isConst` must be TRUE so it threads
+// MutabilityAttr → MirGlobal.isConst → the asm relocBearingGlobalSection
+// chokepoint routes it to RelRoConst, not writable `.data`. The const pointer
+// layer hides inside the parenthesized group, so this REDS if declaratorObject-
+// IsConst stops descending the group (the object then falls to the head scan,
+// which sees no `const` in `int` → isConst=false → mis-routed to `.data`). This
+// is the shape of sqlite3.c's `static int (*const sqlite3BuiltinExtensions[])
+// (sqlite3*) = {…};`. A NON-const sibling and the typedef'd spelling anchor the
+// two ends (must-not-over-classify / must-stay-correct).
+TEST(SemanticAnalyzerCSubset, ElementConstFnPtrArrayGlobalIsConst) {
+    auto model = analyzeShipped("c-subset", {
+        "int a(int x){ return x + 10; }\n"
+        "int b(int x){ return x + 20; }\n"
+        "int (*const ops[2])(int) = { a, b };\n"        // array of CONST fn-ptrs
+        "int (*muts[2])(int) = { a, b };\n"             // array of MUTABLE fn-ptrs
+        "typedef int (*op)(int);\n"
+        "const op tab[2] = { a, b };\n"                 // typedef'd spelling
+        "static int (*const exts[])(int) = { a };\n",   // sqlite's inferred static
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* ops = findSymbolNamed(model, "ops");
+    ASSERT_NE(ops, nullptr);
+    EXPECT_TRUE(ops->isConst)
+        << "int (*const ops[2])(int): the array's elements are const pointers "
+           "→ a const object → RelRoConst; the group-hidden `* const` layer must "
+           "be found by descending the parenthesized group";
+    auto const* muts = findSymbolNamed(model, "muts");
+    ASSERT_NE(muts, nullptr);
+    EXPECT_FALSE(muts->isConst)
+        << "int (*muts[2])(int): mutable fn-ptr elements → NOT const (the fix "
+           "keys on the `* const` marker, never merely on the grouping)";
+    auto const* tab = findSymbolNamed(model, "tab");
+    ASSERT_NE(tab, nullptr);
+    EXPECT_TRUE(tab->isConst)
+        << "const op tab[2] (typedef spelling) stays const — the head-const path "
+           "is untouched by the group descent";
+    auto const* exts = findSymbolNamed(model, "exts");
+    ASSERT_NE(exts, nullptr);
+    EXPECT_TRUE(exts->isConst)
+        << "static int (*const exts[])(int) — sqlite's inferred-size const fn-ptr "
+           "table — is a const object too";
 }
 
 // ★C1 — the auto-presence gate: all four specifier-led C89 implicit-int
@@ -8695,11 +11382,12 @@ TEST(SemanticAnalyzerCSubset, AutoFileScopeAndQualifiedStayLoudParseErrors) {
 // pinned EXACTLY for each non-decaying initializer class the arm passes
 // through unchanged — a struct variable (aggregates infer by value, no
 // decay), an enumerator (the enum TYPE, not its underlying int), a
-// comparison (Bool — promoteComparisons), a char variable (Char, not the
-// promoted int), and an unsuffixed float literal (F64 per C 6.4.4.2). All
-// in ONE unit so the block also witnesses the inferred objects USED
-// together (member access through the inferred struct, arithmetic across
-// the rest).
+// comparison (I32 — a comparison RESULT type is C's `int`, C 6.5.8p6, sourced
+// config-drivenly by subtreeType; D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE), a char
+// variable (Char, not the promoted int), and an unsuffixed float literal (F64
+// per C 6.4.4.2). All in ONE unit so the block also witnesses the inferred
+// objects USED together (member access through the inferred struct, arithmetic
+// across the rest).
 TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     auto model = analyzeShipped("c-subset", {
         "struct S { int x; };\n"
@@ -8731,8 +11419,11 @@ TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     EXPECT_EQ(kindOf("e"), TypeKind::Enum)
         << "an enumerator infers the ENUM type (enumConvertsToArith covers "
            "its uses; the type itself stays Enum)";
-    EXPECT_EQ(kindOf("b"), TypeKind::Bool)
-        << "a comparison infers Bool (promoteComparisons)";
+    EXPECT_EQ(kindOf("b"), TypeKind::I32)
+        << "a comparison infers int (C 6.5.8p6: the RESULT type of a relational "
+           "operator is int, sourced config-drivenly — "
+           "D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE; the i1/Bool SSA carrier is the "
+           "separate machine-tier concern)";
     EXPECT_EQ(kindOf("c"), TypeKind::Char)
         << "a char VARIABLE infers Char (the symbol's type, not the "
            "promoted int)";
@@ -9094,7 +11785,7 @@ TEST(SemanticAnalyzerCSubset, PlainVlaArrayParamStillDecaysToPointer) {
 // n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
 // array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
 // that a struct field NEVER carries (its config row has allowFlexibleArray, not
-// arrayToPointer), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
+// paramAdjustments), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
 // routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
 // an incompleteArray and this diagnostic vanishes.
 TEST(SemanticAnalyzerCSubset, StructFieldVlaSoleMemberStillFailsLoud) {
@@ -9464,24 +12155,39 @@ TEST(SemanticAnalyzerCSubset, LongDoubleLiteralTypesPerAxis) {
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble) {
-    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3). On a
-    // WALLED axis the arm is observable: `x + d` types F80, so it binds an
-    // F80 lhs cleanly and REJECTS an F64 lhs (were the result F64, the two
-    // expectations would invert — a strict both-ways pin of the rank order).
+    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3), so `x + d`
+    // (long double + double) types long double (F80). NOTE: this test formerly proved
+    // the rank via an assignment-rejection PROXY (`double r = x + d;` had to REJECT the
+    // F80->F64 narrowing). D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING now ADMITS that
+    // narrowing, so the proxy is obsolete — the rank is pinned DIRECTLY via the INFERRED
+    // TYPE of the UAC result: `typeof(x + d) pr;` declares `pr` with x+d's type, and the
+    // symbol's resolved TypeKind must be F80 (the exact idiom LongDoubleResolvesPerAxis
+    // uses). The `good` case still also binds an F80 lhs cleanly.
     auto good = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; long double r; r = x + d; }\n"},
+        {"int main(void) { long double x; double d; typeof(x + d) pr;\n"
+         "  long double r; r = x + d; }\n"},
         LongDoubleFormat::X87_80);
     EXPECT_FALSE(good.hasErrors())
-        << "`long double + double` must type long double (F80) — assignable "
-           "into a long double lhs";
+        << "`long double + double` binds an F80 lhs cleanly";
+    auto const* pr = findSymbolNamed(good, "pr");
+    ASSERT_NE(pr, nullptr);
+    ASSERT_TRUE(pr->type.valid());
+    EXPECT_EQ(good.lattice().interner().kind(pr->type), TypeKind::F80)
+        << "`x + d` (long double + double) types long double (F80): typeof(x + d) "
+           "resolves F80, proving the UAC result OUTRANKS double (F64)";
 
-    auto bad = analyzeWithLongDoubleAxis(
-        {"int main(void) { long double x; double d; double r; r = x + d; }\n"},
+    // Positive control / RED-ON-DISABLE of the RANK: `double + double` types double, so
+    // typeof(d1 + d2) resolves F64. Were the UAC rank broken so `x + d` above typed
+    // double, its EXPECT_EQ(..., F80) would fail. Proves the oracle separates F64/F80.
+    auto ctrl = analyzeWithLongDoubleAxis(
+        {"int main(void) { double d1; double d2; typeof(d1 + d2) pr2; }\n"},
         LongDoubleFormat::X87_80);
-    EXPECT_TRUE(bad.hasErrors())
-        << "`long double + double` into a DOUBLE lhs is a narrowing float "
-           "assignment (F80 -> F64) — must reject, proving the UAC result is "
-           "F80, not F64";
+    auto const* pr2 = findSymbolNamed(ctrl, "pr2");
+    ASSERT_NE(pr2, nullptr);
+    ASSERT_TRUE(pr2->type.valid());
+    EXPECT_EQ(ctrl.lattice().interner().kind(pr2->type), TypeKind::F64)
+        << "`double + double` types double (F64) — the typeof oracle separates the two "
+           "float widths, so the F80 rank pin above is observable";
 }
 
 TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldSucceedsOnWalledAxis) {
@@ -9695,4 +12401,2740 @@ TEST(SemanticAnalyzerCSubset, TgmathComplexArgFabsFailsLoudOnBothFormats) {
     auto pe = analyzeRealTgmath(src, ObjectFormatKind::Pe, DataModel::Llp64);
     EXPECT_EQ(countCode(pe.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
         << "fabs(double _Complex) must fail LOUD on pe (the f64 bridge arm)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): multi-root + multi-clause attribute scanning,
+// and the GNU `aligned(N)` sink.
+//
+// Every C snippet below was checked with
+//   clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)
+// and every layout number pinned here is clang's OWN measured answer, not a
+// guess — `struct S { char a; int b; } __attribute__((packed, aligned(16)));`
+// really is sizeof 16 / _Alignof 16 on arm64.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★★ THE LIVE SILENT MISCOMPILE (work item 7). `scanCompositePacked` used to do
+// `if (named) { packed = true; continue; }` over a WHOLE attribute node, so the
+// first clause naming `packed` SWALLOWED every clause after it. Measured before
+// the fix: DSS `sizeof` 5 against clang's 16 with ZERO diagnostics.
+//
+// The MIRROR of that swallow is what this test pins, because it is the half that
+// is fully fixable inside the semantic tier: an unknown name sitting AFTER
+// `packed` used to be accepted in total silence, defeating the typo protection
+// this scan exists for. It now fails loud, and the struct is STILL packed (the
+// recognized clause is honored, the unrecognized one is reported — neither
+// clause swallows the other).
+TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownAfterPackedFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((packed, bogus_xyz));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"still packed\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    // Exactly ONE diagnostic, and it NAMES the offending clause — not a bare
+    // count on a shared code, and not the whole `__attribute__((...))` blob.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a clause after `packed` must still be examined — the pre-TF-C73 "
+           "scan swallowed it and accepted the typo silently";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos)
+            << "the diagnostic must name the unrecognized clause, got: " << d.actual;
+    }
+    // The recognized clause is still honored: packed survives.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "`packed` must still apply when a sibling clause is unknown";
+}
+
+// The same swallow in the other clause ORDER: an unknown name BEFORE `packed`.
+// Pre-TF-C73 this was also silent (the subtree scan found `packed` anywhere in
+// the node and returned early). Both orders now behave identically — which is
+// the point: correctness must not depend on clause position.
+TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownBeforePackedFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((bogus_xyz, packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"still packed\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos) << d.actual;
+    }
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// REGRESSION WALL for the clause-by-clause rewrite: a SINGLE-clause
+// `__attribute__((packed))` must still be exactly as it was — packed honored,
+// no diagnostic. (The multi-clause enumeration must not change the common case.)
+TEST(SemanticAnalyzerCSubset, PackedSingleClauseUnchangedByClauseEnumeration) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "_Static_assert(_Alignof(struct S) == 1, \"packed align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ★ THE PHANTOM-CLAUSE EXCLUSION (work item 8). `format(printf,1,2)` nests its
+// argument identifier `printf` in an `attrArgAtom` whose direct child IS an
+// identifier — exactly the shape the trailing-clause rule looks for. Without the
+// `cfg.attributeArgRule` skip in `collectAttrClauses`, the walk would mint a
+// PHANTOM clause named `printf` and fail it loud on perfectly legal C.
+// The position is a TYPEDEF deliberately: `typedefDecl` sets
+// `unknownStrictAttributeIsError`, so a phantom clause there is not merely
+// ignored — it fails LOUD. That is what makes this pin actually red-on-disable
+// (on a row WITHOUT the strict gate an unknown GNU name is silent, and the test
+// would pass for the wrong reason).
+// RED-ON-DISABLE: delete the `attributeArgRule` guard in `collectAttrClauses`
+// and `printf` is minted as a clause → S_UnknownTypeAttribute on legal C.
+TEST(SemanticAnalyzerCSubset, AttrArgIdentifierNeverMintsPhantomClause) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef void (*fp)(const char *, ...) "
+        "__attribute__((format(printf,1,2)));\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "`printf` is an ARGUMENT, not a clause name — minting a phantom clause "
+           "would reject legal C";
+    for (auto const& d : model.diagnostics().all()) {
+        EXPECT_EQ(d.actual.find("printf"), std::string::npos)
+            << "an ARGUMENT identifier must never be read as a clause NAME, got: "
+            << d.actual;
+    }
+}
+
+// ★ `[[a, b]]` IS TWO CLAUSES, EACH FOLDED ONCE (work item 8 audit caveat). The
+// C23 form's per-item loop is the ONLY producer for that shape; the structural
+// trailing-clause descent is deliberately skipped for it (`collectAttrClauses`
+// returns immediately from the std arm) so no item is yielded twice.
+//
+// ★ MEASURED CAVEAT, recorded so nobody re-derives it: a genuine double-FOLD of
+// the same clause node is NOT observable through diagnostic counts, because
+// `DiagnosticReporter` carries a `dedupWindow` (default 4) that drops an
+// identical (code, buffer, span, rule, actual) diagnostic — and re-folding the
+// same node produces exactly that. Fact folding is idempotent too (booleans OR,
+// messages are first-non-empty-wins, alignment is a MAX). So this test pins the
+// direction that IS observable and does regress: BOTH items must be folded —
+// removing the per-item loop takes the count to 0.
+TEST(SemanticAnalyzerCSubset, StdAttrMultiItemEmitsNoDuplicateDiagnostics) {
+    auto cu = buildShippedUnit("c-subset", {
+        "[[frobnicate, blahblah]] int x;\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownAttribute), 2u)
+        << "[[a, b]] is TWO clauses — one warning each, never doubled";
+}
+
+// ★★ PER-DECLARATOR ISOLATION (work item 1). `int a __attribute__((deprecated)), b;`
+// annotates ONLY `a`. If the declarator-depth scan folded into the SHARED
+// declaration-level facts instead of a per-declarator COPY, `b` would silently
+// inherit the deprecation — a wrong fact on a symbol the programmer never marked.
+// This is the test that distinguishes a copy from a reference.
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrDoesNotLeakToSiblingDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "int a __attribute__((deprecated)), b;\n"
+        "int main(void) { return a + b; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "only `a` is deprecated — folding into shared facts would mark `b` too";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(d.actual, "a") << "the deprecation must land on `a`, never `b`";
+    }
+    SymbolRecord const* bRec = findSym(model, "b");
+    ASSERT_NE(bRec, nullptr);
+    EXPECT_FALSE(bRec->isDeprecated)
+        << "`b` carries no attribute and must not be marked";
+}
+
+// ROOT (b) — DECLARATOR-DEPTH. An attribute written AFTER the declarator used to
+// be parsed and silently ignored (the scan had exactly one root: the specifier
+// prefix). RED-ON-DISABLE: remove the after-declarator root loop and the
+// deprecation warning disappears entirely.
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrIsHonored) {
+    auto model = analyzeShipped("c-subset", {
+        "int x __attribute__((deprecated));\n"
+        "int main(void) { return x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "an after-declarator attribute must be honored, not parse-and-ignore";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(d.actual, "x");
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+    }
+}
+
+// The after-declarator MESSAGE decodes too (the shared string chokepoint is
+// reached from the new root exactly as from the prefix root).
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorAttrMessageDecodes) {
+    auto model = analyzeShipped("c-subset", {
+        "int x __attribute__((deprecated(\"use y\")));\n"
+        "int main(void) { return x; }\n",
+    });
+    bool sawMessage = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        sawMessage = true;
+        EXPECT_NE(d.actual.find("use y"), std::string::npos)
+            << "the message must survive the declarator-depth root, got: " << d.actual;
+    }
+    EXPECT_TRUE(sawMessage);
+}
+
+// ── TF-C73: the GNU `aligned(N)` sink ────────────────────────────────────────
+// Before this cycle `aligned` had NO sink at all: it parsed, folded to nothing,
+// and the object was SILENTLY UNDER-ALIGNED. (That is why `aligned` was
+// deliberately kept OUT of the linkage-scan hint-ignore list — ignoring it would
+// have made the miscompile compile clean.)
+
+// OBJECT (leading position) → SymbolRecord.explicitAlignment. An APPLIED FACT,
+// not a diagnostic count. RED-ON-DISABLE: drop the Align arm and this is nullopt.
+TEST(SemanticAnalyzerCSubset, GnuAlignedLeadingSetsObjectExplicitAlignment) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "__attribute__((aligned(32))) int gv;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* gv = findSym(model, "gv");
+    ASSERT_NE(gv, nullptr);
+    ASSERT_TRUE(gv->explicitAlignment.has_value())
+        << "__attribute__((aligned(32))) must set explicitAlignment — an "
+           "unhonored alignment is a silently under-aligned object";
+    EXPECT_EQ(*gv->explicitAlignment, 32u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// OBJECT (after-declarator position) → the SAME sink, reached through the NEW
+// declarator-depth root. Both spellings must agree.
+TEST(SemanticAnalyzerCSubset, GnuAlignedAfterDeclaratorSetsObjectAlignment) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int gv2 __attribute__((aligned(32)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* gv2 = findSym(model, "gv2");
+    ASSERT_NE(gv2, nullptr);
+    ASSERT_TRUE(gv2->explicitAlignment.has_value());
+    EXPECT_EQ(*gv2->explicitAlignment, 32u);
+}
+
+// `aligned` MAX-folds with `alignas` on the same declaration (C 6.7.5p6: the
+// strictest wins). They write the SAME slot, so they cannot disagree.
+TEST(SemanticAnalyzerCSubset, GnuAlignedMaxFoldsWithAlignas) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "alignas(8) int g __attribute__((aligned(64)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 64u)
+        << "6.7.5p6: with several alignment specifiers the LARGEST wins";
+}
+
+// MEMBER → the existing `fieldAligns` path, end-to-end through the interner.
+// clang measures sizeof 16 / _Alignof 8 for this struct; so must DSS.
+TEST(SemanticAnalyzerCSubset, GnuAlignedOnMemberRaisesLayoutEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct M { char c; int v __attribute__((aligned(8))); };\n"
+        "_Static_assert(sizeof(struct M) == 16, \"member aligned 8\");\n"
+        "_Static_assert(_Alignof(struct M) == 8, \"member raises struct align\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a member `aligned(8)` must reach fieldAligns and change the layout";
+}
+
+// MULTI-CLAUSE FOLD (work item 8): `((deprecated, aligned(32)))` — BOTH clauses
+// take effect. Pre-TF-C73 only the FIRST was folded, so the alignment was
+// silently dropped. RED-ON-DISABLE: remove the trailing-clause descent in
+// `collectAttrClauses` and `explicitAlignment` goes nullopt while `deprecated`
+// still works — which is exactly the asymmetry that made the drop invisible.
+TEST(SemanticAnalyzerCSubset, GnuMultiClauseFoldsEveryClause) {
+    auto model = analyzeShipped("c-subset", {
+        "int q __attribute__((deprecated, aligned(32)));\n"
+        "int main(void) { return q; }\n",
+    });
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(q, nullptr);
+    EXPECT_TRUE(q->isDeprecated) << "clause 1 must fold";
+    ASSERT_TRUE(q->explicitAlignment.has_value())
+        << "clause 2 must fold too — folding only the first silently drops it";
+    EXPECT_EQ(*q->explicitAlignment, 32u);
+}
+
+// The reversed order folds identically — clause position must not matter.
+TEST(SemanticAnalyzerCSubset, GnuMultiClauseOrderIndependent) {
+    auto model = analyzeShipped("c-subset", {
+        "int r __attribute__((aligned(32), deprecated));\n"
+        "int main(void) { return r; }\n",
+    });
+    SymbolRecord const* r = findSym(model, "r");
+    ASSERT_NE(r, nullptr);
+    EXPECT_TRUE(r->isDeprecated);
+    ASSERT_TRUE(r->explicitAlignment.has_value());
+    EXPECT_EQ(*r->explicitAlignment, 32u);
+}
+
+// ★ THE SHARED-LADDER PROOF (work item 4). `aligned(3)` and `alignas(3)` must
+// produce the SAME code, because they run the SAME function. This is what makes
+// the extraction load-bearing rather than cosmetic: bypassing
+// `foldAlignmentOperand` (hand-rolling an equivalent fold in the Align arm)
+// makes the pow2 and >256 arms go SILENT for the attribute spelling while the
+// alignas spelling keeps working — an asymmetry no alignas test can see.
+TEST(SemanticAnalyzerCSubset, GnuAlignedSharesTheAlignasValidationLadder) {
+    {   // not a power of two — the SAME code alignas(3) emits
+        auto cu = buildShippedUnit("c-subset",
+                                   { "int x __attribute__((aligned(3)));\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+            << "aligned(3) must fail through the SHARED ladder, not silently";
+    }
+    {   // over the 256 cap — the SAME code alignas(512) emits
+        auto cu = buildShippedUnit("c-subset",
+                                   { "int x __attribute__((aligned(512)));\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasExceedsMax), 1u)
+            << "aligned(512) must hit the SAME >256 cap alignas does";
+    }
+    {   // the alignas TWIN — proves the two spellings agree, code for code
+        auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
+    }
+}
+
+// ★ KNOWN DIVERGENCE, PINNED DELIBERATELY SO IT IS VISIBLE RATHER THAN FOLKLORE.
+// `aligned(0)` currently reaches the SHARED ladder, whose zero arm implements
+// C 6.7.5p3 — "an alignment specification of zero has no effect" — and returns
+// "no override" with NO diagnostic. That paragraph governs C11 `_Alignas`; it does
+// NOT govern the GNU spelling, and clang REJECTS `__attribute__((aligned(0)))`
+// with "requested alignment is not a power of 2" (MEASURED:
+// `clang -fsyntax-only -Wall -Wextra`, exit 1).
+//
+// The behavior is a direct consequence of the design requirement that the GNU arm
+// call the alignas ladder unchanged — zero behavior change on the alignas path is
+// the regression wall, so the zero arm could not be special-cased for one caller
+// without splitting the ladder the extraction exists to unify. The consequence is
+// recorded here honestly: today `aligned(0)` is accepted and applies nothing, which
+// is the one place in this feature where DSS is LOOSER than clang. Closing it means
+// teaching the shared ladder that its zero arm is spelling-dependent (a `zeroIsNoOp`
+// parameter set true only by `evalOneAlignasSpec`) — a deliberate follow-up, not an
+// accident. This test PINS the current answer so the change is a visible test edit.
+TEST(SemanticAnalyzerCSubset, GnuAlignedZeroIsTheSharedNoOp) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int z __attribute__((aligned(0)));\n" });
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasExceedsMax), 0u);
+    SymbolRecord const* z = findSym(model, "z");
+    ASSERT_NE(z, nullptr);
+    EXPECT_FALSE(z->explicitAlignment.has_value())
+        << "6.7.5p3: an alignment of zero has NO effect";
+}
+
+// ★ BARE `__attribute__((aligned))` FAILS LOUD. gcc reads it as "the target's
+// maximum useful alignment" — a target-dependent number this engine must not
+// invent. clang ACCEPTS this spelling, so DSS is deliberately stricter here:
+// refusing loudly beats guessing an ABI.
+TEST(SemanticAnalyzerCSubset, GnuAlignedWithNoArgumentFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int bare __attribute__((aligned));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    bool named = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
+            << "the message must say WHY the bare form is refused, got: " << d.actual;
+        named = true;
+    }
+    EXPECT_TRUE(named);
+    SymbolRecord const* bare = findSym(model, "bare");
+    ASSERT_NE(bare, nullptr);
+    EXPECT_FALSE(bare->explicitAlignment.has_value())
+        << "never guess 'maximum useful alignment'";
+}
+
+// FUNCTIONS stay LOUD (measured cost: 0 of 204 SDK `aligned` sites).
+TEST(SemanticAnalyzerCSubset, GnuAlignedOnFunctionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "__attribute__((aligned(16))) int f(void);\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasInvalidContext) continue;
+        EXPECT_NE(d.actual.find("function"), std::string::npos) << d.actual;
+    }
+}
+
+// ── ★ THE TYPEDEF RULE (work item 6) ─────────────────────────────────────────
+// A typedef interns to the SAME TypeId as its aliasee, so `explicitAlignment` on
+// a typedef symbol is provably inert — storing it would be the "parses but sets
+// nothing" silent drop. So the request is JUDGED, in three graded arms.
+
+// ARM 1 — N > natural, layout params AVAILABLE ⇒ FAIL LOUD. The program asked for
+// stricter alignment than the alias can deliver, and we genuinely cannot deliver it.
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefStricterThanNaturalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int ti __attribute__((aligned(16)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+        << "aligned(16) on a typedef of int (natural 4) is a REAL drop — say so";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasInvalidContext) continue;
+        EXPECT_NE(d.actual.find("typedef"), std::string::npos) << d.actual;
+    }
+}
+
+// ARM 2 — N <= natural, layout params AVAILABLE ⇒ accept SILENTLY. The alias
+// already satisfies the request, so honoring it is a PROVEN no-op: nothing is
+// dropped, so there is nothing to warn about. (Warning here would be noise on
+// legal, already-satisfied C.)
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWeakerThanNaturalIsSilent) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int ts __attribute__((aligned(2)));\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "aligned(2) on a typedef of int (natural 4) is ALREADY satisfied";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ARM 3 — ★ layout params ABSENT ⇒ STAY SILENT. This deliberately diverges from
+// the alignas precedent (which fails loud when it cannot compute an alignment).
+// `src/lsp/lsp_server.cpp:429` calls `dss::analyze(cu)` with NO layout params, so
+// failing loud here would put a red squiggle under every real SDK typedef in the
+// editor while the same source compiles clean from the CLI.
+// CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
+TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWithoutLayoutParamsStaysSilent) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int ti __attribute__((aligned(16)));\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "no layout params = cannot determine — that must not become "
+           "cannot-compile (the LSP calls analyze() with no layout)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★ THE STRICT UNKNOWN-NAME GATE (work item 3). A `typedefDecl` declares no
+// `linkageSpecifiers`, so `linkageFrom` early-returns and an unknown GNU name in
+// a typedef position was reported by NOBODY — `typedef __attribute__((desprecated))
+// int T;` compiled clean with the decoration silently unapplied. With the row's
+// `unknownStrictAttributeIsError` opt-in it is now an ERROR, using the SAME code
+// and severity `scanCompositePacked` already uses for a strict unknown.
+// RED-ON-DISABLE: drop the `strictUnknownIsError` arm → count goes to 0.
+TEST(SemanticAnalyzerCSubset, TypedefUnknownStrictGnuAttributeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef __attribute__((desprecated)) int T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a typo'd GNU attribute on a typedef must not be silently unapplied";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("desprecated"), std::string::npos) << d.actual;
+    }
+}
+
+// The C23 `[[...]]` form on the SAME row keeps its SUPPRESSIBLE Warning — C23
+// REQUIRES an unknown standard attribute to be ignorable, so the strict gate must
+// not leak across forms. This is the control that proves the gate is GNU-only.
+//
+// The placement is the typedef's MIDDLE slot (`typedef int [[…]] T;`), which is
+// both valid C23 (clang -std=c2x accepts it, warning only about the unknown name)
+// and the SAME scan root the GNU strict test above uses — so the only variable
+// between the two tests is the attribute FORM, which is exactly what is being
+// controlled for. (`typedef [[…]] int T;` — attribute before the type — is NOT
+// valid C: clang rejects it with "an attribute list cannot appear here".)
+TEST(SemanticAnalyzerCSubset, TypedefUnknownC23AttributeStaysASuppressibleWarning) {
+    auto cu = buildShippedUnit("c-subset", { "typedef int [[frobnicate]] T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "C23 forbids a fatal unknown standard attribute — the strict gate is "
+           "GNU-only and must not leak across forms";
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_UnknownAttribute)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+}
+
+// ROOT (a) — DECLARATION-DEPTH SLOTS. `typedef int64_t __attribute__((__aligned__(8)))
+// T;` puts the attribute in the typedef's MIDDLE slot — outside `specifierPrefixChild`'s
+// reach, so pre-TF-C73 it was parsed and silently ignored. RED-ON-DISABLE: remove the
+// `declarationAttrSlotRules` loop and the loud typedef judgement disappears.
+TEST(SemanticAnalyzerCSubset, TypedefMiddleSlotAttributeIsReached) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "typedef int __attribute__((aligned(16))) T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+        << "the typedef's MIDDLE attribute slot must be a scan root — silently "
+           "ignoring it is how the SDK's dominant typedef spelling got dropped";
+}
+
+// ★★ THE COMPOSITE-DEFINITION `aligned` POSITION — NOW A REAL SINK
+// (D-CSUBSET-COMPOSITE-ALIGNED). This test is the CONVERSION of TF-C73's
+// `CompositeDefinitionAlignedFailsLoudPendingInternerChannel` pin, which asserted
+// that the clause failed LOUD because there was nowhere to put it. The interner now
+// carries a genuine per-COMPOSITE alignment channel
+// (`TypeInterner::explicitCompositeAlign`, seeded into `StructLayout::align` by
+// `computeLayout`), so the number is produced instead of refused.
+//
+// ★ CLANG GROUND TRUTH (MEASURED on this machine, arm64 macOS, compiled AND RUN,
+// `clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)` clean):
+//     struct S { char a; int b; } __attribute__((packed, aligned(16)));
+//         → sizeof 16, _Alignof 16
+// NOT 5: packed removes the inter-field padding (a@0, b@1, extent 5) and
+// `aligned(16)` then raises the WHOLE aggregate's alignment, which rounds the size
+// up to 16. Both channels apply; neither swallows the other.
+//
+// RED-ON-DISABLE: revert the `composedAlign.value_or(0u)` argument at the struct
+// `completeComposite` call (semantic_analyzer.cpp) — or the `compositeSeedAlign`
+// seed in type_layout.cpp's Struct arm — and this drops back to packed's bare
+// sizeof 5 / _Alignof 1, firing BOTH _Static_asserts.
+TEST(SemanticAnalyzerCSubset, CompositePackedPlusAlignedRaisesWholeAggregate) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char a; int b; } __attribute__((packed, aligned(16)));\n"
+        "_Static_assert(sizeof(struct S) == 16, \"clang: packed+aligned(16) = 16\");\n"
+        "_Static_assert(_Alignof(struct S) == 16, \"clang: _Alignof 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed removes the padding, aligned(16) raises the aggregate: clang "
+           "gives sizeof 16 / _Alignof 16, NOT packed's bare 5 / 1";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "the composite `aligned` clause is HONORED now, not refused as unknown";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The `aligned(N)` half ALONE on a composite definition — no packed.
+// CLANG (MEASURED, compiled and run): `struct A { char a; int b; }
+// __attribute__((aligned(16)));` → sizeof 16, _Alignof 16 (natural would be 8 / 4).
+// RED-ON-DISABLE: drop the layout seed and this falls to 8 / 4.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedAloneRaisesAlignAndSize) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct A { char a; int b; } __attribute__((aligned(16)));\n"
+        "_Static_assert(sizeof(struct A) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct A) == 16, \"clang: 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★ `aligned(N)` NEVER LOWERS (C 6.7.5 — the composite's alignment is the MAX of its
+// natural alignment and the request). CLANG (MEASURED): `struct L { char a; int b; }
+// __attribute__((aligned(2)));` → sizeof 8, _Alignof 4 — the request is WEAKER than
+// the natural 4 and is simply a no-op. This is the control that proves the fold is a
+// MAX and not an assignment: implement it as `out.align = requested` and this test
+// goes to sizeof 4 / _Alignof 2 while every other test in this group still passes.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedWeakerThanNaturalIsANoOp) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct L { char a; int b; } __attribute__((aligned(2)));\n"
+        "_Static_assert(sizeof(struct L) == 8, \"clang: natural 8 survives\");\n"
+        "_Static_assert(_Alignof(struct L) == 4, \"clang: natural 4 survives\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "aligned(N) may only RAISE — a weaker request is a no-op, not a lowering";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// UNION: the channel is per-COMPOSITE, not per-struct. CLANG (MEASURED):
+// `union U { char a; int b; } __attribute__((aligned(32)));` → sizeof 32,
+// _Alignof 32 (natural 4 / 4). RED-ON-DISABLE: drop the seed in computeLayout's
+// Union arm and this falls to 4 / 4.
+TEST(SemanticAnalyzerCSubset, CompositeAlignedOnUnionRaisesAlignAndSize) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { char a; int b; } __attribute__((aligned(32)));\n"
+        "_Static_assert(sizeof(union U) == 32, \"clang: 32\");\n"
+        "_Static_assert(_Alignof(union U) == 32, \"clang: 32\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// THE THREE-CHANNEL INTERACTION: composite `aligned(16)` + composite `packed` + a
+// MEMBER `alignas(8)`. CLANG (MEASURED, compiled and run):
+//     struct K { char a; _Alignas(8) int b; } __attribute__((packed, aligned(16)));
+//         → sizeof 16, _Alignof 16
+// Each channel does its own job and none overrides another: packed drops the
+// per-field baseline to 1, the member alignas raises member `b` back to 8 (so b@8,
+// extent 12), and the composite aligned(16) raises the aggregate — rounding 12 up
+// to 16. `struct M` is the un-packed twin (same members, aligned(16), no packed) and
+// clang gives it 16 / 16 as well — the member alignas(8) already pushes `b` to 8
+// either way, so these two AGREE, which is the point: this pin is a clang-conformance
+// check on the three-way composition, NOT a packed discriminator. The pin that
+// isolates packed under a composite aligned is
+// `CompositeScanAccumulatesAcrossAdjacentAttrSpecifiers` (6/2 vs 5/1 vs 8/4).
+TEST(SemanticAnalyzerCSubset, CompositeAlignedComposesWithPackedAndMemberAlignas) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct K { char a; alignas(8) int b; }"
+        " __attribute__((packed, aligned(16)));\n"
+        "_Static_assert(sizeof(struct K) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct K) == 16, \"clang: 16\");\n"
+        "struct M { char a; alignas(8) int b; } __attribute__((aligned(16)));\n"
+        "_Static_assert(sizeof(struct M) == 16, \"clang: 16\");\n"
+        "_Static_assert(_Alignof(struct M) == 16, \"clang: 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed (baseline 1), member alignas (raises one field) and composite "
+           "aligned (raises the aggregate) are three independent channels";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The SHARED alignment ladder still applies to the composite position — an
+// `aligned(3)` on a struct definition is not a power of two and fails loud with the
+// SAME code `alignas(3)` uses, because it is literally the same `foldAlignmentOperand`
+// call. RED-ON-DISABLE: route the composite clause around the shared ladder and this
+// count drops to 0 (the struct would silently lay out un-aligned).
+TEST(SemanticAnalyzerCSubset, CompositeAlignedNonPowerOfTwoFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct B { char a; int b; } __attribute__((aligned(3)));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "a composite aligned(3) must reject for the same reason and with the "
+           "same code as alignas(3) — one ladder, not two";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasNotPowerOfTwo) continue;
+        EXPECT_NE(d.actual.find("aligned"), std::string::npos) << d.actual;
+    }
+}
+
+// The BARE composite `__attribute__((aligned))` (no argument) means "the target's
+// maximum useful alignment" in gcc — a target-dependent number this engine refuses
+// to invent. It fails LOUD, exactly like the declaration-level bare form, rather
+// than being silently treated as no request at all.
+TEST(SemanticAnalyzerCSubset, CompositeBareAlignedWithNoArgumentFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct C { char a; int b; } __attribute__((aligned));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
+            << d.actual;
+    }
+}
+
+// ★★ THE MULTI-SURFACE COMPOSITE SCAN (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION).
+// `scanCompositePacked` must be surface-COUNT-agnostic: it accumulates EVERY
+// matching attribute surface on the specifier node rather than selecting the first
+// and stopping. The `break` it used to carry is what BLOCKED the after-keyword slot
+// (`struct __attribute__((packed)) S { … };`, the `mach-o/dyld_images.h` shape) —
+// with it, a lead slot under a distinct rule name is invisible to the scan and
+// `packed` is silently dropped, MEASURED as a clean compile at sizeof 8 against
+// clang's 5.
+//
+// ★ WHAT THIS TEST PINS, AND WHAT IT DOES NOT. The shipped c-subset grammar has
+// exactly ONE composite attribute surface today (the trailing `compositeAttrList`)
+// and declares no `declarationAttrSlotRules` on `structSpec`/`unionSpec`, so a
+// two-ROOT tree is not constructible from C source yet — the after-keyword pin is
+// WAITING on the config re-add and is NOT live here. What IS reachable, and is
+// pinned below, is the same generalization one level in: TWO ADJACENT attribute
+// SPECIFIERS under that one surface, contributing DIFFERENT facts. If the scan
+// stops at the first attribute node, `aligned(16)` is lost and the size reverts.
+//
+// ★ THE NUMBERS ARE CHOSEN TO DISCRIMINATE. `aligned(2)` on a `{char, int}` is the
+// one value where each attribute is independently observable — drop either and BOTH
+// assertions move, in DIFFERENT directions. CLANG GROUND TRUTH (MEASURED, compiled
+// and run on arm64 macOS, `-fsyntax-only -Wall -Wextra -isysroot $(xcrun
+// --show-sdk-path)` clean):
+//     struct V {char a; int b;} __attribute__((packed)) __attribute__((aligned(2)));
+//         → sizeof 6, _Alignof 2     ← BOTH honored
+//     ...with only `packed`                 → sizeof 5, _Alignof 1
+//     ...with only `aligned(2)`             → sizeof 8, _Alignof 4
+// Reversing the two specifiers (`struct W`) gives 6 / 2 as well: the scan is
+// ORDER-independent, which is the other half of "no clause swallows another".
+TEST(SemanticAnalyzerCSubset, CompositeScanAccumulatesAcrossAdjacentAttrSpecifiers) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct V { char a; int b; }"
+        " __attribute__((packed)) __attribute__((aligned(2)));\n"
+        "_Static_assert(sizeof(struct V) == 6, \"clang: 6 (both honored)\");\n"
+        "_Static_assert(_Alignof(struct V) == 2, \"clang: 2 (both honored)\");\n"
+        "struct W { char a; int b; }"
+        " __attribute__((aligned(2))) __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct W) == 6, \"clang: order-independent\");\n"
+        "_Static_assert(_Alignof(struct W) == 2, \"clang: order-independent\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the composite scan must examine EVERY attribute specifier on the "
+           "surface: keeping only the first gives 5/1 or 8/4, never clang's 6/2";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The strict UNKNOWN-name gate on a composite is UNCHANGED by the new `aligned`
+// arm — a typo'd GNU composite attribute still fails loud, and specifically a typo
+// of `aligned` itself does NOT slip through the effect-row match. This is the
+// control that proves the new arm keys on the DECLARED effect row, not on "the
+// clause has an argument".
+TEST(SemanticAnalyzerCSubset, CompositeMisspelledAlignedStillFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct D { char a; int b; } __attribute__((alinged(16)));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a typo'd composite attribute must not be silently unapplied";
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        EXPECT_NE(d.actual.find("alinged"), std::string::npos) << d.actual;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C77 — D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS, the SEMANTIC tier.
+// The linkage-tier pins live in tests/hir/test_hir_lowering_c_subset.cpp; these
+// cover the ATTRIBUTE-SEMANTICS sink (alignment) and the BLOCK-SCOPE twin of the
+// new mid-position slot.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ★★ MODE 2 AT BLOCK SCOPE — the `varDecl` sibling, and the reason it was
+// included rather than cut.
+//
+// MEASURED at the pre-change HEAD: `int __attribute__((aligned(16))) x = 1;`
+// inside a function body was a hard P0009, while the byte-identical file-scope
+// spelling was about to become legal. One attribute must not mean two different
+// things depending on SCOPE, so `declAttrRun` joined BOTH branches of `varDecl`
+// in the same commit as `topLevelDecl`.
+//
+// ★ ASSERTS THE APPLIED ALIGNMENT (32 — a genuine OVER-alignment for `int`,
+// natural 4), not that it compiled. A slot that parses and drops the value emits
+// NOTHING, so only the stored number can catch it.
+//
+// RED-ON-DISABLE: drop `declarationAttrSlotRules` from the varDecl row → the
+// declaration still parses and this reads no value at all. Remove `declAttrRun`
+// from the varDecl branches → P0009, and the ASSERT_NE on the record fires first.
+TEST(SemanticAnalyzerCSubset, MidPositionAlignedAppliesAtBlockScope) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int __attribute__((aligned(32))) x = 1; return x; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr) << "the block-scope mid-position form must PARSE";
+    ASSERT_TRUE(x->explicitAlignment.has_value())
+        << "the mid-position `aligned(32)` on a LOCAL must reach the same "
+           "attribute-semantics sink the file-scope spelling reaches";
+    EXPECT_EQ(*x->explicitAlignment, 32u);
+}
+
+// The block-scope MID position and the block-scope LEADING position must agree,
+// on the same program. This is the scope-level twin of the file-scope symmetry
+// pin in the HIR suite: an attribute that means one thing before the type and
+// another after it is the exact defect class this cycle closes.
+TEST(SemanticAnalyzerCSubset, BlockScopeMidAndLeadingAlignedAgree) {
+    for (char const* decl : {
+             "__attribute__((aligned(32))) int x = 1;",     // leading
+             "int __attribute__((aligned(32))) x = 1;"}) {  // mid (TF-C77)
+        auto cu = buildShippedUnit("c-subset", {
+            std::string("int main(void){ ") + decl + " return x; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        SymbolRecord const* x = findSym(model, "x");
+        ASSERT_NE(x, nullptr) << decl;
+        ASSERT_TRUE(x->explicitAlignment.has_value()) << decl;
+        EXPECT_EQ(*x->explicitAlignment, 32u) << decl;
+    }
+}
+
+// MODE 2 anti-hijack at BLOCK scope: `declAttrRun` is a sibling of `declHead`,
+// never a child, so an attribute identifier that also names a real type must not
+// be resolved as the declaration's type. `long` vs `int` makes the hijack
+// OBSERVABLE as a size — a check that `x` is merely "some integer" would pass
+// through the very hijack this guards.
+TEST(SemanticAnalyzerCSubset, BlockScopeMidPositionDoesNotHijackTheHeadType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef long aligned;\n"
+        "int main(void){ int __attribute__((aligned(4))) x = 1; "
+        "return (int)sizeof(x); }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->explicitAlignment.has_value())
+        << "a typedef named `aligned` must not stop the attribute being honored";
+    EXPECT_EQ(*x->explicitAlignment, 4u);
+}
+
+// ★★ MODE 1, THE NORETURN SINK — the pin that proves the after-keyword position
+// is REACHED by the semantic specifier scan, not merely parsed.
+//
+// `specifierPrefixNamesNoreturn` walks the row's `specifierPrefixChild`. Mode 1
+// works only because `externSpecifiers` IS that prefix and is MANDATORY (it owns
+// the `extern` keyword), so it is always the first visible child and always
+// returned. This test is what makes that "zero new wiring" claim VERIFIED rather
+// than asserted — the Tcl `TCL_NORETURN` shape must MEAN noreturn, not just parse.
+//
+// ★ ASSERTS THE APPLIED BIT. The end-to-end consequence is witnessed separately
+// and more strongly at the HIR verifier: MEASURED, `int pick(int c){ if (c)
+// return 1; die(2); }` compiles with exit 0 when `die` is declared
+// `extern __attribute__((__noreturn__)) void die(int);` and fails
+// `H0003 non-void function may fall through without returning a value` when the
+// attribute is removed — so the flag really does terminate the path.
+//
+// RED-ON-DISABLE: remove `attrSpec` from `externSpecifiers` → P0009 (the shape
+// stops parsing). Remove `noreturn` from `semantics.noreturnAttributeNames` →
+// this parses clean and the bit reads false, silently.
+TEST(SemanticAnalyzerCSubset, ExternHeadNoreturnAttributeIsApplied) {
+    auto model = analyzeShipped("c-subset", {
+        "extern __attribute__((__noreturn__)) void die(int);\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
+        << "an attribute written AFTER the `extern` keyword must reach the "
+           "noreturn scan — the dunder spelling `__noreturn__` normalizes to "
+           "`noreturn`, exactly as it does in the leading position";
+}
+
+// ★★ A DEFECT THIS CYCLE FOUND AND DELIBERATELY DID NOT FIX — RECORDED HERE SO
+// IT IS GREPPABLE INSTEAD OF INVISIBLE.
+//
+// This started life as a symmetry pin ("the after-keyword and after-declarator
+// positions must agree on `noreturn`") and it FAILED — which is the useful
+// outcome. MEASURED: the AFTER-DECLARATOR spelling does NOT reach the noreturn
+// sink at all. End to end, on the identical program:
+//
+//   extern __attribute__((__noreturn__)) void die(int);   (mode 1, NEW)  exit 0
+//   extern void die(int) __attribute__((__noreturn__));   (trailing)     H0003
+//       "non-void function may fall through without returning a value"
+//
+// CAUSE: `specifierPrefixNamesNoreturn` scans the row's `specifierPrefixChild`
+// ONLY. Mode 1 works because `externSpecifiers` IS that prefix. TF-C73 made the
+// after-declarator run a LINKAGE scan root but never a NORETURN one, so the
+// trailing spelling is parsed, linkage-folded, and its noreturn meaning dropped.
+//
+// WHY IT IS NOT FIXED HERE: it is PRE-EXISTING (nothing in TF-C77 touches that
+// scan or that run), it is a SAFE MISS rather than a miscompile — dropping the
+// flag can only produce a SPURIOUS diagnostic, never wrong code, which is the
+// posture `specifierPrefixNamesNoreturn`'s own comment states — and closing it
+// means deciding whether a per-DECLARATOR trailing run may confer a
+// DECLARATION-level property, which is a different anchor's question.
+//
+// ★ THE EXPECT_FALSE BELOW ASSERTS A BUG, NOT A DESIRED PROPERTY. When the
+// trailing position is wired to the noreturn scan, this test WILL fail — that is
+// the point. Flip it to EXPECT_TRUE then, and fold both arms back into one
+// symmetry loop. Do NOT "fix" it by deleting the assertion.
+TEST(SemanticAnalyzerCSubset, ExternTrailingNoreturnIsNotYetHonoredKnownGap) {
+    auto head = analyzeShipped("c-subset", {
+        "extern __attribute__((__noreturn__)) void die(int);\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(head.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(head, "die"))
+        << "mode 1 (after-keyword) IS honored — this half is the new behavior";
+
+    auto trail = analyzeShipped("c-subset", {
+        "extern void die(int) __attribute__((__noreturn__));\n"
+        "int main(void){ die(1); return 0; }\n",
+    });
+    EXPECT_FALSE(trail.hasErrors())
+        << "the trailing form still PARSES and links cleanly — the gap is the "
+           "dropped semantic fact, not a rejection";
+    EXPECT_FALSE(survivingFnIsNoreturn(trail, "die"))
+        << "KNOWN GAP (see banner): if this now reads TRUE the trailing position "
+           "has been wired to the noreturn scan — flip this to EXPECT_TRUE and "
+           "restore the symmetry loop";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C88 — GNU/Clang ASM LABEL (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME,
+// GCC 6.47.5) and TYPEDEF MULTI-DECLARATOR
+// (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR).
+//
+// The two defects behind 41 of the 49 macho-leg corpus errors at HEAD 2637623.
+// Every assertion below is on an OBSERVABLE PROPERTY (the recorded assembler
+// name, the resolved type of each alias), never on "it compiles clean" — a
+// parse-and-ignore asm label and a dropped 2nd typedef alias BOTH compile clean,
+// which is exactly what makes them dangerous.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// Every symbol spelled `name`, oldest first — a multi-declarator declaration and
+// a proto+definition merge both produce several records for one name, and the
+// distinction between them is load-bearing in the merge pin below.
+[[nodiscard]] std::vector<SymbolRecord const*>
+allSymbolsNamed(SemanticModel const& model, std::string_view name) {
+    std::vector<SymbolRecord const*> out;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == name) out.push_back(&model.symbols()[i]);
+    }
+    return out;
+}
+// The asm label recorded on the FIRST symbol spelled `name` that carries one —
+// the merge deliberately propagates the label onto the SURVIVOR, so a proto+def
+// pair must report it whichever record the scan reaches first.
+[[nodiscard]] std::string asmNameOf(SemanticModel const& model,
+                                    std::string_view name) {
+    for (auto const* r : allSymbolsNamed(model, name))
+        if (!r->asmName.empty()) return r->asmName;
+    return {};
+}
+} // namespace
+
+// FORM 1 — a label on an OBJECT at file scope. The MEASURED clang behavior is
+// that the string is the symbol VERBATIM; the assertion is therefore on the
+// exact bytes, `myglobal` and not `_myglobal`, because mangling the label on top
+// is the plausible wrong implementation and it compiles just as cleanly.
+// RED-ON-DISABLE: delete the `rec.asmName = ...` write in Pass-1's declarator
+// loop and this reads "" while the program still compiles.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnFileScopeObjectIsRecordedVerbatim) {
+    auto m = analyzeShipped("c-subset", {
+        "int gv __asm(\"myglobal\") = 7;\n"
+        "int main(void) { return gv; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "gv"), "myglobal");
+}
+
+// FORM 2 — a label on a FUNCTION DEFINITION (declarator + body in one).
+//
+// ★ A DELIBERATE, DOCUMENTED DIVERGENCE FROM CLANG, and the reason is a defect
+// this cycle also closed. `/usr/bin/clang` REJECTS this spelling ("expected ';'
+// after top level declarator") purely for GCC compatibility — GCC wants the label
+// on a preceding DECLARATION. DSS honors it, because the rename it asks for is
+// unambiguous and the symbol it names is right there. That is over-permissiveness,
+// never a silent drop: the label IS applied (asserted below), so nothing the
+// programmer wrote is ignored.
+//
+// The same edit is what makes `int f(void) __attribute__((noinline)) { … }`
+// compile. MEASURED at the pre-TF-C88 HEAD that shape was REFUSED as "a function
+// definition cannot carry an initializer" — a diagnostic naming a construct the
+// source does not contain — because the definition gate counted every Internal
+// child past the declarator and had never received TF-C62's decoration skip. It
+// was the sixth init-detection site and the one left behind.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnFunctionDefinitionIsRecorded) {
+    auto m = analyzeShipped("c-subset", {
+        "int fn(int x) __asm(\"myfn\") { return x; }\n"
+        "int main(void) { return fn(42); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "fn"), "myfn");
+
+}
+
+// TF-C88 — the PRE-EXISTING defect this cycle fixed in passing, with its OWN
+// guard so it has its own red-on-disable arm rather than riding an asm-label
+// test's coat-tails.
+//
+// THE DEFECT (MEASURED at 2637623, before any TF-C88 change): the function-
+// DEFINITION gate in `pass2Post` open-coded its own init detection as "count the
+// Internal children of the init-declarator; more than one means an initializer is
+// present". That counts the DECLARATOR itself as the one, so ANY second Internal
+// child trips it — including an after-declarator ATTRIBUTE. So
+// `int f(void) __attribute__((noinline)) { return 1; }` was refused
+// `S_InvalidFunctionDeclarator: a function definition cannot carry an
+// initializer` — a diagnostic naming a construct the source does not contain,
+// on code `/usr/bin/clang` compiles (it emits only a -Wgcc-compat warning that
+// GCC would not allow `noinline` in that position).
+//
+// It was the SIXTH of six init-detection scans in the SEMANTIC tier and the ONLY
+// one of the six TF-C62 never reached — the other five (declaratorHasInitializer,
+// initializerNodeOf, the constexpr scan, the auto-inference scan, the Pass-2
+// init-type scan) all received the attribute skip then. It is fixed HERE, not in
+// its own cycle, because the asm label would have inherited the identical
+// mis-read: TF-C87's lesson is that a defect fixed in one form and left live in
+// another is the expensive kind.
+//
+// RED-ON-DISABLE: restore the `internals > 1` count in place of the
+// decoration-aware `initializers > 0` and this test reds while every asm-label
+// test stays green (verified against the final build).
+TEST(SemanticAnalyzerCSubset, AfterDeclaratorDecorationOnDefinitionIsNotAnInitializer) {
+    // The ATTRIBUTE form — the one that predates this cycle entirely.
+    auto attr = analyzeShipped("c-subset", {
+        "int g(void) __attribute__((noinline)) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(attr.diagnostics().hasErrors())
+        << "an after-declarator attribute on a DEFINITION is not an initializer";
+    EXPECT_EQ(countCode(attr.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+
+    // A REAL initializer on a definition must STILL fail loud — the fix narrows
+    // the count, it does not remove the gate. Without this the arm above could be
+    // satisfied by deleting the check outright.
+    auto real = analyzeShipped("c-subset", {
+        "int h(void) = 5 { return 1; }\n"
+        "int main(void) { return h(); }\n",
+    });
+    EXPECT_TRUE(real.diagnostics().hasErrors())
+        << "a genuine initializer on a function definition must stay rejected";
+}
+
+// FORM 3 — a label on a PROTOTYPE renames the later DEFINITION. This is the
+// shape every `__DARWIN_ALIAS` header actually uses (the header declares the
+// rename; the definition lives elsewhere), and MEASURED against clang the
+// emitted symbol is the label.
+//
+// ★ THE ASSERTION IS ON THE SURVIVING RECORD, NOT "some record named deffn".
+// The lax form was written first and the RED-ON-DISABLE battery caught it: with
+// the merge carry deleted, the ABSORBED proto still holds the label, so an
+// any-record scan reports "mydeffn" and the test passes while the DEFINITION —
+// the record `nameOf` actually reads — emits `_deffn`. The survivor is the record
+// with `isAbsorbedProto == false`; asserting there is the only form that can see
+// the carry at all.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnPrototypeRidesTheRedeclarationMerge) {
+    auto m = analyzeShipped("c-subset", {
+        "int deffn(int) __asm(\"mydeffn\");\n"
+        "int deffn(int x) { return x; }\n"
+        "int main(void) { return deffn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const recs = allSymbolsNamed(m, "deffn");
+    ASSERT_EQ(recs.size(), 2u) << "a proto + its definition mint two records";
+    SymbolRecord const* survivor = nullptr;
+    for (auto const* r : recs)
+        if (!r->isAbsorbedProto) survivor = r;
+    ASSERT_NE(survivor, nullptr) << "exactly one record must survive the merge";
+    EXPECT_EQ(survivor->asmName, "mydeffn")
+        << "the label must reach the SURVIVING (defining) record — that is the "
+           "one `nameOf` names the emitted symbol from";
+}
+
+// The mirror direction: the DEFINITION comes first and the labelled redundant
+// declaration follows. The survivor is the prior record, so the carry runs down
+// the other branch of the merge — a branch that would otherwise never be
+// exercised and would drift silently.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnTrailingRedeclarationRidesTheMerge) {
+    auto m = analyzeShipped("c-subset", {
+        "int deffn(int x) { return x; }\n"
+        "int deffn(int) __asm(\"mydeffn\");\n"
+        "int main(void) { return deffn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const recs = allSymbolsNamed(m, "deffn");
+    ASSERT_EQ(recs.size(), 2u);
+    SymbolRecord const* survivor = nullptr;
+    for (auto const* r : recs)
+        if (!r->isAbsorbedProto) survivor = r;
+    ASSERT_NE(survivor, nullptr);
+    EXPECT_EQ(survivor->asmName, "mydeffn");
+}
+
+// FORM 4 — a label on an `extern` declaration (the import rail's entry point).
+TEST(SemanticAnalyzerCSubset, AsmLabelOnExternDeclarationIsRecorded) {
+    auto m = analyzeShipped("c-subset", {
+        "extern int extfn(int) __asm(\"_myextfn\");\n"
+        "int main(void) { return extfn(1); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "extfn"), "_myextfn");
+}
+
+// FORM 5 — the ADJACENT-CONCATENATED payload, which is the ONLY spelling the
+// macOS SDK ever produces (`__asm("_" __STRING(sym) __DARWIN_SUF_UNIX03)`).
+// A consumer that read only the first body would record "_" and rename every
+// SDK symbol to a single underscore — clean-compiling and catastrophic. The
+// assertion is on the JOINED bytes, which is what makes it catch that.
+TEST(SemanticAnalyzerCSubset, AsmLabelConcatenatesAdjacentStringPieces) {
+    auto m = analyzeShipped("c-subset", {
+        "#define __STRING(x) #x\n"
+        "#define SUF \"$UNIX2003\"\n"
+        "#define ALIAS(sym) __asm(\"_\" __STRING(sym) SUF)\n"
+        "int aliased(void) ALIAS(aliased);\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "the SDK spelling must parse";
+    EXPECT_EQ(asmNameOf(m, "aliased"), "_aliased$UNIX2003");
+}
+
+// FORM 6 — PER-DECLARATOR granularity. Two labels in ONE declaration must land
+// on their OWN symbols; a declaration-level read (the plausible wrong
+// implementation, and the shape `libraryOverride` legitimately uses) would give
+// both the same name and silently alias two symbols onto one.
+TEST(SemanticAnalyzerCSubset, AsmLabelsAreRecordedPerDeclarator) {
+    auto m = analyzeShipped("c-subset", {
+        "int a __asm(\"aa\") = 1, b __asm(\"bb\") = 2, plain = 3;\n"
+        "int main(void) { return a + b + plain; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(asmNameOf(m, "a"), "aa");
+    EXPECT_EQ(asmNameOf(m, "b"), "bb");
+    EXPECT_EQ(asmNameOf(m, "plain"), "")
+        << "an undecorated declarator in the same declaration must stay unlabelled";
+}
+
+// FORM 7 — a label INTERLEAVED with an attribute, both orders. The run is a
+// `{repeat alt}` precisely so neither order needs a rule, and both must keep the
+// initializer detection correct (the label is not the init value).
+TEST(SemanticAnalyzerCSubset, AsmLabelInterleavesWithAttributesEitherOrder) {
+    auto first = analyzeShipped("c-subset", {
+        "int p __asm(\"pp\") __attribute__((aligned(8))) = 1;\n"
+        "int main(void) { return p; }\n",
+    });
+    EXPECT_FALSE(first.diagnostics().hasErrors()) << "label before attribute";
+    EXPECT_EQ(asmNameOf(first, "p"), "pp");
+    auto second = analyzeShipped("c-subset", {
+        "int q __attribute__((aligned(8))) __asm(\"qq\") = 1;\n"
+        "int main(void) { return q; }\n",
+    });
+    EXPECT_FALSE(second.diagnostics().hasErrors()) << "attribute before label";
+    EXPECT_EQ(asmNameOf(second, "q"), "qq");
+}
+
+// FAIL-LOUD 1 — an EMPTY label. The most dangerous invalid form: an empty name
+// reaches `nameOf` as the module-private signal, the symbol-table row is
+// dropped, and the writer substitutes a synthetic `sym_<id>`. RED-ON-DISABLE:
+// remove the `decoded->empty()` arm in `readAsmLabel` and this compiles clean.
+TEST(SemanticAnalyzerCSubset, EmptyAsmLabelFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "int f(void) __asm(\"\");\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AsmLabelInvalid), 1u);
+}
+
+// FAIL-LOUD 2 — TWO labels on one declarator. Never first-wins: which assembler
+// name was intended is genuinely unknown.
+TEST(SemanticAnalyzerCSubset, DuplicateAsmLabelFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "int f(void) __asm(\"a\") __asm(\"b\");\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AsmLabelDuplicate), 1u);
+    EXPECT_EQ(asmNameOf(m, "f"), "")
+        << "a rejected label must not leave a half-applied rename behind";
+}
+
+// FAIL-LOUD 3 — a label on an AUTOMATIC local. WARNS and drops (matching clang,
+// MEASURED: "ignored asm label 'mylocal' on automatic variable"). Erroring would
+// refuse C every toolchain accepts; silence would leave the programmer believing
+// a rename happened. The `asmName` assertion is what proves the DROP actually
+// happened rather than the warning being cosmetic.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnAutomaticLocalWarnsAndIsDropped) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { int x __asm(\"mylocal\") = 1; return x; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "a warning, never an error";
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_AsmLabelOnAutomaticVariable), 1u);
+    EXPECT_EQ(asmNameOf(m, "x"), "");
+}
+
+// The COMPLEMENT of the warning above: a `static` local DOES have a symbol, so
+// its label is honored. Without this pin the warning could be widened to every
+// block-scope declaration and nothing would notice.
+TEST(SemanticAnalyzerCSubset, AsmLabelOnStaticLocalIsHonored) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { static int s __asm(\"mystatic\") = 1; return s; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_AsmLabelOnAutomaticVariable), 0u);
+    EXPECT_EQ(asmNameOf(m, "s"), "mystatic");
+}
+
+// ── D-CSUBSET-TYPEDEF-MULTI-DECLARATOR ──────────────────────────────────────
+
+// THE corpus witness, verbatim from the macOS SDK (`mach/vm_types.h:87`).
+// Asserting all THREE aliases resolve to the SAME type is what catches the
+// "lowered only the first declarator" implementation — which compiles clean and
+// leaves aliases 2..N undeclared, so a `vm_map_read_t x;` later reads as an
+// implicit-int or an undeclared type depending on the tier that trips first.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorBindsEveryAlias) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef unsigned int mach_port_t;\n"
+        "typedef mach_port_t vm_map_t, vm_map_read_t, vm_map_inspect_t;\n"
+        "vm_map_t a; vm_map_read_t b; vm_map_inspect_t c;\n"
+        "int main(void) { return (int)(a + b + c); }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "SDK mach/vm_types.h:87";
+    auto const* base = findSymbolNamed(m, "mach_port_t");
+    ASSERT_NE(base, nullptr);
+    for (char const* alias : {"vm_map_t", "vm_map_read_t", "vm_map_inspect_t"}) {
+        auto const* r = findSymbolNamed(m, alias);
+        ASSERT_NE(r, nullptr) << alias << " was not bound";
+        EXPECT_EQ(r->kind, DeclarationKind::Type) << alias;
+        EXPECT_EQ(r->type.v, base->type.v)
+            << alias << " must alias the SAME type as the shared head";
+    }
+}
+
+// PER-SLOT declarator suffixes. A shared-head implementation (one type for the
+// whole declaration) would type all three identically and compile clean — this
+// is the assertion that distinguishes a real per-declarator fold from a
+// copy-the-head one. `F` is a FUNCTION type, `P` a pointer, `A` an array.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorFoldsEachSuffixSeparately) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef int *P, A[4], F(void);\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    TypeInterner const& in = m.lattice().interner();
+    auto const* p = findSymbolNamed(m, "P");
+    auto const* a = findSymbolNamed(m, "A");
+    auto const* f = findSymbolNamed(m, "F");
+    ASSERT_NE(p, nullptr); ASSERT_NE(a, nullptr); ASSERT_NE(f, nullptr);
+    EXPECT_EQ(in.kind(p->type), TypeKind::Ptr)   << "P must be int*";
+    EXPECT_EQ(in.kind(a->type), TypeKind::Array) << "A must be int[4]";
+    EXPECT_EQ(in.kind(f->type), TypeKind::FnSig) << "F must be int(void)";
+}
+
+// The single-declarator form must be UNCHANGED — the list rule replaces the bare
+// declarator 1:1 at the same role index, so nothing about a one-alias typedef
+// moves. Without this the index flip could regress every existing typedef and
+// only the multi-declarator tests would notice.
+TEST(SemanticAnalyzerCSubset, TypedefSingleDeclaratorIsUnchanged) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef unsigned long long u_int64_t;\n"
+        "typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));\n"
+        "au_asflgs_t v;\n"
+        "int main(void) { return (int)v; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    auto const* base = findSymbolNamed(m, "u_int64_t");
+    auto const* al   = findSymbolNamed(m, "au_asflgs_t");
+    ASSERT_NE(base, nullptr); ASSERT_NE(al, nullptr);
+    EXPECT_EQ(al->type.v, base->type.v);
+}
+
+// A BLOCK-SCOPE multi-declarator typedef — the statement position, which needs
+// its own Block wrapper because a statement holds exactly one HIR node. Both
+// aliases must bind IN the block.
+TEST(SemanticAnalyzerCSubset, BlockScopeTypedefMultiDeclaratorBindsEveryAlias) {
+    auto m = analyzeShipped("c-subset", {
+        "int main(void) { typedef int LA, LB; LA a = 1; LB b = 2; return a + b; }\n",
+    });
+    EXPECT_FALSE(m.diagnostics().hasErrors());
+    for (char const* alias : {"LA", "LB"}) {
+        auto const* r = findSymbolNamed(m, alias);
+        ASSERT_NE(r, nullptr) << alias << " was not bound in the block";
+        EXPECT_EQ(r->kind, DeclarationKind::Type) << alias;
+    }
+}
+
+// An ABSTRACT slot in the middle of the list fails LOUD per slot — `typedef int
+// A, *, B;` declares nothing at slot 2. Silently binding A and B and skipping
+// the middle would declare fewer aliases than were written.
+TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorAbstractSlotFailsLoud) {
+    auto m = analyzeShipped("c-subset", {
+        "typedef int A, *, B;\n"
+        "int main(void) { return 42; }\n",
+    });
+    EXPECT_GE(countCode(m.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 1u);
+}
+
+// ── TF-C89 — THE SHIPPED-TYPEDEF DEAD WINDOW ─────────────────────────────────
+// D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION
+//
+// MEASURED on the SQLite corpus (arm64 macho, per-TU isolated census at
+// fc0908d, per-code cap temporarily lifted in a local build because the shipped
+// cap of 50 was saturated on two TUs): 80 of the leg's 123 `S0006` came from ONE
+// mechanism — MEASURED after the fix, S0006 123 -> 43. The
+// shipped-descriptor TYPEDEF injection's goal-2 skip ("a user declaration of
+// the name wins") keyed on `userDeclaredNames` — a WHOLE-TU, POSITION-BLIND
+// name set. The user's own typedef, by contrast, is POSITION-SENSITIVE: Pass
+// 1.5 resolves declaration types in TREE ORDER, so its `SymbolRecord::type` is
+// still InvalidType while EARLIER declarations resolve. One user typedef
+// anywhere in the TU therefore DELETED the shipped typedef, leaving a DEAD
+// WINDOW from the top of the TU down to the user's redeclaration point in
+// which the name resolved to NOTHING — no shipped symbol (skipped) and no user
+// symbol (not yet typed). C 6.2.1p7 puts the ENCLOSING declaration in scope for
+// exactly that region.
+//
+// SQLite hits it because `sqliteInt.h` USES the names early
+// (`#define INT16_TYPE int16_t` + `typedef INT16_TYPE i16;` / `LogEst`,
+// `typedef uintptr_t uptr;`) and the platform's OWN `typedef short int16_t;`
+// (the macOS SDK's `<sys/_types/_int16_t.h>`, pulled in later by
+// `<malloc/malloc.h>` / `<sys/sysctl.h>`) lands LATER in the same TU. i16 / i8 /
+// LogEst / ynVar all died with the deleted shipped typedef.
+//
+// The fix has TWO arms and NEITHER works alone:
+//   A) the typedef injection's goal-2 skip keys on `userNonTypeDeclaredNames` —
+//      a user TYPEDEF of the name no longer deletes the shipped one (a user
+//      OBJECT/FUNCTION claim still does);
+//   B) `resolveTypeNodeImpl`'s alias arm walks with `ScopeTree::lookupIf`, so a
+//      binding that is not usable as a type alias (not Type-kind, or Type-kind
+//      with an unresolved type) is SKIPPED and the walk CONTINUES OUTWARD.
+// Every pin below names which arm(s) turn it red.
+
+namespace {
+
+// Build + analyze `mainSrc` against the REAL src/dss-config/shippedLibs — the
+// same descriptors the production driver ships — so a regression in stdint.json
+// itself flips the pin red rather than being mirrored green by a scratch copy.
+[[nodiscard]] SemanticModel analyzeWithRealShippedLibs(std::string mainSrc) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu);
+}
+
+} // namespace
+
+// FORM 1 — THE CORPUS FORM, against the REAL shipped <stdint.h>. Byte-for-byte
+// the SQLite shape: use `int16_t` in a typedef ABOVE the platform's own
+// `typedef short int16_t;`, then use the alias. RED on arm A ALONE (the shipped
+// int16_t is deleted, so the alias's base is unknown) and RED on arm B ALONE
+// (the not-yet-typed user binding stops the walk before the shipped one).
+//
+// The assertion is TWO-SIDED: `alias16` must be exactly I16. "No S_UnknownType"
+// alone would pass on a resolution that silently picked some other width.
+TEST(SemanticAnalyzerCSubset, TFC89ShippedTypedefUsedAboveUserRedeclaration) {
+    auto model = analyzeWithRealShippedLibs(
+        "#include <stdint.h>\n"
+        "typedef int16_t alias16;\n"   // the USE, ABOVE the redeclaration
+        "typedef short int16_t;\n"     // the platform's own, C11 6.7p3 legal
+        "int main(void) { alias16 a = 1; return (int)a; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "int16_t is in scope above the redeclaration (C 6.2.1p7) — the "
+           "shipped typedef must not be deleted by a LATER user redeclaration";
+    auto const* alias = findSymbolNamed(model, "alias16");
+    ASSERT_NE(alias, nullptr);
+    ASSERT_TRUE(alias->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(alias->type), TypeKind::I16)
+        << "alias16 must be exactly the 16-bit core the shipped int16_t names";
+}
+
+// FORM 2 — ARM A's OWN pin, on the SURVIVING INJECTION rather than on
+// resolution. With a user typedef of the same name present, BOTH declarations
+// must exist (the injected one in the CU root, the user's in the tree root, one
+// shadowing the other) — and, because they live in DIFFERENT scopes, the Pass-1
+// same-scope collision check must NOT fire. RED on arm A alone: the count drops
+// to 1. Deliberately independent of arm B, which cannot move either number.
+TEST(SemanticAnalyzerCSubset, TFC89ShippedTypedefSurvivesUserTypedefOfSameName) {
+    ScratchDir sysDir{Location::Temp, "tfc89-survive"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "my16.json",
+        R"({ "header": "my16.h",
+             "typedefs": [ { "name": "my16_t", "type": "i16" } ] })",
+        "#include <my16.h>\n"
+        "typedef short my16_t;\n"
+        "int main(void) { my16_t v = 1; return (int)v; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "my16_t"), 2u)
+        << "the shipped typedef is injected in the CU root AND the user's is "
+           "bound in the tree root — a user TYPEDEF redeclaration must not "
+           "delete the shipped declaration";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol))
+        << "the two bindings are in DIFFERENT scopes — no same-scope collision";
+}
+
+// FORM 3 — ARM B's OWN pin, with NO shipped descriptor anywhere in the CU, so
+// arm A cannot possibly influence it. A BLOCK-SCOPE redeclaration of a
+// file-scope typedef, USED above the redeclaration: C 6.2.1p7 scopes the inner
+// `T` only after its declarator completes, so `typedef T U;` above it must see
+// the FILE-SCOPE `int`. RED on arm B alone (the not-yet-typed inner binding
+// stops the walk); untouched by arm A.
+//
+// TWO-SIDED on purpose: `U` must be I32 (the OUTER int), not I16 (the inner
+// short). A "no diagnostics" pin would accept the wrong declaration winning.
+TEST(SemanticAnalyzerCSubset, TFC89InnerRedeclarationDoesNotHideOuterTypedef) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T;\n"
+        "int main(void) {\n"
+        "    typedef T U;\n"       // must resolve to the FILE-SCOPE T (int)
+        "    typedef short T;\n"   // the inner redeclaration, LATER
+        "    U u = 1;\n"
+        "    return (int)u;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the file-scope T is in scope above the block-scope redeclaration";
+    auto const* u = findSymbolNamed(model, "U");
+    ASSERT_NE(u, nullptr);
+    ASSERT_TRUE(u->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(u->type), TypeKind::I32)
+        << "U aliases the OUTER `typedef int T`, not the inner `short`";
+}
+
+// THE GOAL-2 GUARD (arm A must stay SELECTIVE, not become "always inject"). A
+// user declaration that is NOT a type — an OBJECT of the shipped typedef's
+// spelling — still WINS: the shipped typedef stays skipped, so the name in TYPE
+// position keeps failing LOUD and exactly one symbol carries the name. RED if
+// arm A is widened to drop the skip unconditionally.
+TEST(SemanticAnalyzerCSubset, TFC89NonTypeUserDeclStillSuppressesShippedTypedef) {
+    ScratchDir sysDir{Location::Temp, "tfc89-goal2"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "myint.json",
+        R"({ "header": "myint.h",
+             "typedefs": [ { "name": "my_int_t", "type": "i32" } ] })",
+        "#include <myint.h>\n"
+        "int my_int_t;\n"                       // a user OBJECT of that name
+        "int main(void) { my_int_t = 5; return my_int_t; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "my_int_t"), 1u)
+        << "a user OBJECT claim keeps the goal-2 skip: the descriptor typedef "
+           "must NOT be injected alongside it";
+    auto const* obj = findSymbolNamed(model, "my_int_t");
+    ASSERT_NE(obj, nullptr);
+    EXPECT_EQ(obj->kind, DeclarationKind::Variable)
+        << "the surviving symbol is the user's object, not a Type";
+}
+
+// THE FAIL-LOUD GUARD for arm B: widening WHERE a type may be found must never
+// widen WHETHER a miss is reported. A type name with NO usable binding on the
+// whole chain still fails loud — arm B must not invent a fallback.
+TEST(SemanticAnalyzerCSubset, TFC89UnresolvableTypeNameStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef NoSuchTypeName Alias;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "an unresolvable type name must still fail loud after the walk "
+           "runs off the end of the scope chain";
+}
+
+// ── D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8) ─────────────────────────
+//
+// "A declaration of a parameter as 'function returning type' shall be adjusted
+// to 'pointer to function returning type'." Before this, such a parameter was
+// bound with a FnSig type and fell into the FnSig-typed-Variable arm of the
+// Pass-1.5 bind → S0018 S_InvalidFunctionDeclarator ("function prototype
+// declarations are not supported here"). MEASURED as 6 of sqlite's arm64/macho
+// residuals, all in `src/mem1.c`, all through Darwin's FUNCTION typedefs
+// ($SDK/usr/include/malloc/malloc.h:537,546,550 — `memory_reader_t`,
+// `vm_range_recorder_t`, `print_task_printer_t` are function, NOT
+// function-pointer, typedefs, used bare as parameters).
+//
+// ★ THE FIX IS THE ADJUSTMENT, NOT THE SUPPRESSION. Silencing S0018 at the
+// reject site would leave the symbol typed FnSig — a function VALUE in a
+// parameter slot, i.e. a silent miscompile. The rule lives in
+// `adjustParamDeclaredType`, the ONE chokepoint every parameter resolution
+// funnels through (the definitive Pass-1.5 bind and all three
+// `declRowDeclaredType` arms that `collectParamTypes` uses to build a FnSig).
+//
+// ★ THIS IS A MULTI-SITE CONTRACT AND THE SITES ARE COVERED SEPARATELY. The
+// p7 array twin's corpus exercises only named params in definitions; that
+// weakness is deliberately NOT reproduced. Every form below is its own test:
+// inline, via typedef, prototype-vs-definition equality, ABSTRACT/type-only,
+// nested inside a fn-pointer declarator (the real SDK shape), and a CALL that
+// actually dispatches through the adjusted parameter.
+//
+// RED-ON-DISABLE, shared by every test in this block: delete the FnSig arm of
+// `adjustParamDeclaredType` and each `S_InvalidFunctionDeclarator == 0` pin
+// goes red (S0018 returns), plus every Ptr/FnSig structural pin flips to a bare
+// FnSig.
+
+namespace {
+// The pointee FnSig of a parameter that C 6.7.6.3p8 adjusted, or InvalidType.
+// ASSERTing through this keeps each pin one line and makes a bare-FnSig
+// regression (the un-adjusted state) impossible to pass by accident.
+[[nodiscard]] TypeId adjustedFnParamPointee(SemanticModel const& m, TypeId t) {
+    TypeInterner const& in = m.lattice().interner();
+    if (!t.valid() || in.kind(t) != TypeKind::Ptr) return InvalidType;
+    auto const ops = in.operands(t);
+    if (ops.empty() || in.kind(ops[0]) != TypeKind::FnSig) return InvalidType;
+    return ops[0];
+}
+}  // namespace
+
+// FORM (1) — a DEFINITION with a NAMED, INLINE function-typed parameter.
+// `int g(int)` in parameter position is a function type, adjusted to
+// `int (*)(int)`. Also the SIZE pin: the parameter IS a pointer, so its layout
+// is pointer-sized (a FnSig has no layout at all — computeLayout nullopts —
+// so this pin is only satisfiable by the adjusted type).
+TEST(SemanticAnalyzerCSubset, InlineFunctionTypedParamAdjustsToPointerToFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "a function-typed PARAMETER is not a prototype — C 6.7.6.3p8 adjusts "
+           "it to a pointer; S0018 here is the un-adjusted regression";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr) << "the parameter symbol must still be bound";
+    TypeId const pointee = adjustedFnParamPointee(model, g->type);
+    ASSERT_TRUE(pointee.valid())
+        << "the bound parameter must be Ptr<FnSig>, never a bare FnSig (a "
+           "function VALUE in a parameter slot is the silent miscompile)";
+    TypeInterner const& in = model.lattice().interner();
+    auto const params = in.fnParams(pointee);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(in.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(in.kind(in.fnResult(pointee)), TypeKind::I32);
+    auto const layout = computeLayout(g->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value())
+        << "an un-adjusted FnSig parameter has NO layout — computeLayout nullopts";
+    EXPECT_EQ(layout->size, 8u)  << "sizeof(param) is POINTER size (C: it IS a pointer)";
+    EXPECT_EQ(layout->align.bytes(), 8u);
+}
+
+// FORM (2) — a DEFINITION with a NAMED parameter whose function-ness arrives
+// through a FUNCTION TYPEDEF. THE SDK SHAPE: `typedef kern_return_t
+// memory_reader_t(task_t, vm_address_t, vm_size_t, void **);` then
+// `… (task_t, memory_reader_t reader, …)`. Distinct from form (1) because the
+// declarator here carries NO `()` suffix at all — the FnSig comes from the
+// head type, so a fix that keyed on the declarator's syntax would miss it.
+TEST(SemanticAnalyzerCSubset, FunctionTypedefParamAdjustsToPointerToFunction) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int Fn(int);\n"
+        "int f(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "the SDK's function-TYPEDEF parameter spelling must adjust, not reject";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(adjustedFnParamPointee(model, g->type).valid())
+        << "a parameter typed by a FUNCTION typedef is Ptr<FnSig>";
+    // The typedef ITSELF stays a function type — the adjustment is scoped to the
+    // PARAMETER, it does not rewrite the alias (else `Fn *p;` would become a
+    // pointer-to-pointer and every other use of the alias would shift).
+    auto const* fnAlias = findSym(model, "Fn");
+    ASSERT_NE(fnAlias, nullptr);
+    EXPECT_EQ(model.lattice().interner().kind(fnAlias->type), TypeKind::FnSig)
+        << "the alias is still a FUNCTION type; only the PARAMETER adjusts";
+}
+
+// FORM (3) — a separate PROTOTYPE and DEFINITION of the SAME function. This is
+// the FnSig-EQUALITY pin: the prototype's signature is built by the param
+// HARVEST (`declRowDeclaredType`) and the definition's by the definitive
+// Pass-1.5 bind. If only one of the two applied p8, the two FnSigs would be
+// structurally different interned types and the merge would fail loud
+// (S0022 S_IncompatibleRedeclaration) or the call would (S0003 S_TypeMismatch).
+// Zero of both, with the call still dispatching, is the equality proof.
+TEST(SemanticAnalyzerCSubset, FunctionTypedefParamPrototypeAndDefinitionAgree) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int apply(Fn g, int v);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "prototype and definition must build the SAME FnSig — an asymmetric "
+           "p8 (applied at one resolution site only) shows up exactly here";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "and the call site must agree with both";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// FORM (4) — an ABSTRACT (type-only) parameter, `int apply(Fn, int);`. C
+// 6.7.6.3p8 adjusts regardless of whether the parameter is named, so the
+// abstract prototype and the NAMED definition below it must still merge. The
+// abstract arm of `declRowDeclaredType` is a physically different return
+// statement from the named arm — this is the test that keeps them in step.
+TEST(SemanticAnalyzerCSubset, AbstractFunctionTypedefParamAdjustsAndMergesWithNamedDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int apply(Fn, int);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "`int apply(Fn, int);` and `int apply(Fn g, int v){…}` are the SAME "
+           "signature — the ABSTRACT arm must adjust exactly like the named one";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors());
+    // And the harvested FnSig itself carries the ADJUSTED parameter type.
+    auto const* apply = findSym(model, "apply");
+    ASSERT_NE(apply, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(apply->type), TypeKind::FnSig);
+    auto const params = in.fnParams(apply->type);
+    ASSERT_EQ(params.size(), 2u);
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[0]).valid())
+        << "the FnSig's first parameter must be Ptr<FnSig>, not FnSig";
+}
+
+// FORM (5) — the parameter sits inside a NESTED fn-pointer declarator, which is
+// the shape the SDK actually writes: `malloc_introspection_t`'s `enumerator`
+// member is `kern_return_t (*enumerator)(task_t, …, memory_reader_t reader,
+// vm_range_recorder_t recorder)`. The inner parameter list is harvested by a
+// DIFFERENT walk (the fn-suffix param harvest) from a top-level definition's,
+// so this is not covered by forms (1)/(2).
+TEST(SemanticAnalyzerCSubset, NestedFnPtrDeclaratorFunctionTypedefParamAdjusts) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Reader(int, int);\n"
+        "typedef void Recorder(int);\n"
+        "int enumerate(int task, Reader reader, Recorder recorder);\n"
+        "int (*ep)(int task, Reader reader, Recorder recorder);\n"
+        "int main(void) { ep = enumerate; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
+        << "function-typed params inside a nested fn-POINTER declarator must "
+           "adjust too — this is the shipped malloc_introspection_t shape";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`ep = enumerate` type-checks ONLY if the fn-pointer's harvested "
+           "params and the function's own params adjusted identically";
+    EXPECT_FALSE(model.hasErrors());
+    // Structural pin on the fn-POINTER's pointee signature (the harvest path).
+    auto const* ep = findSym(model, "ep");
+    ASSERT_NE(ep, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(ep->type), TypeKind::Ptr);
+    TypeId const sig = in.operands(ep->type)[0];
+    ASSERT_EQ(in.kind(sig), TypeKind::FnSig);
+    auto const params = in.fnParams(sig);
+    ASSERT_EQ(params.size(), 3u);
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[1]).valid())
+        << "the nested `Reader reader` parameter must be Ptr<FnSig>";
+    EXPECT_TRUE(adjustedFnParamPointee(model, params[2]).valid())
+        << "the nested `Recorder recorder` parameter must be Ptr<FnSig>";
+}
+
+// FORM (6) — a CALL THROUGH the adjusted parameter that actually DISPATCHES,
+// plus the `&param` pin. `g(v)` inside the body is a call through a
+// pointer-to-function; `Fn **pp = &g;` is only well-typed if the parameter is
+// itself a pointer (so its address is a pointer-to-pointer-to-function — both
+// facts correct per C precisely BECAUSE the parameter IS a pointer). A bare
+// FnSig parameter would make `&g` a pointer-to-function and this mismatch.
+TEST(SemanticAnalyzerCSubset, CallAndAddressOfAdjustedFunctionTypeParamAreWellTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "int twice(int x) { return x + x; }\n"
+        "int apply(Fn g, int v) {\n"
+        "  Fn **pp = &g;\n"
+        "  (void)pp;\n"
+        "  return g(v);\n"
+        "}\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`&g` is pointer-to-pointer-to-function — the parameter IS a pointer";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the call THROUGH the adjusted parameter must dispatch cleanly";
+}
+
+// ★ THE ANTI-VACUITY CONTROL. p8 is a PARAMETER rule and nothing else. A
+// function-typed STRUCT FIELD (`struct S { Fn f; };`) is NOT a parameter, has
+// no meaningful runtime form, and must STAY loud. Its row carries no
+// `paramAdjustments`, so `adjustParamDeclaredType` returns it untouched and it
+// still reaches the FnSig-typed-Variable reject. Without this test, a blanket
+// "FnSig anywhere becomes a pointer" implementation would pass every pin above.
+TEST(SemanticAnalyzerCSubset, FunctionTypedStructFieldStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int Fn(int);\n"
+        "struct S { Fn f; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidFunctionDeclarator), 1u)
+        << "a function-typed struct MEMBER is not a parameter and must still "
+           "fail loud — the adjustment is scoped to `paramAdjustments` rows";
+}
+
+// FORM (7) — the SYMBOL-CLASSIFICATION half of p8, which the type pins above
+// cannot see. The INLINE spelling `int g(int)` writes the SAME syntax a function
+// prototype writes — a name carrying a `()` suffix — and Pass 1's `isProto` test
+// is purely syntactic, so it classified the parameter a PROTOTYPE even though
+// p8 had already made its declared type a pointer. Every FORM (1) assertion
+// stayed green throughout: the TYPE was right, the KIND was not. The flag then
+// did real damage one tier down — a prototype re-homes onto the FILE scope, and
+// CST→HIR emits no VarDecl for one — so it is pinned HERE, where it is decided.
+// (`decl.paramAdjustments` suppresses `isProto`; see the derivation's comment.)
+TEST(SemanticAnalyzerCSubset, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
+    auto model = analyzeShipped("c-subset", {
+        "int twice(int x) { return x + x; }\n"
+        "int apply(int g(int), int v) { return g(v); }\n"
+        "int main(void) { return apply(twice, 21); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    EXPECT_FALSE(g->isProtoDeclaration)
+        << "a PARAMETER is never a function prototype — C 6.7.6.3p8 makes its "
+           "declared type a pointer, so it declares an OBJECT";
+    EXPECT_EQ(g->kind, DeclarationKind::Variable)
+        << "and Pass 1.5 must not upgrade it to Function (that upgrade is what "
+           "makes a bare `int f(int);` callable — a parameter is not that)";
+}
+
+// FORM (8) — C 6.2.1p4: a parameter name is scoped to its own declarator and
+// has NO linkage, so two functions may reuse one. The prototype
+// misclassification ALSO re-homed the parameter onto the FILE scope (that is
+// what D-CSUBSET-BLOCK-SCOPE-PROTOTYPE does for a real prototype), where two
+// same-named parameters met as ONE symbol: MEASURED as S0022 on `g`, pointing
+// at the OTHER function's parameter. Distinct symbols in distinct scopes is the
+// only shape in which that cannot recur.
+TEST(SemanticAnalyzerCSubset, SameNamedInlineFunctionTypedParamsDoNotCollide) {
+    auto model = analyzeShipped("c-subset", {
+        "int  twice(int x)   { return x * 2; }\n"
+        "long addOne(long x) { return x + 1; }\n"
+        "int a(int  g(int),  int  v) { return g(v); }\n"
+        "int b(long g(long), long v) { return (int)g(v); }\n"
+        "int main(void) { return a(twice, 20) + b(addOne, 1); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "two functions' parameters merely SHARE a name — a parameter has no "
+           "linkage (C 6.2.1p4) and must never merge across functions";
+    EXPECT_FALSE(model.hasErrors());
+    // TWO symbols named `g`, in DIFFERENT scopes, with DIFFERENT pointees. A
+    // re-homed pair collapses to one symbol, which fails the count first.
+    std::vector<SymbolRecord const*> gs;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "g") gs.push_back(&model.symbols()[i]);
+    ASSERT_EQ(gs.size(), 2u) << "each function owns its OWN `g`";
+    EXPECT_NE(gs[0]->scope.v, gs[1]->scope.v)
+        << "and they live in DIFFERENT scopes — neither is at file scope";
+    TypeInterner const& in = model.lattice().interner();
+    TypeId const p0 = adjustedFnParamPointee(model, gs[0]->type);
+    TypeId const p1 = adjustedFnParamPointee(model, gs[1]->type);
+    ASSERT_TRUE(p0.valid() && p1.valid());
+    EXPECT_EQ(in.kind(in.fnResult(p0)), TypeKind::I32);   // `int  g(int)`
+    EXPECT_EQ(in.kind(in.fnResult(p1)), TypeKind::I64);   // `long g(long)`
+}
+
+// ── D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC ───────────────────────────────
+//
+// THE INSTRUMENT, not a feature: S0029 used to print the author's string and
+// nothing else. MEASURED on sqlite's `src/mem1.c`, its three S0029 all come
+// from ONE macro (`xnu_static_assert_struct_size`, $SDK/usr/include/mach/
+// port.h:100) instantiated ~25× in `mach/message.h`, so all three shared one
+// span, one condition source text and one author string — three literally
+// indistinguishable errors. Appending the condition's SOURCE TEXT would have
+// produced three byte-identical strings; only the FOLDED VALUES discriminate.
+//
+// AGNOSTICISM: the operator verb is read from the config-declared
+// `hirLowering.binaryOps` token→verb table, never from a hardcoded `==`/`<`
+// spelling or a rule name. Two different verbs are pinned below for exactly
+// that reason.
+//
+// ⚠ The suffix APPENDS. `Int128FalseConstantExpressionStillFailsAsAssertion`
+// (above) substring-matches "static assertion failed"; that prefix is
+// deliberately unchanged.
+
+// The `==` case, with real folded values on both sides.
+TEST(SemanticAnalyzerCSubset, StaticAssertFailureAppendsFoldedOperandsForEquality) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 8, \"struct changed size unexpectedly\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    std::size_t n = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++n; text = d.actual;
+    }
+    ASSERT_EQ(n, 1u);
+    EXPECT_NE(text.find("static assertion failed"), std::string::npos)
+        << "the existing prefix must be UNCHANGED (it is substring-matched "
+           "elsewhere); got: " << text;
+    EXPECT_NE(text.find("(folded: 4 Eq 8)"), std::string::npos)
+        << "BOTH folded operands and the config-declared verb must be reported "
+           "— that is the entire point of the instrument; got: " << text;
+}
+
+// The SECOND VERB. `<` proves the suffix reads `hirLowering.binaryOps` rather
+// than hardcoding equality: nothing in the engine names `LtOp` or `Lt`, so a
+// verb-specific implementation reds here while passing the `==` pin above.
+TEST(SemanticAnalyzerCSubset, StaticAssertFoldedOperandSuffixIsVerbAgnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(4 < 3, \"four is not less than three\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
+    EXPECT_NE(text.find("(folded: 4 Lt 3)"), std::string::npos)
+        << "a NON-equality comparison must report its own config verb; got: "
+        << text;
+}
+
+// ★ THE PROPERTY THE INSTRUMENT EXISTS FOR: two failing assertions that share
+// the SAME author message must produce DIFFERENT diagnostic text. This is the
+// `mem1.c` situation reduced to two lines — before the widening both messages
+// were byte-identical and the census collapsed them.
+TEST(SemanticAnalyzerCSubset, StaticAssertFailuresSharingOneMessageAreDistinguishable) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 8, \"struct changed size unexpectedly\");\n"
+        "_Static_assert(sizeof(long) == 4, \"struct changed size unexpectedly\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::vector<std::string> texts;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed)
+            texts.push_back(d.actual);
+    ASSERT_EQ(texts.size(), 2u) << "both assertions must fail loud";
+    EXPECT_NE(texts[0], texts[1])
+        << "two failures sharing one author string must be TELLABLE APART — "
+           "this is the whole instrument; got both as: " << texts[0];
+    EXPECT_NE(texts[0].find("(folded: 4 Eq 8)"), std::string::npos) << texts[0];
+    EXPECT_NE(texts[1].find("(folded: 8 Eq 4)"), std::string::npos) << texts[1];
+}
+
+// DEGRADE CLEANLY: a NON-binary condition still emits, still carries the author
+// string, and appends nothing. No crash, no guessed operands.
+TEST(SemanticAnalyzerCSubset, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(0, \"plain zero\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    std::size_t n = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_StaticAssertFailed) continue;
+        ++n; text = d.actual;
+    }
+    ASSERT_EQ(n, 1u) << "a non-binary condition must STILL fail loud";
+    EXPECT_NE(text.find("static assertion failed: \"plain zero\""),
+              std::string::npos) << text;
+    EXPECT_EQ(text.find("(folded:"), std::string::npos)
+        << "there are no binary operands to report — append nothing rather "
+           "than guess; got: " << text;
+}
+
+// The NON-CONSTANT branch also degrades cleanly: `sizeof` of an incomplete
+// array does not fold, so the LHS renders as `<non-constant>` while the RHS
+// still folds. The message keeps its own "is not an integer constant
+// expression" wording (the two failure modes stay distinguishable on one code).
+TEST(SemanticAnalyzerCSubset, StaticAssertNonConstantOperandRendersAsNonConstant) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "_Static_assert(sizeof(T) == 4, \"incomplete has no size\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    std::string text;
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
+    EXPECT_NE(text.find("is not an integer constant expression"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("(folded: <non-constant> Eq 4)"), std::string::npos)
+        << "a side that does not fold must say so, not be omitted or guessed; "
+           "got: " << text;
+}
+
+// ── D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1) ─────────────────────────
+//
+// "If the size is not present, the array type is an incomplete type." A typedef
+// may therefore NAME one. MEASURED as sqlite's blocker:
+// $SDK/usr/include/mach/vm_region.h:355 `#define VM_PAGE_INFO_MAX` is an EMPTY
+// object-like macro, so `:357` `typedef int vm_page_info_data_t[VM_PAGE_INFO_MAX];`
+// expands to `typedef int vm_page_info_data_t[];` and was S000B.
+//
+// THE ADMISSION IS THE `typeAliasRow` SIGNAL — deliberately NOT
+// `allowFlexibleArray`, which the `typedefDecl` row does not carry and MUST
+// NOT be given (the interaction guard at the foot of the NEXT block states why,
+// and is the pin that killed that first attempt). `typeAliasRow` is DERIVED
+// from the row's already config-declared `kind: type` — literally
+// `typeAliasRow = decl.kind == DeclarationKind::Type` at both declarator-mode
+// minting sites in semantic_analyzer.cpp — and threaded unchanged through
+// `declaratorDeclaredType` → `directDeclaredType` → `applyDeclaratorSuffix`,
+// where its arm sits BELOW every present-bound return. So a present-but-non-
+// constant bound (a VLA typedef) is out of the arm's reach BY CONSTRUCTION,
+// not by ordering luck. The legacy `applyArraySuffix` twin carries the same
+// `decl.kind == DeclarationKind::Type` disjunct under the same absent-length
+// gate — it is unreachable today (no shipped row declares an `arraySuffix`
+// facet) and is kept arm-for-arm in step anyway, which is why the two
+// resolvers cannot drift.
+//
+// ★★ THE FAIL-LOUD HALF IS WHAT MAKES THE ADMISSION SAFE and it is pinned
+// case by case below: an incomplete array silently sized 0 at a use site is
+// precisely the silent-miscompile class the bar forbids.
+
+// ADMIT: the typedef itself resolves, and to an INCOMPLETE array — not to a
+// zero-length one and not to the element type. RED-ON-DISABLE: delete the
+// `if (typeAliasRow) return …incompleteArray(inner);` arm from
+// `applyDeclaratorSuffix` (semantic_analyzer.cpp) — the absent bound then falls
+// straight into the `emit(S_NonConstantArrayLength)` below it and this is S000B
+// again.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefIsAdmittedAsIncompleteArray) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "`typedef int T[];` is legal C — the absent bound names an "
+           "INCOMPLETE array type (C 6.7.6.2p1)";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* t = findSym(model, "T");
+    ASSERT_NE(t, nullptr);
+    ASSERT_TRUE(t->type.valid());
+    TypeInterner const& in = model.lattice().interner();
+    EXPECT_EQ(in.kind(t->type), TypeKind::Array);
+    EXPECT_TRUE(in.isIncompleteArray(t->type))
+        << "it must be the INCOMPLETE array — a silently 0-sized array here is "
+           "the miscompile this whole block guards against";
+}
+
+// The MACRO-EXPANDED spelling, byte-for-byte the SDK's: an EMPTY object-like
+// macro in the bound position. Pinned separately from the bare `[]` because it
+// is the form that actually ships and it exercises the preprocessor→parser
+// hand-off, not just the semantic tier.
+TEST(SemanticAnalyzerCSubset, EmptyMacroArrayBoundTypedefMatchesTheSdkSpelling) {
+    auto model = analyzeShipped("c-subset", {
+        "#define VM_PAGE_INFO_MAX\n"
+        "typedef int vm_page_info_data_t[VM_PAGE_INFO_MAX];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "the shipped mach/vm_region.h:357 spelling must compile";
+    EXPECT_FALSE(model.hasErrors());
+    auto const* t = findSym(model, "vm_page_info_data_t");
+    ASSERT_NE(t, nullptr);
+    EXPECT_TRUE(model.lattice().interner().isIncompleteArray(t->type));
+}
+
+// FAIL LOUD (1): a file-scope OBJECT of the incomplete type. C 6.7p7 — an
+// object shall have a complete type. Silently sizing it 0 is the exact defect
+// class; S0028 S_IncompleteTypeObject is the guard (widened from
+// incomplete-COMPOSITE to also cover incomplete ARRAY in the same commit).
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefFileScopeObjectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "T x;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "an OBJECT of incomplete-array type must fail loud, never be sized 0";
+}
+
+// FAIL LOUD (2): the same at BLOCK scope — a different declaration row
+// (varDecl, not topLevelDecl), so it is a genuinely separate site.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefLocalObjectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "int main(void) { T x; (void)x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a block-scope object of incomplete-array type must fail loud too";
+}
+
+// FAIL LOUD (3): `sizeof(T)`. computeLayout has no size for a bare incomplete
+// array, so a const-expr use refuses — it never folds to 0.
+TEST(SemanticAnalyzerCSubset, SizeofIncompleteArrayTypedefFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "int probe[sizeof(T)];\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "`sizeof(T)` on an incomplete array must REFUSE — folding it to 0 "
+           "would silently declare `int probe[0]`";
+}
+
+// FAIL LOUD (4): a NON-LAST member of that type. The shared composite guard
+// owns this; no special case was added for typedef-sourced incompleteness.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefNonLastMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "struct S { T a; int b; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayNotLast), 1u)
+        << "a non-last incomplete-array member would overlay the fields after "
+           "it — loud, never laid out";
+}
+
+// FAIL LOUD (5): the SOLE member (C99 6.7.2.1 requires at least one other).
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefSoleMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "struct S { T a; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArraySoleMember), 1u);
+}
+
+// THE ONE ADMITTED POSITION, stated explicitly so the fail-loud set above is
+// read as exhaustive rather than as "members are rejected": last AND non-sole
+// is a flexible array member and lays out as one — 0 bytes, element alignment,
+// `sizeof` of the struct unchanged. MEASURED against /usr/bin/clang on
+// arm64-darwin: sizeof 8, offsetof(a) 8, _Alignof 4.
+TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefTrailingMemberIsAFlexibleArrayMember) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int T[];\n"
+        "struct S { int a; int b; T t; };\n"
+        "struct S v;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    auto const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    auto const layout = computeLayout(v->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 8u)  << "clang: sizeof == 8 — the FAM adds nothing";
+    EXPECT_EQ(layout->align.bytes(), 4u);
+    ASSERT_EQ(layout->fieldOffsets.size(), 3u);
+    EXPECT_EQ(layout->fieldOffsets[2], 8u) << "clang: offsetof(t) == 8";
+}
+
+// `extern T x;` stays legal — an extern object is completed in another TU,
+// exactly as `extern char v[];` already is. The fail-loud guard must not have
+// widened into this.
+TEST(SemanticAnalyzerCSubset, ExternIncompleteArrayTypedefObjectStaysLegal) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[];\n"
+        "extern T x;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 0u)
+        << "an EXTERN incomplete-array object is legal C (completed elsewhere)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ── D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18) ────────────────────────────
+//
+// MEASURED: `uint64_t ns_threadids[0];` — the last member of `struct
+// netfs_status`, $SDK/usr/include/sys/mount.h:366, reached by sqlite — was
+// S000C S_ArrayLengthOutOfRange from the `*len <= 0` reject.
+//
+// ★ ONE MECHANISM, per the registry row's instruction to look for the shared
+// chokepoint first: a bound folding to exactly 0 on a row that admits a
+// flexible array member routes into the SAME `incompleteArray` the absent-bound
+// `[]` builds, in BOTH array-length resolvers. `[0]` and `[]` therefore cannot
+// diverge on layout or on position — which is what the two pins below prove by
+// comparing them field-for-field rather than by asserting each separately.
+
+// LAYOUT: adding a trailing `[0]` member changes NOTHING about the struct's
+// size. Exact pins, MEASURED against /usr/bin/clang -std=c17 on arm64-darwin:
+// `struct P{int a;int b;}` and `struct Z{int a;int b;int t[0];}` are both
+// sizeof 8 / _Alignof 4, and offsetof(Z.t) == 8.
+// RED-ON-DISABLE: without the `*len == 0` arm the member is S000C and `Z` never
+// composes, so every pin below reds.
+TEST(SemanticAnalyzerCSubset, TrailingZeroLengthArrayMemberLeavesStructSizeUnchanged) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct P { int a; int b; };\n"
+        "struct Z { int a; int b; int t[0]; };\n"
+        "struct P p; struct Z z;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
+        << "a TRAILING `int t[0];` member is the GNU zero-length array — admit "
+           "it, do not reject the bound";
+    EXPECT_FALSE(model.hasErrors());
+    TypeInterner const& in = model.lattice().interner();
+    auto const* p = findSym(model, "p");
+    auto const* z = findSym(model, "z");
+    ASSERT_NE(p, nullptr); ASSERT_NE(z, nullptr);
+    auto const pl = computeLayout(p->type, in, kAlignasLayout, DataModel::Lp64);
+    auto const zl = computeLayout(z->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(pl.has_value()); ASSERT_TRUE(zl.has_value());
+    EXPECT_EQ(pl->size, 8u)  << "clang: sizeof(struct P) == 8";
+    EXPECT_EQ(zl->size, 8u)  << "clang: sizeof(struct Z) == 8 — the `[0]` member "
+                                "contributes ZERO bytes";
+    EXPECT_EQ(zl->size, pl->size)
+        << "adding a trailing zero-length member must not change sizeof";
+    EXPECT_EQ(zl->align.bytes(), 4u) << "clang: _Alignof(struct Z) == 4";
+    ASSERT_EQ(zl->fieldOffsets.size(), 3u);
+    EXPECT_EQ(zl->fieldOffsets[2], 8u) << "clang: offsetof(struct Z, t) == 8";
+}
+
+// ONE MECHANISM, pinned directly: `int t[0];` and `int t[];` must produce the
+// SAME layout. A parallel implementation of zero-length arrays would drift here
+// (different element handling, a real 0-length Array rather than the incomplete
+// one, a struct that reports `hasFlexibleArrayMember` for only one of the two).
+TEST(SemanticAnalyzerCSubset, ZeroLengthAndAbsentBoundMembersLayOutIdentically) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct Z { int a; int b; int t[0]; };\n"
+        "struct F { int a; int b; int t[]; };\n"
+        "struct Z z; struct F f;\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    TypeInterner const& in = model.lattice().interner();
+    auto const* z = findSym(model, "z");
+    auto const* f = findSym(model, "f");
+    ASSERT_NE(z, nullptr); ASSERT_NE(f, nullptr);
+    auto const zl = computeLayout(z->type, in, kAlignasLayout, DataModel::Lp64);
+    auto const fl = computeLayout(f->type, in, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(zl.has_value()); ASSERT_TRUE(fl.has_value());
+    EXPECT_EQ(zl->size, fl->size);
+    EXPECT_EQ(zl->align.bytes(), fl->align.bytes());
+    ASSERT_EQ(zl->fieldOffsets.size(), fl->fieldOffsets.size());
+    EXPECT_EQ(zl->fieldOffsets[2], fl->fieldOffsets[2]);
+    EXPECT_TRUE(zl->hasFlexibleArrayMember)
+        << "`[0]` IS the GNU spelling of a flexible array member — one "
+           "mechanism, not a parallel one";
+    EXPECT_EQ(zl->hasFlexibleArrayMember, fl->hasFlexibleArrayMember);
+}
+
+// FAIL LOUD: a NON-TRAILING `[0]` member. It would overlay the members that
+// follow it; the shared composite guard rejects it with no special case here.
+TEST(SemanticAnalyzerCSubset, NonTrailingZeroLengthArrayMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int t[0]; int b; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayNotLast), 1u)
+        << "only a TRAILING zero-length member is admitted";
+}
+
+// FAIL LOUD: the SOLE member.
+TEST(SemanticAnalyzerCSubset, SoleZeroLengthArrayMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int t[0]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArraySoleMember), 1u);
+}
+
+// FAIL LOUD: `[0]` OUTSIDE a struct member — a file-scope object, a block-scope
+// object and a parameter. None of those rows admits a flexible array member, so
+// none admits `[0]`: the out-of-range reject is untouched for them. This is the
+// scoping pin — without it the change would read as "zero-length arrays are
+// now legal everywhere".
+TEST(SemanticAnalyzerCSubset, ZeroLengthArrayOutsideAStructMemberStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int g[0];\n"
+        "int take(int p[0]);\n"
+        "int main(void) { int l[0]; (void)l; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 3u)
+        << "a global, a local and a parameter `[0]` each stay S000C — the "
+           "admission is scoped to rows that admit a flexible array member";
+}
+
+// FAIL LOUD: `int a[0] = {1};`. THE `allowInitInferredArray` EXCLUSION. The
+// flag reaching the resolver is `decl.allowFlexibleArray || initNode.valid()`,
+// so without the exclusion an initialized `[0]` would stop being S000C and get
+// SILENTLY re-sized to `int[1]` by the initializer backfill — a written bound
+// overwritten without a word. RED-ON-DISABLE: drop `&& !allowInitInferredArray`
+// and this count drops to 0.
+TEST(SemanticAnalyzerCSubset, ZeroLengthArrayWithInitializerStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int a[0] = {1};\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "an initialized `[0]` must stay loud — never silently re-sized from "
+           "its initializer";
+}
+
+// The NEGATIVE bound is untouched: `[-1]` is out of range in every position,
+// including a struct member. Only EXACTLY 0 routes to the flexible-array path.
+TEST(SemanticAnalyzerCSubset, NegativeArrayBoundStillFailsLoudEvenInAStructMember) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a; int t[-1]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "only a bound of EXACTLY 0 is the GNU zero-length array; a negative "
+           "one stays out of range";
+}
+
+// ★★ THE INTERACTION GUARD FOR D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF, and it is
+// here because the first implementation FAILED IT. Admitting the absent bound
+// by giving the typedefDecl row `allowFlexibleArray` looks equivalent and is
+// not: that flag is tested ABOVE the VLA arm (a struct field's `int a[n]` is
+// deliberately a FAM, not a VLA member), so a VLA TYPEDEF stopped building a
+// vlaArray and silently became an INCOMPLETE array — a wrong type, not a
+// diagnostic. The shipped signal is `typeAliasRow`, derived from the row's
+// `kind: type`, and its arm sits BELOW every present-bound return, so a
+// present-but-non-constant bound is structurally out of its reach — which is
+// the whole reason the two are not one flag.
+// (`VlaTypedefObjectAcceptsAndRecordsOrigin`
+// above is the pin that caught it; this is the same property stated against
+// THIS anchor so the coupling is not rediscovered by accident.)
+TEST(SemanticAnalyzerCSubset, VlaTypedefStaysAVlaAfterIncompleteArrayTypedefAdmission) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int s = 4;\n"
+        "  int n = s;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* r = findSym(model, "R");
+    ASSERT_NE(r, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    EXPECT_TRUE(in.isVlaArray(r->type))
+        << "a PRESENT-but-non-constant bound in a typedef is a VLA — the "
+           "incomplete-array admission must not swallow it";
+    EXPECT_FALSE(in.isIncompleteArray(r->type))
+        << "and it must NOT have become the incomplete array (the silently "
+           "wrong type the first implementation produced)";
+}
+
+// SCOPING, stated as a pin so the two anchors are not read as one rule:
+// D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER is keyed on `allowFlexibleArray`, which
+// the typedef row does not carry, so `typedef int T[0];` is NOT admitted. Only
+// the ABSENT bound is a typedef-nameable incomplete type.
+TEST(SemanticAnalyzerCSubset, ZeroLengthBoundInATypedefStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int T[0];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "the zero-length-array extension is a struct-MEMBER rule; a typedef "
+           "gets the absent-bound rule only";
+}
+
+// ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): ONE file-scope TAG, ──
+// ── ONE TYPE — across the descriptor / source boundary (C 6.2.3)            ──
+//
+// The sqlite `os_unix.c:7731` shape, and the LAST error on the arm64-macho leg:
+//     struct timespec conchModTime;          /* :7711 */
+//     conchModTime = buf.st_mtimespec;       /* :7731 → error[S0003] */
+//
+// ★★ WHAT THESE PINS ASSERT IS THE **ASSIGNMENT**, NEVER THE TAG RESOLUTION,
+// and that is the whole point. The tag BINDING was never the wrong one — a
+// `struct timespec x;` declaration has always resolved. What was wrong is the
+// MEMBER: `sys/stat.json`'s `st_mtimespec` is interned against the DESCRIPTOR's
+// `timespec` when the descriptor loads, while the tag in that TU is claimed by a
+// SOURCE declaration whose tree-root binding shadows the descriptor's cuRoot one.
+// A tag-resolution test is therefore VACUOUS here: it stays GREEN with the defect
+// fully present. (MEASURED, this cycle: `struct timespec conchModTime;` resolved
+// clean while the very next line failed.)
+//
+// ⚠ AND A MEASURED CORRECTION TO THE ORIGINAL DIAGNOSIS, recorded so it cannot
+// be re-proposed: the second party is NOT a second DESCRIPTOR. `time.json` and
+// `sys/stat.json` both declare `timespec` and they already intern ONE TypeId —
+// the interner's complete-at-once path keys a composite on its FIELD CONTENT, so
+// two byte-identical rows collapse, and `ShippedTypeConsistency` would have
+// reported a conflict had they not (`DescriptorOnlyTimespecIsAlreadyOneType`
+// below pins exactly that, and it is green on BOTH sides of this change). The
+// real second party is the macOS SDK's `sys/_types/_timespec.h`, reached through
+// `sys/fcntl.h` — a header DSS ships no descriptor for, so its `struct timespec`
+// is parsed as SOURCE. `SourceTagUnifiesWithDescriptorMember` is the pin that
+// goes RED when the fix is reverted.
+
+namespace {
+
+// The real-shipped-descriptor analysis used by these pins. Unlike
+// `analyzeRealTgmath` it threads the ACTIVE TARGET (`arch`) — `struct stat`'s
+// `st_mtimespec` lives only in the `when:{format:macho}` variant — and it passes
+// `AggregateLayoutParams`, which is REQUIRED: the unification is licensed by the
+// layout engine, so a caller that supplies no layout params gets no unification
+// at all (the gate in semantic_analyzer.cpp), by design.
+[[nodiscard]] SemanticModel analyzeRealShippedForTarget(
+    std::string mainSrc, ObjectFormatKind format, std::string_view arch,
+    DataModel dataModel) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                   std::nullopt, format, arch);
+}
+
+// The symbol a SOURCE declaration minted (a valid `tree`), vs the one descriptor
+// injection minted (`InvalidTree`). Both spell `timespec`, so every identity
+// assertion below has to say WHICH one it means — `findSym`'s first-match would
+// be an accident waiting to flip.
+[[nodiscard]] SymbolRecord const* findSourceSym(SemanticModel const& m,
+                                                std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name && m.symbols()[i].tree.valid())
+            return &m.symbols()[i];
+    return nullptr;
+}
+[[nodiscard]] SymbolRecord const* findInjectedSym(SemanticModel const& m,
+                                                  std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name && !m.symbols()[i].tree.valid())
+            return &m.symbols()[i];
+    return nullptr;
+}
+
+// The xnu `sys/_types/_timespec.h` declaration verbatim (`__darwin_time_t` is
+// `long` on LP64) — so it interns {i64 "long", i64 "long"} against the
+// descriptors' bare {i64, i64}: the SAME 16 bytes, DIFFERENT TypeIds. That gap
+// is why a TypeId-equality comparison alone can never license this unification,
+// and why the layout engine is the authority.
+constexpr char const* kSourceTimespecDecl =
+    "struct timespec { long tv_sec; long tv_nsec; };\n";
+
+// The os_unix.c body, reduced: poison, stat, the BY-VALUE assignment, then read
+// the nested members back.
+constexpr char const* kMtimespecAssignBody =
+    "int main(void) {\n"
+    "    struct stat sb;\n"
+    "    struct timespec conchModTime;\n"
+    "    conchModTime.tv_sec = -1;\n"
+    "    if (stat(\"/\", &sb) != 0) return 1;\n"
+    "    conchModTime = sb.st_mtimespec;\n"
+    "    return (int)(conchModTime.tv_sec + conchModTime.tv_nsec);\n"
+    "}\n";
+
+} // namespace
+
+// ★★★ THE CLOSING PIN. A SOURCE declaration of the tag and the descriptor's
+// `st_mtimespec` member are ONE type, so the by-value assignment COMPILES.
+// RED-ON-DISABLE (MEASURED by demonstration this cycle, against the real
+// compiler on the real corpus, not just here): revert the member adoption and
+// sqlite `os_unix.c` returns to exactly one `error[S0003] got buf.st_mtimespec`
+// — the same diagnostic this TU produces without it.
+TEST(SemanticAnalyzerCSubset, SourceTagUnifiesWithDescriptorMember) {
+    auto model = analyzeRealShippedForTarget(
+        std::string{"#include <time.h>\n#include <sys/stat.h>\n"}
+            + kSourceTimespecDecl + kMtimespecAssignBody,
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`conchModTime = sb.st_mtimespec` is the assignment this anchor "
+           "exists for — an S0003 here IS the defect";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 0u)
+        << "the two declarations lay out identically, so the unification is "
+           "licensed and nothing is reported";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    // The IDENTITY itself, asserted directly and in BOTH directions so a green
+    // result cannot come from a weakened assignment check.
+    SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
+    SymbolRecord const* userTag = findSourceSym(model, "timespec");
+    SymbolRecord const* shippedTag = findInjectedSym(model, "timespec");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    ASSERT_NE(shippedTag, nullptr);
+    EXPECT_EQ(member->type.v, userTag->type.v)
+        << "the descriptor's member must denote the ONE type its tag names in "
+           "this translation unit (C 6.2.3)";
+    EXPECT_NE(member->type.v, shippedTag->type.v)
+        << "and it must have MOVED off the descriptor's own pre-interned type — "
+           "equal here would mean the adoption never ran";
+
+    // Same 16 bytes either way: the unification never changes the layout.
+    TypeInterner const& in = model.lattice().interner();
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16};
+    auto const userLay = computeLayout(userTag->type, in, params, DataModel::Lp64);
+    auto const shippedLay = computeLayout(shippedTag->type, in, params, DataModel::Lp64);
+    ASSERT_TRUE(userLay.has_value());
+    ASSERT_TRUE(shippedLay.has_value());
+    EXPECT_EQ(userLay->size, 16u);
+    EXPECT_EQ(shippedLay->size, 16u);
+}
+
+// THE PREMISE PIN — and it is labelled as such on purpose. Two DESCRIPTORS
+// declaring `timespec` (`time.json` + `sys/stat.json`) already intern ONE
+// TypeId, so the member assignment compiles with NO source declaration in sight.
+// ⚠ THIS TEST IS GREEN ON BOTH SIDES OF TF-C97 — it is a guard against a future
+// descriptor edit (spelling one of the two `i64 "long"`) silently splitting the
+// identity, NOT evidence that the fix works. The closing pin is the one above.
+TEST(SemanticAnalyzerCSubset, DescriptorOnlyTimespecIsAlreadyOneType) {
+    auto model = analyzeRealShippedForTarget(
+        std::string{"#include <time.h>\n#include <sys/stat.h>\n"}
+            + kMtimespecAssignBody,
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
+    SymbolRecord const* tag    = findInjectedSym(model, "timespec");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(tag, nullptr);
+    EXPECT_EQ(member->type.v, tag->type.v)
+        << "time.json's timespec and sys/stat.json's are content-identical, so "
+           "the interner's content-keyed composite path collapses them; a split "
+           "here would ALSO have been reported as F_ShippedTypeIdentityConflict";
+}
+
+// FAIL LOUD, WITH THE SPECIFIC CODE. A source declaration of the same tag that
+// does NOT lay out the same is REFUSED — the layout engine (the one authority)
+// says 8 bytes vs 16, so the unification is reported rather than performed.
+TEST(SemanticAnalyzerCSubset, SourceTagLayoutDisagreementFailsLoud) {
+    auto model = analyzeRealShippedForTarget(
+        "#include <sys/stat.h>\n"
+        "struct timespec { int tv_sec; int tv_nsec; };\n"
+        + std::string{kMtimespecAssignBody},
+        ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 1u)
+        << "a 8-byte source `timespec` against the descriptor's 16-byte one must "
+           "fail LOUD with the EXISTING cross-declaration identity code — never "
+           "unify, and never a generic error";
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// ★★ THE PER-TARGET PIN — the guard against keying identity GLOBALLY, which is
+// the one mistake that would have made this feature dangerous. ONE scratch
+// descriptor and ONE source text, analyzed under TWO data models:
+//
+//   * LP64  — `long` is 64 bits, so the source `probe_ts` is 16 bytes and matches
+//             the descriptor's `{i64,i64}`: unified, and the by-value assignment
+//             compiles;
+//   * LLP64 — `long` is 32 bits, so the SAME source text is 8 bytes: the layouts
+//             disagree, the two stay DISTINCT TypeIds, and the conflict is
+//             reported.
+//
+// Identity is keyed (tag, THIS compilation), and a compilation carries exactly
+// one target/dataModel — so the LP64 and LLP64 types can never be candidates for
+// each other, which is what keeps
+// D-CSUBSET-DARWIN-STRUCT-LAYOUT-DISAGREEMENT closed. A global key would make
+// both legs green here and silently give one of them the other's layout.
+namespace {
+constexpr char const* kProbeTagDescriptor =
+    R"({ "header": "probe.h",
+         "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+         "structs": [
+           { "name": "probe_ts",
+             "fields": [ { "name": "a", "type": "i64" },
+                         { "name": "b", "type": "i64" } ] },
+           { "name": "probe_box",
+             "fields": [ { "name": "stamp", "type": "probe_ts" },
+                         { "name": "tag",   "type": "i32" } ] }
+         ] })";
+
+constexpr char const* kProbeTagSource =
+    "#include <probe.h>\n"
+    "struct probe_ts { long a; long b; };\n"
+    "int main(void) {\n"
+    "    struct probe_box bx;\n"
+    "    struct probe_ts t;\n"
+    "    t = bx.stamp;\n"
+    "    return (int)(t.a + t.b);\n"
+    "}\n";
+
+[[nodiscard]] SemanticModel analyzeProbeTag(ScratchDir const& sysDir,
+                                            DataModel dataModel) {
+    auto cu = buildAngleDescriptorUnit(sysDir, "probe.json", kProbeTagDescriptor,
+                                       kProbeTagSource);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+}
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, CrossOriginTagUnifiesOnLp64) {
+    ScratchDir sysDir{Location::Temp, "c97-probe-lp64"};
+    auto model = analyzeProbeTag(sysDir, DataModel::Lp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+
+    SymbolRecord const* member  = findInjectedSym(model, "stamp");
+    SymbolRecord const* userTag = findSourceSym(model, "probe_ts");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    EXPECT_EQ(member->type.v, userTag->type.v)
+        << "on LP64 `long` is 64 bits, so the two declarations lay out the same "
+           "16 bytes and the tag names ONE type";
+}
+
+TEST(SemanticAnalyzerCSubset, CrossOriginTagStaysDistinctOnLlp64) {
+    ScratchDir sysDir{Location::Temp, "c97-probe-llp64"};
+    auto model = analyzeProbeTag(sysDir, DataModel::Llp64);
+
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::F_ShippedTypeIdentityConflict), 1u)
+        << "on LLP64 `long` is 32 bits: the source struct is 8 bytes against the "
+           "descriptor's 16, so the identity must be REFUSED and reported";
+
+    SymbolRecord const* member  = findInjectedSym(model, "stamp");
+    SymbolRecord const* userTag = findSourceSym(model, "probe_ts");
+    ASSERT_NE(member, nullptr);
+    ASSERT_NE(userTag, nullptr);
+    EXPECT_NE(member->type.v, userTag->type.v)
+        << "★ THE ANTI-GLOBAL-KEY ASSERTION: the SAME tag under a DIFFERENT data "
+           "model must remain a DIFFERENT TypeId — a global key would have "
+           "unified these and handed one leg the other's layout";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C94 (D-CSUBSET-GNU-ATTRIBUTE): the LEADING struct/union member attribute
+// position, and the `noreturn` sink that makes opening it safe.
+//
+// THE WITNESS: Tcl 9.0's `TclStubs` (tclDecls.h:1893/:2024/:2185) writes
+//   TCL_NORETURN1 void (*tcl_Panic) (const char *format, ...) …;
+// where tcl.h:116 expands TCL_NORETURN1 to `__attribute__ ((__noreturn__))`.
+// Before this cycle the shape was `error[P0009] … got '__attribute__'`.
+//
+// ★★ WHY THESE TESTS ASSERT A FLAG AND NOT "no error". Opening an attribute
+// POSITION whose names have no consumer converts a LOUD parse error into a
+// SILENT drop — the trap `compositeAttrList`'s $packedStaysNoneComment records
+// after `packed` compiled clean at the wrong `sizeof`. A member can NEVER be a
+// FnSig (host clang: "field 'f' declared as a function"), so under the old
+// `isFnSig`-only apply gate every `noreturn` written here would have been READ
+// by `specifierPrefixNamesNoreturn` and then discarded. The gate now admits
+// `Ptr<FnSig>` — which is what GNU means (the attribute binds the POINTEE's
+// function type) and what host clang honors — so the fact lands on the symbol.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// (a) THE TCL SHAPE. The decorated member's SymbolRecord carries isNoreturn;
+// the undecorated sibling member of the SAME struct does NOT — so the flag
+// tracks the SPELLING, not the position or the type.
+// RED-ON-DISABLE: revert the apply gate to `isFnSig &&` → `panic` flips false
+// while `plain` stays false, i.e. the attribute parses and vanishes.
+TEST(SemanticAnalyzerCSubset, NoreturnOnStructMemberFunctionPointerReachesTheSink) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct TclStubs {\n"
+        "    __attribute__((__noreturn__)) void (*panic)(int);\n"
+        "    void (*plain)(int);\n"
+        "};\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "the leading GNU member attribute must analyze cleanly";
+
+    SymbolRecord const* panic = findSym(model, "panic");
+    SymbolRecord const* plain = findSym(model, "plain");
+    ASSERT_NE(panic, nullptr);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_TRUE(panic->isNoreturn)
+        << "__attribute__((__noreturn__)) on a function-pointer MEMBER must "
+           "reach SymbolRecord.isNoreturn — parsing it and dropping it is the "
+           "silent-miscompile shape this position was opened to avoid";
+    EXPECT_FALSE(plain->isNoreturn)
+        << "an undecorated member of the same struct must stay clean — the flag "
+           "must track the spelling, not the member list";
+}
+
+// (b) THE SAME SPELLING IN THE ALREADY-OPEN FILE-SCOPE POSITION, where the flag
+// is not merely recorded but CONSUMED: a call through such an object lowers its
+// callee to Ref(gp), which `isDirectNoreturnCall` reads (see the HIR pin
+// NoreturnFunctionPointerObjectCallWrapsAndVerifies). Host clang is likewise
+// SILENT here and honors it (-Wreturn-type, measured).
+TEST(SemanticAnalyzerCSubset, NoreturnOnFunctionPointerObjectReachesTheSink) {
+    auto cu = buildShippedUnit("c-subset", {
+        "__attribute__((__noreturn__)) void (*gp)(int);\n"
+        "void (*gp2)(int);\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* gp  = findSym(model, "gp");
+    SymbolRecord const* gp2 = findSym(model, "gp2");
+    ASSERT_NE(gp, nullptr);
+    ASSERT_NE(gp2, nullptr);
+    EXPECT_TRUE(gp->isNoreturn);
+    EXPECT_FALSE(gp2->isNoreturn);
+}
+
+// (c) THE WIDENING MUST NOT LEAK. A plain data object still gets NO flag: the
+// gate admits FnSig and Ptr<FnSig> ONLY, so the pre-existing
+// `_Noreturn`-on-a-non-function safe-miss deferral is untouched and no data
+// symbol carries a codegen directive nothing can honor. Host clang WARNS on
+// this shape ("'__noreturn__' only applies to function types", measured); DSS's
+// silence here is the separate open row
+// D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT / the `none`-verb
+// row split, NOT something this cycle introduced.
+// RED-ON-DISABLE: widen the gate to "any declarator" → both EXPECTs flip.
+TEST(SemanticAnalyzerCSubset, NoreturnOnPlainDataObjectStaysInert) {
+    auto cu = buildShippedUnit("c-subset", {
+        "__attribute__((__noreturn__)) int gv = 1;\n"
+        "struct S { __attribute__((__noreturn__)) int m; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    SymbolRecord const* gv = findSym(model, "gv");
+    SymbolRecord const* m  = findSym(model, "m");
+    ASSERT_NE(gv, nullptr);
+    ASSERT_NE(m, nullptr);
+    EXPECT_FALSE(gv->isNoreturn)
+        << "a non-function, non-function-pointer object must carry NO noreturn";
+    EXPECT_FALSE(m->isNoreturn)
+        << "the member arm must obey the same gate as the file-scope arm";
+}
+
+// (d) THE POSITION REACHES `scanAttributeSemantics`, NOT JUST THE NORETURN
+// SCAN. A leading `aligned(N)` on a member is HONORED into the member symbol's
+// explicitAlignment — the same sink the shipped TRAILING member slot feeds — so
+// the whole effects table is live in the new position, not only one name.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignedAttributeIsHonored) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { __attribute__((aligned(16))) int a; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->explicitAlignment.has_value())
+        << "a LEADING member `aligned(N)` must reach the alignment sink";
+    EXPECT_EQ(*a->explicitAlignment, 16u);
+}
+
+// (e) AN UNRECOGNIZED GNU NAME IN THE NEW POSITION IS LOUD. structField /
+// unionField carry `unknownStrictAttributeIsError: true`, and the leading slot
+// inherits it because it folds into the SAME declaration's facts. Without this
+// the new position would be a hole in the name axis exactly as
+// D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP describes.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingUnknownAttributeIsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { __attribute__((frobnicate)) int x; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "an unknown GNU attribute name in the leading member position must "
+           "fail loud, never be skipped";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+}
+
+// (f) THE DECL-KIND GATE (TF-C93) IS LIVE IN THE NEW POSITION. `noinline` is
+// `appliesTo: ["function"]`, a member is a variable, so the shared warning
+// fires — identical to what the shipped TRAILING member slot already does
+// (measured at the pre-change HEAD). One attribute must not mean two different
+// things depending on which side of the declarator it is written.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingNoinlineWarnsLikeTheTrailingSlot) {
+    for (char const* src : {
+             "struct S { __attribute__((noinline)) int x; };\n",
+             "struct S { int x __attribute__((noinline)); };\n"}) {
+        auto cu = buildShippedUnit("c-subset", { std::string(src) });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  1u)
+            << "leading and trailing member slots must be judged identically: "
+            << src;
+    }
+}
+
+// (g) REGRESSION: the rule that grew the alt still carries its original
+// content, and a MIXED run (alignas + attribute, either order) folds both.
+TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignasAndAttributeCompose) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { alignas(16) __attribute__((__noreturn__)) void (*p)(int); };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->explicitAlignment.has_value())
+        << "the alignas branch of the run must still reach its sink";
+    EXPECT_EQ(*p->explicitAlignment, 16u);
+    EXPECT_TRUE(p->isNoreturn)
+        << "and the attribute branch beside it must still reach its own";
 }

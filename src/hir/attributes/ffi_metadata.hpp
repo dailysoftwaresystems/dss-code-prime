@@ -65,6 +65,16 @@ struct FfiMetadata {
     // (every other producer) keeps the hard every-extern-must-declare-its-
     // library contract unchanged.
     bool noLibraryBinding = false;
+
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER shipped-descriptor
+    // import (producer C — a `#include`d library descriptor symbol). Carried to
+    // the MIR `ExternImport.isEagerImport` at HIR→MIR (`collectExterns`), then to
+    // the linker's reference gate, which KEEPS an eager row even when
+    // unreferenced (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). A NON-eager
+    // import (producers A/B) survives only when referenced. INVARIANT:
+    // isEagerImport ⟹ library-bound (mutually consistent with, never both true
+    // as, `noLibraryBinding`). FALSE for every non-descriptor producer.
+    bool isEagerImport = false;
 };
 
 } // namespace dss

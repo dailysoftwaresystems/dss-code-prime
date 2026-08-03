@@ -12,8 +12,13 @@
 
 // runOnLargeStack — the standard compiler technique for deep recursion:
 // run a recursive callable on a DEDICATED worker thread that owns a large
-// RESERVED stack, JOIN it (the caller blocks — this is synchronous, there
-// is NO concurrency), and propagate any exception the callable threw.
+// RESERVED stack, JOIN it (the CALLER blocks — each individual call is
+// synchronous), and propagate any exception the callable threw. ★ D-PERF-4:
+// the per-CU compile thread pool now runs MANY of these calls CONCURRENTLY
+// (one per parallel compilation unit), so this primitive must touch no
+// shared mutable state — and it doesn't: each call owns its own worker
+// thread + reserved stack, and the callable is per-CU (private interner /
+// symbol table / arenas). "one stack live-deep at a time" is now per-thread.
 //
 // WHY this exists (host/OS utility — NOT a language/CPU/format concept):
 // the frontend's expression-tree walks (semantic `analyze`; potentially

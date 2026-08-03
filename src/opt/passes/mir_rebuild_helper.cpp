@@ -137,12 +137,84 @@ MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
 }
 
 void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
+    // TF-C78 (D-CSUBSET-NOINLINE): `funcNoInline` rides along with
+    // binding/visibility. ★ THIS IS THE LOAD-BEARING PROPAGATION SITE — this
+    // rebuilder is the shared substrate under EVERY optimizer pass, so a flag
+    // dropped here is erased by the very release pipeline it exists to
+    // constrain: the first pass to rebuild the module (ConstFold, Mem2Reg, …)
+    // would hand a cleared flag to the NEXT Inlining iteration, which would then
+    // splice the body the source forbade — silently.
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): `funcAlwaysInline` rides along too — but
+    // ★ ITS FAILURE MODE IS NOT ITS NEIGHBOUR'S, AND THE DIFFERENCE WAS
+    // MEASURED RATHER THAN ASSUMED.
+    //
+    // For `noInline` the flag must keep refusing on EVERY iteration, so clearing
+    // it here re-arms the inliner on iteration 2 and the end-to-end release
+    // outcome breaks. For `alwaysInline` the flag only has to be present at the
+    // FIRST inlining opportunity: `Inlining` runs first in iteration 1, before
+    // any rebuild has touched the module, so the splice has already happened by
+    // the time a cleared flag could matter.
+    //
+    // MEASURED CONSEQUENCE: dropping this argument leaves
+    // `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+    // GREEN — the end-to-end pin CANNOT detect this hop. Only the dedicated
+    // flag-survival assertions catch it
+    // (`MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` and the
+    // survives-the-rebuild check inside
+    // `Inlining.AlwaysInlineCalleeBypassesCostThreshold`). So the propagation
+    // pin is MORE load-bearing here than it was for `noInline`, not less: TF-C78
+    // had two indistinguishable failures, this one has a failure the end-to-end
+    // test is blind to entirely.
+    //
+    // The bit still matters in every shape where the first iteration does NOT
+    // finish the job — a callee that becomes inlinable only after an earlier
+    // pass simplifies a caller, or a cross-CU module merged after one round of
+    // optimization — which is exactly why it is carried rather than argued away.
+    // TF-C85: `funcNoOptimize` rides along on the same terms and for the same
+    // reason — the merged/rebuilt module is what the NEXT pass sees, so a flag
+    // cleared here would let iteration 2 start optimizing a function the source
+    // excluded.
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): `funcNoSanitizeThread` rides along
+    // too, and ★ ITS PIN IS THE MOST LOAD-BEARING OF THE FOUR, not the least.
+    // The other three flags each reach a consumer whose OUTPUT changes when the
+    // flag is lost (a splice that happens, a threshold that re-applies, a function
+    // that gets optimized), so at least one end-to-end fixture can in principle go
+    // red. This flag reaches NO pass at all — DSS ships no sanitizer — so dropping
+    // this argument changes NOTHING observable anywhere in the pipeline except the
+    // `.dssir` text of a module that has been rebuilt. There is no end-to-end
+    // witness to fall back on, by construction: `MirRebuildHelper.
+    // RebuildFunctionPreservesNoSanitizeThread` is the ONLY thing standing between
+    // this argument and silent deletion.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
-                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn));
+                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
+                     src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn),
+                     src_.funcNoOptimize(oldFn),
+                     src_.funcNoSanitizeThread(oldFn));
+
+    // ★★ TF-C85 (D-OPT-NOOPTIMIZE-NEUTERS-POLICY): THE per-function optimizer
+    // opt-out, applied at the ONE shared chokepoint under all 8 rebuild passes.
+    //
+    // ★ THE FUNCTION IS STILL REBUILT — ONLY THE POLICY IS SWAPPED. This is the
+    // whole design, and the obvious alternative is a bug: `return`ing before the
+    // `addFunction` above (or before the block walk) does NOT "leave the
+    // function alone", it DELETES it, because `dst_` is a fresh module that
+    // contains exactly what this rebuilder puts in it. Swapping in the identity
+    // policy instead reproduces the source function instruction for instruction
+    // while every pass-specific hook — ConstFold's folds, DCE's liveness filter,
+    // Mem2Reg's phi insertion, LICM's hoists, SimplifyCfg's merges/redirects,
+    // CopyProp's and CSE's operand substitutions — is simply not consulted.
+    //
+    // Restored on the way out (RAII-free but exception-free code path; the
+    // rebuild has no early returns after this point), so the next function in
+    // the same rebuild gets the pass's real policy back.
+    bool const neuter =
+        src_.funcNoOptimize(oldFn) && !policy_.mandatoryNormalization();
+    if (neuter) policy_.onFunctionNeutered(oldFn);
+    active_ = neuter ? static_cast<MirRebuildPolicy*>(&identity_) : &policy_;
 
     // Phase 1: select + pre-create blocks. The policy decides which
     // blocks to walk (all blocks vs RPO-reachable subset etc.).
-    auto const blocks = policy_.selectBlocks(src_, oldFn);
+    auto const blocks = active_->selectBlocks(src_, oldFn);
     blockMap_.clear();
     blockMap_.reserve(blocks.size());
     for (MirBlockId const oldB : blocks) {
@@ -168,7 +240,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
         dst_.beginBlock(newB);
         // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-
         // ONBLOCKBEGIN-HOOK). Default no-op for every other pass.
-        policy_.onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
+        active_->onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
 
         // Walk source-block insts. If a block-merge policy chooses to
         // absorb a successor, the loop continues with the absorbed
@@ -192,18 +264,18 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
                     // wants to absorb a successor — if so, skip the
                     // terminator and continue with that successor's
                     // insts in the next outer-loop iteration.
-                    absorbed = policy_.absorbSuccessor(currentSource);
+                    absorbed = active_->absorbSuccessor(currentSource);
                     if (absorbed.has_value()) break;
                     // No absorb — fire the LICM hoist hook + emit the
                     // terminator. This is the merged-block's actual
                     // terminator (which may be the head's original
                     // terminator OR the tail of an absorb chain's).
-                    policy_.onBlockBeforeTerminator(oldB, newB, dst_,
+                    active_->onBlockBeforeTerminator(oldB, newB, dst_,
                                                     rewrite_, blockMap_);
                     emitTerminator(op, oldId);
                     break;
                 }
-                if (!policy_.shouldEmit(oldId)) continue;
+                if (!active_->shouldEmit(oldId)) continue;
                 if (op == MirOpcode::Phi) {
                     MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
                     rewrite_.emplace(oldId.v, newPhi);
@@ -232,9 +304,9 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     for (auto const& dp : deferredPhis) {
         std::size_t kept = 0;
         for (auto const& inc : src_.phiIncomings(dp.oldPhi)) {
-            if (!policy_.acceptPhiIncoming(inc, dp.oldBlock, blockMap_)) continue;
+            if (!active_->acceptPhiIncoming(inc, dp.oldBlock, blockMap_)) continue;
             MirBlockId const redirectedPred =
-                policy_.redirectBlockTarget(inc.pred);
+                active_->redirectBlockTarget(inc.pred);
             auto const predIt = blockMap_.find(redirectedPred.v);
             if (predIt == blockMap_.end()) {
                 // After `acceptPhiIncoming` admitted this incoming AND
@@ -263,9 +335,23 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             ++kept;
         }
         if (kept == 0) {
-            policy_.onZeroPhiIncomings(dp.oldPhi, dp.oldBlock, oldFn, dp.newPhi);
+            active_->onZeroPhiIncomings(dp.oldPhi, dp.oldBlock, oldFn, dp.newPhi);
         }
     }
+    // TF-C85: hand the pass its own policy back for the next function.
+    active_ = &policy_;
+}
+
+// TF-C85: the ONE hook `MirRebuildPolicy` leaves without a default. "All blocks
+// in natural order" is the verbatim answer — the same one ConstFold's policy
+// gives, and the only one consistent with copying a function unchanged.
+std::vector<MirBlockId>
+MirIdentityRebuildPolicy::selectBlocks(Mir const& src, MirFuncId fn) {
+    std::vector<MirBlockId> out;
+    std::uint32_t const n = src.funcBlockCount(fn);
+    out.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i) out.push_back(src.funcBlockAt(fn, i));
+    return out;
 }
 
 void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
@@ -306,7 +392,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         // guarantees an address-taken target is never elided/merged, so it is in
         // the map; abort loud if not (a policy bug) rather than miscompile.
         MirBlockId const oldTarget = src_.blockAddressTarget(oldId);
-        MirBlockId const redirected = policy_.redirectBlockTarget(oldTarget);
+        MirBlockId const redirected = active_->redirectBlockTarget(oldTarget);
         auto const it = blockMap_.find(redirected.v);
         if (it == blockMap_.end()) {
             std::fprintf(stderr,
@@ -326,7 +412,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
     // Per-pass full-inst-replacement hook. Returns nullopt → verbatim
     // copy. ConstFold emits a Const for foldable expressions; CopyProp
     // uses substituteOldOperand instead so the dead Phi stays for DCE.
-    if (auto rewritten = policy_.tryRewrite(op, oldId, dst_, rewrite_);
+    if (auto rewritten = active_->tryRewrite(op, oldId, dst_, rewrite_);
         rewritten.has_value()) {
         rewrite_.emplace(oldId.v, *rewritten);
         return;
@@ -355,19 +441,19 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
     auto const oldOps  = src_.instOperands(oldId);
     auto const oldBlk  = src_.instBlock(oldId);
     auto const oldSucc = src_.blockSuccessors(oldBlk);
-    bool const record  = policy_.recordTerminatorInRewrite();
+    bool const record  = active_->recordTerminatorInRewrite();
     auto remember = [&](MirInstId newId) {
         if (record) rewrite_.emplace(oldId.v, newId);
     };
     // Per-terminator full-replacement hook (branch-folding etc.).
     // Returning a value short-circuits the standard emit arms.
-    if (auto const rewritten = policy_.tryRewriteTerminator(
+    if (auto const rewritten = active_->tryRewriteTerminator(
             op, oldId, dst_, rewrite_, blockMap_); rewritten.has_value()) {
         remember(*rewritten);
         return;
     }
     auto mapSucc = [&](MirBlockId oldS) -> MirBlockId {
-        MirBlockId const redirected = policy_.redirectBlockTarget(oldS);
+        MirBlockId const redirected = active_->redirectBlockTarget(oldS);
         auto const it = blockMap_.find(redirected.v);
         if (it == blockMap_.end()) {
             std::fprintf(stderr,

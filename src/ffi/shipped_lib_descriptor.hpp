@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -189,18 +190,61 @@ struct DSS_EXPORT ShippedSymbol {
     // case). A flat string is also accepted (arch-invariant). ELF-only
     // semantics; carried but unused on PE/Mach-O.
     std::string version;
+    // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
+    // image for THIS symbol alone, SAME shape as the descriptor-level `library`
+    // map ("pe"/"elf"/"macho" -> image name). EMPTY (default, almost every
+    // symbol) means the symbol INHERITS the descriptor's map, byte-identical to
+    // the pre-override image. When NON-EMPTY the semantic injector MERGES it OVER
+    // the descriptor map (symbol keys WIN; a format the symbol OMITS inherits the
+    // descriptor's entry — the same "a missing format key inherits" semantics the
+    // descriptor map itself has). This lets ONE symbol bind a DIFFERENT image than
+    // its header's default — e.g. pe `strftime`->`ucrtbase.dll` (C99-complete
+    // `%e`/`%F`/`%R`) while the rest of <time.h> stays on the legacy `msvcrt.dll`
+    // (whose bare `time`/`localtime`/... have no ucrtbase export, so the whole
+    // descriptor cannot move). This field is the RAW declared override — the merge
+    // lives at INJECTION, where the descriptor map is in scope. Keys are the
+    // `objectFormatKindFromName` vocabulary; an unknown key / non-string value
+    // fails loud on read (the SAME `decodeLibraryMap` chokepoint the
+    // descriptor-level map uses).
+    std::unordered_map<std::string, std::string> library;
 };
 
-// True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21
-// recipes: the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/call_once/
-// thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only — deferred, see the
-// .cpp vocab list.) The SINGLE source of truth shared by the descriptor loader (which
-// rejects an unknown `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND
-// the driver's multi-CU merged-module recipe reconstruction (program.cpp). The synth pass
-// (`synthesizeThreadsShim`) has the matching per-recipe body switch PER VEHICLE (pe→win32/
-// kernel32, macho→pthread/libSystem); a vocab id with no switch arm fails loud at synth
-// (they cannot silently diverge). (D-CSUBSET-C11-THREADS-HEADER)
+// True iff `id` is a member of the CLOSED synth-recipe vocabulary — 22 recipes spanning
+// TWO families:
+//   * <threads.h> (21): the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/
+//     call_once/thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only —
+//     deferred, see the .cpp vocab list.)
+//   * <stdio.h> (1): `sprintf` — the whole shipped printf family for now; each further
+//     recipe lands with its own descriptor row, its UCRT core row, and a runtime witness.
+// The SINGLE source of truth shared by the descriptor loader (which rejects an unknown
+// `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND the driver's multi-CU
+// merged-module recipe reconstruction (program.cpp). Each family's synth pass has the
+// matching per-recipe body switch — `synthesizeThreadsShim` PER VEHICLE (pe→win32/kernel32,
+// macho→pthread/libSystem), `synthesizeStdioShim` over the UCRT `__stdio_common_v*` cores;
+// a vocab id with no switch arm fails loud at synth (they cannot silently diverge).
+// (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
 [[nodiscard]] DSS_EXPORT bool isKnownSynthesizeRecipe(std::string_view id);
+
+// Which SHIM FAMILY a recipe id belongs to. There is ONE recipe map
+// (`CstToHirResult::synthRecipeBySymbol`) but more than one synthesis pass, and each pass
+// FAIL-LOUDS on a recipe it has no arm for — deliberately, as its anti-vocab-drift
+// backstop. So the driver seam partitions the map by family and hands each pass only its
+// own entries; without that, adding <stdio.h> recipes would make the <threads.h> pass
+// reject them and break the build before the stdio pass ever ran.
+//
+// The primary anti-drift guard is UPSTREAM of this: the descriptor loader already rejects
+// an unknown `synthesize` value at READ time (a typo never reaches a pass at all). This
+// split is what keeps each pass's own "no arm for MY family's id" check meaningful.
+// (D-CSUBSET-C11-THREADS-HEADER / D-FFI-PE-CRT-UCRT-MIGRATION)
+enum class ShimFamily : std::uint8_t {
+    Threads,   // <threads.h> over kernel32 (win32) / libSystem (pthread)
+    Stdio,     // <stdio.h> printf family over the UCRT __stdio_common_v* cores
+};
+
+// nullopt ⇔ !isKnownSynthesizeRecipe(id) — the two are kept in lockstep by construction
+// (both read the same table), so a new recipe cannot be admitted by the loader while
+// being invisible to the family split.
+[[nodiscard]] DSS_EXPORT std::optional<ShimFamily> shimFamilyOf(std::string_view id);
 
 // One decoded named CONSTANT — the neutral form of a header's object-like
 // `#define CHAR_BIT 8` surface (a macro that IS a compile-time constant). A C
@@ -331,6 +375,27 @@ struct DSS_EXPORT ShippedStruct {
     TypeId                    typeId;   // interned struct type (set on decode)
 };
 
+// One decoded UNION — the neutral form of a header's `union tag { … };` with
+// NAMED members (e.g. the `key` union inside Tcl_HashEntry: the real
+// `Tcl_GetHashKey` macro reads `h->key.oneWordValue` / `h->key.string`). The
+// SIBLING of `ShippedStruct`: the semantic phase interns the union type
+// (`TypeKind::Union` — every member overlaid at OFFSET 0, C 6.7.2.1) and injects
+// a field scope + `compositeScopeByType` entry so `unionValue.member` resolves,
+// MIRRORING the struct field-scope injection. This surface exists because the
+// hir-text `union "N" { T,… }` spelling carries member TYPES positionally but NO
+// names — so, exactly like `structs`, the member names live HERE. `typeId` is the
+// interned union type (name + positional member types), byte-identical to the
+// same-spelled `union "N" {…}` used by-name in a struct field (Option C).
+//
+// Members overlay at offset 0 by union semantics — a `ShippedField.offset` is
+// REJECTED on a union member (an explicit-offset overlapping layout is the c107
+// STRUCT channel, `D-FFI-DESCRIPTOR-UNION-OVERLAY`, not this). (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
+struct DSS_EXPORT ShippedUnion {
+    std::string               name;     // the union tag, e.g. "Tcl_HashKey"
+    std::vector<ShippedField> fields;   // named members, decl order (all @0)
+    TypeId                    typeId;   // interned union type (set on decode)
+};
+
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
 // provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
@@ -354,16 +419,35 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // loud on read). AGNOSTIC: a config-declared set the resolver tests membership
     // against — never an `if (format == ...)`. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
     std::vector<std::string>   availableObjectFormats;
+    // Optional `includes` — the transitive sibling headers this descriptor
+    // `#include`s in the real world (D-FFI-DESCRIPTOR-INCLUDES). When a TU
+    // `#include`s the parent header (so DSS resolves THIS descriptor), DSS ALSO
+    // resolves + injects each declared sibling descriptor's surface into that TU
+    // — modeling the real transitive `#include` graph a flat descriptor cannot
+    // carry (real `tcl.h` `#include`s `<stdio.h>`, so tcl.json declares
+    // `includes:["stdio.h"]` and a `<tcl.h>` user reaches FILE/fopen/…). Each
+    // entry is a header NAME resolved by the SAME `<stem>.json` convention as a
+    // source `#include <…>` (`resolveSystemDescriptor`): "stdio.h"→stdio.json,
+    // "sys/uio.h"→sys/uio.json (subdir-preserving, extension-agnostic). EMPTY/
+    // absent ⇒ no transitive edges (every existing descriptor is untouched —
+    // pure back-compat). Fully generic: any descriptor may declare `includes`;
+    // the engine walks a config-declared graph via `forEachDescriptorInClosure`
+    // with NO `if (name==…)` and no source/target/format identity branch.
+    std::vector<std::string>     includes;    // transitive sibling header names
     // The full neutral surface a header provides. A descriptor must declare AT
     // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
     // no-op artifact and fails loud); a header may legitimately carry only
-    // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix.
+    // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix. (`includes`
+    // above does NOT count toward "declares something" — an includes-only
+    // umbrella descriptor is out of scope this cycle; add it here when a real
+    // umbrella-header consumer lands.)
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
     std::vector<ShippedFloatConstant> floatConstants; // named float constants (folded; c52)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
     std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
+    std::vector<ShippedUnion>    unions;      // named-member unions (tag + field scope; all @0)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's
@@ -474,6 +558,52 @@ readShippedLibAvailability(std::filesystem::path const& path,
 readShippedLibTypedefNames(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
 
+// Read ONLY the `includes` surface (the transitive sibling-header NAMES) from the
+// descriptor at `path`, WITHOUT a TypeInterner — the interner-free sibling of
+// `readShippedLibMacros`/`readShippedLibAvailability` for the two tiers that have
+// `systemDirs` (the preprocessor macro-splice + the import resolver) and no
+// interner. Returns the declared header-name list (EMPTY when the descriptor
+// declares no `includes` — the common case, every existing descriptor);
+// std::nullopt + `F_ShippedLibDescriptorMalformed` on a malformed `includes` field
+// (not an array, or a non-string / empty entry). Validated through the SAME shared
+// decode as the full `readShippedLibDescriptor` read, so the interner-free and
+// interned reads never drift (the `readShippedLibMacros` lock-step precedent).
+// (D-FFI-DESCRIPTOR-INCLUDES)
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibIncludes(std::filesystem::path const& path,
+                       DiagnosticReporter&          reporter);
+
+// Walk the transitive shipped-descriptor closure rooted at `startPath`, invoking
+// `visit(path)` once for EACH DISTINCT descriptor in the closure, PARENT-FIRST (a
+// descriptor before the siblings its `includes` declares). The SHARED cycle-safe
+// walker both `systemDirs`-bearing tiers use (the preprocessor macro-splice + the
+// import resolver typed-surface record), so the two can never disagree on the
+// transitive set. (D-FFI-DESCRIPTOR-INCLUDES)
+//
+//   * CYCLE / DIAMOND SAFE: a single DFS keyed on the WEAKLY-CANONICAL descriptor
+//     path in `visited` — the SAME key the semantic `readDescriptors` dedup +
+//     `cachedDescriptorJson` cache use. A path is visited AT MOST ONCE, so A→B→A
+//     terminates at the second A and a diamond's shared leaf is visited once. The
+//     recursion is bounded by the finite shipped-descriptor count. `visited` is
+//     in/out: pass ONE shared set across multiple roots (the import resolver's
+//     CU-wide set — a sibling reached from two parents or also included directly
+//     is recorded once) or a fresh set per root (the preprocessor's per-call set).
+//   * `includes` is read interner-free with a THROWAWAY reporter: a malformed
+//     `includes` FIELD is surfaced by the semantic `readShippedLibDescriptor` that
+//     reads the SAME descriptor (the import resolver records a ref per closure
+//     descriptor) — never silent, never double-reported here.
+//   * An `includes` entry that resolves to NO descriptor on `systemDirs` (a typo
+//     `stdioo.h`) invokes `onUnresolvedInclude(headerName)` — a config error the
+//     caller surfaces LOUD (the import resolver positions an
+//     `F_ShippedHeaderNotFound` on the `#include` line; this is the ONLY tier that
+//     can catch it, since the interner-less semantic tier has no `systemDirs`).
+DSS_EXPORT void forEachDescriptorInClosure(
+    std::filesystem::path const&                            startPath,
+    std::span<std::filesystem::path const>                  systemDirs,
+    std::unordered_set<std::string>&                        visited,
+    std::function<void(std::filesystem::path const&)> const& visit,
+    std::function<void(std::string const&)> const&           onUnresolvedInclude);
+
 // True iff a header carrying availability set `availableObjectFormats` is
 // available on object-format `fmt`. EMPTY set ⇒ available on EVERY format
 // (back-compat). The SINGLE membership predicate shared by the semantic
@@ -492,29 +622,62 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
 [[nodiscard]] DSS_EXPORT bool shippedHeaderAvailableForFormat(
     std::filesystem::path const& descriptorPath, ObjectFormatKind fmt);
 
-// c162 fold (D-FF1-READER-CONSUMER): the UNION of every extern symbol NAME
-// declared by any shipped-library descriptor under `src/dss-config/shippedLibs`
-// (the `symbols[].name` set, FORMAT-AGNOSTIC -- a symbol known on ANY format
-// counts). This is the "is X a known system symbol" oracle the `--resolve-library`
+// c162 fold (D-FF1-READER-CONSUMER), made FORMAT-AWARE by
+// D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS: every extern symbol NAME
+// declared by any shipped-library descriptor under `src/dss-config/shippedLibs`,
+// mapped to the set of OBJECT FORMATS that name is AVAILABLE on. This is the
+// "is X a known system symbol ON THIS TARGET" oracle the `--resolve-library`
 // consumer uses to distinguish a bare `extern puts;` (a real libc symbol the
 // user did not #include -- resolve it against the format-default library, NOT
 // fail loud) from a genuine typo (`dss_lib_answr` -- in neither the named
-// binary nor any descriptor -> fail loud). Returns std::nullopt iff the
-// shippedLibs directory cannot be located (DSS_CONFIG_ROOT unset + no ancestor
-// hit) -- the caller then treats every symbol as "possibly known" and falls
-// through to the format-default (SAFE: never a false-positive fail-loud on a
-// legitimate program just because config discovery failed).
+// binary nor any descriptor -> route unbound, the link tier judges) from a
+// name that is real BUT NOT ON THIS FORMAT (elf-only `fdatasync` in a macho
+// build -> fail loud F_ShippedSymbolUnavailableForTarget instead of binding it
+// to a libSystem that has no such export and dying silently at load).
 //
-// Names only (no signature decode / interner needed) -- a lightweight scan
-// distinct from the full `readShippedLibDescriptor`. Lenient per-file: an
-// unreadable / malformed descriptor is SKIPPED (its symbols are absent from the
-// set, so they would fail loud under --resolve-library -- an acceptable, LOUD,
-// user-fixable outcome; the descriptor's malformedness is caught for real by
-// the semantic-injection reader on #include + the AllShippedDescriptorsDecode
-// test). Not cached -- runs only on the --resolve-library path when a governed
-// extern is unmatched by the named binaries (the uncommon case).
-[[nodiscard]] DSS_EXPORT std::optional<std::unordered_set<std::string>>
-collectShippedExternSymbolNames();
+// ★ THE VALUE IS A UNION ACROSS ROWS, NOT ONE ROW'S GATE. The SAME name is
+// routinely declared by SEVERAL rows with DIFFERENT gates: `call_once` /
+// `thrd_create` / `mtx_lock` and ~20 more carry three separate rows in
+// threads.json gated ["elf"] / ["macho"] / ["pe"]; `sprintf` has an
+// ["elf","macho"] row AND a ["pe"] row in stdio.json; `fabsf`/`ldexpf` appear in
+// both math.json and tgmath.json. The predicate the consumer needs is therefore
+// "does ANY row declare this name available on the target format?", so this map
+// accumulates the union -- a per-row answer would turn the whole C11 threads
+// surface red on every format.
+//
+// VALUE ENCODING (the `objectFormatInAvailabilitySet` contract, verbatim): an
+// EMPTY vector means AVAILABLE ON EVERY FORMAT, exactly as an empty
+// `availableObjectFormats` does everywhere else in this header. The union
+// therefore SATURATES: once any row of a name is unrestricted, the name is
+// unrestricted. Test membership with `objectFormatInAvailabilitySet` -- the ONE
+// shared predicate, so this oracle can never drift from the `#include` /
+// `__has_include` / semantic-injection gates.
+//
+// TWO-LEVEL FALLBACK per row, mirroring the semantic injector: a symbol with no
+// `availableObjectFormats` key inherits the DOCUMENT-level
+// `availableObjectFormats`; if the document has none either, the row is
+// available everywhere.
+//
+// Returns std::nullopt iff the shippedLibs directory cannot be located
+// (DSS_CONFIG_ROOT unset + no ancestor hit) -- the caller then treats every
+// symbol as "possibly known" and falls through to the format-default (SAFE:
+// never a false-positive fail-loud on a legitimate program just because config
+// discovery failed).
+//
+// Names + availability only (no signature decode / interner needed) -- a
+// lightweight scan distinct from the full `readShippedLibDescriptor`. Lenient
+// per-file: an unreadable / malformed descriptor is SKIPPED (its symbols are
+// absent from the map, so they route unbound under --resolve-library -- an
+// acceptable, LOUD, user-fixable outcome; the descriptor's malformedness is
+// caught for real by the semantic-injection reader on #include + the
+// AllShippedDescriptorsDecode test). A malformed/unknown availability ENTRY
+// inside an otherwise-readable descriptor is likewise skipped, which can only
+// WIDEN the row's set -- never narrow it into a false fail-loud. Not cached --
+// runs only on the --resolve-library path when a governed extern is unmatched by
+// the named binaries (the uncommon case).
+[[nodiscard]] DSS_EXPORT
+std::optional<std::unordered_map<std::string, std::vector<std::string>>>
+collectShippedExternSymbolFormats();
 
 } // namespace ffi
 } // namespace dss

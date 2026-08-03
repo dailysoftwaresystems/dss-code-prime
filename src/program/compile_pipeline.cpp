@@ -31,6 +31,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
 #include "opt/passes/prune_unreachable.hpp"
@@ -80,6 +81,18 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     // the honest undeclared state; the semantic bind fails loud on it.
     return format.longDoubleFormat();
 }
+
+// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-
+// PLATFORM) ──────────────────────────────────────────────────────────────
+// There is deliberately no third member of the `effective*` family for
+// bare-`char` signedness. This family exists because those axes have
+// contributions from BOTH schemas that must be RECONCILED — a genuine
+// two-sided negotiation. Char signedness has exactly ONE contributor: the
+// target declares the whole (processor × platform) fact in its single
+// `charIsUnsigned` key. An `effectiveCharIsUnsigned(target, format)` wrapper
+// would advertise a negotiation that no longer happens, and would be a second
+// place the fact is "about" — the exact duplication this reshape removed.
+// The call site asks the owner directly: `target.charIsUnsigned(format.kind())`.
 
 namespace {
 
@@ -400,9 +413,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // EMPTY (no format-default fallback) so the reference resolves
             // at the link tier (sibling-TU definition, or the LOUD
             // undefined-symbol reject).
+            // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker so a
+            // shipped-descriptor import (producer C) reaches the linker's
+            // reference gate as eager (kept even when unreferenced). Non-eager
+            // source/bare-proto externs leave it false → dropped if unreferenced.
+            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): carry the per-declarator
+            // assembler
+            // name so FF5/FF1 name the import with it VERBATIM instead of the
+            // C-mangled identifier. Empty for every extern without a label ⇒ the
+            // downstream naming is byte-identical there.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
-                            r.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                            r.isEagerImport,
+                            r.asmName});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -422,15 +446,36 @@ static std::optional<CuMirModule> buildCuMirImpl(
         //      a named binary: bind to it (the true DT_NEEDED / import
         //      descriptor for a DSS-built library that has no descriptor).
         //   4. a governed extern ABSENT from every named binary:
-        //      * KNOWN system symbol (in some shipped descriptor, e.g. a bare
-        //        `extern int puts;` the user did not #include) → fall through
-        //        to the format-default library (`externLibraryByFormat`), the
-        //        gcc implicit-libc semantics -- NOT a fail-loud;
-        //      * GENUINE typo (in NEITHER a named binary NOR any shipped
-        //        descriptor, e.g. `dss_lib_answr`) → FAIL LOUD
-        //        `F_FfiResolveLibrarySymbolAbsent`. That is the meaningful,
-        //        false-positive-scarce validation: reading a real export
-        //        table proves an own-library symbol exists at compile time.
+        //      * KNOWN system symbol AND declared for the ACTIVE OBJECT FORMAT
+        //        (in some shipped descriptor, e.g. a bare `extern int puts;`
+        //        the user did not #include) → fall through to the format-default
+        //        library (`externLibraryByFormat`), the gcc implicit-libc
+        //        semantics -- NOT a fail-loud;
+        //      * KNOWN system symbol but declared ONLY FOR OTHER FORMATS (the
+        //        elf-only `fdatasync` referenced by a macho build) → FAIL LOUD
+        //        F_ShippedSymbolUnavailableForTarget. Falling through here would
+        //        bind it to a library the config says has no such export: the
+        //        image links CLEAN and dies at LOAD with no diagnostic at all
+        //        (MEASURED exit 255). See the oracle call site below --
+        //        D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS;
+        //      * anything else → route to the UNBOUND channel (precedence 1's
+        //        empty-library shape) and let the LINK tier decide. TF-C66
+        //        (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture): this stage is
+        //        PER-CU, so it cannot know the symbol is defined by a SIBLING
+        //        TU of the same multi-TU build (sqlite's own `sqlite3_version`
+        //        etc. -- the 185-TU testfixture declared 2770 such externs and
+        //        a compile-time fail-loud here false-positived on every one).
+        //        The link tier has the whole merged picture and already
+        //        implements the exact right policy (rejectOrDropUnreferenced-
+        //        Externs, c143/c150): a sibling-TU definition RESOLVES the
+        //        reference; an unreferenced declaration is DROPPED; a
+        //        referenced-but-undefined symbol (the genuine typo, e.g.
+        //        `dss_lib_answr`) REJECTS LOUD with K_SymbolUndefined on any
+        //        exec-flavor image. The typo protection is preserved -- it
+        //        moved to the tier that can judge it soundly (the same tier
+        //        every C toolchain reports undefined symbols from).
+        //        F_FfiResolveLibrarySymbolAbsent is retired from this path
+        //        (kept in the enum for diagnostic-name stability).
         //
         // The binary read is NON-DUPLICATIVE of the JSON/shipped path
         // precisely because a DSS-BUILT library has no shipped descriptor --
@@ -485,35 +530,103 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // (ii) The governed externs `ingest()` did NOT bind (absent from
             // ffiMap) split by the shipped-descriptor oracle: a KNOWN system
             // symbol falls through to `synthesize` (format-default library);
-            // a GENUINE typo fails loud. `shippedNames == nullopt` (config
-            // discovery failed) ⇒ treat every symbol as possibly-known and
-            // fall through -- never a false-positive fail-loud.
-            auto const shippedNames = ffi::collectShippedExternSymbolNames();
-            std::string libList;
-            for (std::size_t k = 0; k < opts.resolveLibraries.size(); ++k) {
-                if (k) libList += ", ";
-                libList += opts.resolveLibraries[k].filename().generic_string();
-            }
+            // everything else routes UNBOUND (empty library -- precedence 1's
+            // channel) so the LINK tier resolves a sibling-TU definition,
+            // drops an unreferenced declaration, or rejects a referenced-
+            // undefined symbol LOUD (K_SymbolUndefined) -- see the precedence
+            // comment above (TF-C66).
+            // D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS: the oracle is
+            // FORMAT-AWARE. It answers name -> the UNION (across every declaring
+            // row, in every descriptor) of the object formats that name is
+            // available on; an EMPTY set means "every format" (the
+            // `objectFormatInAvailabilitySet` encoding). Three outcomes below,
+            // and the middle one is the whole point of the anchor: a name that
+            // is REAL but NOT ON THIS FORMAT used to be judged "known" and bound
+            // to the format-default library, which links clean and then dies at
+            // LOAD with no diagnostic at all (MEASURED: elf-only `fdatasync` on a
+            // macho build -> the loader cannot resolve it in libSystem -> exit
+            // 255). The UNION is load-bearing: `call_once`/`thrd_create`/
+            // `mtx_lock` (+~20 more) are declared by THREE separate rows gated
+            // ["elf"] / ["macho"] / ["pe"], and `sprintf` by an ["elf","macho"]
+            // row plus a ["pe"] row -- a per-row test would turn the whole C11
+            // threads surface red on every format.
+            auto const shippedFormats = ffi::collectShippedExternSymbolFormats();
             std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
             for (auto const& g : binaryGoverned) {
                 if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
-                bool const known =
-                    !shippedNames.has_value()
-                    || shippedNames->count(std::string{g.canonicalName}) != 0;
-                if (known) {
-                    fallThrough.push_back(g);  // system symbol -> format-default
+                // `shippedFormats == nullopt` (config discovery failed) => treat
+                // every symbol as possibly-known and fall through -- never a
+                // false-positive fail-loud just because DSS_CONFIG_ROOT was unset.
+                std::vector<std::string> const* declaredFormats = nullptr;
+                bool inDescriptors = false;
+                if (shippedFormats.has_value()) {
+                    if (auto it = shippedFormats->find(
+                            std::string{g.canonicalName});
+                        it != shippedFormats->end()) {
+                        inDescriptors   = true;
+                        declaredFormats = &it->second;
+                    }
                 } else {
+                    inDescriptors = true;   // discovery failed -> assume known
+                }
+                // Known ON THIS FORMAT? `declaredFormats == nullptr` is the
+                // discovery-failed arm (assume yes). Otherwise ask the ONE shared
+                // membership predicate the #include / __has_include / semantic-
+                // injection gates all use, so the oracle can never drift from
+                // them (and no `if (format == ...)` appears anywhere here).
+                bool const availableHere =
+                    declaredFormats == nullptr
+                    || ffi::objectFormatInAvailabilitySet(*declaredFormats,
+                                                          format.kind());
+                // `declaredFormats != nullptr` (rather than `inDescriptors`)
+                // makes the deref below locally provable: availableHere is
+                // unconditionally true when the pointer is null, so the two
+                // spellings select the same set of externs.
+                if (declaredFormats != nullptr && !availableHere) {
+                    // REAL SYMBOL, WRONG FORMAT. Binding it to the format
+                    // default is provably wrong -- the config states it does not
+                    // exist there. Fail LOUD naming the symbol, the active
+                    // format, and the formats it IS declared for, so the user can
+                    // tell this apart from "never heard of this symbol" (which
+                    // routes unbound below and surfaces as K_SymbolUndefined at
+                    // link).
+                    std::string declared;
+                    for (auto const& f : *declaredFormats) {
+                        if (!declared.empty()) declared += ", ";
+                        declared += f;
+                    }
                     ParseDiagnostic d;
-                    d.code     = DiagnosticCode::F_FfiResolveLibrarySymbolAbsent;
+                    d.code     = DiagnosticCode::F_ShippedSymbolUnavailableForTarget;
                     d.severity = DiagnosticSeverity::Error;
                     d.actual   = std::format(
-                        "declared extern '{}' is not exported by any "
-                        "--resolve-library binary [{}] and is not a known "
-                        "system symbol -- a genuine typo or a missing library. "
-                        "Fix the spelling, #include the header that declares "
-                        "it, or add the defining library to --resolve-library.",
-                        g.canonicalName, libList);
+                        "shipped system symbol '{}' is NOT available on object "
+                        "format '{}' -- the shipped descriptors declare it only "
+                        "for: {}. Under --resolve-library it matched no named "
+                        "binary's export table, and binding it to this format's "
+                        "default library would link clean and then FAIL AT LOAD "
+                        "(that library has no such export). Guard the reference "
+                        "per platform, use this format's own spelling of the "
+                        "facility, or declare the symbol for '{}' in its shipped "
+                        "descriptor if it really exists there.",
+                        g.canonicalName,
+                        objectFormatKindName(format.kind()),
+                        declared,
+                        objectFormatKindName(format.kind()));
                     reporter.report(std::move(d));
+                    continue;   // never binds, never routes
+                }
+                if (inDescriptors) {
+                    fallThrough.push_back(g);  // system symbol -> format-default
+                } else {
+                    // Unknown to the named binaries AND the descriptors:
+                    // hand it to the link tier with NO library binding. The
+                    // c86 no-library marker makes FF5 leave the import row's
+                    // library EMPTY, which is exactly the shape the link
+                    // gate governs (resolve / drop / loud-undefined).
+                    ffi::ExternDeclRef unbound = g;
+                    unbound.libraryOverride = {};
+                    unbound.noLibraryBinding = true;
+                    fallThrough.push_back(std::move(unbound));
                 }
             }
 
@@ -562,6 +675,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+    // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
+    // so HIR→MIR picks ZExt vs SExt for the char→int promotion. The axis is
+    // (processor × PLATFORM), not per-processor — the same arm64 CPU is
+    // UNSIGNED under GNU/Linux and SIGNED under Darwin — and the TARGET
+    // declares BOTH halves in its one `charIsUnsigned` key, so this asks the
+    // one owner and passes it the active format KIND. No format schema
+    // contributes; no arch or platform name is compared.
+    mirCfg.charIsUnsigned        = target.charIsUnsigned(format.kind());
     // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
     // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
     // merge maps MIR symbols to names through `model.recordFor`, so a
@@ -604,7 +726,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->sizeofVlaSymbol,   // VLA C2 (D-CSUBSET-VLA)
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
                           &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
-                          &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
+                          &hir->returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
+                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+                          &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
+                          &hir->noOptimizeMap,   // TF-C85 (#pragma optimize region)
+                          &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -637,6 +763,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
         format.dataImportBinding(),
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): capture the format's
+        // extern-ADDRESS binding now, for the same reason (the LOWER half's
+        // MIR→LIR GlobalAddr value-form arm routes an `&extern` value
+        // through the arm64 GOT-address macro under `got`).
+        format.externAddrBinding(),
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): capture the format's thread-local
         // access block now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects the TLS access sequence; nullopt =
@@ -660,6 +791,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
     cuMir.librarySynthesis = format.librarySynthesis();
     cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's va_list strategy so
+    // the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding model.
+    // Reuses `analyzeVaStrategy` (computed above from the SAME resolved CC for the semantic
+    // `va_list`-type injection) rather than re-resolving the CC a second time. The optional
+    // is assigned THROUGH — its EMPTINESS is part of the signal, not noise to be defaulted
+    // away: a CC that declares no `vaListLayout` must reach the synth pass as "nothing
+    // declared", which that pass refuses loudly, rather than as a real strategy it could
+    // not tell from a genuine declaration. Consulted only if a stdio recipe appears.
+    cuMir.vaListStrategy = analyzeVaStrategy;
     return cuMir;
 }
 
@@ -700,6 +840,12 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
                          std::optional<DataImportBinding>            dataImportBinding,
+                         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                         // format's extern-ADDRESS binding, threaded into
+                         // MIR→LIR exactly like dataImportBinding (nullopt =
+                         // this leg has no GOT-address model; an `&extern`
+                         // value takes the ordinary lea).
+                         std::optional<ExternAddrBinding>            externAddrBinding,
                          // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                          // thread-local access block, threaded into MIR→LIR
                          // exactly like dataImportBinding (nullopt = this leg
@@ -735,7 +881,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           dataImportBinding,
                           tlsAccess,
                           sehScopes,
-                          std::move(wideFloatSoftcallLibrary));
+                          std::move(wideFloatSoftcallLibrary),
+                          // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
+                          // trailing param on lowerToLir (positional-safe).
+                          externAddrBinding);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -779,6 +928,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
         return std::nullopt;
     }
+    // TF-C58 bisect (env-gated, zero-cost when unset): the loop-carried-update check
+    // runs at EACH post-regalloc stage so the pass that drops a back-edge update is
+    // identified by which stage first reports.
+    checkLoopCarriedSpills(legal.lir, target, "post-legalize");
 
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
@@ -825,6 +978,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     auto const asmEntry = reporter.errorCount();
     phase.emplace(substrate::CompilePhase::Encode);
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    checkLoopCarriedSpills(cc.lir, target, "post-callconv");
+    dumpLirFuncs(cc.lir, target, "post-callconv");
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
@@ -1272,6 +1427,43 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         }
     }
 
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.threadsRecipes` (the single
+    // combined synthesize-recipe map CST→HIR seeded — its name predates the <stdio.h>
+    // family and is now a misnomer) by `dss::ffi::shimFamilyOf` BEFORE calling EITHER synth
+    // pass. Each pass fails loud on a recipe id it has no switch arm for (its own anti-
+    // vocab-drift backstop), so handing the WHOLE map to one pass would make it reject the
+    // other family's ids and abort a build that never should have failed. A `nullopt`
+    // family here is an INTERNAL INVARIANT BREACH, not a user error: the descriptor loader
+    // (`readShippedLibDescriptor`) already rejects an unknown `synthesize` id at READ time
+    // via the same closed-vocab table `shimFamilyOf` reads, so a recipe reaching this point
+    // with no family means the loader and this switch have drifted out of lockstep. It is
+    // reported with the DRIVER-band internal-invariant code `D_SynthRecipeFamilyUnknown`
+    // (the `D_CompileUnitNullNoDiagnostic` class) — never the linker's
+    // `K_NoMatchingObjectFormat`, which would point an operator at the object-format config
+    // for what is a recipe-table defect. The merged-module seam (program.cpp) emits the
+    // SAME code for the SAME breach.
+    std::unordered_map<std::uint32_t, std::string> threadsRecipes, stdioRecipes;
+    for (auto const& [symV, recipe] : cuMir.threadsRecipes) {
+        auto const family = dss::ffi::shimFamilyOf(recipe);
+        if (!family.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::D_SynthRecipeFamilyUnknown;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "synthesize recipe '{}' (symbol {{ {} }}) belongs to no known shim "
+                "family (D-FFI-PE-CRT-UCRT-MIGRATION) — internal invariant breach: the "
+                "descriptor loader should have rejected an unknown recipe id at read "
+                "time (isKnownSynthesizeRecipe)",
+                recipe, symV);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        switch (*family) {
+        case dss::ffi::ShimFamily::Threads: threadsRecipes.emplace(symV, recipe); break;
+        case dss::ffi::ShimFamily::Stdio:   stdioRecipes.emplace(symV, recipe);   break;
+        }
+    }
+
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): single-CU
     // counterpart of the merge-path shim synth (program.cpp). Supply a definition for every
     // <threads.h> shim symbol the descriptor tagged (mtx_lock etc.) over the format's synth
@@ -1280,9 +1472,22 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // optimized; the appended shims are lowered like any other function). The interner is
     // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
     if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
-                               cuMir.threadsRecipes, cuMir.librarySynthesis,
+                               threadsRecipes, cuMir.librarySynthesis,
                                cuMir.objectFormat, cuMir.externImports, reporter)) {
         return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
+    }
+
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling — see
+    // `synth_stdio_shim.hpp` for the full contract. A clean no-op when `stdioRecipes` is
+    // empty (every elf/macho build and every pe TU that includes no <stdio.h> printf
+    // family). `cuMir.vaListStrategy` is the RESOLVED CC's va_list model (captured at BUILD
+    // time in `buildCuMirImpl`, above) — the shim's variadic-forwarding arm reads it to pick
+    // the HomogeneousPointer MIR leaf or fail loud on a strategy this pass has no arm for
+    // (SysVRegisterSave, until a consumer exists).
+    if (!synthesizeStdioShim(cuMir.mir, model.lattice().interner(),
+                             stdioRecipes, cuMir.vaListStrategy,
+                             cuMir.externImports, reporter)) {
+        return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
 
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
@@ -1305,9 +1510,18 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // to the pre-fix output; adds the `_` on Mach-O only. A SymbolId with no
     // record (synthesized / out-of-range) yields "" — the LK11a symbol-table
     // populate then skips it as module-private, exactly as before.
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): routed through `linkNameFor`,
+    // which returns an
+    // explicit assembler name VERBATIM and falls back to `applyCMangling` when
+    // there is none — so this lambda is byte-identical for every symbol without a
+    // label (i.e. every symbol in every program before this cycle). This is the
+    // DEFINITION rail; `program.cpp`'s merge-key lambda is its cross-CU twin and
+    // MUST route through the same function (see linkNameFor's own comment for what
+    // a divergence between the two silently produces).
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? dss::ffi::applyCMangling(r->name, fmtKind) : std::string{};
+        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind)
+                 : std::string{};
     };
 
     // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's
@@ -1315,7 +1529,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // in scope here — no new CuMirModule field needed). Empty = the format
     // declares none (nullopt → an F128 softcall fails loud).
     std::string_view const wfLib =
-        cuMir.target->wideFloatSoftcallLibrary(objectFormatKindName(fmtKind));
+        cuMir.target->wideFloatSoftcallLibrary(fmtKind);
     std::optional<std::string> wideFloatSoftcallLibrary =
         wfLib.empty() ? std::nullopt
                       : std::optional<std::string>(std::string(wfLib));
@@ -1326,6 +1540,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
+        cuMir.externAddrBinding,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
@@ -1354,6 +1569,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding, pre-resolved one
+                      // level up in program.cpp (same shape as
+                      // externCallDispatch / dataImportBinding).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       std::optional<TlsAccessInfo> tlsAccess,
                       std::vector<MirSehScope> sehScopes,
                       // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128
@@ -1375,7 +1595,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, dataImportBinding, tlsAccess,
+        externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
 
@@ -1386,11 +1606,12 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
                   TargetSchema const&              target,
                   ObjectFormatSchema const&        format,
                   std::filesystem::path const&     outPath,
-                  DiagnosticReporter&              reporter) {
+                  DiagnosticReporter&              reporter,
+                  ImageRequest const&              request) {
     // c97: link phase — resolution + byte emission + image write.
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(modules, target, format, reporter);
+    auto image = linker::link(modules, target, format, reporter, request);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
@@ -1424,6 +1645,52 @@ bool isArArchiveFile(std::filesystem::path const& path) {
         if (buf[i] != kArGlobalMagic[i]) return false;
     }
     return true;
+}
+
+// Parse ONE `ar` member's raw bytes back into a mergeable `AssembledModule`,
+// dispatching to the per-FORMAT relocatable-object reader by the object-format
+// KIND (the closed-enum agnostic axis, never a format-name branch). A fresh,
+// process-unique CompilationUnitId is minted per member (the merge keys its
+// symbol index by (cuId, SymbolId), so a member must never share a cuId with the
+// client or another member -- the monotonic minter never repeats). A format whose
+// kind has no reader arm fails loud rather than silently mis-parsing a member with
+// the wrong reader. Consuming the reader's `optional` is the read-success signal
+// -- NOT `module.ok()`, which is a tautology for reader output AND false for a
+// data-only member (see elf_object_reader.hpp). THE single member-read chokepoint
+// shared by BOTH the lazy reference-driven pull (`pullStaticArchiveMembers`, the
+// exe/final-link path) AND the whole-archive extraction (`extractStaticArchive-
+// Members`, the fat-static-library path) -- so a new object format lights up for
+// both by construction (the §A.5 multi-site funnel).
+[[nodiscard]] static std::optional<AssembledModule>
+readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
+                        TargetSchema const&           target,
+                        ObjectFormatSchema const&     format,
+                        DiagnosticReporter&           reporter) {
+    CompilationUnitId const memberCu =
+        substrate::mintMonotonicId<CompilationUnitId>();
+    switch (format.kind()) {
+        case ObjectFormatKind::Elf:
+            return elf::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::MachO:
+            return macho::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        case ObjectFormatKind::Pe:
+            return pe::readRelocatableObject(
+                memberBytes, target, format, reporter, memberCu);
+        default: {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "archive member reader: object format '{}' (kind {}) has no "
+                "relocatable-object reader -- cannot pull archive members for "
+                "this format.",
+                format.name(), objectFormatKindName(format.kind()));
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+    }
 }
 
 std::optional<std::vector<AssembledModule>>
@@ -1515,46 +1782,11 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
             archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
             static_cast<std::size_t>(member.size)};
 
-        // Fresh, process-unique CompilationUnitId per member: the merge keys its
-        // symbol index by (cuId, SymbolId), so a member must never share a cuId
-        // with the client or another member (the monotonic minter never repeats).
-        CompilationUnitId const memberCu =
-            substrate::mintMonotonicId<CompilationUnitId>();
-        // Dispatch the member read by the format's object-format KIND -- the
-        // relocatable-object reader is per-format (ELF ET_REL c164 / Mach-O
-        // MH_OBJECT c168). A format with no reader arm fails loud rather than
-        // silently mis-parsing a member with the wrong reader (agnostic:
-        // switch on the schema-declared kind, never a format-name branch).
-        std::optional<AssembledModule> member_mod;
-        switch (format.kind()) {
-            case ObjectFormatKind::Elf:
-                member_mod = elf::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::MachO:
-                member_mod = macho::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            case ObjectFormatKind::Pe:
-                member_mod = pe::readRelocatableObject(
-                    memberBytes, target, format, reporter, memberCu);
-                break;
-            default: {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "static-link member reader: object format '{}' (kind {}) "
-                    "has no relocatable-object reader -- cannot pull archive "
-                    "members for this format.",
-                    format.name(), objectFormatKindName(format.kind()));
-                reporter.report(std::move(d));
-                return std::nullopt;
-            }
-        }
-        // Consume the reader's optional as the read-success signal -- NOT
-        // `ok()`, which is a tautology for reader output AND false for a
-        // data-only member (see elf_object_reader.hpp).
+        // Parse the member back into a mergeable module via the shared
+        // per-format reader chokepoint (fresh cuId minted inside; a format
+        // with no reader arm fails loud there).
+        auto member_mod =
+            readArchiveMemberModule(memberBytes, target, format, reporter);
         if (!member_mod) return std::nullopt;   // member-read fail-loud
 
         // A pulled member's externally-visible definitions satisfy later
@@ -1573,15 +1805,67 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
     return pulled;
 }
 
+std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter) {
+    ExtractedArchiveMembers out;
+    for (auto const& archivePath : archivePaths) {
+        std::ifstream in(archivePath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "fat-archive: failed to open input static archive '{}' for "
+                "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
+                archivePath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = ffi::readArArchive(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+            archivePath.filename().string(), reporter);
+        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+
+        // EVERY member, in archive order -- a static LIBRARY packages all of its
+        // objects (unlike the LAZY referenced-subset the exe/final-link path
+        // pulls): a downstream link against this library must be able to pull
+        // ANY member, so dropping an unreferenced one would silently ship an
+        // incomplete library. The member name (long-name-expanded by the reader)
+        // is carried verbatim -- cosmetic (the armap selects members by index),
+        // and `ar` permits duplicate member names; a rare empty name (never from
+        // a well-formed archive) is synthesized so the writer's name belt holds.
+        for (auto const& member : arch->members) {
+            std::span<std::uint8_t const> const memberBytes{
+                bytes.data() + static_cast<std::size_t>(member.dataOffset),
+                static_cast<std::size_t>(member.size)};
+            auto member_mod =
+                readArchiveMemberModule(memberBytes, target, format, reporter);
+            if (!member_mod) return std::nullopt;   // member-read fail-loud
+            out.modules.push_back(std::move(*member_mod));
+            out.names.push_back(
+                member.name.empty()
+                    ? ("member_" + std::to_string(out.names.size()) + ".o")
+                    : member.name);
+        }
+    }
+    return out;
+}
+
 bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
                                     std::span<std::filesystem::path const> staticArchives,
                                     TargetSchema const&                    target,
                                     ObjectFormatSchema const&              format,
                                     std::filesystem::path const&           outPath,
-                                    DiagnosticReporter&                    reporter) {
+                                    DiagnosticReporter&                    reporter,
+                                    ImageRequest const&                    request) {
     if (staticArchives.empty()) {
         return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
-                            target, format, outPath, reporter);
+                            target, format, outPath, reporter, request);
     }
     auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
                                            target, format, reporter);
@@ -1598,7 +1882,7 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
     combined.push_back(std::move(clientModule));
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
-                        target, format, outPath, reporter);
+                        target, format, outPath, reporter, request);
 }
 
 // c163 (D-LK-STATIC-ARCHIVE-WRITER): link N assembled CUs into N relocatable
@@ -1609,7 +1893,8 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                                TargetSchema const&              target,
                                ObjectFormatSchema const&        format,
                                std::filesystem::path const&     outPath,
-                               DiagnosticReporter&              reporter) {
+                               DiagnosticReporter&              reporter,
+                               ImageRequest const&              request) {
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const entry = reporter.errorCount();
 
@@ -1650,8 +1935,13 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i) {
+        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
+        // so the capability gate fires on the archive path too. No archive
+        // format declares a stack-reserve capability (an `ar` member carries no
+        // image headers), so a request here is REFUSED on the first member —
+        // never silently swallowed by a build that reports success.
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter);
+                                  target, format, reporter, request);
         if (!image.ok() || !tierClean(reporter, entry)) {
             return false;
         }

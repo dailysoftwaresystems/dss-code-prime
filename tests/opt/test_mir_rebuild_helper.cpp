@@ -25,6 +25,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <variant>
+#include <unordered_map>
+#include <optional>
 #include <vector>
 
 using namespace dss;
@@ -307,6 +310,489 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
 // (`MirMerge.MergePreservesGlobalConstness`). RED-ON-DISABLE: drop the
 // `…globalIsConst(g)` argument at mir_rebuild_helper.cpp:54 / :96 (let it default to
 // false) → the const global's `isConst` flips to false and the `EXPECT_TRUE` fails.
+// TF-C78 (D-CSUBSET-NOINLINE): ★ THE LOAD-BEARING PROPAGATION PIN.
+//
+// `rebuildFunction` is the shared substrate under EVERY optimizer pass
+// (ConstFold, Mem2Reg, CopyProp, Cse, Licm, SimplifyCfg, Dce). The shipped
+// `release` pipeline runs `Inlining` FIRST in each of its 4 iterations, so a
+// `noInline` flag dropped by ANY of those rebuilds is gone by iteration 2 and
+// the callee is spliced then — with the inliner's refusal rule fully present
+// and correct.
+//
+// ★ THIS IS MEASURED, NOT REASONED. Removing ONLY the `src_.funcNoInline(oldFn)`
+// argument from `mir_rebuild_helper.cpp` — leaving `inlining.cpp` rule 2b
+// untouched — produced a release-pipeline binary IDENTICAL to deleting rule 2b
+// outright: the `noinline` helper gone entirely and `main` const-folded to a
+// single `mov x29, #0x2a`. A half-landed flag and no flag at all are
+// indistinguishable in the output, which is exactly why the refusal pin cannot
+// stand alone and this one has to exist.
+//
+// RED-ON-DISABLE: drop that argument (let the 5th parameter default to false)
+// and the `EXPECT_TRUE` below fails while every other rebuild test stays green.
+// The un-annotated sibling asserts the flag is not spuriously acquired, so the
+// test cannot be satisfied by hardcoding true.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoInline) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: NOINLINE (and deliberately Global/Default so the flag is the
+    // only non-default axis — a Local binding would let a binding-preserving
+    // rebuild look correct while dropping this bit).
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: plain — must NOT acquire the flag.
+    mb.addFunction(fnSig, SymbolId{2});
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 2u);
+    ASSERT_TRUE(src.funcNoInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(1)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+
+    EXPECT_TRUE(dst.funcNoInline(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noInline flag — this rebuilder "
+           "runs under every optimizer pass, so dropping it here silently "
+           "re-arms the inliner on the pipeline's next iteration";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(1)))
+        << "an un-annotated function must not acquire the flag";
+
+    // The sibling per-function axes must survive the same rebuild — they are
+    // carried by the same call and a regression to any of them has the same
+    // shape (this rebuilder is where `binding`/`visibility` are already pinned
+    // by test_dce_linkage, mirrored here so the three stay pinned together).
+    EXPECT_EQ(dst.funcBinding(dst.funcAt(0)),    SymbolBinding::Global);
+    EXPECT_EQ(dst.funcVisibility(dst.funcAt(0)), SymbolVisibility::Default);
+}
+
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): ★ THE SECOND PROPAGATION PIN — and MEASUREMENT
+// MADE IT MORE NECESSARY THAN ITS TF-C78 SIBLING, NOT LESS. THIS TEST IS THE ONLY
+// THING THAT CATCHES THIS HOP.
+//
+// TF-C78's finding was that two disable states (delete the rule / drop the flag
+// at one hop) produce BYTE-IDENTICAL breakage, so an end-to-end test can prove
+// the chain is broken but not which hop broke it. For `alwaysInline` the
+// situation is STRICTLY WORSE and it was MEASURED, not assumed: dropping
+// `src_.funcAlwaysInline(oldFn)` below leaves the end-to-end pin
+// `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+// COMPLETELY GREEN. The end-to-end test is BLIND to this hop.
+//
+// Why the asymmetry: `noInline` must keep REFUSING on every iteration, so a
+// cleared flag re-arms the inliner on iteration 2 and the output changes.
+// `alwaysInline` only has to be present at the FIRST inlining opportunity —
+// `Inlining` runs first in iteration 1, before any rebuild touches the module,
+// so in the simple shape the splice is already done. The flag still matters
+// wherever the first iteration does not finish the job (a callee that becomes
+// inlinable only after an earlier pass simplifies its caller; a cross-CU module
+// merged after a round of optimization), and those shapes are precisely the ones
+// an end-to-end fixture does not happen to construct.
+//
+// So: without THIS test the hop could be deleted and the whole suite would stay
+// green. That is the entire argument for a dedicated propagation pin, in its
+// sharpest form yet.
+//
+// ★ THE FIXTURE IS DELIBERATELY ASYMMETRIC: func #0 sets ONLY `alwaysInline` and
+// this test asserts its `noInline` is still CLEAR. The two flags are adjacent
+// trailing bools at every `addFunction` copy site, so a transposed pair would
+// compile silently and invert the directive; a fixture that set both could not
+// detect that. Keep the asymmetry when extending this test.
+//
+// RED-ON-DISABLE (MEASURED against the final build): drop the
+// `src_.funcAlwaysInline(oldFn)` argument in `mir_rebuild_helper.cpp` (let the
+// 6th parameter default to false) and exactly TWO assertions in the whole suite
+// fail — the first EXPECT_TRUE below, and the flag-survival check inside
+// `Inlining.AlwaysInlineCalleeBypassesCostThreshold`. Every other test,
+// INCLUDING the shipped-release end-to-end pin and the corpus example, stays
+// green.
+TEST(MirRebuildHelper, RebuildFunctionPreservesAlwaysInline) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: ALWAYS_INLINE only — Global/Default binding and noInline CLEAR,
+    // so this flag is the single non-default axis on the record.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: NOINLINE only — the mirror record. Its presence is what proves a
+    // swapped argument pair cannot pass: a transposition would make func #0 read
+    // noInline and func #1 read alwaysInline, failing both directions at once.
+    mb.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/true,
+                   /*alwaysInline=*/false);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    // func #2: plain — must acquire NEITHER flag.
+    mb.addFunction(fnSig, SymbolId{3});
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b2);
+    MirLiteralValue v2; v2.value = std::int64_t{9}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 3u);
+    ASSERT_TRUE(src.funcAlwaysInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 3u);
+
+    EXPECT_TRUE(dst.funcAlwaysInline(dst.funcAt(0)))
+        << "rebuildFunction must preserve the alwaysInline flag — this "
+           "rebuilder runs under every optimizer pass, so dropping it here "
+           "silently re-applies the size threshold on the next iteration";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — the two flags are adjacent "
+           "bools at the addFunction call, so a swap must fail here";
+    EXPECT_TRUE(dst.funcNoInline(dst.funcAt(1)))
+        << "the mirror record: noInline must survive independently";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(1)))
+        << "and must not bleed into the alwaysInline bit";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(2)))
+        << "an un-annotated function must not acquire the flag";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(2)));
+}
+
+// ══ TF-C85: the `#pragma optimize("", off)` per-function opt-out ══════════════
+namespace {
+// A policy that WOULD mangle any function it is let near: it drops every
+// non-terminator instruction (`shouldEmit` false) and keeps only the entry
+// block. Under the neuter it must be consulted ZERO times, so a `noOptimize`
+// function comes through with all of its blocks and instructions intact.
+//
+// ★ IT IS DELIBERATELY DESTRUCTIVE RATHER THAN MERELY DIFFERENT. A policy that
+// made a subtle change could pass a sloppy assertion; this one makes the
+// difference between "neutered" and "not neutered" impossible to miss, and it
+// exercises BOTH the block-selection hook and a per-instruction hook.
+// A policy that INJECTS one extra instruction at the head of every block it is
+// let near — the `Mem2Reg` shape (its `onBlockBegin` inserts IDF phis), and the
+// simplest transform that is both legal and trivially observable.
+//
+// ★ WHY A HOOK THAT ADDS RATHER THAN ONE THAT REMOVES. A policy that dropped
+// instructions would trip the rebuilder's own `D-OPT2-REWRITE-MAP-COMPLETENESS`
+// fail-loud the moment a surviving operand referenced a skipped instruction —
+// MEASURED while writing this test. Injection is unconditionally safe (an
+// unreferenced Const is legal MIR) and makes "the policy ran" a pure count.
+//
+// ★ NOTE `tryRewrite` IS NOT USABLE HERE: `emitValue` copies a `Const` verbatim
+// BEFORE consulting the hook, so a Const-rewriting policy is silently a no-op.
+// (MEASURED — the first draft of this test used exactly that and passed
+// vacuously on one arm.)
+class InjectingPolicy : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        ++selectBlocksCalls;
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    void onBlockBegin(MirBlockId /*oldB*/, MirBlockId /*newB*/,
+                      MirBuilder& dst,
+                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
+                      std::unordered_map<std::uint32_t, MirBlockId> const&
+                          /*blockMap*/) override {
+        ++onBlockBeginCalls;
+        MirLiteralValue v;
+        v.value = std::int64_t{999};
+        v.core  = TypeKind::I32;
+        (void)dst.addConst(v, i32Type);
+    }
+    TypeId      i32Type = InvalidType;
+    std::size_t selectBlocksCalls  = 0;
+    std::size_t onBlockBeginCalls  = 0;
+};
+
+// The same policy, but declaring itself a MANDATORY NORMALIZATION — the
+// `PruneUnreachable` posture. It must run even on a `noOptimize` function.
+class MandatoryInjectingPolicy final : public InjectingPolicy {
+public:
+    [[nodiscard]] bool mandatoryNormalization() const noexcept override {
+        return true;
+    }
+};
+
+// A policy recording whether the rebuilder told it a function was neutered —
+// the `Mem2Reg` notification, isolated.
+class NeuterNotedPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    void onFunctionNeutered(MirFuncId oldFn) override {
+        neutered.push_back(oldFn.v);
+    }
+    std::vector<std::uint32_t> neutered;
+};
+
+// Two single-block functions: #0 `noOptimize`, #1 plain. Each returns a const.
+[[nodiscard]] Mir buildNoOptimizePair(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    // func #0: noOptimize ONLY — noInline and alwaysInline deliberately CLEAR so
+    // this flag is the single non-default axis. The three are adjacent trailing
+    // bools at every `addFunction` copy site, so a transposed argument would
+    // compile silently; the asymmetry is what makes a swap fail here.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: plain.
+    mb.addFunction(fnSig, SymbolId{2});
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{8}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    return std::move(mb).finish();
+}
+} // namespace
+
+// ★ THE THIRD PROPAGATION PIN. Same argument as its two neighbours: this
+// rebuilder runs under every optimizer pass, so a flag dropped here means
+// iteration 2 starts optimizing a function the source excluded.
+//
+// RED-ON-DISABLE (re-verified against the FINAL build): drop the
+// `src_.funcNoOptimize(oldFn)` argument at `mir_rebuild_helper.cpp`'s
+// `addFunction` (let the 7th parameter default to false) and the first
+// EXPECT_TRUE below fails.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoOptimize) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    ASSERT_EQ(src.moduleFuncCount(), 2u);
+    ASSERT_TRUE(src.funcNoOptimize(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoInline(src.funcAt(0)));
+    ASSERT_FALSE(src.funcAlwaysInline(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noOptimize flag";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — three adjacent bools at the "
+           "addFunction call, so a swap must fail here";
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(1)))
+        << "an un-marked function must not acquire the flag";
+}
+
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): THE FOURTH PROPAGATION PIN — AND THE
+// ONLY ONE OF THE FOUR WITH **NO** BEHAVIOURAL BACKSTOP ANYWHERE IN THE SUITE.
+//
+// The argument, sharpened from TF-C81's: `noInline` must keep refusing on every
+// iteration (so dropping it changes the end-to-end release output);
+// `alwaysInline`'s hop is invisible to the end-to-end pin but a dedicated
+// inliner-behaviour test still exists; `noOptimize` reaches the rebuilder's own
+// policy swap, which a behaviour test observes. `noSanitizeThread` reaches NO PASS
+// AT ALL — MEASURED, `grep -rni sanitiz src/` returns zero hits — so dropping the
+// argument below changes NOTHING that any pass-behaviour test could see. The only
+// detectors are this pin and the MIR-text assertions.
+//
+// ★ THE FIXTURE IS DELIBERATELY ASYMMETRIC: func #0 sets ONLY `noSanitizeThread`
+// and this test asserts its other three flags are still CLEAR. Four adjacent
+// trailing bools at every `addFunction` copy site means a transposed pair compiles
+// silently; a fixture that set two flags could not detect it. Func #1 sets ONLY
+// `noOptimize` — the IMMEDIATE neighbour in the argument list — so a one-position
+// shift fails both records at once. Keep the asymmetry when extending this test.
+//
+// RED-ON-DISABLE (verified against the final build): drop the
+// `src_.funcNoSanitizeThread(oldFn)` argument at `mir_rebuild_helper.cpp`'s
+// `addFunction` (let the 8th parameter default to false) and the first EXPECT_TRUE
+// below fails, together with the post-optimize MIR-text assertions in
+// `MirLoweringCSubsetLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
+// Nothing else in the suite moves.
+TEST(MirRebuildHelper, RebuildFunctionPreservesNoSanitizeThread) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // func #0: NO_SANITIZE_THREAD only — Global/Default binding and all three
+    // sibling flags CLEAR, so this flag is the single non-default axis on the record.
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/false,
+                   /*noSanitizeThread=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{11}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    // func #1: NOOPTIMIZE only — the adjacent-argument mirror. Its presence is what
+    // proves a shifted argument list cannot pass: a one-position shift would make
+    // func #0 read noOptimize and func #1 read noSanitizeThread, failing both
+    // directions at once.
+    mb.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/true,
+                   /*noSanitizeThread=*/false);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{12}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    // func #2: plain — must acquire NEITHER flag.
+    mb.addFunction(fnSig, SymbolId{3});
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b2);
+    MirLiteralValue v2; v2.value = std::int64_t{13}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleFuncCount(), 3u);
+    ASSERT_TRUE(src.funcNoSanitizeThread(src.funcAt(0)));
+    ASSERT_FALSE(src.funcNoOptimize(src.funcAt(0)));
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 3u);
+
+    EXPECT_TRUE(dst.funcNoSanitizeThread(dst.funcAt(0)))
+        << "rebuildFunction must preserve the noSanitizeThread flag — this "
+           "rebuilder runs under every optimizer pass, and because NO pass reads "
+           "the flag, dropping it here is invisible to every behavioural test in "
+           "the suite; this assertion is the only guard";
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "and it must land in the RIGHT bit — four adjacent bools at the "
+           "addFunction call, so a shift must fail here";
+    EXPECT_FALSE(dst.funcNoInline(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcAlwaysInline(dst.funcAt(0)));
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(1)))
+        << "the mirror record: noOptimize must survive independently";
+    EXPECT_FALSE(dst.funcNoSanitizeThread(dst.funcAt(1)))
+        << "and must not bleed into the noSanitizeThread bit";
+    EXPECT_FALSE(dst.funcNoSanitizeThread(dst.funcAt(2)))
+        << "an un-annotated function must not acquire the flag";
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(2)));
+}
+
+// ★★ THE SINK ITSELF. A `noOptimize` function is rebuilt VERBATIM under a policy
+// that would otherwise gut it — and, critically, IT STILL EXISTS.
+//
+// ★ THE SURVIVES-AT-ALL ASSERTION IS THE POINT, NOT A FORMALITY. The obvious
+// implementation of "skip optimizing this function" is to `return` early from
+// `rebuildFunction`. That does not leave the function alone: `dst` is a FRESH
+// module containing exactly what the rebuilder puts in it, so an early return
+// DELETES the function and every caller is left referencing an undefined symbol.
+// `moduleFuncCount() == 2` is what fails first under that mistake.
+TEST(MirRebuildHelper, NoOptimizeFunctionIsRebuiltVerbatimUnderAnInjectingPolicy) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    std::uint32_t const srcInsts0 = src.blockInstCount(src.funcEntry(src.funcAt(0)));
+    std::uint32_t const srcInsts1 = src.blockInstCount(src.funcEntry(src.funcAt(1)));
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "NoOptimizeNeuter"),
+              GlobalClonePrelude::Cloned);
+    InjectingPolicy policy;
+    policy.i32Type = interner.primitive(TypeKind::I32);
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir dst = std::move(dstB).finish();
+
+    ASSERT_EQ(dst.moduleFuncCount(), 2u)
+        << "THE FUNCTION MUST STILL EXIST. Neutering means swapping the POLICY, "
+           "never skipping the rebuild — skipping deletes the function";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(0))), srcInsts0)
+        << "func #0 is noOptimize: it comes through VERBATIM because the "
+           "injecting policy was never consulted for it";
+    EXPECT_EQ(policy.selectBlocksCalls, 1u)
+        << "selectBlocks must be called for the PLAIN function only";
+    EXPECT_EQ(policy.onBlockBeginCalls, 1u)
+        << "…and so must the per-block hook";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(1))), srcInsts1 + 1u)
+        << "the plain function DOES get the injected instruction, proving the "
+           "policy is effective and the comparison above is not vacuous";
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)));
+    EXPECT_FALSE(dst.funcNoOptimize(dst.funcAt(1)));
+}
+
+// ★★ THE EXEMPTION. A policy that declares itself a MANDATORY NORMALIZATION runs
+// on a `noOptimize` function anyway. MEASURED necessity: without this,
+// `PruneUnreachable` was neutered and sqlite's `ext/misc/totype.c` — the corpus's
+// only no-optimize TU — produced four `I_UnreachableBlock` verifier errors.
+// `#pragma optimize` switches optimization off; it does not license invalid IR.
+TEST(MirRebuildHelper, MandatoryNormalizationPolicyIsNotNeutered) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+    std::uint32_t const srcInsts0 = src.blockInstCount(src.funcEntry(src.funcAt(0)));
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "MandatoryNormalization"),
+              GlobalClonePrelude::Cloned);
+    MandatoryInjectingPolicy policy;
+    policy.i32Type = interner.primitive(TypeKind::I32);
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir dst = std::move(dstB).finish();
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+    EXPECT_EQ(policy.selectBlocksCalls, 2u)
+        << "a mandatory-normalization policy is consulted for EVERY function, "
+           "including the noOptimize one";
+    EXPECT_EQ(dst.blockInstCount(dst.funcEntry(dst.funcAt(0))), srcInsts0 + 1u)
+        << "…and its hooks really ran on the noOptimize function";
+    EXPECT_TRUE(dst.funcNoOptimize(dst.funcAt(0)))
+        << "…and the flag still rides through the exempt rebuild";
+}
+
+// ★ THE `onFunctionNeutered` NOTIFICATION. Fired for the neutered function and
+// only for it. MEASURED necessity: `Mem2Reg` plans IDF phis in `analyze`, emits
+// them in `onBlockBegin`, and wires them in a POST-rebuild step — silencing the
+// hooks without telling it aborted the whole pe64 sqlite build with "phi marker
+// has incomings but no emitted phi".
+TEST(MirRebuildHelper, NeuteredFunctionIsAnnouncedToThePolicy) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir src = buildNoOptimizePair(interner);
+
+    MirBuilder dstB;
+    DiagnosticReporter rep;
+    ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "NeuterNotice"),
+              GlobalClonePrelude::Cloned);
+    NeuterNotedPolicy policy;
+    for (std::uint32_t i = 0; i < src.moduleFuncCount(); ++i) {
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(i));
+    }
+    Mir unused = std::move(dstB).finish();
+    (void)unused;
+    ASSERT_EQ(policy.neutered.size(), 1u)
+        << "exactly one function is noOptimize, so exactly one notification";
+    EXPECT_EQ(policy.neutered[0], src.funcAt(0).v);
+}
+
 TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32 = interner.primitive(TypeKind::I32);

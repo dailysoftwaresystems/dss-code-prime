@@ -11,6 +11,19 @@
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (AArch64 is Variant I under EVERY OS, so it lives on the TARGET, not the format; the x86_64 twin declares variant2). variant1 = the thread pointer (TPIDR_EL0) points AT the TCB head and the TLS block FOLLOWS it; a symbol's link-time thread-pointer offset is POSITIVE: tpoff = alignUp(tcbHeaderBytes, p_align) + templateOffset. tcbHeaderBytes = 16 — the AArch64 TCB header is two pointers (the psABI/glibc `tcbhead_t` prefix: dtv pointer + private). Consumed ONLY by the walker's tpoff helper (addTlsSymbolOffsets) when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
   "tls": { "variant": "variant1", "tcbHeaderBytes": 16 },
+  "$charIsUnsignedComment": "TF-C56 + TF-C75 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET; D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, CLOSED) — ★ THIS KEY IS THE SINGLE SOURCE OF TRUTH FOR BARE-`char` SIGNEDNESS. The whole fact is here, in ONE key, in the ONE file that owns it: `default` is the AArch64 PROCESSOR's answer and `byObjectFormat` carries the PLATFORM overrides. Nothing on the object-format side declares this axis at all — a `charSignedness` key in a *.format.json is now REJECTED by the format loader's closed root-key vocabulary. WHY THE FACT CANNOT LIVE ON THE FORMAT: `elf` serves BOTH aarch64 (unsigned) and x86_64 (signed), so any flat value there is a lie on one of them, and making it honest would force all 24 format files to enumerate CPU architectures — a layering inversion. WHY IT CANNOT BE A BARE BOOLEAN EITHER: bare `char` (unqualified — NOT `signed char`) signedness is IMPLEMENTATION-DEFINED (C 6.2.5p15), AAPCS64 leaves it implementation-defined too, the AArch64/GNU-Linux platform ABI chose UNSIGNED, APPLE'S PLATFORM ABI CHOSE SIGNED, and clang follows the PLATFORM, not the CPU — so `true` alone would be a claim about every AArch64 platform, and it was WRONG on Darwin. MEASURED BY THIS AGENT 2026-07-28 (Darwin 25.5.0 arm64, Apple clang 21.0.0 / clang-2100.1.1.101, /usr/bin/clang — note the PATH-default clang on that host is an Android NDK build that cannot link): `clang -dM -E` defines __CHAR_UNSIGNED__ 1 for aarch64-linux-gnu and NOT for arm64-apple-darwin; `_Static_assert((char)-1 < 0)` PASSES (signed) on arm64-apple-darwin, x86_64-linux and x86_64-windows-msvc, FAILS (unsigned) on aarch64-linux-gnu; codegen is a sign-extending byte load (ldrsb) native darwin-arm64 vs a zero-extending one (ldrb) under --target=aarch64-linux-gnu. THE `pe` ROW IS A FORWARD GUARD, not dead config: there is no pe64-arm64-*.format.json today, and if one lands while PE is silent here, Windows-ARM64 silently inherits `default: true` and re-acquires the exact zero-vs-sign-extend miscompile this anchor was opened for, with no diagnostic. Declaring it now states the RULE (“Windows, like Darwin, fixes `char` signedness for every CPU it serves”). ★ THE PREPROCESSOR FACE OF THIS KEY is the `__CHAR_UNSIGNED__` row in `predefinedMacros` below, gated [\"elf\"] so it fires on exactly the leg where `default` is the effective answer. The two declarations must agree; examples/c-subset/char_signedness_macro_coherence is the test that makes a drift between them impossible to leave green. Two corpus examples witness the CODEGEN half per platform, and their arm64 rows are SUPPOSED to differ: examples/c-subset/char_signedness (macho 10 / elf 20) and examples/c-subset/char_value (macho 132 / elf 131) — ★ never flip both arm64 rows of either example together; the elf row is the unsigned-`char` leg and is correct as it stands. x86_64/pe64 use signed `char` on every format they serve and x86_64.target.json therefore OMITS this key entirely (absent ⇒ signed everywhere). Resolved by `TargetSchema::charIsUnsigned(ObjectFormatKind)` — the object format is a REQUIRED argument, there is no no-arg overload, so a caller cannot silently get the processor half alone. Consumed by HIR→MIR: `isSignedIntKind(Char)` makes the one SExt-vs-ZExt decision for the char→int integer promotion, so `(char)0x80 < 0` is FALSE on arm64-elf (zero-extend, uxtb) and TRUE on arm64-macho (sign-extend, sxtb) — correct on both.",
+  "charIsUnsigned": {
+    "default": true,
+    "byObjectFormat": { "macho": false, "pe": false }
+  },
+  "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like charIsUnsigned/aggregateLayout/tls above) because they are per-CPU facts; putting them on the language would force c-subset.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is a LOAD-TIME-equivalent FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): `__aarch64__` and `__ARM_ARCH_ISA_A64` are defined by EVERY AArch64 toolchain (present on both arm64-apple-darwin and aarch64-linux-gnu) so they are UNGATED; `__arm64__` and `__arm64` are APPLE-ONLY (present on arm64-apple-darwin, ABSENT on aarch64-linux-gnu) so they are gated [\"macho\"] — shipping them ungated would leak an Apple spelling onto the ELF leg, and shipping only `__aarch64__` would clear nothing on macOS, whose SDK arch ladders (machine/_types.h, sys/cdefs.h) gate on `__arm64__`. ★ `__CHAR_UNSIGNED__` is gated [\"elf\"] (TF-C75) and is the ONE ROW HERE WHOSE GATE IS AN ABI PROPERTY RATHER THAN A VENDOR SPELLING. It is not an identity macro at all: it is the PREPROCESSOR-VISIBLE FACE of this file's `charIsUnsigned` key above. That key is the SINGLE SOURCE OF TRUTH for bare-`char` signedness — `default: true` (the AArch64 processor's answer) with `byObjectFormat` overrides making macho and pe SIGNED — so this macro must be defined on exactly the leg where the `default` is the effective answer, i.e. elf, and must NOT appear where an override fires. MEASURED BY THIS AGENT 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>` (/usr/bin/clang, Apple clang 21.0.0 / clang-2100.1.1.101): DEFINED as 1 for aarch64-linux-gnu, and NOT defined for arm64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc or x86_64-apple-darwin — so arm64×elf defines it, arm64×macho does not, and x86_64 never does (x86_64.target.json ships no such row and declares no `charIsUnsigned` at all). It could not be expressed before TF-C75 because the split is (architecture × PLATFORM) and this file is per-ARCHITECTURE; the gate now supplies the platform half, exactly as it already does for `__arm64__`. ★ THIS ROW AND THE `charIsUnsigned` KEY ABOVE STATE THE SAME FACT IN TWO NOTATIONS — a preprocessor macro and a codegen switch — SO THEY CAN DRIFT. No engine-side coherence check is possible: any such check would have to name `__CHAR_UNSIGNED__` in engine code, which is a forbidden identity branch. The anti-drift device is therefore a TEST: examples/c-subset/char_signedness_macro_coherence asserts the macro and the emitted char codegen in ONE program with per-leg exit codes, so a disagreement between the two declarations cannot be made green. If you change this row, change `charIsUnsigned` above to match, and expect that example to be the thing that tells you if you did not. SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. DELIBERATELY NOT SHIPPED (unchanged): `__BYTE_ORDER__` (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body); toolchain identity (`__GNUC__`/`__clang__`/`__APPLE_CC__`) which is a COMPILER profile, not a CPU, and is blocked on two absent parser features anyway (leading-position `__attribute__`, and the `inline` function specifier).",
+  "predefinedMacros": [
+    { "name": "__aarch64__",          "kind": "constant", "value": "1" },
+    { "name": "__ARM_ARCH_ISA_A64",   "kind": "constant", "value": "1" },
+    { "name": "__arm64__",            "kind": "constant", "value": "1", "availableObjectFormats": ["macho"] },
+    { "name": "__arm64",              "kind": "constant", "value": "1", "availableObjectFormats": ["macho"] },
+    { "name": "__CHAR_UNSIGNED__",    "kind": "constant", "value": "1", "availableObjectFormats": ["elf"]   }
+  ],
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel — same discipline as x86_64. Substrate's addInst guard rejects opcode 0 loudly.",
@@ -563,6 +576,42 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-INTRINSIC-BSWAP: byte reverse — a structural clone of `clz`/`rbit` above (data-processing 1-source: Rn bits 9:5 = source (wire 0), Rd bits 4:0 = result), differing ONLY in the opcode field (bits 15:10) and, at 64 bits, sf. Base words: 0x5AC00000 (W, sf=0) / 0xDAC00000 (X, sf=1), cross-validated against the shipped `rbit` (opcode 000000 -> 0x5AC00000) and `clz` (opcode 000100 -> 0x5AC01000) rows. THREE width-keyed variants, because arm64 — unlike x86 — encodes all three widths natively, so MIR Bswap never needs the universal-ALU expansion here:  width 16 -> REV16 Wd,Wn, opcode 000001 -> 0x5AC00400 = 1522533376;  width 32 -> REV Wd,Wn, opcode 000010 with sf=0 -> 0x5AC00800 = 1522534400;  width 64 -> REV Xd,Xn, opcode 000011 with sf=1 -> 0xDAC00C00 = 3670019072. ★★ THE 32-BIT SLOT IS **REV W-FORM**, NOT REV32 — a trap worth stating because the mnemonic reads like the right one and the deferred-anchor registry row named it wrongly. AArch64 `REV32` is X-FORM ONLY (0xDAC00800, opcode 000010 with sf=1) and reverses the bytes WITHIN EACH 32-BIT HALF of a 64-bit register — a DIFFERENT operation. A 32-bit byte swap is REV at sf=0. ★ REV16 IS PER-HALFWORD: `REV16 Wd,Wn` reverses the bytes of EACH halfword of the W register independently, so its low 16 bits are the correct swap of the input's low 16 bits REGARDLESS of what sits above them — which is exactly why the width-16 arm is safe against DSS's lazy-narrowing model (a U16 value may carry stale bits 31:16). Its OWN bits 31:16 are then the swapped garbage; that is permitted for a U16 result and the consumer's UXTH narrows it. Do NOT 'fix' this by substituting REV at width 16: REV would reverse all four bytes and put the input's bits 31:24 into the result's low byte — a silent wrong answer.",
+      "mnemonic":      "bswap",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670019072 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522534400 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 1522533376 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
       "mnemonic":      "ldaxr",
       "result":        "value",
@@ -717,6 +766,25 @@
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "memoffset.zero"  }
             ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): DMB ISH — the STANDALONE seq_cst CPU fence MIR AtomicFence (__sync_synchronize) lowers to. 0xD5033BBF (3573758911), MEASURED via clang -c -arch arm64 + otool -t on `__sync_synchronize()` (this machine, 2026-07-30); cross-checked against the acquire-only `__atomic_thread_fence(__ATOMIC_ACQUIRE)` = dmb ishld 0xD50339BF — the two differ in exactly the CRm nibble (ISH=0xB full barrier vs ISHLD=0x9 load-only), so a transposed word FAILS the byte-pin. Zero operands, no result, no register fields — a fixed word (the setcc no-wire shape, minus the result). NOTE the deliberate asymmetry with store_seqcst above: STLR (RCsc) needs NO DMB when fencing a STORE it fuses with, but a store-LESS __sync_synchronize() call site (sqlite3MemoryBarrier) has no STLR to lean on — the standalone fence must be a real DMB ISH.",
+      "mnemonic":      "atomic_fence_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3573758911 }
           }
         ]
       }
@@ -1649,6 +1717,34 @@
       }
     },
     {
+      "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): GOT-address materialization macro -- `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]`. Loads the RUN-TIME address of an undefined/preemptible extern (function OR data) OUT of a GOT slot the FINAL (foreign) linker synthesizes, so a foreign default-PIE link of the emitted relocatable `.o`/`.a` accepts it (an absolute ADRP+ADD page-pair against a symbol that may bind externally is rejected 'when making a shared object'). A DISTINCT MnemonicSlot (the `tlsbase` precedent), NOT a new `lea` variant -- a `lea` `[symbol]` variant would COLLIDE with the existing absolute ADRP+ADD `[symbol]` lea (ambiguous encoder match); MIR->LIR `lowerGlobalAddr`'s value-form arm emits THIS mnemonic explicitly (keyed on the capability-derived `externAddrGotSymbols_` set) for an `&extern` VALUE. word0 = ADRP Xd, sym@GOTPAGE (0x90000000=2415919104): Rd at bits 0..4 via resultSlot; immlo[30:29]+immhi[23:5] left ZERO -- the adr_got_page reloc (R_AARCH64_ADR_GOT_PAGE) patches the GOT-page delta. word1 = LDR Xd, [Xd, #:got_lo12:sym] (0xF9400000=4181721088, the 64-bit unsigned-offset LDR base shared with `load_u`'s width-64 word): Rt at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots -- the LDR reads the ADRP page-base register into itself); imm12[21:10] left ZERO -- the ld64_got_lo12 reloc (R_AARCH64_LD64_GOT_LO12_NC) patches the scaled slot offset. BYTE-STRUCTURE-IDENTICAL to the ADRP+ADD `lea` `[symbol]` variant (same resultSlot/extraResultSlots threading) except the 2nd word is an LDR (a load, not an add) and the two sym.patch wires carry the GOT relocs. DSS never APPLIES these relocs (the exec_reloc_apply kernel arm fail-loud-refuses); the foreign linker resolves the GOT slot.",
+      "mnemonic":      "lea_extern_got",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "fixedWords": [2415919104, 4181721088] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_got_page" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "ld64_got_lo12" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): integer compare writing the NZCV flags, no GPR result. AArch64 `CMP Xn, Xm` is an alias for `SUBS XZR, Xn, Xm` (subtract-and-set-flags discarding the result into the zero register). Fixed word 0xEB00001F = SUBS (sf=1, op=1, S=1) with Rd=31 (XZR) baked in; Rn at bits 5..9, Rm at bits 16..20. Mirrors x86's `cmp` LIR shape (InvalidLirReg result, 2 reg operands) — ML5 lowerICmp + lowerCondBr emit it before the conditional branch. NO resultSlot (the flags are the implicit output). Reuses the Rn/Rm slots already exercised by the add/sub reg-reg variants.",
       "mnemonic":      "cmp",
       "result":        "none",
@@ -2487,6 +2583,10 @@
     { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 },
     { "$comment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the local-exec thread-pointer-offset pair — the imm12 fields of the `lea` [reg, symbol] ADD/ADD macro. S = the SIGNED tpoff the walker bit-casts into symbolVa (arm64 Variant I ⇒ POSITIVE: alignUp(tcbHeaderBytes 16, p_align) + templateOffset). hi12 = (S+A)>>12 via the NEW Aarch64TprelAddHi12 formula — the pair's RANGE GATE ([0, 0xFFFFFF]; a silent wrap would address the wrong per-thread slot, audit LOW-d). lo12 = (S+A)&0xFFF — the SAME Aarch64AddAbsLo12 formula as add_abs_lo12_nc but a DISTINCT tls-flagged KIND row: the walker's CRIT-1 cross-check keys (target ∈ tlsSymbols) XOR (kind.tls) both directions, so reusing kind 3 for a tpoff patch would either reject loud (tls symbol under a non-tls kind) or — with the flag moved — mis-admit VA patches as tpoffs. `tls: true` is what marks the patched value a tpoff, not a VA.",
       "name": "tls-tprel-hi12",    "kind": 5, "formula": "aarch64_tprel_add_hi12", "tls": true },
-    { "name": "tls-tprel-lo12",    "kind": 6, "formula": "aarch64_add_abs_lo12",   "tls": true }
+    { "name": "tls-tprel-lo12",    "kind": 6, "formula": "aarch64_add_abs_lo12",   "tls": true },
+    { "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-page word of the `lea_extern_got` macro (ADRP of `:got:sym`). `aarch64_adr_got_page` is a REAL non-Linear RelocFormulaKind (so the ET_DYN slide-safe classifier does not mis-treat it as a Linear-absolute-in-.text fixup -- D-LK-DYN-TEXT-ABS-RELOC keys formulaKind==Linear) but DSS never APPLIES it: it is emitted ONLY into a foreign-linked relocatable object, and the `applyExecRelocations` kernel arm is an explicit fail-loud REFUSAL. Non-Linear => widthBytes auto-defaults to 4, pcRelative/addendBias must be absent (the ADRP is PC-relative BY CONSTRUCTION, encoded intrinsically). kind 7 matches both elf64-aarch64-linux{,-staticlib}.format.json's R_AARCH64_ADR_GOT_PAGE (nativeId 311).",
+      "name": "adr_got_page",     "kind": 7, "formula": "aarch64_adr_got_page" },
+    { "$comment": "D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-lo12 word of the `lea_extern_got` macro (LDR of `[x,:got_lo12:sym]`). Same foreign-linked-only / fail-loud-in-kernel discipline as adr_got_page. kind 8 matches both format siblings' R_AARCH64_LD64_GOT_LO12_NC (nativeId 312).",
+      "name": "ld64_got_lo12",    "kind": 8, "formula": "aarch64_ld64_got_lo12" }
   ]
 }

@@ -10,6 +10,7 @@
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
+#include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
 #include "mir/merge/synth_seh_funclets.hpp"  // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
@@ -99,6 +100,20 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
 [[nodiscard]] DSS_EXPORT LongDoubleFormat
 effectiveLongDoubleFormat(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;
+
+// ★ NO `effectiveCharIsUnsigned` HERE — and its absence is the design, not an
+// omission (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, TF-C75). The two resolvers
+// above exist because their axes have contributions from BOTH schemas that must
+// be reconciled. Bare-`char` signedness has exactly ONE contributor: the TARGET
+// declares the whole (processor × platform) fact in its single `charIsUnsigned`
+// key (`{"default": …, "byObjectFormat": {…}}`), and resolution is
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)` — a method on the owner, with
+// the format KIND as a REQUIRED argument so no caller can silently take the
+// processor half alone. A wrapper here would be a second place the fact is
+// "about", which is precisely the duplication this reshape removed. The result
+// still lands in `MirLoweringConfig.charIsUnsigned`, whose sole reader is
+// `isSignedIntKind(TypeKind::Char)` — the single SExt-vs-ZExt decision for the
+// char→int promotion.
 
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
@@ -270,6 +285,14 @@ struct DSS_EXPORT CuMirModule {
     // stdout) materializes its address (got-indirect → lea-of-slot + deref).
     // nullopt iff the format declared none (data imports fail loud at link).
     std::optional<DataImportBinding> dataImportBinding;
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the active object
+    // format's extern-ADDRESS materialization binding (`got`), captured
+    // here for the SAME reason as `dataImportBinding` — the LOWER half's
+    // MIR→LIR GlobalAddr value-form arm routes an `&extern` VALUE through
+    // the arm64 GOT-address macro from it. nullopt iff the format declared
+    // none (the ordinary lea — foreign-PIE-safe only for a DSS exec /
+    // x86_64).
+    std::optional<ExternAddrBinding> externAddrBinding;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the active object format's
     // thread-local access block, captured here for the SAME reason as
     // `dataImportBinding` — the LOWER half's MIR→LIR GlobalAddr lowering
@@ -308,6 +331,24 @@ struct DSS_EXPORT CuMirModule {
     // LOWER half's `synthesizeThreadsShim` can C-mangle its native helper-import names for
     // the format (macho prepends `_`) — the SAME applyCMangling the FFI ingest uses.
     ObjectFormatKind objectFormat = ObjectFormatKind::Unknown;
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's va_list
+    // lowering strategy, captured here for the SAME reason as `librarySynthesis`/
+    // `objectFormat` — the LOWER half sees only this struct, and `synthesizeStdioShim`'s
+    // variadic-forwarding arm (a printf-family shim forwards its caller's va_list into the
+    // UCRT `__stdio_common_v*` core) needs the target's va_list model to pick the right MIR
+    // leaf (VaHomeArgAreaAddr on HomogeneousPointer/Win64) or fail loud (SysVRegisterSave —
+    // no stdio-synthesize descriptor exists on that model yet).
+    //
+    // ★ OPTIONAL, DEFAULTED EMPTY — deliberately, and for the same reason its two siblings
+    // above keep "absent" representable (`librarySynthesis` is an optional; `objectFormat`
+    // defaults to an `Unknown` SENTINEL, not to a real format). A default of any REAL
+    // strategy would make "the resolved CC declares no `vaListLayout`" indistinguishable
+    // downstream from "the resolved CC declares SysVRegisterSave": a config gap would then
+    // arrive at the synth pass wearing a legitimate strategy's face and be refused (or, one
+    // day, ACCEPTED) for the wrong reason, with a diagnostic pointing at the wrong end of
+    // the pipeline. `synthesizeStdioShim` fails loud on nullopt. Consulted only when a
+    // stdio recipe actually appears — an empty recipe map is a clean no-op either way.
+    std::optional<VaListStrategy> vaListStrategy;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -380,6 +421,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                      // format's extern-ADDRESS binding (nullopt = this leg
+                      // has no GOT-address model — an `&extern` value takes
+                      // the ordinary lea).
+                      std::optional<ExternAddrBinding> externAddrBinding,
                       // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
                       // thread-local access block (nullopt = this leg has
                       // no TLS machinery — MIR→LIR fails loud on a
@@ -398,12 +444,16 @@ lowerMergedToAssembly(MergedMirModule&    merged,
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's
 // cross-CU merge (LK11a resolution + LK11b byte emission). Returns true iff the
 // image is `ok()`, no link-tier error fired, and `writeImage` committed bytes.
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
+// STACK-DEPTH); it is forwarded verbatim to `linker::link`, which gates it
+// against the format's DECLARED capability. Defaults to empty.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWrite(std::span<AssembledModule const> modules,
              TargetSchema const&              target,
              ObjectFormatSchema const&        format,
              std::filesystem::path const&     outPath,
-             DiagnosticReporter&              reporter);
+             DiagnosticReporter&              reporter,
+             ImageRequest const&              request = {});
 
 // -- c165 (D-LK-STATIC-LINK): STATIC linking against `ar` archives --------------
 //
@@ -450,6 +500,31 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
 
+// The members extracted from one-or-more input static archives (parallel):
+// `modules[i]` is a mergeable relocatable object, `names[i]` its `ar` file name.
+struct ExtractedArchiveMembers {
+    std::vector<AssembledModule> modules;
+    std::vector<std::string>     names;   // parallel to `modules`
+};
+
+// Extract EVERY member of each input static `ar` archive (whole-archive), each
+// parsed into a mergeable `AssembledModule` via the same per-format reader the
+// lazy pull uses. Unlike `pullStaticArchiveMembers` (which pulls only the
+// referenced members for an exe/final LINK), this carries ALL members -- a
+// static LIBRARY is a package: a DOWNSTREAM link must be able to pull any of
+// them, so dropping an unreferenced member would silently ship an incomplete
+// library. This is how a merged/"fat" static library bundles the input archives
+// it was handed (D-FF1-STATICLIB-FAT-ARCHIVE): the driver appends these to its
+// own CU-derived members before `linkAndWriteStaticArchive`. Returns `nullopt`
+// (fail loud via `reporter`) on any file-open / archive-parse / member-read
+// failure -- never a silent member omission. An empty `archivePaths` yields an
+// empty result (a valid no-op).
+[[nodiscard]] DSS_EXPORT std::optional<ExtractedArchiveMembers>
+extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
+                            TargetSchema const&                    target,
+                            ObjectFormatSchema const&              format,
+                            DiagnosticReporter&                    reporter);
+
 // Link `clientModule` against zero-or-more static `ar` archives, then write the
 // image to `outPath`. When `staticArchives` is empty this is exactly
 // `linkAndWrite({clientModule})` (byte-identical to the pre-c165 path). Otherwise
@@ -464,7 +539,8 @@ linkAndWriteWithStaticArchives(AssembledModule                        clientModu
                                TargetSchema const&                    target,
                                ObjectFormatSchema const&              format,
                                std::filesystem::path const&           outPath,
-                               DiagnosticReporter&                    reporter);
+                               DiagnosticReporter&                    reporter,
+                               ImageRequest const&                    request = {});
 
 // c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-
 // LINK): link N assembled CUs into N RELOCATABLE object members and bundle them
@@ -489,12 +565,20 @@ linkAndWriteWithStaticArchives(AssembledModule                        clientModu
 // `--emit staticlib` flag routing here + the `.a`/`.lib` extension policy +
 // member naming) is the named follow-up D-FF1-AR-STATICLIB-DRIVER-WIRING; this
 // is the shipped composition it will call.
+//
+// `request` (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) is forwarded to EVERY member
+// link so the capability gate fires here too. No relocatable/archive format
+// declares a stack-reserve capability -- a static archive carries no image
+// headers at all -- so a request routed here is REFUSED. That is the point:
+// accepting the parameter and ignoring it is what would let the request vanish
+// on a `staticlib` target.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                           std::span<std::string const>     memberNames,
                           TargetSchema const&              target,
                           ObjectFormatSchema const&        format,
                           std::filesystem::path const&     outPath,
-                          DiagnosticReporter&              reporter);
+                          DiagnosticReporter&              reporter,
+                          ImageRequest const&              request = {});
 
 } // namespace dss

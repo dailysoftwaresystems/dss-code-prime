@@ -4,6 +4,7 @@
 
 #include "core/types/grammar_schema.hpp"
 #include "lsp/schema_cache.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -11,7 +12,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -140,18 +140,29 @@ TEST(SchemaCache, ShippedModeWithNoDirectoryReportsShippedDirNotFound) {
 // `src/dss-config/sources/` with zero `*.lang.json` files.
 TEST(SchemaCache, ShippedModeWithEmptyDirectoryReportsShippedDirEmpty) {
     namespace fs = std::filesystem;
-    const auto tmp = fs::temp_directory_path() / "dss_schema_cache_empty_dir";
-    std::error_code ec;
-    fs::remove_all(tmp, ec);   // clean any prior run
-    fs::create_directories(tmp / "src" / "dss-config" / "sources");
-    SchemaCache c{std::nullopt, tmp};
+    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the root came from a CONSTANT name
+    // under `temp_directory_path()`, and the old "clean any prior run"
+    // `remove_all` existed precisely BECAUSE that path could be stale. Under two
+    // concurrent instances that line was the weapon: one instance wiped the tree
+    // the other had just built, so the walk reported ShippedDirNotFound (kind 3)
+    // instead of ShippedDirEmpty (kind 4), or `create_directories` itself blew up
+    // with EINVAL mid-rmdir. Both MEASURED. `ScratchDir` claims a per-instance
+    // slot atomically (SINGULAR `create_directory`; the pid is only a seed), so
+    // the "prior run" wipe is unnecessary by construction and is gone.
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "schema-cache-empty"};
+    // Throwing overload on purpose: a scratch tree we could not build is a setup
+    // failure the suite must see, not something to paper over.
+    fs::create_directories(scratch.path() / "src" / "dss-config" / "sources");
+    SchemaCache c{std::nullopt, scratch.path()};
     auto r = c.resolveByExtension(".toy");
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::ShippedDirEmpty);
     EXPECT_NE(r.error().detail.find("contains no"), std::string::npos)
         << "error must explain the directory is empty, got: "
         << r.error().detail;
-    fs::remove_all(tmp, ec);   // best-effort cleanup
+    // `c` is destroyed before `scratch` (reverse declaration order), so the
+    // dtor's `remove_all` runs after the cache has released the directory.
 }
 
 TEST(SchemaCache, ConcurrentResolveYieldsSingleSharedPointer) {

@@ -178,7 +178,13 @@ decodeStringLiteralBody(std::string_view body, EscapeDecodeOutcome* outcome = nu
 // Decode a DOUBLED-DELIMITER string body (SQL `'…''…'`): a doubled `delimiter`
 // is one literal delimiter byte; every other byte passes through. The coalesced
 // body the tokenizer captured contains `''` pairs for embedded quotes and no
-// lone delimiter (the closer was consumed on mode-pop), so this never fails.
+// lone delimiter — the body's span STOPS before the closing delimiter — so this
+// never fails. (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN changed only who OWNS
+// those closing bytes: they used to belong to no token at all, and now form a
+// `StringEnd` token FOLLOWING the body. The body's own span and text are
+// byte-identical either way, which is exactly why this decoder needed no
+// change. The prose here previously said "the closer was consumed on mode-pop";
+// the invariant held, the explanation had gone stale.)
 [[nodiscard]] inline std::string
 decodeDoubledDelimiterBody(std::string_view body, char delimiter) {
     std::string out;

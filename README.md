@@ -31,9 +31,9 @@ The result is a **hermetic, auditable toolchain**. DSS writes its own machine co
 
 DSS Code Prime already compiles and runs **real, unmodified, production software**:
 
-- **SQLite** — the complete ~270,000-line amalgamation — compiles and runs as a working database on **four OS × ISA targets**: Linux (x86_64 + arm64), Windows (x86_64), and macOS (arm64), with **zero special flags**. Verified end-to-end by the in-repo [`real-examples/c/sqlite`](real-examples/c/sqlite) harness — `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result.
+- **SQLite — compiled from the complete upstream source tree, and passing SQLite's own test suite.** Not just the amalgamation: **189 translation units** of unmodified upstream source go through a single `--project` manifest to build SQLite's own `testfixture`, which then runs **SQLite's own unit corpus**. At the `full` tier that is **~1.06 million assertions per run**: Linux x86_64 **7 failures / 1,061,830**, Linux arm64 **12 / 1,060,828**, Windows x86_64 **0 / 979,736**. Every residual failure is a known **non-DSS confound backed by a matched control** — a GCC-built reference `testfixture`, containing no DSS-compiled code, fails it identically on the same machine. **Nothing in the SQLite tree is patched and no test file is excluded to get there.** The amalgamation is compiled too, on **four OS × ISA targets** — Linux (x86_64 + arm64), Windows (x86_64), macOS (arm64) — with **zero special flags**: `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result.
 - **Cross-checked against GCC where it counts.** DSS's **ABI** — struct and bit-field layout — is verified byte-for-byte against GCC, Clang, and MSVC, and its **preprocessor** output byte-for-byte against `gcc -E`. It runs SQLite to correct results on every target, and continuously audits itself for **silent miscompiles** — the one failure class this project treats as unacceptable.
-- **600+ internal tests, 100% green**, backed by a test corpus nearly as large as the engine itself (~143,000 lines).
+- **770+ internal tests, 100% green** on every leg (Windows x86_64, Linux x86_64, Linux arm64), backed by a test corpus nearly as large as the engine itself (~143,000 lines).
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
 
 | Capability | Status |
@@ -41,10 +41,10 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
 | **Source languages** | `c-subset` (→ full C23, in progress), `tsql-subset`, `toy` — each a `.lang.json` |
 | **CPU targets** | `x86_64`, `arm64` — shipped end-to-end (encoder + round-trip oracle) |
 | **Object formats** | ELF, PE, Mach-O — shipped (executables + dynamic linking); WASM, SPIR-V — skeletons |
-| **Real-world corpus** | SQLite — compiles **and runs** on four OS × ISA targets, zero flags |
+| **Real-world corpus** | [`real-examples/`](real-examples/) — the registry of **known real-world repositories DSS compiles from unmodified upstream source and then runs their own test suites against**. Today: [`c/sqlite`](real-examples/c/sqlite) — full source (189 TUs), ~1.06 M unit assertions per `full`-tier run. Each entry ships `build-and-test.sh` + `build-and-test.ps1`, which clone upstream, build, run the project's own suite and classify every failure against a reference build |
 | **Codegen fidelity** | ABI byte-identical to GCC / Clang / MSVC; preprocessor byte-identical to `gcc -E`; self-audited for silent miscompiles |
 
-> **Honest status.** DSS is in active development toward full C23 conformance — today it clears ~90% of an empirical, end-to-end C-feature battery (compiled *and executed*, not just parsed). It compiles and *runs* SQLite now; passing SQLite's own upstream test suite is a tracked next milestone. See [`.plans/`](.plans/) for the live, per-cycle status.
+> **Honest status.** DSS is in active development toward full C23 conformance — today it clears ~90% of an empirical, end-to-end C-feature battery (compiled *and executed*, not just parsed). It compiles SQLite from unmodified upstream source and **passes SQLite's own unit suite at the `full` tier** on Linux (x86_64 + arm64) and Windows (x86_64) — with every residual failure identified as a non-DSS confound rather than waved through by excluding a test. See [`.plans/`](.plans/) for the live, per-cycle status.
 
 ## How it works
 

@@ -23,16 +23,31 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "link/format/elf.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
+// TF-C52 (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT): the ELF-writer GOT pin drives a
+// hand-built MIR through the REAL back-half (the same stage order as
+// compile_pipeline.cpp's lowerMirModuleToAssembly) so the emitted `.o`'s GOT
+// reloc nativeIds are asserted — mirrors test_asm_arm64.cpp's runFullPipeline.
+#include "lir/lir_2addr_legalize.hpp"
+#include "lir/lir_callconv.hpp"
+#include "lir/lir_liveness.hpp"
+#include "lir/lir_regalloc.hpp"
+#include "lir/lir_rewrite.hpp"
+#include "lir/lowering/mir_to_lir.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_node.hpp"
+#include "mir/mir_opcode.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -225,7 +240,14 @@ TEST(ElfWriter, SectionHeaderTableHasSevenEntriesNullThenTextThenRelocThenNoteLa
 
 // ── .symtab local-then-global ordering ──────────────────────────
 
-TEST(ElfWriter, SymtabFirstNonLocalEqualsTwoBecauseSectionSymbolIsLocal) {
+TEST(ElfWriter, SymtabLocalDefinedFunctionLandsBeforeFirstNonLocal) {
+    // A defined function with NO `ModuleSymbol` row (the substrate /
+    // `makeTrivialModule` shape) is not externally visible, so `definedBinding`
+    // returns Local: it emits STB_LOCAL and lands in the LOCAL region, and
+    // `.symtab.sh_info` (the first-non-local index) counts it — UNDEF(0) +
+    // STT_SECTION(1) + this local func(2) = 3. RED-ON-DISABLE vs TF-C54
+    // (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION): the pre-fix
+    // writer emitted it STB_GLOBAL at index 2 with sh_info=2.
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 7);
     DiagnosticReporter rep;
@@ -233,11 +255,17 @@ TEST(ElfWriter, SymtabFirstNonLocalEqualsTwoBecauseSectionSymbolIsLocal) {
     ASSERT_EQ(rep.errorCount(), 0u);
 
     std::uint64_t const shoff = readU64LE(bytes, 40);
-    // Section 3 is .symtab. sh_info @ offset 44 within Shdr.
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    // The nameless-substrate function is Local: STB_LOCAL|STT_FUNC = 0x02, at
+    // index 2 (right after UNDEF + the .text STT_SECTION local).
+    EXPECT_EQ(bytes[symtabOff + 2 * 24 + 4], 0x02u)
+        << "a defined function with no ModuleSymbol row emits STB_LOCAL (TF-C54)";
+
+    // Section 3 is .symtab. sh_info @ offset 44 within Shdr = first non-LOCAL.
     std::uint64_t const symtabShdr = shoff + 3 * 64;
-    EXPECT_EQ(readU32LE(bytes, symtabShdr + 44), 2u)
-        << "first non-LOCAL symbol must be at index 2 (after STN_UNDEF + "
-           "STT_SECTION local for .text)";
+    EXPECT_EQ(readU32LE(bytes, symtabShdr + 44), 3u)
+        << "first non-LOCAL index = UNDEF + STT_SECTION + the now-Local defined "
+           "function = 3 (was 2 pre-TF-C54 when the func was hardcoded STB_GLOBAL)";
     // sh_link points at .strtab (index 4).
     EXPECT_EQ(readU32LE(bytes, symtabShdr + 40), 4u);
     // sh_entsize = 24 (Elf64_Sym).
@@ -277,64 +305,102 @@ TEST(ElfWriter, FunctionSymbolStValueMatchesTextOffset) {
     EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 1u);
 }
 
-// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .o symtab ──
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54) ──
+// ── the .o symtab couples NAME and BINDING, local-before-global ──
 
-TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+TEST(ElfWriter, ObjectSymtabCouplesNameAndBindingLocalStaticBeforeGlobalWeak) {
+    // THE red-on-disable pin for TF-C54. One module with every defined-symbol
+    // form the coupling must distinguish:
+    //   * fn A  (SymbolId 10) — Global   → real name `public_fn`, STB_GLOBAL,
+    //                                       GLOBAL region (after sh_info);
+    //   * fn B  (SymbolId 11) — static   → internal `sym_11`,     STB_LOCAL,
+    //                           (Local)    LOCAL region (before sh_info);
+    //   * fn C  (SymbolId 12) — Weak     → real name `weak_fn`,   STB_WEAK,
+    //                                       GLOBAL region;
+    //   * data D (SymbolId 13) — static  → internal `sym_13`,     STB_LOCAL.
+    //                            (Local)
+    // The emitted NAME (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) and the emitted BINDING
+    // are driven by the SAME predicate (`definedName`/`definedBinding`), so a
+    // `sym_<id>` name is ALWAYS STB_LOCAL and a real name keeps its real
+    // binding. Reverting `definedBinding` to the pre-TF-C54 hardcoded STB_GLOBAL
+    // makes the static fn/data emit 0x12/0x11 in the GLOBAL region and sh_info
+    // collapse to 2 → this pin goes red (the exact FOREIGN multi-TU `sym_<id>`
+    // multiple-definition collision this cycle fixes).
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
-    // Two defined functions covering both externally-visible forms:
-    //   * fn A (SymbolId 10) — externally-visible (Global) → REAL name.
-    //   * fn B (SymbolId 11) — static (Local) → stays internal `sym_11`.
-    // (The IMPORT side — naming an undefined extern + its PLT32 reloc — is
-    // covered by ObjectExternCallEmitsUndefImportNameAndPlt32Reloc below.)
     AssembledModule mod;
-    mod.expectedFuncCount = 2;
-
-    AssembledFunction a;
-    a.symbol = SymbolId{10};
-    a.bytes  = {0xC3};
-    mod.functions.push_back(std::move(a));
-
-    AssembledFunction b;
-    b.symbol = SymbolId{11};
-    b.bytes  = {0xC3};
-    mod.functions.push_back(std::move(b));
+    mod.expectedFuncCount = 3;
+    auto addFn = [&](std::uint32_t id) {
+        AssembledFunction f;
+        f.symbol = SymbolId{id};
+        f.bytes  = {0xC3};
+        mod.functions.push_back(std::move(f));
+    };
+    addFn(10);   // A — global
+    addFn(11);   // B — static (Local)
+    addFn(12);   // C — weak
+    AssembledData d;
+    d.symbol    = SymbolId{13};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {0, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
 
     // The name/binding table the compile pipeline populates (LK11a), carrying
     // the already-mangled on-binary name (identity on ELF).
     mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "public_fn",
-                                       SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+                                       SymbolBinding::Global, SymbolVisibility::Default});
     mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "static_fn",
-                                       SymbolBinding::Local,
-                                       SymbolVisibility::Default});
+                                       SymbolBinding::Local, SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{12}, "weak_fn",
+                                       SymbolBinding::Weak, SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{13}, "static_data",
+                                       SymbolBinding::Local, SymbolVisibility::Default});
 
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    std::uint64_t const shoff     = readU64LE(bytes, 40);
-    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
-    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    // A `.data` section is present, so locate `.symtab`/`.strtab` by name.
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint32_t const shInfo    = readU32LE(bytes, shoff + symtabIdx * 64 + 44);
 
-    // Symtab order: 0=UNDEF, 1=STT_SECTION, 2=fnA, 3=fnB.
     auto nameAt = [&](std::uint64_t i) {
         return readStrtabName(bytes, strtabOff,
                               readU32LE(bytes, symtabOff + i * 24 + 0));
     };
     auto infoAt = [&](std::uint64_t i) { return bytes[symtabOff + i * 24 + 4]; };
 
-    // EXPORT — externally-visible fn A carries its real C name (STB_GLOBAL|STT_FUNC).
-    EXPECT_EQ(nameAt(2), "public_fn")
-        << "externally-visible defined function must carry its real name";
-    EXPECT_EQ(infoAt(2), 0x12u);   // (STB_GLOBAL<<4)|STT_FUNC
+    // Order: 0=UNDEF, 1=STT_SECTION(.text) | LOCAL pass: 2=static fn B,
+    // 3=static data D | [sh_info=4] | GLOBAL pass: 4=fn A, 5=weak fn C.
+    EXPECT_EQ(nameAt(2), "sym_11")
+        << "a static (Local) function stays internal `sym_<id>`";
+    EXPECT_EQ(infoAt(2), 0x02u)  // (STB_LOCAL<<4)|STT_FUNC — THE FIX
+        << "static fn emits STB_LOCAL, not the pre-fix STB_GLOBAL";
+    EXPECT_EQ(nameAt(3), "sym_13")
+        << "a static (Local) data item stays internal `sym_<id>`";
+    EXPECT_EQ(infoAt(3), 0x01u)  // (STB_LOCAL<<4)|STT_OBJECT
+        << "static data emits STB_LOCAL|STT_OBJECT";
 
-    // CARVE-OUT — static fn B stays internal `sym_11` (isExternallyVisible=false).
-    EXPECT_EQ(nameAt(3), "sym_11")
-        << "a static (Local-binding) function must stay internal, not leak its "
-           "real name into the object symtab";
-    EXPECT_EQ(infoAt(3), 0x12u);   // still STB_GLOBAL|STT_FUNC (name-only carve-out)
+    EXPECT_EQ(shInfo, 4u)
+        << "sh_info = first non-local: UNDEF + STT_SECTION + local fn + local "
+           "data = 4 (every STB_LOCAL precedes the first non-local, ELF ABI)";
+
+    EXPECT_EQ(nameAt(4), "public_fn")
+        << "externally-visible fn keeps its real name in the GLOBAL region";
+    EXPECT_EQ(infoAt(4), 0x12u)  // (STB_GLOBAL<<4)|STT_FUNC — unchanged
+        << "global fn stays STB_GLOBAL|STT_FUNC";
+    EXPECT_EQ(nameAt(5), "weak_fn")
+        << "a weak def keeps its real name";
+    EXPECT_EQ(infoAt(5), 0x22u)  // (STB_WEAK<<4)|STT_FUNC
+        << "weak fn emits STB_WEAK|STT_FUNC (native ELF weak)";
 }
 
 // ── D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined extern + PLT32 ──
@@ -391,6 +457,219 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
         << "reloc must target the undefined extern symbol";
     std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
     EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
+}
+
+// ── D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH: arm64 undefined extern + CALL26 (no PLT variant) ──
+
+TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64) {
+    // The arm64 relocatable format now declares externCallDispatch=direct-plt — the
+    // sibling of x86_64's ObjectExternCallEmitsUndefImportNameAndPlt32Reloc — so an
+    // arm64 ET_REL object CAN carry an extern import (`bl printf` in a `.o` the FINAL
+    // linker resolves). The extern must appear as an SHN_UNDEF symbol with its real
+    // name; its BL call reloc must be R_AARCH64_CALL26 (283) — NOT a PLT-variant.
+    // AArch64 has no distinct PLT26 reloc: CALL26 against an undefined symbol is
+    // exactly what gcc/clang emit and the foreign linker inserts the veneer/PLT
+    // transparently — so the CALL26 row carries NO pltNativeId, and the writer emits
+    // its plain nativeId 283 (the pltNativeId==0 branch of the reloc-type selection).
+    // This locks in the "no pltNativeId is correct on arm64" decision against drift.
+    // RED-ON-DISABLE: remove externCallDispatch from elf64-aarch64-linux.format.json
+    // -> elf::encode rejects the ET_REL extern (K_FormatLacksImportSupport, errors>0).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0x00, 0x00, 0x00, 0x94};   // BL #0 (0x94000000 LE) → extern
+    caller.relocations.push_back(Relocation{/*offset=*/0u, /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},  // call26
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "caller",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "libc_fn";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "arm64 ET_REL with externCallDispatch must "
+                                       "accept an extern import";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.text");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << "arm64 .o with an extern call must emit .rela.text";
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const relaOff   = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+
+    // The .rela.text reloc: r_offset = 0 (the BL word), type = R_AARCH64_CALL26 (283),
+    // addend = 0 (arm64 branch is instruction-relative — no baked bias, unlike x86_64
+    // rel32's -4). Type 283, NOT a PLT variant, is the crux.
+    EXPECT_EQ(readU64LE(bytes, relaOff + 0), 0u) << "reloc r_offset = the BL word";
+    std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 283u)
+        << "arm64 extern-call reloc must be R_AARCH64_CALL26 (283), not a PLT variant "
+           "(AArch64 has none — the CALL26 row carries no pltNativeId)";
+    std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
+    EXPECT_EQ(addend, 0) << "arm64 CALL26 addend = 0 (no baked bias)";
+
+    // That reloc names the SHN_UNDEF extern carrying its real import name.
+    std::uint32_t const relSymIdx = static_cast<std::uint32_t>(rInfo >> 32);
+    std::uint32_t const extStName = readU32LE(bytes, symtabOff + relSymIdx * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, extStName), "libc_fn")
+        << "undefined extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 0u)   // st_shndx
+        << "extern must be SHN_UNDEF";
+}
+
+// ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the emitted-.o GOT-reloc pin ──
+//
+// The SIBLING of the CALL26 test above, for the GOT-ADDRESS case: taking the
+// ADDRESS of an undefined extern as a live VALUE (`return &ext;`) under the
+// `externAddrBinding=got` arm64 relocatable format must, in the emitted ELF
+// `.o`, carry R_AARCH64_ADR_GOT_PAGE (nativeId 311) on the adrp word +
+// R_AARCH64_LD64_GOT_LO12_NC (312) on the ldr word against the SHN_UNDEF
+// extern (real name, addend 0), and NOT the absolute R_AARCH64_ADR_PREL_PG_HI21
+// (275) / ADD_ABS_LO12_NC (277). This is the ONLY pin that drives the GOT
+// materialization through the ELF WRITER — the LIR pin covers routing, the
+// schema pins cover kind-coherence, but a wire→nativeId regression in the
+// emitted object flips only THIS test (otherwise only the qemu witness would
+// catch it). Drives a hand-built MIR through the REAL back-half (MIR→LIR under
+// the got format → regalloc → rewrite → 2-addr → callconv → assemble), the
+// exact stage order of compile_pipeline.cpp's lowerMirModuleToAssembly, then
+// elf::encode.
+// RED-ON-DISABLE: revert the externAddrGotSymbols_ routing arm in
+// mir_to_lir.cpp (or drop externAddrBinding from the format) → the plain
+// absolute ADRP+ADD lea is emitted → the .o carries 275/277, not 311/312 →
+// all four EXPECTs flip.
+TEST(ElfWriter, GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->externAddrBinding().has_value())
+        << "the arm64 relocatable format must declare externAddrBinding=got";
+
+    // MIR: `void* f(void){ return &ext; }` — GlobalAddr(ext) used as a VALUE
+    // (its sole use is the Return → not a callee, not a foldable load → the
+    // value-form GOT arm is reached).
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const sig  = interner.fnSig(std::span<TypeId const>{}, ptrT,
+                                       CallConv::CcAAPCS64);
+    SymbolId const kCaller{10};
+    SymbolId const kExtern{20};
+    MirBuilder mb;
+    mb.addFunction(sig, kCaller);
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const ga = mb.addGlobalAddr(kExtern, ptrT);
+    mb.addReturn(ga);
+    Mir mir = std::move(mb).finish();
+
+    ExternImport ext;
+    ext.symbol      = kExtern;
+    ext.mangledName = "got_extern_fn";
+    ext.libraryPath = "libc.so.6";
+    ext.isData      = false;  // a FUNCTION extern whose ADDRESS is taken
+
+    DiagnosticReporter rep;
+    std::vector<ExternImport> externs{ext};
+    // FULL back-half WITH the got extern-address binding threaded in — the same
+    // stage order as compile_pipeline.cpp's lowerMirModuleToAssembly.
+    auto lir = lowerToLir(mir, **target, interner, rep, externs,
+                          ExternCallDispatch::DirectPlt,
+                          /*dataImportBinding=*/std::nullopt,
+                          /*tlsAccess=*/std::nullopt,
+                          /*sehScopes=*/{},
+                          /*wideFloatSoftcallLibrary=*/std::nullopt,
+                          /*externAddrBinding=*/ExternAddrBinding::Got);
+    ASSERT_TRUE(lir.ok);
+    auto const liveness = analyzeLiveness(lir.lir);
+    auto const alloc = allocateRegisters(lir.lir, **target, liveness, 0, rep);
+    ASSERT_TRUE(alloc.ok());
+    auto rewritten = rewriteWithAllocation(lir.lir, **target, alloc, rep);
+    ASSERT_TRUE(rewritten.ok);
+    auto legal = legalizeTwoAddress(rewritten.lir, **target, rep);
+    ASSERT_TRUE(legal.ok());
+    auto cc = materializeCallingConvention(legal.lir, **target, alloc, rep);
+    ASSERT_TRUE(cc.ok());
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    auto assembled = assemble(cc.lir, **target, lirToMir, rep);
+    ASSERT_TRUE(assembled.ok());
+    // Complete the module the way the pipeline's LK11a stage would (`assemble`
+    // sets functions + expectedFuncCount; the defined-symbol table + the extern
+    // imports are populated downstream — supplied here, mirroring the sibling).
+    assembled.symbols.push_back(ModuleSymbol{kCaller, "f",
+                                             SymbolBinding::Global,
+                                             SymbolVisibility::Default});
+    assembled.externImports.push_back(ext);
+
+    auto bytes = elf::encode(assembled, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "arm64 ET_REL GOT-address emit must be clean";
+
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.text");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << "an arm64 .o with a GOT-address extern must emit .rela.text";
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const relaOff   = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const relaSize  = readU64LE(bytes, shoff + relaIdx * 64 + 32);
+    std::size_t   const relaCount = static_cast<std::size_t>(relaSize / 24);
+
+    // Scan .rela.text for the GOT pair (311/312) + assert the absolute
+    // page-pair (275/277) is ABSENT for this symbol.
+    bool sawGotPage = false, sawGotLo12 = false, sawAbsPage = false, sawAbsLo12 = false;
+    std::uint64_t gotPageOff = 0, gotLo12Off = 0;
+    std::uint32_t gotPageSym = 0, gotLo12Sym = 0;
+    std::int64_t  gotPageAddend = -1, gotLo12Addend = -1;
+    for (std::size_t i = 0; i < relaCount; ++i) {
+        std::uint64_t const off  = readU64LE(bytes, relaOff + i * 24 + 0);
+        std::uint64_t const info = readU64LE(bytes, relaOff + i * 24 + 8);
+        std::int64_t const  add  = static_cast<std::int64_t>(readU64LE(bytes, relaOff + i * 24 + 16));
+        std::uint32_t const type = static_cast<std::uint32_t>(info);
+        std::uint32_t const sym  = static_cast<std::uint32_t>(info >> 32);
+        if (type == 311u) { sawGotPage = true; gotPageOff = off; gotPageSym = sym; gotPageAddend = add; }
+        if (type == 312u) { sawGotLo12 = true; gotLo12Off = off; gotLo12Sym = sym; gotLo12Addend = add; }
+        if (type == 275u) sawAbsPage = true;
+        if (type == 277u) sawAbsLo12 = true;
+    }
+    EXPECT_TRUE(sawGotPage)
+        << "the adrp word must emit R_AARCH64_ADR_GOT_PAGE (nativeId 311).";
+    EXPECT_TRUE(sawGotLo12)
+        << "the ldr word must emit R_AARCH64_LD64_GOT_LO12_NC (nativeId 312).";
+    EXPECT_FALSE(sawAbsPage)
+        << "NO R_AARCH64_ADR_PREL_PG_HI21 (275) — a foreign default-PIE link "
+           "rejects the absolute page-pair against a preemptible extern.";
+    EXPECT_FALSE(sawAbsLo12)
+        << "NO R_AARCH64_ADD_ABS_LO12_NC (277) for the GOT-address extern.";
+    EXPECT_EQ(gotLo12Off, gotPageOff + 4)
+        << "the ldr (312) sits exactly one word after the adrp (311).";
+    EXPECT_EQ(gotPageAddend, 0) << "GOT-page addend = 0";
+    EXPECT_EQ(gotLo12Addend, 0) << "GOT-lo12 addend = 0";
+    EXPECT_EQ(gotPageSym, gotLo12Sym) << "both GOT relocs name the SAME symbol";
+
+    // Both relocs name the SHN_UNDEF extern carrying its real import name.
+    std::uint32_t const stName = readU32LE(bytes, symtabOff + gotPageSym * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, stName), "got_extern_fn")
+        << "the address-taken extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + gotPageSym * 24 + 6), 0u)   // st_shndx
+        << "the address-taken extern must be SHN_UNDEF";
 }
 
 // ── D-LK-OBJECT-DATA-EXTERN-RELOCATABLE: data extern → PC32, not PLT32 ──

@@ -53,4 +53,26 @@ std::optional<fs::path> resolveSystemDescriptor(
     return findInDirs(descriptorName, systemDirs);
 }
 
+AngleIncludeResolution resolveAngleInclude(
+    std::string_view          filename,
+    std::span<fs::path const> systemDirs,
+    std::span<fs::path const> includeDirs) {
+    // 1. Descriptor FIRST — the DSS neutral `<stem>.json` model. Existence of the
+    //    descriptor FILE is the gate here; per-format availability is the caller's
+    //    verdict (so an existing-but-unavailable descriptor still returns
+    //    Descriptor and does NOT fall through to a source header).
+    if (auto desc = resolveSystemDescriptor(filename, systemDirs)) {
+        return {AngleIncludeKind::Descriptor, std::move(*desc)};
+    }
+    // 2. Source fallback — a REAL header on the -I includeDirs. The angle form does
+    //    NOT search the including file's own directory (C 6.10.2p2), so this is
+    //    `includeDirs` ONLY, never a self-dir prepend (that distinction is what the
+    //    quote form's `resolveIncludePath` adds; angle omits it by construction).
+    if (auto src = findInDirs(filename, includeDirs)) {
+        return {AngleIncludeKind::Source, std::move(*src)};
+    }
+    // 3. Total miss — the caller fails loud (F_ShippedHeaderNotFound).
+    return {AngleIncludeKind::NotFound, {}};
+}
+
 } // namespace dss

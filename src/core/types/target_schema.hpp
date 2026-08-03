@@ -5,6 +5,7 @@
 #include "core/types/aggregate_layout.hpp"  // FC6: AggregateLayoutParams
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (extracted; breaks the leaf-enum cycle)
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
+#include "core/types/object_format_kind.hpp"  // ObjectFormatKind (charIsUnsigned's per-format axis)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
 
@@ -788,11 +789,16 @@ struct DSS_EXPORT TargetCallingConvention {
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `__va_list_tag` layout + register-
     // save-area geometry for `va_start`/`va_arg`/`va_end` in a variadic CALLEE.
-    // ENGAGED (SysV AMD64) ⇒ the semantic phase injects `__va_list_tag`, HIR→MIR
-    // lowers the va_arg diamond, and the LIR prologue spills the arg registers.
-    // ABSENT (Win64 / AAPCS64 this cycle — a different variadic ABI) ⇒ a variadic
-    // function body using va_start fails LOUD ("variadic callee unsupported for
-    // this CC"), never silently mis-walked. One field selects support agnostically.
+    // ENGAGED today for EVERY shipped calling convention, each via its own
+    // `VaListLayout::strategy`: sysv_amd64 = SysVRegisterSave (the __va_list_tag
+    // register-save-area this field was originally named for); ms_x64 + apple_arm64
+    // = HomogeneousPointer (FC12b / FC12c — `va_list` is a plain pointer into a
+    // contiguous arg area); aapcs64 = Aapcs64DualCursor (FC12c — the dual gr/vr-
+    // offset `__va_list` struct). ABSENT ⇒ the target/CC declares NO variadic-
+    // callee model at all; a variadic function body using va_start then fails
+    // LOUD ("variadic callee unsupported for this CC"), never silently mis-walked.
+    // One field selects support — and which of the three lowering strategies —
+    // fully agnostically, never a per-CC-name branch.
     std::optional<VaListLayout> vaListLayout;
 };
 
@@ -1891,6 +1897,26 @@ enum class RelocFormulaKind : std::uint8_t {
     //   lo12 word reuses Aarch64AddAbsLo12 verbatim (same formula,
     //   distinct tls-flagged KIND row on the target).
     Aarch64TprelAddHi12   = 4,
+    // ARM64 R_AARCH64_ADR_GOT_PAGE (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+    // TF-C52): the ADRP word of the `adrp x,:got:sym` + `ldr x,
+    // [x,:got_lo12:sym]` GOT-address macro — materializes an undefined-
+    // extern's address as a live code-form VALUE so a foreign default-PIE
+    // link accepts it (an absolute ADR_PREL_PG_HI21 against a preemptible
+    // symbol is rejected "when making a shared object"). Emitted ONLY into
+    // an ELF relocatable `.o` / static-archive member, which is linked by
+    // a FOREIGN toolchain (gcc/clang) — DSS itself NEVER applies this
+    // reloc (no DSS-apply consumer: the exec path uses copy-relocation,
+    // the PIE path the c117 DSS-local slot). So the `applyExecRelocations`
+    // kernel arm is an EXPLICIT FAIL-LOUD REFUSAL, not an S/A/P formula.
+    // Declaring it a real (non-Linear) kind is what keeps the ET_DYN
+    // slide-safe classifier from mis-treating it as a Linear-absolute-in-
+    // `.text` fixup (D-LK-DYN-TEXT-ABS-RELOC keys `formulaKind == Linear`).
+    Aarch64AdrGotPage     = 5,
+    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-
+    // GOT, TF-C52): the LDR word of the same GOT-address macro (the
+    // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
+    // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
+    Aarch64Ld64GotLo12    = 6,
 };
 
 // Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
@@ -1899,12 +1925,14 @@ enum class RelocFormulaKind : std::uint8_t {
 // on size catches forgetting one half. (architect + type-design
 // 4-agent convergence at post-fold #2 — was previously 3 independent
 // hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
-inline constexpr EnumNameTable<RelocFormulaKind, 5> kRelocFormulaTable{{{
+inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
     { RelocFormulaKind::Linear,               "linear" },
     { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
     { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
     { RelocFormulaKind::Aarch64AddAbsLo12,    "aarch64_add_abs_lo12" },
     { RelocFormulaKind::Aarch64TprelAddHi12,  "aarch64_tprel_add_hi12" },
+    { RelocFormulaKind::Aarch64AdrGotPage,    "aarch64_adr_got_page" },
+    { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
 }}};
 
 [[nodiscard]] DSS_EXPORT std::string_view
@@ -2499,13 +2527,31 @@ struct DSS_EXPORT TargetSchemaData {
     // `declared == false` → `wideFloatSoftcall()` returns nullptr → the
     // F128 engine verb falls through to the fail-loud encoded-width gate
     // (this ABSENCE, not a target/format check, is what gates the softcall
-    // path). `wideFloatSoftcallLibraryByFormat` maps an object-format key
-    // ("elf") → the DT_NEEDED library the minted extern imports bind to
+    // path). `wideFloatSoftcallLibraryByFormat` maps an object FORMAT KIND
+    // (Elf) → the DT_NEEDED library the minted extern imports bind to
     // ("libgcc_s.so.1"); the LIR lowerer resolves the ACTIVE format's entry
     // and threads it in (nullopt = the format declares none → the softcall
     // fails loud rather than mint an unbound extern).
+    //
+    // ★ KEYED ON THE ENUM, NOT ON A STRING — the `charIsUnsignedByFormat`
+    // reshape, applied here. This map USED to be an
+    // `unordered_map<std::string,std::string>` filled from arbitrary JSON keys,
+    // so a misspelled `"elff"` (or a mis-cased `"ELF"`) STORED cleanly, the
+    // accessor's raw-string lookup missed, and the F128 softcall path reported
+    // "this format declares no softcall library" — a config typo degrading
+    // long-double arithmetic with no diagnostic pointing at the config. An
+    // `ObjectFormatKind`-indexed array makes that state UNREPRESENTABLE: there
+    // is no slot for a name that is not in `kObjectFormatKindTable`, so the
+    // loader MUST resolve every key through `objectFormatKindFromName` (and
+    // reject the `unknown` sentinel) before it can store anything at all.
+    //
+    // An EMPTY slot means "this format declares no softcall library". The
+    // loader rejects an empty library STRING for exactly that reason — an
+    // empty value would be indistinguishable from an absent key, which is the
+    // same silent-fallback shape one layer down.
     std::array<WideFloatSoftcall, kWideFloatOpCount> wideFloatSoftcalls{};
-    std::unordered_map<std::string, std::string> wideFloatSoftcallLibraryByFormat;
+    std::array<std::string, kObjectFormatKindCount>
+        wideFloatSoftcallLibraryByFormat{};
 
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
@@ -2549,6 +2595,65 @@ struct DSS_EXPORT TargetSchemaData {
     // diagnostic, no artifact) at use rather than silently returning a zero param.
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
+
+    // ── Bare-`char` signedness — THE SINGLE SOURCE OF TRUTH ──────────────
+    // (TF-C56 D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET,
+    //  TF-C75 D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+    //
+    // Whether bare `char` (the distinct `TypeKind::Char`, NOT `signed char` /
+    // `unsigned char`) is an UNSIGNED type. C 6.2.5p15 leaves this
+    // IMPLEMENTATION-DEFINED, and the implementation that decides is the
+    // (processor × PLATFORM) pair, not either alone: the SAME AArch64 CPU is
+    // UNSIGNED under GNU/Linux AAPCS64 and SIGNED under Apple's Darwin ABI.
+    //
+    // ★ THE WHOLE FACT LIVES HERE, IN ONE KEY. `charIsUnsignedDefault` is the
+    // processor's answer; `charIsUnsignedByFormat[kind]` overrides it for the
+    // object formats whose PLATFORM fixes the answer for every CPU it serves
+    // (Darwin/macho and Windows/pe both chose SIGNED). It is NOT split across
+    // the target and the format schemas: `elf` serves both aarch64 (unsigned)
+    // and x86_64 (signed), so a flat value on the FORMAT would be a lie on one
+    // of them, and making it honest would force all 24 `.format.json` files to
+    // enumerate CPU architectures — a layering inversion. The processor half
+    // and the platform half are both per-processor knowledge, so they belong
+    // in the per-processor file.
+    //
+    // `charIsUnsignedByFormatDeclared[kind]` is the presence bit — the
+    // `condCodeDeclared` discipline. It exists because `false` (signed) is a
+    // MEANINGFUL override value: without it, "this format declares signed"
+    // would be indistinguishable from "this format says nothing", and the
+    // macho/pe rows (which declare exactly `false`) would silently vanish.
+    //
+    // Indexed by `static_cast<std::size_t>(ObjectFormatKind)`; the array size
+    // is derived from the enum's own name table (`kObjectFormatKindCount`), so
+    // a new format kind cannot leave the table one slot short.
+    //
+    // Consumed through ONE accessor, `charIsUnsigned(ObjectFormatKind)`, whose
+    // result is threaded into `MirLoweringConfig.charIsUnsigned` — sole reader
+    // `isSignedIntKind(Char)`, the single SExt-vs-ZExt decision on the char→int
+    // promotion. No arch, format, or platform NAME is ever compared.
+    bool charIsUnsignedDefault = false;
+    std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormat{};
+    std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormatDeclared{};
+
+    // TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the target's
+    // PER-ARCHITECTURE IDENTITY predefined macros
+    // (`"predefinedMacros"` — the same entry grammar as the language's
+    // `preprocess.predefinedMacros`, parsed by the SHARED
+    // `parsePredefinedMacroArray`). This lives on the TARGET, not the
+    // language, because it is per-CPU-architecture semantics — exactly like
+    // `charIsUnsigned` / `aggregateLayout` / `tls` above. The alternative
+    // (a language-side arch filter) would force `c-subset.lang.json` to
+    // enumerate CPU architectures: a layering inversion.
+    //
+    // Merged with the language list at preprocess time
+    // (`mergePredefinedMacros`), which is where a name declared by BOTH
+    // sides fails LOUD — there is no last-writer-wins in either direction.
+    // OPTIONAL; absent ⇒ empty ⇒ the preprocessor's effective list is
+    // byte-identical to the language-only list (the no-regression
+    // invariant). Per-entry `availableObjectFormats` still applies, which is
+    // how the Apple-only `__arm64__`/`__arm64` spellings stay macho-gated
+    // while `__aarch64__` is universal.
+    std::vector<PredefinedMacroDef> predefinedMacros;
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
@@ -2739,15 +2844,20 @@ public:
         auto const& row = d_.wideFloatSoftcalls[idx];
         return row.declared ? &row : nullptr;
     }
-    // The DT_NEEDED library the minted F128-softcall externs bind to, for
-    // the object format named `formatKey` ("elf"), or empty when the format
-    // declares none. Resolved once per compilation (the LIR lowerer captures
-    // it), so the `std::string` key temporary is not a hot-path cost.
+    // The DT_NEEDED library the minted F128-softcall externs bind to, for the
+    // object format `format`, or empty when the format declares none.
+    //
+    // Takes the KIND, never a name string: both call sites (program.cpp's merge
+    // path and compile_pipeline.cpp's single-CU path) already hold an
+    // `ObjectFormatKind` and used to stringify it just to feed a string lookup
+    // that could silently miss. The round trip is gone — an unresolvable name
+    // can no longer reach this function, because the loader could not have
+    // stored one.
     [[nodiscard]] std::string_view
-    wideFloatSoftcallLibrary(std::string_view formatKey) const {
-        auto it = d_.wideFloatSoftcallLibraryByFormat.find(std::string(formatKey));
-        if (it == d_.wideFloatSoftcallLibraryByFormat.end()) return {};
-        return it->second;
+    wideFloatSoftcallLibrary(ObjectFormatKind format) const noexcept {
+        auto const idx = static_cast<std::size_t>(format);
+        if (idx >= d_.wideFloatSoftcallLibraryByFormat.size()) return {};
+        return d_.wideFloatSoftcallLibraryByFormat[idx];
     }
 
     // ── Calling conventions (cycle 2b) ──────────────────────────
@@ -2804,6 +2914,47 @@ public:
     }
     [[nodiscard]] bool aggregateLayoutLoaded() const noexcept {
         return d_.aggregateLayoutLoaded;
+    }
+
+    // ── Bare-char signedness (TF-C56 + TF-C75) ────────────────────────────
+    // THE one resolution point for "is bare `char` unsigned here". True ⇒ the
+    // char→int promotion zero-extends; false ⇒ it sign-extends.
+    //
+    // ★ The OBJECT FORMAT is a REQUIRED argument, and there is deliberately NO
+    // zero-argument overload. Bare-`char` signedness is a (processor ×
+    // PLATFORM) fact, so a no-arg accessor could only return the processor
+    // half — and a caller that forgot the format would silently get arm64's
+    // `true` on Darwin, which is precisely the zero-vs-sign-extend miscompile
+    // this shape exists to make unrepresentable. Requiring the argument moves
+    // that error from "silently wrong output" to "does not compile".
+    //
+    // Resolution: the format's declared override if this target declared one
+    // for that kind, else the target's own default. Both halves come from the
+    // ONE `charIsUnsigned` key in the `.target.json`; no format schema
+    // contributes. Selects on the enum ordinal only — never a format, arch, or
+    // platform NAME.
+    [[nodiscard]] bool charIsUnsigned(ObjectFormatKind format) const noexcept {
+        auto const idx = static_cast<std::size_t>(format);
+        // Bounds-check a corrupt/out-of-enum cast rather than index out of
+        // range; an unrepresentable kind reads as "no override declared".
+        if (idx < d_.charIsUnsignedByFormatDeclared.size()
+            && d_.charIsUnsignedByFormatDeclared[idx]) {
+            return d_.charIsUnsignedByFormat[idx];
+        }
+        return d_.charIsUnsignedDefault;
+    }
+
+    // ── Per-architecture identity predefined macros (TF-C74) ──────
+    // The target's `predefinedMacros` rows, in declaration order and
+    // UNFILTERED (the per-entry `availableObjectFormats` filter is
+    // applied ONCE downstream, in `mergePredefinedMacros`, alongside
+    // the language's — one filter, so the four preprocessor seed
+    // sites can never disagree). EMPTY for a target that declares
+    // none ⇒ the preprocessor's effective list is byte-identical to
+    // the language-only list.
+    [[nodiscard]] std::span<PredefinedMacroDef const>
+    predefinedMacros() const noexcept {
+        return d_.predefinedMacros;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────

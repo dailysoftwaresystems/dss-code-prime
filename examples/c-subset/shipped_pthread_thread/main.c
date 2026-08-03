@@ -4,14 +4,15 @@
  * The rest of the pthread surface (mutex API + pthread_self/equal + the opaque
  * pthread_mutex_t/_t typedefs) was already shipped in c14/c15; only these two
  * were missing -> S0001 undeclared.
- *   pthread_create: fn(ptr<void>,ptr<void>,ptr<void>,ptr<void>) -> i32  (all four
- *     args are pointer-position: pthread_t*, attr*, start_routine, arg).
+ *   pthread_create: fn(ptr<void>, ptr<void>, ptr<fn(ptr<void>) -> ptr<void>>,
+ *     ptr<void>) -> i32  (pthread_t*, attr*, the PRECISE start_routine fn-ptr, arg).
  *   pthread_join:   fn(u64, ptr<void>) -> i32   (the pthread_t thread-id BY VALUE
  *     = u64 — the established pthread_self/equal ABI; void** result out-param).
  *
- * The start routine is passed as a function-POINTER variable (`fn`), exactly as
- * sqlite passes `xTask` — so it converts via the Ptr->void* arm (a bare function
- * designator -> void* is a SEPARATE unshipped gap, NOT exercised here).
+ * The start routine is passed as a function-POINTER variable (`fn`) of type
+ * void*(*)(void*), exactly as sqlite passes `xTask` — it matches the tightened
+ * 3rd param EXACTLY (no conversion). A bare function designator also decays to
+ * that fn-ptr (see shipped_pthread_cond); the earlier Ptr->void* arm is gone.
  *
  * Gated [elf,macho] (pthread is unix; a pe build uses os_win). RED-ON-DISABLE:
  * remove either symbol from pthread.json -> S0001. */

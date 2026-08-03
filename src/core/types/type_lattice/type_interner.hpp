@@ -281,10 +281,46 @@ public:
     // matters: a silently-unpacked round-trip is an ABI miscompile). packed +
     // non-empty `fieldOffsets` is contradictory (explicit offsets place fields
     // wholesale, overriding padding entirely) → fail loud here.
+    //
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): `explicitAlign` is the WHOLE-COMPOSITE
+    // explicit alignment request (C 6.7.5 / GNU `__attribute__((aligned(N)))` on a
+    // struct/union DEFINITION), in bytes; 0 = no request. It is a genuinely
+    // PER-COMPOSITE channel — NOT a smuggled `fieldAligns[0]`, which would lie about
+    // member 0's `_Alignof`, be unrepresentable for a zero-field composite, and
+    // reintern as a different type. `computeLayout` folds it with MAX semantics
+    // (6.7.5: the composite's alignment is max(natural, requested) — a request
+    // WEAKER than natural is a no-op, never a lowering), which is what makes
+    // `struct S { char a; int b; } __attribute__((packed, aligned(16)));` come out
+    // sizeof 16 / _Alignof 16 (clang-MEASURED) rather than packed's bare 5.
+    //
+    // UNLIKE `packed` this parameter IS defaulted, and the reason is a hard
+    // constraint, not a preference: an undefaulted parameter cannot follow the
+    // already-defaulted spans, and inserting one before them would break
+    // `completeComposite` call sites in files this change does not own
+    // (`src/hir/hir_text.cpp`, `tests/hir/test_hir_text.cpp`). What replaces the
+    // "forgetting it fails to COMPILE" guard is three RUNTIME/TEST guards: a
+    // non-power-of-two / >256 value aborts loud here; a re-completion that changes
+    // the value aborts loud as a conflicting re-completion; and the reintern
+    // round-trip pin asserts the value survives a cross-interner hop.
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): `maxFieldAlign` is the C `#pragma pack(N)`
+    // MEMBER-ALIGNMENT CAP in effect where the composite was DEFINED, in bytes;
+    // 0 = no cap. It is the exact dual of `explicitAlign`: that one RAISES the
+    // aggregate's alignment, this one LOWERS each member's — and it is a
+    // GENERALIZATION of `packed`, which is the special case cap == 1. `packed`
+    // is NOT re-expressed in terms of it (that refactor would touch the reintern,
+    // cross-CU, `mir_text` and descriptor paths this change has no business in);
+    // when BOTH are present `packed` WINS, matching gcc.
+    // Defaulted for the same hard reason `explicitAlign` is — an undefaulted
+    // parameter cannot follow the already-defaulted spans — and guarded by the
+    // same three runtime/test checks: an unrepresentable value aborts loud here, a
+    // re-completion that CHANGES it aborts as a conflicting re-completion, and it
+    // is part of the content identity so it survives a reintern round-trip.
     void completeComposite(TypeId id, std::span<TypeId const> fields, bool packed,
                            std::span<std::int64_t const> fieldBitWidths = {},
                            std::span<std::uint64_t const> fieldOffsets = {},
-                           std::span<std::uint32_t const> fieldAligns = {});
+                           std::span<std::uint32_t const> fieldAligns = {},
+                           std::uint32_t explicitAlign = 0,
+                           std::uint32_t maxFieldAlign = 0);
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -341,6 +377,33 @@ public:
                       std::span<std::int64_t const> fieldBitWidths,
                       std::span<std::uint64_t const> fieldOffsets,
                       std::span<std::uint32_t const> fieldAligns);
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the complete-at-once path for a struct
+    // carrying a WHOLE-COMPOSITE explicit alignment (`struct S {…}
+    // __attribute__((aligned(N)))`). `explicitAlign` is the requested byte alignment
+    // (a power of two ≤ 256; 0 = no request) and is part of the struct's CONTENT
+    // identity: two structs with identical (name, fields, widths, offsets, aligns)
+    // but DIFFERENT `explicitAlign` are DISTINCT interned types and must never
+    // collide in the intern map — they lay out to different sizes. `explicitAlign
+    // == 0` routes exactly like the 5-arg overload (byte-identical declSiteKey, zero
+    // TypeId churn). Independent of `fieldAligns`: a member alignas raises ONE
+    // field, this raises the WHOLE aggregate, and both fold with MAX at layout.
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns,
+                      std::uint32_t explicitAlign);
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): the complete-at-once path for a struct
+    // defined under a `#pragma pack(N)` member-alignment CAP. `maxFieldAlign` is
+    // the cap in bytes (a power of two ≤ 256; 0 = no cap) and is part of the
+    // struct's CONTENT identity for the same reason `explicitAlign` is: the same
+    // fields under caps 4 and 8 lay out to DIFFERENT sizes, so aliasing them on
+    // one TypeId would be a layout miscompile. `maxFieldAlign == 0` routes exactly
+    // like the 6-arg overload (byte-identical declSiteKey, zero TypeId churn).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns,
+                      std::uint32_t explicitAlign, std::uint32_t maxFieldAlign);
     // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
     // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
     [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
@@ -361,6 +424,20 @@ public:
     // ordinary (padded) composite. Mirrors `hasExplicitAligns`. The layout engine
     // reads it to seed the per-field baseline alignment to 1.
     [[nodiscard]] bool isPacked(TypeId id) const;
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` member-alignment CAP
+    // this composite was defined under, in bytes; 0 = no cap (every composite
+    // before this cycle, and every one defined outside a pack region). The layout
+    // engine reads it to clamp each field's effective alignment. Struct/Union
+    // only; 0 for every other kind. Mirrors `explicitCompositeAlign`.
+    [[nodiscard]] std::uint32_t maxFieldAlign(TypeId id) const;
+    // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE explicit alignment
+    // request on `id` in bytes, or 0 when the composite has none (the ordinary
+    // path) / `id` is not a Struct/Union. The per-COMPOSITE counterpart of the
+    // per-FIELD `explicitFieldAlign`, and the twin of `isPacked` — packed LOWERS the
+    // aggregate's baseline to 1, this RAISES its final alignment. The layout engine
+    // reads it to SEED `StructLayout::align` before the per-field MAX-fold, so the
+    // composite's alignment ends up max(natural, requested) exactly per C 6.7.5.
+    [[nodiscard]] std::uint32_t explicitCompositeAlign(TypeId id) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -576,6 +653,31 @@ private:
         // GUARDED on true, exactly like offsets/aligns). packed + explicit offsets is
         // contradictory (offsets place fields wholesale) → fail loud at completion.
         bool                      packed      = false;
+        // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE explicit
+        // alignment request in bytes (a power of two ≤ 256; 0 = none), for
+        // C 6.7.5 / GNU `__attribute__((aligned(N)))` on a struct/union
+        // DEFINITION. A SEPARATE channel from BOTH `fieldAligns` (per-FIELD, and
+        // `fieldAligns[0]` would lie about member 0's `_Alignof` and not exist at
+        // all for a zero-field composite) AND `packed` (which LOWERS the per-field
+        // baseline to 1 — this RAISES the aggregate's final alignment, and the two
+        // legitimately COMBINE: `packed, aligned(16)` is clang sizeof 16, not 5).
+        // `computeLayout` seeds `StructLayout::align` with it, so the per-field
+        // MAX-fold can only raise it further — never lower it (6.7.5: an
+        // `aligned(N)` weaker than natural is a no-op). 0 = no request (every
+        // existing composite → byte-identical TypeId — it enters
+        // `contentDeclSiteKey` GUARDED on non-zero, exactly like offsets/aligns).
+        std::uint32_t             explicitAlign = 0;
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): the C `#pragma pack(N)` member-alignment
+        // CAP in effect at the composite's DEFINITION, in bytes (a power of two
+        // <= 256; 0 = no cap). The EXACT DUAL of `explicitAlign`: that one raises
+        // the aggregate's alignment, this one clamps each member's — which is why
+        // it is a separate channel and not a reuse of either it or `fieldAligns`
+        // (those RAISE a single field and would be the wrong direction on every
+        // count). It generalizes `packed` (cap == 1) without replacing it; when
+        // both are set `packed` wins, as in gcc. 0 = no cap, so every existing
+        // composite hashes byte-identically (it enters `contentDeclSiteKey`
+        // GUARDED on non-zero, exactly like offsets/aligns/explicitAlign).
+        std::uint32_t             maxFieldAlign = 0;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

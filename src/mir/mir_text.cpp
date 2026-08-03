@@ -2,6 +2,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/symbol_attrs.hpp"   // symbolBindingName / symbolVisibilityName
 #include "core/types/target_schema.hpp"  // callConvName / callConvFromName
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
@@ -26,6 +27,41 @@
 #include <vector>
 
 namespace dss {
+
+// TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the ONE spelling of the
+// `noinline` function attribute in the `.dssir` text format. The printer
+// (`appendFuncAttrs`) and the parser sit in two SEPARATE anonymous namespaces
+// several hundred lines apart, so a bare literal in each is two independently
+// editable copies of one fact — and the error message that lists the accepted
+// names is a third. Its neighbours `binding`/`visibility` never had this
+// problem because they route through `symbolBindingName`/`symbolVisibilityName`
+// name tables; `noInline` is a plain bool with no table to borrow, which is
+// exactly how the literal crept in. Same drift this project closed for the
+// object-format sentinel message with a shared constant.
+// NOTE this is the TEXT FORMAT's own keyword, NOT a source-language attribute
+// name: `.dssir` is a compiler-defined serialization format, so its vocabulary
+// legitimately lives in code. The C-side spelling stays config-declared.
+inline constexpr std::string_view kMirTextNoInlineAttr = "noinline";
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): the same one-spelling discipline for the
+// cost-model-bypass flag. Deliberately NOT `always_inline` with an underscore —
+// this is the `.dssir` text format's own keyword, matching LLVM's `alwaysinline`
+// / this file's `noinline` style, not the C source attribute's spelling.
+inline constexpr std::string_view kMirTextAlwaysInlineAttr = "alwaysinline";
+// TF-C85: the same one-spelling discipline for the per-function optimizer
+// opt-out. Again the `.dssir` text format's own keyword, matching this file's
+// `noinline` / `alwaysinline` style, not the MSVC pragma's spelling.
+inline constexpr std::string_view kMirTextNoOptimizeAttr = "nooptimize";
+// TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the same one-spelling discipline for the
+// per-function thread-sanitizer exclusion. Again the `.dssir` text format's own
+// keyword, matching this file's `noinline` / `alwaysinline` / `nooptimize` style
+// rather than the C attribute's `no_sanitize_thread` underscores.
+// ★★ AND FOR THIS AXIS THE PRINTER IS THE SINK, NOT A CONVENIENCE. `noinline`
+// reaches the inliner, `nooptimize` reaches the rebuilder; `no_sanitize_thread`
+// reaches NOTHING in this compiler (MEASURED: `grep -rni sanitiz src/` is empty),
+// so `appendFuncAttrs` emitting this keyword IS the observable effect the whole
+// source→MIR chain exists to produce. Deleting the printer arm below does not
+// degrade a diagnostic — it erases the feature.
+inline constexpr std::string_view kMirTextNoSanitizeThreadAttr = "nosanitizethread";
 
 // ── shared helpers ────────────────────────────────────────────────────
 
@@ -363,9 +399,49 @@ private:
         out_ += '\n';
     }
 
+    // TF-C78 (D-CSUBSET-NOINLINE): the function-attribute list — the per-MirFunc
+    // metadata that is NOT recoverable from the symbol + signature alone.
+    //
+    // ★ THIS PRINTER PREVIOUSLY DROPPED `binding` AND `visibility` OUTRIGHT.
+    // `emitFunction` emitted only `function %sym : <type> {`, and `parseFunction`
+    // called the 2-arg `addFunction`, so every round-tripped function came back
+    // (Global, Default) no matter what it was: a `static` function re-read as
+    // externally visible, a `weak` one as strong. Adding `noInline` beside them
+    // without fixing that would have reproduced the identical defect one field
+    // over — so all three are carried, by the SAME mechanism, and the round-trip
+    // pin covers all three.
+    //
+    // Printed ONLY when something is non-default (the `blockMarker != Linear`
+    // discipline), so existing golden text for ordinary functions is unchanged.
+    // Names come from the SHARED `symbolBindingName` / `symbolVisibilityName`
+    // tables — not a second spelling table that could drift from them.
+    void appendFuncAttrs(MirFuncId f) {
+        SymbolBinding    const b  = mir_.funcBinding(f);
+        SymbolVisibility const v  = mir_.funcVisibility(f);
+        bool             const ni = mir_.funcNoInline(f);
+        bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
+        bool             const no = mir_.funcNoOptimize(f);     // TF-C85
+        bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
+        if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
+            && !ai && !no && !ns) {
+            return;
+        }
+        out_ += " [";
+        bool first = true;
+        auto const sep = [&] { if (!first) out_ += ", "; first = false; };
+        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
+        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        if (ni)                             { sep(); out_ += kMirTextNoInlineAttr; }
+        if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
+        if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
+        if (ns)                             { sep(); out_ += kMirTextNoSanitizeThreadAttr; }
+        out_ += "]";
+    }
+
     void emitFunction(MirFuncId f) {
         out_ += std::format("  function %{} : ", mir_.funcSymbol(f).v);
         appendType(mir_.funcSignature(f));
+        appendFuncAttrs(f);
         out_ += " {\n";
         std::uint32_t const nBlocks = mir_.funcBlockCount(f);
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
@@ -1145,7 +1221,65 @@ private:
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
         TypeId const sig = parseType();
-        MirFuncId const f = builder_.addFunction(sig, SymbolId{sym});
+        // TF-C78 (D-CSUBSET-NOINLINE): the optional `[...]` function-attribute
+        // list `appendFuncAttrs` emits. Unambiguous after the signature: types
+        // bracket with `<>`, never `[]`. Absent ⇒ the (Global, Default, not-
+        // noinline) defaults, which is what an un-annotated function prints as.
+        // An UNRECOGNIZED name FAILS LOUD rather than being skipped — a silently
+        // ignored attribute here is precisely how `binding`/`visibility` went
+        // missing for as long as they did.
+        SymbolBinding    binding    = SymbolBinding::Global;
+        SymbolVisibility visibility = SymbolVisibility::Default;
+        bool             noInline   = false;
+        bool             alwaysInline = false;   // TF-C81
+        bool             noOptimize   = false;   // TF-C85
+        bool             noSanitizeThread = false;   // TF-C92
+        if (lex_.peek().kind == TokKind::LBracket) {
+            lex_.take();
+            while (true) {
+                Tok a = lex_.take();
+                if (a.kind == TokKind::RBracket) break;
+                if (a.kind == TokKind::Comma) continue;
+                if (a.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected a function attribute name, got '{}'", a.text));
+                    break;
+                }
+                if (a.text == kMirTextNoInlineAttr) { noInline = true; continue; }
+                if (a.text == kMirTextAlwaysInlineAttr) {   // TF-C81
+                    alwaysInline = true;
+                    continue;
+                }
+                if (a.text == kMirTextNoOptimizeAttr) {   // TF-C85
+                    noOptimize = true;
+                    continue;
+                }
+                if (a.text == kMirTextNoSanitizeThreadAttr) {   // TF-C92
+                    noSanitizeThread = true;
+                    continue;
+                }
+                if (auto b = symbolBindingFromName(a.text); b.has_value()) {
+                    binding = *b;
+                    continue;
+                }
+                if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
+                    visibility = *v;
+                    continue;
+                }
+                emitMalformed(std::format(
+                    "unknown function attribute '{}' — expected a binding "
+                    "(local | global | weak), a visibility (default | hidden | "
+                    "protected | internal), '{}', '{}', '{}' or '{}'",
+                    a.text, kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
+                    kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr));
+                break;
+            }
+        }
+        MirFuncId const f =
+            builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
+                                 alwaysInline,    // TF-C81
+                                 noOptimize,      // TF-C85
+                                 noSanitizeThread);   // TF-C92
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.

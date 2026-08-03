@@ -68,6 +68,20 @@ constexpr std::uint8_t STT_FUNC   = 2;
 constexpr std::uint8_t STT_SECTION = 3;
 constexpr std::uint16_t SHN_UNDEF = 0;
 
+// The ELF vocabulary for a shared `SymbolBinding` decision (the ONE per-format
+// mapping the `.symtab` / `.dynsym` emitters own; the DECISION itself is
+// format-neutral -- `ObjectSymbolNames::definedBinding`,
+// D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). ELF represents
+// all three bindings natively, so this is total.
+[[nodiscard]] constexpr std::uint8_t stbForBinding(SymbolBinding b) noexcept {
+    switch (b) {
+        case SymbolBinding::Local:  return STB_LOCAL;
+        case SymbolBinding::Weak:   return STB_WEAK;
+        case SymbolBinding::Global: return STB_GLOBAL;
+    }
+    return STB_GLOBAL;  // unreachable: SymbolBinding is a closed 3-value enum
+}
+
 // Elf64 sh_type / sh_flags (gABI 4.7-4.8) — used by the dynamic
 // walker (cycle 2b.2). Named to match `<elf.h>`; type-design #2
 // convergence (LK6 cycle 2b.2 review).
@@ -3142,11 +3156,15 @@ encode(AssembledModule const&    module,
 
     // ── Build .strtab + .symtab ────────────────────────────────
     //
-    // Symbol layout: STN_UNDEF (idx 0) → STT_SECTION for .text
-    // (LOCAL) → defined function symbols (GLOBAL) → defined DATA symbols
-    // (GLOBAL, STT_OBJECT, D-LK-OBJECT-DATA-SECTION-RELOCATABLE) → undefined
+    // Symbol layout (LOCAL-first, an ELF ABI requirement): STN_UNDEF (idx 0) →
+    // STT_SECTION for .text (LOCAL) → interior block symbols (LOCAL) → the
+    // now-Local static/synthesized defined funcs + DATA (LOCAL — TF-C54,
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION) → [sh_info
+    // boundary] → externally-visible defined funcs + DATA (GLOBAL/WEAK,
+    // STT_FUNC/STT_OBJECT, D-LK-OBJECT-DATA-SECTION-RELOCATABLE) → undefined
     // extern symbols (GLOBAL, SHN_UNDEF). `.symtab.sh_info` = index of first
-    // non-LOCAL symbol.
+    // non-LOCAL symbol. Per-symbol binding is `objNames.definedBinding` (name +
+    // binding kept in lockstep); ET_EXEC forces GLOBAL (final image, unchanged).
     //
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: the data-section header indices,
     // computed HERE (before the symtab) so a data symbol's `st_shndx` names its
@@ -3235,78 +3253,116 @@ encode(AssembledModule const&    module,
             symIdxBySymbol.emplace(bs.symbol, idx);
         }
     }
-    // `.symtab.sh_info` = index of the first non-LOCAL symbol = the count
-    // of the LOCAL prefix (UNDEF + STT_SECTION + every block symbol).
-    std::uint32_t const firstNonLocalSymIdx =
-        static_cast<std::uint32_t>(symtab.size() / 24);
+    // Defined function + data symbols, emitted in a LOCAL pass then a GLOBAL
+    // pass so every STB_LOCAL symbol precedes the first non-local (an ELF ABI
+    // requirement; `.symtab.sh_info` = that first-non-local index, computed
+    // between the passes). The per-symbol binding is the format-neutral
+    // `ObjectSymbolNames::definedBinding` (coupled to the NAME from
+    // `definedName`: a `sym_<id>`-named static/synthesized def is Local, a
+    // real-named def keeps its Global/Weak binding), mapped to STB_* by the
+    // format-neutral `stbForBinding` — D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
+    // FOREIGN-COLLISION (TF-C54). Pre-TF-C54 every defined symbol was hardcoded
+    // STB_GLOBAL, so a static `sym_<id>` collided across TUs at a FOREIGN
+    // multi-TU link (`ld: multiple definition`); DSS's own linker keys by
+    // (cuId,SymbolId) and was unaffected.
+    //
+    // ET_EXEC is a FINAL image (no foreign re-link): it keeps the synthesized
+    // `sym_<id>` name UNCHANGED — entry-point resolution matches the schema's
+    // `entryPoint` string against that reconstructed name (D-LK1-1) — AND its
+    // GLOBAL binding UNCHANGED (`definedFuncBinding` forces Global), so the
+    // informational `.symtab` stays byte-identical. Only the ET_REL `.o` (the
+    // foreign-linker input) carries the real per-symbol binding; ET_EXEC emits
+    // no DATA symbols here at all (`addDataSymbolVas` handles those).
+    auto definedFuncBinding = [&](SymbolId id) -> SymbolBinding {
+        return isExec ? SymbolBinding::Global : objNames.definedBinding(id);
+    };
 
-    // Defined function symbols (GLOBAL + STT_FUNC + shndx=.text). In an
-    // ET_REL object an externally-visible symbol gets its real C name
-    // (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) so a foreign linker resolves it; a
-    // static/local one keeps `sym_<id>` (binding stays GLOBAL — the `may stay
-    // internal` name carve-out). ET_EXEC keeps the synthesized `sym_<id>`
-    // form UNCHANGED — its entry-point resolution matches the schema's
-    // `entryPoint` string against that reconstructed name (D-LK1-1), and no
-    // foreign toolchain ever re-links a DSS executable, so real names there
-    // are an unfired, separate concern.
-    for (auto const& f : funcSyms) {
+    // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text) — name + binding
+    // coupled through `objNames`.
+    auto emitFuncSym = [&](FuncSymRecord const& f) {
         std::string const symName =
             isExec ? std::string{"sym_"} + std::to_string(f.symId.v)
                    : objNames.definedName(f.symId, "sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         std::uint32_t const idx =
             static_cast<std::uint32_t>(symtab.size() / 24);
-        appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_FUNC), 0,
-                  /*shndx=.text*/ 1, f.valueInText, f.size);
+        appendSym(nameOff,
+                  makeStInfo(stbForBinding(definedFuncBinding(f.symId)), STT_FUNC),
+                  0, /*shndx=.text*/ 1, f.valueInText, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
+    };
+
+    // Emit the defined DATA symbols of ONE binding class (`wantLocal` selects
+    // Local vs non-Local) for ONE section — ET_REL only (D-LK-OBJECT-DATA-
+    // SECTION-RELOCATABLE). A global lands in `.rodata`/`.data`/`.bss`; its
+    // symtab entry names the section (st_shndx) + section-relative offset
+    // (st_value) + size the FINAL linker binds, so a `.text`→global reloc
+    // resolves to a DEFINED symbol rather than being misclassified as an
+    // undefined extern by the loop below. Externally-visible → real name +
+    // Global/Weak; static/synthesized → `sym_<id>` + STB_LOCAL (which lands in
+    // the LOCAL pass, before sh_info — same local-first rule the functions
+    // obey). MUST precede the extern-fallback loop.
+    auto emitDataSyms =
+        [&](link::format::ExecDataSectionLayout const& layout,
+            std::uint16_t sectionIdx, bool wantLocal) {
+            for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+                AssembledData const& di =
+                    module.dataItems[layout.itemIndices[j]];
+                if (di.symbol == SymbolId{}) continue;   // anonymous item
+                SymbolBinding const bind = objNames.definedBinding(di.symbol);
+                if ((bind == SymbolBinding::Local) != wantLocal) continue;
+                // A data global's SymbolId must be unique. A collision with
+                // an already-emitted (function / block / data) symbol is a
+                // producer-contract breach — fail loud (symmetry with the
+                // exec `addDataSymbolVas` K_DuplicateDataSymbol), never a
+                // silent skip that would bind a `.text`→data reloc to the
+                // WRONG symbol.
+                if (symIdxBySymbol.contains(di.symbol)) {
+                    emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                         "elf::encode (ET_REL): data SymbolId={ "
+                             + std::to_string(di.symbol.v)
+                             + " } collides with an already-emitted symbol "
+                               "- a data global's SymbolId must be unique.");
+                    continue;
+                }
+                std::string const symName =
+                    objNames.definedName(di.symbol, "sym_");
+                std::uint32_t const nameOff = strtab.add(symName);
+                std::uint32_t const idx =
+                    static_cast<std::uint32_t>(symtab.size() / 24);
+                appendSym(nameOff, makeStInfo(stbForBinding(bind), STT_OBJECT),
+                          0, sectionIdx, layout.itemOffsets[j],
+                          di.sizeInSection());
+                symIdxBySymbol.emplace(di.symbol, idx);
+            }
+        };
+
+    // ── LOCAL pass — static/synthesized funcs + data (Local binding). The
+    //    block symbols emitted above are also Local and already sit here. ──
+    for (auto const& f : funcSyms)
+        if (definedFuncBinding(f.symId) == SymbolBinding::Local) emitFuncSym(f);
+    if (!isExec) {
+        if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA, /*wantLocal=*/true);
+        if (hasData)   emitDataSyms(dataLayout,   IDX_DATA,   /*wantLocal=*/true);
+        if (hasRelRo)  emitDataSyms(relroLayout,  IDX_RELRO,  /*wantLocal=*/true);  // c145
+        if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/true);
     }
 
-    // Defined DATA symbols (GLOBAL + STT_OBJECT, SECTION-RELATIVE) — ET_REL
-    // only (D-LK-OBJECT-DATA-SECTION-RELOCATABLE). A global lands in
-    // `.rodata`/`.data`/`.bss`; its symtab entry names the section (st_shndx)
-    // + section-relative offset (st_value) + size the FINAL linker binds, so a
-    // `.text`→global reloc resolves to a DEFINED symbol rather than being
-    // misclassified as an undefined extern by the loop below. Externally-
-    // visible → real name; static → `sym_<id>` (same carve-out as functions).
-    // ET_EXEC resolves data symbols via `addDataSymbolVas` (absolute VAs) and
-    // emits none into this symtab. MUST precede the extern-fallback loop.
+    // `.symtab.sh_info` = index of the first non-LOCAL symbol = the count of
+    // the LOCAL prefix (UNDEF + STT_SECTION + block symbols + the now-Local
+    // static/synthesized funcs + data emitted in the pass above).
+    std::uint32_t const firstNonLocalSymIdx =
+        static_cast<std::uint32_t>(symtab.size() / 24);
+
+    // ── GLOBAL pass — externally-visible (Global/Weak) funcs + data, after
+    //    sh_info. For ET_EXEC every func is here (binding forced Global). ──
+    for (auto const& f : funcSyms)
+        if (definedFuncBinding(f.symId) != SymbolBinding::Local) emitFuncSym(f);
     if (!isExec) {
-        auto emitDataSyms =
-            [&](link::format::ExecDataSectionLayout const& layout,
-                std::uint16_t sectionIdx) {
-                for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
-                    AssembledData const& di =
-                        module.dataItems[layout.itemIndices[j]];
-                    if (di.symbol == SymbolId{}) continue;   // anonymous item
-                    // A data global's SymbolId must be unique. A collision with
-                    // an already-emitted (function / block / data) symbol is a
-                    // producer-contract breach — fail loud (symmetry with the
-                    // exec `addDataSymbolVas` K_DuplicateDataSymbol), never a
-                    // silent skip that would bind a `.text`→data reloc to the
-                    // WRONG symbol.
-                    if (symIdxBySymbol.contains(di.symbol)) {
-                        emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
-                             "elf::encode (ET_REL): data SymbolId={ "
-                                 + std::to_string(di.symbol.v)
-                                 + " } collides with an already-emitted symbol "
-                                   "- a data global's SymbolId must be unique.");
-                        continue;
-                    }
-                    std::string const symName =
-                        objNames.definedName(di.symbol, "sym_");
-                    std::uint32_t const nameOff = strtab.add(symName);
-                    std::uint32_t const idx =
-                        static_cast<std::uint32_t>(symtab.size() / 24);
-                    appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_OBJECT), 0,
-                              sectionIdx, layout.itemOffsets[j],
-                              di.sizeInSection());
-                    symIdxBySymbol.emplace(di.symbol, idx);
-                }
-            };
-        if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA);
-        if (hasData)   emitDataSyms(dataLayout, IDX_DATA);
-        if (hasRelRo)  emitDataSyms(relroLayout, IDX_RELRO);   // c145
-        if (hasBss)    emitDataSyms(bssLayout, IDX_BSS);
+        if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA, /*wantLocal=*/false);
+        if (hasData)   emitDataSyms(dataLayout,   IDX_DATA,   /*wantLocal=*/false);
+        if (hasRelRo)  emitDataSyms(relroLayout,  IDX_RELRO,  /*wantLocal=*/false);  // c145
+        if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/false);
     }
 
     // Undefined extern symbols referenced by any relocation but not

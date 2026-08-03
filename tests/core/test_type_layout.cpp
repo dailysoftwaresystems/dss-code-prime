@@ -508,6 +508,338 @@ TEST(TypeLayout, PackedPlusBitfieldFailsLoud) {
     EXPECT_FALSE(computeLayout(s, ti, kGnu16, DataModel::Lp64).has_value());  // belt
 }
 
+// ── D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE `aligned(N)` ──────
+//
+// `struct S {…} __attribute__((aligned(N)))` raises the AGGREGATE's own alignment
+// (C 6.7.5: the composite's alignment is the MAX of its natural alignment and the
+// request), which also rounds its size up. `computeLayout` realizes this by SEEDING
+// `StructLayout::align` from `TypeInterner::explicitCompositeAlign` before the
+// per-field folds, all of which are `maxAlign` — so it can only ever RAISE.
+//
+// Every number below was MEASURED with clang on arm64 macOS (compiled AND run,
+// `-fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)` clean).
+// Each is RED-ON-DISABLE: remove the `compositeSeedAlign` seed from the Struct or
+// Union arm and the assertion reverts to the un-raised natural value.
+
+[[nodiscard]] TypeId alignedComposite(TypeInterner& ti, TypeKind kind,
+                                      std::string_view name, std::uint64_t key,
+                                      std::span<TypeId const> fields,
+                                      std::uint32_t align, bool packed = false,
+                                      std::span<std::int64_t const> widths = {}) {
+    TypeId const s = ti.forwardComposite(kind, name, key);
+    ti.completeComposite(s, fields, packed, widths, /*fieldOffsets=*/{},
+                         /*fieldAligns=*/{}, align);
+    return s;
+}
+
+TEST(TypeLayout, CompositeAlignedRaisesAggregateAlignAndSize) {
+    auto ti = makeInterner(1);
+    // clang: `struct A { char c; unsigned v; } __attribute__((aligned(16)));`
+    //        → size 16, align 16 (natural would be 8 / 4).
+    // Field OFFSETS are UNCHANGED — the request touches the aggregate, not the
+    // fields: c@0, v@4 exactly as in the unaligned twin.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const a = alignedComposite(ti, TypeKind::Struct, "A", 1, fields, 16u);
+    EXPECT_EQ(ti.explicitCompositeAlign(a), 16u);
+    auto const l = layoutOf(a, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // natural placement — NOT pushed by the request
+    EXPECT_EQ(l.align.bytes(), 16u);    // RED-ON-DISABLE (natural 4)
+    EXPECT_EQ(l.size, 16u);             // RED-ON-DISABLE (natural 8)
+
+    // The same fields with NO request are a distinct type with the natural layout.
+    std::array<TypeId, 2> const fields2{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::U32)};
+    TypeId const nat = ti.structType("A", fields2);
+    EXPECT_EQ(ti.explicitCompositeAlign(nat), 0u);
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 8u);
+}
+
+// ── ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` MEMBER-ALIGNMENT CAP ──
+//
+// The EXACT DUAL of the `aligned(N)` block above: that one RAISES the aggregate's
+// alignment, this one CLAMPS each member's — so it moves field OFFSETS, which
+// `aligned(N)` never does. `computeLayout` realizes it by capping each field's
+// baseline alignment before the member-`alignas` MAX-fold.
+//
+// Every number below was MEASURED with clang on arm64 macOS (compiled AND run).
+// Each is RED-ON-DISABLE: remove the cap from the Struct or Union arm and the
+// assertion reverts to the uncapped natural value.
+[[nodiscard]] TypeId cappedComposite(TypeInterner& ti, TypeKind kind,
+                                     std::string_view name, std::uint64_t key,
+                                     std::span<TypeId const> fields,
+                                     std::uint32_t cap, bool packed = false,
+                                     std::uint32_t explicitAlign = 0) {
+    TypeId const s = ti.forwardComposite(kind, name, key);
+    ti.completeComposite(s, fields, packed, /*fieldBitWidths=*/{},
+                         /*fieldOffsets=*/{}, /*fieldAligns=*/{}, explicitAlign,
+                         cap);
+    return s;
+}
+
+TEST(TypeLayout, PragmaPackCapsMemberAlignmentAndMovesOffsets) {
+    auto ti = makeInterner(1);
+    // THE CORPUS WITNESS, `sys/fcntl.h`'s `struct log2phys` under `#pragma
+    // pack(4)`: { unsigned int; long long; long long }.
+    // clang MEASURED: offsets 0/4/12, size 20, align 4.
+    // Uncapped it is  offsets 0/8/16, size 24, align 8 — the value DSS computed
+    // before this cycle, for a struct sqlite hands to `fcntl(F_LOG2PHYS)`.
+    std::array<TypeId, 3> const fields{ti.primitive(TypeKind::U32),
+                                       ti.primitive(TypeKind::I64),
+                                       ti.primitive(TypeKind::I64)};
+    TypeId const capped =
+        cappedComposite(ti, TypeKind::Struct, "log2phys", 1, fields, 4u);
+    EXPECT_EQ(ti.maxFieldAlign(capped), 4u);
+    auto const l = layoutOf(capped, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 3u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.fieldOffsets[2], 12u);  // RED-ON-DISABLE (uncapped 16)
+    EXPECT_EQ(l.align.bytes(), 4u);     // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 20u);             // RED-ON-DISABLE (uncapped 24)
+
+    // The CONTROL that makes every line above non-vacuous: the SAME fields with
+    // no cap. It is also the interning pin — the cap is part of the content
+    // identity, so these are two DISTINCT TypeIds and must not collapse.
+    std::array<TypeId, 3> const fields2{ti.primitive(TypeKind::U32),
+                                        ti.primitive(TypeKind::I64),
+                                        ti.primitive(TypeKind::I64)};
+    TypeId const nat = ti.structType("log2phys", fields2);
+    EXPECT_NE(nat.v, capped.v)
+        << "identical fields under different pack caps lay out to different "
+           "sizes; collapsing them onto one TypeId is a layout miscompile";
+    EXPECT_EQ(ti.maxFieldAlign(nat), 0u);
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.fieldOffsets[1], 8u);
+    EXPECT_EQ(ln.align.bytes(), 8u);
+    EXPECT_EQ(ln.size, 24u);
+}
+
+TEST(TypeLayout, PragmaPackCapWeakerThanNaturalIsANoOp) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(16)` over { char; unsigned } asks for a cap LOOSER than
+    // every member's natural alignment — a no-op, exactly like an `aligned(N)`
+    // weaker than natural. A cap that ROUNDED UP would be a silent over-align.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s = cappedComposite(ti, TypeKind::Struct, "L", 1, fields, 16u);
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);
+    EXPECT_EQ(l.align.bytes(), 4u);
+    EXPECT_EQ(l.size, 8u);
+}
+
+TEST(TypeLayout, PragmaPackCapAndPackedComposeWithPackedWinning) {
+    auto ti = makeInterner(1);
+    // gcc: an explicit `__attribute__((packed))` is NOT weakened by a
+    // surrounding `#pragma pack(4)` — the stricter (1) wins. { char; unsigned }
+    // is then 5/1, not the cap's 8/4.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s = cappedComposite(ti, TypeKind::Struct, "PK", 1, fields, 4u,
+                                     /*packed=*/true);
+    auto const l = layoutOf(s, ti);
+    EXPECT_EQ(l.fieldOffsets[1], 1u) << "packed wins over the pack cap";
+    EXPECT_EQ(l.align.bytes(), 1u);
+    EXPECT_EQ(l.size, 5u);
+
+    // And the cap composes with a whole-composite `aligned(N)` in the other
+    // direction: the cap lowers members, the request raises the aggregate.
+    std::array<TypeId, 2> const f2{ti.primitive(TypeKind::U32),
+                                   ti.primitive(TypeKind::I64)};
+    TypeId const both = cappedComposite(ti, TypeKind::Struct, "BOTH", 2, f2, 4u,
+                                        /*packed=*/false, /*explicitAlign=*/16u);
+    auto const lb = layoutOf(both, ti);
+    EXPECT_EQ(lb.fieldOffsets[1], 4u) << "the cap still moves the member";
+    EXPECT_EQ(lb.align.bytes(), 16u) << "the request still raises the aggregate";
+    EXPECT_EQ(lb.size, 16u);
+}
+
+TEST(TypeLayout, PragmaPackCapOnUnionLowersAlignAndSize) {
+    auto ti = makeInterner(1);
+    // A union places every member at offset 0, so a cap cannot move an offset —
+    // it lowers the union's own alignment, and therefore the size it rounds up
+    // to. { char; long long } under pack(4) is 8/4; uncapped it is 8/8.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::I64)};
+    TypeId const u = cappedComposite(ti, TypeKind::Union, "U", 1, fields, 4u);
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 8u);
+}
+
+// ★★ TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the cap on a struct that
+// CONTAINS a bit-field — the hole in the block above.
+//
+// Every test above this one is bit-field FREE, and that was exactly the shape of the
+// defect: the cap was read only on the non-bit-field path, so ONE `unsigned b:1;`
+// made `computeLayout` forget it — no diagnostic, just the wrong ABI. The
+// cross-compile-compare twin lives in `test_packed_abi_conformance.cpp`
+// (`DssPackBitfieldLayoutMatchesNativeCompiler`, which re-derives these from the host
+// compiler); these hermetic pins hold on a box with no toolchain.
+//
+// clang -arch arm64 MEASURED (compiled AND run), cross-checked -arch x86_64.
+[[nodiscard]] TypeId cappedBitfieldStruct(TypeInterner& ti, std::string_view name,
+                                          std::uint64_t key,
+                                          std::span<TypeId const> fields,
+                                          std::span<std::int64_t const> widths,
+                                          std::uint32_t cap) {
+    TypeId const s = ti.forwardComposite(TypeKind::Struct, name, key);
+    ti.completeComposite(s, fields, /*packed=*/false, widths,
+                         /*fieldOffsets=*/{}, /*fieldAligns=*/{},
+                         /*explicitAlign=*/0, cap);
+    return s;
+}
+
+TEST(TypeLayout, PragmaPackCapAppliesToBitfieldBearingStruct) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(4) struct { unsigned long long a; unsigned b:1; }`
+    // clang: size 12, align 4.  Uncapped (what DSS computed before): 16 / 8.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::U64),
+                                       ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{kNotBitfield, 1};
+    TypeId const capped = cappedBitfieldStruct(ti, "QA", 1, fields, widths, 4u);
+    auto const l = layoutOf(capped, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 12u);           // RED-ON-DISABLE (uncapped 16)
+
+    // The CONTROL that makes both lines above non-vacuous: identical fields and
+    // widths, NO cap. Also the interning pin — the cap is part of the content
+    // identity even for a bit-field struct, so these must not collapse to one TypeId.
+    TypeId const nat = ti.forwardComposite(TypeKind::Struct, "QA", 2);
+    ti.completeComposite(nat, fields, /*packed=*/false, widths);
+    EXPECT_NE(nat.v, capped.v)
+        << "identical bit-field structs under different pack caps lay out to "
+           "different sizes; collapsing them onto one TypeId is a layout miscompile";
+    auto const ln = layoutOf(nat, ti, kGnu16);
+    EXPECT_EQ(ln.align.bytes(), 8u);
+    EXPECT_EQ(ln.size, 16u);
+}
+
+TEST(TypeLayout, PragmaPackCapMovesAnOrdinaryFieldThatFollowsABitfield) {
+    auto ti = makeInterner(1);
+    // `#pragma pack(4) struct { unsigned b:3; unsigned long long a; }`
+    // clang: offsetof(a) == 4, size 12, align 4. Uncapped: a@8, size 16, align 8.
+    // The bit-field comes FIRST here, so this pins that the cap reaches the ORDINARY
+    // field's placement inside the bit-field packer — not just the struct alignment.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::U32),
+                                       ti.primitive(TypeKind::U64)};
+    std::array<std::int64_t, 2> const widths{3, kNotBitfield};
+    TypeId const capped = cappedBitfieldStruct(ti, "QB", 3, fields, widths, 4u);
+    auto const l = layoutOf(capped, ti, kGnu16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.align.bytes(), 4u);     // RED-ON-DISABLE (uncapped 8)
+    EXPECT_EQ(l.size, 12u);             // RED-ON-DISABLE (uncapped 16)
+}
+
+TEST(TypeLayout, CompositeAlignedWeakerThanNaturalIsANoOp) {
+    auto ti = makeInterner(1);
+    // ★ THE MAX-vs-ASSIGNMENT CONTROL. clang:
+    //   `struct L { char c; unsigned v; } __attribute__((aligned(2)));` → 8 / 4.
+    // The request is WEAKER than the natural 4, so it does nothing — `aligned` may
+    // only RAISE (C 6.7.5). Implement the fold as an assignment instead of a MAX and
+    // this becomes 4 / 2 while every other pin in this group still passes.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const l2 = alignedComposite(ti, TypeKind::Struct, "L", 1, fields, 2u);
+    auto const l = layoutOf(l2, ti);
+    EXPECT_EQ(l.align.bytes(), 4u);   // natural 4 SURVIVES the weaker request
+    EXPECT_EQ(l.size, 8u);
+}
+
+TEST(TypeLayout, CompositeAlignedComposesWithPacked) {
+    auto ti = makeInterner(1);
+    // ★ THE HEADLINE WITNESS. clang:
+    //   `struct S { char a; int b; } __attribute__((packed, aligned(16)));` → 16 / 16.
+    // packed removes the inter-field padding (a@0, b@1, extent 5) and the request
+    // raises the aggregate — rounding 5 up to 16. Neither channel overrides the
+    // other: drop packed and it is 16/16 by a DIFFERENT route (b@4, extent 8); drop
+    // the request and it is packed's bare 5 / 1.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::I32)};
+    TypeId const s = alignedComposite(ti, TypeKind::Struct, "S", 1, fields, 16u,
+                                      /*packed=*/true);
+    EXPECT_TRUE(ti.isPacked(s));
+    EXPECT_EQ(ti.explicitCompositeAlign(s), 16u);
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 1u);   // packed still removes the padding
+    EXPECT_EQ(l.align.bytes(), 16u);    // ...and the request still raises the whole
+    EXPECT_EQ(l.size, 16u);             // clang MEASURED 16, NOT packed's 5
+}
+
+TEST(TypeLayout, CompositeAlignedOnUnionRaisesAlignAndSize) {
+    auto ti = makeInterner(1);
+    // clang: `union UA { char c; int i; } __attribute__((packed, aligned(8)));`
+    //        → size 8, align 8. packed alone would give align 1 / size 4.
+    std::array<TypeId, 2> const members{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::I32)};
+    TypeId const u = alignedComposite(ti, TypeKind::Union, "UA", 1, members, 8u,
+                                      /*packed=*/true);
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 8u);   // RED-ON-DISABLE (packed → 1)
+    EXPECT_EQ(l.size, 8u);            // RED-ON-DISABLE (max member 4)
+}
+
+TEST(TypeLayout, CompositeAlignedBitfieldStructRaisesThroughThePacker) {
+    auto ti = makeInterner(1);
+    // ★ The BIT-FIELD path must honor the request too — it is a SEPARATE code path
+    // (the per-ABI packers), and the seed is what covers it BY CONSTRUCTION rather
+    // than by a second edit. clang:
+    //   `struct BF { int x:3; int y:5; } __attribute__((aligned(16)));` → 16 / 16.
+    // (Unaligned it is 4 / 4: 8 bits in one int unit.)
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::I32),
+                                       ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    TypeId const s = alignedComposite(ti, TypeKind::Struct, "BF", 1, fields, 16u,
+                                      /*packed=*/false, widths);
+    auto const l = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 16u);   // RED-ON-DISABLE (int unit → 4)
+    EXPECT_EQ(l.size, 16u);            // RED-ON-DISABLE (4)
+    // The MSVC strategy raises identically — the seed is strategy-independent.
+    EXPECT_EQ(layoutOf(s, ti, kMsvc16).align.bytes(), 16u);
+}
+
+TEST(TypeLayout, CompositeAlignedPropagatesToArrayStrideAndEnclosingStruct) {
+    auto ti = makeInterner(1);
+    // The raised alignment is a property of the TYPE, so it flows outward with no
+    // extra wiring. clang:
+    //   struct A { char c; unsigned v; } __attribute__((aligned(16)));  → 16 / 16
+    //   struct A arr[2];                                                 → 32
+    //   struct Outer { char a; struct A inner; };  → size 32, align 16, inner@16
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const a = alignedComposite(ti, TypeKind::Struct, "A", 1, fields, 16u);
+    EXPECT_EQ(layoutOf(ti.array(a, 2), ti).size, 32u);   // stride 16, not 8
+    std::array<TypeId, 2> const outerFields{ti.primitive(TypeKind::Char), a};
+    auto const o = layoutOf(ti.structType("Outer", outerFields), ti);
+    ASSERT_EQ(o.fieldOffsets.size(), 2u);
+    EXPECT_EQ(o.fieldOffsets[1], 16u);   // inner pushed to 16  RED-ON-DISABLE (4)
+    EXPECT_EQ(o.align.bytes(), 16u);
+    EXPECT_EQ(o.size, 32u);
+}
+
+TEST(TypeLayout, CompositeAlignedAtTheAlignmentCap) {
+    auto ti = makeInterner(1);
+    // The upper bound of the `Alignment` newtype's domain. clang:
+    //   `struct E0 { int a; } __attribute__((aligned(256)));` → 256 / 256.
+    // NOTE `maxAlignment` in the params caps SCALAR alignment (the bounded
+    // natural-alignment rule), NOT an explicit aggregate request — which is why the
+    // request survives a params `maxAlignment` of 16 here, exactly as in clang.
+    std::array<TypeId, 1> const fields{ti.primitive(TypeKind::I32)};
+    TypeId const e = alignedComposite(ti, TypeKind::Struct, "E0", 1, fields, 256u);
+    auto const l = layoutOf(e, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 256u);
+    EXPECT_EQ(l.size, 256u);
+}
+
 TEST(TypeLayout, StructTailPaddingAndNesting) {
     auto ti = makeInterner(1);
     TypeId const i = ti.primitive(TypeKind::I32);
@@ -1198,45 +1530,156 @@ TEST(TypeLayout, SizeOfScalarOrBitIntShim) {
     EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.primitive(TypeKind::I32), DataModel::Lp64), 4u);
 }
 
-// D-CSUBSET-BITINT-C2-WIDE: the memory-resident / by-value-class type-shape predicates
-// over EVERY form. A wide `_BitInt(N>64)` is BOTH (multi-limb, reached by ADDRESS); a
-// narrow `_BitInt(N<=64)` is NEITHER (a single native container — a scalar). Array is
-// memory-resident but NOT by-value-class (it decays); struct/union are both; a plain
-// scalar and the invalid TypeId are neither. `isWideBitInt` is the exact N>64 line.
+// D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE: the memory-resident / by-value-
+// class type-shape predicates over EVERY form. A WIDE integer — a `_BitInt(N>64)` or
+// a 128-bit standard-rank integer (I128/U128) — is BOTH (multi-limb, reached by
+// ADDRESS); a narrow `_BitInt(N<=64)` is NEITHER (a single native container — a
+// scalar). Array is memory-resident but NOT by-value-class (it decays); struct/union
+// are both; a plain scalar and the invalid TypeId are neither. `isWideInt` is the
+// membership line: the exact N>64 boundary for BitInt, plus the two 128-bit kinds.
 TEST(TypeLayout, WideBitIntTypeShapePredicates) {
     auto ti = makeInterner(72);
     TypeId const wide   = ti.bitInt(128, true);
     TypeId const wide2  = ti.bitInt(65, false);   // the smallest wide width
     TypeId const narrow = ti.bitInt(64, true);    // the widest single-container width
     TypeId const i32    = ti.primitive(TypeKind::I32);
+    TypeId const i64    = ti.primitive(TypeKind::I64);
+    TypeId const i128   = ti.primitive(TypeKind::I128);
+    TypeId const u128   = ti.primitive(TypeKind::U128);
     std::array<TypeId, 1> const sfields{i32};
     TypeId const st     = ti.structType("S", sfields);
     TypeId const arr    = ti.array(i32, 4);
 
-    // isWideBitInt — the exact N>64 boundary (64 is narrow, 65 is wide).
-    EXPECT_TRUE(isWideBitInt(ti, wide));
-    EXPECT_TRUE(isWideBitInt(ti, wide2));
-    EXPECT_FALSE(isWideBitInt(ti, narrow));
-    EXPECT_FALSE(isWideBitInt(ti, i32));
-    EXPECT_FALSE(isWideBitInt(ti, st));
-    EXPECT_FALSE(isWideBitInt(ti, TypeId{}));
+    // isWideInt — the exact N>64 boundary (64 is narrow, 65 is wide), PLUS the two
+    // 128-bit standard-rank kinds. I64 pins the "64 bits is still native" line for a
+    // non-BitInt kind, mirroring `narrow` on the BitInt side.
+    EXPECT_TRUE(isWideInt(ti, wide));
+    EXPECT_TRUE(isWideInt(ti, wide2));
+    EXPECT_TRUE(isWideInt(ti, i128));
+    EXPECT_TRUE(isWideInt(ti, u128));
+    EXPECT_FALSE(isWideInt(ti, narrow));
+    EXPECT_FALSE(isWideInt(ti, i32));
+    EXPECT_FALSE(isWideInt(ti, i64));
+    EXPECT_FALSE(isWideInt(ti, st));
+    EXPECT_FALSE(isWideInt(ti, TypeId{}));
 
-    // isMemoryResidentType — struct/union/array + wide _BitInt; NOT narrow/scalar/invalid.
+    // The width/signedness accessors over every wide form. BitInt reads the interned
+    // pair; the 128-bit kinds answer from the KIND alone (I128 signed, U128 not).
+    EXPECT_EQ(wideIntWidthBits(ti, wide), 128);
+    EXPECT_EQ(wideIntWidthBits(ti, wide2), 65);
+    EXPECT_EQ(wideIntWidthBits(ti, i128), 128);
+    EXPECT_EQ(wideIntWidthBits(ti, u128), 128);
+    EXPECT_TRUE(wideIntIsSigned(ti, wide));
+    EXPECT_FALSE(wideIntIsSigned(ti, wide2));
+    EXPECT_TRUE(wideIntIsSigned(ti, i128));
+    EXPECT_FALSE(wideIntIsSigned(ti, u128));
+
+    // isMemoryResidentType — struct/union/array + EVERY wide integer; NOT narrow/
+    // scalar/invalid. The I128/U128 rows are what route a 128-bit value through the
+    // multi-limb emitters instead of a bare-SSA scalar carrying only the low 8 bytes.
     EXPECT_TRUE(isMemoryResidentType(ti, wide));
+    EXPECT_TRUE(isMemoryResidentType(ti, i128));
+    EXPECT_TRUE(isMemoryResidentType(ti, u128));
     EXPECT_TRUE(isMemoryResidentType(ti, st));
     EXPECT_TRUE(isMemoryResidentType(ti, arr));
     EXPECT_FALSE(isMemoryResidentType(ti, narrow));
     EXPECT_FALSE(isMemoryResidentType(ti, i32));
+    EXPECT_FALSE(isMemoryResidentType(ti, i64));
     EXPECT_FALSE(isMemoryResidentType(ti, TypeId{}));
 
-    // isByValueClass — struct/union + wide _BitInt; ARRAY EXCLUDED (decays), NOT narrow/
-    // scalar/invalid. This is the ONLY difference from isMemoryResidentType: the array.
+    // isByValueClass — struct/union + EVERY wide integer; ARRAY EXCLUDED (decays), NOT
+    // narrow/scalar/invalid. This is the ONLY difference from isMemoryResidentType:
+    // the array. The two predicates must agree on I128/U128 (neither decays).
     EXPECT_TRUE(isByValueClass(ti, wide));
+    EXPECT_TRUE(isByValueClass(ti, i128));
+    EXPECT_TRUE(isByValueClass(ti, u128));
     EXPECT_TRUE(isByValueClass(ti, st));
     EXPECT_FALSE(isByValueClass(ti, arr));       // the array/by-value distinction
     EXPECT_FALSE(isByValueClass(ti, narrow));
     EXPECT_FALSE(isByValueClass(ti, i32));
+    EXPECT_FALSE(isByValueClass(ti, i64));
     EXPECT_FALSE(isByValueClass(ti, TypeId{}));
+}
+
+// ★ D-CSUBSET-UINT128-TYPE: `_BitInt(128)` and `unsigned __int128` share a limb COUNT
+// and a SIZE but NOT a LAYOUT, and the whole 128-bit design depends on those two facts
+// staying independent. `_BitInt(128)` is 16/8 — size 16, align EIGHT — because the
+// x86-64 psABI aligns a bit-precise type to its limb, not its size (computeLayout's
+// BitInt arm hardcodes alignBytes=8 for N>64, and examples/c-subset/c23_bitint_wide
+// pins it from real C). U128 is 16/16 — the ordinary natural-alignment rule applied to
+// a 16-byte scalar via scalarByteSize. MEASURED against the shipped consumer: the pe/
+// x86_64 `jmp_buf` is `arr<u128,16>` (shippedLibs/setjmp.json), sizeof 256, _Alignof 16
+// — which is exactly `_setjmp`'s movaps requirement and would BREAK at align 8.
+// Asserting both in ONE test is the point: a future "unify the 128-bit types" edit
+// cannot make one follow the other without turning this red.
+TEST(TypeLayout, Int128AndBitInt128AreIndependentLayouts) {
+    auto ti = makeInterner(74);
+
+    auto const lb = layoutOf(ti.bitInt(128, true), ti);
+    EXPECT_EQ(lb.size, 16u);
+    EXPECT_EQ(lb.align.bytes(), 8u) << "_Alignof(_BitInt(128)) must stay 8 (psABI)";
+
+    auto const li = layoutOf(ti.primitive(TypeKind::I128), ti);
+    EXPECT_EQ(li.size, 16u);
+    EXPECT_EQ(li.align.bytes(), 16u) << "_Alignof(__int128) must stay 16";
+
+    auto const lu = layoutOf(ti.primitive(TypeKind::U128), ti);
+    EXPECT_EQ(lu.size, 16u);
+    EXPECT_EQ(lu.align.bytes(), 16u) << "_Alignof(unsigned __int128) must stay 16";
+
+    // Same size, DIFFERENT alignment — stated as a relation so the divergence itself
+    // is the assertion, not just two coincidental constants.
+    EXPECT_EQ(lb.size, lu.size);
+    EXPECT_NE(lb.align.bytes(), lu.align.bytes());
+
+    // The shipped consumer: `arr<u128,16>` is the pe/x86_64 jmp_buf — 256 bytes,
+    // 16-aligned. Element alignment propagates to the array (setjmp_longjmp depends
+    // on it: a wrong alignment crashes `_setjmp`'s movaps xmm saves).
+    auto const lj = layoutOf(ti.array(ti.primitive(TypeKind::U128), 16), ti);
+    EXPECT_EQ(lj.size, 256u);
+    EXPECT_EQ(lj.align.bytes(), 16u);
+}
+
+// ★ D-CSUBSET-UINT128-TYPE: the align-16 fact PROPAGATED THROUGH A REAL AGGREGATE, and
+// the C++ twin of the `_Static_assert(sizeof(struct N) == 528)` in
+// examples/c-subset/c_int128_arith/main.c. Two reasons this lives here as well:
+//
+//  1. UN-MASKABLE. A failed `_Static_assert` ABORTS translation, so if the example's
+//     compile-time block ever turns red it takes every runtime pin in that file with
+//     it. This test cannot be masked that way — it is the belt for the example's braces.
+//  2. NON-VACUOUS BY MEASUREMENT. `struct { u128 v[32]; unsigned f1, f2; }` is 528, and
+//     the `_BitInt(128)` twin of the SAME struct is 520. The 8-byte difference is the
+//     tail round-up: 32*16 = 512 bytes of array + 8 bytes of `unsigned` pair = 520,
+//     rounded UP to the struct alignment — 16 for U128 (⇒ 528), 8 for `_BitInt(128)`
+//     (⇒ 520, a no-op round). Asserting BOTH numbers in one test is the point: it is
+//     the aggregate-level statement of the same independence
+//     `Int128AndBitInt128AreIndependentLayouts` asserts on the bare scalars, and a
+//     future "unify the 128-bit types" edit cannot satisfy both.
+//
+// The `unsigned` pair is load-bearing — a struct of ONLY the array would be 512 either
+// way and the two layouts would agree, which is exactly the vacuous shape to avoid.
+TEST(TypeLayout, Int128AggregateLayoutVsBitInt128) {
+    auto ti = makeInterner(75);
+    TypeId const u32Ty = ti.primitive(TypeKind::U32);
+
+    std::array<TypeId, 3> const uFields{
+        ti.array(ti.primitive(TypeKind::U128), 32), u32Ty, u32Ty};
+    auto const lu = layoutOf(ti.structType("NU128", uFields), ti);
+    EXPECT_EQ(lu.size, 528u)
+        << "512B of u128[32] + 8B of unsigned pair, rounded UP to align 16";
+    EXPECT_EQ(lu.align.bytes(), 16u) << "the member's align 16 propagates to the struct";
+
+    std::array<TypeId, 3> const bFields{
+        ti.array(ti.bitInt(128, false), 32), u32Ty, u32Ty};
+    auto const lb = layoutOf(ti.structType("NBitInt128", bFields), ti);
+    EXPECT_EQ(lb.size, 520u)
+        << "the _BitInt(128) twin: same 520 bytes of payload, but align 8 makes the "
+           "tail round-up a NO-OP — this is what makes the 528 above non-vacuous";
+    EXPECT_EQ(lb.align.bytes(), 8u) << "_Alignof(_BitInt(128)) must stay 8 (psABI)";
+
+    // Stated as a relation, so the DIVERGENCE itself is the assertion.
+    EXPECT_NE(lu.size, lb.size);
+    EXPECT_NE(lu.align.bytes(), lb.align.bytes());
 }
 
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5p13): a complex lays out as {re@0, im@es},
@@ -1267,7 +1710,7 @@ TEST(TypeLayout, ComplexLayoutAndShapePredicates) {
     // it does NOT decay). NOT a wide _BitInt.
     EXPECT_TRUE(isMemoryResidentType(ti, cd));
     EXPECT_TRUE(isByValueClass(ti, cd));
-    EXPECT_FALSE(isWideBitInt(ti, cd));
+    EXPECT_FALSE(isWideInt(ti, cd));
 
     // IMPORTANT-5 (red-on-disable): a Complex takes the GPR default reg class — NEVER
     // the FPR arm. requireEncodedFloatWidth no-ops on non-FPR, so the aggregate never

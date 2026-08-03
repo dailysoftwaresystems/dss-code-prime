@@ -24,6 +24,9 @@ thread_local PhaseTimers::Scope* gCurrentScope = nullptr;
 std::string_view compilePhaseName(CompilePhase p) noexcept {
     switch (p) {
         case CompilePhase::Preprocess:     return "preprocess";
+        case CompilePhase::PreprocessSplice:   return "preprocess-splice";
+        case CompilePhase::PreprocessTokenize: return "preprocess-tokenize";
+        case CompilePhase::PreprocessExpand:   return "preprocess-expand";
         case CompilePhase::Tokenize:       return "tokenize";
         case CompilePhase::Parse:          return "parse";
         case CompilePhase::Reparse:        return "reparse";

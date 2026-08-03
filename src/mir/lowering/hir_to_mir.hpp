@@ -92,6 +92,21 @@ struct DSS_EXPORT MirLoweringConfig {
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
 
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
+    // CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
+    // `signed char`/`unsigned char`) is UNSIGNED for this compilation. ALREADY
+    // RESOLVED when it arrives here — the driver threads in
+    // `TargetSchema::charIsUnsigned(format.kind())`, which folds the target's
+    // per-processor default together with its per-object-format overrides. The
+    // axis is (processor × PLATFORM), not per-processor: the same AArch64 CPU
+    // is UNSIGNED under GNU/Linux AAPCS64 and SIGNED under Apple's Darwin ABI.
+    // Read ONLY by `isSignedIntKind(Char)` — the one char-signedness predicate,
+    // driving the char→int promotion's SExt (signed) vs ZExt (unsigned) in
+    // `mapCast`. Default false = signed (x86_64/pe64 stay byte-identical).
+    // NO arch, format or platform identity branch anywhere — the decision is
+    // this already-resolved config bool.
+    bool                  charIsUnsigned = false;
+
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate
     // classification strategy + max-register-bytes, threaded from the resolved
     // `TargetCallingConvention` (the §B-locked HIR→MIR boundary, mirroring how
@@ -274,6 +289,46 @@ lowerToMir(Hir const&               hir,
            // carrier the optimizer's returns-twice-aware passes (mem2reg no-promote,
            // inliner callee-refusal) consult (noreturn is HIR-discharged and never
            // reaches MIR; returns-twice MUST, so it needs this flag).
-           HirReturnsTwiceMap const* returnsTwiceMap = nullptr);
+           HirReturnsTwiceMap const* returnsTwiceMap = nullptr,
+           // TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION-DECLARATION inliner
+           // opt-out side-table, populated by the CST→HIR lowerer from each
+           // function's bound symbol `SymbolRecord.isNoInline`. Optional:
+           // nullptr (or a decl with no entry) ⇒ freely inlinable, which is the
+           // correct reading of an un-annotated C function AND the behavior
+           // before this key existed. Read here to stamp `MirFunc.noInline` —
+           // the flag the optimizer's inlining legality gate refuses on, beside
+           // the Weak-binding rule. Keyed on the same declaration node as
+           // `linkageMap` and read at the same site.
+           HirNoInlineMap const*    noInlineMap = nullptr,
+           // TF-C81 (D-CSUBSET-ALWAYSINLINE): the `noInlineMap` mirror —
+           // per-FUNCTION-DECLARATION inliner COST-MODEL BYPASS side-table,
+           // populated by the CST→HIR lowerer from each function's bound symbol
+           // `SymbolRecord.isAlwaysInline`. Optional: nullptr (or a decl with no
+           // entry) ⇒ the size threshold applies as usual, which is both the
+           // correct reading of an un-annotated C function and the behavior
+           // before this key existed. Read here to stamp `MirFunc.alwaysInline`.
+           // Keyed on the same declaration node as `linkageMap` / `noInlineMap`
+           // and read at the same site.
+           HirAlwaysInlineMap const* alwaysInlineMap = nullptr,
+           // ★★ TF-C85: per-FUNCTION-DECLARATION OPTIMIZER OPT-OUT side-table,
+           // populated by the CST→HIR lowerer from each function's bound symbol
+           // `SymbolRecord.isNoOptimize` — which the semantic tier set from the
+           // preprocessor's `#pragma optimize("", off)` REGION stamps, not from
+           // an attribute. Optional: nullptr (or a decl with no entry) ⇒
+           // optimize normally, which is both the correct reading of a function
+           // outside every region and the behavior before this key existed.
+           // Read here to stamp `MirFunc.noOptimize`. Keyed on the same
+           // declaration node as the three maps above and read at the same site.
+           HirNoOptimizeMap const*  noOptimizeMap = nullptr,
+           // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): per-FUNCTION-DECLARATION
+           // thread-sanitizer EXCLUSION side-table, populated by the CST→HIR
+           // lowerer from each function's bound symbol
+           // `SymbolRecord.isNoSanitizeThread`. Optional: nullptr (or a decl with
+           // no entry) ⇒ no recorded exclusion, which is both the correct reading
+           // of an un-annotated C function and the behavior before this key
+           // existed. Read here to stamp `MirFunc.noSanitizeThread`, which
+           // `mir_text` surfaces as `nosanitizethread`. Keyed on the same
+           // declaration node as the four maps above and read at the same site.
+           HirNoSanitizeThreadMap const* noSanitizeThreadMap = nullptr);
 
 } // namespace dss

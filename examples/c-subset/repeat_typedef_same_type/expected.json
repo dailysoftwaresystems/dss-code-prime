@@ -1,0 +1,35 @@
+{
+  "$comment": "TF-C97 (D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE, C11 6.7p3: a typedef name may be redefined to denote the same type as it currently does, provided that type is not a variably modified type). Runtime witness on every shipped (architecture x object-format) leg, RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. TWO ARMS, ONE EXIT: (1) the REAL macOS SDK shape — one tag, two headers: `$SDK/usr/include/malloc/_malloc_type.h:79` typedefs the FORWARD-DECLARED `struct _malloc_zone_t` and `malloc/malloc.h:246` typedefs the SAME tag AT ITS COMPLETION, which after preprocessing are two same-scope typedefs of one name (reproduced here as `zone_t`); (2) the direct byte-identical repeat `typedef int Count;` twice. WHAT THE DEFECT WAS: a typedef is neither a prototype nor an extern nor a tentative definition, so `mergeOrCollideRedeclaration`'s definedness rank scored BOTH sides 3 and the merge gate's `!bothDefinitions` term rejected even a LEGAL repeat as S0002 — the category was never wrong (`category()` already returned Type for both), the definedness ladder simply had no notion of a typedef. WHY IT SURFACED NOW: this cycle's SIBLING change (D-PP-FORMAT-DATA-MODEL-PREDEFINES, the `predefined_lp64_macho` example) ships `__LP64__`, so DSS began compiling the SDK's LP64 arms; the ILP32 arm it used to take never reached the second typedef. MEASURED A/B on the real census manifest for sqlite src/mem1.c: 3x error[S0029] with the `__LP64__` rows stripped, 1x error[S0002] with them shipped — a net improvement that was still an error, and the LAST error on the arm64-macho sqlite leg. WHY THE EXIT IS LOAD-BEARING rather than decorative: `zone_total` is PROTOTYPED between the two typedefs (its parameter resolves through alias #1, against the INCOMPLETE tag) and DEFINED after them (through alias #2, against the COMPLETED tag), so the proto/def pair merges only if the two aliases are ONE type — were they distinct, the post-Pass-1.5 signature sweep would fire S_IncompatibleRedeclaration and no binary would exist to run. `tag_total` reaches the same fields through the TAG spelling, so all three spellings must name one type for 21+21. THE VERIFICATION COMPARES RESOLVED TypeIds, NEVER SPELLINGS: Pass 1 admits the Type-to-Type pair optimistically (at Pass 1 neither side's type is resolved yet — `typedef struct _zone_t zone_t;` names a tag a LATER declaration completes) and the existing `mergedFnDecls` post-1.5 sweep renders the verdict, the same seam D-CSUBSET-FN-TYPEDEF-PROTOTYPE's candidate already defers to. RED-ON-DISABLE (MEASURED, not predicted): drop `|| typedefRepeat` from the Pass-1 merge gate and both `zone_t` and `Count` fall into the bothDefinitions collision arm — 2x error[S0002], the program no longer COMPILES and the runner reports a compile failure instead of exit 42; replayed on a VERBATIM extract of the two real `malloc_zone_t` declarations taken from `/usr/bin/clang -E` output of `#include <malloc/malloc.h>` (post-preprocessing lines 3185 and 3218-3340), the same revert gives exactly `1 x error[S0002]: got malloc_zone_t` and the restored build compiles it clean and exits 42. NOT WIDENED, each pinned in tests/analysis/semantic/test_semantic_analyzer_c_subset.cpp against /usr/bin/clang ground truth: a VARIABLY MODIFIED repeat stays loud (6.7p3's carve-out — the interner has no length operand on a vlaArray so the two TypeIds are EQUAL, and a bare same-TypeId check would silently accept precisely the shape the standard singles out; clang: `redefinition of typedef for variably-modified type`); two DIFFERENT types under one name stay loud with the specific S_IncompatibleRedeclaration; a sized-vs-incomplete array pair stays loud because 6.7p3's `same type` is strictly stronger than C 6.2.7's OBJECT composite-type relaxation (clang: `typedef redefinition with different types ('int[]' vs 'int[3]')`); an INNER-scope shadow stays legal and never reaches the rule (the merge runs only on a same-scope bind collision); and a typedef repeating a NON-typedef name stays a cross-category S0002 (clang: `redefinition of 'x' as different kind of symbol`). ALL FOUR LEGS: the rule is a pure source-language (C11) property with no target or object-format content, so every shipped leg must agree — a divergence would mean the semantic tier had become target-aware, which is exactly the agnosticism this corpus exists to defend. FOLD-RESISTANCE: `g_seed` is a mutable global (runtime-opaque) feeding both field values across a real call boundary, so the baseline arm keeps live loads instead of folded immediates; the `release` arm re-runs the SHIPPED release pipeline (Mem2Reg + Inlining active) over the same source, witnessing optimizer x feature composition rather than assuming it.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

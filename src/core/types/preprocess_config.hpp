@@ -2,7 +2,11 @@
 
 #include "core/export.hpp"
 
+#include <cstdint>
+#include <expected>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss {
@@ -22,6 +26,34 @@ namespace dss {
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
 enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// TF-C83 (D-CSUBSET-TOOLCHAIN-IDENTITY-PREDEFINES). Pack a dot-separated version ("0.0.2")
+// into ONE integer using `weights` (most-significant first, last entry 1):
+// sum(component[i] * weights[i]). With [1000000, 1000, 1] this is the
+// GCC_VERSION encoding, so the result ORDERS correctly — 0.0.2 (2) < 0.1.0
+// (1000) < 1.0.0 (1000000) — so a `#if`-time `>=` against the resulting macro
+// behaves as read. Which macro that is stays CONFIG's business; the engine
+// knows only the `version` kind and the `componentWeights` key.
+//
+// Returns the packed value, or an ERROR MESSAGE. Every rejection is a case
+// where the encoding would otherwise be silently WRONG rather than merely
+// unusual:
+//   * malformed version text (empty field / non-digit / absurd component);
+//   * component count != weight count (the config describes a different
+//     version shape than the build actually has);
+//   * a component that REACHES its derived bound weights[i-1]/weights[i] —
+//     e.g. 0.0.1000 under [1000000,1000,1] packs to 1000, indistinguishable
+//     from 0.1.0. The bound is read off the weights the CONFIG declared; no
+//     magic 1000 exists in the engine, so a different declared encoding is
+//     bounded correctly for free.
+//
+// Split out of the `version`-kind loader specifically so these paths are
+// reachable from unit tests with an ARBITRARY version string — baking the
+// build's own version in would make them testable only by editing the repo's
+// VERSION file and reconfiguring, which in practice means untested.
+[[nodiscard]] DSS_EXPORT std::expected<long long, std::string>
+packVersionComponents(std::string_view           versionText,
+                      std::span<const long long> weights);
 
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
@@ -97,6 +129,90 @@ struct DSS_EXPORT CAttributeDef {
 //   are NOT grammar keywords), so matching them by text keeps the grammar
 //   untouched. The loader validates each as a non-empty string.
 //
+// ── TF-C82: the `#pragma` / `_Pragma` effect registry (C 6.10.6 / 6.10.9) ──
+//
+// The CLOSED verb set a `pragmaEffects` row may declare. Mirrors
+// `AttributeEffect` exactly — one table, `static_assert`ed complete at the
+// switch, and an unknown verb is a LOAD error (`C_InvalidPreprocess`) so a typo
+// can never silently disarm a row.
+//
+// ★ WHY THREE FLAVOURS OF "DO NOTHING" RATHER THAN ONE. They make DIFFERENT
+// claims, and the whole reason this registry exists is that "the compiler was
+// silent" is not a claim at all:
+//
+//  • `DiagnosticsOnly` asserts the pragma's ENTIRE effect is to configure
+//    diagnostics of a compiler DSS is not, AND that DSS emits none of them. That
+//    is checkable — `clang diagnostic push/pop/ignored` tunes clang warnings;
+//    `clang assume_nonnull begin/end` scopes NULLABILITY qualifiers DSS neither
+//    parses nor diagnoses. Both are inert HERE for a stated reason, not by
+//    accident. (MEASURED reached in the sqlite corpus: 48 `clang diagnostic`
+//    + 24 `clang assume_nonnull` occurrences.)
+//  • `AnnotationOnly` asserts the pragma is pure authoring metadata with no
+//    translation semantics in ANY compiler (`#pragma mark` is an IDE bookmark).
+//  • `RealizationRequestOnly` (TF-C85) asserts something NEITHER of the two
+//    above can say, and is why it needed its own verb rather than being folded
+//    into one of them. MSVC `#pragma intrinsic(f, g)` DOES concern translation —
+//    it is not a diagnostic knob and not metadata — but its entire content is a
+//    request about HOW a listed name is realized (inline expansion instead of a
+//    CRT call), never a claim that the name EXISTS or a change to what calling
+//    it means. DSS chooses realization itself: a name it lowers as a builtin
+//    never becomes a CRT call, and a name it does not provide fails loud at the
+//    CALL SITE (`S_UnknownIdentifier`) whether or not the pragma was honored. So
+//    ignoring the pragma cannot mask a missing symbol and cannot change program
+//    behavior. That is a checkable claim about the ENGINE, not about the
+//    pragma's arguments — which matters because the match is by PREFIX, so ONE
+//    row makes ONE claim covering EVERY name the pragma can list, including
+//    names this implementation has never heard of.
+//  • `Unsupported` asserts the pragma DOES have translation semantics that DSS
+//    has not implemented — so it is LOUD, and (like `#error`) unsuppressable:
+//    silencing a real semantic effect is how a wrong-layout/wrong-code artifact
+//    ships green.
+//  • `IncludeOnce` (TF-C87) asserts the pragma declares its FILE include-once
+//    (C's `#pragma once`). It is a REFINEMENT of `Unsupported`, not an escape
+//    from it: DSS does not implement include-once dedup, so `applyPragma` is
+//    just as LOUD on this verb as on `Unsupported`. What the separate verb buys
+//    is that ONE OTHER reader — the include-guard detector
+//    (D-PP-INCLUDE-REENTRY-GUARD-AWARE) — can tell "this header's include-once
+//    mechanism is a pragma I don't implement" apart from "this header carries no
+//    include-once mechanism at all". Those are different facts about the user's
+//    code and they need different messages; without the verb the detector would
+//    have to recognise the WORD `once`, which is exactly the identity branch the
+//    registry exists to forbid.
+//
+// `StructPacking` and `OptimizerControl` are the verbs with a real sink:
+// `#pragma pack` drives the member-alignment CAP into the composite layout
+// channel; `#pragma optimize` drives a per-function optimizer opt-out into
+// `MirFunc.noOptimize`.
+enum class PragmaEffect : std::uint8_t {
+    // Configures another compiler's diagnostics; DSS emits none of them.
+    DiagnosticsOnly,
+    // Authoring/IDE metadata with no translation semantics anywhere.
+    AnnotationOnly,
+    // TF-C85: the pragma only requests HOW a name it LISTS is realized — never
+    // WHETHER that name exists. See the long argument on the enumerator below.
+    RealizationRequestOnly,
+    // C `#pragma pack` — a LEXICALLY SCOPED maximum member alignment. The one
+    // verb with a layout sink (`TypeInterner`'s `maxFieldAlign` channel).
+    StructPacking,
+    // TF-C85: MSVC `#pragma optimize("", on|off)` — a LEXICALLY SCOPED
+    // per-function optimizer opt-out. The second verb with a real sink.
+    OptimizerControl,
+    // Real translation semantics DSS has NOT implemented → loud + unsuppressable.
+    Unsupported,
+    // TF-C87: the pragma declares its FILE include-once (C's `#pragma once`).
+    // Still loud at `applyPragma` (DSS implements no include-once dedup); the
+    // verb exists so the include-guard detector can NAME the mechanism instead
+    // of reporting "no include guard detected". See the argument above.
+    IncludeOnce,
+};
+
+// One registry row: the leading WORD(S) that identify a pragma, and what DSS
+// does with it. The LONGEST matching prefix wins.
+struct DSS_EXPORT PragmaEffectRow {
+    std::vector<std::string> prefix;   // e.g. {"clang","diagnostic"} or {"pack"}
+    PragmaEffect             effect = PragmaEffect::Unsupported;
+};
+
 // Every field is validated at load (`C_InvalidPreprocess` / `C_MissingField`
 // / `C_UnknownToken`) so a loaded schema is guaranteed self-consistent; the
 // engine's lookups are defensive only.
@@ -277,14 +393,103 @@ struct DSS_EXPORT PreprocessConfig {
 
     // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
     // TEXT against the token after `#` (like define/undef/include -- `pragma`
-    // lexes as a plain Identifier, NOT a grammar keyword). The preprocessor
-    // consumes-and-DROPS the whole `#pragma` line with NO error (C 6.10.6p2
-    // licenses ignoring an unrecognized pragma; DSS recognizes none, so every
-    // pragma is dropped). OPTIONAL -- empty means the language has NO `#pragma`
-    // directive, so a `#pragma` line then hits the generic unsupported-directive
-    // fail-loud (`P_PreprocessorUnsupported`). The engine matches THIS string,
-    // never a hard-coded "pragma".
+    // lexes as a plain Identifier, NOT a grammar keyword). OPTIONAL -- empty
+    // means the language has NO `#pragma` directive, so a `#pragma` line then
+    // hits the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`). The engine matches THIS string, never a
+    // hard-coded "pragma".
+    //
+    // ★★ TF-C82 — WHAT THIS FIELD USED TO MEAN, AND WHY THAT WAS A SILENT DROP.
+    // From FC15c until TF-C82 a recognized `#pragma` line was consumed and
+    // DROPPED with no diagnostic and no tokens, justified by C 6.10.6p2 ("an
+    // unrecognized pragma may be ignored"). The justification was sound for a
+    // pragma that DOES nothing and false for one that does: MEASURED on this
+    // Mac, the sqlite corpus REACHES 40 `#pragma pack` lines across 5 TUs, and
+    // `sys/fcntl.h`'s `#pragma pack(4)` region makes `struct log2phys` 20 bytes
+    // / align 4 where the unpacked layout is 24 / 8 — a wrong-ABI struct handed
+    // to a live `fcntl(F_LOG2PHYS)` syscall. 6.10.6p2 licenses IGNORING a
+    // pragma; it does not license claiming to have ignored one that changed the
+    // layout. So recognition is now a REGISTRY (`pragmaEffects`) and the
+    // unknown case is LOUD (`unknownPragmaIsError`).
     std::string pragmaDirective;
+
+    // TF-C82 (`_Pragma`; C 6.10.9): the PRAGMA OPERATOR word, matched by lexeme
+    // TEXT (an ordinary identifier, like `defined`/`__has_include`). `_Pragma(
+    // "string-literal")` is EXACTLY equivalent to a `#pragma` line whose
+    // pp-tokens are the DE-STRINGIZED literal (6.10.9p1: delete the `L` prefix
+    // if present, delete the outer quotes, replace `\"` with `"` and `\\` with
+    // `\`), so it routes through the SAME `pragmaEffects` registry — one
+    // registry, two spellings. OPTIONAL: empty ⇒ the language has no pragma
+    // operator and `_Pragma` is an ORDINARY identifier (toy / tsql — pinned).
+    //
+    // ★ IT RESOLVES AT EXPANSION TIME, NOT AT THE DIRECTIVE SCAN. `_Pragma` is
+    // an operator in the token stream, not a directive, so it can (and in the
+    // Apple SDK routinely does) arrive from inside a macro REPLACEMENT LIST:
+    // `sys/queue.h`'s `__NULLABILITY_COMPLETENESS_PUSH/POP` are exactly that
+    // shape, expanded at 40 use sites. Handling it only where directives are
+    // scanned would leave a file-scope `_Pragma` green while every macro-borne
+    // one silently vanished — the halfway state this field's test battery
+    // discriminates on.
+    std::string pragmaOperator;
+
+    // TF-C82: what a `#pragma` / `_Pragma` whose leading word(s) match NO
+    // `pragmaEffects` row does. TRUE (the C-subset posture) ⇒ fail loud
+    // (`P_PreprocessorPragma`). FALSE ⇒ silently ignored, the pre-TF-C82
+    // behavior, kept as a deliberate OPT-OUT rather than deleted: C 6.10.6p2
+    // genuinely permits it, and a language whose pragma surface is provably
+    // inert may say so. Default FALSE so a language that declares no registry
+    // at all is unchanged (a config must OPT IN to loudness).
+    //
+    // ★ THE POINT OF THE PAIR IS THAT SILENCE BECOMES A CLAIM. Before TF-C82
+    // every pragma was silently dropped and nothing distinguished "we checked
+    // and it is inert" from "we never looked". With the registry, an ignored
+    // pragma is ignored because a ROW SAYS SO, and anything else is loud.
+    bool unknownPragmaIsError = false;
+
+    // TF-C82: the pragma REGISTRY — the `attributeEffects` house pattern, keyed
+    // by the pragma's leading WORD(S) rather than by a single name (a real
+    // pragma's identity is a prefix: `clang diagnostic push` is a `clang
+    // diagnostic` pragma). The LONGEST matching prefix wins, so a future
+    // `["clang","diagnostic","push"]` row could refine `["clang","diagnostic"]`
+    // without either row being shadowed by declaration order.
+    //
+    // OPTIONAL: an empty registry with `unknownPragmaIsError == false` is
+    // byte-for-byte the pre-TF-C82 drop-everything behavior.
+    std::vector<PragmaEffectRow> pragmaEffects;
+
+    // TF-C82: the `structPacking` operand SUB-VOCABULARY — the two words that
+    // select the STACK forms of C's `#pragma pack` (`pack(push, N)` /
+    // `pack(pop)`), matched by lexeme TEXT. The depth-less SET/RESET forms
+    // (`pack(N)` / `pack()`) need no vocabulary at all: they are recognized
+    // structurally (one integer operand, or none).
+    //
+    // ★ WHY THESE ARE CONFIG AND `N` IS NOT. The engine owns the SEMANTIC of the
+    // `structPacking` verb — a maximum member alignment, its push/pop discipline,
+    // its power-of-two rule — exactly as `AttributeEffect::Align` owns
+    // `aligned(N)`'s. What it must never own is a WORD: a literal `"push"` in
+    // engine code is an identity branch on source vocabulary, the same class of
+    // hard-coding `pragmaDirective` exists to prevent. OPTIONAL and independent:
+    // a language declaring `structPacking` but NOT these words gets the set/reset
+    // forms and a LOUD refusal of the stack forms (never a silent no-op) — which
+    // is also the red-on-disable pin for this pair.
+    //
+    // MEASURED necessity: the reached sqlite corpus uses BOTH idioms — 13
+    // `pack(4)` + 1 `pack(1)` closed by 14 `pack()`, and 5 `pack(push, 4)` + 1
+    // `pack(push, 1)` closed by 6 `pack(pop)`. Building only one is insufficient.
+    std::string pragmaPackPushWord;
+    std::string pragmaPackPopWord;
+
+    // TF-C85: the `optimizerControl` operand SUB-VOCABULARY — the two words that
+    // OPEN and CLOSE an MSVC `#pragma optimize("", off) … #pragma optimize("",
+    // on)` region, matched by lexeme TEXT. Same discipline as the `pack`
+    // push/pop pair above and for the same reason: the engine owns the SEMANTIC
+    // (a lexically scoped per-function optimizer opt-out), config owns the WORD.
+    //
+    // OPTIONAL and independent. A language declaring `optimizerControl` but NOT
+    // these words gets a LOUD refusal of every `#pragma optimize` form (never a
+    // silent no-op) — which is this pair's red-on-disable pin.
+    std::string pragmaOptimizeOnWord;
+    std::string pragmaOptimizeOffWord;
 
     // FC15c (`__has_include`; C23 6.10.1p4): the `__has_include` OPERATOR
     // keyword, valid only inside a `#if`/`#elif` operand. `__has_include(<h>)` /
@@ -337,6 +542,55 @@ struct DSS_EXPORT PreprocessConfig {
     // THIS string, never a hard-coded "embed".
     std::string embedDirective;    // "embed"
 
+    // TF-C59 (`#line`; C23 6.10.4 / D-CPP-LINE-DIRECTIVE): the LINE-CONTROL
+    // directive keyword. `#line digits ["file"]` sets the PRESUMED line (and
+    // optionally the presumed file name) reported by `__LINE__`/`__FILE__` and
+    // by diagnostic positions from the FOLLOWING line onward. The operands may
+    // themselves be macro-invocations (6.10.4p4), in which case they are
+    // macro-expanded first and the RESULT must match one of the two forms.
+    //
+    // Why this is not optional in practice: every C-generating tool emits it
+    // (lemon, bison, flex, re2c, protoc) so the compiler's diagnostics point at
+    // the GENERATOR's input rather than the generated file. SQLite's own
+    // `parse.c` (lemon) carries 50 of them — the amalgamation only works today
+    // because `mksqlite3c.tcl` STRIPS them while generating `sqlite3.c`.
+    //
+    // OPTIONAL -- empty means the language declares NO `#line`, so a `#line`
+    // falls through to the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`; the `pragmaDirective`/`embedDirective`
+    // opt-in model). The engine matches THIS string, never a hard-coded "line".
+    std::string lineDirective;     // "line"
+
+    // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5 / `#warning`; C23 6.10.6): the
+    // DIAGNOSTIC directive words, matched by lexeme TEXT against the token after
+    // `#` (like define/undef/include/line -- `error`/`warning` lex as plain
+    // Identifiers, NOT grammar keywords). A REACHED `#error` emits
+    // `P_PreprocessorErrorDirective` at Error severity (C23 6.10.5p1: a
+    // constraint -- the implementation shall diagnose and the translation unit
+    // is invalid); a reached `#warning` emits `P_PreprocessorWarningDirective` at
+    // Warning severity and translation CONTINUES. Both messages carry the
+    // directive's `pp-tokens` VERBATIM -- the operand is never macro-expanded
+    // (gcc/clang agree; the text is prose, not a macro invocation site) and is
+    // OPTIONAL (`pp-tokens_opt`), so a bare `#error` is well-formed and still
+    // fires.
+    //
+    // OPTIONAL -- empty means the language declares NO such directive, so the
+    // line falls through to the generic unsupported-directive fail-loud
+    // (`P_PreprocessorUnsupported`; the `pragmaDirective`/`embedDirective`/
+    // `lineDirective` opt-in model). The engine matches THESE strings, never a
+    // hard-coded "error"/"warning" -- rebinding the word in the config rebinds
+    // the feature, and stripping the field restores the fail-loud fallback.
+    //
+    // ★ Both are dispatched BELOW `handleDirective`'s `if (!stackActive())`
+    // dead-branch gate -- the `#pragma`/`#embed`/`#line` parity -- so an `#error`
+    // inside a NOT-TAKEN `#if` branch is entirely SILENT (C 6.10p1: a skipped
+    // group is parsed only far enough to track nesting). That is load-bearing,
+    // not cosmetic: the Apple SDK headers guard unsupported configurations with
+    // an `#error` inside branches a supported target skips, so a recognise-on-lex
+    // implementation could not compile a single macOS translation unit.
+    std::string errorDirective;    // "error"
+    std::string warningDirective;  // "warning"
+
     // FC17.9(h) (`__has_embed`; C23 6.10.1): the `__has_embed` OPERATOR keyword,
     // valid only inside a `#if`/`#elif` operand. `__has_embed("resource")` tests
     // whether the resource a `#embed` of the same form would read exists, yielding
@@ -373,5 +627,52 @@ struct DSS_EXPORT PreprocessConfig {
     // not opt in (every non-C grammar) leaves this FALSE -> no behavior change.
     bool variadicCommaElision = false;
 };
+
+// ── TF-C86 (D-CSUBSET-STDARG-F001A): the conditional-inclusion OPERATOR names ──
+//
+// A language's `#if`-only operators (`__has_include`, `__has_embed`,
+// `__has_c_attribute`) are IMPLEMENTATION-OWNED IDENTIFIERS, not ordinary
+// undefined names. Two consequences a preprocessor MUST honor, and which DSS
+// did not until TF-C86:
+//
+//   (1) `#ifdef`/`#ifndef`/`#elifdef`/`#elifndef`/`defined()` see them as
+//       DEFINED. MEASURED on the host clang
+//       (`clang -std=c2x -E`): `#ifdef __has_include` -> taken;
+//       likewise `__has_embed`, `__has_c_attribute`. This is the entire point
+//       of the ubiquitous portability shim
+//           #ifndef __has_include
+//           #define __has_include(x) 0
+//           #endif
+//       (Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc,
+//       musl, Boost, zlib, ...): the guard is DEAD on a compiler that has the
+//       operator. Reading the name as undefined takes the arm and SHADOWS the
+//       real operator with a function-like macro that answers 0 forever.
+//       MEASURED consequence before this predicate existed: every
+//       `#if __has_include(<mach/…>)`-guarded include in `malloc/_platform.h`
+//       became `F001A` — not because the header was missing (it is right there
+//       in the SDK) but because the pre-scan saw a function-like macro in the
+//       guard, went conservative-uncertain, skipped the angle SOURCE splice,
+//       and the post-parse import resolver then hard-failed the surviving
+//       directive as a missing system header.
+//
+//   (2) They are NOT names a program may `#define` or `#undef` (C23 6.10.1).
+//       Honoring such a redefinition would make `#include <h>` and
+//       `__has_include(<h>)` disagree — a silent miscompile — so DSS refuses
+//       it LOUDLY (`P_PreprocessorOperatorNameNotDefinable`).
+//
+// `definedOperator` is deliberately NOT a member of this set: `defined` is an
+// operator spelling, not a macro name. MEASURED on the same clang:
+// `#ifdef defined` is NOT taken.
+//
+// Config-driven throughout — the set is whatever spellings THIS language
+// declares, so a grammar that names its operator something else is covered and
+// one that declares none has an empty set. No hard-coded `__has_include`.
+[[nodiscard]] inline bool
+isConditionalInclusionOperator(std::string_view        name,
+                               PreprocessConfig const& cfg) noexcept {
+    return (!cfg.hasIncludeOperator.empty()    && name == cfg.hasIncludeOperator)
+        || (!cfg.hasEmbedOperator.empty()      && name == cfg.hasEmbedOperator)
+        || (!cfg.hasCAttributeOperator.empty() && name == cfg.hasCAttributeOperator);
+}
 
 } // namespace dss

@@ -81,7 +81,13 @@ public:
                     std::vector<CrossTreeRef>            crossRefs,
                     std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                     std::uint32_t                        typeNameReparseCount = 0,
-                    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {});
+                    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {},
+                    // TF-C82: index-parallel to `trees` — see `pragmaPackFor`.
+                    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
+                        pragmaPackMaps = {},
+                    // TF-C85: index-parallel to `trees` — see `pragmaNoOptimizeFor`.
+                    std::vector<std::unordered_set<std::uint32_t>>
+                        pragmaNoOptimizeSets = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -162,6 +168,37 @@ public:
     [[nodiscard]] std::span<std::shared_ptr<SourceBuffer> const>
     auxiliaryBuffers() const noexcept;
 
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): tree `treeIndex`'s `#pragma pack` stamps —
+    // synth byte offset of a token -> the MAXIMUM MEMBER ALIGNMENT (bytes) the
+    // preprocessor had in effect when it emitted that token. An offset ABSENT
+    // from the map means NO cap, so an empty map is exactly the pre-TF-C82
+    // behavior; it is empty for every tree that was not preprocessed and for
+    // every preprocessed TU containing no `#pragma pack` (all of them before
+    // this cycle). Out-of-range `treeIndex` yields the empty map.
+    //
+    // The semantic tier looks up a composite specifier's FIRST TOKEN offset here
+    // and feeds the answer to the interner's `maxFieldAlign` channel. This is the
+    // ONE hop that carries `#pragma pack` from the preprocessor — where the
+    // lexically-scoped state lives — to layout, where it changes bytes.
+    [[nodiscard]] std::unordered_map<std::uint32_t, std::uint32_t> const&
+    pragmaPackFor(std::size_t treeIndex) const noexcept;
+
+    // ★★ TF-C85: tree `treeIndex`'s `#pragma optimize` stamps — the synth byte
+    // offsets of tokens the preprocessor emitted inside a
+    // `#pragma optimize("", off)` region. An offset ABSENT from the set means
+    // "optimize normally", so an empty set is exactly the pre-TF-C85 behavior;
+    // it is empty for every tree that was not preprocessed and for every
+    // preprocessed TU containing no `#pragma optimize`. Out-of-range `treeIndex`
+    // yields the empty set.
+    //
+    // The semantic tier looks up a FUNCTION DECLARATION's leftmost token offset
+    // here and folds the answer onto `SymbolRecord::isNoOptimize`, from which it
+    // reaches `MirFunc::noOptimize` and the optimizer's rebuild seams. The exact
+    // structural sibling of `pragmaPackFor`, and deliberately so: both are
+    // lexically scoped pragmas whose product is keyed on EMISSION.
+    [[nodiscard]] std::unordered_set<std::uint32_t> const&
+    pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -171,6 +208,11 @@ private:
     std::vector<ShippedDescriptorRef>    shippedLibDescriptors_;  // FF11 neutral-JSON descriptor refs (path+span+buffer)
     std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
+    // TF-C82: index-parallel to `trees_` (the builder emits one entry per tree,
+    // so alignment is by construction, not by convention).
+    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
+    // TF-C85: index-parallel to `trees_`, on the same by-construction terms.
+    std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -267,6 +309,34 @@ public:
     // block. Aborts if called after finish().
     void setUserDefines(std::vector<std::string> defines);
 
+    // TF-C74: declare the active TARGET's per-architecture identity predefined
+    // macros (`TargetSchema::predefinedMacros()`), merged with the language's
+    // by the preprocessor. UNSET (the default) ⇒ empty ⇒ the effective list is
+    // the language's alone, byte-identical to pre-TF-C74 — which is the state
+    // the LSP and the FFI header parser deliberately stay in (see their call
+    // sites). Because it changes the preprocessed token stream exactly as
+    // `setActiveFormat` does, the driver builds the CU ONCE PER (target,
+    // object-format) pair, not once per object-format. Owned BY VALUE: the
+    // `TargetSchema` the rows came from must not have to outlive the builder.
+    // Aborts if called after finish().
+    void setTargetPredefinedMacros(std::vector<PredefinedMacroDef> macros);
+
+    // TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): declare the active OBJECT
+    // FORMAT's predefined macros (`ObjectFormatSchema::predefinedMacros()`) —
+    // the C-visible face of the format's own ABI axes, `__LP64__`/`_LP64`
+    // first among them. Merged with the language's and the target's by the
+    // preprocessor. UNSET (the default) ⇒ empty ⇒ byte-identical to
+    // pre-TF-C97, the state the LSP and the FFI header parser stay in.
+    //
+    // ★ THIS IS NOT `setActiveFormat`, AND ONE DOES NOT IMPLY THE OTHER.
+    // `setActiveFormat` takes a format KIND (the `availableObjectFormats`
+    // filter axis, shared by every macho/elf/pe file alike); this takes the
+    // rows of ONE format FILE, which is a finer grain — two files of the same
+    // kind may legitimately declare different macros. That is exactly why the
+    // driver's CU cache key carries the format NAME and not only the kind.
+    // Aborts if called after finish().
+    void setFormatPredefinedMacros(std::vector<PredefinedMacroDef> macros);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -304,6 +374,12 @@ private:
     struct TreeParseSidecar {
         std::vector<AmbiguousTypeNameCandidate> candidates;
         std::vector<std::string>                globalTypeNames;
+        // The tree's own global TYPE bindings with their name-token spans —
+        // the oracle's self-definition guard (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-
+        // NAME): a candidate whose (name, span) matches one of THIS tree's
+        // bindings is a typedef's own defining occurrence (C 6.2.1p7) and is
+        // not seeded for that tree's reparse.
+        std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
         std::shared_ptr<SourceBuffer>           source;   // null for addTree trees
         std::shared_ptr<GrammarSchema const>    schema;   // null for addTree trees
         // FC13: when the file went through the C preprocessor, `source` is the
@@ -315,6 +391,18 @@ private:
         // diagnostics. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token ->
+        // the `#pragma pack` member-alignment cap in effect when the preprocessor
+        // emitted it. EMPTY for a tree that was not preprocessed, and for every
+        // preprocessed TU that uses no `#pragma pack`. Rides the SIDECAR rather
+        // than a parallel vector of its own so it stays index-aligned with
+        // `trees_` by construction — the same reason everything else per-tree
+        // lives here.
+        std::unordered_map<std::uint32_t, std::uint32_t> pragmaPack;
+        // TF-C85: the synth byte offsets of tokens emitted inside a
+        // `#pragma optimize("", off)` region. Same sidecar, same
+        // index-alignment-by-construction argument as `pragmaPack`.
+        std::unordered_set<std::uint32_t> pragmaNoOptimize;
     };
 
     CompilationUnitId                    id_;
@@ -330,6 +418,8 @@ private:
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
+    std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
+    std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

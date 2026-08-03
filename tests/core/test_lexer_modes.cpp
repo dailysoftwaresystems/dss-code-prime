@@ -1,12 +1,16 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/lexer_mode.hpp"
+#include "core/types/literal_close_token.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 using namespace dss;
 
@@ -854,4 +858,313 @@ TEST(LexerModesLoader, TokenWithoutModeOpDefaultsToNone) {
     ASSERT_EQ(m.size(), 1u);
     EXPECT_EQ(m[0].modeOp, ModeOp::None);
     EXPECT_FALSE(m[0].modeArg.valid());
+}
+
+// ── D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: `defaultToken.closeToken` loader
+//    rules ─────────────────────────────────────────────────────────────────
+//
+// Five fail-louds in grammar_schema_json.cpp guard the coalesced-body closer.
+// Each gets a NEGATIVE pin below asserting its SPECIFIC diagnostic code, plus
+// one POSITIVE pin that the five shipped coalesced modes still load clean — a
+// check that rejected the shipped grammar would be worse than no check at all.
+//
+// Precedent: PopAtNewlineWithDefaultTokenIsLoadError above — inline JSON
+// through `loadFromText`, assert on `loaded.error()` by code + message
+// fragment. Every config below differs from a CLEAN one in exactly the one
+// field its rule is about, so a firing diagnostic can only be that rule's.
+
+// (1) :2273 — CLOSED KEY VOCABULARY for `defaultToken`. A mis-spelled knob
+// must not load clean and do nothing. `closeTokn` is the exact typo the rule
+// exists for: without this check the config below would load as a
+// coalesce-without-closeToken and report a MISSING field the author
+// demonstrably DID write.
+TEST(LexerModesLoader, DefaultTokenUnknownKeyIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "Ch", "coalesce": true,
+                                    "closeToken": "End", "closeTokn": "End" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value())
+        << "a mis-spelled defaultToken key must not load clean";
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("unknown key 'closeTokn'") != std::string::npos;
+    })) << "an unknown 'defaultToken' key must fail loud as C_ConflictingField "
+           "naming the offending key";
+}
+
+// The `$`-doc-key exemption is part of the same rule: `$comment` /
+// `$…Comment` is the codebase-wide documentation convention and never a knob,
+// so the closed vocabulary must let it through. Without this pin, tightening
+// the check to "no unlisted keys at all" would reject every documented mode in
+// the shipped configs.
+TEST(LexerModesLoader, DefaultTokenDollarDocKeyIsExemptFromClosedVocabulary) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "$comment": "documented, not a knob",
+                                    "kind": "Ch", "coalesce": true,
+                                    "closeToken": "End" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+}
+
+// (2) :2352 — `coalesce: true` REQUIRES `closeToken`. There is no defensible
+// default: falling back to `kind` re-creates the silent decode corruption rule
+// (4) rejects, and emitting nothing restores the very defect this anchor
+// closed (the closer's bytes belonging to no token's span).
+TEST(LexerModesLoader, CoalesceWithoutCloseTokenIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "Ch", "coalesce": true } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value())
+        << "a coalesced body mode with no closeToken must not load";
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_MissingField &&
+               d.message.find("'defaultToken.coalesce' is true but no") !=
+                   std::string::npos;
+    })) << "coalesce without closeToken must fail loud as C_MissingField";
+}
+
+// (3) :2366 — the converse knob-that-lies. ONLY the coalesced tokenizer path
+// reads `closeToken`; a per-codepoint mode emits its closer through the
+// ordinary body path, so a `closeToken` there is config the engine silently
+// never consults.
+TEST(LexerModesLoader, CloseTokenWithoutCoalesceIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "Ch", "closeToken": "End" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value())
+        << "closeToken on a per-codepoint mode must not load clean";
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("requires 'defaultToken.coalesce': true") !=
+                   std::string::npos;
+    })) << "closeToken without coalesce must fail loud as C_ConflictingField";
+}
+
+// (4) :2382 — the closer must NOT reuse the body's kind. `decodeAdjacent-
+// StringBodies` selects segments by FILTERING children on the body kind, so a
+// same-kind closer decodes INTO the value (`"abc"` → `abc"`) with the semantic
+// and HIR tiers agreeing on the same wrong length — no cross-tier guard can
+// fire. Load time is the only place the mistake is still cheap.
+TEST(LexerModesLoader, CloseTokenEqualToBodyKindIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "Ch", "coalesce": true,
+                                    "closeToken": "Ch" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value())
+        << "a closer reusing the body kind must not load";
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("must differ from 'defaultToken.kind'") !=
+                   std::string::npos;
+    })) << "closeToken == kind must fail loud as C_ConflictingField";
+}
+
+// (5) :2539 — CROSS-MODE. Two coalesced modes MAY share a body kind (tsql's
+// `single-string` / `unicode-string` both emit `StringLiteral`; only the
+// OPENER tells `'a'` from `N'a'`), but they MUST then agree on the closer.
+//
+// ★ This is the invariant `closeTokenForCoalescedBody`
+// (core/types/literal_close_token.hpp) DEPENDS on: its lookup is a FIRST-MATCH
+// scan keyed on the body kind. Two answers for one body kind and that scan
+// hands every consumer the FIRST-DECLARED mode's closer — for literals lexed
+// by the second mode, silently the wrong kind, with mode-declaration ORDER as
+// the deciding factor and no diagnostic anywhere. Enforced at load time or the
+// resolver is a silent-wrong-answer waiting for its second consumer.
+TEST(LexerModesLoader, CoalescedModesSharingBodyKindMustAgreeOnCloseToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "StrA", "modeOp": "pushMode", "modeArg": "bodyA",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }],
+        "N\"": [{ "kind": "StrB", "modeOp": "pushMode", "modeArg": "bodyB",
+                  "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "StrA" ] } },
+      "lexerModes": {
+        "main":  { "tokens": "default" },
+        "bodyA": { "defaultToken": { "kind": "Body", "coalesce": true,
+                                     "closeToken": "EndA" } },
+        "bodyB": { "defaultToken": { "kind": "Body", "coalesce": true,
+                                     "closeToken": "EndB" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value())
+        << "two coalesced modes sharing a body kind with DIFFERENT closers "
+           "must not load — the consumer-side resolver would silently answer "
+           "by declaration order";
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("share the body kind") != std::string::npos;
+    })) << "a cross-mode closer disagreement must fail loud as "
+           "C_ConflictingField";
+}
+
+// The SAME-closer case is the one the rule deliberately ALLOWS — tsql ships
+// exactly this shape. Pinned so a future tightening to "body kinds must be
+// unique per mode" cannot land unnoticed: it would reject the shipped grammar.
+TEST(LexerModesLoader, CoalescedModesMaySharedBodyKindWithTheSameCloseToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "StrA", "modeOp": "pushMode", "modeArg": "bodyA",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }],
+        "N\"": [{ "kind": "StrB", "modeOp": "pushMode", "modeArg": "bodyB",
+                  "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "StrA" ] } },
+      "lexerModes": {
+        "main":  { "tokens": "default" },
+        "bodyA": { "defaultToken": { "kind": "Body", "coalesce": true,
+                                     "closeToken": "End" } },
+        "bodyB": { "defaultToken": { "kind": "Body", "coalesce": true,
+                                     "closeToken": "End" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    // …and the resolver's first-match scan is therefore order-independent: it
+    // returns THE closer, not "whichever mode happened to be declared first".
+    // Ids come off the loaded modes rather than a fresh intern, so the pin
+    // reads the same table the resolver walks.
+    GrammarSchema const& s   = **loaded;
+    LexerModeId const    aId = s.findLexerMode("bodyA");
+    LexerModeId const    bId = s.findLexerMode("bodyB");
+    ASSERT_TRUE(aId.valid());
+    ASSERT_TRUE(bId.valid());
+    auto const& a = s.lexerMode(aId).defaultToken;
+    auto const& b = s.lexerMode(bId).defaultToken;
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a->kind, b->kind);
+    EXPECT_EQ(a->closeToken, b->closeToken);
+    EXPECT_EQ(closeTokenForCoalescedBody(s, a->kind), a->closeToken);
+    EXPECT_EQ(closeTokenForCoalescedBody(s, b->kind), b->closeToken);
+}
+
+// (6) POSITIVE — the five shipped coalesced modes load clean and satisfy every
+// rule above. A validation that rejects the grammar it ships with would be
+// worse than no validation, and none of the five negative pins proves the
+// checks are SATISFIABLE. Also re-derives the cross-mode invariant over the
+// REAL configs, so the resolver's first-match scan is pinned against the data
+// it actually runs on rather than a hand-built fixture.
+TEST(LexerModesLoader, ShippedCoalescedModesDeclareValidDistinctCloseTokens) {
+    struct Expect { std::string_view mode, body, closer; };
+    struct Cfg { std::string_view name; std::vector<Expect> modes; };
+    std::vector<Cfg> const shipped{
+        {"c-subset", {{"string",         "StringLiteral", "StringEnd"},
+                      {"charBody",       "CharLiteral",   "CharEnd"},
+                      {"header-body",    "HeaderPath",    "HeaderEnd"}}},
+        {"tsql-subset", {{"single-string",  "StringLiteral", "StringEnd"},
+                         {"unicode-string", "StringLiteral", "StringEnd"}}},
+    };
+    std::size_t totalCoalesced = 0;
+    for (Cfg const& cfg : shipped) {
+        auto loaded = GrammarSchema::loadShipped(cfg.name);
+        ASSERT_TRUE(loaded.has_value())
+            << cfg.name << " must load clean: "
+            << (loaded.error().empty() ? "<no diagnostics>"
+                                       : loaded.error()[0].message);
+        GrammarSchema const& s = **loaded;
+        // body kind -> closer, rebuilt from the loaded modes. Agreement here
+        // is what makes closeTokenForCoalescedBody's first-match scan sound.
+        std::unordered_map<std::uint32_t, SchemaTokenId> closerOf;
+        std::size_t coalesced = 0;
+        for (LexerMode const& m : s.lexerModes()) {
+            if (!m.defaultToken || !m.defaultToken->coalesce) continue;
+            ++coalesced;
+            EXPECT_TRUE(m.defaultToken->closeToken.valid())
+                << cfg.name << '/' << m.name << ": a coalesced mode must "
+                << "declare a closeToken";
+            EXPECT_NE(m.defaultToken->closeToken, m.defaultToken->kind)
+                << cfg.name << '/' << m.name << ": the closer must not reuse "
+                << "the body kind";
+            auto const [it, inserted] = closerOf.try_emplace(
+                m.defaultToken->kind.v, m.defaultToken->closeToken);
+            EXPECT_EQ(it->second, m.defaultToken->closeToken)
+                << cfg.name << '/' << m.name << ": modes sharing a body kind "
+                << "must agree on the closer";
+            (void)inserted;
+        }
+        totalCoalesced += coalesced;
+        EXPECT_EQ(coalesced, cfg.modes.size())
+            << cfg.name << ": coalesced-mode count drifted — update this pin "
+            << "AND check the new mode declares a closer";
+        for (Expect const& e : cfg.modes) {
+            LexerModeId const id = s.findLexerMode(e.mode);
+            ASSERT_TRUE(id.valid()) << cfg.name << '/' << e.mode;
+            LexerMode const& m = s.lexerMode(id);
+            ASSERT_TRUE(m.defaultToken.has_value()) << cfg.name << '/' << e.mode;
+            EXPECT_TRUE(m.defaultToken->coalesce) << cfg.name << '/' << e.mode;
+            EXPECT_EQ(s.schemaTokens().name(m.defaultToken->kind), e.body);
+            EXPECT_EQ(s.schemaTokens().name(m.defaultToken->closeToken), e.closer);
+            // The consumer-side resolver agrees with the mode table — this is
+            // the path every real consumer (cst_to_hir, the preprocessor's
+            // include arms) actually takes.
+            EXPECT_EQ(s.schemaTokens().name(
+                          closeTokenForCoalescedBody(s, m.defaultToken->kind)),
+                      e.closer);
+        }
+    }
+    EXPECT_EQ(totalCoalesced, 5u)
+        << "the shipped grammars declare five coalesced body modes";
 }

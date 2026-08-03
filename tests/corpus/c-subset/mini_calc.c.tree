@@ -3,29 +3,34 @@ rule:root
     rule:externDecl
       rule:externSpecifiers
         tok:"extern"
-      rule:typeRef
-        rule:typeBase
+      rule:typeRefAllowingStruct
+        rule:typeBaseAllowingStruct
           rule:typeSpecifierSeq
             tok:"int"
-      tok:"printf"
-      rule:externTail
-        rule:externFuncTail
-          tok:"("
-          rule:paramList
-            rule:param
-              rule:declHeadForParam
-                rule:typeSpecifierSeq
-                  tok:"int"
-              rule:declarator
-                rule:directDeclarator
-                  tok:"fmt"
-          tok:")"
-          tok:";"
+      rule:initDeclaratorList
+        rule:initDeclarator
+          rule:declarator
+            rule:directDeclarator
+              tok:"printf"
+              rule:fnSuffixTail
+                tok:"("
+                rule:paramList
+                  rule:param
+                    rule:declHeadForParam
+                      rule:typeSpecifierSeq
+                        tok:"int"
+                    rule:declarator
+                      rule:directDeclarator
+                        tok:"fmt"
+                tok:")"
+      rule:externDeclTail
+        tok:";"
   rule:topLevel
     rule:topLevelDecl
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -43,6 +48,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -61,6 +67,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -76,6 +83,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -112,6 +120,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -157,6 +166,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -276,6 +286,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -311,6 +322,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -329,6 +341,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -399,6 +412,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -469,6 +483,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -550,6 +565,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -607,6 +623,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -633,6 +650,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -651,6 +669,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -746,6 +765,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -780,6 +800,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -844,6 +865,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -920,6 +942,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -964,6 +987,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1042,6 +1066,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -1086,6 +1111,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1122,6 +1148,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1158,6 +1185,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1198,6 +1226,7 @@ rule:root
       rule:topLevelHead
         rule:typeSpecifierSeq
           tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -1216,6 +1245,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1229,6 +1259,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1248,6 +1279,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1294,6 +1326,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1341,6 +1374,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator
@@ -1374,6 +1408,7 @@ rule:root
                   rule:typeSpecifierForDecl
                     rule:typeSpecifierSeq
                       tok:"int"
+                rule:declAttrRun
                 rule:initDeclaratorList
                   rule:initDeclarator
                     rule:declarator

@@ -6,7 +6,9 @@
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_reg.hpp"
 
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,5 +78,48 @@ emitTerminator(LirBuilder& b, std::uint16_t op,
 // rebuild gap was invisible; the `mov r64, imm64` carrier exposes it.)
 DSS_EXPORT void
 copyLiteralPool(Lir const& src, LirBuilder& dst);
+
+// D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: resolve the physical
+// INCOMING argument register a register-machine `arg` op's parameter arrives
+// in, or classify why there is none. ONE formula, shared by the two consumers
+// that ask the SAME question ("which physical register still holds a live
+// incoming param"):
+//   (a) the regalloc position-aware occupied-arg exclusion
+//       (collectArgRegisterOccupied, lir_regalloc.cpp) — keeps a vreg HOME off
+//       a still-live arg register;
+//   (b) the rewriter spill-scratch forbid (rewriteOneFunc, lir_rewrite.cpp) —
+//       keeps a transient reload SCRATCH off it.
+// Coupling them here is what makes them provably agree (a drift would re-open
+// the incoming-param clobber this anchor closes).
+//
+// NOT the arg MATERIALIZATION path: lir_callconv's `h.arg` emits the actual
+// `mov home, argReg` and needs the register NAME plus the slot-aligned pool
+// size for its cursor-desync assert — a different output, deliberately left
+// untouched. The register-resident test here mirrors the collector's existing
+// per-class-pool `payload < pool.size()` (byte-identical on every shipped cc).
+// A hypothetical slot-aligned cc with UNEQUAL arg pool sizes is the only shape
+// where this per-class test would diverge from `h.arg`'s `max(g,f)` test; none
+// ships, and both consumers here treat the divergent slot as "no register to
+// protect" (safe — a stack-passed param has no incoming register to clobber).
+// DOMAIN NOTE (pre-existing, unreached — preserved byte-for-byte from the
+// pre-hoist collector): a non-FPR result class resolves through `argGprs`, so a
+// VR-class (vector) param would protect a GPR ordinal rather than its v-register.
+// Unreached by the c-subset (no vector params; AAPCS64 F128 aliases the FPR
+// d-view). If a vector-param ABI ever ships, add its arg-vector pool arm here.
+enum class IncomingArgRegKind : std::uint8_t {
+    Register,          // arrives in a physical register (ordinal below)
+    StackPassed,       // payload past the arg-register pool → caller's stack
+    UnresolvableName,  // the cc names a register absent from the target table
+};
+struct IncomingArgReg {
+    IncomingArgRegKind kind{IncomingArgRegKind::StackPassed};
+    std::uint16_t      ordinal{0};  // meaningful iff kind == Register
+};
+
+[[nodiscard]] DSS_EXPORT IncomingArgReg
+incomingArgRegister(TargetSchema const&            schema,
+                    TargetCallingConvention const& cc,
+                    LirRegClass                    resultClass,
+                    std::uint32_t                  payload);
 
 } // namespace dss::lir_pass_util

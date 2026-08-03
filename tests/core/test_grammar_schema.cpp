@@ -312,8 +312,12 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // statement-ambiguity rules replace them.
     for (std::string_view rule : {"root", "topLevel", "topLevelDecl",
                                   "topLevelDeclTail", "topLevelHead",
-                                  "varDeclTail",
-                                  "typeBase", "typeRef",
+                                  // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: externDecl
+                                  // became the extern twin of topLevelDecl (star-free
+                                  // head + initDeclaratorList), retiring the single-
+                                  // declarator `varDeclTail`/`typeBase`/`typeRef` +
+                                  // `externTail`/`externFuncTail` (pinned ABSENT below).
+                                  "typeRefAllowingStruct", "typeBaseAllowingStruct",
                                   "declarator", "directDeclarator",
                                   "parenDeclarator", "pointerLayer",
                                   "fnSuffix", "initDeclarator",
@@ -345,11 +349,16 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     }
 
     // c25: the former specifier-body rules were RETIRED (folded into the
-    // unified XxxSpec). Pin their ABSENCE so a stray re-introduction (or an
-    // incomplete unification) is visible at load.
+    // unified XxxSpec). c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: the single-
+    // declarator extern spine rules were RETIRED (externDecl routes through
+    // typeRefAllowingStruct + initDeclaratorList). Pin their ABSENCE so a stray
+    // re-introduction (or an incomplete unification) is visible at load.
     for (std::string_view retired : {"structSpecifierBody",
                                      "unionSpecifierBody",
-                                     "enumSpecifierBody"}) {
+                                     "enumSpecifierBody",
+                                     "typeRef", "typeBase",
+                                     "externTail", "externFuncTail",
+                                     "varDeclTail"}) {
         EXPECT_FALSE(schema.rules().find(retired).valid())
             << "retired rule must not resolve: " << retired;
     }
@@ -787,16 +796,22 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
         << "FIRST(expression) must include Identifier (atom FIRST)";
 }
 
-// `typeRef` admits `const int const x` (double-const). Real C allows
-// double-const only with intervening type modifiers; the c-subset is
-// deliberately more permissive while precedence/arity are deferred.
-// Pinned so a future PR doesn't tighten this without intent.
-TEST(GrammarSchema, CSubsetTypeRefAllowsDoubleConst) {
+// c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR: externDecl's head is now the star-free
+// `typeRefAllowingStruct` (the retired `typeRef` folded into it). It admits
+// `const int const x` (double-const: leading const via the `{repeat headQualifier}`
+// prefix, trailing const via the `{opt ConstKeyword}` east-const) AND `volatile`
+// in the head — a strict superset of the retired typeRef's const-only leading
+// qualifier. Real C allows double-const only with intervening type modifiers; the
+// c-subset is deliberately more permissive. Pinned so a future PR doesn't tighten
+// this without intent.
+TEST(GrammarSchema, CSubsetExternHeadAllowsDoubleConst) {
     auto result = GrammarSchema::loadShipped("c-subset");
     if (!result.has_value()) {
         FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
     }
-    EXPECT_TRUE((*result)->rules().find("typeRef").valid());
+    EXPECT_TRUE((*result)->rules().find("typeRefAllowingStruct").valid());
+    EXPECT_FALSE((*result)->rules().find("typeRef").valid())
+        << "the retired single-declarator typeRef must not resolve";
 }
 
 // dssSchemaVersion 2 must load AND emit zero diagnostics — a future
@@ -858,6 +873,21 @@ TEST(GrammarSchema, SchemaVersionFiveRejectedWithRangeMessage) {
 namespace {
 [[nodiscard]] bool hasDiagCode(std::vector<ConfigDiagnostic> const& diags, DiagnosticCode code) {
     return std::ranges::any_of(diags, [code](auto const& d) { return d.code == code; });
+}
+
+// Every ERROR-severity diagnostic, one per line. ★ Use this instead of
+// `diags[0].message` when reporting why a load failed: the list is in emission
+// order and its FIRST entry is routinely a WARNING (the shipped c-subset opens
+// with a `defaultToken`-without-`tokens` mode warning), so `[0]` regularly
+// names something entirely unrelated to the failure and sends the reader
+// chasing it.
+[[nodiscard]] std::string errorDiags(std::vector<ConfigDiagnostic> const& diags) {
+    std::string out;
+    for (auto const& d : diags) {
+        if (d.severity != DiagnosticSeverity::Error) continue;
+        out += std::format("\n  [{}] {}", d.path, d.message);
+    }
+    return out.empty() ? std::string{"<no error-severity diagnostics>"} : out;
 }
 } // namespace
 
@@ -1821,6 +1851,1196 @@ TEST(GrammarSchema, SemanticsNotAnObjectReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ── `semantics` closed key vocabulary (typo discriminator) ───────────────
+//
+// A misspelled sub-block name must FAIL THE LOAD. Silently accepting it
+// would leave the whole facet unhonored while the config looks correct —
+// the knob-that-lies class. Mirrors the `declarators` / `gatedMarkers`
+// closed-key pins.
+
+namespace {
+// The shared skeleton: a minimal loadable schema whose `semantics` object
+// is spliced at %SEM%. Every positive variant below MUST load clean, so the
+// skeleton itself carries no semantic requirements of its own.
+[[nodiscard]] std::string semanticsSchemaWith(std::string_view semBody) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "ClosedKeys", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "[": [{ "kind": "BracketOpen" }],
+        "]": [{ "kind": "BracketClose" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt":     { "alt": [ "attrStmt", "bare" ] },
+        "attrStmt": { "sequence": [ "attrSpec", "Semi" ] },
+        "attrSpec": { "sequence": [ "BracketOpen", "stdAttr", "BracketClose" ] },
+        "stdAttr":  { "sequence": [ "Identifier" ] },
+        "bare":     { "sequence": [ "Semi" ] }
+      },
+      "semantics": %SEM%
+    })JSON";
+    auto const pos = cfg.find("%SEM%");
+    cfg.replace(pos, 5, semBody);
+    return cfg;
+}
+
+// A well-formed `attributeSemantics` block, spliced at %EXTRA% so each test
+// can add exactly one extra key.
+[[nodiscard]] std::string attributeSemanticsSchemaWith(std::string_view extra) {
+    std::string body = R"JSON({
+        "attributeSemantics": {
+          %EXTRA%
+          "attrSpecRule":      "attrSpec",
+          "stdAttrRule":       "stdAttr",
+          "bareStatementRule": "bare",
+          "effects": [ { "names": ["maybe_unused"], "appliesTo": ["variable"],
+                         "effect": "suppressUnused" } ]
+        }
+      })JSON";
+    auto const pos = body.find("%EXTRA%");
+    body.replace(pos, 7, extra);
+    return semanticsSchemaWith(body);
+}
+} // namespace
+
+// Baseline: the skeleton with a complete `attributeSemantics` and no extra
+// key loads clean — without this the negative pins below could pass for the
+// wrong reason (RED if the allowed-key list is over-narrow).
+TEST(GrammarSchema, SemanticsClosedKeySkeletonLoadsCleanly) {
+    auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().attrSpecRuleName, "attrSpec");
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+}
+
+// An unknown key directly inside `semantics` → C_InvalidSemantics. `alinged`
+// is the real-world shape of the bug: the `alignas` facet would silently
+// never be configured.
+TEST(GrammarSchema, SemanticsUnknownKeyReportsInvalid) {
+    auto const cfg = semanticsSchemaWith(R"({
+        "scopes": [ "bare" ],
+        "alinged": { "keyword": "AlignasKw" }
+      })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd 'semantics' sub-block must fail the load, not load clean";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `$`-prefixed keys are the documentation convention and stay EXEMPT — the
+// shipped configs carry dozens of `$…Comment` keys here.
+TEST(GrammarSchema, SemanticsDollarPrefixedKeyIsExempt) {
+    auto const cfg = semanticsSchemaWith(R"({
+        "$scopesComment": "block scopes live on the bare statement",
+        "scopes": [ "bare" ]
+      })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().scopes.size(), 1u);
+}
+
+// The EMPTY key must be rejected — the runtime symptom of an under-filled
+// closed-key array, and the observable half of the compile-time
+// `isWellFormedKeyVocabulary` guard.
+//
+// ★ `std::array<std::string_view, N>` with FEWER than N initializers is legal
+// C++: it value-initializes the tail, so every phantom element is the EMPTY
+// string_view and the typo discriminator silently starts whitelisting a key of
+// `""` — while quietly shrinking the vocabulary it actually enforces. MEASURED
+// on `kSemanticsKeys`: bumping its declared size 56→57 and touching nothing
+// else compiled clean, made a `semantics` key of `""` load without a
+// diagnostic, and left the whole suite green. The compile-time assert is the
+// real guard (and now covers every closed-key table in the loader, not the one
+// it was written for); this pins the behavior it protects, so the two must
+// break together.
+TEST(GrammarSchema, SemanticsEmptyKeyIsRejected) {
+    auto const cfg = semanticsSchemaWith(R"({
+        "scopes": [ "bare" ],
+        "": "an under-filled key array would whitelist this"
+      })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "the EMPTY key must never be accepted by a closed-key vocabulary — "
+           "accepting it is the signature of an array whose declared size "
+           "exceeds its initializer count";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An unknown key inside `attributeSemantics` → C_InvalidSemantics. A typo'd
+// `stdAtrRule` would otherwise leave the block half-wired (no std-attribute
+// surface at all) while the load reports success.
+TEST(GrammarSchema, SemanticsAttributeSemanticsUnknownKeyReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(R"("stdAtrRule": "stdAttr",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd 'attributeSemantics' key must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// The `$` exemption applies inside `attributeSemantics` too.
+TEST(GrammarSchema, SemanticsAttributeSemanticsDollarPrefixedKeyIsExempt) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("$effectsComment": "maybe_unused silences the unused warning",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].effect,
+              AttributeEffect::SuppressUnused);
+}
+
+// ── TF-C73 (D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP): the OPTIONAL
+//    `attributeSemantics.attributeArgRule` key ──────────────────────────────
+//
+// This key names the attribute ARGUMENT-group shape so `linkageFrom` can flag
+// argument tokens out of its specifier key lookup. It closes half (a) of
+// D-CONFIG-ATTRIBUTE-ARG-RULE-DOCUMENTED-BUT-UNIMPLEMENTED: two shipped
+// `$comment`s asserted this mechanism in the present tense for a full cycle
+// while `attributeArgRule` resolved to NOTHING — no loader key, no field, no
+// consumer, no test. These three pins are what make the name greppable to an
+// implementation from now on.
+
+// PRESENT + VALID: the key loads and reaches `SemanticConfig`.
+TEST(GrammarSchema, AttributeArgRuleLoadsWhenPresent) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "stdAttr",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().attributeArgRuleName, "stdAttr");
+    EXPECT_TRUE((*r)->semantics().attributeArgRule.valid());
+}
+
+// ABSENT: still loads, and the rule stays INVALID. This is the pin that keeps
+// the key OPTIONAL — the three sibling rules are required, and copying that
+// posture here would refuse to load every language whose attribute clauses take
+// no arguments (and every fixture in this file). An invalid id is the documented
+// "flag nothing" state, so the consumer degrades to its pre-key behavior rather
+// than to a wrong one.
+TEST(GrammarSchema, AttributeArgRuleIsOptional) {
+    auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << "attributeArgRule must be OPTIONAL — a language may declare an "
+           "attribute surface with no argument grammar: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_FALSE((*r)->semantics().attributeArgRule.valid());
+    EXPECT_TRUE((*r)->semantics().attributeArgRuleName.empty());
+}
+
+// PRESENT but naming a shape that does not exist → C_UnknownShape, LOUD.
+// ★ Optional must not mean forgiving: a typo'd rule name that merely left the id
+// invalid would silently restore the arg-soup bug this key exists to fix, and the
+// load would report success — the exact failure mode
+// D-CONFIG-ATTRIBUTE-ARG-RULE-DOCUMENTED-BUT-UNIMPLEMENTED is about.
+TEST(GrammarSchema, AttributeArgRuleUnknownShapeReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "attrArgsTypo",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an attributeArgRule naming a nonexistent shape must fail the load, "
+           "not leave the mechanism silently half-wired";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// (The shipped-config regression wall for this vocabulary lives at the end
+// of the file, next to the helper that locates c-subset.lang.json.)
+
+// ── TF-C73: the attribute NAME vocabulary — `effect: "align"`, and the
+//    loader's ABI-neutral-hint DRIFT cross-check ─────────────────────────────
+//
+// One skeleton serves all of them: a language with a declaration row that runs
+// the strict linkage-specifier scan AND an `attributeSemantics` block, so the
+// two lists the cross-check relates are both present and both parameterized.
+
+namespace {
+// %EFFECTS%    the `attributeSemantics.effects` array;
+// %ROWEXTRA%   extra keys on the single declaration row (trailing comma);
+// %BLOCKS%     extra `semantics` sub-blocks (trailing comma).
+[[nodiscard]] std::string attrVocabSchema(std::string_view effects,
+                                          std::string_view rowExtra,
+                                          std::string_view blocks) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "AttrVocab", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "(": [{ "kind": "ParenOpen" }],
+        ")": [{ "kind": "ParenClose" }],
+        "[": [{ "kind": "BracketOpen" }],
+        "]": [{ "kind": "BracketClose" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "st", "kind": "StKw" } ],
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": "vdecl" } ] },
+        "vdecl":    { "sequence": [ "vprefix", "Identifier", "Semi" ] },
+        "vprefix":  { "sequence": [ { "repeat": { "alt": [ "StKw", "attrSpec", "stdAttr" ] } } ] },
+        "attrSpec": { "sequence": [ "ParenOpen", "Identifier", "ParenClose" ] },
+        "stdAttr":  { "sequence": [ "BracketOpen", "Identifier", "BracketClose" ] },
+        "bare":     { "sequence": [ "Semi" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarations": [
+          { "rule": "vdecl", "name": 0, "kind": "variable",
+            "specifierPrefix": "vprefix",
+            %ROWEXTRA%
+            "linkageSpecifiers": { "st": { "binding": "local" } } }
+        ],
+        %BLOCKS%
+        "attributeSemantics": {
+          "attrSpecRule":      "attrSpec",
+          "stdAttrRule":       "stdAttr",
+          "bareStatementRule": "bare",
+          "effects": %EFFECTS%
+        }
+      }
+    })JSON";
+    cfg.replace(cfg.find("%ROWEXTRA%"), 10, rowExtra);
+    cfg.replace(cfg.find("%BLOCKS%"),    8, blocks);
+    cfg.replace(cfg.find("%EFFECTS%"),   9, effects);
+    return cfg;
+}
+
+// The reference vocabulary: `deprecated` carries a declaration-attached effect
+// and IS linkage-ignored; `fallthrough` is inert and deliberately is NOT.
+constexpr std::string_view kConsistentEffects =
+    R"([ { "names": ["deprecated"],  "appliesTo": ["variable"],
+           "effect": "warnOnUse" },
+         { "names": ["fallthrough"], "effect": "none"      } ])";
+constexpr std::string_view kIgnoresDeprecated =
+    R"("linkageSpecifierIgnoredNames": ["deprecated"],)";
+} // namespace
+
+// ── the `align` verb ──────────────────────────────────────────────────────
+
+// `effect: "align"` reaches `SemanticConfig` as `AttributeEffect::Align`.
+// Without a loader arm this verb would hit the closed-set rejection, and the
+// `aligned` attribute could never be declared at all.
+TEST(GrammarSchema, AttributeEffectAlignLoads) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].effect,
+              AttributeEffect::Align);
+}
+
+// A MISSPELLED verb still fails the load — and the closed-set message must
+// enumerate EXACTLY the verbs the loader accepts, in BOTH directions.
+//
+// ★ The both-directions part is the whole pin. The earlier version asserted
+// only that the message CONTAINS `align`, and the message was a hand-written
+// literal with no mechanical link to the arm chain — so deleting the `align`
+// arm left this test GREEN while the sentence it checks became false (MEASURED:
+// with the arm removed the loader rejects `align` and still advertises it).
+// Here each verb is probed against the real loader and then required to appear
+// in the message, and any word IN the message must be a verb that loads — so
+// the message can no longer drift from the vocabulary in either direction, and
+// the fix that makes this pass is deriving one from the other.
+TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
+    // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
+    // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
+    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`. This list is the
+    // hand-maintained mirror of the loader's `kEffectVerbs`, and it going RED
+    // on a vocabulary change is the test working as designed — the whole point
+    // is that a verb cannot be added to the loader without the closed-set
+    // message and this mirror both accounting for it.
+    constexpr std::string_view kVerbs[] = {"suppressUnused", "warnOnUse",
+                                           "warnOnDiscard", "align",
+                                           "noInline", "alwaysInline",
+                                           "noSanitizeThread", "none"};
+    // The message under test.
+    auto const bad = attrVocabSchema(
+        R"([ { "names": ["aligned"], "effect": "algin" } ])", "", "");
+    auto r = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled effect verb must fail the load, never silently "
+           "default the row to a no-op";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    std::string closedSetMessage;
+    for (auto const& d : r.error()) {
+        if (d.message.find("unknown attribute effect") != std::string::npos)
+            closedSetMessage = d.message;
+    }
+    ASSERT_FALSE(closedSetMessage.empty())
+        << "the closed-set rejection message was not emitted at all";
+
+    for (auto const verb : kVerbs) {
+        // Direction 1 — every verb the LOADER ACCEPTS must be LISTED. A verb
+        // the loader takes but the message omits sends an author who is
+        // already confused to fix the wrong thing.
+        //
+        // ★ TF-C93: the probe row now has to respect the `appliesTo` split, and
+        // this branch IS the split, stated once: every verb but `none` REQUIRES
+        // the key, `none` REFUSES it. Writing one shape for both would make the
+        // loop fail for a reason that has nothing to do with the verb vocabulary
+        // it is here to check.
+        auto const good = attrVocabSchema(
+            verb == "none"
+                ? std::string{R"([ { "names": ["aligned"], "effect": "none" } ])"}
+                : std::format(R"([ {{ "names": ["aligned"],
+                                      "appliesTo": ["variable"],
+                                      "effect": "{}" }} ])",
+                              verb),
+            R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+        auto const ok = GrammarSchema::loadFromText(good);
+        ASSERT_TRUE(ok.has_value())
+            << "'" << verb << "' must be an accepted effect verb: "
+            << errorDiags(ok.error());
+        EXPECT_NE(closedSetMessage.find(verb), std::string::npos)
+            << "the loader accepts effect verb '" << verb << "' but the "
+               "closed-set message does not list it — the message must be "
+               "DERIVED from the arms, not restated beside them. Message was: "
+            << closedSetMessage;
+    }
+    // Direction 2 — nothing the message lists may be a verb the loader
+    // REJECTS. Counts the listed alternatives so a verb dropped from the arms
+    // while left in the message is caught too.
+    std::size_t listed = 1;   // n alternatives ⇒ n-1 separators
+    for (std::size_t p = closedSetMessage.find(" | ");
+         p != std::string::npos;
+         p = closedSetMessage.find(" | ", p + 1)) {
+        ++listed;
+    }
+    EXPECT_EQ(listed, std::size(kVerbs))
+        << "the closed-set message lists " << listed << " verbs but the "
+           "loader accepts " << std::size(kVerbs)
+        << " — a listed verb the loader rejects is the same lie in the other "
+           "direction. Message was: " << closedSetMessage;
+}
+
+// ── the effects TABLE's own well-formedness ───────────────────────────────
+
+// A name may be bound ONCE. Two rows claiming it load cleanly and leave WHICH
+// applies to consumer iteration order.
+//
+// ★ `align` is where that stops being cosmetic. `AttributeEffect::Align`'s own
+// contract says demoting `aligned` to a no-op "produces a silently
+// UNDER-ALIGNED object — a miscompile, not a missing warning" — and the pair
+// below is exactly that demotion, admitted by the loader.
+TEST(GrammarSchema, AttributeEffectDuplicateNameAcrossRowsReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" },
+             { "names": ["aligned"], "effect": "none"  } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "the same attribute name bound to two different effects must fail "
+           "the load — which one wins is otherwise consumer iteration order, "
+           "and for 'align' the losing row silently under-aligns the object";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesTheAttribute = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("already bound") != std::string::npos
+            && d.message.find("aligned") != std::string::npos) {
+            namesTheAttribute = true;
+        }
+    }
+    EXPECT_TRUE(namesTheAttribute)
+        << "the duplicate diagnostic must name the offending ATTRIBUTE — "
+           "'some row is a duplicate' does not tell the author which";
+}
+
+// The duplicate check uses the SAME dunder normalizer every other attribute
+// comparison uses, so `aligned` and `__aligned__` are ONE binding. Without
+// this the conflicting pair is spelled around in one character.
+TEST(GrammarSchema, AttributeEffectDuplicateNameIsDunderNormalized) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["variable"],
+               "effect": "align" },
+             { "names": ["__aligned__"], "effect": "none"  } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "'__aligned__' is the SAME attribute as 'aligned' everywhere else "
+           "in this loader; the duplicate check must normalize identically or "
+           "the conflict is spelled around in two characters";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A duplicate WITHIN one row is the same defect and must also fail — the check
+// is over the table, not over row boundaries.
+TEST(GrammarSchema, AttributeEffectDuplicateNameWithinOneRowReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated", "deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a name repeated inside one row is still a name bound twice";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ANTI-OVER-BROAD. Two DIFFERENT names sharing a row, and two rows with
+// disjoint names, must keep loading — the check is on the NAME, not on the
+// verb or the row count.
+TEST(GrammarSchema, AttributeEffectDistinctNamesAcrossRowsStillLoad) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
+             { "names": ["aligned"],    "appliesTo": ["variable"],
+               "effect": "align"     },
+             { "names": ["likely", "unlikely"],  "effect": "none"      } ])",
+        R"("linkageSpecifierIgnoredNames": ["deprecated", "aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "distinct names must keep loading — the duplicate check must not "
+           "widen into 'one row only' or 'one name per row': "
+        << errorDiags(r.error());
+    EXPECT_EQ((*r)->semantics().attributeEffects.size(), 3u);
+}
+
+// An UNKNOWN KEY on an `effects` row. One nesting level under the row whose
+// keys this cycle DID close, and the identical knob-that-lies: `"efect":
+// "align"` beside a real `effect` loads clean and the intended verb never
+// takes.
+TEST(GrammarSchema, AttributeEffectRowUnknownKeyReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse", "efect": "align" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an unknown key on an effects row must fail the load — it reads as "
+           "configured and does nothing";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// …and the `$` documentation convention stays exempt there too.
+TEST(GrammarSchema, AttributeEffectRowDollarPrefixedKeyIsExempt) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "$comment": "deprecated warns at every use",
+               "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key on an effects row must not trip "
+           "the typo discriminator: " << errorDiags(r.error());
+    EXPECT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+}
+
+// A row naming NOTHING binds its verb to nothing: inert config that reads as
+// configured.
+TEST(GrammarSchema, AttributeEffectEmptyNamesArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": [], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])", kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an effects row with no names can never fire and must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// The empty NAME is unreachable by construction — no attribute clause can
+// spell it — so it is always a typo or a stray comma.
+TEST(GrammarSchema, AttributeEffectEmptyNameStringReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": [""], "effect": "none" } ])", kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an empty attribute name could never match and must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── ★★★ TF-C93: the `appliesTo` KIND-SET key
+//    (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) ─────────────────────
+//
+// `appliesTo` names the entity kinds an attribute may appertain to, and the
+// semantic tier's ONE shared decl-kind gate walks it. Its VALUE therefore needs
+// real validation — `DSS_CHECK_KEY_VOCABULARY` does NOT provide any: MEASURED at
+// `config_key_vocabulary.hpp:92-97`, it is a `static_assert` on array
+// WELL-FORMEDNESS only (no empty/duplicate KEY NAMES) and says nothing about a
+// key's contents. Growing `kEffectRowKeys` 2 → 3 correctly extends the
+// unknown-KEY loop; everything below is about the VALUE.
+
+// ★★ THE REQUIREMENT ITSELF — the design's blocking correction. A row with a
+// declaration-attached effect and NO `appliesTo` must fail the LOAD.
+//
+// ★ WHY REQUIRED RATHER THAN OPTIONAL-WITH-A-DEFAULT, pinned because the cheap
+// alternative is so tempting: "absent ⇒ applies to every kind" makes a row that
+// merely FORGOT the key read as a deliberate universal claim, and the gate then
+// goes silent on exactly the misuse it exists to report. That is
+// [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] one cycle after that row was
+// written. A required key cannot be forgotten quietly.
+TEST(GrammarSchema, AttributeEffectAppliesToMissingOnDeclAttachedRowReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a row whose effect acts on the DECLARED ENTITY must say which entity "
+           "kinds it appertains to — an absent key must NOT degrade to a "
+           "permissive 'every kind' default";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool rightDiag = false;
+    for (auto const& d : r.error()) {
+        if (d.code == DiagnosticCode::C_InvalidSemantics
+            && d.path == "/semantics/attributeSemantics/effects/0/appliesTo"
+            && d.message.find("REQUIRED") != std::string::npos
+            && d.message.find("warnOnUse") != std::string::npos) {
+            rightDiag = true;
+        }
+    }
+    EXPECT_TRUE(rightDiag)
+        << "the diagnostic must be AT the missing key's path and NAME the verb "
+           "that made it required — 'something is invalid' does not tell the "
+           "author which row to edit: "
+        << errorDiags(r.error());
+}
+
+// THE EXEMPTION, asserted in the same file as the requirement so neither can
+// drift. A `none`-verb row bundles function-only, type-only, statement-only and
+// elsewhere-consumed names in ONE list, so no single kind set is correct for it
+// — and the loader must not demand one.
+TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["fallthrough", "likely"], "effect": "none" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a 'none' row must stay exempt — demanding a kind set from a row that "
+           "mixes statement-, type- and function-attached names would force the "
+           "author to invent a wrong answer: "
+        << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_TRUE((*r)->semantics().attributeEffects[0].appliesTo.empty())
+        << "and it must reach SemanticConfig with an EMPTY set — that emptiness "
+           "IS the exemption the engine's gate reads (it tests the config, never "
+           "the verb)";
+}
+
+// …and the key is REFUSED on a `none` row, not silently accepted. The gate can
+// never read it there (an empty set is what marks the exemption), so accepting
+// it would be a knob that lies — the same defect class as every unknown-key
+// check in this loader.
+TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["fallthrough"], "appliesTo": ["variable"],
+               "effect": "none" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "'appliesTo' on a 'none' row could never be read — accepting it would "
+           "let an author believe a kind restriction is in force when none is";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An UNKNOWN kind string. The rejection must ENUMERATE the closed set, and the
+// enumeration must be DERIVED from the vocabulary table rather than restated
+// beside it — the drift discipline this loader already applies to the effect-verb
+// closed set, where a hand-written literal was MEASURED to keep advertising a
+// verb the loader had stopped accepting.
+TEST(GrammarSchema, AttributeEffectAppliesToUnknownKindEnumeratesTheClosedSet) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["varaible"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled declaration kind must fail the load — silently dropping "
+           "it would shrink the declared set and make the gate fire on correct C";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    std::string msg;
+    for (auto const& d : r.error()) {
+        if (d.message.find("unknown declaration kind") != std::string::npos
+            && d.message.find("appliesTo") != std::string::npos) {
+            msg = d.message;
+        }
+    }
+    ASSERT_FALSE(msg.empty())
+        << "the unknown-kind rejection was not emitted at all: "
+        << errorDiags(r.error());
+    EXPECT_NE(msg.find("varaible"), std::string::npos)
+        << "it must quote what the author WROTE: " << msg;
+    // Every kind the loader ACCEPTS must appear in the message — probed against
+    // the real loader, so the sentence cannot drift from the vocabulary.
+    for (auto const* kind : {"variable", "function", "table", "type"}) {
+        auto const good = attrVocabSchema(
+            std::format(R"([ {{ "names": ["deprecated"], "appliesTo": ["{}"],
+                                "effect": "warnOnUse" }} ])", kind),
+            kIgnoresDeprecated, "");
+        auto const ok = GrammarSchema::loadFromText(good);
+        ASSERT_TRUE(ok.has_value())
+            << "'" << kind << "' must be an accepted declaration kind: "
+            << errorDiags(ok.error());
+        EXPECT_NE(msg.find(kind), std::string::npos)
+            << "the loader accepts kind '" << kind << "' but the closed-set "
+               "message omits it — the message must be DERIVED from the "
+               "vocabulary table, not restated beside it. Message was: " << msg;
+    }
+}
+
+// An EMPTY `appliesTo`. "Appertains to nothing" is not a coherent claim: the
+// row's effect would still fire nowhere while every declaration spelling the
+// attribute warned. Rejected rather than treated as a silent disable.
+TEST(GrammarSchema, AttributeEffectAppliesToEmptyArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": [],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an empty kind set must fail the load — it is also indistinguishable "
+           "from the 'none'-row exemption the engine's gate reads";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A DUPLICATE kind. The list is a SET; a repeat changes nothing and is always a
+// typo or a botched merge. Left accepted it trains an author to read the list as
+// unchecked prose.
+TEST(GrammarSchema, AttributeEffectAppliesToDuplicateKindReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable", "variable"],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a declaration kind listed twice must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesTheKind = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("listed twice") != std::string::npos
+            && d.message.find("variable") != std::string::npos) {
+            namesTheKind = true;
+        }
+    }
+    EXPECT_TRUE(namesTheKind)
+        << "and it must name WHICH kind repeats: " << errorDiags(r.error());
+}
+
+// NOT AN ARRAY — the shape mistake a hand-edited config makes first
+// (`"appliesTo": "function"`). Rejected with the closed set, so the author can
+// fix both the shape and the value from one message.
+TEST(GrammarSchema, AttributeEffectAppliesToNotAnArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": "variable",
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a bare string must not be silently accepted as a one-element set";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A NON-STRING ELEMENT. `["variable", 3]` must not load with the good element
+// kept and the bad one dropped — a partially-parsed kind set is a SHRUNKEN one,
+// which makes the gate warn on correct C.
+TEST(GrammarSchema, AttributeEffectAppliesToNonStringElementReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable", 3],
+               "effect": "warnOnUse" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a non-string entry must fail the load, not be skipped — the "
+           "surviving set would be silently narrower than the author wrote";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// POSITIVE: a well-formed multi-kind set REACHES `SemanticConfig` in order. This
+// is the pin that keeps every negative above from passing for the wrong reason,
+// and it is the shape the shipped `aligned` row uses (the negative control whose
+// own sink judges all three kinds).
+TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["variable", "function", "type"],
+               "effect": "align" } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
+    ASSERT_EQ(applies.size(), 3u);
+    EXPECT_EQ(applies[0], DeclarationKind::Variable);
+    EXPECT_EQ(applies[1], DeclarationKind::Function);
+    EXPECT_EQ(applies[2], DeclarationKind::Type);
+}
+
+// ★ THE SHIPPED CONFIG ITSELF loads with every non-`none` row carrying a
+// non-empty `appliesTo`. This is the pin that catches a half-landed config edit
+// (a new verb added to `effects` without its kind set) at the tier where it is
+// cheapest to see — and it asserts the PROPERTY over the whole table rather than
+// naming the eight rows individually, so it keeps holding as the table grows.
+//
+// ⚠ ROWS ≠ VERBS, and the distinction is why the count below is a `_GE` on ROWS.
+// c-subset ships EIGHT declaration-attached rows carrying SEVEN distinct effect
+// verbs: `warnOnDiscard` is spelled by TWO rows (`nodiscard` and its GNU twin
+// `warn_unused_result`), because the two names share one effect but have DIFFERENT
+// applicability sets — `nodiscard` is function-only per C23 6.7.13.3 while clang
+// enumerates typedefs among the valid positions for the GNU spelling. That split
+// is the whole reason a row-count and a verb-count diverge here, so counting verbs
+// would under-count the table by one and hide a lost row.
+TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
+    auto r = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(r.has_value())
+        << "the shipped c-subset config must satisfy its own `appliesTo` rule";
+    std::size_t declAttached = 0;
+    for (auto const& row : (*r)->semantics().attributeEffects) {
+        if (row.effect == AttributeEffect::None) {
+            EXPECT_TRUE(row.appliesTo.empty())
+                << "a 'none' row must carry NO kind set — an empty set is what "
+                   "marks the exemption the engine's gate reads";
+            continue;
+        }
+        ++declAttached;
+        EXPECT_FALSE(row.appliesTo.empty())
+            << "every declaration-attached row must declare its kinds; row "
+               "naming '"
+            << (row.names.empty() ? "<none>" : row.names[0]) << "' does not";
+    }
+    EXPECT_GE(declAttached, 8u)
+        << "c-subset ships EIGHT declaration-attached effect ROWS carrying SEVEN "
+           "distinct effect VERBS — suppressUnused / warnOnUse / warnOnDiscard "
+           "(TWO rows: `nodiscard` and the GNU `warn_unused_result`, one verb but "
+           "two applicability sets) / align / noInline / alwaysInline / "
+           "noSanitizeThread. A lower count means a row was lost, demoted to "
+           "'none', or merged back into a sibling — each of which is how a sink "
+           "goes silent, and the middle two are invisible to a verb-count";
+}
+
+// ── the drift cross-check ─────────────────────────────────────────────────
+
+// BASELINE. A consistent vocabulary loads clean, so every negative below
+// cannot pass for the wrong reason. Note what this pins POSITIVELY: the inert
+// `fallthrough` is NOT linkage-ignored and that is FINE — a statement-attached
+// attribute never reaches a declaration's specifier scan, and a cross-check
+// that demanded it would reject correct config.
+TEST(GrammarSchema, AttributeVocabularyConsistentPairLoadsCleanly) {
+    auto const cfg =
+        attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().attributeEffects.size(), 2u);
+}
+
+// CLAUSE B, DRIFTED. `deprecated` keeps its declaration-attached effect but is
+// dropped from the row's ignore list — exactly what happens when someone edits
+// one list and not the other. Left unchecked this is not a load error but a
+// COMPILE error on legal source: a leading `__attribute__((deprecated))` fails
+// H_UnknownLinkageSpecifier, so the effects row can never fire.
+TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects, R"("linkageSpecifierIgnoredNames": ["noreturn"],)",
+        "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an effects name with a declaration-attached effect that the row's "
+           "strict linkage scan neither ignores nor recognizes must fail the "
+           "load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesBothLists = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("attributeSemantics.effects") != std::string::npos
+            && d.message.find("linkageSpecifierIgnoredNames")
+                   != std::string::npos) {
+            namesBothLists = true;
+        }
+    }
+    EXPECT_TRUE(namesBothLists)
+        << "the drift message must name BOTH lists — the reader has to know "
+           "which two surfaces disagree, not merely that something does";
+}
+
+// CLAUSE B, INERT NAMES STAY EXEMPT. The same drifted shape but with the name
+// carrying `effect: "none"` must still load. This is the pin that keeps the
+// cross-check from becoming the over-broad "every effects name must be
+// ignored everywhere" rule, which would reject the shipped c-subset (whose
+// `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
+TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
+             { "names": ["likely", "unlikely"], "effect": "none" } ])",
+        kIgnoresDeprecated, "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "an inert ('none') attribute name may be statement- or type-"
+           "attached and must not be forced into a declaration row's ignore "
+           "list: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// CLAUSE B, THE GATE — and this is a REPLACEMENT for a pin that cemented a
+// hole. The gate used to be "does this row list at least one ignored NAME?",
+// and the test here asserted that a row listing none stays EXEMPT. That made an
+// invariant out of the check's own blind spot: deleting ONE name from a list
+// failed correctly, while deleting the WHOLE key emptied the list and silently
+// exempted the row — so the larger, more plausible edit was the one that
+// escaped, and this file said that was intended. A test that pins a known false
+// negative is worse than no test: it converts "we have not closed this" into
+// "we decided not to", and the next reader has no way to tell them apart.
+//
+// The gate now reads `linkageSpecifierIgnoredRules` FIRST and the name list
+// only as a fallback, giving three tiers. The four tests below pin each.
+
+// (i) TIER 2 — DELETING THE WHOLE NAMES KEY MUST STILL FAIL. The row ignores
+// `stdAttr` wholesale but leaves `attrSpec` LIVE, so it has demonstrably
+// reasoned about attribute syntax reaching this declaration form and part of
+// that syntax still routes identifiers to the strict name lookup. The gate
+// therefore keys on the RULES list, which this edit does not touch — the whole
+// point, since deleting the names list is exactly how the old gate was
+// switched off.
+TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredRules": ["stdAttr"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "deleting the ENTIRE 'linkageSpecifierIgnoredNames' key is the SAME "
+           "drift as deleting one entry from it, and must not be the version "
+           "that escapes by emptying the list the gate reads";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool rightDiag = false;
+    for (auto const& d : r.error()) {
+        if (d.code == DiagnosticCode::C_InvalidSemantics
+            && d.path == "/semantics/declarations/0/"
+                         "linkageSpecifierIgnoredNames"
+            && d.message.find("attribute-vocabulary drift") != std::string::npos
+            && d.message.find("deprecated") != std::string::npos) {
+            rightDiag = true;
+        }
+    }
+    EXPECT_TRUE(rightDiag)
+        << "the diagnostic must be the drift one, AT the ignore-names path, "
+           "naming 'deprecated' — asserting only that the load failed would "
+           "pass for any unrelated error";
+}
+
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the NEW verb participates in the SAME
+// mechanical coupling — asserted per-verb rather than assumed from the check's
+// `effect != None` shape.
+//
+// ★ WHY A DEDICATED CASE FOR THIS VERB RATHER THAN TRUSTING THE GENERIC GATE. The
+// shipped c-subset config needed THREE coordinated edits for this attribute (the
+// `effects` row plus BOTH declaration rows' `linkageSpecifierIgnoredNames`), and the
+// only thing that makes forgetting one of them impossible is this cross-check. Its
+// generality is a property of the current implementation, not of the contract — a
+// future refactor could special-case a verb and nothing would notice. This pins the
+// contract for the verb whose config edits are newest and therefore likeliest to be
+// half-reverted.
+//
+// BOTH DIRECTIONS ARE ASSERTED: without the ignored name the load must FAIL with the
+// drift diagnostic naming the attribute; with it the load must SUCCEED. The second
+// half matters as much as the first — a check that rejected the consistent
+// configuration too would be indistinguishable from a working one here.
+TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
+    constexpr std::string_view kEffects =
+        R"([ { "names": ["no_sanitize_thread"], "appliesTo": ["function"],
+               "effect": "noSanitizeThread" } ])";
+
+    // (a) the effect row alone — the half-landed config edit.
+    auto const missing = attrVocabSchema(
+        kEffects, R"("linkageSpecifierIgnoredRules": ["stdAttr"],)", "");
+    auto rBad = GrammarSchema::loadFromText(missing);
+    ASSERT_FALSE(rBad.has_value())
+        << "a declaration-attached `noSanitizeThread` effect whose name is NOT in "
+           "this row's linkageSpecifierIgnoredNames must fail the LOAD — otherwise "
+           "the effects row is unreachable config: a leading "
+           "__attribute__((no_sanitize_thread)) would die at the linkage tier "
+           "before the semantic scan ever runs";
+    EXPECT_TRUE(hasDiagCode(rBad.error(), DiagnosticCode::C_InvalidSemantics));
+    bool rightDrift = false;
+    for (auto const& d : rBad.error()) {
+        if (d.code == DiagnosticCode::C_InvalidSemantics
+            && d.path == "/semantics/declarations/0/"
+                         "linkageSpecifierIgnoredNames"
+            && d.message.find("attribute-vocabulary drift") != std::string::npos
+            && d.message.find("no_sanitize_thread") != std::string::npos) {
+            rightDrift = true;
+        }
+    }
+    EXPECT_TRUE(rightDrift)
+        << "the diagnostic must be the drift one, AT the ignore-names path, and it "
+           "must NAME the attribute the author has to add: "
+        << errorDiags(rBad.error());
+
+    // (b) both halves present — must load clean. This is the shape the shipped
+    // c-subset config uses on BOTH its topLevelDecl and externDecl rows.
+    auto const consistent = attrVocabSchema(
+        kEffects, R"("linkageSpecifierIgnoredNames": ["no_sanitize_thread"],)", "");
+    auto rGood = GrammarSchema::loadFromText(consistent);
+    ASSERT_TRUE(rGood.has_value())
+        << "the CONSISTENT pairing must load — a gate that also rejected this "
+           "would look identical to a working one in half (a): "
+        << errorDiags(rGood.error());
+}
+
+// (i-b) TIER 3 — a row that mentions NO attribute rule at all and ignores
+// nothing by name stays EXEMPT, and that limit is DELIBERATE, not an oversight.
+// The loader holds only a name↔id rule table; it cannot see whether such a
+// row's prefix grammar admits an attribute clause at all, and c-subset's
+// `externDecl` is exactly this shape (its specifier prefix is `extern` plus the
+// thread-local twins, so no attribute identifier can occur there).
+//
+// ★ Pinning the limit is the honest alternative to pretending it is closed. It
+// is also the reason (i) uses the RULES signal rather than simply dropping the
+// old gate: dropping it outright was MEASURED to reject the shipped c-subset on
+// this very row.
+TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
+    auto const cfg = attrVocabSchema(kConsistentEffects, "", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a row that neither ignores an attribute rule nor ignores anything "
+           "by name makes no visible claim about attribute syntax, and the "
+           "loader cannot prove its prefix grammar admits one — this "
+           "reachability limit is documented and must stay exempt: "
+        << errorDiags(r.error());
+}
+
+// (ii) THE EXEMPTION THAT IS ACTUALLY SOUND. A row that skips every declared
+// attribute rule WHOLESALE (`linkageSpecifierIgnoredRules`) cannot route an
+// attribute identifier to its name lookup at all, so no per-name entry could
+// change its behavior.
+//
+// ★ Without this, the check is wrong in the OTHER direction, and wrong in a way
+// that pushes config the wrong way. MEASURED on the shipped c-subset: adding
+// ONE unrelated name to `varDecl` — a row that already ignores `attrSpec` and
+// `stdAttr` wholesale — flipped the old gate on and demanded six more names be
+// added to a silence list that could never be consulted. A guard whose remedy
+// is "silence more things" teaches the wrong lesson even when it is right.
+TEST(GrammarSchema, AttributeVocabularyRowIgnoringAttrRulesWholesaleIsExempt) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredNames": ["restrict"],
+           "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a row that skips every attribute rule wholesale can never route an "
+           "attribute identifier to its name lookup, so it must stay exempt "
+           "however many unrelated names it happens to ignore: "
+        << errorDiags(r.error());
+}
+
+// (iii) THE EXEMPTION IS ALL-OR-NOTHING. Skipping `attrSpec` while leaving
+// `stdAttr` live still lets a `[[deprecated]]` identifier reach the strict
+// lookup, so a PARTIAL wholesale skip must NOT exempt the row. Without this the
+// fix for (ii) would be "any ignoredRules entry disarms the check" — trading
+// one silent hole for another.
+TEST(GrammarSchema, AttributeVocabularyPartialWholesaleSkipIsNotExempt) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredRules": ["attrSpec"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "ignoring only SOME attribute rules still leaves the others' "
+           "identifiers reaching the strict lookup — the wholesale exemption "
+           "must require ALL of them";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// CLAUSE A, DRIFTED. `packed.attributeNames` names a spelling the dedicated
+// composite scan CONSUMES, but no `effects` row declares it known — so the
+// `[[...]]` spelling of that very name warns S_UnknownAttribute while the GNU
+// spelling is acted upon. That contradiction is what `AttributeEffect::None`
+// exists to prevent, and it was documented in prose only until now.
+TEST(GrammarSchema, AttributeVocabularyDriftedPackedNameReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects, kIgnoresDeprecated,
+        R"("packed": { "listRule": "attrSpec",
+                       "attributeNames": ["packed"] },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a dedicated-scan attribute name missing from the effects table "
+           "must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesBothLists = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("semantics.packed.attributeNames")
+                != std::string::npos
+            && d.message.find("attributeSemantics.effects")
+                   != std::string::npos) {
+            namesBothLists = true;
+        }
+    }
+    EXPECT_TRUE(namesBothLists)
+        << "the drift message must name BOTH the dedicated-scan list and the "
+           "effects table";
+}
+
+// CLAUSE A, DUNDER-NORMALIZED. `__packed__` in the dedicated list is satisfied
+// by a `packed` effects row — the cross-check must use the SAME normalizer the
+// runtime scans use, or it would fire on config that works perfectly.
+TEST(GrammarSchema, AttributeVocabularyDedicatedNameMatchesDunderNormalized) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" },
+             { "names": ["packed"],     "effect": "none"      } ])",
+        kIgnoresDeprecated,
+        R"("packed": { "listRule": "attrSpec",
+                       "attributeNames": ["__packed__"] },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "the cross-check must dunder-normalize exactly like the scans it "
+           "guards: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// CLAUSE A, THE GATE. It keys off `stdAttrRule` — "does this language HAVE a
+// standard-attribute surface?" — NOT off "is the effects table non-empty?".
+//
+// ★ Those coincide until exactly the moment they matter. Commenting the
+// `effects` rows out to debug something emptied the table and DISARMED the
+// clause, so the edit most likely to introduce the drift was also the one that
+// switched the detector off. Here the effects table is empty while
+// `packed.attributeNames` still names a spelling the dedicated scan consumes —
+// which is itself drift, and must report.
+TEST(GrammarSchema, AttributeVocabularyClauseAFiresWithEmptyEffectsTable) {
+    auto const cfg = attrVocabSchema(
+        R"([ ])", kIgnoresDeprecated,
+        R"("packed": { "listRule": "attrSpec",
+                       "attributeNames": ["packed"] },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "emptying the effects table must not DISARM the dedicated-scan "
+           "cross-check — commenting rows out to debug is precisely when the "
+           "check is needed, and a guard that switches itself off then is not "
+           "a guard";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesPackedList = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("attribute-vocabulary drift") != std::string::npos
+            && d.message.find("semantics.packed.attributeNames")
+                   != std::string::npos) {
+            namesPackedList = true;
+        }
+    }
+    EXPECT_TRUE(namesPackedList)
+        << "the diagnostic must be clause A's drift one naming the "
+           "dedicated-scan list, not some unrelated failure";
+}
+
+// ANTI-OVER-BROAD for that gate: a language with NO attribute surface at all
+// (no `attributeSemantics` block, so no `stdAttrRule`) is not forced to declare
+// one. This is the case the old `attributeEffects.empty()` gate was reaching
+// for, and it keeps working under the new one.
+TEST(GrammarSchema, AttributeVocabularyClauseAExemptsLanguageWithNoAttrSurface) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoAttrs", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }], "(": [{ "kind": "ParenOpen" }],
+                  ")": [{ "kind": "ParenClose" }] },
+      "shapes": { "root":     { "sequence": [ "Semi" ] },
+                  "attrSpec": { "sequence": [ "ParenOpen", "Identifier",
+                                              "ParenClose" ] } },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "packed": { "listRule": "attrSpec", "attributeNames": ["packed"] }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a language that declares no standard-attribute surface has no "
+           "S_UnknownAttribute warning to contradict and must not be forced "
+           "to declare an effects table: " << errorDiags(r.error());
+}
+
+// ── declarationAttrSlotRules: the degenerate shapes ───────────────────────
+
+// A repeated slot rule makes the semantic attribute scan visit that slot
+// TWICE, so every clause under it is seen twice — per-attribute diagnostics
+// fire twice and per-attribute effects apply twice. Silent before this.
+TEST(GrammarSchema, DeclarationAttrSlotRulesDuplicateReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredNames": ["deprecated"],
+           "declarationAttrSlotRules": ["attrSpec", "attrSpec"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a repeated attribute-slot rule must fail the load — the scan would "
+           "visit that slot twice and double every finding under it";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An EMPTY list is byte-identical to omitting the key, so writing it says
+// nothing while reading as a configured attribute surface.
+TEST(GrammarSchema, DeclarationAttrSlotRulesEmptyArrayReportsInvalid) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredNames": ["deprecated"],
+           "declarationAttrSlotRules": [],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an empty declarationAttrSlotRules is identical to omitting the "
+           "key — a knob that reads as configured and does nothing";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ANTI-OVER-BROAD: a well-formed list of DISTINCT slot rules still loads and
+// still reaches SemanticConfig.
+TEST(GrammarSchema, DeclarationAttrSlotRulesDistinctEntriesLoad) {
+    auto const cfg = attrVocabSchema(
+        kConsistentEffects,
+        R"("linkageSpecifierIgnoredNames": ["deprecated"],
+           "declarationAttrSlotRules": ["attrSpec", "stdAttr"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    EXPECT_EQ((*r)->semantics().declarations[0]
+                  .declarationAttrSlotRules.size(), 2u);
+}
+
+// ── linkageSpecifiers: the EFFECT object's closed keys ────────────────────
+
+// A typo on ONE axis while another axis is set. The "sets at least one axis"
+// guard only catches an object whose EVERY key is misspelled, so this shape
+// loaded clean and silently dropped the visibility — a linkage knob that lies,
+// one nesting level under the declaration row whose keys this cycle closed.
+TEST(GrammarSchema, LinkageSpecifierEffectUnknownKeyReportsInvalid) {
+    auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+    constexpr std::string_view kNeedle = R"({ "binding": "local" })";
+    auto const pos = cfg.find(kNeedle);
+    ASSERT_NE(pos, std::string::npos);
+    cfg.replace(pos, kNeedle.size(),
+                R"({ "binding": "local", "visibilty": "hidden" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled axis on a linkage effect must fail the load — with a "
+           "good axis present the 'sets at least one' guard is satisfied and "
+           "the typo'd one is silently dropped";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    bool namesTheKey = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("visibilty") != std::string::npos
+            && d.message.find("linkage effect") != std::string::npos) {
+            namesTheKey = true;
+        }
+    }
+    EXPECT_TRUE(namesTheKey)
+        << "the diagnostic must name the offending KEY — the pre-existing "
+           "'must set at least one axis' error fires on a different shape and "
+           "would satisfy a weaker assertion";
+}
+
+// …and the `$` convention stays exempt inside a linkage effect too.
+TEST(GrammarSchema, LinkageSpecifierEffectDollarPrefixedKeyIsExempt) {
+    auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+    constexpr std::string_view kNeedle = R"({ "binding": "local" })";
+    auto const pos = cfg.find(kNeedle);
+    ASSERT_NE(pos, std::string::npos);
+    cfg.replace(pos, kNeedle.size(),
+                R"({ "$comment": "internal linkage", "binding": "local" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key inside a linkage effect must not "
+           "trip the typo discriminator: " << errorDiags(r.error());
+}
+
 // Missing required `rule` field on a declaration entry → C_MissingField.
 TEST(GrammarSchema, SemanticsDeclarationMissingRuleField) {
     constexpr std::string_view kCfg = R"JSON({
@@ -2055,6 +3275,583 @@ TEST(GrammarSchema, DeclaratorModeRowWithoutHeadStillReportsMissingField) {
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// ── `declarations[]` ROW closed key vocabulary (typo discriminator) ──────
+//
+// Nearly every row field is an OPTIONAL opt-in facet whose absence is
+// silent, so a near-miss spelling used to load clean and simply no-op the
+// facet. These reuse the skeleton above, which already loads cleanly.
+
+// Baseline: the reference row (no extra key) loads clean, so the negative
+// pin below cannot pass for the wrong reason.
+TEST(GrammarSchema, DeclarationRowClosedKeyBaselineLoadsCleanly) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().declarations.size(), 1u);
+}
+
+// An unknown key on a declaration row → C_InvalidSemantics. The SINGULAR
+// `linkageSpecifierIgnoredName` is the real-world near-miss: the loader only
+// ever reads the plural, so the ignore-list silently stayed empty.
+TEST(GrammarSchema, DeclarationRowUnknownKeyReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true,
+             "linkageSpecifierIgnoredName": ["C"] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd declaration-row key must fail the load, not silently "
+           "no-op the facet";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A second near-miss on a different facet — `specifierPrefx` — to pin that
+// the check is a vocabulary, not a single special-cased name.
+TEST(GrammarSchema, DeclarationRowMisspelledSpecifierPrefixReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true, "specifierPrefx": 0 })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── TF-C73: `declarationAttrSlotRules` + `unknownStrictAttributeIsError` ──
+//
+// The two new row keys. Both had to join `kDeclarationRowKeys` in the same
+// edit, so these also cover that the closed vocabulary grew with them (an
+// unlisted key would be rejected by the typo discriminator above).
+
+// `declarationAttrSlotRules` resolves each NAME to a rule id and keeps the
+// source spelling for diagnostics.
+TEST(GrammarSchema, DeclarationAttrSlotRulesLoad) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": ["heads", "idecl"] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    ASSERT_EQ((*r)->semantics().declarations.size(), 1u);
+    auto const& d = (*r)->semantics().declarations[0];
+    ASSERT_EQ(d.declarationAttrSlotRules.size(), 2u);
+    EXPECT_TRUE(d.declarationAttrSlotRules[0].valid());
+    EXPECT_TRUE(d.declarationAttrSlotRules[1].valid());
+    ASSERT_EQ(d.declarationAttrSlotRuleNames.size(), 2u);
+    EXPECT_EQ(d.declarationAttrSlotRuleNames[0], "heads");
+    EXPECT_EQ(d.declarationAttrSlotRuleNames[1], "idecl");
+}
+
+// ★ THE REASON THE KEY IS NAME-BASED. An unknown rule NAME fails the load.
+// The rejected design was a list of visible-child INDICES: a wrong index is
+// SILENT — the scan descends the named child, finds no attribute specifier
+// under it, and asserts nothing, so the config looks configured while the
+// attributes are never honored. This test is the measurement that the chosen
+// identifier space has the loud failure mode the indexed one lacks.
+TEST(GrammarSchema, DeclarationAttrSlotRulesUnknownNameReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": ["heads", "attrRunTypo"] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an attribute slot naming a nonexistent shape must fail the load — "
+           "a silently-unresolved slot is exactly the failure mode the "
+           "name-based design exists to rule out";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A non-array value → C_InvalidSemantics (never coerced to a one-element list).
+TEST(GrammarSchema, DeclarationAttrSlotRulesNonArrayReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable", "declarationAttrSlotRules": "heads" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a scalar 'declarationAttrSlotRules' must fail the load, not be "
+           "silently promoted to a single-entry list";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A non-string ELEMENT is rejected too — the array type check alone would let
+// `[0]` through, which is precisely the indexed spelling this key rejects.
+TEST(GrammarSchema, DeclarationAttrSlotRulesNonStringEntryReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable", "declarationAttrSlotRules": [0] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an INDEX where a rule name belongs must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `unknownStrictAttributeIsError` loads, and DEFAULTS to false (= today's
+// behavior) when absent, so adding the key changes no existing config.
+TEST(GrammarSchema, UnknownStrictAttributeIsErrorLoads) {
+    auto const withKey = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable", "unknownStrictAttributeIsError": true })");
+    auto r = GrammarSchema::loadFromText(withKey);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    ASSERT_EQ((*r)->semantics().declarations.size(), 1u);
+    EXPECT_TRUE((*r)->semantics().declarations[0].unknownStrictAttributeIsError);
+
+    auto const without = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable" })");
+    auto r2 = GrammarSchema::loadFromText(without);
+    ASSERT_TRUE(r2.has_value())
+        << (r2.error().empty() ? "<no diagnostics>" : r2.error()[0].message);
+    ASSERT_EQ((*r2)->semantics().declarations.size(), 1u);
+    EXPECT_FALSE(
+        (*r2)->semantics().declarations[0].unknownStrictAttributeIsError)
+        << "the default must be TODAY's behavior — a key that tightens on "
+           "absence would change every shipped config's meaning silently";
+}
+
+// A non-bool → C_InvalidSemantics. `"true"` is the realistic typo, and JSON
+// truthiness would happily accept it as a non-empty string.
+TEST(GrammarSchema, UnknownStrictAttributeIsErrorNonBoolReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable", "unknownStrictAttributeIsError": "true" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a stringly-typed boolean must fail the load, not be coerced";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `$`-prefixed documentation keys stay EXEMPT on a row.
+TEST(GrammarSchema, DeclarationRowDollarPrefixedKeyIsExempt) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true,
+             "$kindComment": "variables only; functions are a separate row" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().declarations.size(), 1u);
+}
+
+// ── TOP-LEVEL document closed key vocabulary (typo discriminator) ────────
+//
+// The widest-blast-radius instance: every block is optional and absence is
+// MEANINGFUL, so a misspelled block name used to load clean and silently
+// drop that entire phase.
+
+namespace {
+// A minimal loadable document with one extra top-level key spliced at %X%.
+[[nodiscard]] std::string documentSchemaWith(std::string_view extra) {
+    std::string cfg = R"JSON({
+      %X%
+      "dssSchemaVersion": 4,
+      "language": { "name": "DocKeys", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, extra);
+    return cfg;
+}
+} // namespace
+
+// Baseline: the skeleton with no extra key loads clean.
+TEST(GrammarSchema, DocumentClosedKeyBaselineLoadsCleanly) {
+    auto r = GrammarSchema::loadFromText(documentSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// A misspelled top-level BLOCK must fail the load. `semantcs` is the worst
+// case in the whole defect class: the loader's contract is "absent ⇒ the
+// analyzer performs no semantic analysis", so this used to load perfectly
+// clean and silently disable semantic analysis entirely.
+TEST(GrammarSchema, DocumentUnknownTopLevelKeyReportsMalformed) {
+    auto const cfg = documentSchemaWith(R"("semantcs": { "scopes": [] },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled top-level block must fail the load — silently "
+           "dropping the whole phase is the knob-that-lies";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// A second misspelling on a different block, to pin the vocabulary rather
+// than one special-cased name.
+TEST(GrammarSchema, DocumentMisspelledShapesKeyReportsMalformed) {
+    auto const cfg = documentSchemaWith(R"("shape": { "x": {} },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// `$`-prefixed documentation keys stay EXEMPT at document level too.
+TEST(GrammarSchema, DocumentDollarPrefixedKeyIsExempt) {
+    auto const cfg = documentSchemaWith(
+        R"("$comment": "the minimal document used by the closed-key pins",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// ── the `$` convention at the REMAINING key-iteration sites ───────────────
+//
+// The shapes-map fix closed ONE instance and the cycle asserted the class was
+// closed with it ("every site now calls isDocumentationKey"). It was not: five
+// more loops read an object's keys and rejected a `$comment` with a HARD LOAD
+// FAILURE, and two more read them AS IDENTIFIERS and silently MINTED the
+// documentation key as a real one. Each pin below is a site that was measured
+// broken; together they are what makes the class claim true rather than
+// asserted. The two shapes — closed-key vocabulary vs. identifier-valued map —
+// need different assertions, so both are spelled out per site.
+
+// (1) `tokens` — NOT a site for the convention, and the pins below say why.
+//
+// ★ This was the audit finding that turned out to be REFUTED, and refuting it
+// mattered: a key in the `tokens` map is a LEXEME — arbitrary SOURCE TEXT the
+// target language defines — not an identifier out of a vocabulary this loader
+// owns. Adding the `$` carve-out here was MEASURED to break
+// `core/test_operator_table` (a language whose `$` is an infix operator) and
+// seven `core/test_lexer_modes` cases (C#-style `$"…"` interpolation and `$$`).
+// A source-agnostic frontend cannot reserve a punctuation character, so the
+// exemption was reverted and these pins keep it reverted.
+TEST(GrammarSchema, TokensMapDollarLexemeIsARealOperatorNotAComment) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "DollarLang", "version": "0.1.0" },
+      "tokens": { "$": [{ "kind": "DollarOp" }],
+                  "$$": [{ "kind": "DoubleDollarOp" }],
+                  ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    EXPECT_EQ((*r)->lookupLexeme("$").size(), 1u)
+        << "'$' is an ordinary operator character in many languages — the "
+           "documentation-key convention must NOT reach a map whose keys are "
+           "source text, or declaring it silently deletes the operator";
+    EXPECT_EQ((*r)->lookupLexeme("$$").size(), 1u);
+}
+
+// The per-MODE token override table shares that key space, so it must behave
+// identically. Pinned separately because it is a separate loop that a future
+// "apply the convention everywhere" sweep would find on its own.
+TEST(GrammarSchema, PerModeTokensMapDollarLexemeIsHonored) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "DollarLang", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "lexerModes": {
+        "alt": { "tokens": { "$$": [{ "kind": "DoubleDollarOp" }] } }
+      },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const mode = (*r)->findLexerMode("alt");
+    ASSERT_TRUE(mode.valid());
+    EXPECT_EQ((*r)->lookupLexemeInMode(mode, "$$").size(), 1u)
+        << "the per-mode token table has the same source-text key space as the "
+           "global one and must not reserve '$' either";
+}
+
+// `linkageSpecifiers` is the third map keyed by SOURCE TEXT (its keys are
+// matched against `tree().text(token)`), so it gets the same treatment — the
+// audit listed it as a missing carve-out, and it is deliberately absent.
+// Documentation for that map goes on a `$`-prefixed sibling of the declaration
+// ROW's keys, which IS the loader's own vocabulary; the shipped c-subset's
+// `$linkageSpecifiersComment` already does exactly that.
+TEST(GrammarSchema, LinkageSpecifiersMapDollarKeyIsASpecifierNotAComment) {
+    auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+    constexpr std::string_view kNeedle =
+        R"("linkageSpecifiers": { "st": { "binding": "local" } })";
+    auto const pos = cfg.find(kNeedle);
+    ASSERT_NE(pos, std::string::npos);
+    cfg.replace(pos, kNeedle.size(),
+                R"("linkageSpecifiers": { "$st": { "binding": "local" },
+                                          "st":  { "binding": "local" } })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& ls = (*r)->semantics().declarations[0].linkageSpecifiers;
+    EXPECT_EQ(ls.size(), 2u)
+        << "a specifier whose source spelling begins with '$' must remain "
+           "declarable — this key space is source text, not loader vocabulary";
+    EXPECT_TRUE(ls.contains("$st"));
+}
+
+// (2) `lexerModes` — the other identifier-valued map. A `$comment` here used to
+// REGISTER a lexer mode named `$comment`.
+TEST(GrammarSchema, LexerModesMapDollarPrefixedKeyIsExempt) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "ModeKeys", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "lexerModes": {
+        "$comment": "the mode table",
+        "line-comment": { "defaultToken": { "kind": "CommentBody" } }
+      },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key in the lexerModes map must not be "
+           "registered as a mode: " << errorDiags(r.error());
+    EXPECT_FALSE((*r)->findLexerMode("$comment").valid())
+        << "the documentation key must not be REGISTERED as a lexer mode";
+}
+
+// (3) `semantics.externLibraryByFormat` — an identifier-valued map, but a
+// CLOSED one: its keys must name an ObjectFormatKind, so a `$comment` can
+// never be a legal key and skipping it forecloses nothing.
+TEST(GrammarSchema, ExternLibraryByFormatDollarPrefixedKeyIsExempt) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "$comment": "the CRT, per format",
+                                   "pe": "msvcrt.dll" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not be read as an "
+           "object-format name: " << errorDiags(r.error());
+    EXPECT_EQ((*r)->semantics().externLibraryByFormat.size(), 1u);
+}
+
+// (4) `declarations[].gatedMarkers[]` — a closed-key vocabulary that rejected
+// `$comment` outright.
+TEST(GrammarSchema, GatedMarkerDollarPrefixedKeyIsExempt) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }], "!": [{ "kind": "Bang" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] },
+                  "vdecl": { "sequence": [ "Identifier", "Semi" ] } },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarations": [
+          { "rule": "vdecl", "name": 0, "kind": "variable",
+            "gatedMarkers": [ { "$comment": "not supported yet",
+                                "token": "Bang",
+                                "code": "H_UnknownLinkageSpecifier" } ] }
+        ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key on a gatedMarkers entry must not "
+           "trip the typo discriminator: " << errorDiags(r.error());
+}
+
+// (5) `numberStyle.exponent` — a closed-key vocabulary shared by the top-level
+// exponent block and every prefix's `float.exponent`, so one exemption covers
+// both readers.
+TEST(GrammarSchema, NumberStyleExponentDollarPrefixedKeyIsExempt) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }], "#": [{ "kind": "Num" }],
+                  "~": [{ "kind": "Flt" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "numberStyle": {
+        "emitKind": { "integer": "Num", "float": "Flt" },
+        "exponent": { "$comment": "both e and E introduce an exponent",
+                      "letters": ["e", "E"], "signOptional": true }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key in numberStyle.exponent must not "
+           "trip the typo discriminator: " << errorDiags(r.error());
+}
+
+// ANTI-OVER-SKIP for that same block: the real typo it exists to catch must
+// still fail. `signOptionl` is the misspelling the discriminator was written
+// for, and it must not have been widened away by the `$` exemption.
+TEST(GrammarSchema, NumberStyleExponentMisspelledKeyStillReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }], "#": [{ "kind": "Num" }],
+                  "~": [{ "kind": "Flt" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "numberStyle": {
+        "emitKind": { "integer": "Num", "float": "Flt" },
+        "exponent": { "letters": ["e"], "signOptionl": true }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled exponent key must still fail — the '$' exemption "
+           "must not widen into accepting any unknown key";
+    bool namesTheKey = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("signOptionl") != std::string::npos) namesTheKey = true;
+    }
+    EXPECT_TRUE(namesTheKey)
+        << "the diagnostic must name the misspelled key — a load that fails "
+           "for some other reason would satisfy a weaker assertion";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// (6) a shape's `commitRequiresTypeName` guard object — the last closed-key
+// vocabulary that rejected `$comment`.
+TEST(GrammarSchema, TypeNameCommitGuardDollarPrefixedKeyIsExempt) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":     { "sequence": [ "Semi" ] },
+        "typeName": { "sequence": [ "Identifier" ] },
+        "vdecl":    { "sequence": [ "typeName", "Identifier", "Semi" ],
+                      "commitRequiresTypeName": {
+                        "$comment": "only commit once a real type name is seen",
+                        "rule": "typeName",
+                        "polarity": "requireKnownType" } }
+      },
+      "semantics": { "identifierToken": "Identifier" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key in commitRequiresTypeName must "
+           "not trip the typo discriminator: " << errorDiags(r.error());
+}
+
+// ── the `$` convention inside the `shapes` MAP ────────────────────────────
+//
+// The `$comment` convention was honored at the document top level, inside
+// `semantics`, inside `attributeSemantics`, on every `declarations[]` row and
+// inside an individual shape BODY — but NOT as a sibling of the rule names in
+// the `shapes` map, where the key was read as a SHAPE DEFINITION and its prose
+// value as a rule REFERENCE. The whole load failed with the paragraph printed
+// back as if it were a rule name. Hit for real while authoring c-subset.
+
+namespace {
+// One extra entry spliced into the `shapes` map at %X%, ahead of `root`.
+[[nodiscard]] std::string shapesMapSchemaWith(std::string_view extraEntry) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "ShapeKeys", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        %X%
+        "root": { "sequence": [ "Semi" ] }
+      }
+    })JSON";
+    cfg.replace(cfg.find("%X%"), 3, extraEntry);
+    return cfg;
+}
+} // namespace
+
+// Baseline: the skeleton with no extra entry loads clean.
+TEST(GrammarSchema, ShapesMapBaselineLoadsCleanly) {
+    auto r = GrammarSchema::loadFromText(shapesMapSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// (a) A `$`-prefixed key at the shapes-MAP level is documentation: the load
+// succeeds AND no rule by that name is minted. ★ Both halves matter. A fix
+// that only stopped the reference check would still INTERN the key, leaving a
+// junk rule in the table that nothing defines — greppable from the outside as
+// a real shape, and a `nameMatch`/`kindByChild` typo could then "resolve" to
+// it. Asserting only "loads clean" would pass for that broken fix.
+TEST(GrammarSchema, ShapesMapDollarPrefixedKeyIsExempt) {
+    auto const cfg = shapesMapSchemaWith(
+        R"("$rootComment": "root is a lone statement terminator — this is prose, not a rule",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key in the shapes map must not be "
+           "read as a shape definition: "
+        << errorDiags(r.error());
+    EXPECT_FALSE((*r)->rules().contains("$rootComment"))
+        << "the documentation key must not be INTERNED as a rule — a junk "
+           "rule that nothing defines is exactly the silent state the "
+           "reference check exists to prevent";
+}
+
+// (b) ANTI-OVER-SKIP. A non-`$` shapes entry whose body is a bad reference
+// must still fail loud. Without this pin the fix could be "skip more than
+// intended" — silently dropping real, misspelled shapes — and nothing would
+// notice. The exemption is for the `$` sigil, not for string-valued entries.
+TEST(GrammarSchema, ShapesMapNonDollarBadEntryStillReportsUnknownShape) {
+    auto const cfg = shapesMapSchemaWith(
+        R"("notAShape": "this prose is not a rule name",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a NON-'$' shapes entry naming an unresolvable reference must "
+           "still fail the load — the '$' exemption must not widen into "
+           "skipping real shapes";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// (c) THE FILTER MUST NOT SWALLOW THE MISSING-ROOT CHECK. A `shapes` block
+// holding NOTHING BUT documentation keys is a block the author DID write, and
+// it declares no `root` — so it must fail exactly as any other rootless
+// non-empty block does.
+//
+// ★ This is the pin the `$` filter itself broke, and it is the one shape the
+// exemption pin above cannot see (that fixture always keeps a real `root`, so
+// the filtered and unfiltered maps are both non-empty and the two tests agree
+// no matter which one the check reads). The failure it guards is not cosmetic:
+// an author bisecting a grammar comments shapes out one at a time, and the last
+// state before "nothing left" is a lone `$wipComment`. Testing the FILTERED map
+// makes that state report SUCCESS with `rootRule` invalid — a compiler holding
+// no grammar at all, and no diagnostic anywhere saying so.
+TEST(GrammarSchema, ShapesMapOfOnlyDocumentationKeysStillDemandsRoot) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "ShapeKeys", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "$comment": "everything commented out while I bisect" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "a 'shapes' block the author wrote — even one holding only "
+           "documentation keys — declares no 'root' and must say so; loading "
+           "clean leaves the compiler with NO grammar and no diagnostic";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+    bool namesShapes = false;
+    for (auto const& d : r.error()) {
+        if (d.code == DiagnosticCode::C_MissingField && d.path == "/shapes"
+            && d.message.find("root") != std::string::npos) {
+            namesShapes = true;
+        }
+    }
+    EXPECT_TRUE(namesShapes)
+        << "the diagnostic must be the missing-'root' one AT '/shapes' — a "
+           "load that merely fails for some other reason would pass a weaker "
+           "assertion while the regression stayed live";
+}
+
+// (d) THE EXEMPTION BOUNDARY. An EMPTY `shapes` object still loads. A config
+// that has not reached its grammar yet has always been allowed to say so, and
+// (c) must not widen into "every config must declare a root".
+TEST(GrammarSchema, ShapesMapEmptyObjectStillLoads) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "ShapeKeys", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "an EMPTY shapes block is a config that has not reached its grammar "
+           "yet and must keep loading: "
+        << errorDiags(r.error());
 }
 
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: references[].compositeKind ──────
@@ -2454,6 +4251,37 @@ TEST(GrammarSchema, SemanticsExternLibraryByFormatUnknownKeyReportsInvalid) {
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ★ A DIFFERENT SPECIES FROM THE "pee" TYPO ABOVE. `unknown` is a real row in
+// `kObjectFormatKindTable`, so `objectFormatKindFromName("unknown")` SUCCEEDS
+// and the name check one test up waves it straight through. The entry then sits
+// in the map keyed to a format no emitted image can ever have — so every extern
+// falls through to `F_FfiNoImportLibraryForFormat`, i.e. a config that DOES
+// declare the library is told the library is undeclared.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
+// `grammar_schema_json.cpp`'s externLibraryByFormat loop and this load succeeds.
+TEST(GrammarSchema, SemanticsExternLibraryByFormatSentinelKeyReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "unknown": "msvcrt.dll" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "'unknown' is the invalid sentinel — it SPELLS correctly, so only an "
+           "explicit selectability check can stop it";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    EXPECT_TRUE(std::ranges::any_of(r.error(), [](auto const& d) {
+        return d.message.find("sentinel") != std::string::npos;
+    })) << "the diagnostic must say WHY 'unknown' is refused — 'unrecognized "
+           "name' would be a confusing lie for a correctly-spelled row:\n"
+        << errorDiags(r.error());
 }
 
 TEST(GrammarSchema, SemanticsExternLibraryByFormatNonStringValueReportsInvalid) {
@@ -3905,6 +5733,38 @@ TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
 }
 
+// ★ THE SENTINEL VARIANT of the test above, and the WORST of the family. This
+// map is ALREADY keyed on `ObjectFormatKind`, so `"unknown"` does not merely sit
+// dead — it stores a LIVE `ObjectFormatKind::Unknown` row. `resolveElementCore`
+// takes an `optional<ObjectFormatKind>`, so any caller holding a
+// default-constructed kind (== Unknown, NOT nullopt) MATCHES that row and takes
+// a wchar_t element width nothing intended. A dead entry is a silent no-op; this
+// one is a silent WRONG ANSWER.
+//
+// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
+// `elementCoreByFormat` loop and the mutated config loads clean.
+TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos)
+        << "elementCoreByFormat pe-key not found in shipped config";
+    text.replace(pos, needle.size(),
+                 "\"elementCoreByFormat\": { \"unknown\": \"U16\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "the 'unknown' sentinel must fail the load — it resolves through the "
+           "name table, so it would be STORED as a live per-format override";
+    EXPECT_TRUE(hasDiagCode(result.error(),
+                            DiagnosticCode::C_InvalidHirLowering));
+    EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
+        return d.message.find("sentinel") != std::string::npos;
+    })) << errorDiags(result.error());
+}
+
 TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
     // A per-format value that is not a known TypeKind must FAIL LOUD.
     std::string text = shippedCSubsetTextForPrefixTest();
@@ -3940,4 +5800,127 @@ TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
     ASSERT_FALSE(result.has_value())
         << "an unknown object-format key in charLiteralPrefixes must fail the load";
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// The regression wall for the CLOSED `semantics` key vocabulary: every key
+// the shipped c-subset config actually uses must survive it. An over-narrow
+// allowed-key list would reject the real config — and the fix is always the
+// list, never the config.
+TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedCSubset) {
+    std::string const text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(result.has_value())
+        << "the shipped c-subset config must still load under the closed "
+           "'semantics' key vocabulary: "
+        << (result.error().empty() ? "<no diagnostics>"
+                                   : result.error()[0].message);
+}
+
+// ── TF-C73: the drift cross-check, against the REAL config ────────────────
+//
+// Two halves, and both are needed.
+//
+// (1) THE WALL. The shipped c-subset's three ABI-neutral name lists are 18 /
+//     12 / 2 entries with a pairwise overlap of only 6 — they answer different
+//     questions and must NOT be merged. A cross-check that mistook them for
+//     three copies of one set would reject the real config, and the fix would
+//     always be the check, never the config. This is the pin that keeps the
+//     rule honest about that.
+TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedCSubset) {
+    std::string const text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(result.has_value())
+        << "the shipped c-subset config must still load under the attribute-"
+           "vocabulary drift cross-check — the three lists are deliberately "
+           "different and a check that demanded they agree would be wrong: "
+        << errorDiags(result.error());
+}
+
+// (2) THE LIVE PROOF. A wall alone can pass because the check never runs. So
+//     drift the REAL config by one character — delete `deprecated` from
+//     `topLevelDecl`'s ignore list while its `warnOnUse` effects row stays —
+//     and the load must FAIL. Without this, a cross-check that silently
+//     no-ops on the shipped config would look identical to one that works.
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedCSubset) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos)
+        << "the topLevelDecl ignore list was not found — if the list was "
+           "reformatted, update this needle rather than dropping the pin";
+    text.replace(pos, needle.size(),
+                 R"("linkageSpecifierIgnoredNames": ["noreturn",)");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "dropping a declaration-attached effect's name from the real "
+           "config's ignore list must fail the load — otherwise a leading "
+           "__attribute__((deprecated)) rejects legal C at COMPILE time and "
+           "nothing said so at LOAD time";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// (3) THE LIVE PROOF FOR THE WHOLE-KEY EDIT. Deleting ONE entry (above) is the
+//     small edit; deleting the ENTIRE `linkageSpecifierIgnoredNames` key is the
+//     large one, and it used to be the one that escaped — the gate exempted any
+//     row whose list was empty, so emptying the list disarmed the check for that
+//     row. Same config, same drift, one keystroke further.
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedCSubset) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    // `topLevelDecl`'s list — the row that does NOT ignore `attrSpec`
+    // wholesale, so its per-name opt-in is the only thing keeping a leading
+    // `__attribute__((deprecated))` from failing H_UnknownLinkageSpecifier.
+    std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos)
+        << "the topLevelDecl ignore list was not found — if the list was "
+           "reformatted, update this needle rather than dropping the pin";
+    auto const close = text.find("],", pos);
+    ASSERT_NE(close, std::string::npos);
+    text.erase(pos, close + 2 - pos);
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "deleting the ENTIRE ignore-names key from the real config must "
+           "fail the load — an empty list is not an opt-out, it is the same "
+           "drift as deleting one entry and must not be the version that "
+           "escapes";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// (4) THE LIVE PROOF THAT THE CHECK IS NOT OVER-STRICT. `varDecl` ignores
+//     `attrSpec` and `stdAttr` WHOLESALE BY RULE, so no attribute identifier
+//     can reach its name lookup and it names nothing. Adding one unrelated
+//     ignored NAME to it must NOT suddenly demand the whole declaration-attached
+//     vocabulary — MEASURED under the old gate: it demanded six.
+//
+//     ★ Note the shape of what this prevents: a guard whose remedy is "add more
+//     names to the silence list" pushes config in the wrong direction, and it
+//     does so most convincingly when the guard is otherwise correct.
+TEST(GrammarSchema, AttributeVocabularyCrossCheckStaysQuietOnWholesaleIgnoringShippedRow) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    std::string const needle =
+        R"("linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
+      { "rule": "identVarDecl")";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos)
+        << "the varDecl row tail was not found — if the row was reformatted, "
+           "update this needle rather than dropping the pin";
+    text.replace(pos, needle.size(),
+        R"("linkageSpecifierIgnoredNames": ["restrict"],
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
+      { "rule": "identVarDecl")");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(result.has_value())
+        << "a row that already ignores every attribute rule wholesale cannot "
+           "route an attribute identifier to its name lookup, so ignoring one "
+           "more unrelated specifier by name must stay clean: "
+        << errorDiags(result.error());
 }

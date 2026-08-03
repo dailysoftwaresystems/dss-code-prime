@@ -135,7 +135,15 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // CRIT-3 belt-and-suspenders: a BitInt-typed RESULT whose operand values did NOT
     // fold to bit-precise (a shape C's typing rules never produce) must NEVER take the
     // un-wrapped int64 path — fail loud rather than silently mis-fold.
-    if (interner.kind(hir.typeId(expr)) == TypeKind::BitInt) {
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): I128/U128 join the belt for the SAME
+    // reason and it is the load-bearing half of this cycle's const-fold closure.
+    // The int64 path below wraps at 64 bits; a 128-bit-typed result reaching it
+    // would be silently mod-2^64 — green in every existing test, wrong in the
+    // emitted value. Complete routing (the widened `foldBitIntBinary` entry above
+    // and the cast arm) should make this unreachable, so this belt is what turns
+    // any FUTURE routing miss into a loud failure instead of a quiet wrap.
+    TypeKind const resultKind = interner.kind(hir.typeId(expr));
+    if (resultKind == TypeKind::BitInt || detail::isInt128Kind(resultKind)) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     // CE5: float promotion. Per C99 UAC, if either operand is float
@@ -249,6 +257,24 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
                       interner.bitIntIsSigned(targetTy));
         HirLiteralValue v;
         v.core  = TypeKind::BitInt;
+        v.value = std::move(*bv);
+        return ok(std::move(v));
+    }
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast TO a 128-bit integer routes
+    // through the SAME wrap-aware bignum. Without this arm `(__uint128_t)X`
+    // produced a plain u64/i64 literal merely TAGGED `core = U128`: the value had
+    // already been truncated to 64 bits, so every later fold read a wrapped
+    // operand while the type said 128. Mirrors the `_BitInt` arm above exactly —
+    // `convertTo(128, signed)` is mod-2^128 — and differs only in the resulting
+    // `core`, which stays I128/U128 (a `__int128` is a STANDARD type, not a
+    // bit-precise one; conflating them would misname it in every later
+    // diagnostic and mis-rank it in the usual arithmetic conversions).
+    if (detail::isInt128Kind(toK)) {
+        auto bv = detail::asBitIntValue(*inner.value);
+        if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        bv->convertTo(128u, toK == TypeKind::I128);
+        HirLiteralValue v;
+        v.core  = toK;
         v.value = std::move(*bv);
         return ok(std::move(v));
     }

@@ -348,9 +348,15 @@ TEST(MirMemoryClobbers, LoopBackEdgeRegionDifferentialEquality) {
 
 // Every opaque-clobber opcode mints a def: the non-Store `opcodeClobbersMemory`
 // members that are BUILDABLE as ordinary insts (SehTryEnd, CompilerBarrier,
-// AtomicCas) sit between two Loads; the range queries must see each. (The
-// clobbering TERMINATORS — SehTryBegin / SehFilterReturn — get their own pin
+// AtomicFence, AtomicCas) sit between two Loads; the range queries must see each.
+// (The clobbering TERMINATORS — SehTryBegin / SehFilterReturn — get their own pin
 // below; Call/IntrinsicCall ride the same positive-list arm by construction.)
+// D-CSUBSET-ATOMIC-FENCE joined this set as the 4th buildable non-Store clobber:
+// the INDEX is a different chokepoint from the region walk pinned in
+// test_mir_alias — this one memoizes clobber defs per block, and today answers
+// correctly only because it queries `opcodeClobbersMemory` generically. The
+// AtomicFence slot pin below is what reds if that generic query is ever traded
+// for a hand-rolled opcode allowlist that forgets the fence.
 TEST(MirMemoryClobbers, OpaqueClobberOpsMintDefsDifferentialEquality) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
@@ -372,6 +378,11 @@ TEST(MirMemoryClobbers, OpaqueClobberOpsMintDefsDifferentialEquality) {
     (void)mb.addInst(MirOpcode::Load, lops, i32);
     (void)mb.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
     (void)mb.addInst(MirOpcode::Load, lops, i32);
+    // D-CSUBSET-ATOMIC-FENCE: the REAL-instruction sibling of CompilerBarrier above
+    // — 0 operands, no result (R::None ⇒ InvalidType), the C11 order in `payload`
+    // (seq_cst=5, __sync_synchronize's sole shipped bake).
+    (void)mb.addInst(MirOpcode::AtomicFence, {}, InvalidType, /*payload=*/5);
+    (void)mb.addInst(MirOpcode::Load, lops, i32);
     MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
     MirInstId const c1 = mb.addConst(v1, i32);
     MirInstId const casOps[] = {p, c0, c1};
@@ -379,6 +390,27 @@ TEST(MirMemoryClobbers, OpaqueClobberOpsMintDefsDifferentialEquality) {
     MirInstId const ld = mb.addInst(MirOpcode::Load, lops, i32);
     mb.addReturn(ld);
     Mir mir = std::move(mb).finish();
+
+    // The AtomicFence slot ALONE must mint a clobber def in the INDEX. The
+    // differential sweep below compares index-vs-oracle and BOTH consult
+    // `opcodeClobbersMemory`, so it cannot red on a dropped membership — this
+    // direct one-slot pin is what reds if the memoized index ever trades the
+    // generic predicate for a hand-rolled opcode allowlist that omits the fence.
+    auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const idx{mir, preds};
+    std::uint32_t const n = mir.blockInstCount(entry);
+    std::uint32_t fenceIdx = n;   // located by opcode — the shape above may grow
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (mir.instOpcode(mir.blockInstAt(entry, i)) == MirOpcode::AtomicFence) {
+            fenceIdx = i;
+            break;
+        }
+    }
+    ASSERT_LT(fenceIdx, n) << "the AtomicFence must survive into the finished Mir";
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, p, entry, fenceIdx,
+                                           fenceIdx + 1u, StrictTbaa::No, true))
+        << "the standalone CPU fence (AtomicFence) must mint a clobber def — no "
+           "Load may be forwarded across it (D-CSUBSET-ATOMIC-FENCE)";
 
     assertDifferentialEquality(mir, interner, {p});
 }

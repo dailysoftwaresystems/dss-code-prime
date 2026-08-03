@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING (C 6.3.1.4 / 6.5.16.1): the implicit double->float NARROWING assignment conversion in EVERY context — init / assign / store-through-pointer / call-arg / return. Frontier: sqlite GEOPOLY `typedef float GeoCoord` assigned `double` RHS (geopolyParseNumber/geopolyRegularFunc) -> DSS rejected double->float in assign/call-arg/store (S0003) and return (S0008) though float->double widening was already clean. FIX: a config-gated `floatSameKindNarrows` bool; isAssignable's float rank arm admits rank(rhs)>rank(lhs) only when the gate is on (WIDENING stays unconditional); coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR FPTrunc — the SAME makeCast path F32->F64 widening already used, NO codegen change), lowered by cvtsd2ss (x86) / FCVT (arm64). Threaded through all 6 semantic isAssignable sites (init x2 / assign / call-arg x2 / return). Numeric proof the FPTrunc ran: 2^24+1=16777217 is exact in f64 but rounds to the nearest-even float 16777216 (diff exactly 1); 2^25+1=33554433 rounds to 33554432 (diff 1). Inputs via io_d()/io_f() stay runtime so the optimized arm runs the real round (and if it const-folds, ConstFold's double->float rounding must AGREE with the runtime FPTrunc). f1/f2/store/arg/return each narrow; the F32->F64 widening guard (2.5->2.5, *4=10) proves widening is untouched; all asserts pass -> 42. RED-ON-DISABLE: flip floatSameKindNarrows to false in c-subset.lang.json -> `float f = d;` errors S0003 (the return site S0008) -> does not compile. The explicit (int) casts are FC2-legal and are NOT the sites under test.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

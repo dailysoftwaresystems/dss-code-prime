@@ -4,3 +4,5 @@
 # self-tests for the substrate itself.)
 
 dss_add_test(NAME test_support/test_scratch_dir SOURCES test_scratch_dir.cpp)
+dss_add_test(NAME test_support/test_host_native_target
+             SOURCES test_host_native_target.cpp)

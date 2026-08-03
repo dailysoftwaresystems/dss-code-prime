@@ -341,13 +341,21 @@ ingest(std::span<IngestionSource const> sources,
                         "skipping match.");
             continue;
         }
-        auto it = bySymbol.find(std::string{ext.canonicalName});
+        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the LIBRARY-MATCH key is
+        // the extern's
+        // ON-BINARY name un-decorated, not its C identifier. Without a label
+        // `unapplyCMangling(applyCMangling(name))` is `name` on every format, so
+        // this is byte-identical to the previous `bySymbol.find(canonicalName)`;
+        // WITH one it is the label's canonical form, which is the only key that can
+        // match. The library really exports the LABEL — `open` declared
+        // `__DARWIN_ALIAS_C(open)` is `_open…` on disk — so keying on the C
+        // identifier would silently miss the row and drop the extern through to the
+        // format-default library with no diagnostic.
+        std::string const linkerName =
+            linkNameFor(ext.canonicalName, ext.asmName, format.kind());
+        auto it = bySymbol.find(unapplyCMangling(linkerName, format.kind()));
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
-
-        // Apply FF4 to produce the linker-visible decorated name.
-        std::string const linkerName =
-            applyCMangling(ext.canonicalName, format.kind());
 
         FfiMetadata meta{};
         meta.mangledName   = linkerName;
@@ -373,6 +381,11 @@ ingest(std::span<IngestionSource const> sources,
         // (FF1 is the binary-reader ingestion path), but a versioned
         // ExternDeclRef routed here must not silently drop its version.
         meta.version = std::string{ext.version};
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
+        // with the FF5 source-decl path). Eager imports flow through
+        // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
+        // eager ExternDeclRef routed here must not silently drop the field.
+        meta.isEagerImport = ext.isEagerImport;
         // The raw embedded soname, at its semantic home (the DT_SONAME of
         // `importLibrary`). Populated now that the FF1 readers extract it;
         // `ExternImport` carries no separate soname yet, so DT_NEEDED rides
@@ -471,8 +484,16 @@ synthesizeFfiFromSourceDecls(
         }
 
         FfiMetadata meta{};
-        meta.mangledName   = applyCMangling(ext.canonicalName,
-                                            format.kind());
+        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): `linkNameFor` returns an
+        // explicit
+        // assembler name VERBATIM and falls back to `applyCMangling` when there is
+        // none — byte-identical for every extern declared without a label. This is
+        // the IMPORT rail's single naming point; it MUST agree with the definition
+        // rail (`program.cpp`'s merge-key lambda), which routes through the same
+        // function, or a labelled definition and a labelled reference to it stop
+        // collapsing at merge time and the call is emitted as a dynamic import.
+        meta.mangledName   = linkNameFor(ext.canonicalName, ext.asmName,
+                                         format.kind());
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a
@@ -500,6 +521,10 @@ synthesizeFfiFromSourceDecls(
         // reader. Rides to the MIR ExternImport → the ELF writer's
         // .gnu.version_r. Empty (the default) ⇒ unversioned.
         meta.version = std::string{ext.version};
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (producer
+        // C shipped-descriptor imports) to the MIR ExternImport → the linker's
+        // reference gate, which keeps an eager row even when unreferenced.
+        meta.isEagerImport = ext.isEagerImport;
         // `soname` left empty — same convention as `ingest()`.
 
         ffiMap.set(ext.node, std::move(meta));

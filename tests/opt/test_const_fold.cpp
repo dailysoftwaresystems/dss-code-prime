@@ -224,6 +224,54 @@ TEST(ConstFold, DoesNotFoldBitIntArithmetic) {
     EXPECT_FALSE(ret.isConst);
 }
 
+// TF-C94 (D-CSUBSET-INT128-CONSTFOLD): the ConstFold pass MUST NOT fold an
+// I128/U128-typed instruction either — the exact twin of the `_BitInt` refusal
+// above, and for the identical reason: this pass's int64 helpers have no
+// mod-2^128 wrap, and `wrapToIntTarget(v, {128, …})` returns its input UNCHANGED,
+// so a folded 128-bit op would carry a 64-bit value under a 128-bit type.
+//
+// Under complete routing a 128-bit op is memory-resident and never reaches this
+// pass, so this guard is defence-in-depth — but it is exactly the defence that
+// catches a ROUTING MISS, and a miss here is the nastiest possible failure shape:
+// the debug pipeline does not run ConstFold, so the wrong value would appear ONLY
+// under `--config=release`. Green in debug, silently wrong in release.
+// Witness choice matters, and the obvious one is a TRAP: `0xFFFFFFFFFFFFFFFF + 1`
+// on the u64 arm never reaches the guard at all — `asInt64` nullopts for anything
+// above INT64_MAX, so the pass declines for an unrelated reason and the pin passes
+// even with the guard deleted (measured). The witness must therefore BRIDGE to
+// int64 cleanly and still expose the wrap: `INT64_MAX + 1` as an `__int128`. The
+// true 128-bit sum is 2^63 = 9223372036854775808; the int64 helpers wrap it to
+// INT64_MIN. So folding here does not merely fold something it should not — it
+// produces a value of the WRONG SIGN.
+TEST(ConstFold, DoesNotFoldInt128Arithmetic) {
+    TypeInterner interner{CompilationUnitId{1}};
+    BuildResult br;
+    TypeId const i128 = interner.primitive(TypeKind::I128);
+    br.i32   = interner.primitive(TypeKind::I32);
+    br.fnSig = interner.fnSig({}, i128, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(br.fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue va;
+    va.value = std::numeric_limits<std::int64_t>::max();
+    va.core  = TypeKind::I128;
+    MirLiteralValue vb; vb.value = std::int64_t{1}; vb.core = TypeKind::I128;
+    MirInstId const ops[] = {mb.addConst(va, i128), mb.addConst(vb, i128)};
+    mb.addReturn(mb.addInst(MirOpcode::Add, ops, i128));
+    br.mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 0u)
+        << "a 128-bit Add must NOT const-fold — red-on-disable: drop I128/U128 from "
+           "the tryFold guard and this folds to 0 (the mod-2^64 answer) in release";
+    auto const ret = inspectReturnOperand(br.mir);
+    EXPECT_EQ(ret.op, MirOpcode::Add) << "the 128-bit Add must survive unfolded";
+    EXPECT_FALSE(ret.isConst);
+}
+
 // Div-by-zero MUST defer to runtime (folding would introduce a trap
 // that the unoptimized path doesn't have). Pin: the SDiv(7, 0) is
 // preserved as an SDiv, not folded.

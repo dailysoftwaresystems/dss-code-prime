@@ -49,6 +49,10 @@ build-wsl/
 # timed before/after measurements and per-config canary builds).
 build-*/
 tmp_probe/
+# Ad-hoc agent/probe scratch at repo root (repro programs, throwaway bash
+# scripts) — working files, never committed. (Prefer the out-of-repo session
+# scratchpad; this catches anything that lands here anyway.)
+scratchpad/
 # DSS CLI default output dir (target-spec-named subdirs of compiled binaries
 # from ad-hoc `dss-code-prime <src>` runs; not a build-system dir).
 target/

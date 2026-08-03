@@ -4,6 +4,7 @@ add_library(core OBJECT
     # ── substrate/ — host/OS utilities (the first non-header-only one) ──
     substrate/large_stack_call.cpp
     substrate/phase_timers.cpp
+    substrate/thread_pool.cpp
 
     # ── types/ — universal in-memory model ──
     types/source_span.cpp
@@ -15,8 +16,10 @@ add_library(core OBJECT
     types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
     types/include_path_resolve.cpp
+    types/glob_match.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    types/predefined_macro_json.cpp
     types/target_schema.cpp
     types/target_schema_json.cpp
     types/lexer_mode.cpp
@@ -42,6 +45,15 @@ target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # copies finished .o files, not usage requirements — so DSS_BUILDING_DLL has
 # to live here for __declspec(dllexport) in core/export.hpp to fire on MSVC.
 target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
+
+# TF-C83 — forward the repo-root VERSION file to the `version` predefine kind
+# (`core/types/predefined_macro_json.hpp`). `DSS_VERSION` is the STRIPPED
+# contents of that file, already read by the top-level CMakeLists as the single
+# source of truth for `project(VERSION ...)`; re-using the same variable is what
+# keeps `__DSSCP__` from becoming a second place the version is written. The
+# header `#error`s if this definition is missing, so a botched wireup fails the
+# BUILD rather than silently predefining a wrong identity.
+target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
 
 # nlohmann/json is included by exactly one translation unit
 # (grammar_schema_json.cpp). PRIVATE keeps the include path off the

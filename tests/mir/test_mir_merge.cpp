@@ -38,6 +38,7 @@
 #include "mir/merge/mir_merge.hpp"
 #include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
+#include "mir/merge/synth_stdio_shim.hpp"       // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION P3)
 #include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -356,6 +357,72 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
 
     MirVerifier verifier{mm, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── D-LINK-EXTERN-IMPORT-REFERENCE-GATE (e): the merge OR-combines the eager bit
+// when collapsing duplicate imports of one name. Two CUs both import "puts": one
+// EAGER (a `#include`d shipped-descriptor import), one NON-EAGER (a hand-written
+// `extern int puts()`). Neither defines puts, so it stays a real FFI import and
+// the merge collapses the two rows to ONE. The surviving row MUST be EAGER (the
+// eager law wins on collapse) so the linker's reference gate keeps it even when
+// unreferenced. ORDER-INDEPENDENT: whichever CU lands first, the eager bit is
+// ORed in. RED-ON-DISABLE: replace the OR-combine with a plain first-wins skip →
+// the swapped-order arm (non-eager CU first) yields a NON-EAGER surviving row and
+// goes red.
+TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
+    auto buildCallsPuts = [](SymbolId fnSym, SymbolId extSym,
+                             TypeInterner& in) -> Mir {
+        TypeId const i32 = in.primitive(TypeKind::I32);
+        TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(sig, fnSym);
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const pAddr = mb.addGlobalAddr(extSym, sig);   // extern puts
+        MirInstId const callOps[] = {pAddr};
+        MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+        mb.addReturn(call);
+        return std::move(mb).finish();
+    };
+    // Merge two CUs importing "puts" — one eager, one not — and return the
+    // surviving row's eager bit. `eagerInCu0` selects which CU carries the eager
+    // marker, so running both ways proves the OR-combine is order-independent.
+    auto survivingPutsEager = [&](bool eagerInCu0) -> bool {
+        TypeInterner in0{CompilationUnitId{1}};
+        Mir mir0 = buildCallsPuts(SymbolId{100}, SymbolId{10}, in0);
+        ExternImport e0{SymbolId{10}, "puts", "libc.so"};
+        e0.isEagerImport = eagerInCu0;
+        std::vector<ExternImport> ext0 = {e0};
+
+        TypeInterner in1{CompilationUnitId{2}};
+        Mir mir1 = buildCallsPuts(SymbolId{50}, SymbolId{20}, in1);
+        ExternImport e1{SymbolId{20}, "puts", "libc.so"};
+        e1.isEagerImport = !eagerInCu0;
+        std::vector<ExternImport> ext1 = {e1};
+
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {10, "puts"}}), ext0},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "helper"}, {20, "puts"}}), ext1},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        auto merged =
+            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+        EXPECT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+        if (!merged.has_value()) return false;
+        std::size_t putsRows = 0;
+        bool eager = false;
+        for (ExternImport const& e : merged->externImports) {
+            if (e.mangledName == "puts") { ++putsRows; eager = e.isEagerImport; }
+        }
+        EXPECT_EQ(putsRows, 1u) << "same-named imports must collapse to ONE row";
+        return eager;
+    };
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/true))
+        << "eager CU0 + non-eager CU1 → surviving row EAGER";
+    EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/false))
+        << "non-eager CU0 + eager CU1 → surviving row EAGER (ORDER-INDEPENDENT; "
+           "RED if the merge uses plain first-wins instead of the OR-combine)";
 }
 
 // ── A cross-CU call into a MULTI-BLOCK callee: clone + rewire ──────
@@ -806,6 +873,129 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
+// D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0: a file-LOCAL (`static`, internal-linkage /
+// Local binding) global or function must NEVER be identified with a same-named
+// EXTERNALLY-VISIBLE (Global) symbol in ANOTHER CU — C 6.2.2p3 internal linkage
+// makes them DISTINCT entities. The canonical sqlite defect: os_unix.c's
+// `static struct unix_syscall aSyscall[]` (24-byte rows → the static `posixOpen`)
+// shares the NAME `aSyscall` with test_syscall.c's NON-static `aSyscall[]` (32-byte
+// rows → `ts_open`). The merge (a) FOLDED the Local onto the Global winner's id in
+// `assignSymbol` AND (b) DROPPED the Local as a "shadowed loser" in
+// `isShadowedLoser`, so os_unix's own code read test_syscall's table → a call
+// through a NULL fn-ptr at the first FILE-DB open (invisible until BOTH TUs link;
+// the 2-TU `sqlite3.c + main` build lacks the extern `aSyscall`, hence "works at 2,
+// crashes at 88"). This models it at the merge tier: CU0 has a GLOBAL `T` → &fa;
+// CU1 has a same-named STATIC (Local) `T` → &fb. Post-merge BOTH `T`s must survive
+// as DISTINCT globals, each keeping its OWN symbol-address init target.
+// RED-ON-DISABLE: drop the `!isLocalDef` guard in `assignSymbol` OR the `isLocal`
+// guard in `isShadowedLoser` → CU1's Local `T` folds onto / is shadowed by CU0's
+// `T`, so only ONE `T` survives (the `size()==2` pin fails) and it points at fa.
+TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
+    // CU0 — the test_syscall analogue: private `int fa(void){return 1;}` and a
+    // NON-static (Global, externally visible) `int(*T)(void) = &fa;`.
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const sig0  = in0.fnSig({}, i32_0, CallConv::CcSysV);
+    TypeId const pfn0  = in0.pointer(sig0);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig0, SymbolId{10}, SymbolBinding::Local);  // fa (private)
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(1), i32_0));
+        MirLiteralValue saA;
+        saA.value = MirSymbolAddrValue{/*symbol=*/10u, /*addend=*/0};   // &fa
+        saA.core  = TypeKind::Ptr;
+        (void)mb.addGlobal(pfn0, SymbolId{20}, mb.literalPoolAdd(saA),
+                           MirFuncId{}, SymbolBinding::Global,   // EXTERNAL "T"
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
+        mir0 = std::move(mb).finish();
+    }
+    // CU1 — the os_unix analogue: private `int fb(void){return 2;}` and a STATIC
+    // (Local) `int(*T)(void) = &fb;` with the SAME name `T` as CU0's extern.
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    TypeId const pfn1  = in1.pointer(sig1);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{60}, SymbolBinding::Local);  // fb (private)
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(2), i32_1));
+        MirLiteralValue saB;
+        saB.value = MirSymbolAddrValue{/*symbol=*/60u, /*addend=*/0};   // &fb
+        saB.core  = TypeKind::Ptr;
+        (void)mb.addGlobal(pfn1, SymbolId{70}, mb.literalPoolAdd(saB),
+                           MirFuncId{}, SymbolBinding::Local,   // STATIC "T" (same name)
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
+        mir1 = std::move(mb).finish();
+    }
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{10, "fa"}, {20, "T"}}), {}},
+        MergeCuInput{&mir1, &in1, namerOf({{60, "fb"}, {70, "T"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    Mir const& mm = merged->mir;
+
+    // Both private functions survive with DISTINCT merged ids (a Local func/global
+    // is module-private and is never folded by name).
+    auto const fa = findFuncByName(mm, merged->symbolNames, "fa");
+    auto const fb = findFuncByName(mm, merged->symbolNames, "fb");
+    ASSERT_TRUE(fa.has_value());
+    ASSERT_TRUE(fb.has_value());
+    std::uint32_t const faSym = mm.funcSymbol(*fa).v;
+    std::uint32_t const fbSym = mm.funcSymbol(*fb).v;
+    EXPECT_NE(faSym, fbSym);
+
+    // Collect EVERY merged global named "T" together with its symbol-address init
+    // target.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tGlobals;  // (Tsym, initTarget)
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = mm.globalAt(i);
+        std::uint32_t const gsym = mm.globalSymbol(g).v;
+        auto const it = merged->symbolNames.find(gsym);
+        if (it == merged->symbolNames.end() || it->second != "T") continue;
+        std::uint32_t const initIdx = mm.globalInitLiteralIndex(g);
+        ASSERT_NE(initIdx, UINT32_MAX);
+        auto const* sa =
+            std::get_if<MirSymbolAddrValue>(&mm.literalValue(initIdx).value);
+        ASSERT_NE(sa, nullptr) << "each T's init must stay a MirSymbolAddrValue";
+        tGlobals.emplace_back(gsym, sa->symbol);
+    }
+
+    // THE PIN: the file-local `static T` and the extern `T` remain TWO distinct
+    // globals with distinct merged ids — the Local was NOT folded onto / shadowed
+    // by the Global.
+    ASSERT_EQ(tGlobals.size(), 2u)
+        << "the file-local `static T` and the extern `T` must remain TWO distinct "
+           "globals; folding the Local onto the same-named Global is the miscompile.";
+    EXPECT_NE(tGlobals[0].first, tGlobals[1].first);
+
+    // Each `T` keeps its OWN init target: one points at CU0's fa, the OTHER at CU1's
+    // fb (never both folded to fa).
+    bool const pointsFa =
+        tGlobals[0].second == faSym || tGlobals[1].second == faSym;
+    bool const pointsFb =
+        tGlobals[0].second == fbSym || tGlobals[1].second == fbSym;
+    EXPECT_TRUE(pointsFa) << "one T must still point at CU0's fa";
+    EXPECT_TRUE(pointsFb)
+        << "the OTHER T must still point at CU1's fb (not folded to CU0's fa) — the "
+           "os_unix-reads-test_syscall's-table miscompile.";
+
+    MirVerifier verifier{mm, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
 // const-ness preservation across the cross-CU merge global-clone site
 // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). `mergeCuMirs` rebuilds every CU's globals
 // into the merged module (mir_merge.cpp:625); it MUST carry `MirGlobal.isConst`,
@@ -814,6 +1004,126 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
 // keep this robust to any merge reordering. RED-ON-DISABLE: drop the
 // `m.globalIsConst(g)` argument at mir_merge.cpp:625 → both globals come back
 // mutable and the `constCount == 1` expectation fails.
+// ★★ TF-C85: the CROSS-CU merge is the THIRD `MirFunc` copy hop (the other two
+// are `mir_rebuild_helper` and the inliner's own rebuild). The merged module is
+// what the optimizer runs on for an N>1 build, so a `noOptimize` flag dropped
+// here lets a function the source put inside a `#pragma optimize("", off)`
+// region be optimized after link — invisibly, because the single-CU path stays
+// correct and only the multi-CU one changes.
+//
+// RED-ON-DISABLE: drop the `src_.funcNoOptimize(f)` argument at mir_merge.cpp's
+// addFunction (let it default to false) and the first EXPECT_TRUE fails. The
+// un-flagged sibling keeps the test from being satisfiable by hardcoding true,
+// and the cleared inline flags pin the adjacent-bool swap.
+TEST(MirMerge, MergePreservesFunctionNoOptimize) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32   = in0.primitive(TypeKind::I32);
+    TypeId const fnSig = in0.fnSig({}, i32, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // sym 400: noOptimize ONLY — the two inline flags deliberately clear, so
+        // a transposed argument at the copy site fails here.
+        mb.addFunction(fnSig, SymbolId{400}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*noInline=*/false,
+                       /*alwaysInline=*/false, /*noOptimize=*/true);
+        MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b0);
+        mb.addReturn(mb.addConst(i32Lit(7), i32));
+        // sym 401: plain.
+        mb.addFunction(fnSig, SymbolId{401});
+        MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b1);
+        mb.addReturn(mb.addConst(i32Lit(8), i32));
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{400, "shielded"}, {401, "plain"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleFuncCount(), 2u);
+    int flagged = 0, plain = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        MirFuncId const f = mm.funcAt(i);
+        if (mm.funcNoOptimize(f)) ++flagged; else ++plain;
+        EXPECT_FALSE(mm.funcNoInline(f))
+            << "neither source function is noinline — an adjacent-bool swap at "
+               "the merge copy site would land the flag here";
+        EXPECT_FALSE(mm.funcAlwaysInline(f));
+    }
+    EXPECT_EQ(flagged, 1)
+        << "the no-optimize function must survive the cross-CU merge still "
+           "excluded, or an N>1 build silently optimizes it after link";
+    EXPECT_EQ(plain, 1) << "and the plain function must not acquire the flag";
+}
+
+// ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the SAME cross-CU copy hop for the
+// thread-sanitizer exclusion. The merged module is the artifact an N>1 build's
+// `.dssir` describes, so a flag dropped here means a per-function fact recorded in
+// CU A silently disappears at the link boundary — and because NO pass reads this
+// flag (MEASURED: `grep -rni sanitiz src/` is empty), nothing else in the suite
+// would notice. Single-CU builds stay correct, which is exactly what makes the
+// multi-CU loss invisible without this pin.
+//
+// RED-ON-DISABLE: drop the `src_.funcNoSanitizeThread(f)` argument at mir_merge.cpp's
+// addFunction (let the 8th parameter default to false) and the `flagged == 1`
+// expectation fails. The un-flagged sibling keeps the test from being satisfiable by
+// hardcoding true; `noOptimize` is asserted CLEAR on both records because it is the
+// IMMEDIATELY PRECEDING argument, so a one-position shift fails here too.
+TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32   = in0.primitive(TypeKind::I32);
+    TypeId const fnSig = in0.fnSig({}, i32, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // sym 500: noSanitizeThread ONLY — all three sibling flags deliberately
+        // clear, so a transposed/shifted argument at the copy site fails here.
+        mb.addFunction(fnSig, SymbolId{500}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*noInline=*/false,
+                       /*alwaysInline=*/false, /*noOptimize=*/false,
+                       /*noSanitizeThread=*/true);
+        MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b0);
+        mb.addReturn(mb.addConst(i32Lit(9), i32));
+        // sym 501: plain.
+        mb.addFunction(fnSig, SymbolId{501});
+        MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(b1);
+        mb.addReturn(mb.addConst(i32Lit(10), i32));
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{500, "racy_ok"}, {501, "plain2"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleFuncCount(), 2u);
+    int flagged = 0, plain = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        MirFuncId const f = mm.funcAt(i);
+        if (mm.funcNoSanitizeThread(f)) ++flagged; else ++plain;
+        EXPECT_FALSE(mm.funcNoOptimize(f))
+            << "neither source function is nooptimize — a one-position argument "
+               "shift at the merge copy site would land the flag here";
+        EXPECT_FALSE(mm.funcNoInline(f));
+        EXPECT_FALSE(mm.funcAlwaysInline(f));
+    }
+    EXPECT_EQ(flagged, 1)
+        << "the thread-sanitizer exclusion must survive the cross-CU merge, or a "
+           "fact recorded in one CU vanishes at link with no other symptom";
+    EXPECT_EQ(plain, 1) << "and the plain function must not acquire the flag";
+}
+
 TEST(MirMerge, MergePreservesGlobalConstness) {
     TypeInterner in0{CompilationUnitId{1}};
     TypeId const i32 = in0.primitive(TypeKind::I32);
@@ -2114,4 +2424,240 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
 
     MirVerifier verifier{mm, &hi};
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): synthesizeStdioShim ───────────────────
+//
+// The <stdio.h> printf-family sibling of the SynthThreadsShim suite above. The modern
+// UCRT (`ucrtbase.dll`) exports NO concrete `sprintf` — only the common core
+// `__stdio_common_vsprintf` — so the pe `sprintf` row in stdio.json carries
+// `synthesize: "sprintf"` and this pass supplies the body. NOTHING about that surface was
+// unit-covered when it landed; these tests are that cover.
+//
+// Two properties carry the weight, and BOTH fail SILENTLY rather than loudly if they
+// regress (wrong text at runtime, never a compile or link error):
+//   * the body must route through the module's ALREADY-IMPORTED UCRT core and mint no
+//     import of its own (the "the helpers are ordinary descriptor imports" contract — the
+//     eager-import law is what proves the core really exists as an export, so a
+//     self-minted import would bypass that proof);
+//   * the body must carry the `VaHomeArgAreaAddr` leaf, which is simultaneously (a) the
+//     Win64 `va_list` value `&home[namedArgCount]`, (b) lir_callconv's prologue-spill
+//     signal, and (c) the ONLY thing making the inliner refuse to splice the shim into a
+//     caller (src/opt/passes/inlining.cpp). Under the MULTI-CU driver the shim is
+//     synthesized PRE-optimize, so the release pipeline's Inlining pass really is offered
+//     this body — see examples/c-subset/shipped_sprintf_ucrt_crosscu for the end-to-end
+//     runtime witness of that seam.
+
+namespace {
+
+// The shim's caller-side scaffold: one `main` that references `sprintf` (pre-minted
+// SymbolId{10}, seeded into functionSymbols by the CST→HIR seam so the reference lowered
+// to a GlobalAddr against a NOT-yet-defined callee) and returns.
+Mir buildSprintfCaller(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
+    std::array<TypeId, 2> const sp{pCh, pCh};
+    TypeId const sprintfSig = in.fnSig(sp, i32, CallConv::CcMS64, /*isVariadic=*/true);
+
+    MirBuilder mb;
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});   // main
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
+    MirInstId const ga  = mb.addGlobalAddr(SymbolId{10}, in.pointer(sprintfSig));
+    MirInstId const co[] = {ga, buf, buf};
+    mb.addInst(MirOpcode::Call, co, i32);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// The UCRT core as an ORDINARY descriptor import — exactly what stdio.json's pe
+// `__stdio_common_vsprintf` row produces, bound to ucrtbase.dll.
+std::vector<ExternImport> ucrtCoreImports() {
+    ExternImport core;
+    core.symbol      = SymbolId{20};
+    core.mangledName = "__stdio_common_vsprintf";
+    core.libraryPath = "ucrtbase.dll";
+    core.isData      = false;
+    return {core};
+}
+
+// Locate a definition by its SymbolId value.
+std::optional<MirFuncId> findFuncBySymbol(Mir const& mir, std::uint32_t symV) {
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == symV) return f;
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+// The HAPPY PATH, asserted STRUCTURALLY rather than "it returned true": the referenced
+// `sprintf` becomes a DEFINED variadic function whose single block carries the
+// `VaHomeArgAreaAddr` leaf at the right named-arg count and calls the module's existing
+// UCRT core — while the import list is left EXACTLY as it was found.
+//
+// RED-ON-DISABLE (each assertion independently): drop the `ap` operand from the ops array
+// and the leaf assertion reds; point `coreAddr` at a freshly minted symbol and the
+// "callee is SymbolId{20}" assertion reds; have the pass push its own ExternImport and
+// the "imports unchanged" assertion reds.
+TEST(SynthStdioShim, SprintfSynthesizesVariadicBodyOverImportedUcrtCore) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    std::vector<ExternImport> const before = externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                    externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    // (a) SymbolId{10} (sprintf) is now a DEFINED module function, and main survived.
+    auto const shim = findFuncBySymbol(mir, 10u);
+    ASSERT_TRUE(shim.has_value()) << "sprintf must be a synthesized definition";
+    EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must be cloned verbatim";
+    EXPECT_EQ(mir.moduleFuncCount(), 2u) << "exactly one shim appended (main + sprintf)";
+
+    // (b) The shim's OWN signature is VARIADIC with the 2 FIXED params (buf, fmt) —
+    // `...` is a marker, so a non-variadic sig here would mean the Win64 prologue never
+    // spills the home area at all and `ap` would point at uninitialized stack.
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "the sprintf shim must itself be variadic";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sprintf's FIXED arity is (buf, fmt)";
+
+    // (c) The body: exactly one VaHomeArgAreaAddr, payload == the named-arg slot count
+    // (2), and a Call whose CALLEE operand is a GlobalAddr to the imported core.
+    ASSERT_EQ(mir.funcBlockCount(*shim), 1u) << "every printf-family recipe is single-block";
+    MirBlockId const b = mir.funcBlockAt(*shim, 0);
+    std::uint32_t vaLeaves = 0;
+    std::uint32_t calls    = 0;
+    std::optional<std::uint32_t> calleeSym;
+    for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
+        MirInstId const id = mir.blockInstAt(b, i);
+        if (mir.instOpcode(id) == MirOpcode::VaHomeArgAreaAddr) {
+            ++vaLeaves;
+            EXPECT_EQ(mir.instPayload(id), 2u)
+                << "the va leaf is &home[namedArgCount]; sprintf's named count is 2";
+        }
+        if (mir.instOpcode(id) == MirOpcode::Call) {
+            ++calls;
+            auto const ops = mir.instOperands(id);
+            ASSERT_FALSE(ops.empty());
+            if (mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr)
+                calleeSym = mir.globalAddrSymbol(ops[0]).v;
+            // callee + (opts, buf, count, fmt, locale, ap) == 7 operands.
+            EXPECT_EQ(ops.size(), 7u) << "__stdio_common_vsprintf takes 6 arguments";
+        }
+    }
+    EXPECT_EQ(vaLeaves, 1u)
+        << "exactly one VaHomeArgAreaAddr: the va_list value, the prologue-spill signal, "
+           "AND the inliner's refusal trigger (src/opt/passes/inlining.cpp)";
+    EXPECT_EQ(calls, 1u) << "the shim forwards through exactly one core call";
+    ASSERT_TRUE(calleeSym.has_value()) << "the shim must call through a GlobalAddr";
+    EXPECT_EQ(*calleeSym, 20u)
+        << "the shim must call the module's ALREADY-IMPORTED __stdio_common_vsprintf";
+
+    // (d) The pass mints NO import — the cores are ordinary descriptor imports, which is
+    // what makes the eager-import law their existence proof. `sprintf` itself must never
+    // be imported (ucrtbase exports no such symbol; importing it would break every
+    // binary's LOAD).
+    ASSERT_EQ(externs.size(), before.size()) << "synthesizeStdioShim must mint no import";
+    for (std::size_t i = 0; i < externs.size(); ++i)
+        EXPECT_EQ(externs[i].mangledName, before[i].mangledName);
+    for (auto const& e : externs)
+        EXPECT_NE(e.mangledName, "sprintf") << "sprintf must NEVER be an import";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the stdio-shim-synthesized module must verify";
+}
+
+// An EMPTY recipe map is a clean no-op — and it must short-circuit BEFORE the va-strategy
+// check, so it stays clean even with NO strategy resolved (every elf/macho build and
+// every pe TU that includes no printf family). Locks the pass to a pure DATA gate, never
+// a format check. RED-ON-DISABLE: move the `recipeBySymbol.empty()` early return below
+// the strategy gate and this reds.
+TEST(SynthStdioShim, EmptyRecipeMapIsNoOpEvenWithNoVaStrategy) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+    std::size_t const before = mir.moduleFuncCount();
+
+    std::unordered_map<std::uint32_t, std::string> const recipes;   // empty
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_EQ(mir.moduleFuncCount(), before) << "no shim appended for an empty map";
+    EXPECT_TRUE(externs.empty()) << "no import planted for an empty map";
+}
+
+// FAIL-LOUD (1/3): a recipe id with NO switch arm. The family split routes every Stdio id
+// here, so an id this pass cannot build MUST be a reported error AND a `false` return —
+// never a silently missing definition (which surfaces, if at all, as an undefined symbol
+// far downstream, and on pe as a 0xC0000139 at LOAD).
+TEST(SynthStdioShim, UnknownRecipeIdFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "no_such_recipe"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                     externs, rep))
+        << "a recipe with no synth arm MUST fail loud, never silently skip the definition";
+    EXPECT_TRUE(rep.hasErrors())
+        << "the refusal must carry a real diagnostic, not a bare false";
+}
+
+// FAIL-LOUD (2/3): the UCRT core is NOT among the module's imports — i.e. stdio.json
+// declared a `synthesize` row without the `__stdio_common_v*` row it needs. Unchecked,
+// this is exactly the drift that yields a shim calling nothing.
+TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs;   // NO __stdio_common_vsprintf
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+                                     externs, rep))
+        << "an unimported UCRT core MUST fail loud (descriptor/pass drift)";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
+}
+
+// FAIL-LOUD (3/3): NO va-list strategy resolved. `CuMirModule::vaListStrategy` is
+// `std::optional` precisely so UNRESOLVED is distinguishable from resolved — the shape it
+// replaced defaulted a missing strategy to SysVRegisterSave, which READS as "the target
+// declared SysV" when the truth is "nobody ever asked the target". With a real stdio
+// recipe in hand that ambiguity must be an ERROR: the alternative is forwarding a va_list
+// under a guessed ABI, which miscompiles silently.
+TEST(SynthStdioShim, NulloptVaListStrategyWithRecipesFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep))
+        << "recipes present + NO resolved va_list strategy MUST fail loud, never default";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
+}
+
+// FAIL-LOUD (bonus): a RESOLVED but unimplemented strategy. Only the HomogeneousPointer
+// (Win64) arm is built — no elf/macho descriptor declares a stdio synthesize recipe, so a
+// SysVRegisterSave arm would be a speculative build. Refusing is right; silently emitting
+// the Win64 forward under a SysV target would be a wrong-ABI miscompile. Distinct from the
+// nullopt case above: this one is "the target ANSWERED, with a model we don't implement".
+TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSprintfCaller(in);
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
+    std::vector<ExternImport> externs = ucrtCoreImports();
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::SysVRegisterSave,
+                                     externs, rep))
+        << "an unimplemented va_list model MUST fail loud, never forward under a wrong ABI";
+    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }

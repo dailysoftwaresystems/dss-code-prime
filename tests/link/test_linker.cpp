@@ -19,6 +19,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/unsuppressable_codes.hpp"
+#include "link/format/pe.hpp"
+#include "link/image_request.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
@@ -124,13 +127,19 @@ struct Loaded {
 
 } // namespace
 
-TEST(Linker, EmptyModuleIsNotOk) {
+TEST(Linker, EmptyModuleIsOk) {
+    // D-CSUBSET-TESTTU-SILENT-EXIT1: an empty module (a declaration-only /
+    // all-preprocessed-out TU) links cleanly to a valid empty relocatable
+    // object — resolvedFuncCount == expectedFuncCount == 0 is a VALID success.
+    // RED-ON-DISABLE: restoring the `expectedFuncCount > 0` clause in
+    // LinkedImage::ok() flips this back to false and silently rejects the
+    // whole compile of any declaration-only TU.
     auto loaded = loadMinimal();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule empty{};
     DiagnosticReporter rep;
     auto image = linker::link(empty, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(image.ok());
+    EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.expectedFuncCount, 0u);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -314,6 +323,48 @@ TEST(Linker, UnknownSymbolEmitsK_SymbolUndefined) {
     auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u);
+}
+
+// D-LINK-DATA-RELOC-TARGET-VALIDATE: a DATA-item relocation (an abs64 pointer slot
+// in a symbol-address global / function-pointer table / switch jump table) whose
+// target is declared by NO function / data item / extern in its CU must fail LOUD at
+// the RESOLUTION tier — symmetric with the function-relocation check above. Before
+// this the resolver inspected ONLY `m.functions[].relocations`, so a dangling /
+// mis-targeted DATA reloc slipped past resolution and surfaced only as a silent
+// wrong / NULL pointer at runtime (the class the aSyscall miscompile belonged to).
+// RED-ON-DISABLE: remove the `m.dataItems` loop in `resolveCrossCuSymbols` → the
+// resolution-tier diagnostic (message "data-item relocation in CU …") never fires.
+TEST(Linker, DataItemUndefinedRelocationFailsLoud) {
+    auto loaded = loadMinimal();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;             // one clean function (no relocations)
+    fn.symbol = SymbolId{1};
+    mod.functions.push_back(std::move(fn));
+    // A data item (a function-pointer table analogue) whose abs64 relocation targets
+    // SymbolId #99 — declared by nothing in this CU.
+    AssembledData di;
+    di.symbol  = SymbolId{2};
+    di.section = DataSectionKind::Data;
+    di.bytes.assign(8, std::uint8_t{0});
+    di.relocations.push_back(Relocation{/*offset=*/0u, /*target=*/SymbolId{99},
+                                        /*kind=*/RelocationKind{2}, /*addend=*/0});
+    mod.dataItems.push_back(std::move(di));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "a DATA-item relocation to an undeclared symbol must fail loud";
+    bool namedByResolutionCheck = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("data-item relocation") != std::string::npos) {
+            namedByResolutionCheck = true;
+        }
+    }
+    EXPECT_TRUE(namedByResolutionCheck)
+        << "the resolution-tier data-item reloc check must NAME the dangling target "
+           "(RED-on-disable if the dataItems loop is removed).";
+    EXPECT_FALSE(image.ok());
 }
 
 // D-LK4-3 collision pin: two CompilationUnits (distinct cuIds) each define a
@@ -687,6 +738,158 @@ TEST(Linker, UnreferencedNoLibraryExternIsDroppedNotRejected) {
         << "the dropped row must not reach the emitted import table";
 }
 
+// ── D-LINK-EXTERN-IMPORT-REFERENCE-GATE ──────────────────────────
+// (c) The 3-row reference-gate pin. Three LIBRARY-BOUND extern imports exercise
+// all three survival outcomes in one link:
+//   (i)   unreferenced + EAGER      → KEPT (the shipped-descriptor eager law —
+//         D-FFI-DESCRIPTOR-EAGER-IMPORT is untouched);
+//   (ii)  unreferenced + non-eager  → DROPPED (gcc's unused-decl rule; the
+//         Sqlitetestsse_Init shape — a LIBRARY-BOUND row the pre-fix gate skipped
+//         because it only touched zero-library rows → the load-time exit-127);
+//   (iii) referenced   + non-eager  → KEPT (the ordinary libc FFI import).
+// Runs on the shipped RELOCATABLE ELF so all three library-bound rows emit as
+// faithful undefined symbols and `externImportNames` reflects the survivors.
+// RED-ON-DISABLE (both ways): flipping (i)'s eager bit to false drops (i) — which
+// locks OUT an accidental Design-3 slide (dropping eager imports); clearing the
+// gate's `!isEagerImport` erase term for bound rows keeps (ii) — the pre-fix
+// load-blocker.
+TEST(Linker, ReferenceGateKeepsEagerAndReferencedDropsUnreferencedNonEager) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_FALSE((*fmt)->isImageFlavor()) << "elf64-x86_64-linux is relocatable";
+    AssembledModule mod;
+    mod.cuId = CompilationUnitId{1};
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00};   // call rel32 → row (iii) only
+    fn.relocations.push_back(
+        Relocation{1u, SymbolId{30}, RelocationKind{1}, 0});   // references (iii)
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                       SymbolBinding::Global, SymbolVisibility::Default});
+    // (i) unreferenced + library-bound + EAGER → kept
+    ExternImport eagerUnref;
+    eagerUnref.symbol        = SymbolId{10};
+    eagerUnref.mangledName   = "eager_unref";
+    eagerUnref.libraryPath   = "libc.so.6";
+    eagerUnref.isEagerImport = true;
+    mod.externImports.push_back(std::move(eagerUnref));
+    // (ii) unreferenced + library-bound + non-eager → DROPPED
+    ExternImport nonEagerUnref;
+    nonEagerUnref.symbol        = SymbolId{20};
+    nonEagerUnref.mangledName   = "noneager_unref";
+    nonEagerUnref.libraryPath   = "libc.so.6";
+    nonEagerUnref.isEagerImport = false;
+    mod.externImports.push_back(std::move(nonEagerUnref));
+    // (iii) referenced + library-bound + non-eager → kept
+    ExternImport nonEagerRef;
+    nonEagerRef.symbol        = SymbolId{30};
+    nonEagerRef.mangledName   = "noneager_ref";
+    nonEagerRef.libraryPath   = "libc.so.6";
+    nonEagerRef.isEagerImport = false;
+    mod.externImports.push_back(std::move(nonEagerRef));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto kept = [&](std::string const& n) {
+        return std::count(image.externImportNames.begin(),
+                          image.externImportNames.end(), n) > 0;
+    };
+    EXPECT_TRUE(kept("eager_unref"))
+        << "(i) an UNREFERENCED EAGER descriptor import must be KEPT";
+    EXPECT_FALSE(kept("noneager_unref"))
+        << "(ii) an UNREFERENCED non-eager library-bound import must be DROPPED "
+           "(the Sqlitetestsse_Init load-blocker)";
+    EXPECT_TRUE(kept("noneager_ref"))
+        << "(iii) a REFERENCED non-eager library-bound import must be KEPT";
+}
+
+// D-LINK-EXTERN-IMPORT-REFERENCE-GATE (c, red-on-disable companion): flipping row
+// (i)'s eager bit to FALSE — an UNREFERENCED non-eager library-bound import —
+// makes it DROP exactly like row (ii). This is the second red-on-disable
+// direction: it proves the KEEP of (i) above is due to the eager bit and locks
+// out an accidental Design-3 slide (a gate that dropped eager imports too would
+// pass the (i)-kept assertion only because SOMETHING kept it — here the SAME row,
+// eager-cleared, must drop).
+TEST(Linker, ReferenceGateDropsUnreferencedImportOnceEagerBitCleared) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.cuId = CompilationUnitId{1};
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};       // no relocations — nothing references the import
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                       SymbolBinding::Global, SymbolVisibility::Default});
+    ExternImport imp;
+    imp.symbol        = SymbolId{10};
+    imp.mangledName   = "was_eager";
+    imp.libraryPath   = "libc.so.6";
+    imp.isEagerImport = false;     // the ONLY change vs (i) — eager bit cleared
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(std::count(image.externImportNames.begin(),
+                         image.externImportNames.end(), std::string{"was_eager"}), 0)
+        << "an unreferenced library-bound import with the eager bit CLEARED must "
+           "DROP (the same row kept only while eager)";
+}
+
+// (d) The exec reject STILL fires. A REFERENCED + UNBOUND + non-eager extern on an
+// EXEC image (nothing later binds it) is a genuine undefined symbol: the gate must
+// still reject LOUD, naming the symbol (the c143/c150 policy, preserved by the
+// reference-gate generalization — the inner reject stays scoped to
+// `libraryPath.empty()`). ★ The complementary safety — a REFERENCED
+// LIBRARY-BOUND import must NOT reject on an exec (else every referenced libc
+// import rejects loud, catastrophic) — is the reason the reject stays gated on the
+// empty-library guard; it is witnessed green end-to-end by the referenced-import
+// corpus examples (extern_call_elf / hello_printf). RED-ON-DISABLE: widening the
+// reject past the empty-library guard, or dropping the referenced-unbound reject,
+// silently defers this to a load-time crash.
+TEST(Linker, ReferenceGateExecRejectStillFiresForReferencedUnboundExtern) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->isImageFlavor());
+    AssembledModule m;
+    m.cuId = CompilationUnitId{1};
+    m.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.relocations.push_back(
+        Relocation{4u, SymbolId{5}, RelocationKind{1}, 0});   // references the extern
+    m.functions.push_back(std::move(fn));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                     SymbolBinding::Global, SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol        = SymbolId{5};
+    ext.mangledName   = "unresolved_ref";
+    ext.libraryPath   = "";          // unbound + referenced → undefined on an exec
+    ext.isEagerImport = false;
+    m.externImports.push_back(std::move(ext));
+    DiagnosticReporter rep;
+    auto image = linker::link(m, **target, **fmt, rep);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "a referenced unbound extern on an EXEC must still reject loud";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("unresolved_ref") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named) << "the undefined-symbol diagnostic must NAME the symbol";
+    EXPECT_FALSE(image.ok());
+}
+
 // A relocation whose target is neither defined nor imported in its own CU is an
 // undefined reference — fail loud (the per-CU compound index does not contain it).
 TEST(Linker, CrossCuUndefinedRelocationFailsLoud) {
@@ -1009,19 +1212,25 @@ TEST(Linker, CrossCuRetargetAndStripPatches) {
         << "the sibling definition's body must land in the merged object";
 }
 
-// The strip must NOT over-strip: a real FFI extern (no sibling definition) survives the
-// merge as a genuine library import (the FF11 library tier owns it, untouched).
+// The strip must NOT over-strip: a real FFI extern (no sibling definition) that is
+// REFERENCED survives the merge as a genuine library import (the FF11 library tier
+// owns it, untouched). D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the import must be
+// REFERENCED — an unreferenced non-eager library import is now dropped (gcc's
+// unused-decl rule), so CU #1 CALLS "realffi" (the realistic real-FFI shape) to
+// isolate the merge's not-over-stripping behavior from the reference gate's drop.
 TEST(Linker, CrossCuRealFfiExternSurvivesMerge) {
     auto loaded = loadMinimal();
     ASSERT_TRUE(loaded.target && loaded.format);
     std::vector<AssembledModule> mods;
     {
-        AssembledModule m;  // CU #1: imports "realffi" (no sibling def)
+        AssembledModule m;  // CU #1: imports + CALLS "realffi" (no sibling def)
         m.cuId = CompilationUnitId{1};
         m.expectedFuncCount = 1;
         AssembledFunction fn;
         fn.symbol = SymbolId{1};
-        fn.bytes  = {0xC3};
+        fn.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};   // call rel32 realffi; ret
+        fn.relocations.push_back(
+            Relocation{1u, SymbolId{2}, RelocationKind{1}, 0});  // references realffi
         m.functions.push_back(std::move(fn));
         ExternImport ext;
         ext.symbol      = SymbolId{2};
@@ -1195,7 +1404,14 @@ TEST(Linker, SurvivingThreadLocalExternImportRejectsLoud) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    fn.bytes  = {0xC3};
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the TLS import must be REFERENCED to
+    // survive the reference gate and REACH this (later) TLS gate — an unreferenced
+    // non-eager library import is now dropped (gcc's unused-decl rule). A true
+    // library thread-local you actually read IS referenced, so the function loads
+    // it (mov rax,[rip+lib_tls_object]) via a relocation targeting the import.
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};   // mov rax,[rip+tls]; ret
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{77}, RelocationKind{1}, 0});   // references the TLS import
     mod.functions.push_back(std::move(fn));
     ExternImport tlsImp;
     tlsImp.symbol        = SymbolId{77};
@@ -1275,4 +1491,484 @@ TEST(Linker, TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate) {
             << fmtName << ": the schema-declared acceptsDataSection "
                           "gate must reject a tdata item loud";
     }
+}
+
+// ── D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — the per-PROGRAM stack-reserve
+//    request gate. These pins live HERE (the format-BLIND linker substrate)
+//    rather than in a per-format writer test, because the property under
+//    test is precisely that the gate reads a DECLARED CAPABILITY and never a
+//    format identity. The PE arm's byte-level effect is pinned in
+//    `test_pe_writer.cpp`; what is pinned here is the REFUSAL.
+
+namespace {
+
+// The shipped formats that declare NO `stackReserveControl`, paired with a
+// target that loads with them. A request against ANY of them must be REFUSED
+// LOUD — never silently dropped, which is the failure mode the capability
+// exists to eliminate (a build that reports success while emitting an image
+// whose stack is not the size the program asked for).
+//
+// Deliberately a SWEEP over EVERY shipped no-capability format rather than one
+// representative: the contract is "no format silently drops a request", and a
+// green test over a SUBSET would leave a latent drop at every unexercised
+// format. A new format added without a capability comes under this pin the
+// moment its row is added here; one added WITH a capability must also land a
+// walker arm, and the premise assertion below fails loudly until it moves.
+struct NoStackReserveFormatRow {
+    std::string_view              formatName;
+    std::string_view              targetName;
+    StackReserveUnsupportedReason reason;   // the verb the schema must declare
+};
+
+using SRR = StackReserveUnsupportedReason;
+
+constexpr NoStackReserveFormatRow kNoStackReserveFormats[] = {
+    // ELF has NO image field for stack SIZE at all: PT_GNU_STACK encodes
+    // EXECUTABILITY, not size. On ELF the stack size is a RUNTIME property
+    // (`ulimit -s` / setrlimit / pthread_attr_setstacksize).
+    { "elf64-x86_64-linux",            "x86_64", SRR::RuntimeControlled },
+    { "elf64-x86_64-linux-exec",       "x86_64", SRR::RuntimeControlled },
+    { "elf64-x86_64-linux-pie",        "x86_64", SRR::RuntimeControlled },
+    { "elf64-x86_64-linux-dyn",        "x86_64", SRR::RuntimeControlled },
+    { "elf64-x86_64-linux-staticlib",  "x86_64", SRR::RuntimeControlled },
+    { "elf64-aarch64-linux",           "arm64",  SRR::RuntimeControlled },
+    { "elf64-aarch64-linux-exec",      "arm64",  SRR::RuntimeControlled },
+    { "elf64-aarch64-linux-pie",       "arm64",  SRR::RuntimeControlled },
+    { "elf64-aarch64-linux-dyn",       "arm64",  SRR::RuntimeControlled },
+    { "elf64-aarch64-linux-staticlib", "arm64",  SRR::RuntimeControlled },
+    // Mach-O `LC_MAIN.stacksize` IS a genuine equivalent — but no walker arm
+    // writes it yet, so no Mach-O schema declares the capability and a request
+    // is REFUSED rather than accepted-and-dropped. When that arm lands these
+    // rows move to the positive side.
+    { "macho64-x86_64-darwin",           "x86_64", SRR::NoImageField },
+    { "macho64-x86_64-darwin-exec",      "x86_64", SRR::WalkerNotImplemented },
+    { "macho64-x86_64-darwin-dylib",     "x86_64", SRR::NoImageField },
+    { "macho64-x86_64-darwin-staticlib", "x86_64", SRR::NoImageField },
+    { "macho64-arm64-darwin",            "arm64",  SRR::NoImageField },
+    { "macho64-arm64-darwin-exec",       "arm64",  SRR::WalkerNotImplemented },
+    { "macho64-arm64-darwin-dylib",      "arm64",  SRR::NoImageField },
+    { "macho64-arm64-darwin-staticlib",  "arm64",  SRR::NoImageField },
+    // PE .obj has no optional header at all; PE .dll HAS the header field but
+    // the Windows loader IGNORES a DLL's copy (the .exe's value governs the
+    // main thread). The dll row is the load-bearing one: same `kind: pe`, same
+    // IMAGE_OPTIONAL_HEADER64 struct as the .exe, OPPOSITE answer — so an
+    // `if (kind == Pe)` engine branch would write a field nothing reads. Only
+    // a per-FORMAT declared capability gets this right.
+    { "pe64-x86_64-windows",           "x86_64", SRR::NoImageField },
+    { "pe64-x86_64-windows-dll",       "x86_64", SRR::LoaderIgnoresField },
+    { "pe64-x86_64-windows-staticlib", "x86_64", SRR::NoImageField },
+};
+
+} // namespace
+
+TEST(LinkerStackReserve, EveryFormatWithoutTheCapabilityRefusesLoud) {
+    for (auto const& row : kNoStackReserveFormats) {
+        auto target = TargetSchema::loadShipped(std::string{row.targetName});
+        ASSERT_TRUE(target.has_value()) << row.targetName;
+        auto fmt = ObjectFormatSchema::loadShipped(std::string{row.formatName});
+        ASSERT_TRUE(fmt.has_value()) << row.formatName;
+        // The row's PREMISE: this format declares no capability.
+        EXPECT_FALSE((*fmt)->stackReserveControl().has_value())
+            << row.formatName
+            << ": this row asserts NO stack-reserve capability, but the schema "
+               "now declares one — move it to the positive list AND land its "
+               "walker arm, else the request would be silently dropped";
+        // ...and it must declare WHY, with the EXACT verb this row expects.
+        // A missing verb still fails loud, but only with the generic tail —
+        // which is a degraded, unactionable diagnostic. Pinning the verb per
+        // format is what keeps the four remedies from silently collapsing
+        // into one (e.g. a PE dll drifting to "no-image-field" would tell the
+        // user to fix the final link when the real answer is the host .exe).
+        auto const declared = (*fmt)->stackReserveUnsupportedReason();
+        ASSERT_TRUE(declared.has_value())
+            << row.formatName
+            << ": every format that cannot carry a stack reserve must declare "
+               "'stackReserveUnsupportedReason' so the refusal can name an "
+               "actionable remedy";
+        EXPECT_EQ(*declared, row.reason)
+            << row.formatName << ": declared '"
+            << stackReserveUnsupportedReasonName(*declared)
+            << "', expected '" << stackReserveUnsupportedReasonName(row.reason)
+            << "'";
+
+        AssembledModule mod{};
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = 4u * 1024u * 1024u;   // 4 MiB
+        auto image = linker::link(mod, **target, **fmt, rep, req);
+
+        EXPECT_FALSE(image.ok()) << row.formatName;
+        EXPECT_TRUE(image.bytes.empty()) << row.formatName;
+        EXPECT_EQ(countCode(rep,
+                            DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << row.formatName
+            << ": a stack-reserve request against a format that declares no "
+               "capability must emit EXACTLY one "
+               "K_FormatLacksStackReserveControl — not zero (a silent drop), "
+               "not a generic error";
+    }
+}
+
+// Each refusal must carry the remedy that is RIGHT FOR THAT ARTIFACT. The
+// three cases below are genuinely different answers to "so where DO I set the
+// stack?", and collapsing them into one message would send users to the wrong
+// place — most damagingly for the PE .dll, whose header DOES contain
+// SizeOfStackReserve, so "this format can't carry it" reads as obviously false
+// and invites someone to just write the field. (It is inert: MEASURED, 12
+// unrelated Microsoft system DLLs all ship the identical untuned 0x40000 while
+// system EXEs are individually tuned.)
+struct RemedyExpectation {
+    std::string_view formatName;
+    std::string_view targetName;
+    std::string_view reasonVerb;      // must appear verbatim in the message
+    std::string_view mustMention[3];  // remedy-specific phrases
+};
+
+constexpr RemedyExpectation kRemedyExpectations[] = {
+    // ELF: no image field on ANY flavor -- the process limit owns it.
+    { "elf64-x86_64-linux-exec", "x86_64", "runtime-controlled",
+      { "ulimit", "setrlimit", "RUNTIME" } },
+    // PE .dll: the field EXISTS and the loader ignores it -- the answer is the
+    // executable that loads the module, or CreateThread's explicit size.
+    { "pe64-x86_64-windows-dll", "x86_64", "loader-ignores-field",
+      { "IGNORES", "CreateThread", "EXECUTABLE" } },
+    // PE .lib / .obj: no image header at all -- the answer is the final link.
+    { "pe64-x86_64-windows-staticlib", "x86_64", "no-image-field",
+      { "no image header", "later link", "EXECUTABLE" } },
+    // Mach-O exec: the format COULD do it; DSS's walker cannot yet. The
+    // remedy is honesty about the gap, not a platform fact.
+    { "macho64-arm64-darwin-exec", "arm64", "walker-not-implemented",
+      { "no DSS walker arm", "compiler gap", "refused" } },
+};
+
+TEST(LinkerStackReserve, RefusalCarriesTheRemedyForThatArtifact) {
+    for (auto const& exp : kRemedyExpectations) {
+        auto target = TargetSchema::loadShipped(std::string{exp.targetName});
+        ASSERT_TRUE(target.has_value()) << exp.targetName;
+        auto fmt = ObjectFormatSchema::loadShipped(std::string{exp.formatName});
+        ASSERT_TRUE(fmt.has_value()) << exp.formatName;
+        AssembledModule mod{};
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = 4194304u;
+        auto image = linker::link(mod, **target, **fmt, rep, req);
+        ASSERT_FALSE(image.ok()) << exp.formatName;
+
+        std::string message;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_FormatLacksStackReserveControl) {
+                message = d.actual;
+            }
+        }
+        ASSERT_FALSE(message.empty()) << exp.formatName;
+        // Always: the offending format + the exact byte count asked for.
+        EXPECT_NE(message.find(exp.formatName), std::string::npos)
+            << exp.formatName << ": message must name the format";
+        EXPECT_NE(message.find("4194304"), std::string::npos)
+            << exp.formatName << ": message must quote the requested bytes";
+        // The DECLARED verb, echoed so the user can find the schema key.
+        EXPECT_NE(message.find(exp.reasonVerb), std::string::npos)
+            << exp.formatName << ": message must name the declared reason '"
+            << exp.reasonVerb << "'; got: " << message;
+        // ...and the remedy phrases that make this case ACTIONABLE.
+        for (auto const& phrase : exp.mustMention) {
+            EXPECT_NE(message.find(phrase), std::string::npos)
+                << exp.formatName << ": remedy must mention '" << phrase
+                << "'; got: " << message;
+        }
+    }
+}
+
+TEST(LinkerStackReserve, DllRefusalIsNotJustTheGenericMessage) {
+    // The load-bearing distinction, isolated: the PE .dll and the PE .exe are
+    // the SAME `kind: pe` with the SAME IMAGE_OPTIONAL_HEADER64 struct, and
+    // the .dll's copy of SizeOfStackReserve is present-but-inert. So the .dll
+    // must be REFUSED (never quietly written) and its message must differ from
+    // the relocatable sibling's -- proving the remedy is declaration-driven
+    // per FORMAT and not derived from the format KIND.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto dll = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dll.has_value());
+    auto obj = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(obj.has_value());
+    // Same kind, same optional-header struct -- and the dll's header DOES
+    // carry a non-zero reserve, which is exactly why "the field is missing"
+    // would be the wrong explanation.
+    ASSERT_EQ((*dll)->kind(), (*obj)->kind());
+    EXPECT_GT((*dll)->peOptionalHeader().sizeOfStackReserve, 0u)
+        << "the dll header carries the field; the point is that it is INERT";
+
+    auto refuse = [&](ObjectFormatSchema const& f) {
+        AssembledModule mod{};
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = 4194304u;
+        auto image = linker::link(mod, **target, f, rep, req);
+        EXPECT_FALSE(image.ok());
+        EXPECT_TRUE(image.bytes.empty());
+        std::string msg;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_FormatLacksStackReserveControl) {
+                msg = d.actual;
+            }
+        }
+        return msg;
+    };
+    std::string const dllMsg = refuse(**dll);
+    std::string const objMsg = refuse(**obj);
+    ASSERT_FALSE(dllMsg.empty());
+    ASSERT_FALSE(objMsg.empty());
+    EXPECT_NE(dllMsg, objMsg)
+        << "two PE formats of the same kind must not share one remedy — the "
+           "dll's field is inert (fix the host .exe), the .obj has no field "
+           "(fix the final link)";
+    EXPECT_NE(dllMsg.find("loader-ignores-field"), std::string::npos);
+    EXPECT_NE(objMsg.find("no-image-field"), std::string::npos);
+}
+
+TEST(LinkerStackReserve, FormatDeclaringNeitherKeyStillRefusesGenerically) {
+    // The FALLBACK branch. Declaring a reason is OPTIONAL, and the WASM /
+    // SPIR-V skeletons are forbidden from declaring EITHER key (both are on
+    // the universal-field reject list — a stack reserve is an ELF/PE/Mach-O
+    // image notion and would be dead data there). So they exercise the path
+    // where the engine has a request, no capability, and no declared reason.
+    //
+    // The contract for that path is the load-bearing bit: fail-closed degrades
+    // to a LESS SPECIFIC message, NEVER to a silent acceptance. Without this
+    // pin the fallback is unexecuted code, and a future edit could turn it
+    // into a silent pass without any test noticing.
+    // The gate runs BEFORE any target/format cross-validation, so the target
+    // is immaterial here — `x86_64` is what the existing wasm/spirv walker
+    // tests pair these formats with (there is no `wasm32`/`spirv` target
+    // schema). NO conditional skip: a row that cannot run must FAIL, not
+    // quietly vanish and leave a green test asserting nothing.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (auto const& formatName : { "wasm32-v1", "spirv-1.6" }) {
+        auto fmt = ObjectFormatSchema::loadShipped(formatName);
+        ASSERT_TRUE(fmt.has_value()) << formatName;
+        EXPECT_FALSE((*fmt)->stackReserveControl().has_value()) << formatName;
+        EXPECT_FALSE((*fmt)->stackReserveUnsupportedReason().has_value())
+            << formatName
+            << ": the skeleton formats declare NEITHER key by design — this "
+               "test exists to cover exactly that combination";
+
+        AssembledModule mod{};
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = 4194304u;
+        auto image = linker::link(mod, **target, **fmt, rep, req);
+        EXPECT_FALSE(image.ok()) << formatName;
+        EXPECT_TRUE(image.bytes.empty()) << formatName;
+        ASSERT_EQ(countCode(rep,
+                            DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << formatName << ": no declared reason must NOT mean no refusal";
+        for (auto const& d : rep.all()) {
+            if (d.code != DiagnosticCode::K_FormatLacksStackReserveControl)
+                continue;
+            EXPECT_NE(d.actual.find("no specific remedy can be offered"),
+                      std::string::npos)
+                << formatName
+                << ": the fallback must SAY that no specific remedy is "
+                   "available rather than inventing one; got: " << d.actual;
+            EXPECT_NE(d.actual.find("stackReserveUnsupportedReason"),
+                      std::string::npos)
+                << formatName
+                << ": ...and name the key whose absence caused the degraded "
+                   "message, so the schema author can fix it";
+        }
+    }
+}
+
+TEST(LinkerStackReserve, DllWalkerItselfRefusesWhenReachedDirectly) {
+    // `pe::encode` is a PUBLIC entry point and the SAME walker serves the
+    // .exe and the .dll, so the linker gate is not the only door. Reaching
+    // the walker directly with a request on the .dll schema must still be
+    // refused -- otherwise a caller that skips `linker::link` would write the
+    // inert field and report success.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto dll = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dll.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                     // ret — a valid, non-empty .text
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    ImageRequest req;
+    req.stackReserveBytes = 4194304u;
+    auto const bytes = pe::encode(mod, **target, **dll, rep, req);
+    EXPECT_TRUE(bytes.empty())
+        << "the walker must emit NOTHING rather than an image carrying an "
+           "inert reserve";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl),
+              1u);
+}
+
+TEST(LinkerStackReserve, AbsentRequestLeavesEveryFormatUngated) {
+    // The gate must be INERT when nothing was requested — otherwise it would
+    // break every existing build. An EMPTY request against a no-capability
+    // format links exactly as it did before the capability existed.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x90};
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter repDefault;
+    auto viaDefault = linker::link(mod, **target, **fmt, repDefault);
+    DiagnosticReporter repExplicit;
+    auto viaExplicit =
+        linker::link(mod, **target, **fmt, repExplicit, ImageRequest{});
+
+    EXPECT_EQ(repDefault.errorCount(), 0u);
+    EXPECT_EQ(repExplicit.errorCount(), 0u);
+    EXPECT_TRUE(viaDefault.ok());
+    EXPECT_TRUE(viaExplicit.ok());
+    // BYTE-identical: an explicitly-empty request is indistinguishable from
+    // the defaulted parameter, so the feature cannot perturb an existing build.
+    EXPECT_EQ(viaDefault.bytes, viaExplicit.bytes);
+    EXPECT_TRUE(ImageRequest{}.empty());
+}
+
+TEST(LinkerStackReserve, DeclaringFormatPassesTheGate) {
+    // The positive half of the sweep above: the ONE shipped format that
+    // declares the capability must NOT be refused. (Where the value LANDS in
+    // the emitted header is pinned byte-for-byte in `test_pe_writer.cpp`; this
+    // pin is only that the gate lets it through — so a future over-tightening
+    // cannot silently break the one format the feature exists for.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->stackReserveControl().has_value())
+        << "pe64-x86_64-windows-exec must declare the stack-reserve capability";
+    AssembledModule mod{};
+    DiagnosticReporter rep;
+    ImageRequest req;
+    req.stackReserveBytes = 4194304u;
+    auto image = linker::link(mod, **target, **fmt, rep, req);
+    // The empty module fails DOWNSTREAM in the PE walker (an exec with no
+    // instructions), which is expected — what must NOT appear is the gate's
+    // refusal or a range rejection of a legal value.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl),
+              0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_InvalidStackReserveRequest), 0u);
+}
+
+TEST(LinkerStackReserve, OutOfRangeRequestIsRefusedNotClamped) {
+    // Range + alignment are checked against the numbers the FORMAT declares,
+    // and a violation is REFUSED — never rounded to the nearest legal value.
+    // A silently-rounded reserve is a knob that lies about the number it was
+    // given, indistinguishable at runtime from the bug this capability fixes.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    auto const cap = (*fmt)->stackReserveControl();
+    ASSERT_TRUE(cap.has_value());
+
+    struct Case { std::uint64_t value; char const* why; };
+    Case const cases[] = {
+        { cap->minimumBytes - cap->granularityBytes, "below minimumBytes" },
+        { cap->maximumBytes + cap->granularityBytes, "above maximumBytes" },
+        { cap->minimumBytes + 1,                     "misaligned"         },
+    };
+    for (auto const& c : cases) {
+        AssembledModule mod{};
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = c.value;
+        auto image = linker::link(mod, **target, **fmt, rep, req);
+        EXPECT_FALSE(image.ok()) << c.why;
+        EXPECT_TRUE(image.bytes.empty()) << c.why;
+        EXPECT_EQ(countCode(rep,
+                            DiagnosticCode::K_InvalidStackReserveRequest), 1u)
+            << c.why << " (value " << c.value << ")";
+    }
+}
+
+TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
+    // REGRESSION PIN for a real gap found in review. The first cut of this
+    // feature put the CAPABILITY check in the PE walker but the declared
+    // BOUNDS check only in `linker::link`. Because `pe::encode` is a public
+    // entry point, a caller reaching it directly with 8 GiB — DOUBLE the
+    // format's declared `maximumBytes` — got `errorCount() == 0`, a non-empty
+    // image, and 8589934592 written verbatim into SizeOfStackReserve. The
+    // walker's own comment justified its re-check with "a caller that bypasses
+    // linker::link bypasses that gate", and that reasoning applies to the
+    // bounds identically — the belt was half-fastened.
+    //
+    // Both checks now come from ONE `enforceImageRequest`, so this pin guards
+    // against them drifting apart again. It deliberately does NOT go through
+    // `linker::link`: routing through the gate would pass even with the bug.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    auto const cap = (*fmt)->stackReserveControl();
+    ASSERT_TRUE(cap.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                     // ret — a valid, non-empty .text
+    mod.functions.push_back(std::move(fn));
+
+    struct Case { std::uint64_t value; char const* why; };
+    Case const cases[] = {
+        { cap->maximumBytes + cap->granularityBytes, "above maximumBytes" },
+        { cap->minimumBytes - cap->granularityBytes, "below minimumBytes" },
+        { cap->minimumBytes + 1,                     "misaligned"         },
+    };
+    for (auto const& c : cases) {
+        DiagnosticReporter rep;
+        ImageRequest req;
+        req.stackReserveBytes = c.value;
+        auto const bytes = pe::encode(mod, **target, **fmt, rep, req);
+        EXPECT_TRUE(bytes.empty())
+            << c.why << " (" << c.value
+            << "): the walker must emit NOTHING rather than an image whose "
+               "header carries an out-of-range reserve";
+        EXPECT_EQ(countCode(rep,
+                            DiagnosticCode::K_InvalidStackReserveRequest), 1u)
+            << c.why << " (" << c.value << ")";
+    }
+
+    // ...and the in-range control still succeeds through the same door, so
+    // the pin above cannot be satisfied by the walker simply refusing
+    // everything.
+    DiagnosticReporter okRep;
+    ImageRequest okReq;
+    okReq.stackReserveBytes = 4194304u;
+    auto const okBytes = pe::encode(mod, **target, **fmt, okRep, okReq);
+    EXPECT_EQ(okRep.errorCount(), 0u);
+    ASSERT_GT(okBytes.size(), 0xE8u);
+    std::uint64_t landed = 0;
+    for (int i = 7; i >= 0; --i) {
+        landed = (landed << 8) | okBytes[0xE0u + static_cast<std::size_t>(i)];
+    }
+    EXPECT_EQ(landed, 4194304u)
+        << "the in-range request must still reach optional-header +72";
+}
+
+TEST(LinkerStackReserve, BothGateCodesAreUnsuppressable) {
+    // Suppressing either code would restore EXACTLY the silent drop the gate
+    // exists to prevent, so both must sit outside the `--suppress` surface.
+    EXPECT_TRUE(
+        isUnsuppressable(DiagnosticCode::K_FormatLacksStackReserveControl));
+    EXPECT_TRUE(
+        isUnsuppressable(DiagnosticCode::K_InvalidStackReserveRequest));
 }

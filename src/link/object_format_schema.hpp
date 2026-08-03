@@ -6,6 +6,7 @@
 #include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
+#include "core/types/preprocess_config.hpp"   // PredefinedMacroDef (TF-C97 — the format's data-model predefines)
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
@@ -805,6 +806,57 @@ struct DSS_EXPORT ObjectFormatData {
     // NO target-side fallback field — the axis is format-only.
     LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
 
+    // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the format's own
+    //    predefined macros ─────────────────────────────────────────────
+    //
+    // OPTIONAL top-level `"predefinedMacros"` — the SAME entry grammar as
+    // the language's `preprocess.predefinedMacros` and the target's
+    // `predefinedMacros`, parsed by the SHARED `parsePredefinedMacroArray`,
+    // merged with both at preprocess time by `mergePredefinedMacros`.
+    //
+    // ★ WHAT BELONGS HERE, AND WHY IT IS A THIRD FAMILY RATHER THAN A
+    // WIDENING OF THE TARGET'S. The macros a C program uses to read this
+    // schema's OWN axes — first among them `dataModel`, whose C-visible face
+    // is `__LP64__`/`_LP64`. Those are NOT architecture facts: ONE CPU
+    // (x86_64) is LP64 under elf64/macho64 and LLP64 under pe64, so a
+    // target-side row would be a lie on one of its own formats — exactly the
+    // argument that keeps `bitFieldStrategy` and `longDoubleFormat` here and
+    // sends `charIsUnsigned` to the target. Both `.target.json` files record
+    // the same conclusion in prose, and this key is what finally lets them
+    // stop deferring it.
+    //
+    // ★ WHY THE MACRO NAMES ARE CONFIG DATA AND NOT DERIVED IN THE LOADER.
+    // `__LP64__` is a C-FAMILY SPELLING. A loader that synthesized it from
+    // `dataModel == Lp64` would hardcode one source language's vocabulary
+    // into the object-format tier, which is the source-agnosticism break the
+    // whole config-driven design exists to prevent (and it would have no
+    // answer at all for a second language that spells the same fact
+    // differently). The loader therefore knows only "this format declares
+    // some predefines"; WHICH ones is derived — by the config author, in the
+    // file, from that file's own `dataModel` value — and never from a format
+    // NAME. Nothing in the engine compares a format name to a literal.
+    //
+    // OPTIONAL; absent ⇒ empty ⇒ the preprocessor's effective list is
+    // byte-identical to the pre-TF-C97 (language + target) list. That is the
+    // state the LLP64 and ILP32 formats deliberately stay in: defining
+    // NEITHER macro is the whole point of putting the channel here, so their
+    // silence is a DECLARED answer, not an omission (each such file records
+    // it in a `$predefinedMacrosComment`). Per-entry `availableObjectFormats`
+    // still applies and is still filtered ONCE downstream.
+    std::vector<PredefinedMacroDef> predefinedMacros;
+
+    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-
+    // PLATFORM) ─────────────────────────────────────────────────────────
+    // The axis is (processor × platform), and it is declared ENTIRELY on the
+    // TARGET — one key, `charIsUnsigned`, carrying its own per-object-format
+    // overrides (`{"default": …, "byObjectFormat": {…}}`), resolved by
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`. A format-side field
+    // was tried and removed: `elf` serves BOTH aarch64 (unsigned) and x86_64
+    // (signed), so any flat value here is a lie on one of them, and making it
+    // honest would force all 24 format files to enumerate CPU architectures —
+    // a layering inversion. Do not re-add a `charSignedness` key here; the
+    // closed root-key vocabulary in the loader will reject it.
+
     // Relocations row — same shape as `TargetSchema::relocations[]`
     // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;
@@ -933,6 +985,31 @@ struct DSS_EXPORT ObjectFormatData {
     // (the closed-enum check — a typo never falls back).
     std::optional<DataImportBinding> dataImportBinding;
 
+    // ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): extern-ADDRESS
+    //     materialization binding ─────────────────────────────────────
+    //
+    // How code MATERIALIZES the ADDRESS of an undefined/preemptible
+    // extern (function OR data) as a LIVE code-form VALUE (an argument,
+    // an automatic's initializer, a returned function pointer) under
+    // THIS format. `got` = through a GOT slot the FINAL (foreign) linker
+    // synthesizes (arm64 ADR_GOT_PAGE + LD64_GOT_LO12_NC), so a foreign
+    // default-PIE link of the emitted relocatable `.o`/`.a` accepts it —
+    // an absolute page-pair against a preemptible symbol is rejected
+    // "when making a shared object". See `ExternAddrBinding`
+    // (core/types/object_format_kind.hpp) for the full rationale.
+    //
+    // `std::nullopt` = the format declared no binding — NOT a silent
+    // default: an `&extern` value then materializes via the ordinary lea
+    // (a PC-relative rel32 on x86_64 — already foreign-PIE-safe; an
+    // absolute page-pair on arm64 — foreign-PIE-safe ONLY for a
+    // DSS-linked exec). Only the arm64 relocatable + static-archive
+    // formats declare `got`; the DSS-linked exec/pie/dyn formats omit it
+    // (they use copy-relocation / the c117 __got path). Consumed by
+    // MIR→LIR `lowerGlobalAddr`'s value-form arm. An unknown VALUE fails
+    // loud at load (the closed-enum check — the externCallDispatch /
+    // dataImportBinding discipline).
+    std::optional<ExternAddrBinding> externAddrBinding;
+
     // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
     //
     // HOW code reaches a thread-local object's per-thread copy under
@@ -968,6 +1045,37 @@ struct DSS_EXPORT ObjectFormatData {
     // API directly → the synth recipe map is empty on elf → clean no-op);
     // pe/macho declare it. An unknown VALUE fails loud at load.
     std::optional<LibrarySynthesis> librarySynthesis;
+
+    // ── D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: stack-reserve capability ──
+    //
+    // Whether THIS format can record a per-PROGRAM stack reserve in the
+    // emitted image (`"stackReserveControl"` in the JSON): the closed
+    // VEHICLE naming the header field / load command it lands in, plus the
+    // declared legal range a request is validated against. See
+    // `StackReserveControl` (core/types/object_format_kind.hpp).
+    //
+    // `std::nullopt` = this format cannot express a stack reserve. NOT a
+    // silent default: `linker::link` fails loud
+    // (`K_FormatLacksStackReserveControl`) on a project/CLI request against
+    // a nullopt format, because silently dropping the request would ship an
+    // image whose stack is NOT what the program asked for — the exact
+    // knob-that-lies class. Declared by the PE **exec** format only: PE
+    // **dll** omits it (the loader ignores a DLL's SizeOfStackReserve), ELF
+    // omits it (no image field carries a stack SIZE — `PT_GNU_STACK` is
+    // executability; the size is a runtime/`ulimit` property), Mach-O omits
+    // it until an `LC_MAIN.stacksize` walker arm lands. An unknown VEHICLE,
+    // or one incoherent with `format.kind`, fails loud at load.
+    std::optional<StackReserveControl> stackReserveControl;
+
+    // The REMEDY axis of the same anchor (`"stackReserveUnsupportedReason"`):
+    // WHY this format cannot carry a stack reserve, as a closed verb the
+    // diagnostic turns into an actionable remedy. Mutually exclusive with
+    // `stackReserveControl` (declaring both is contradictory config and fails
+    // loud at load). OPTIONAL: a format that declares neither still REFUSES a
+    // request — just with the generic message. See
+    // `StackReserveUnsupportedReason` (core/types/object_format_kind.hpp) for
+    // why each of the four verbs exists and what it tells the user to do.
+    std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
@@ -1074,6 +1182,17 @@ public:
     [[nodiscard]] LongDoubleFormat     longDoubleFormat() const noexcept {
         return d_.longDoubleFormat;
     }
+
+    // ── Format-owned predefined macros (TF-C97) ───────────────────
+    // The format's `predefinedMacros` rows, in declaration order and
+    // UNFILTERED — the per-entry `availableObjectFormats` filter is
+    // applied ONCE downstream in `mergePredefinedMacros`, alongside
+    // the language's and the target's, so no seed site can drift.
+    // Symmetric with `TargetSchema::predefinedMacros()`. EMPTY for a
+    // format that declares none (every LLP64/ILP32 format today) ⇒
+    // the effective list is the language+target list unchanged.
+    [[nodiscard]] std::span<PredefinedMacroDef const>
+    predefinedMacros() const noexcept { return d_.predefinedMacros; }
 
     // Relocation accessors — symmetric with TargetSchema's. The
     // linker calls `relocationByKind(kind)` to find which
@@ -1249,6 +1368,17 @@ public:
         return d_.dataImportBinding;
     }
 
+    // ── D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT accessor (TF-C52) ────
+    // The format's extern-ADDRESS materialization binding (`got`), or
+    // nullopt if the format declared none. MIR→LIR reads this to route
+    // an `&extern` VALUE through the arm64 GOT-address macro (adrp:got:
+    // + ldr:got_lo12:) instead of an absolute page-pair lea; nullopt =
+    // the ordinary lea (foreign-PIE-safe only on x86_64 / a DSS exec).
+    [[nodiscard]] std::optional<ExternAddrBinding>
+    externAddrBinding() const noexcept {
+        return d_.externAddrBinding;
+    }
+
     // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────
     // The format's thread-local access block (model + x86 segment
     // prefix + tp-slot displacement), or nullopt if the format
@@ -1269,6 +1399,28 @@ public:
     [[nodiscard]] std::optional<LibrarySynthesis> const&
     librarySynthesis() const noexcept {
         return d_.librarySynthesis;
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the format's stack-reserve
+    // capability (vehicle + declared legal range), or `std::nullopt` if this
+    // format cannot express a per-program stack reserve at all. THE
+    // capability query the linker gate asks — presence, never a format
+    // identity — so PE-exec (declares) and PE-dll (does not) diverge from
+    // config alone. A request against a nullopt format is a fail-loud.
+    [[nodiscard]] std::optional<StackReserveControl>
+    stackReserveControl() const noexcept {
+        return d_.stackReserveControl;
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: WHY this format cannot carry a
+    // stack reserve, as a closed verb the refusal diagnostic turns into an
+    // actionable remedy (`stackReserveUnsupportedRemedy`). `std::nullopt`
+    // ⇒ the format declared no reason; the refusal still fires, with the
+    // generic message. Never consulted when `stackReserveControl()` has a
+    // value — the two are mutually exclusive by load-time validation.
+    [[nodiscard]] std::optional<StackReserveUnsupportedReason>
+    stackReserveUnsupportedReason() const noexcept {
+        return d_.stackReserveUnsupportedReason;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

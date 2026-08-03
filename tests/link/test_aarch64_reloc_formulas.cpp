@@ -115,14 +115,70 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrPrelPgHi21), "aarch64_adr_prel_pg_hi21");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AddAbsLo12),    "aarch64_add_abs_lo12");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64TprelAddHi12),  "aarch64_tprel_add_hi12");
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-address pair.
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrGotPage),    "aarch64_adr_got_page");
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64Ld64GotLo12),   "aarch64_ld64_got_lo12");
 
     EXPECT_EQ(parseRelocFormulaKind("linear"),                   RelocFormulaKind::Linear);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_call26"),           RelocFormulaKind::Aarch64Call26);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_prel_pg_hi21"), RelocFormulaKind::Aarch64AdrPrelPgHi21);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_add_abs_lo12"),     RelocFormulaKind::Aarch64AddAbsLo12);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_tprel_add_hi12"),   RelocFormulaKind::Aarch64TprelAddHi12);
+    EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_got_page"),     RelocFormulaKind::Aarch64AdrGotPage);
+    EXPECT_EQ(parseRelocFormulaKind("aarch64_ld64_got_lo12"),    RelocFormulaKind::Aarch64Ld64GotLo12);
     EXPECT_EQ(parseRelocFormulaKind("nonsense"),                 std::nullopt);
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
+}
+
+// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the two GOT-address reloc
+// formulas are declared REAL (non-Linear) kinds — so the loader coherence
+// gate + the ET_DYN slide-safe classifier treat them right — but DSS never
+// APPLIES them (they are emitted only into a foreign-linked relocatable
+// object). The `applyExecRelocations` kernel arm is an EXPLICIT FAIL-LOUD
+// REFUSAL: reaching it means a DSS exec/dyn image carried a foreign-link-only
+// reloc — a bug, never a silent S/A/P fabrication (which would patch a
+// GOT-slot offset the DSS image has no slot for). RED-ON-DISABLE: delete
+// either kernel arm and this build fails `-Werror=switch` (the exhaustive
+// switch over RelocFormulaKind).
+TEST(Aarch64GotAddr, ApplyFailsLoudAdrGotPage) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_got_page");
+    ASSERT_NE(tgt, nullptr);
+    // A base ADRP word (0x90000000); any symbol VA. The kernel must REFUSE.
+    auto p = applyOneReloc(tgt, 0x90000000u, 0x400000, 0, 0x400000, 0);
+    EXPECT_FALSE(p.ok)
+        << "DSS must NOT apply an arm64 GOT-page reloc — it is foreign-linked.";
+}
+
+TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
+    auto tgt = loadOneRelocTarget("aarch64_ld64_got_lo12");
+    ASSERT_NE(tgt, nullptr);
+    // A base LDR word (0xF9400000); any symbol VA. The kernel must REFUSE.
+    auto p = applyOneReloc(tgt, 0xF9400000u, 0x400000, 0, 0x400000, 0);
+    EXPECT_FALSE(p.ok)
+        << "DSS must NOT apply an arm64 GOT-lo12 reloc — it is foreign-linked.";
+}
+
+// TF-C52 loader coherence: a GOT-address formula is non-Linear, so
+// widthBytes auto-defaults to 4 and an explicit pcRelative=true is rejected
+// (the ADRP/LDR are PC-relative BY CONSTRUCTION, not via the Linear -P term).
+TEST(Aarch64GotAddr, NonLinearDefaultsAndRejectsPcRelative) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_got_page");
+    ASSERT_NE(tgt, nullptr);
+    auto const* tri = tgt->relocationInfo(RelocationKind{1});
+    ASSERT_NE(tri, nullptr);
+    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::Aarch64AdrGotPage);
+    EXPECT_EQ(tri->widthBytes, 4);
+    EXPECT_FALSE(tri->pcRelative);
+
+    auto bad = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"bad"},
+      "relocations":[
+        { "name": "x", "kind": 1, "formula": "aarch64_adr_got_page", "pcRelative": true }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    EXPECT_FALSE(bad.has_value());
 }
 
 // ── JSON loader rejects bad formula discriminator ─────────────
@@ -597,6 +653,8 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     EXPECT_NE(list.find("'aarch64_adr_prel_pg_hi21'"), std::string::npos);
     EXPECT_NE(list.find("'aarch64_add_abs_lo12'"),     std::string::npos);
     EXPECT_NE(list.find("'aarch64_tprel_add_hi12'"),   std::string::npos);
+    EXPECT_NE(list.find("'aarch64_adr_got_page'"),     std::string::npos);
+    EXPECT_NE(list.find("'aarch64_ld64_got_lo12'"),    std::string::npos);
 }
 
 // ── Post-fold #2 (second 7-agent audit) ──────────────────────
@@ -608,7 +666,8 @@ TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
     EXPECT_EQ(acceptedRelocFormulaList(),
               "'linear', 'aarch64_call26', "
               "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12', "
-              "'aarch64_tprel_add_hi12'");
+              "'aarch64_tprel_add_hi12', 'aarch64_adr_got_page', "
+              "'aarch64_ld64_got_lo12'");
 }
 
 // pr-test-analyzer Rating 7: whitespace tolerance pinned as reject
@@ -774,4 +833,23 @@ TEST(ShippedArm64Target, LoadsAllSixRelocKinds) {
     EXPECT_EQ(lo->widthBytes, 4);
     EXPECT_TRUE(lo->tls);
     EXPECT_NE(lo->kind, add->kind);
+
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-address pair —
+    // kind 7/8, kind-coherent with both format siblings' R_AARCH64_ADR_GOT_
+    // PAGE (311) / R_AARCH64_LD64_GOT_LO12_NC (312) so the `lea_extern_got`
+    // macro's `relocationKind` wires resolve. Non-Linear (width 4), not tls.
+    auto const* gotPage = tgt.relocationByName("adr_got_page");
+    ASSERT_NE(gotPage, nullptr);
+    EXPECT_EQ(gotPage->formulaKind, RelocFormulaKind::Aarch64AdrGotPage);
+    EXPECT_EQ(gotPage->widthBytes, 4);
+    EXPECT_EQ(gotPage->kind, RelocationKind{7});
+    EXPECT_FALSE(gotPage->tls);
+    EXPECT_FALSE(gotPage->pcRelative);
+
+    auto const* gotLo12 = tgt.relocationByName("ld64_got_lo12");
+    ASSERT_NE(gotLo12, nullptr);
+    EXPECT_EQ(gotLo12->formulaKind, RelocFormulaKind::Aarch64Ld64GotLo12);
+    EXPECT_EQ(gotLo12->widthBytes, 4);
+    EXPECT_EQ(gotLo12->kind, RelocationKind{8});
+    EXPECT_FALSE(gotLo12->tls);
 }

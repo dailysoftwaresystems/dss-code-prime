@@ -579,7 +579,7 @@ struct Parser::Impl {
         // (FC4 c1: a declarator-mode row's initDeclarator LIST yields
         // MULTIPLE bindings — `typedef int A, *B;` binds both — hence the
         // vector; legacy rows yield 0 or 1.)
-        std::vector<std::pair<std::string, bool>> binderNames;
+        std::vector<BinderName> binderNames;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
                 binderNames = extractBinderNames_(*decl);
@@ -591,8 +591,8 @@ struct Parser::Impl {
         if (!frameRules.empty()) frameRules.pop_back();
         if (sketch.enabled()) {
             if (sketch.isScopeRule(rule)) sketch.closeScope();
-            for (auto& [name, isType] : binderNames) {
-                sketch.record(std::move(name), isType);
+            for (auto& bn : binderNames) {
+                sketch.record(std::move(bn.name), bn.isType, bn.span);
             }
         }
     }
@@ -677,9 +677,18 @@ struct Parser::Impl {
     // Legacy rows yield 0 or 1 entries; FC4 declarator-mode rows yield one
     // entry PER named declarator below the carrier child (abstract
     // declarators contribute nothing — a legal outcome).
-    [[nodiscard]] std::vector<std::pair<std::string, bool>>
+    // A binder name plus the source span of its declaring name-token. The
+    // span flows into the sketch binding so the CU oracle can distinguish a
+    // typedef's own defining occurrence from a use (D-CSUBSET-FN-TYPE-
+    // TYPEDEF-PAREN-NAME).
+    struct BinderName {
+        std::string name;
+        bool        isType;
+        SourceSpan  span;
+    };
+    [[nodiscard]] std::vector<BinderName>
     extractBinderNames_(BinderSketch::BinderDecl const& decl) const {
-        std::vector<std::pair<std::string, bool>> out;
+        std::vector<BinderName> out;
         std::vector<NodeId> kids;
         for (NodeId c : builder->currentFramePendingChildren()) {
             if (!isEmptySpace(builder->nodeFlags(c))) kids.push_back(c);
@@ -710,9 +719,9 @@ struct Parser::Impl {
             for (NodeId d : declarators) {
                 const NodeId nameNode = declaratorNameNode(view, d, *dcOpt);
                 if (!nameNode.valid()) continue;   // abstract — no binding
+                const SourceSpan nameSpan = builder->nodeSpan(nameNode);
                 out.emplace_back(
-                    std::string{src->slice(builder->nodeSpan(nameNode))},
-                    decl.isType);
+                    std::string{src->slice(nameSpan)}, decl.isType, nameSpan);
             }
             return out;
         }
@@ -724,8 +733,9 @@ struct Parser::Impl {
             || builder->nodeTokenKind(nameNode).v != identifierKind.v) {
             return out;
         }
-        out.emplace_back(std::string{src->slice(builder->nodeSpan(nameNode))},
-                         decl.isType);
+        const SourceSpan nameSpan = builder->nodeSpan(nameNode);
+        out.emplace_back(std::string{src->slice(nameSpan)}, decl.isType,
+                         nameSpan);
         return out;
     }
 
@@ -767,8 +777,8 @@ struct Parser::Impl {
         // extractBinderNames_ uses; at this point the only staged visible children
         // are [keyword, tag], so nameChild resolves to the just-consumed tag.
         auto names = extractBinderNames_(*decl);
-        for (auto& [name, isType] : names) {
-            sketch.record(std::move(name), isType);
+        for (auto& bn : names) {
+            sketch.record(std::move(bn.name), bn.isType, bn.span);
         }
     }
 
@@ -2197,6 +2207,7 @@ ParseResult Parser::parse() && {
         .tree               = std::move(*I.builder).finish(),
         .typeNameCandidates = I.sketch.takeCandidates(),
         .globalTypeNames    = I.sketch.globalTypeNames(),
+        .globalTypeBindings = I.sketch.globalTypeBindings(),
         .tokenAccessCount   = accesses,
     };
 }

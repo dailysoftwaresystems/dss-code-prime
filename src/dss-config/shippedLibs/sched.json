@@ -1,0 +1,10 @@
+{
+  "$comment": "Neutral shipped <sched.h> (POSIX) — SQLite testfixture arc (F001A blocker clear, 2026-07-18): the ONE function test4.c routes its thread-handoff spin loop through — `sched_yield()` (`while( p->opnum<=p->completed ) sched_yield();`, test4.c lines 82/92/176). POSIX.1b `int sched_yield(void)`: yields the CPU to another ready thread, returns 0 on success. Exported by glibc as a WEAK dynamic symbol (nm -D libc.so.6 → `W sched_yield@@GLIBC_2.2.5`) — a `W` export is resolvable + eager-import-safe EXACTLY like the weak close/read/write/unlink already shipped in unistd.json (D-FFI-DESCRIPTOR-EAGER-IMPORT is about UNEXPORTED symbols; a weak-but-present symbol resolves fine at load), and it is a standard POSIX symbol on Darwin libSystem too, so it rides the [elf,macho] gate. availableObjectFormats:[elf,macho]: elf = the WSL run target (linux, run-green) + native arm64 CI; macho = the macos-latest CI leg; a windows-pe `#include <sched.h>` fails loud (POSIX-on-windows is the separate os_win axis — Windows has no <sched.h>), mirroring sys/mman.json. NO over-ship: test4.c uses ONLY sched_yield — sched_setscheduler/sched_getparam/the CPU_SET macros/struct sched_param stay OUT of the descriptor until a real consumer needs them (the tcl.json need-driven-growth discipline).",
+  "header": "sched.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "sched_yield", "signature": "fn() -> i32", "kind": "function", "linkage": "external" }
+  ]
+}

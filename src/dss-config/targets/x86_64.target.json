@@ -7,6 +7,13 @@
     "description": "x86_64 opcode set + physical register file + SysV AMD64 / Microsoft x64 calling conventions. Cycle 2b: regfile/ABI added. Cycle 3 (instruction selection) expands the opcode set to full c-subset corpus coverage.",
     "$reservedFields": "The per-opcode minOperands/maxOperands fields are documented in the JSON for completeness but are NOT yet fully enforced by the substrate. Terminator-ness derives from `terminatorKind` (Br/CondBr/Switch/Return/Unreachable; default `none` = non-terminator); the parser's `parseInst` and `LirVerifier` consult it directly. Per-kind successor-count is enforced by `TargetSchemaData::validate()` via the shared `kTargetTerminatorShapes` table."
   },
+  "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like aggregateLayout/tls below) because they are per-CPU facts; putting them on the language would force c-subset.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): all four spellings are defined identically by x86_64-linux-gnu, x86_64-apple-darwin AND x86_64-pc-windows-msvc, so all four are UNGATED — unlike the arm64 twin, where `__arm64__`/`__arm64` are Apple-only and must carry availableObjectFormats. DELIBERATELY NOT SHIPPED: `_M_X64` (an MSVC TOOLCHAIN-profile macro, not a CPU fact — it belongs with the pe-gated `_MSC_VER` family on the language side); SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. `__BYTE_ORDER__` (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body); toolchain identity (`__GNUC__`/`__clang__`) which is a COMPILER profile, not a CPU.",
+  "predefinedMacros": [
+    { "name": "__x86_64__", "kind": "constant", "value": "1" },
+    { "name": "__x86_64",   "kind": "constant", "value": "1" },
+    { "name": "__amd64__",  "kind": "constant", "value": "1" },
+    { "name": "__amd64",    "kind": "constant", "value": "1" }
+  ],
   "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t). D-CSUBSET-BITFIELD-ABI-EXACT: `bitFieldStrategy` here is the BACK-COMPAT FALLBACK only — C bit-field packing is OS/format-determined (this CPU serves BOTH ELF-SysV gnu_packed AND PE-MS msvc_straddle), so the ACTIVE strategy is resolved from the object FORMAT (effectiveBitFieldStrategy). The fallback is used only by direct-API / test callers with no format in scope.",
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (x86_64 is Variant II under EVERY OS, so it lives on the TARGET, not the format). variant2 = the thread pointer points ONE PAST the TLS block's end (fs:[0] holds tp itself); a symbol's link-time thread-pointer offset is NEGATIVE: tpoff = templateOffset − alignUp(blockSize, p_align). tcbHeaderBytes = 0 (a Variant-I-only input — arm64 declares 16 with its own block at TLS C2). Consumed ONLY by the walker's tpoff helper when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
@@ -617,6 +624,29 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-INTRINSIC-BSWAP: BSWAP r — reverse the byte order of a register (Intel SDM Vol. 2A BSWAP). 0F C8+rd; width 64 adds REX.W (48 0F C8+rd). ★ A DIFFERENT SHAPE FROM ITS THREE NEIGHBOURS ABOVE, in the one way that matters: BSWAP's destination rides the OPCODE BYTE (+rd), not ModR/M — the instruction has no ModR/M byte at all — and it is destructive (dest == source). So it is declared `requires2Address: true` with the operand-0 wire in `opcode.reg` and NO `resultSlot`, exactly like `add`/`not` declare theirs in `modrm.rm`: after `lir_2addr_legalize` inserts `mov result, operands[0]` and rewrites operand 0 to the result register, operand 0 IS the destination, so wiring it places the destination. (target_schema's rule-G `isDestSlot` lists `opcode.reg` for precisely this shape; the `mov r64,imm64` variant uses the same slot but as a `resultSlot`, a different code path.) ★★ NO WIDTH-16 VARIANT, AND THAT IS DELIBERATE, NOT AN OVERSIGHT: `bswap r16` is architecturally undefined (SDM: 'BSWAP with a 16-bit register is undefined'), MEASURED — GAS REFUSES `bswap %ax` outright with 'operand size mismatch', and gcc emits no 16-bit bswap across 20 flag combinations. `_byteswap_ushort` therefore takes mir_to_lir's generic universal-ALU byte-reversal expansion on x86 BY DESIGN; the lowering's capability probe is PER-WIDTH (`opcodeWithWidth`) rather than mnemonic-presence for exactly this reason — a presence-only probe would emit a width-16 bswap that matches no variant here. arm64 needs no such fallback (it declares all three widths: REV16/REV/REV(X)). Both variants below are width-keyed because the schema rejects mixing a width-keyed variant with a width-absent sibling of the same operand shape.",
+      "mnemonic": "bswap", "result": "value",
+      "requires2Address": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [15, 200] },
+            "wires":    [{ "index": 0, "slotKind": "opcode.reg" }]
+          },
+          {
+            "$comment": "bswap r32 — 0F C8+rd without REX.W. A 32-bit register write auto-zero-extends to the full 64-bit register, so the u32 result is clean.",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [15, 200] },
+            "wires":    [{ "index": 0, "slotKind": "opcode.reg" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) — atomic compare-and-swap, mem-dest: LOCK CMPXCHG [base+disp32], reg (LOCK 0xF0 mandatoryPrefix + 0x0F 0xB1 /r). Semantics: compares RAX/EAX (the implicit 'comparand' input-role) with [mem]; equal -> stores the wired reg (the NEW value, modrm.reg); unequal -> loads [mem] into RAX/EAX. EITHER way RAX ends holding the ORIGINAL observed value (the 'old' output-role the MIR AtomicCas lowering captures). LOCK makes it a full barrier — the correct strength for Win32 InterlockedCompareExchange. Operand shape mirrors `store`'s 4-op mem-dest form: [newval_reg, base_reg, MemBase(scale), MemOffset(disp)]. mandatoryPrefix [240] emits BEFORE the auto-REX (the 0x66 width-16-store precedent — legacy prefixes precede REX, REX immediately precedes the opcode), so a high-numbered base/newval register REX.B/R composes correctly: F0 [REX] 0F B1 /r. Width 32 = the Win32 LONG (LLP64) CAS — NO rexW; width 64 for completeness (a future 64-bit CAS consumer). implicitRegisters: inputs=[rax] (the comparand), outputs/clobbered=[rax] (the observed-original; outputs ⊆ clobbered).",
       "mnemonic":      "lock_cmpxchg",
       "result":        "none",
@@ -760,6 +790,25 @@
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
             ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): MFENCE — the STANDALONE seq_cst CPU fence MIR AtomicFence (__sync_synchronize) lowers to. 0F AE F0, MEASURED via clang -c -arch x86_64 + otool -t on `__sync_synchronize()` (this machine, 2026-07-30). Zero operands, no result, no ModR/M — a fixed 3-byte instruction (the xor_rdx_zero match-any shape; deliberately WIDTH-ABSENT, a fence has no operand width). hasSideEffects=true so no LIR pass drops or reorders it. Distinct from store_seqcst above (xchg — a fence FUSED to a store): this is the fence ALONE, for the store-less __sync_synchronize call sites (sqlite3MemoryBarrier).",
+      "mnemonic":      "atomic_fence_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 174, 240] }
           }
         ]
       }
@@ -2310,7 +2359,7 @@
       "callPushBytes": 8,
       "$variadicVectorCountRegComment": "D-LANG-VARIADIC (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c-subset stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c-subset or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
       "variadicVectorCountReg": "rax",
-      "$vaListLayoutComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): System V AMD64 §3.5.7 variadic-CALLEE layout. `__va_list_tag` = {u32 gp_offset@0; u32 fp_offset@4; void* overflow_arg_area@8; void* reg_save_area@16;} = 24B. A variadic callee's prologue spills the 6 integer arg regs (rdi..r9, 8B each = 48B) then the al-gated 8 SSE arg regs (xmm0..xmm7, 16B each = 128B) into a 176B register-save-area. va_start sets gp_offset = fixedGPR*8, fp_offset = 48 + fixedSSE*16, reg_save_area = &save, overflow_arg_area = &(incoming stack args). va_arg(T) of an INTEGER reads reg_save_area+gp_offset (bump +8) while gp_offset < gpOffsetLimit(48), else overflow; an SSE arg reads reg_save_area+fp_offset (bump +16) while fp_offset < fpOffsetLimit(176), else overflow. Every fact is config — the HIR→MIR diamond + LIR prologue spill read these, never branching on cc.name/arch/format. Win64/AAPCS64 omit this block (different variadic ABI) and fail loud at the va_start site.",
+      "$vaListLayoutComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): System V AMD64 §3.5.7 variadic-CALLEE layout. `__va_list_tag` = {u32 gp_offset@0; u32 fp_offset@4; void* overflow_arg_area@8; void* reg_save_area@16;} = 24B. A variadic callee's prologue spills the 6 integer arg regs (rdi..r9, 8B each = 48B) then the al-gated 8 SSE arg regs (xmm0..xmm7, 16B each = 128B) into a 176B register-save-area. va_start sets gp_offset = fixedGPR*8, fp_offset = 48 + fixedSSE*16, reg_save_area = &save, overflow_arg_area = &(incoming stack args). va_arg(T) of an INTEGER reads reg_save_area+gp_offset (bump +8) while gp_offset < gpOffsetLimit(48), else overflow; an SSE arg reads reg_save_area+fp_offset (bump +16) while fp_offset < fpOffsetLimit(176), else overflow. Every fact is config — the HIR→MIR diamond + LIR prologue spill read these, never branching on cc.name/arch/format. ★ STALENESS FIXED 2026-07-25: this note used to end \"Win64/AAPCS64 omit this block (different variadic ABI) and fail loud at the va_start site\" — no longer true, and it had become actively misleading. Every shipped CC now declares its own `vaListLayout`, each naming a DIFFERENT `strategy`: `ms_x64` two rows below (homogeneous_pointer, FC12b), arm64 `aapcs64` (aapcs64_dual_cursor, FC12c) and `apple_arm64` (homogeneous_pointer). So the block is not a SysV-only opt-in whose absence means fail-loud; it is the per-CC declaration of WHICH variadic model applies, and `strategy` is the closed-vocabulary verb the engine dispatches on. Absent `vaListLayout` now describes only a hypothetical future CC that declares none — nothing shipped.",
       "vaListLayout": {
         "strategy": "sysv_register_save",
         "gpOffsetField":        { "byteOffset": 0,  "widthBytes": 4 },

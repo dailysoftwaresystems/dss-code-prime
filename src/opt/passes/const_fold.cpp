@@ -183,11 +183,24 @@ private:
         // wrap-aware fold lives in the HIR/CST const-eval (C4b); the optimizer defers
         // BitInt entirely. (A wide `_BitInt` is memory-resident — no scalar Const —
         // but the explicit guard pins the intent + is a red-on-disable boundary.)
+        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): I128/U128 join the refusal, for the
+        // IDENTICAL reason — this pass's int64/uint64 helpers have no mod-2^128
+        // wrap either, and `wrapToIntTarget(v, {128, …})` returns its input
+        // unchanged, so a folded 128-bit instruction would carry a 64-bit value
+        // under a 128-bit type. Under complete routing (the memory-resident
+        // 128-bit path) no 128-bit op reaches this pass at all, so this is
+        // defence-in-depth — but it is precisely the defence that catches a
+        // ROUTING MISS, and without it such a miss is invisible: the debug build
+        // never runs this pass, so the miscompile would appear only under
+        // `--config=release`. `mem2reg.cpp`'s promotable-kind switch already
+        // excludes I128/U128 (that sibling is correct and untouched).
         // A non-value instruction (Store/Br/…) carries InvalidType — `kind()` aborts
         // on it, so gate on `valid()` first.
-        if (TypeId const it = src_.instType(oldId);
-            it.valid() && interner_.kind(it) == TypeKind::BitInt) {
-            return std::nullopt;
+        if (TypeId const it = src_.instType(oldId); it.valid()) {
+            TypeKind const k = interner_.kind(it);
+            if (k == TypeKind::BitInt || detail::isInt128Kind(k)) {
+                return std::nullopt;
+            }
         }
         auto const oldOps = src_.instOperands(oldId);
 

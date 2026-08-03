@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -30,19 +31,67 @@ namespace dss {
 //                         deferred, D-AP2-TARGET-NAME-DEFAULT-FORMAT).
 //                         Spec FORMAT is validated downstream by the
 //                         delegated compile path (D_InvalidTargetSpec).
-//   * `sources`         — literal source paths. Glob expansion (e.g.
-//                         `src/**/*.c`) is deferred (D-AP2-SOURCES-GLOB);
-//                         AP2 routes over the literal file count.
+//   * `sources`         — source paths OR glob patterns. The LOADER keeps each
+//                         entry VERBATIM (a glob string is a valid non-empty
+//                         source string — no filesystem here). `Program::
+//                         compileProject` then EXPANDS any entry containing a
+//                         glob metacharacter (`* ? [`) against the filesystem
+//                         BEFORE the routing count is taken (D-AP2-SOURCES-GLOB,
+//                         via `core/types/glob_match.hpp`); a metacharacter-free
+//                         entry stays literal. Base = the process working
+//                         directory; a zero-match pattern fails loud there.
 //   * `output`          — artifact output hint. Parsed + type-validated
 //                         (a user-authored schema field); its path
 //                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2
 //                         uses the existing per-target output convention.
+//   * `artifactName`    — OPTIONAL base NAME for the emitted binary (no
+//                         extension, no path separators — a name, not a path).
+//                         Absent ⇒ the source stem (unchanged). A project build
+//                         routes each target's artifact to `<outputDir>/
+//                         <formatName>/<artifactName-or-stem><ext>` — the
+//                         per-platform subdir applies to EVERY project build
+//                         (single- or multi-target). This is the artifactName +
+//                         subdir half of D-AP2-OUTPUT-ROUTING (the
+//                         `output`-field-as-output-dir half stays deferred).
+//   * `includes`        — OPTIONAL quote-include search dirs; the file-driven
+//                         counterpart of the CLI `-I <dir>`. Empty when absent.
+//   * `defines`         — OPTIONAL `NAME[=VALUE]` macros; the counterpart of
+//                         the CLI `--define`. Empty when absent.
+//   * `resolveLibraries`— OPTIONAL library paths whose export surfaces resolve
+//                         this build's externs; the counterpart of the CLI
+//                         `--resolve-library <path>`. Empty when absent.
+//   The three flag arrays MERGE (append) onto the Program's current state in
+//   `Program::compileProject` — they ADD to any CLI-provided flags, never
+//   replace them. A present-but-empty `[]` is allowed (⇒ empty list).
 struct DSS_EXPORT ProjectConfig {
     std::string              language;
     std::string              artifactProfile;
     std::vector<std::string> targets;
     std::vector<std::string> sources;
     std::optional<std::string> output;   // nullopt iff the field is absent
+    // OPTIONAL base NAME for the emitted binary (no extension / path
+    // separators). nullopt ⇒ the source stem. In a project build each target's
+    // artifact routes to `<outputDir>/<formatName>/<artifactName-or-stem><ext>`
+    // (the artifactName + per-format-subdir half of D-AP2-OUTPUT-ROUTING).
+    std::optional<std::string> artifactName;  // nullopt iff the field is absent
+    // OPTIONAL compile-flag fields (empty when the field is absent). Each maps
+    // to the same Program state as the matching CLI flag; see the field notes
+    // above. Threaded (merge/append) by Program::compileProject.
+    std::vector<std::string> includes;         // → setIncludeDirs      (CLI -I <dir>)
+    std::vector<std::string> defines;          // → setUserDefines      (CLI --define NAME[=VALUE])
+    std::vector<std::string> resolveLibraries; // → setResolveLibraries (CLI --resolve-library <path>)
+    // OPTIONAL per-PROGRAM stack reserve in BYTES (manifest key
+    // `stackReserve`; D-SQLITE-PE64-FULL-TIER-STACK-DEPTH). nullopt iff the
+    // field is absent ⇒ the object format's declared default stands.
+    //
+    // Unlike the three arrays above, this is a SCALAR and therefore cannot
+    // merge — so it has an explicit PRECEDENCE rule instead: the CLI
+    // `--stack-reserve` WINS; the manifest value applies only when the CLI
+    // supplied none (`Program::compileProject`). Rationale: an explicit
+    // command-line argument overriding a committed file is the universal
+    // convention, and it is the only rule that lets a user probe a different
+    // reserve without editing (and risking committing) the manifest.
+    std::optional<std::uint64_t> stackReserveBytes;
 };
 
 // Parse a project config from JSON text. `sourceLabel` names the input

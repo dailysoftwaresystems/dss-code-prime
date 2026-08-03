@@ -9,6 +9,29 @@ namespace dss::lir_pass_util {
 // `report()` moved to `dss::report` in
 // `core/types/diagnostic_reporter.hpp` at LK10 cycle 3 post-fold #2.
 
+IncomingArgReg
+incomingArgRegister(TargetSchema const&            schema,
+                    TargetCallingConvention const& cc,
+                    LirRegClass                    resultClass,
+                    std::uint32_t                  payload) {
+    // The arg-register pool for this parameter's class. Slot-aligned ccs
+    // (Win64) keep argGprs/argFprs the same length so `payload` (a flat slot
+    // index) selects the same slot in either; independent-counter ccs
+    // (SysV/AAPCS64) pass `payload` as the per-class index. Either way the
+    // per-class pool indexed by `payload` is the incoming register — the exact
+    // shape collectArgRegisterOccupied used before this was hoisted.
+    auto const& pool = (resultClass == LirRegClass::FPR) ? cc.argFprs
+                                                         : cc.argGprs;
+    if (payload >= pool.size()) {
+        return {IncomingArgRegKind::StackPassed, 0};
+    }
+    auto const ord = schema.registerByName(pool[payload]);
+    if (!ord.has_value()) {
+        return {IncomingArgRegKind::UnresolvableName, 0};
+    }
+    return {IncomingArgRegKind::Register, *ord};
+}
+
 LirOperand
 remapBlockRef(LirOperand const& op,
               std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst) {

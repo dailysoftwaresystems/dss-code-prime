@@ -13,29 +13,130 @@
 #include "core/types/object_format_kind.hpp"   // c105: per-format prologue tests
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
+#include "core/types/unsuppressable_codes.hpp"  // TF-C86: the refusal's closed-table pin
+#include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
+#include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
+#include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <type_traits>   // TF-C91: the cSubset() return-shape static_assert
 #include <vector>
 
 namespace {
 
 using namespace dss;
 
-[[nodiscard]] std::shared_ptr<GrammarSchema const> cSubset() {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded.has_value()) {
-        ADD_FAILURE() << "loadShipped(c-subset) failed";
-        std::abort();
-    }
-    return *loaded;
+// ── THE scratch-path chokepoint ────────────────────────────────────────────
+// Every filesystem fixture in this file hangs its directory off THIS root.
+// Nothing below may name `temp_directory_path()` directly — that is the whole
+// point of routing 39 sites through one function.
+//
+// WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
+// `tests/CMakeLists.txt:156` registers a SECOND ctest entry that runs THIS
+// binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
+// serialization. So on any ordinary `ctest -j` two live processes of this
+// binary overlap — and while the fixtures derived their directories from
+// CONSTANT `/tmp/dss_pp_*` names they addressed the same bytes: one process's
+// `remove_all` deleted a header the other had just written and was about to
+// read. MEASURED pre-fix on this host: `ctest -j 8` over the two entries went
+// red 1 run in 3 with `SourceBuffer::fromFile: cannot open
+// .../dss_tf87_depthcap/rec.h`, and two concurrent bare processes BOTH went red
+// with DIFFERENT counts (20 vs 18 distinct tests) — the tell that this is
+// contention and not a real regression.
+//
+// The paths must be UNIQUE, not contended-for. Serializing the two entries
+// (`RUN_SERIAL` / `RESOURCE_LOCK`) would bury the defect and slow every gate
+// run, and dropping the shuffle arm would give up the order-dependence
+// coverage it exists for. Neither is a fix; do not "simplify" back to either.
+//
+// `ScratchDir` (tests/test_support/scratch_dir.hpp:114) already carries the
+// correct scheme, so this REUSES it rather than growing a second one: a PID
+// SEED plus an atomic claim via `create_directory` (SINGULAR) in a loop. The
+// singular form returns true only for the caller that actually created the
+// directory — check-and-create is atomic in the OS — so the claim is race-free
+// against a concurrent sibling AND steps over a stale directory left by a
+// killed run instead of silently sharing it. A PID alone would not do: PIDs
+// recycle.
+//
+// ONE root per process, not one per fixture, and that is load-bearing twice
+// over: repeated calls with the SAME tag must resolve to the SAME directory
+// (`writeEmbedResource` is called twice with "dss_embed_t10" to sit two
+// resources side by side), and the static's destructor sweeps the whole tree at
+// exit, so a fixture whose trailing `remove_all` is skipped by an early
+// `ASSERT_*` return no longer leaks a directory under the temp base.
+[[nodiscard]] std::filesystem::path const& ppScratchRoot() {
+    static test_support::ScratchDir const root{test_support::Location::Temp,
+                                               "preprocess"};
+    return root.path();
 }
+
+// Shared schema fixture: load once per test binary process, and hand back a
+// REFERENCE to the cached owner. Same shape as `x86Schema()` in
+// tests/lir/test_lir.cpp:36.
+//
+// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
+// While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
+// call built a fresh schema owned solely by the returned temporary, so the
+// one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
+// object destroyed at the end of that full-expression. `GrammarSchema`'s
+// accessors (`preprocess()`, src/core/types/grammar_schema.hpp:665) return
+// references INTO the schema, so that is a heap-use-after-free — MEASURED with
+// ASan as a 40/40 deterministic `heap-use-after-free`, and reported from
+// Windows/g++/libstdc++ as a non-deterministic 0xC0000005 that a full-suite run
+// could not see. Returning a reference to a function-local static makes the
+// pointee outlive every expression, so NO accessor on this helper can dangle at
+// any call site, present or future: the defect class is unrepresentable here
+// rather than merely absent.
+//
+// Safe to cache (MEASURED over this file, not assumed): the pointee is
+// `GrammarSchema const` so mutation is ill-formed; no test asserts on pointer
+// identity, `use_count()`, or freshness; nothing here writes to
+// `src/dss-config/`, so the shipped config cannot change mid-process; and
+// `reboundCSubset()` — the one helper that DOES need a per-call variant — builds
+// its own schema via `loadFromText` and never calls this function.
+//
+// The 34 `auto schema = cSubset();` call sites are unaffected: `auto` deduces
+// `shared_ptr` BY VALUE from a `const&`, i.e. a refcount bump.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubset() {
+    static std::shared_ptr<GrammarSchema const> const schema = [] {
+        auto loaded = GrammarSchema::loadShipped("c-subset");
+        if (!loaded.has_value()) {
+            ADD_FAILURE() << "loadShipped(c-subset) failed";
+            std::abort();
+        }
+        return *loaded;
+    }();
+    return schema;
+}
+
+// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — the DURABLE guard, and the only
+// kind available here. Once `cSubset()` hands back a reference to a static the
+// dangling read becomes IMPOSSIBLE, which retires the crash test that proved it:
+// a runtime red-on-disable cannot survive its own fix. So the property is pinned
+// at COMPILE time instead. Restoring the by-value return re-admits the entire
+// defect class at all 36 call sites, so that regression must not be silent.
+// RED-ON-DISABLE (MEASURED): change the return type back to
+// `std::shared_ptr<GrammarSchema const>` and this fails to compile.
+static_assert(std::is_reference_v<decltype(cSubset())>,
+              "cSubset() must return a REFERENCE to a cached owner. A by-value "
+              "return re-admits D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: "
+              "`helper()->accessor()` would again bind a reference into a schema "
+              "owned only by the temporary, which dies at the end of the "
+              "full-expression (heap-use-after-free).");
 
 // Run the preprocessor over `text` (no include dirs) and return the NON-trivia
 // token lexemes (sliced from the synth buffer), in order. Directives removed +
@@ -912,6 +1013,115 @@ reboundCSubset(std::string const& from, std::string const& to,
 }
 } // namespace
 
+// ── TF-C82 (D-PP-PRAGMA-REGISTRY): the LOADER's guards on `pragmaEffects` ──
+//
+// The registry mirrors `attributeEffects`, so it inherits that table's hard-won
+// rules: a CLOSED verb set (a typo can never silently disarm a row), no
+// DUPLICATE key (which row wins must not be decided by iteration order), no
+// EMPTY key (an empty prefix matches EVERY pragma and would silently disarm
+// `unknownPragmaIsError` wholesale), and no row without a SURFACE to fire on.
+// Each sub-case rebinds the shipped config and asserts the load REJECTS.
+namespace {
+[[nodiscard]] std::vector<ConfigDiagnostic>
+loadCSubsetExpectingFailure(std::string const& from, std::string const& to,
+                            std::string const& label) {
+    std::string text = loadShippedCSubsetText();
+    if (text.empty()) {
+        ADD_FAILURE() << "could not locate shipped c-subset config";
+        return {};
+    }
+    auto const pos = text.find(from);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "shipped c-subset config no longer carries: " << from;
+        return {};
+    }
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, label);
+    if (loaded.has_value()) {
+        ADD_FAILURE() << "the load should have FAILED for: " << label;
+        return {};
+    }
+    return loaded.error();
+}
+[[nodiscard]] bool hasCode(std::vector<ConfigDiagnostic> const& ds,
+                           DiagnosticCode code) {
+    for (auto const& d : ds) if (d.code == code) return true;
+    return false;
+}
+} // namespace
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsUnknownVerb) {
+    // The CLOSED verb set, and — like `kEffectVerbs` — the rejection message is
+    // DERIVED from the vocabulary rather than restated beside it, so it cannot
+    // drift into advertising a verb that no longer loads. This mirror going RED
+    // on a vocabulary change is the test working as designed.
+    constexpr std::string_view kVerbs[] = {"diagnosticsOnly", "annotationOnly",
+                                           "structPacking", "unsupported"};
+    auto const ds = loadCSubsetExpectingFailure(
+        "\"effect\": \"structPacking\" }", "\"effect\": \"strcutPacking\" }",
+        "<bad-pragma-verb>");
+    EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+        << "a misspelled pragma effect must fail the LOAD — silently defaulting "
+           "it would disarm the row, and for `structPacking` that is a wrong "
+           "struct layout rather than a lost warning";
+    std::string closed;
+    for (auto const& d : ds) {
+        if (d.message.find("unknown pragma effect") != std::string::npos) {
+            closed = d.message;
+        }
+    }
+    ASSERT_FALSE(closed.empty()) << "the rejection must name the closed set";
+    for (std::string_view v : kVerbs) {
+        EXPECT_NE(closed.find(v), std::string::npos)
+            << "the closed-set message omits the ACCEPTED verb '" << v
+            << "' — a config author reads exactly this sentence to learn the "
+               "vocabulary";
+    }
+}
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
+    {
+        // DUPLICATE: two rows claiming `pack`. Which wins would be decided by
+        // consumer iteration order, and here that is `structPacking` (a real
+        // layout) versus `unsupported` (a refusal) — never a cosmetic ambiguity.
+        auto const ds = loadCSubsetExpectingFailure(
+            "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
+            "\"prefix\": [\"pack\"],                  \"effect\": \"unsupported\" },",
+            "<dup-pragma-prefix>");
+        EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+            << "a prefix bound twice must fail the load";
+    }
+    {
+        // EMPTY: `[]` is a prefix of EVERY pragma, so one such row silently
+        // turns the whole registry into a catch-all and disarms the loudness.
+        auto const ds = loadCSubsetExpectingFailure(
+            "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
+            "\"prefix\": [],                        \"effect\": \"unsupported\" },",
+            "<empty-pragma-prefix>");
+        EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
+            << "an empty prefix matches everything and must be rejected";
+    }
+}
+
+TEST(Preprocessor, TfC82PragmaEffectsLoaderRequiresASurface) {
+    // A registry with no `pragmaDirective` AND no `pragmaOperator` is an
+    // incomplete contract: every row would read as configured and never fire —
+    // the knob-that-lies this loader rejects everywhere else.
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (char const* key : {"\"pragmaDirective\":          \"pragma\",",
+                            "\"pragmaOperator\":           \"_Pragma\","}) {
+        auto const pos = text.find(key);
+        ASSERT_NE(pos, std::string::npos) << key;
+        text.erase(pos, std::strlen(key));
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<registry-no-surface>");
+    ASSERT_FALSE(loaded.has_value())
+        << "a pragma registry with NO pragma surface must fail the load — the "
+           "rows could never fire, so declaring them would be a lie";
+    EXPECT_TRUE(hasCode(loaded.error(), DiagnosticCode::C_InvalidPreprocess));
+}
+
 TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
@@ -1100,7 +1310,7 @@ TEST(Preprocessor, DeepNestedMacroArgumentFailsLoudNotSilent) {
 // fails.
 TEST(Preprocessor, HeaderOriginDiagnosticAttributesToHeader) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_linemap_test";
+    auto dir = ppScratchRoot() / "dss_pp_linemap_test";
     fs::create_directories(dir);
     // The header contains a malformed construct (a stray `@` is an illegal
     // char in c-subset) so the parser/lexer emits a diagnostic whose span
@@ -1198,7 +1408,7 @@ TEST(Preprocessor, ShiftOperatorInDefineIsNotMisLexedAsHeader) {
 // registration (or the makeRemap main-origin remap) breaks one of these.
 TEST(Preprocessor, IncludeSpliceDiagnosticsRenderToRealFilesAndLines) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_render_attribution_test";
+    auto dir = ppScratchRoot() / "dss_pp_render_attribution_test";
     fs::create_directories(dir);
     // Header error: a stray `@` (illegal char) on the header's line 1.
     { std::ofstream(dir / "bad.h", std::ios::binary)
@@ -1654,34 +1864,59 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
 // FC15a (`#`/`##` operators -- C 6.10.3.2 stringize, 6.10.3.3 token-paste).
 //
 // A stringize product (`#x` -> `"..."`) is, by GRAMMAR REALITY, the string
-// literal's StringStart + StringLiteral pair (`stringLiteralExpr = StringStart
-// StringLiteral`), NOT a single fabricated token -- so `ppLexemes` yields TWO
-// entries for it: the opening `"` (StringStart) then the body (StringLiteral,
-// whose span excludes the consumed closing `"`). `reconstructStringLiteral`
-// joins them back into the full `"..."` for readable assertions. A paste product
-// (`a##b` -> `ab`) is exactly ONE token (F1) and yields ONE lexeme.
+// literal's token TRIPLE (`stringLiteralExpr = StringStart StringLiteral
+// StringEnd`), NOT a single fabricated token -- so `ppLexemes` yields THREE
+// entries for it: the opening `"` (StringStart), the body (StringLiteral, whose
+// span covers only the bytes BETWEEN the delimiters), and the closing `"`
+// (StringEnd). `reconstructStringLiteral` joins them back into the full `"..."`
+// for readable assertions. A paste product (`a##b` -> `ab`) is exactly ONE token
+// (F1) and yields ONE lexeme.
 // Every assertion is RED-ON-DISABLE: without the `#` handling `#x` emits the
 // literal `#` token (lexs[0]=="#" not "\""); without the `##` handling `a##b`
 // emits three tokens (`a`, `##`, `b`) instead of the single `ab`.
+//
+// ★ RENEGOTIATED -- D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. This block used to say
+// the pair was TWO entries and that the body's span "excludes the CONSUMED
+// closing `\"`". The closer is no longer consumed token-lessly; it is a
+// `StringEnd` token of its own, so every stringize/predefined-macro lexeme count
+// in this file went UP BY ONE PER STRING PRODUCT. The BODY lexeme is byte-for-
+// byte unchanged, which is why no `decodeStringLiteralBody` expectation moved.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Join a StringStart (`"`) + StringLiteral (body, no closing quote) pair from the
-// pp lexemes at index `i` back into the full source-form literal `"...body..."`.
+// Join the StringStart (`"`) + StringLiteral (body) + StringEnd (`"`) TRIPLE
+// starting at pp-lexeme index `i` back into the full source-form literal.
+//
+// ★ D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: this used to be
+//     `lexs[i] + lexs[i + 1] + "\""`
+// -- the trailing quote was a HAND-WRITTEN CONSTANT, because the closer had no
+// token to read it from. That made this helper one more instance of the
+// compensate-at-the-consumer pattern the anchor is about, and it also made the
+// assertions WEAKER than they looked: a corrupted or missing closer could never
+// fail them, since the closing quote came from this line rather than from the
+// token stream. It now READS the closer, so `reconstructStringLiteral` is a real
+// round-trip check on all three tokens.
 [[nodiscard]] std::string reconstructStringLiteral(
     std::vector<std::string> const& lexs, std::size_t i) {
-    if (i + 1 >= lexs.size()) return "<malformed-string-product>";
-    return lexs[i] + lexs[i + 1] + "\"";   // StringStart + body + implied close
+    if (i + 2 >= lexs.size()) return "<malformed-string-product>";
+    return lexs[i] + lexs[i + 1] + lexs[i + 2];   // opener + body + closer
 }
 
 TEST(Preprocessor, FC15aStringizeSimple) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define STR(x) #x\nSTR(hello)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    // The product `"hello"` is StringStart `"` + StringLiteral `hello`.
-    ASSERT_EQ(lexs.size(), 2u) << "expected the string-literal pair: \" hello";
+    // The product `"hello"` is StringStart `"` + StringLiteral `hello` +
+    // StringEnd `"`.
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `"` of the
+    // stringize product is now its own token. The stringize BODY is unchanged --
+    // what the `#` operator produces did not change, only how many tokens the
+    // literal is spelled with.
+    ASSERT_EQ(lexs.size(), 3u)
+        << "expected the string-literal triple: \" hello \"";
     EXPECT_EQ(lexs[0], "\"") << "stringize must produce a string-literal opener "
                                 "(red-on-disable: a literal `#` here)";
     EXPECT_EQ(lexs[1], "hello");
+    EXPECT_EQ(lexs[2], "\"") << "the closing `\"` is a token of its own";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"hello\"");
 }
 
@@ -1691,9 +1926,14 @@ TEST(Preprocessor, FC15aStringizeEscapes) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define STR(x) #x\nSTR(a \"b\\c\")\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the product's closing `"`
+    // is its own token. The ESCAPING under test is untouched -- note the body
+    // expectation below is byte-identical to before, which is the proof that
+    // giving the closer a token did not disturb the escape logic.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(lexs[0], "\"");
-    // Body (StringStart consumed the opening `"`, the close `"` is consumed):
+    // Body (StringStart is the opening `"`, StringEnd the closing one; the body
+    // token covers only what is BETWEEN them):
     //   a <space> \ " b \ \ c \ "   (the escaped inner text).
     EXPECT_EQ(lexs[1], "a \\\"b\\\\c\\\"")
         << "interior `\"` and `\\` of the string arg must be backslash-escaped";
@@ -1710,7 +1950,8 @@ TEST(Preprocessor, FC15aStringizeUsesUnexpandedArg) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define X hello\n#define STR(x) #x\nSTR(X)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + closer.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(lexs[1], "X")
         << "stringize uses the RAW arg `X`, not its expansion `hello`";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"X\"");
@@ -1775,7 +2016,8 @@ TEST(Preprocessor, FC15aStringizeVaArgs) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define S(...) #__VA_ARGS__\nS(a,b)\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 2u);
+    // ★ 2 -> 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + closer.
+    ASSERT_EQ(lexs.size(), 3u);
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a,b\"")
         << "#__VA_ARGS__ stringizes the raw comma-joined trailing args";
 }
@@ -1869,12 +2111,16 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
         r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "the directive `#define` must be consumed, not treated as a stringize";
-    // Output: "a" (StringStart+body)  then  int after ;
-    ASSERT_EQ(lexs.size(), 5u) << "expected: \" a int after ;";
+    // Output: "a" (StringStart + body + StringEnd)  then  int after ;
+    // ★ 5 -> 6 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): ONE extra lexeme, the
+    // stringize product's closing `"`. The trailing `int after ;` shifts by one
+    // index for the same reason -- the non-contamination property under test is
+    // unaffected, only the literal's spelling widened.
+    ASSERT_EQ(lexs.size(), 6u) << "expected: \" a \" int after ;";
     EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a\"");
-    EXPECT_EQ(lexs[2], "int");
-    EXPECT_EQ(lexs[3], "after");
-    EXPECT_EQ(lexs[4], ";");
+    EXPECT_EQ(lexs[3], "int");
+    EXPECT_EQ(lexs[4], "after");
+    EXPECT_EQ(lexs[5], ";");
     // The directive-introducing `#` never leaked a stringize diagnostic.
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize));
 }
@@ -1898,6 +2144,133 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
 // token's OWN span (its physical position is the `#define` line 1) yields `1`;
 // the invocation-offset inheritance (ExpToken::invOffset threaded through the
 // object-like splice) is exactly what makes it `4`.
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C59 `#line` (C23 6.10.4 -- D-CPP-LINE-DIRECTIVE). Sets the PRESUMED line,
+// and optionally the presumed file, for the lines that FOLLOW. Config-driven
+// (`lineDirective`), so an empty field leaves `#line` to the generic
+// unsupported-directive fail-loud. Every assertion below is RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// THE off-by-one that a naive implementation gets wrong: `#line N` numbers the
+// line FOLLOWING the directive N -- not the directive's own line.
+// RED-ON-DISABLE: dropping the `-1` in `N + physLine - dirLine - 1` yields 101.
+TEST(Preprocessor, Tf59LineDirectiveRenumbersFollowingLine) {
+    PreprocessResult r;
+    //                    line: 1          2
+    auto lexs = ppLexemes("#line 100\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "#line 100 must number the FOLLOWING line 100 (not 101, and not the "
+           "directive's own physical line)";
+}
+
+// Numbering ADVANCES from the directive: two lines later is N+1.
+// RED-ON-DISABLE: a fix that pins every following line to N gives 100 twice.
+TEST(Preprocessor, Tf59LineDirectiveNumberingAdvances) {
+    PreprocessResult r;
+    //                    line: 1          2               3
+    auto lexs = ppLexemes("#line 100\nint a = __LINE__;\nint b = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 10u) << "expected: int a = 100 ; int b = 101 ;";
+    EXPECT_EQ(lexs[3], "100");
+    EXPECT_EQ(lexs[8], "101") << "numbering must ADVANCE from the directive";
+}
+
+// C23 6.10.4p3: the file operand is OPTIONAL, and when OMITTED the presumed NAME
+// is left UNCHANGED. So a bare `#line N` AFTER a `#line M "f"` must keep "f".
+// RED-ON-DISABLE: resetting the name on a bare directive reverts __FILE__ to the
+// real buffer name -- the single subtlest rule in the directive.
+TEST(Preprocessor, Tf59LineDirectiveOmittedFileLeavesPresumedNameUnchanged) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#line 10 \"virtual.c\"\n#line 900\n"
+                          "const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool sawVirtual = false;
+    for (auto const& s : lexs) {
+        if (s.find("virtual.c") != std::string::npos) sawVirtual = true;
+    }
+    EXPECT_TRUE(sawVirtual)
+        << "a BARE `#line 900` must NOT revert the presumed file name set by the "
+           "earlier `#line 10 \"virtual.c\"` (C23 6.10.4p3)";
+}
+
+// A `#line` inside an ELIDED conditional branch is skipped with NO diagnostic and
+// NO renumbering -- the #define/#include/#pragma/#embed dead-branch parity.
+// RED-ON-DISABLE: dispatching before the `stackActive()` gate renumbers to 500.
+TEST(Preprocessor, Tf59LineDirectiveInDeadBranchIsInert) {
+    PreprocessResult r;
+    //                    line: 1      2           3       4
+    auto lexs = ppLexemes("#if 0\n#line 500\n#endif\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a `#line` in a dead branch must not diagnose";
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "4")
+        << "a dead-branch `#line` must NOT renumber -- the real line 4 stands";
+}
+
+// Fail loud, never silently mis-number: a non-digit operand is rejected. This is
+// also the current behaviour for the macro-expanded form (6.10.4p4), pinned by
+// D-CPP-LINE-DIRECTIVE-MACRO-OPERAND -- a wrong line number would be exactly the
+// silent-wrongness the bar forbids.
+TEST(Preprocessor, Tf59LineDirectiveNonDigitOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line abc\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "a non-digit `#line` operand must FAIL LOUD, never silently renumber";
+}
+
+// A missing operand is a constraint violation, not a no-op.
+TEST(Preprocessor, Tf59LineDirectiveMissingOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#line` with no operand must FAIL LOUD";
+}
+
+// C23 6.10.4p2: the digit sequence is constrained to 1..2147483647 — the range is
+// TWO-sided. `#line 0` was silently accepted (making __LINE__ 0) until the
+// code-audit caught the one-sided check. RED-ON-DISABLE: drop the `n == 0` arm.
+TEST(Preprocessor, Tf59LineDirectiveZeroFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line 0\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#line 0` is out of the 1..2147483647 range (C23 6.10.4p2)";
+}
+
+// Trailing junk after the file operand must be rejected, matching handleEmbed.
+// Silently ignoring it would half-honour an unsupported form.
+// RED-ON-DISABLE: drop the trailing-token arm.
+TEST(Preprocessor, Tf59LineDirectiveTrailingJunkFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line 5 \"f.c\" garbage\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "tokens after the #line file operand must FAIL LOUD";
+}
+
+// A directive may span several PHYSICAL lines via a `\` continuation. `#line N`
+// renumbers the line after the directive ENDS, so keying the record on the
+// directive's FIRST token made this silently off-by-one (audit finding 1:
+// DSS gave 101, gcc gives 100).
+// RED-ON-DISABLE: resolve from `dirTok` instead of the line's last token.
+TEST(Preprocessor, Tf59LineDirectiveSpanningContinuationIsNotOffByOne) {
+    PreprocessResult r;
+    //                    line: 1        2      3
+    auto lexs = ppLexemes("#line \\\n100\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "a `\\`-continued #line renumbers the line after the directive ENDS "
+           "(gcc gives 100); keying on the directive's first token gives 101";
+}
+
+// The design's HEADLINE property, which nothing pinned until the code-audit said
+// so: records are keyed PER ORIGIN BUFFER, so a `#line` inside an #include'd
+// header renumbers only THAT header — the includer's own numbering is untouched.
+// RED-ON-DISABLE: replace the per-origin map with one global vector and the
+// includer's __LINE__ after the #include wrongly follows the header's directive.
+// (moved below — it needs the `fs` alias + `ppText`, declared later in this file)
+
 TEST(Preprocessor, FC15bLineInMacroResolvesToInvocationLine) {
     PreprocessResult r;
     //              line: 1                    2        3        4
@@ -2018,13 +2391,19 @@ TEST(Preprocessor, FC15bStdcVersionInIfExpression) {
 // The `file` kind (C 6.10.8.1): `__FILE__` materializes the current source file
 // name as a C string literal. The buffer is named "main.c" by ppLexemes, so the
 // product decodes to "main.c". A string-literal product is a StringStart +
-// StringLiteral pair (like a stringize product), so we reconstruct it.
+// StringLiteral + StringEnd triple (like a stringize product), so we
+// reconstruct it.
 TEST(Preprocessor, FC15bFileResolvesToSourceName) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* f = __FILE__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    // const char * f = " main.c ;   -> the string product is lexs[5]+lexs[6].
-    ASSERT_EQ(lexs.size(), 8u) << "const char * f = <str-start> <str-body> ;";
+    // const char * f = " main.c " ;  -> the string product is lexs[5..7].
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the materialized literal
+    // now carries its closing `"` as a token. `__FILE__`'s VALUE is unchanged --
+    // the reconstruction below still reads "main.c", which is what this test is
+    // actually about.
+    ASSERT_EQ(lexs.size(), 9u)
+        << "const char * f = <str-start> <str-body> <str-end> ;";
     EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
         << "__FILE__ materializes the source file name as a string literal";
 }
@@ -2037,7 +2416,7 @@ TEST(Preprocessor, FC15bFileResolvesToSourceName) {
 // buffer name (ignoring the line-map origin) yields "main.c" inside the header.
 TEST(Preprocessor, FC15bFileInIncludedHeaderReportsHeaderName) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_pp_file_macro_test";
+    auto dir = ppScratchRoot() / "dss_pp_file_macro_test";
     fs::create_directories(dir);
     // The header USES __FILE__ -- so the product must carry the HEADER's name.
     { std::ofstream(dir / "hdr.h", std::ios::binary)
@@ -2094,8 +2473,14 @@ TEST(Preprocessor, FC15bDateShapeOnly) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* d = __DATE__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `"` is a
+    // token. The BODY index (6) and the 11-char shape below are UNCHANGED --
+    // the closer was split off the body, not folded into it, so the decoded
+    // `"Mmm dd yyyy"` is still exactly 11 chars. If it ever reads 12, the
+    // delimiter leaked into the body.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(lexs[5], "\"") << "__DATE__ is a string-literal product";
+    EXPECT_EQ(lexs[7], "\"") << "...terminated by its own closer token";
     auto decoded = decodeStringLiteralBody(lexs[6]);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), 11u)
@@ -2112,8 +2497,11 @@ TEST(Preprocessor, FC15bTimeShapeOnly) {
     PreprocessResult r;
     auto lexs = ppLexemes("const char* t = __TIME__;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), as for __DATE__. The
+    // 8-char decoded shape is unchanged; a 9 would mean the closer leaked in.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(lexs[5], "\"") << "__TIME__ is a string-literal product";
+    EXPECT_EQ(lexs[7], "\"") << "...terminated by its own closer token";
     auto decoded = decodeStringLiteralBody(lexs[6]);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), 8u)
@@ -2147,7 +2535,9 @@ TEST(Preprocessor, FC15bUndefOfPredefinedFailsLoud) {
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
         << "#undef of a predefined macro name must fail loud";
     // __FILE__ still materializes (the #undef was rejected, not applied).
-    ASSERT_EQ(lexs.size(), 8u);
+    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the materialized literal
+    // carries its closer token. The fail-loud property under test is unaffected.
+    ASSERT_EQ(lexs.size(), 9u);
     EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
         << "the rejected #undef must NOT remove the predefined macro";
 }
@@ -2231,16 +2621,31 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // 11 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
     // D-CSUBSET-BITINT — C23 6.2.5, the mandatory bit-precise max width 8388608 + the
     // FC17.9(h) C23 `#embed` trichotomy macros `__STDC_EMBED_NOT_FOUND__`/`_FOUND__`/
-    // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 10 pe-gated = 21: the pe-gated set is the c95
+    // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 11 pe-gated = 22: the pe-gated set is the c95
     // Windows selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
-    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec). NO macho-gated
-    // macros remain: `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho
-    // trampolines — <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
+    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec) + the legacy
+    // single-underscore `_declspec` alias (B1, D-SQLITE-PE64-TESTFIXTURE-FRONTEND) + 2
+    // macho-gated (the Darwin platform-selection pair pinned as an EXACT SET below)
+    // = 24. `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho trampolines —
+    // <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
     // `__STDC_NO_VLA__` (a VLA-supporting impl must not define it).
-    EXPECT_EQ(pms.size(), 21u)
-        << "c-subset declares 11 un-gated + 10 pe-gated predefined macros (no macho-gated)";
+    //
+    // TF-C74 SCOPE NOTE: the per-ARCHITECTURE identity macros (`__aarch64__`,
+    // `__x86_64__`, …) are deliberately ABSENT from this list — they live on the
+    // TARGET config, not the language, and are merged in at preprocess time. That
+    // is why this count did not move in TF-C74. The effective language ⊕ target
+    // sets are pinned by `TFC74EffectiveArchPredefinesForShippedTargets`.
+    //
+    // TF-C83: +6 rows — the identities DSS
+    // presents. 5 un-gated (`__DSSCP__` the honest one, plus the dialect claim
+    // `__GNUC__`/`__GNUC_MINOR__`/`__GNUC_PATCHLEVEL__` and `__clang__`) and 1
+    // macho-gated (`__APPLE_CC__`). 11+5=16 un-gated, 11 pe-gated, 2+1=3
+    // macho-gated = 30.
+    EXPECT_EQ(pms.size(), 30u)
+        << "c-subset declares 16 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
+    std::vector<std::string> machoGatedNames;
     for (auto const& pm : pms) {
         if (pm.availableObjectFormats.empty()) {
             ++ungated;
@@ -2249,19 +2654,43 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be gated to exactly one format";
             EXPECT_NE(pm.name, "__STDC_NO_THREADS__")
                 << "__STDC_NO_THREADS__ must be REMOVED (threads.h complete on all legs)";
-            ++peGated;
-            EXPECT_EQ(pm.availableObjectFormats.front(), "pe")
-                << pm.name << " should be pe-gated (Windows selection) — no macho-gated macro remains";
+            auto const& fmt = pm.availableObjectFormats.front();
+            if (fmt == "macho") {
+                machoGatedNames.push_back(pm.name);
+            } else {
+                ++peGated;
+                EXPECT_EQ(fmt, "pe")
+                    << pm.name << " should be pe-gated (Windows selection) or macho-gated "
+                                  "(Darwin selection) — no other format gate is declared";
+            }
         }
     }
-    EXPECT_EQ(ungated, 11u)
+    // Darwin platform-selection macros (first macOS sqlite-corpus run, 2026-07-27,
+    // D-CSUBSET-DARWIN-PLATFORM-MACROS). EXACT SET, not a count: every portable C
+    // program branches on `__APPLE__`, and without it DSS silently compiled the
+    // `#else` (Linux) arm of sqlite's `src/test1.c` CPU-count code on a Darwin
+    // target — reaching `sysconf(_SC_NPROCESSORS_ONLN)` instead of the `sysctl`
+    // arm real Apple toolchains take. Mirrors the c95 `_WIN32`-for-pe precedent.
+    std::sort(machoGatedNames.begin(), machoGatedNames.end());
+    EXPECT_EQ(machoGatedNames,
+              (std::vector<std::string>{"__APPLE_CC__", "__APPLE__", "__MACH__"}))
+        << "macho targets must predefine exactly __APPLE__, __MACH__ and (TF-C83) "
+           "__APPLE_CC__ — the platform-selection macros clang/gcc define on Darwin; "
+           "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
+           "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
+           "TargetConditionals.h:342 conjunction that gates the whole Darwin ladder";
+    EXPECT_EQ(ungated, 16u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
-           "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) are un-gated (every "
-           "format); __STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
+           "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
+           "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
+           "__GNUC_PATCHLEVEL__, __clang__) are un-gated (every format); "
+           "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
-    EXPECT_EQ(peGated, 10u)
+    EXPECT_EQ(peGated, 11u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
-           "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";
+           "_MSC_VER/__int64/__forceinline/__declspec (c105) + _declspec (the legacy "
+           "single-underscore MSVC alias; tcl.h's TCL_NORETURN under the pe profile, "
+           "D-SQLITE-PE64-TESTFIXTURE-FRONTEND B1) are pe-gated";
 }
 
 // LOADER fail-loud (c95): a `predefinedMacros.availableObjectFormats` naming an
@@ -2286,6 +2715,215 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
     auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
     EXPECT_FALSE(loaded.has_value())
         << "an unknown availableObjectFormats name ('pee') must be a load error";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C83 — the six rows that make DSS present a
+// coherent identity to Apple SDK headers, and the `version` predefine kind that
+// derives `__DSSCP__` from the repo-root VERSION file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The VALUES, as an exact SET, every one MEASURED against
+// `/usr/bin/clang -dM -E -x c /dev/null` (2026-07-29):
+//   __GNUC__ 4 / __GNUC_MINOR__ 2 / __GNUC_PATCHLEVEL__ 1 / __APPLE_CC__ 6000 /
+//   __clang__ 1.
+// `__DSSCP__` is the one row with no clang counterpart — it is DSS's own
+// identity, packed from VERSION (0.0.2 -> 0*1000000 + 0*1000 + 2 == 2).
+//
+// WHY VALUES AND NOT JUST PRESENCE: `__GNUC__` alone would satisfy a
+// presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
+// 4002001 that sqliteInt.h:112 computes.
+TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    std::map<std::string, std::string> got;
+    for (auto const& pm : (*c)->preprocess().predefinedMacros) {
+        if (pm.name == "__GNUC__" || pm.name == "__GNUC_MINOR__"
+            || pm.name == "__GNUC_PATCHLEVEL__" || pm.name == "__APPLE_CC__"
+            || pm.name == "__clang__" || pm.name == "__DSSCP__") {
+            got[pm.name] = pm.value;
+        }
+    }
+    const std::map<std::string, std::string> want{
+        {"__APPLE_CC__", "6000"},     {"__DSSCP__", "2"},
+        {"__GNUC_MINOR__", "2"},      {"__GNUC_PATCHLEVEL__", "1"},
+        {"__GNUC__", "4"},            {"__clang__", "1"},
+    };
+    EXPECT_EQ(got, want)
+        << "the TF-C83 identity predefines must carry their clang-MEASURED "
+           "values; __DSSCP__ must be VERSION (0.0.2) packed to 2";
+    // The GCC_VERSION arithmetic sqliteInt.h:112 actually performs.
+    EXPECT_EQ(std::stoll(got.at("__GNUC__")) * 1000000
+                  + std::stoll(got.at("__GNUC_MINOR__")) * 1000
+                  + std::stoll(got.at("__GNUC_PATCHLEVEL__")),
+              4002001)
+        << "GCC_VERSION must evaluate to 4002001 — shipping __GNUC__ without "
+           "its two components would yield 4000000 and misreport the dialect";
+}
+
+// `__DSSCP__` FOLLOWS the VERSION file rather than restating a literal. The
+// packing is exercised directly with arbitrary version strings — the loader
+// calls this same function with the build's own version, so a green run here
+// plus the value pin above is the full chain.
+//
+// ORDERING is the property the encoding exists for: 0.0.2 < 0.1.0 < 1.0.0 must
+// hold as INTEGER comparison so `#if __DSSCP__ >= ...` behaves as anyone reading
+// it expects.
+TEST(Preprocessor, TFC83VersionPackingIsOrderPreserving) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    auto pack = [&](std::string_view v) {
+        auto r = dss::packVersionComponents(v, w);
+        EXPECT_TRUE(r.has_value()) << v << ": " << (r ? "" : r.error());
+        return r.value_or(-1);
+    };
+    EXPECT_EQ(pack("0.0.2"), 2);
+    EXPECT_EQ(pack("0.1.0"), 1000);
+    EXPECT_EQ(pack("1.0.0"), 1000000);
+    EXPECT_EQ(pack("4.2.1"), 4002001);   // the GCC_VERSION shape, same encoding
+    EXPECT_LT(pack("0.0.2"), pack("0.1.0"));
+    EXPECT_LT(pack("0.1.0"), pack("1.0.0"));
+    EXPECT_LT(pack("0.0.999"), pack("0.1.0"));
+
+    // RED-ON-DISABLE for the value pin above: a DIFFERENT VERSION produces a
+    // DIFFERENT macro body. If `__DSSCP__` were a hard-coded "2" this would be
+    // the assertion that could not hold.
+    EXPECT_NE(pack("0.0.3"), pack("0.0.2"));
+}
+
+// ★ THE BOUND IS DERIVED FROM THE WEIGHTS, NOT HARD-CODED — and it FAILS LOUD.
+// Under [1000000,1000,1] a component of 1000 carries into the next field:
+// 0.0.1000 would pack to 1000, byte-identical to 0.1.0, and every `#if
+// __DSSCP__ >= ...` downstream would silently compare wrongly. That is the
+// wrong-value-with-no-diagnostic class this arc keeps closing, so it is an
+// ERROR naming the offending component — never a wraparound.
+TEST(Preprocessor, TFC83VersionPackingBoundFailsLoud) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    auto bad = dss::packVersionComponents("0.0.1000", w);
+    ASSERT_FALSE(bad.has_value())
+        << "0.0.1000 must be REFUSED — it packs to 1000, identical to 0.1.0";
+    EXPECT_NE(bad.error().find("component #2"), std::string::npos)
+        << "the diagnostic must name the offending component: " << bad.error();
+    EXPECT_NE(bad.error().find("1000"), std::string::npos) << bad.error();
+    // The collision the bound prevents, stated as the fact it is.
+    auto collide = dss::packVersionComponents("0.1.0", w);
+    ASSERT_TRUE(collide.has_value());
+    EXPECT_EQ(*collide, 1000);
+
+    EXPECT_FALSE(dss::packVersionComponents("1.2000.0", w).has_value())
+        << "a middle component at its bound must be refused too";
+    // The MOST-significant component has no field above it -> unbounded.
+    EXPECT_TRUE(dss::packVersionComponents("9999.0.0", w).has_value())
+        << "the leading component has no more-significant neighbour to collide "
+           "with and must NOT be bounded";
+
+    // A DIFFERENT declared encoding gets its own correct bound for free —
+    // proving 1000 is nowhere in the engine.
+    const std::vector<long long> w2{10000, 100, 1};
+    EXPECT_FALSE(dss::packVersionComponents("0.0.100", w2).has_value())
+        << "under [10000,100,1] the bound is 100, derived from the weights";
+    EXPECT_TRUE(dss::packVersionComponents("0.0.99", w2).has_value());
+}
+
+// Shape mismatches and malformed version text are load errors, not guesses.
+TEST(Preprocessor, TFC83VersionPackingRejectsMalformed) {
+    const std::vector<long long> w{1000000, 1000, 1};
+    for (auto const* v : {"0.0", "0.0.2.1", "", "0..2", "0.0.x", "1.0.2a"}) {
+        EXPECT_FALSE(dss::packVersionComponents(v, w).has_value())
+            << "'" << v << "' must be refused, never silently coerced";
+    }
+    auto countErr = dss::packVersionComponents("0.0", w);
+    ASSERT_FALSE(countErr.has_value());
+    EXPECT_NE(countErr.error().find("component"), std::string::npos)
+        << countErr.error();
+}
+
+// LOADER fail-loud for the `version` kind. RED-ON-DISABLE: each corruption must
+// make the load FAIL — a tolerated one would ship a macro whose declared
+// encoding never ran.
+TEST(Preprocessor, TFC83VersionKindLoadFailures) {
+    // Match only the FIELDS of the version row (the row also carries a
+    // `$comment`, so the whole-object spelling is not stable to match on).
+    const std::string good =
+        "\"name\": \"__DSSCP__\",           \"kind\": \"version\",  "
+        "\"componentWeights\": [1000000, 1000, 1]";
+    struct Case { const char* what; std::string to; };
+    const std::vector<Case> cases{
+        {"componentWeights missing",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\""},
+        {"weights ascending (non-injective packing)",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1, 1000, 1000000]"},
+        {"last weight not 1",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1000000, 1000, 10]"},
+        {"weight count != version component count",
+         "\"name\": \"__DSSCP__\", \"kind\": \"version\", "
+         "\"componentWeights\": [1000, 1]"},
+        {"componentWeights on a non-version kind",
+         "\"name\": \"__DSSCP__\", \"kind\": \"constant\", \"value\": \"2\", "
+         "\"componentWeights\": [1000000, 1000, 1]"},
+        {"unknown kind stays loud",
+         "\"name\": \"__DSSCP__\", \"kind\": \"vershion\", "
+         "\"componentWeights\": [1000000, 1000, 1]"},
+    };
+    for (auto const& c : cases) {
+        std::string text = loadShippedCSubsetText();
+        ASSERT_FALSE(text.empty());
+        auto const pos = text.find(good);
+        ASSERT_NE(pos, std::string::npos)
+            << "the __DSSCP__ version entry must be present verbatim";
+        text.replace(pos, good.size(), c.to);
+        auto loaded = GrammarSchema::loadFromText(text, "<tfc83-version>");
+        EXPECT_FALSE(loaded.has_value()) << "must be a load error: " << c.what;
+    }
+    // Control: the UNMODIFIED text still loads, so the cases above fail for the
+    // reason claimed and not because the fixture text is stale.
+    auto ok = GrammarSchema::loadFromText(loadShippedCSubsetText(),
+                                          "<tfc83-version-control>");
+    EXPECT_TRUE(ok.has_value()) << "the shipped c-subset text must still load";
+}
+
+// AGNOSTICISM: not one of these macro spellings may appear in engine C++. The
+// engine knows the KIND verbs (`version`, `constant`, …) and the config key
+// (`componentWeights`); it must never know that `__DSSCP__` or `__GNUC__`
+// exist. Guarded here rather than by review because this is exactly the rule a
+// well-meaning "just special-case it" patch breaks.
+TEST(Preprocessor, TFC83IdentityMacroNamesAreNotInEngineCpp) {
+    namespace fs = std::filesystem;
+    auto root = fs::path{__FILE__}.parent_path().parent_path().parent_path()
+                    .parent_path() / "src";
+    ASSERT_TRUE(fs::is_directory(root)) << root.string();
+    const std::vector<std::string> banned{"__DSSCP__", "__GNUC__", "__clang__",
+                                          "__APPLE_CC__"};
+    std::vector<std::string> hits;
+    for (auto const& e : fs::recursive_directory_iterator(root)) {
+        if (!e.is_regular_file()) continue;
+        auto const p = e.path();
+        // Only ENGINE sources. `src/dss-config/` is config — the macro names
+        // are supposed to live there, that is the entire point.
+        if (p.extension() != ".cpp" && p.extension() != ".hpp") continue;
+        if (p.string().find("dss-config") != std::string::npos) continue;
+        std::ifstream in(p);
+        std::string   line;
+        int           n = 0;
+        while (std::getline(in, line)) {
+            ++n;
+            for (auto const& b : banned) {
+                if (line.find(b) != std::string::npos) {
+                    hits.push_back(p.filename().string() + ":"
+                                   + std::to_string(n) + " " + b);
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(hits.empty())
+        << "identity macro spellings must live ONLY in config, never in engine "
+           "C++; found: "
+        << [&] {
+               std::string s;
+               for (auto const& h : hits) s += "\n  " + h;
+               return s;
+           }();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2321,37 +2959,631 @@ namespace {
 }
 } // namespace
 
-// `#pragma` is consumed-and-DROPPED with NO error (C 6.10.6p2). The line carries
-// a GCC-style payload; only `int v = 1 ;` survives. RED-ON-DISABLE: without the
-// `#pragma`-consume arm the directive hits the generic unsupported-directive
-// fail-loud (P_PreprocessorUnsupported).
-TEST(Preprocessor, FC15cPragmaConsumedAndDropped) {
-    PreprocessResult r;
-    auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
-    EXPECT_FALSE(r.diagnostics->hasErrors())
-        << "a `#pragma` line must be silently consumed (C 6.10.6p2)";
-    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
-        << "a `#pragma` must NOT trip the unsupported-directive fail-loud";
-    ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives the dropped pragma";
-    EXPECT_EQ(lexs[0], "int");
-    EXPECT_EQ(lexs[1], "v");
-    EXPECT_EQ(lexs[2], "=");
-    EXPECT_EQ(lexs[3], "1");
-    EXPECT_EQ(lexs[4], ";");
+// ★★ TF-C82 (D-PP-PRAGMA-REGISTRY) — REWRITTEN, not deleted. THIS TEST USED TO
+// PIN THE BUG. As `FC15cPragmaConsumedAndDropped` it asserted
+// `EXPECT_FALSE(r.diagnostics->hasErrors())` for `#pragma GCC optimize("O2")`
+// and called that correct, citing C 6.10.6p2. The citation was right and the
+// conclusion was wrong: 6.10.6p2 licenses IGNORING a pragma, and DSS was not
+// ignoring pragmas, it was ignoring the QUESTION — the same silence covered
+// `GCC optimize` (harmless here) and `pack(4)` (MEASURED: it makes
+// `sys/fcntl.h`'s `struct log2phys` 20 bytes where DSS computed 24, on a live
+// `fcntl(F_LOG2PHYS)` path). What is pinned now is the DISTINCTION: a pragma the
+// registry CLAIMS is ignored silently, and one it does not is LOUD.
+//
+// The token assertions are unchanged and still load-bearing in both arms: a
+// pragma line is never program text, whatever the verdict on its meaning.
+TEST(Preprocessor, TfC82RegisteredInertPragmaIsSilentUnknownIsLoud) {
+    // (A) REGISTERED as `diagnosticsOnly` -> ignored, and ignored because a ROW
+    // SAYS SO. `clang diagnostic` is the MEASURED most-reached pragma in the
+    // sqlite corpus (48 occurrences across 12 TUs).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma clang diagnostic push\nint v=1;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "a pragma whose `pragmaEffects` row is `diagnosticsOnly` is "
+               "ignored with NO diagnostic — the row is the justification";
+        ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives";
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[1], "v");
+        EXPECT_EQ(lexs[2], "=");
+        EXPECT_EQ(lexs[3], "1");
+        EXPECT_EQ(lexs[4], ";");
+    }
+    // (B) UNREGISTERED -> LOUD. This is the exact input the old test asserted
+    // was silent. `GCC optimize` matches no row, and DSS cannot know whether
+    // ignoring it is safe, so it says so instead of assuming.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an unregistered pragma must be LOUD under "
+               "`unknownPragmaIsError` — the whole thesis of this cycle";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "it is a RECOGNIZED directive with an unrecognized payload, not "
+               "an unsupported directive — the code must distinguish them";
+        ASSERT_EQ(lexs.size(), 5u)
+            << "the line is still not program text: a REFUSED pragma emits no "
+               "tokens either (a leaked payload would cascade into a parse error "
+               "that hides this accurate one)";
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[4], ";");
+    }
+    // (C) `unsupported` -> LOUD, and for a DIFFERENT reason than (B): the row
+    // exists and states that the pragma has real translation semantics DSS has
+    // not built. Both are `P_PreprocessorPragma`; what differs is that this one
+    // is a considered answer.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma STDC FP_CONTRACT OFF\nint v=1;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an `unsupported` row must fail loud, not be silently ignored";
+        ASSERT_EQ(lexs.size(), 5u);
+    }
 }
 
-// A `#pragma` inside a DEAD branch is silent too (the arm is past the
-// stackActive gate). `#if 0 ... #pragma ... #endif` -> no diagnostic, nothing
-// emitted from the dead group.
-TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+// ★ TF-C82: the OPT-OUT, and the red-on-disable for the loudness itself.
+// `unknownPragmaIsError: false` restores the pre-TF-C82 silent drop EXACTLY —
+// so the loud posture is a declared choice a language makes, not a behavior
+// baked into the engine. Without this pin, "loud" and "hard-coded" would be
+// indistinguishable from the outside.
+TEST(Preprocessor, TfC82UnknownPragmaIsErrorFalseRestoresSilence) {
+    auto schema = reboundCSubset("\"unknownPragmaIsError\":     true,",
+                                 "\"unknownPragmaIsError\":     false,",
+                                 "<silent-pragma-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_FALSE(schema->preprocess().unknownPragmaIsError)
+        << "the rebound schema must declare the silent posture";
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "with `unknownPragmaIsError` false an unregistered pragma is ignored "
+           "in silence — C 6.10.6p2's licence, taken deliberately rather than by "
+           "omission";
+}
+
+// ★★ TF-C82 — `#pragma pack` REALLY APPLIES, and the assertion is the NUMBER.
+// `pack` is the one registry row with a layout sink, so the pin is not "it
+// compiled": it reads the cap the preprocessor recorded for the tokens inside
+// the region, which is the value the semantic tier feeds to the interner.
+// MEASURED against clang for the same source: cap 4 inside, none outside.
+TEST(Preprocessor, TfC82PragmaPackStampsTheTokensInsideTheRegion) {
     PreprocessResult r;
-    auto lexs =
-        ppLexemes("#if 0\n#pragma whatever here\nint dead;\n#endif\nint x;\n", r);
-    EXPECT_FALSE(r.diagnostics->hasErrors());
-    ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives";
-    EXPECT_EQ(lexs[0], "int");
-    EXPECT_EQ(lexs[1], "x");
-    EXPECT_EQ(lexs[2], ";");
+    auto lexs = ppLexemes("#pragma pack(4)\nint inside;\n"
+                          "#pragma pack()\nint outside;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a well-formed `#pragma pack` is honored, not diagnosed";
+    ASSERT_EQ(lexs.size(), 6u) << "`int inside ; int outside ;` survives";
+
+    // Find the two identifier tokens and read their recorded caps.
+    std::optional<std::uint32_t> insideCap, outsideCap;
+    for (Token const& t : r.tokens) {
+        std::string_view const tx = r.synthBuffer->slice(t.span);
+        auto const  key = static_cast<std::uint32_t>(t.span.start());
+        auto const  it  = r.pragmaPackByOffset.find(key);
+        std::uint32_t const cap =
+            it == r.pragmaPackByOffset.end() ? 0u : it->second;
+        if (tx == "inside")  insideCap  = cap;
+        if (tx == "outside") outsideCap = cap;
+    }
+    ASSERT_TRUE(insideCap.has_value());
+    ASSERT_TRUE(outsideCap.has_value());
+    EXPECT_EQ(*insideCap, 4u)
+        << "a token inside the `pack(4)` region carries the cap 4 — the value "
+           "that makes `struct log2phys` 20 bytes instead of 24";
+    EXPECT_EQ(*outsideCap, 0u)
+        << "`pack()` RESETS to no cap (the depth-less idiom the SDK uses 14 "
+           "times); a token after it must carry no cap at all, or every struct "
+           "in the rest of the file is silently relaid out";
+}
+
+// ★★ TF-C82 — THE HALFWAY-STATE DISCRIMINATOR. `_Pragma` inside a macro
+// REPLACEMENT LIST must resolve at EXPANSION time, not at the directive scan.
+// Route `_Pragma` at the directive scan only and the file-scope case below stays
+// GREEN while this one silently does nothing — a green-looking half-feature. It
+// is the `sys/queue.h` shape (`__NULLABILITY_COMPLETENESS_PUSH`, expanded at 40
+// use sites) and MEASURED it is how 24 of the corpus's reached pragmas arrive.
+TEST(Preprocessor, TfC82PragmaOperatorResolvesAtExpansionNotAtDirectiveScan) {
+    // (A) FILE SCOPE — the easy half. Both routings pass this one.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("_Pragma(\"pack(4)\")\nint a;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u) << "`int a ;` — the operator emits nothing";
+        bool sawCap = false;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != "a") continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            sawCap = it != r.pragmaPackByOffset.end() && it->second == 4u;
+        }
+        EXPECT_TRUE(sawCap) << "a file-scope `_Pragma(\"pack(4)\")` applies";
+    }
+    // (B) FROM A MACRO REPLACEMENT LIST — the half that discriminates.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define PACK4 _Pragma(\"pack(4)\")\n"
+                              "PACK4\nint b;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u)
+            << "`int b ;` — the expanded `_Pragma` must leave no tokens behind";
+        bool sawCap = false;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != "b") continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            sawCap = it != r.pragmaPackByOffset.end() && it->second == 4u;
+        }
+        EXPECT_TRUE(sawCap)
+            << "a `_Pragma` reached through a macro must take effect at its "
+               "EXPANSION site — this is the assertion a directive-scan-only "
+               "routing fails while (A) above still passes";
+    }
+}
+
+// ★ TF-C82 — ONE REGISTRY, TWO SPELLINGS. `_Pragma("pack(4)")` must produce the
+// IDENTICAL state as `#pragma pack(4)`. Give the operator its own table and the
+// two drift; the pin compares them directly rather than checking each in
+// isolation.
+TEST(Preprocessor, TfC82PragmaOperatorAndDirectiveAgree) {
+    auto capOf = [](char const* src, char const* name) -> std::uint32_t {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        EXPECT_TRUE(r.diagnostics->all().empty()) << src;
+        for (Token const& t : r.tokens) {
+            if (r.synthBuffer->slice(t.span) != name) continue;
+            auto const it = r.pragmaPackByOffset.find(
+                static_cast<std::uint32_t>(t.span.start()));
+            return it == r.pragmaPackByOffset.end() ? 0u : it->second;
+        }
+        return 0xFFFFFFFFu;   // name not found — a broken fixture, never a pass
+    };
+    std::uint32_t const viaDirective = capOf("#pragma pack(4)\nint z;\n", "z");
+    std::uint32_t const viaOperator  = capOf("_Pragma(\"pack(4)\")\nint z;\n", "z");
+    EXPECT_EQ(viaDirective, 4u);
+    EXPECT_EQ(viaOperator, viaDirective)
+        << "the two spellings are one feature routed through one registry; a "
+           "divergence here means `_Pragma` grew a table of its own";
+}
+
+// ★ TF-C82 — C 6.10.9p1 DE-STRINGIZE: `\"` -> `"` and `\\` -> `\`. The escape
+// pass is exactly those two replacements, NOT the general string decoder (which
+// would turn a `\n` a pragma legitimately contains into a newline byte).
+// `sys/queue.h:225` needs this.
+TEST(Preprocessor, TfC82PragmaOperatorDestringizesPerC6109) {
+    PreprocessResult r;
+    // The operand de-stringizes to: clang diagnostic ignored "-Wfoo"
+    auto lexs = ppLexemes(
+        "_Pragma(\"clang diagnostic ignored \\\"-Wfoo\\\"\")\nint q;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "after de-stringizing, the pragma matches the `clang diagnostic` row "
+           "and is inert; a failure here means the `\\\"` escapes were not "
+           "collapsed and the leading words did not match";
+    ASSERT_EQ(lexs.size(), 3u) << "`int q ;`";
+}
+
+// ★ TF-C82 — AGNOSTICISM. `toy.lang.json` declares no `pragmaOperator`, so
+// `_Pragma` there is an ORDINARY IDENTIFIER and survives into the token stream.
+// The rebind proves the engine reads the CONFIG word rather than knowing the
+// spelling `_Pragma`.
+TEST(Preprocessor, TfC82PragmaOperatorIsConfigDrivenOrdinaryIdentifierWhenAbsent) {
+    auto schema = reboundCSubset("\"pragmaOperator\":           \"_Pragma\",",
+                                 "",
+                                 "<no-pragma-operator-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaOperator.empty())
+        << "the rebound schema must declare no pragma operator";
+    auto buf = SourceBuffer::fromString(
+        std::string{"int _Pragma;\n"}, "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "with no `pragmaOperator` declared, `_Pragma` is just an identifier";
+    std::size_t seen = 0;
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) == "_Pragma") ++seen;
+    }
+    EXPECT_EQ(seen, 1u)
+        << "the identifier must reach the parser untouched — the identity-pass "
+           "property for a language that declares no pragma operator";
+}
+
+// ★ TF-C82 — the `pack` operand forms that were MEASURED reachable, and the ones
+// that were not. Building a form nothing uses is how a wrong guess ships; the
+// unbuilt forms fail LOUD rather than silently doing nothing.
+TEST(Preprocessor, TfC82PragmaPackFormsBuiltAndRefused) {
+    struct Row { char const* src; bool loud; char const* why; };
+    Row const rows[] = {
+        {"#pragma pack(4)\nint x;\n",        false, "pack(N) — MEASURED 14x"},
+        {"#pragma pack()\nint x;\n",         false, "pack() reset — MEASURED 14x"},
+        {"#pragma pack(push, 4)\n#pragma pack(pop)\nint x;\n",
+                                              false, "push/pop — MEASURED 6x"},
+        // NOT built, and deliberately: bare `pack(push)` occurs 0 times in the
+        // whole macOS SDK, and the paren-less `pragma pack 8` occurs twice (both
+        // in an unreached `ffi/ffi.h`). A guess would silently relayout structs.
+        {"#pragma pack(push)\nint x;\n",     true,  "bare pack(push) — 0 in SDK"},
+        {"#pragma pack 8\nint x;\n",         true,  "paren-less — unreached"},
+        // Envelope: the cap lands in the same layout channel `alignas` uses.
+        {"#pragma pack(3)\nint x;\n",        true,  "non-power-of-two"},
+        {"#pragma pack(512)\nint x;\n",      true,  "over the 256 cap"},
+        // An unbalanced pop makes the alignment below it underivable from source.
+        {"#pragma pack(pop)\nint x;\n",      true,  "pop with an empty stack"},
+        // A push never popped: the `#endif`-balance argument.
+        {"#pragma pack(push, 4)\nint x;\n",  true,  "push unbalanced at EOF"},
+    };
+    for (Row const& row : rows) {
+        PreprocessResult r;
+        (void)ppLexemes(row.src, r);
+        EXPECT_EQ(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma), row.loud)
+            << row.why << "  [" << row.src << "]";
+    }
+}
+
+// ★ TF-C82 — the STACK-form vocabulary is CONFIG. Strip `pragmaPackPushWord` and
+// `pack(push, 4)` becomes an unbuilt form (LOUD), while `pack(4)` keeps working:
+// the red-on-disable for that pair, and the proof the engine never compares a
+// token to a literal `"push"`.
+TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
+    auto schema = reboundCSubset("\"pragmaPackPushWord\":       \"push\",",
+                                 "",
+                                 "<no-pack-push-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaPackPushWord.empty());
+    std::vector<std::filesystem::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma pack(push, 4)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "with no `pragmaPackPushWord` declared the push form is an "
+               "unbuilt form and must be REFUSED, never silently ignored";
+    }
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma pack(4)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "the set/reset forms are independent of the stack vocabulary";
+    }
+}
+
+// ══ TF-C85: the three rows the pe64 sqlite leg needed, and the `optimize` sink ══
+//
+// MEASURED at TF-C85 on the real pe64 corpus leg: 2135 `error[P0020]` across 113
+// of 189 TUs, partitioned `warning` 1685 / `intrinsic` 448 / `optimize` 2. Every
+// one of those is invisible to a macOS `clang -E` census, because `_MSC_VER` is
+// never defined there and DSS's `pe` profile DOES define it.
+namespace {
+// Preprocess `text` under an explicit predefine class. Returns the result by
+// out-param so a test can inspect BOTH the diagnostics and the pragma products.
+void ppUnderFormat(std::string text, std::optional<ObjectFormatKind> fmt,
+                   PreprocessResult& out) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines);
+}
+// TRUE iff the token spelled `name` was emitted inside a `#pragma optimize("",
+// off)` region — the exact lookup the semantic tier performs on a function
+// declaration's leftmost token.
+[[nodiscard]] bool tokenIsNoOptimize(PreprocessResult const& r,
+                                     std::string_view name) {
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) != name) continue;
+        return r.pragmaNoOptimizeByOffset.contains(
+            static_cast<std::uint32_t>(t.span.start()));
+    }
+    ADD_FAILURE() << "token '" << name << "' not found in the output";
+    return false;
+}
+} // namespace
+
+// ★ ONE `["warning"]` ROW, ALL FOUR REACHED PAYLOAD SHAPES. MEASURED in the
+// corpus: `disable : N` (msvc.h x15, mutex_w32.c, totype.c), `push`/`pop`
+// (mutex_w32.c:40,64) and `default : N` (totype.c:504). The row claims nothing
+// about the argument list, which is exactly why one row can cover four shapes —
+// and the test asserts all four rather than the one that happens to dominate.
+TEST(Preprocessor, TfC85WarningPragmaIsInertInEveryReachedShape) {
+    char const* const shapes[] = {
+        "#pragma warning(disable: 4127)\n",
+        "#pragma warning(push)\n",
+        "#pragma warning(pop)\n",
+        "#pragma warning(default: 4748)\n",
+    };
+    for (char const* s : shapes) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "a `diagnosticsOnly` row claims this pragma; it must be silent: "
+            << s;
+        EXPECT_EQ(lexs.size(), 3u) << "`int x ;` survives, the directive does not";
+    }
+}
+
+// ★ RED-ON-DISABLE for the `["warning"]` row: rename the PREFIX (the structural
+// key, never the prose) and the same pragmas go loud again.
+TEST(Preprocessor, TfC85WarningRowIsWhatMakesTheWarningPragmaSilent) {
+    auto schema = reboundCSubset("\"prefix\": [\"warning\"]",
+                                 "\"prefix\": [\"warningXX\"]",
+                                 "<no-warning-row-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma warning(disable: 4127)\nint x;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "with no row claiming `warning` the pragma is UNREGISTERED and loud — "
+           "which is precisely the state that broke pe64 for 1685 of 2135 lines";
+}
+
+// ★★ THE `realizationRequestOnly` VERB. Its claim is about the ENGINE, not about
+// the pragma's arguments: `#pragma intrinsic` asks HOW a listed name is realized,
+// never WHETHER it exists, and a name DSS does not provide fails loud at the CALL
+// SITE. That is why one PREFIX row can speak for names this implementation has
+// never heard of — asserted here with a deliberately invented name beside the
+// four MEASURED-reached ones.
+TEST(Preprocessor, TfC85IntrinsicPragmaIsInertForAnyNameList) {
+    char const* const lists[] = {
+        "#pragma intrinsic(_byteswap_ushort)\n",
+        "#pragma intrinsic(_byteswap_ulong)\n",
+        "#pragma intrinsic(_byteswap_uint64)\n",
+        "#pragma intrinsic(_ReadWriteBarrier)\n",
+        // NOT a name DSS knows, and deliberately so: the row's claim spans every
+        // name the pragma can list. A per-name claim would be false the moment a
+        // new one appeared.
+        "#pragma intrinsic(_no_such_intrinsic_anywhere)\n",
+        "#pragma intrinsic(_byteswap_ulong, _ReadWriteBarrier)\n",
+    };
+    for (char const* s : lists) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "the row claims the pragma requests a REALIZATION, so it is "
+               "inert regardless of the names listed: " << s;
+        EXPECT_EQ(lexs.size(), 3u);
+    }
+}
+
+TEST(Preprocessor, TfC85IntrinsicRowIsWhatMakesTheIntrinsicPragmaSilent) {
+    auto schema = reboundCSubset("\"prefix\": [\"intrinsic\"]",
+                                 "\"prefix\": [\"intrinsicXX\"]",
+                                 "<no-intrinsic-row-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma intrinsic(_byteswap_ulong)\nint x;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "with no row claiming `intrinsic` the pragma is UNREGISTERED and loud "
+           "— 448 of the 2135 pe64 failures";
+}
+
+// ★★ THE `optimizerControl` SINK, PREPROCESSOR HALF. A REGION, stamped per
+// EMITTED TOKEN — the `#pragma pack` mechanism, for the same reason: a function
+// definition arriving from a macro replacement list carries the `#define` line's
+// span, so a byte-RANGE lookup would answer "optimize" for exactly the case the
+// author was controlling.
+TEST(Preprocessor, TfC85OptimizePragmaStampsTheTokensInsideTheRegion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#pragma optimize(\"\", off)\nint inside;\n"
+                          "#pragma optimize(\"\", on)\nint outside;\n", r);
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a well-formed `#pragma optimize` is honored, not diagnosed";
+    ASSERT_EQ(lexs.size(), 6u) << "`int inside ; int outside ;` survives";
+    EXPECT_TRUE(tokenIsNoOptimize(r, "inside"))
+        << "a token inside the region must be stamped — this is the state the "
+           "semantic tier folds onto SymbolRecord.isNoOptimize";
+    EXPECT_FALSE(tokenIsNoOptimize(r, "outside"))
+        << "`optimize(\"\", on)` CLOSES the region; a token after it must carry "
+           "nothing, or the whole rest of the file stops being optimized";
+}
+
+// ★★ THE SINGLE-DISPATCH PIN. Every failing corpus site is `#pragma`-spelled, so
+// a directive-arm-only implementation would go GREEN on the corpus while silently
+// destroying the property `D-PP-PRAGMA-OPERATOR-FORM` closed. This asserts the
+// `_Pragma` spelling of the NEW row reaches the SAME sink — including from inside
+// a macro replacement list, which resolves at EXPANSION time.
+TEST(Preprocessor, TfC85OptimizeReachesTheSameSinkThroughThePragmaOperator) {
+    {   // file-scope operator form
+        PreprocessResult r;
+        auto lexs = ppLexemes("_Pragma(\"optimize(\\\"\\\", off)\")\nint a;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u) << "`int a ;` — the operator emits nothing";
+        EXPECT_TRUE(tokenIsNoOptimize(r, "a"))
+            << "the `_Pragma` spelling must drive the SAME region state as the "
+               "`#pragma` spelling — one registry, two spellings";
+    }
+    {   // ★ THE DISCRIMINATOR: from a macro REPLACEMENT LIST.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define NOOPT _Pragma(\"optimize(\\\"\\\", off)\")\n"
+            "NOOPT\nint b;\n", r);
+        EXPECT_TRUE(r.diagnostics->all().empty());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_TRUE(tokenIsNoOptimize(r, "b"))
+            << "a `_Pragma` reached through a macro takes effect at its "
+               "EXPANSION site; a directive-scan-only routing fails HERE while "
+               "the corpus stays green";
+    }
+}
+
+// ★ THE UNBUILT FORMS FAIL LOUD — the `#pragma pack` posture. A selective option
+// list names MSVC optimizations DSS does not have; widening it to "all off" or
+// dropping it are both silent wrong answers.
+TEST(Preprocessor, TfC85OptimizeUnbuiltFormsAreRefusedNotGuessed) {
+    char const* const refused[] = {
+        "#pragma optimize(\"gt\", off)\n",   // selective option list
+        "#pragma optimize(\"\", sideways)\n",// not a declared state word
+        "#pragma optimize(\"\")\n",          // no state word at all
+        "#pragma optimize off\n",            // paren-less
+    };
+    for (char const* s : refused) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{s} + "int x;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "an unbuilt `#pragma optimize` form must be REFUSED: " << s;
+    }
+}
+
+// ★ RED-ON-DISABLE for the `optimizerControl` sink AND for its config words.
+TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
+    {   // no row -> the pragma is unregistered -> loud
+        auto schema = reboundCSubset("\"prefix\": [\"optimize\"]",
+                                     "\"prefix\": [\"optimizeXX\"]",
+                                     "<no-optimize-row-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        std::vector<std::filesystem::path> noDirs;
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma));
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty())
+            << "and nothing is stamped — the sink is inert without its row";
+    }
+    {   // row present, but the OFF word undeclared -> the form is unbuilt -> loud
+        auto schema = reboundCSubset("\"pragmaOptimizeOffWord\":    \"off\",",
+                                     "",
+                                     "<no-optimize-off-word-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        ASSERT_TRUE(schema->preprocess().pragmaOptimizeOffWord.empty());
+        std::vector<std::filesystem::path> noDirs;
+        auto buf = SourceBuffer::fromString(
+            std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "with no `pragmaOptimizeOffWord` declared the off form is an "
+               "unbuilt form and must be REFUSED, never silently ignored";
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty());
+    }
+}
+
+// ★★★ THE PROFILE-CENSUS GUARD (tier a) — THE CLASS FIX.
+//
+// TF-C82's row set came from a census taken under ONE predefine class, written up
+// as if it were universal. This preprocesses an in-repo fixture under ALL THREE
+// classes and asserts NO pragma goes unclaimed in any of them.
+//
+// MEASURED: `availableObjectFormats` keys on format KIND, so the 24 shipped
+// format files collapse to exactly three predefine classes — `pe`
+// (_WIN32/_WIN64/_MSC_VER + more), `macho` (__APPLE__/__MACH__), and the
+// NEITHER class (elf/spirv/wasm declare no identity predefines at all). Three
+// passes, not 24. `nullopt` is a FOURTH state (only universal entries survive)
+// and is included because the LSP / direct-API callers use it.
+//
+// ★ WHAT A GREEN RUN HERE DOES AND DOES NOT PROVE. It proves every pragma THIS
+// FIXTURE reaches has a row under every class. It does NOT prove the row set is
+// complete — a reached-set is a function of the defines in play and of how far
+// each TU gets (MEASURED: sqlite's `ext/rtree/rtree.c` carries two more
+// `#pragma intrinsic` lines that contribute nothing because its whole body sits
+// in a not-taken `#if`). Completeness is what tier (b), the corpus census
+// script, exists to keep reviewable.
+TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
+    namespace fs = std::filesystem;
+    fs::path const fixture =
+        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c";
+    ASSERT_TRUE(fs::exists(fixture))
+        << "the profile-census fixture must exist: " << fixture.string();
+    auto const text = test_support::readFile(fixture);
+    ASSERT_FALSE(text.empty());
+
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{}}) {
+        PreprocessResult r;
+        ppUnderFormat(text, fmt, r);
+        std::string const legName =
+            fmt.has_value() ? std::string{objectFormatKindName(*fmt)}
+                            : std::string{"<no active format>"};
+        // The ONE assertion that matters. `P_PreprocessorPragma` covers BOTH
+        // "no row claimed it" and "a row claimed it `unsupported`", which is
+        // exactly the pair a census is meant to surface.
+        std::string offending;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::P_PreprocessorPragma) continue;
+            offending += "\n    " + d.actual;
+        }
+        EXPECT_TRUE(offending.empty())
+            << "predefine class " << legName
+            << " reaches a pragma no `preprocess.pragmaEffects` row claims."
+               " Add a row (or fix the fixture) — do NOT relax this test:"
+            << offending;
+    }
+}
+
+// ★ NON-VACUITY FOR THE CENSUS GUARD. A census that preprocesses nothing passes
+// trivially, and the pe-only pragmas live behind `#if defined(_MSC_VER)` — so the
+// fixture MUST actually reach them on the pe leg and MUST NOT on the others.
+// Without this, deleting the fixture's whole body would leave the guard green.
+TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) {
+    auto const text = test_support::readFile(
+        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c");
+    ASSERT_FALSE(text.empty());
+    {   // pe: `_MSC_VER` is defined, so the MSVC arm is LIVE and its
+        // `#pragma optimize("", off)` region actually stamps a token.
+        PreprocessResult r;
+        ppUnderFormat(text, ObjectFormatKind::Pe, r);
+        EXPECT_FALSE(r.pragmaNoOptimizeByOffset.empty())
+            << "on the pe leg the fixture's `#pragma optimize` region must be "
+               "REACHED — otherwise this whole census is vacuous";
+        EXPECT_TRUE(tokenIsNoOptimize(r, "msvc_no_optimize_marker"));
+    }
+    {   // macho: `_MSC_VER` undefined -> the MSVC arm is a DEAD branch -> C
+        // 6.10p1 silence, and nothing is stamped.
+        PreprocessResult r;
+        ppUnderFormat(text, ObjectFormatKind::MachO, r);
+        EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty())
+            << "the MSVC arm must be entirely elided off the pe leg — the "
+               "dead-branch gate is what keeps the Apple SDK compiling";
+    }
+}
+
+// ★★ REACHABILITY, NOT RECOGNITION (C 6.10p1) — the `#error`/`#embed`/`#line`
+// parity. A `#pragma` inside a DEAD branch is entirely silent because the arm
+// sits past the `stackActive()` gate.
+//
+// ★ TF-C82 STRENGTHENED THIS TEST RATHER THAN LEAVING IT. It used to elide a
+// pragma (`whatever here`) that was silent EVERYWHERE, so it could not tell a
+// working reachability gate from a broken one. Now each dead-branch arm carries
+// a pragma that is MEASURABLY LOUD when reached — an UNREGISTERED one, an
+// `unsupported` one, and a MALFORMED `pack` — so the test fails the moment
+// recognition is hoisted above the gate. That hoist is not hypothetical: the
+// Apple SDK headers park hundreds of pragmas inside unsupported-configuration
+// branches, and erroring on them would break every macOS compile.
+TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+    char const* const deadPragmas[] = {
+        "#pragma whatever here",        // unregistered -> loud if reached
+        "#pragma STDC FP_CONTRACT OFF", // `unsupported` row -> loud if reached
+        "#pragma pack(3)",              // malformed operand -> loud if reached
+        "#pragma pack(pop)",            // unbalanced pop    -> loud if reached
+    };
+    for (char const* const dead : deadPragmas) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{"#if 0\n"} + dead
+                                  + "\nint dead;\n#endif\nint x;\n",
+                              r);
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "a pragma in a NOT-TAKEN branch is never recognized at all: "
+            << dead;
+        ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives: " << dead;
+        EXPECT_EQ(lexs[0], "int");
+        EXPECT_EQ(lexs[1], "x");
+        EXPECT_EQ(lexs[2], ";");
+    }
+    // The CONTROL that makes the four arms above non-vacuous: the same pragmas
+    // in a LIVE branch DO fire. Without this, a change that silenced pragmas
+    // everywhere would leave the loop above green.
+    for (char const* const live : deadPragmas) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{"#if 1\n"} + live + "\n#endif\nint x;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "reached, this pragma must be loud — else the dead-branch arms "
+               "above assert nothing: "
+            << live;
+    }
 }
 
 // OPT-OUT (RED-ON-DISABLE for the config match): with `pragmaDirective` stripped
@@ -2383,7 +3615,7 @@ TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
 // `__has_include` arm the identifier folds to 0 -> the #else branch.
 TEST(Preprocessor, FC15cHasIncludeQuoteExistingFileIsOne) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_fc15c_has_include_q";
+    auto dir = ppScratchRoot() / "dss_fc15c_has_include_q";
     fs::create_directories(dir);
     { std::ofstream(dir / "real_header.h", std::ios::binary) << "/* x */\n"; }
     PreprocessResult r;
@@ -2422,7 +3654,7 @@ TEST(Preprocessor, FC15cHasIncludeQuoteMissingFileIsZero) {
 // systemDirs (which holds only `stdio.json`) yields 0 -> the wrong branch.
 TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
     namespace fs = std::filesystem;
-    auto sysdir = fs::temp_directory_path() / "dss_fc15c_has_include_sys";
+    auto sysdir = ppScratchRoot() / "dss_fc15c_has_include_sys";
     fs::create_directories(sysdir);
     // Ship a JSON descriptor (the shape DSS ships), NOT a `.h` file.
     { std::ofstream(sysdir / "stdio.json", std::ios::binary) << "{}\n"; }
@@ -2449,6 +3681,209 @@ TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
             << "__has_include(<nope.h>) with no nope.json on the path must be 0";
     }
     std::error_code ec;
+    fs::remove_all(sysdir, ec);
+}
+
+// D-INCLUDE-ANGLE-SOURCE-FALLBACK (P1 — the PP surface): an angle `#include <h>`
+// with NO `h.json` descriptor but a REAL `h` source header on the -I includeDirs
+// falls back to TEXTUALLY splicing that header (byte-for-byte like a quote
+// include), so its `#define`s AND declarations inline into THIS TU — the crux
+// (a post-parse cross-ref would carry the symbol but NOT the macro). We ship a
+// `foo.h` (a macro + a symbol) on an includeDir, NO systemDir descriptor, and
+// angle-include it. RED-ON-DISABLE: revert the source-fallback arm -> the angle
+// include is left verbatim -> `FOO_OK` never expands (no `7`), `foo_sym` never
+// appears (the header text is absent), and the `#` of the directive survives.
+TEST(Preprocessor, FC15cAngleSourceFallbackSplicesHeaderTextually) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_angle_src_fallback_p1";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "foo.h", std::ios::binary)
+        << "#define FOO_OK 7\nint foo_sym;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <foo.h>\nint u = FOO_OK;\n", r, {inc}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a resolvable angle source fallback must not error";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("foo_sym"))
+        << "the fallback header's declaration must be textually inlined";
+    EXPECT_TRUE(has("7"))
+        << "the fallback header's macro FOO_OK must EXPAND -- proving a textual "
+           "splice, not a symbol-only cross-ref (which carries no macros)";
+    EXPECT_FALSE(has("FOO_OK"))
+        << "FOO_OK must be expanded, not survive as a bare identifier";
+    EXPECT_FALSE(has("#"))
+        << "the angle directive must be consumed (dropped), not left verbatim";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// D-INCLUDE-ANGLE-SOURCE-FALLBACK (P5 — the FC15c parity pin): `__has_include(<h>)`
+// MUST give the SAME answer `#include <h>` would. With `foo.h` on the -I
+// includeDirs and NO descriptor, the source fallback makes `#include <foo.h>`
+// resolve -> `__has_include(<foo.h>)` MUST be 1 (the `yes` branch). A header
+// absent on BOTH paths is 0 (the `no` branch). RED-ON-DISABLE: revert the
+// funnel's Source arm in the `__has_include` callback -> `<foo.h>` answers 0 ->
+// the wrong branch, AND it would then DISAGREE with the now-resolving `#include`
+// -- exactly the FC15c silent-miscompile this parity forbids.
+TEST(Preprocessor, FC15cAngleSourceFallbackHasIncludeParity) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_angle_src_fallback_p5";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "foo.h", std::ios::binary) << "/* x */\n"; }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<foo.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "__has_include(<foo.h>) must be 1 via the source fallback "
+               "(parity with the now-resolving #include <foo.h>)";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<none_xyz.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "__has_include of a header absent on BOTH paths must be 0";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: `preprocess()` surfaces the
+// weakly-canonical paths of every RESOLVED system descriptor an angle
+// `#include <h>` splices, EXPANDED to the transitive `includes` closure and
+// deduped. This is the exact set `parseAndAdd_` harvests typedef NAMES from to
+// seed the first parse (so `(size_t)(x)` commits as a cast without a full-file
+// oracle reparse). EMIT-ONLY: it changes no token output. RED-ON-DISABLE: drop
+// the 581/807/1945 accumulation (or the closure expansion) → the vector is empty
+// / missing the child → the seed never covers the descriptor's typedefs.
+TEST(Preprocessor, DPerf2ResolvedShippedDescriptorsIncludeTransitiveClosure) {
+    namespace fs = std::filesystem;
+    auto sysdir = ppScratchRoot() / "dss_dperf2_resolved_desc";
+    fs::create_directories(sysdir);
+    { std::ofstream(sysdir / "parent.json", std::ios::binary)
+        << R"({ "header": "parent.h", "includes": ["child.h"],
+                "typedefs": [ { "name": "ParentT", "type": "i32" } ] })"; }
+    { std::ofstream(sysdir / "child.json", std::ios::binary)
+        << R"({ "header": "child.h",
+                "typedefs": [ { "name": "ChildT", "type": "i32" } ] })"; }
+
+    PreprocessResult r;
+    (void)ppLexemesWithDirs("#include <parent.h>\nint x;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    std::error_code ec;
+    auto const wantParent = fs::weakly_canonical(sysdir / "parent.json", ec);
+    auto const wantChild  = fs::weakly_canonical(sysdir / "child.json", ec);
+    bool sawParent = false;
+    bool sawChild  = false;
+    for (auto const& p : r.resolvedShippedDescriptors) {
+        auto const c = fs::weakly_canonical(p, ec);
+        if (c == wantParent) sawParent = true;
+        if (c == wantChild) sawChild = true;
+    }
+    EXPECT_EQ(r.resolvedShippedDescriptors.size(), 2u)
+        << "the angle include must surface parent.json + the transitive "
+           "child.json, deduped by weakly-canonical path";
+    EXPECT_TRUE(sawParent) << "the parent descriptor must be surfaced";
+    EXPECT_TRUE(sawChild)
+        << "the transitively-included child descriptor must be surfaced";
+
+    fs::remove_all(sysdir, ec);
+}
+
+// D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION (dead-range filter — the effectiveness
+// proof): the recorded seed set is the AUTHORITATIVELY-LIVE one, EQUAL to the
+// finish() oracle's `shippedLibDescriptors`, never a superset. A LIVE angle
+// `#include <h>` IS recorded (its un-gated splice offset lands in a live region);
+// the SAME include inside a `#if 0 … #endif` dead branch is DROPPED (its splice
+// offset lands in an AUTHORITATIVE dead range), so the first-parse seed can never
+// resolve a name the finish() reparse would not. RED-ON-DISABLE: revert the
+// `byteInDeadRegion(off)` skip in `preprocess()`'s closure block -> the dead
+// branch's un-gated splice survives -> the descriptor is surfaced -> the two
+// dead-branch assertions below fail.
+TEST(Preprocessor, DPerf2SeedSetMatchesLiveOracleNotDeadBranch) {
+    namespace fs = std::filesystem;
+    auto sysdir = ppScratchRoot() / "dss_dperf2_deadbranch";
+    fs::create_directories(sysdir);
+    // A typedef-only descriptor for `<stddef.h>` (the `size_t` shape). Its typedef
+    // surface is injected SEMANTICALLY, so an angle include does not splice text —
+    // the ONLY trace is the recorded seed entry this test pins.
+    { std::ofstream(sysdir / "stddef.json", std::ios::binary)
+        << R"({ "header": "stddef.h",
+                "typedefs": [ { "name": "size_t", "type": "u64" } ] })"; }
+    std::error_code ec;
+    auto const wantDesc = fs::weakly_canonical(sysdir / "stddef.json", ec);
+
+    auto containsStddef = [&](PreprocessResult const& r) {
+        for (auto const& p : r.resolvedShippedDescriptors) {
+            if (fs::weakly_canonical(p, ec) == wantDesc) return true;
+        }
+        return false;
+    };
+
+    // (1) LIVE include -> the descriptor IS recorded (the seed covers `size_t`, so
+    // the includer's `(size_t)(0)` cast commits on parse 1 without a reparse).
+    PreprocessResult live;
+    (void)ppLexemesWithDirs(
+        "#include <stddef.h>\nint main(){ return (size_t)(0); }\n",
+        live, {}, {sysdir});
+    EXPECT_FALSE(live.diagnostics->hasErrors());
+    EXPECT_TRUE(containsStddef(live))
+        << "a LIVE angle include must record its descriptor for the seed";
+
+    // (2) DEAD include (`#if 0 … #endif`) -> NOT recorded: the un-gated splice
+    // still fires, but its offset is in an authoritative dead range, so the filter
+    // drops it. The finish() oracle would not resolve it either -> seed == oracle.
+    PreprocessResult dead;
+    (void)ppLexemesWithDirs(
+        "#if 0\n#include <stddef.h>\n#endif\nint main(){ return 0; }\n",
+        dead, {}, {sysdir});
+    EXPECT_FALSE(dead.diagnostics->hasErrors());
+    EXPECT_FALSE(containsStddef(dead))
+        << "a dead `#if 0` include must NOT seed -- the finish() oracle would "
+           "not resolve it either";
+    EXPECT_TRUE(dead.resolvedShippedDescriptors.empty())
+        << "the dead-branch TU resolves no LIVE system descriptor";
+
+    // (3) MACRO-GATED dead branch (`#define GATE 0` then `#if GATE` -> the
+    // condition is dead only AFTER macro expansion): the authoritative
+    // MacroExpander records the dead byte range branch-agnostically, so the
+    // un-gated splice's offset is filtered EXACTLY as the `#if 0` case --
+    // locking the seed==oracle guarantee for EVERY dead-branch form, not only
+    // the literal constant one.
+    PreprocessResult macroDead;
+    (void)ppLexemesWithDirs(
+        "#define DSS_GATE 0\n#if DSS_GATE\n#include <stddef.h>\n#endif\n"
+        "int main(){ return 0; }\n",
+        macroDead, {}, {sysdir});
+    EXPECT_FALSE(macroDead.diagnostics->hasErrors());
+    EXPECT_FALSE(containsStddef(macroDead))
+        << "a macro-gated dead include must NOT seed (the dead range is "
+           "branch-agnostic)";
+
+    // (4) LIVE include immediately AFTER a dead `#endif`: the filter is half-open
+    // `[deadStart, deadEnd)`, so a live include at/after the reactivating
+    // directive is KEPT -- never over-filtered into the adjacent live region.
+    PreprocessResult liveAfterDead;
+    (void)ppLexemesWithDirs(
+        "#if 0\n#endif\n#include <stddef.h>\n"
+        "int main(){ return (size_t)(0); }\n",
+        liveAfterDead, {}, {sysdir});
+    EXPECT_FALSE(liveAfterDead.diagnostics->hasErrors());
+    EXPECT_TRUE(containsStddef(liveAfterDead))
+        << "a live include after a dead #endif must still seed";
+
     fs::remove_all(sysdir, ec);
 }
 
@@ -3021,23 +4456,798 @@ TEST(Preprocessor, DefineMakesIfBranchLiveSoIncludeErrors) {
            "quote-#include -- proves localMacros tracking + the live include gate";
 }
 
-// (FIX-3) the CONSERVATIVE fallback: a guard that INVOKES a FUNCTION-LIKE macro
-// (the pre-scan's weaker eval cannot fold it) takes the P0016-safe direction --
-// the quote-`#include` is SKIPPED, so a missing header does NOT error (a
-// wrongly-skipped LIVE include would instead fail loud downstream as a missing
-// symbol, never a silent wrong include). RED-ON-DISABLE: removing the
-// function-like-invocation detection lets the include resolve -> the missing
-// header errors (P0016 returns in the uncertain direction).
-TEST(Preprocessor, FunctionLikeMacroGuardSkipsIncludeConservatively) {
+// ── TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE) ───────────────────────────
+// The pre-scan's macro state must span the WHOLE include tree in DOCUMENT ORDER.
+// Before the fix, `localMacros` was PER-BUILDER: a `#define` arriving via a
+// NESTED include was invisible to the parent's later `#if` (and a parent's
+// source `#define` invisible to a child's), so the guard folded 0 → FALSE-DEAD →
+// the gated quote-include was left verbatim → the macro pass forwarded it as
+// INERT tokens → the header was SILENTLY DROPPED (green-with-missing-code).
+// This is the sqlite os_unix.c shape: sqliteInt.h→os_setup.h defines
+// SQLITE_OS_UNIX=1; `#if SQLITE_OS_UNIX` gates `#include "os_common.h"`.
+
+// CHILD→PARENT: a gate macro defined in an INCLUDED header must make the
+// parent's later `#if GATE`-gated include LIVE. The included inner.h defines a
+// macro the parent USES — if inner.h is dropped, EMPTY stays undefined and the
+// use site parse-errors (the exact os_unix.c failure).
+// RED-ON-DISABLE: fresh per-child localMacros (the pre-fix state) drops inner.h.
+TEST(Preprocessor, Tf60GateDefinedInChildHeaderMakesParentIncludeLive) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf60_c2p";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "gate.h", std::ios::binary) << "#define GATE 1\n"; }
+    { std::ofstream(dir / "inner.h", std::ios::binary)
+          << "#define EMPTY(A)\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#include \"gate.h\"\n#if GATE\n#include \"inner.h\"\n#endif\n"
+        "int f(void) { EMPTY( return 7; ); return 42; }\n",
+        "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    EXPECT_FALSE(out.diagnostics->hasErrors())
+        << "a gate macro defined in an INCLUDED header must make the parent's "
+           "#if-gated include LIVE — dropping inner.h leaves EMPTY undefined "
+           "and the use site errors (the sqlite os_unix.c silent-drop)";
+    bool sawEmptyWord = false;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "EMPTY")
+            sawEmptyWord = true;
+    }
+    EXPECT_FALSE(sawEmptyWord)
+        << "EMPTY( ... ) must have been macro-EXPANDED away — its survival "
+           "means inner.h was silently dropped";
+    fs::remove_all(dir, ec);
+}
+
+// PARENT→CHILD: a `#define` in the parent's OWN text before the include must be
+// visible to the CHILD's pre-scan (only command-line defines threaded before).
+// RED-ON-DISABLE: the child's fresh localMacros drops inner.h the same way.
+TEST(Preprocessor, Tf60GateDefinedInParentSourceMakesChildIncludeLive) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf60_p2c";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "outer.h", std::ios::binary)
+          << "#if GATE\n#include \"inner.h\"\n#endif\n"; }
+    { std::ofstream(dir / "inner.h", std::ios::binary)
+          << "#define EMPTY(A)\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#define GATE 1\n#include \"outer.h\"\n"
+        "int f(void) { EMPTY( return 7; ); return 42; }\n",
+        "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    EXPECT_FALSE(out.diagnostics->hasErrors())
+        << "a parent-source #define before the include must be visible to the "
+           "CHILD's pre-scan so its #if GATE-gated include is LIVE";
+    bool sawEmptyWord = false;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "EMPTY")
+            sawEmptyWord = true;
+    }
+    EXPECT_FALSE(sawEmptyWord)
+        << "EMPTY( ... ) must have been macro-EXPANDED away — its survival "
+           "means the child dropped inner.h";
+    fs::remove_all(dir, ec);
+}
+
+// TF-C60 code-audit BLOCKER 1: a macro whose replacement is a CHARACTER LITERAL
+// must survive into the pre-scan's guard evaluation. The tokenizer USED TO emit
+// a coalesced literal as OPENER + BODY and consume the closing delimiter with NO
+// token, so building the stored replacement by joining token TEXTS lost the
+// closer (`'A'` → `' A`), which re-lexed to an unterminated literal → the guard
+// became unevaluable → the (d) arm turned it into a HARD ERROR on valid C.
+// (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN has since given the closer its own
+// `CharEnd` token. This test stayed GREEN through that change and is kept: it
+// pins the OBSERVABLE contract — a char-literal macro replacement survives
+// guard evaluation — which must hold regardless of how the replacement is
+// captured.)
+// `#define NEWLINE '\n'` guarding a conditional include is ordinary C.
+//
+// RED-ON-DISABLE, RE-AIMED AND MEASURED: replace `sbTrackDefine`'s source
+// SLICE with a WHITESPACE-SEPARATED join of `toks[q].text` and this errors
+// while every `#define GATE 1`-shaped test stays green — the coverage hole the
+// audit found. Verified: the stored replacement becomes `' \n '` (the
+// separators land INSIDE the literal), a multi-char char constant, so the guard
+// is unevaluable and the (d) arm hard-errors on valid C — `hasErrors()` true
+// and `inner.h` never splices.
+//
+// ★ The BARE join (`joined += toks[q].text`, the pre-TF-C60 shape the earlier
+// version of this note named) no longer reddens it — MEASURED GREEN. Now that
+// the closer carries its own `CharEnd` token, a bare join happens to
+// reassemble `'\n'` byte-for-byte. That is exactly why the instruction is
+// aimed at the SEPARATOR instead: it targets the property the slice actually
+// buys — every replacement byte in its ORIGINAL spacing — which no token-text
+// join can promise, rather than a token-count accident that the closer-token
+// work already changed once.
+TEST(Preprocessor, Tf60CharLiteralMacroReplacementSurvivesGuardEval) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf60_charlit";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "inner.h", std::ios::binary) << "int lit_ok_zzz;\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#define NL '\\n'\n#if NL == 10\n#include \"inner.h\"\n#endif\nint y;\n",
+        "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    EXPECT_FALSE(out.diagnostics->hasErrors())
+        << "a char-literal macro replacement must round-trip into the guard "
+           "evaluation — losing the literal's closing delimiter makes the guard "
+           "unevaluable and hard-errors valid C";
+    bool sawMarker = false;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "lit_ok_zzz")
+            sawMarker = true;
+    }
+    EXPECT_TRUE(sawMarker) << "`#if NL == 10` is TRUE, so inner.h must splice";
+    fs::remove_all(dir, ec);
+}
+
+// TF-C60 code-audit BLOCKER 2: an object-like macro that expands TO a
+// function-like macro's NAME leaves the guard undecidable for this weaker
+// pre-scan. Freezing the expansion (folding the identifier to 0) is conservative
+// ONLY at even polarity — under `!` it inverts to TRUE and eagerly resolves an
+// authoritatively-DEAD include, re-opening P0016. It must take the UNCERTAIN
+// (skip) path in both polarities.
+// RED-ON-DISABLE: make the post-expansion arm `return in;` without setting
+// `sbPostExpandUncertain` and this resolves the dead include → P0016 fires.
+TEST(Preprocessor, Tf60ObjectMacroExpandingToFunclikeIsUncertainUnderNegation) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#define ENABLED(x) x\n#define Z ENABLED(1)\n"
+        "#if !Z\n#include \"nope_missing_z.h\"\n#endif\nint g;\n",
+        r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "`#if !Z` is authoritatively DEAD; the pre-scan must NOT eagerly "
+           "resolve its include (P0016: never resolve a dead include)";
+}
+
+// TF-C60 code-audit SHOULD-FIX 7(b): the mint/slice arithmetic pinned on a
+// DISTINCTIVE value through a two-step chain, plus a negative control — a wrong
+// product-region slice that happens to yield some other nonzero number would
+// pass a mere "is live" assertion.
+TEST(Preprocessor, Tf60MintedProductSlicesExactValueThroughChain) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf60_mint";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "inner.h", std::ios::binary) << "int mint_ok_zzz;\n"; }
+    auto schema = cSubset();
+    std::vector<fs::path> includeDirs{dir};
+    {   // positive: the chain must fold to EXACTLY 424242
+        auto buf = SourceBuffer::fromString(
+            "#define A B\n#define B 424242\n#if A == 424242\n"
+            "#include \"inner.h\"\n#endif\nint y;\n", "main.c");
+        auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+        EXPECT_FALSE(out.diagnostics->hasErrors());
+        bool saw = false;
+        for (Token const& t : out.tokens)
+            if (std::string{out.synthBuffer->slice(t.span)} == "mint_ok_zzz")
+                saw = true;
+        EXPECT_TRUE(saw) << "the minted chain must slice to exactly 424242";
+    }
+    {   // negative control: a MISSING header under a FALSE guard must stay unresolved
+        PreprocessResult r;
+        (void)ppLexemes("#define A B\n#define B 424242\n#if A != 424242\n"
+                        "#include \"nope_missing_mint.h\"\n#endif\nint y;\n", r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a FALSE guard must not resolve its include — a mis-sliced "
+               "product that folded differently would wrongly make this live";
+    }
+    fs::remove_all(dir, ec);
+}
+
+// TF-C60 (design-audit Finding 6): the ONE residual direction where the pre-scan
+// can read MORE-live than the authoritative pass — a function-like-guarded
+// branch containing an `#undef` the pre-scan never tracks (the FIX-3 skip means
+// the branch is not stack-active for tracking). The later `#if X` then reads X
+// still defined → the pre-scan eagerly SPLICES "a.h" — but the authoritative
+// pass (which DID run the #undef) reads that region DEAD and ELIDES the spliced
+// content. The edge is LOUD-OR-BENIGN by construction: an existing header is
+// spliced-then-elided (benign, pinned here); a missing one errors loudly.
+// RED-ON-DISABLE: if the authoritative dead-gate ever stopped eliding the
+// pre-scan's over-eager splice, the marker below would LEAK into the output.
+TEST(Preprocessor, Tf60FunclikeGuardedUndefMoreLiveEdgeStaysBenign) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf60_morelive";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "a.h", std::ios::binary)
+          << "int morelive_marker_zzz;\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#define X 1\n#define FUNC(a) a\n"
+        "#if FUNC(1)\n#undef X\n#endif\n"
+        "#if X\n#include \"a.h\"\n#endif\n"
+        "int y;\n",
+        "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    bool sawMarker = false;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "morelive_marker_zzz")
+            sawMarker = true;
+    }
+    EXPECT_FALSE(sawMarker)
+        << "the authoritative pass #undef'd X, so the pre-scan's eager splice of "
+           "a.h must be ELIDED by the authoritative dead-gate — content leaking "
+           "past it would be a silent wrong-include";
+    fs::remove_all(dir, ec);
+}
+
+// (FIX-3, re-pinned by TF-C60) a guard that INVOKES a FUNCTION-LIKE macro is
+// still not evaluated by the weaker pre-scan (the conservative skip stands),
+// but the OUTCOME is no longer silence: this guard is authoritatively LIVE
+// (`ENABLED(1)` -> 1), so the unresolved quote-`#include` reaches the macro
+// pass, and the TF-C60 fail-loud arm ERRORS rather than forwarding the line as
+// inert tokens. The pre-fix behaviour — no diagnostic at all — was the
+// silent-drop bug class (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the old
+// comment claimed a wrongly-skipped live include "fails loud downstream", and
+// nothing downstream ever failed.
+// RED-ON-DISABLE: removing the macro-pass unresolved-live-quote-include arm
+// returns this to the silent drop (no error at all).
+TEST(Preprocessor, FunctionLikeMacroGuardUnresolvedLiveIncludeFailsLoud) {
     PreprocessResult r;
     auto lexs = ppLexemes(
         "#define ENABLED(x) x\n#if ENABLED(1)\n#include \"nope_fn.h\"\n#endif\n"
         "int x;\n",
         r);
-    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
-        << "a function-like-macro guard must take the conservative skip (no "
-           "missing-include error) -- the FIX-3 P0016-safe direction";
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a LIVE quote-#include the pre-scan could not resolve (function-like "
+           "guard) must FAIL LOUD in the macro pass — never a silent drop";
     (void)lexs;
+}
+
+// ── C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): the include-gating pre-scan must know
+// COMMAND-LINE `--define`s. A `#ifdef <cmdline-define>`-gated quote-`#include` was
+// FALSELY read dead -- the pre-scan saw only in-source `#define`s (localMacros) +
+// predefined, never the `<command-line>` prologue (spliced straight into synthText)
+// -- so the header was left un-inlined and its `#define`s dropped, surfacing
+// downstream as a spurious P0009 (the real SQLITE_TEST-gated `tclsqlite.h` ->
+// `SQLITE_TCLAPI` drop across 7 `src/test*.c` TUs). These pins reuse the
+// "missing-header-must-error-when-LIVE" oracle of DefineMakesIfBranchLiveSoInclude-
+// Errors, so the gate state is directly observable. ──────────────────────────────
+
+// (Self-contained: `ppLexemesWithDefines` lives later in this file, so these call
+// `preprocess()` directly -- they only need the include-error diagnostic / a short
+// lexeme check.)
+
+// Pin 1 (CORE, RED-ON-DISABLE): a command-line `--define GATE` makes `#ifdef GATE`
+// LIVE in the include-gating pre-scan, so its quote-`#include` RESOLVES (and errors
+// on the missing header). Disable the seed -> GATE unknown -> branch read dead ->
+// include silently skipped -> NO error (the exact silent drop this cycle fixes).
+TEST(Preprocessor, CommandLineDefineMakesIfdefIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#ifdef GATE\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a command-line --define GATE must make #ifdef GATE live in the include-"
+           "gating pre-scan so its quote-#include resolves "
+           "(D-PP-PRESCAN-DEFINEDNESS-PARITY)";
+}
+
+// Pin 2 (SYMMETRY, RED-ON-DISABLE): the `#if defined(GATE)` form agrees with
+// `#ifdef GATE` for a command-line define -- both route through the unified
+// `sbNameDefined`. Before, `#ifdef` saw ONLY localMacros while `#if defined()` also
+// saw predefined, and NEITHER saw a command-line define; now they agree.
+TEST(Preprocessor, CommandLineDefineViaDefinedOperatorIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if defined(GATE)\n#include \"still_missing.h\"\n#endif\nint x;\n",
+        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "#if defined(GATE) must agree with #ifdef GATE for a command-line define "
+           "(the unified sbNameDefined oracle)";
+}
+
+// Pin 3 (CHILD THREADING, depth>=1, RED-ON-DISABLE): a header included LIVE from an
+// outer command-line-gated conditional must ITSELF see the command-line define for
+// its OWN gated includes -- proving the C21 `preScanDefinePrefix` (which supersedes
+// the C19 `seededDefines` NAME set) threads into child builders. `outer.h`
+// (resolved + inlined from main) has its own `#ifdef GATE #include <missing_inner>`;
+// with child-threading that inner include resolves + errors, without it the child
+// never learns GATE -> inner skipped -> no error.
+TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_c19_child_seed";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "outer.h", std::ios::binary)
+          << "#ifdef GATE\n#include \"still_missing_inner.h\"\n#endif\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#ifdef GATE\n#include \"outer.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the command-line define seed must thread into the child builder so "
+           "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
+           "DEFINEDNESS-PARITY child-threading)";
+    fs::remove_all(dir, ec);
+}
+
+// TF-C59 (D-CPP-LINE-DIRECTIVE) — the design's HEADLINE property, which nothing
+// pinned until the independent code-audit said so: `#line` records are keyed PER
+// ORIGIN BUFFER, so a `#line` inside an #include'd header renumbers only THAT
+// header; the includer's own numbering is untouched.
+// RED-ON-DISABLE: replace the per-origin `lineDirs_` map with a single global
+// vector and the includer's `__LINE__` after the #include wrongly follows the
+// header's directive (every other Tf59 test stays green — they are all
+// single-buffer, which is exactly the coverage hole the audit found).
+TEST(Preprocessor, Tf59LineDirectiveInHeaderDoesNotRenumberIncluder) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf59_line_hdr";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "h.h", std::ios::binary)
+          << "#line 700\nint from_header = __LINE__;\n"; }
+    auto schema = cSubset();
+    //                                        line: 1              2
+    auto buf = SourceBuffer::fromString(
+        "#include \"h.h\"\nint after = __LINE__;\n", "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    EXPECT_FALSE(out.diagnostics->hasErrors());
+    bool saw700 = false, saw2 = false;
+    for (Token const& t : out.tokens) {
+        std::string const s{out.synthBuffer->slice(t.span)};
+        if (s == "700") saw700 = true;
+        if (s == "2")   saw2   = true;
+    }
+    EXPECT_TRUE(saw700) << "the header's own line must follow its #line 700";
+    EXPECT_TRUE(saw2)
+        << "the INCLUDER's line 2 must be UNAFFECTED by the header's #line — "
+           "exactly what per-origin keying buys";
+    fs::remove_all(dir, ec);
+}
+
+// Pin 4 (NO OUTPUT CONTAMINATION): the definedness seed is pre-scan knowledge ONLY
+// -- read for branch decisions, never written to the output. `--define GATE=7`
+// still expands GATE to its prologue value `7` in a live branch (not shadowed to
+// empty by a stray seed `#define`), and no extra tokens leak.
+TEST(Preprocessor, CommandLineDefineSeedDoesNotContaminateOutput) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("#ifdef GATE\nint v = GATE;\n#endif\n",
+                                        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE=7"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(out.diagnostics->hasErrors());
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof
+            || t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 5u) << "expected exactly: int v = 7 ;";
+    EXPECT_EQ(lexs[3], "7") << "GATE expands to its prologue value, seed adds no "
+                               "shadowing #define";
+}
+
+// ── C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): the include-gating pre-scan
+// now seeds command-line/predefined macro VALUES (not just definedness) via a
+// NON-EMITTED span-safe `#define NAME VALUE` prefix on each build()'s scan buffer,
+// so a `#if <macro>` VALUE guard gating a quote-`#include` evaluates correctly.
+// These pins use the same "missing-header-errors-when-LIVE" oracle as the C19 pins
+// above and are RED-ON-DISABLE (revert the value prefix -> the value guard folds to
+// 0 -> the include is silently skipped -> NO error). ────────────────────────────
+
+// C21 Pin A (VALUE CORE, RED-ON-DISABLE): a command-line `--define M=1` makes the
+// VALUE guard `#if M` LIVE (not merely `#ifdef M`), so its quote-`#include`
+// RESOLVES (and errors on the missing header). This is the value capability C19's
+// definedness-only seed lacked: without the value prefix `#if M` folds M->0->dead
+// -> the include is silently skipped -> NO error (the exact drop this cycle fixes).
+TEST(Preprocessor, CommandLineDefineValueMakesIfIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a command-line --define M=1 must make the VALUE guard #if M live in the "
+           "include-gating pre-scan so its quote-#include resolves "
+           "(D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE)";
+}
+
+// C21 Pin B (VALUE-vs-DEFINEDNESS PARITY): with `--define M=1`, BOTH `#if defined(M)`
+// (definedness, via sbNameDefined) AND `#if M` (value, via the prefix seeding
+// localMacros) gate the include LIVE -> both error. The two contexts agree.
+TEST(Preprocessor, CommandLineDefineValueAndDefinednessAgree) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    {
+        auto buf = SourceBuffer::fromString(
+            "#if defined(M)\n#include \"still_missing.h\"\n#endif\nint x;\n",
+            "main.c");
+        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+            << "#if defined(M) must gate the include LIVE for --define M=1";
+    }
+    {
+        auto buf = SourceBuffer::fromString(
+            "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+            << "#if M (value) must agree with #if defined(M) for --define M=1";
+    }
+}
+
+// C21 Pin C (NEGATIVE / P0016 one-directional divergence): `--define M=0` makes the
+// VALUE guard `#if M` DEAD, so the quote-`#include` is NOT resolved -> NO error.
+// Proves the value seed does not OVER-resolve -- a 0-valued define stays dead, so
+// the pre-scan is more-live only IN LOCKSTEP with the authoritative pass.
+TEST(Preprocessor, CommandLineDefineValueZeroKeepsIncludeDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=0"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "--define M=0 must leave #if M dead so its quote-#include is not resolved "
+           "(no P0016 over-resolution)";
+}
+
+// C21 Pin D (FINDING-C, NOT-EMIT, RED-ON-DISABLE): the value prefix is pre-scan
+// knowledge ONLY -- it must NEVER be emitted into the synth buffer. Token-count is
+// BLIND to a leak (a duplicate `#define GATE 7` is an idempotent redefinition -> 0
+// extra output tokens), so this inspects the synth buffer TEXT and asserts the
+// `#define GATE` string occurs EXACTLY ONCE (the authoritative <command-line>
+// prologue). A leaked prefix -> TWO occurrences.
+TEST(Preprocessor, CommandLineDefineValuePrefixNotEmittedIntoSynthText) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("#ifdef GATE\nint v = GATE;\n#endif\n",
+                                        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE=7"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    std::string_view syn = out.synthBuffer->text();
+    std::size_t count = 0;
+    for (std::size_t pos = syn.find("#define GATE");
+         pos != std::string_view::npos; pos = syn.find("#define GATE", pos + 1)) {
+        ++count;
+    }
+    EXPECT_EQ(count, 1u)
+        << "the non-emitted value prefix must NOT leak into the synth buffer -- "
+           "`#define GATE` must appear exactly once (the <command-line> prologue)";
+}
+
+// C21 Pin E (predefined-VALUE, RED-ON-DISABLE -- CLOSES the sibling anchor
+// D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): a predefined macro used in VALUE
+// position (`#if __STDC_VERSION__ >= 201112L`) now gates a quote-`#include` LIVE ->
+// the missing header errors. Before C21 the pre-scan folded __STDC_VERSION__ to 0
+// -> 0 >= 201112L is false -> dead -> the include was conservatively skipped (the
+// exact residual this anchor tracked). The value comes from the OBJECT-like
+// predefined subset of the prefix (c-subset __STDC_VERSION__ = 202311L).
+TEST(Preprocessor, PredefinedValueGuardMakesIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __STDC_VERSION__ >= 201112L\n#include \"still_missing.h\"\n#endif\n"
+        "int x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a predefined VALUE guard (#if __STDC_VERSION__ >= 201112L) must gate the "
+           "quote-#include LIVE (closes D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE)";
+}
+
+// C21 Pin E' (predefined-VALUE converse): the SAME predefined used in a FALSE guard
+// (`#if __STDC_VERSION__ < 0`) stays DEAD -> NO error. Proves the seeded value is
+// REAL (not a blanket "predefined -> live").
+TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __STDC_VERSION__ < 0\n#include \"still_missing.h\"\n#endif\nint x;\n",
+        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "#if __STDC_VERSION__ < 0 must stay dead (the seeded predefined value is "
+           "real, not a blanket predefined->live)";
+}
+
+// C21 Pin F (FINDING-A, function-like predefine must NOT be value-seeded): a bare
+// `#if NAME` (no call) on a FUNCTION-like predefine must fold to 0 in the pre-scan
+// EXACTLY as in the authoritative pass; value-seeding it would make the pre-scan
+// MORE-live -> a silent P0016 re-open. The prefix builder therefore SKIPS
+// `isFunctionLike` predefines (mirroring the MacroExpander ctor + the <built-in>
+// prologue). NOTE: the c-subset schema's function-like predefines are `_declspec` (B1) +
+// `__declspec` (pe-only, value ""), a WEAK red-on-disable witness -- wrongly
+// value-seeding it yields an object-like EMPTY macro, so `#if __declspec` -> empty
+// operand -> uncertain -> conservative skip -> NO error, the SAME outcome as the
+// correct guard (`#if __declspec` -> undefined identifier -> 0 -> skip). So this pin
+// POSITIVELY confirms the guarded outcome (the function-like predefine is available
+// on pe yet its VALUE guard stays dead -> no include resolved); the CODE guard is
+// what enforces FINDING-A. Run on the pe format so __declspec passes the
+// availability filter and actually reaches the isFunctionLike guard.
+TEST(Preprocessor, FunctionLikePredefinedNotValueSeededIntoPrescan) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if __declspec\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> noDefs;
+    auto out = preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Pe, noDefs);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a function-like predefine (__declspec) must NOT be value-seeded into the "
+           "pre-scan: #if __declspec stays dead so its quote-#include is not resolved";
+}
+
+// C21 Pin G (#undef COMPOSE, Option 2): `--define M=1` followed by an in-source
+// `#undef M` BEFORE the `#if M`-gated include leaves the include DEAD -> NO error.
+// The Option-2 improvement over C19's separate NAME set (which ignored #undef): the
+// value seeds `localMacros`, so a source `#undef` erases it and the guard composes.
+TEST(Preprocessor, CommandLineDefineThenUndefComposesDead) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#undef M\n#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"M=1"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "an in-source #undef M must compose with --define M=1 (Option 2 seeds the "
+           "value into localMacros, which #undef erases) -> #if M dead -> no include";
+}
+
+// ── D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS: the ANGLE shipped-
+// macro splice is NO LONGER gated on the pre-scan's (weaker, sometimes-blind)
+// conditional verdict -- the injected `#define`s are emitted inside the include's
+// conditional region and the AUTHORITATIVE MacroExpander (which elides dead-branch
+// defines) arbitrates their liveness. Two pins: the POSITIVE case the fix unblocks
+// (a shipped macro under a `#if` gated by a QUOTE-include define the pre-scan cannot
+// see) and the NEGATIVE final-output invariant (a `#if 0`-gated shipped include must
+// not leak a usable macro -- the authoritative pass elides it). ──────────────────
+
+// POSITIVE (RED-ON-DISABLE): a shipped OBJECT-macro from an ANGLE `#include` must
+// inject+expand even when that include is gated by `#if <flag>` whose flag is
+// `#define`d in a QUOTE-included header -- a flag the include-gating pre-scan is BLIND
+// to (a child SynthBuilder's localMacros is discarded), so the pre-scan CONFIDENTLY
+// folds the guard to 0 (an undefined identifier -> 0, C 6.10.1p4) and mis-marks the
+// branch dead, while the authoritative pass (seeing platform.h's spliced text) reads
+// it LIVE. This is the reduced sqlite test_syscall.c shape (`#if SQLITE_OS_UNIX` ->
+// `#include <errno.h>`, SQLITE_OS_UNIX from the quote-included os_setup.h). Uses a
+// FLAT object-macro (no per-format variant) so it injects under the harness's nullopt
+// activeFormat. RED-ON-DISABLE: restore the `includeResolvable()` gate on the angle
+// arm -> the pre-scan skips the splice -> SHIPPED_MAC survives unexpanded.
+TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_pos_sys";
+    auto incdir = ppScratchRoot() / "dss_ppangle_pos_inc";
+    fs::create_directories(sysdir, ec);
+    fs::create_directories(incdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    { std::ofstream(incdir / "platform.h", std::ios::binary)
+          << "#define GATE_FLAG 1\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include \"platform.h\"\n"
+        "#if GATE_FLAG\n"
+        "#include <shippedmac.h>\n"
+        "int v = SHIPPED_MAC;\n"
+        "#endif\n",
+        r, {incdir}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has777 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "777") has777 = true;
+        if (l == "SHIPPED_MAC") hasBareMac = true;
+    }
+    EXPECT_TRUE(has777)
+        << "the shipped object-macro must inject+expand under a quote-include-gated "
+           "#if the pre-scan is blind to (D-PP-PRESCAN-ANGLE-MACRO-SPLICE-"
+           "AUTHORITATIVE-LIVENESS)";
+    EXPECT_FALSE(hasBareMac) << "SHIPPED_MAC must not survive the parser boundary "
+                               "unexpanded";
+    fs::remove_all(sysdir, ec);
+    fs::remove_all(incdir, ec);
+}
+
+// NEGATIVE (final-output layer, RED-ON-DISABLE): splice-always emits the shipped
+// `#define` into scanBuf even for a confidently-DEAD `#if 0` angle include, but the
+// AUTHORITATIVE pass elides dead-branch `#define`s -- so the macro must NOT be usable
+// in the final token stream (the P0016 one-directional-divergence invariant, measured
+// where it matters: the tokens the parser sees). This is the layer the SynthBuilder
+// emit-only property protects: the spliced define never enters the pre-scan's
+// localMacros, and the authoritative pass drops it in the dead branch. RED-ON-DISABLE:
+// if the authoritative pass ever stops eliding a dead-branch `#define`, SHIPPED_MAC
+// would expand to 777 here -> the leak this pin forbids.
+TEST(Preprocessor, DeadBranchAngleShippedMacroDoesNotLeakToFinalOutput) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_dead_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#if 0\n"
+        "#include <shippedmac.h>\n"
+        "#endif\n"
+        "int v = SHIPPED_MAC;\n",
+        r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has777 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "777") has777 = true;
+        if (l == "SHIPPED_MAC") hasBareMac = true;
+    }
+    EXPECT_FALSE(has777)
+        << "a #if 0-gated shipped include must NOT leak a usable macro into the final "
+           "token stream (the authoritative pass elides the dead-branch #define)";
+    EXPECT_TRUE(hasBareMac)
+        << "SHIPPED_MAC stays an undefined bare identifier after the dead-branch "
+           "include (final-output P0016 invariant)";
+    fs::remove_all(sysdir, ec);
+}
+
+// DIRECT P0016 PIN (RED-ON-DISABLE against a future refactor): a shipped `#define`
+// spliced inside a confidently-DEAD `#if 0` angle include must be INVISIBLE to a
+// LATER pre-scan `#if defined(thatMacro)`. The splice is EMIT-ONLY (`out.append`
+// into the authoritative buffer), never tracked into the pre-scan's localMacros, so
+// the later guard folds dead in the pre-scan exactly as in the authoritative pass --
+// the pre-scan is never MORE-live. Observed via the include gate: the later guard
+// gates a MISSING quote-`#include`, which must NOT resolve (no missing-file error).
+// RED-ON-DISABLE: route the splice through localMacros and the pre-scan would see
+// the macro defined -> resolve that guard live -> the missing include errors (a P0016
+// re-open). A DIRECT `#define` positive-control proves the probe can observe a leak.
+TEST(Preprocessor, DeadBranchAngleShippedMacroInvisibleToLaterPrescanGuard) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_p0016_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "shippedmac.json", std::ios::binary)
+          << "{ \"header\": \"shippedmac.h\", \"macros\": ["
+             "{ \"name\": \"SHIPPED_MAC\", \"replacement\": \"777\" } ] }\n"; }
+    // MAIN: dead-branch splice must not leak into the later pre-scan guard.
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if 0\n#include <shippedmac.h>\n#endif\n"
+            "#if defined(SHIPPED_MAC)\n#include \"missing_p0016_probe.h\"\n#endif\n"
+            "int v = 0;\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a shipped #define spliced in a DEAD #if 0 angle include must be "
+               "INVISIBLE to a later pre-scan #if defined() -- emit-only, never "
+               "tracked into localMacros (the P0016 one-directional invariant)";
+    }
+    // POSITIVE CONTROL: a DIRECT #define makes the SAME later guard resolve LIVE in
+    // the pre-scan -> the missing include DOES error, so the MAIN case's silence
+    // genuinely means "no leak" (not "the probe can't observe a live guard").
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#define SHIPPED_MAC 777\n"
+            "#if defined(SHIPPED_MAC)\n#include \"missing_p0016_probe.h\"\n#endif\n"
+            "int v = 0;\n",
+            r, {}, {sysdir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a DIRECT #define must make #if defined() live in the pre-scan (the "
+               "leak-observability control)";
+    }
+    fs::remove_all(sysdir, ec);
+}
+
+// ITEM-2 PIN (RED-ON-DISABLE for the reportMalformed gate): removing the angle-arm
+// `includeResolvable()` gate also un-gated the malformed-descriptor DIAGNOSTIC
+// (`spliceSystemDescriptorMacros` emits P_PreprocessorIncludeError on an exists-but-
+// fails-macro-decode descriptor). Threading `reportMalformed = includeResolvable()`
+// restores its dead-branch inertness (C 6.10p1): the SPLICE stays ungated but the
+// diagnostic fires only on a confidently-LIVE include. RED-ON-DISABLE: pass
+// reportMalformed=true unconditionally and the DEAD case below emits the error.
+TEST(Preprocessor, DeadBranchMalformedShippedDescriptorStaysSilent) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_malformed_sys";
+    fs::create_directories(sysdir, ec);
+    // Malformed: `macros` is not an array -> readShippedLibMacros fails to decode ->
+    // the "descriptor malformed (macros)" P_PreprocessorIncludeError would fire.
+    { std::ofstream(sysdir / "badmac.json", std::ios::binary)
+          << "{ \"macros\": \"not-an-array\" }\n"; }
+    // LIVE (top-level, confidently-live): the malformed descriptor errors loud.
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#include <badmac.h>\nint v = 0;\n", r, {}, {sysdir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a malformed shipped descriptor on a CONFIDENTLY-LIVE include must "
+               "error loud (reportMalformed = includeResolvable() = true)";
+    }
+    // DEAD (#if 0): the SAME malformed descriptor stays SILENT (dead-branch inertness).
+    {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if 0\n#include <badmac.h>\n#endif\nint v = 0;\n", r, {}, {sysdir});
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a malformed shipped descriptor on a DEAD #if 0 include must stay "
+               "SILENT -- the reportMalformed gate restores dead-branch inertness "
+               "(code-audit Item-2)";
+    }
+    fs::remove_all(sysdir, ec);
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES: the preprocessor macro-splice walks the TRANSITIVE
+// descriptor closure. A parent descriptor declaring `includes:["child.h"]` where
+// the CHILD ships a macro -> `#include <parent.h>` splices the CHILD's macro too,
+// so a use of the child macro expands. RED-ON-DISABLE: revert the closure walk in
+// spliceSystemDescriptorMacros to a single-descriptor read -> only parent.json's
+// macros (none here) splice -> CHILD_MAC stays a bare undefined identifier.
+TEST(Preprocessor, AngleIncludeSplicesTransitiveSiblingMacros) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_transitive_sys";
+    fs::create_directories(sysdir, ec);
+    // parent.json declares NO macros of its own — only the `includes` edge.
+    { std::ofstream(sysdir / "parent.json", std::ios::binary)
+          << "{ \"header\": \"parent.h\", \"includes\": [\"child.h\"], "
+             "\"symbols\": [ { \"name\": \"pfn\", \"signature\": \"fn() -> i32\" } ] }\n"; }
+    // child.json ships the macro reached transitively.
+    { std::ofstream(sysdir / "child.json", std::ios::binary)
+          << "{ \"header\": \"child.h\", \"macros\": ["
+             "{ \"name\": \"CHILD_MAC\", \"replacement\": \"42\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <parent.h>\nint v = CHILD_MAC;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has42 = false, hasBareMac = false;
+    for (auto const& l : lexs) {
+        if (l == "42") has42 = true;
+        if (l == "CHILD_MAC") hasBareMac = true;
+    }
+    EXPECT_TRUE(has42)
+        << "a transitively-included sibling descriptor's macro must be spliced by "
+           "the closure walk (CHILD_MAC -> 42 via parent.h's includes:[child.h])";
+    EXPECT_FALSE(hasBareMac)
+        << "CHILD_MAC must NOT survive unexpanded (the transitive #define was spliced)";
+    fs::remove_all(sysdir, ec);
+}
+
+// D-FFI-DESCRIPTOR-INCLUDES: an `includes` CYCLE (parent<->child) must TERMINATE in
+// the preprocessor splice (the shared visited-set), not infinite-loop. RED-ON-DISABLE:
+// drop the visited-set guard in forEachDescriptorInClosure -> this hangs / OOMs.
+TEST(Preprocessor, AngleIncludeCyclicIncludesTerminate) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sysdir = ppScratchRoot() / "dss_ppangle_cyclic_sys";
+    fs::create_directories(sysdir, ec);
+    { std::ofstream(sysdir / "pa.json", std::ios::binary)
+          << "{ \"header\": \"pa.h\", \"includes\": [\"pb.h\"], \"macros\": ["
+             "{ \"name\": \"PA_MAC\", \"replacement\": \"40\" } ] }\n"; }
+    { std::ofstream(sysdir / "pb.json", std::ios::binary)
+          << "{ \"header\": \"pb.h\", \"includes\": [\"pa.h\"], \"macros\": ["
+             "{ \"name\": \"PB_MAC\", \"replacement\": \"2\" } ] }\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <pa.h>\nint v = PA_MAC + PB_MAC;\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool has40 = false, has2 = false;
+    for (auto const& l : lexs) {
+        if (l == "40") has40 = true;
+        if (l == "2") has2 = true;
+    }
+    EXPECT_TRUE(has40 && has2)
+        << "a cyclic includes graph must terminate AND splice both descriptors' "
+           "macros exactly once (the closure visited-set)";
+    fs::remove_all(sysdir, ec);
 }
 
 // AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by
@@ -3336,9 +5546,12 @@ TEST(Preprocessor, ProductSpansSurviveAcrossFlush) {
         r);
     EXPECT_FALSE(r.diagnostics->hasErrors());
     // A stringize product is tokenized as a string-literal opener `"` + a BODY
-    // token (+ implied close) -- see reconstructStringLiteral above -- so we check
+    // token + a closing `"` -- see reconstructStringLiteral above -- so we check
     // the distinctive product BODIES (which slice from productText_; an invalid
     // multi-flush span would yield an empty/garbage lexeme, not the exact body).
+    // This test is count-free by construction, so D-TOK-CLOSING-DELIMITER-HAS-NO-
+    // TOKEN left it GREEN; only the wording above needed the correction (the
+    // close is no longer "implied", it is a real token).
     auto has = [&](std::string_view s) {
         for (auto const& l : lexs) if (l == s) return true;
         return false;
@@ -3794,7 +6007,7 @@ TEST(Preprocessor, ElifdefIsConfigDrivenFailsLoudWhenStripped) {
 // live include is never spliced -> `included_by_elifdef` is missing.
 TEST(Preprocessor, ElifdefLiveArmResolvesNestedQuoteInclude) {
     namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path() / "dss_elifdef_live_inc";
+    auto dir = ppScratchRoot() / "dss_elifdef_live_inc";
     fs::create_directories(dir);
     { std::ofstream(dir / "elifdef_live.h", std::ios::binary)
           << "int included_by_elifdef;\n"; }
@@ -3867,7 +6080,7 @@ namespace fsemb = std::filesystem;
 [[nodiscard]] fsemb::path
 writeEmbedResource(std::string const& sub, std::string const& name,
                    std::string const& bytes) {
-    auto dir = fsemb::temp_directory_path() / sub;
+    auto dir = ppScratchRoot() / sub;
     fsemb::create_directories(dir);
     std::ofstream out(dir / name, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -3986,7 +6199,7 @@ TEST(Preprocessor, FC179EmbedProbeShapeSingleByteIsFortyTwo) {
 // the `#embed "res.bin"`; `inc/res.bin` exists but NO copy sits next to main.c.
 // RED-ON-DISABLE: resolving against the main dir (not the header's) misses res.bin.
 TEST(Preprocessor, FC179EmbedResolvesRelativeToIncludingHeader) {
-    auto root = fsemb::temp_directory_path() / "dss_embed_t4";
+    auto root = ppScratchRoot() / "dss_embed_t4";
     auto inc  = root / "inc";
     fsemb::create_directories(inc);
     { std::ofstream(inc / "h.h", std::ios::binary)
@@ -4254,4 +6467,2567 @@ TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
            "and splice the gated header (else the include is conservatively "
            "skipped and the type is unresolved)";
     std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// D-PERF-1 (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
+// consumes its stream from a FRONT-CONSUMED deque and splices only at the front,
+// so the TOTAL splice-work (`PreprocessResult::macroTokenMoves`, summing
+// `consumed + produced` over every `spliceOver`) is LINEAR in the invocation
+// count N. On a pathological macro-dense source -- one trivial object-like macro
+// invoked N times -- each `A` pops 1 (`A`) + pushes 1 (`1`) = 2 moves, so the
+// total is ~2*N. We pin it <= 8*N (generous linear headroom; the MEASURED value
+// is 2*N). RED-ON-DISABLE intent: this pins that the pass does LINEAR total
+// splice-work -- a regression that re-splices an ever-GROWING region (the
+// superlinear pattern the front-consumed deque eliminates) blows the bound. The
+// wall-clock O(n^2)->O(n) win itself (the old mid-vector erase+insert paid an
+// O(n) PHYSICAL tail-shift per call on top of the same logical count) is
+// confirmed separately by the sqlite `preprocess-expand` phase re-measure.
+TEST(Preprocessor, DPerf1MacroPassTokenMovesStayLinear) {
+    constexpr std::size_t N = 4000;
+    std::string src = "#define A 1\n";
+    src.reserve(src.size() + N * 2 + 1);
+    for (std::size_t k = 0; k < N; ++k) src += "A ";
+    src += "\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(std::move(src), r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    // Non-vacuous: every one of the N `A`s actually expanded to `1` (otherwise a
+    // zero-work pass would trivially satisfy the bound).
+    std::size_t ones = 0;
+    for (auto const& l : lexs)
+        if (l == "1") ++ones;
+    EXPECT_EQ(ones, N) << "each object-like `A` must expand to `1`";
+
+    // The load-bearing assertion: EXACTLY 2 front-splice token-moves per object-
+    // like expansion (pop the name `A`, push its replacement `1`) -> 2*N total,
+    // LINEAR in N. The exact count is the strongest provable property here.
+    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the D-PERF-1 deque splice;
+    // reverting `spliceOver` to the pre-D-PERF-1 `std::vector` erase+insert removes
+    // it (the counter lives inside the deque splice), so macroTokenMoves -> 0 and
+    // this EQ fails (0 != 2*N). A logical op-counter
+    // cannot by itself distinguish the deque's O(n) front-splice from a
+    // same-formula vector mid-splice; the PHYSICAL O(n^2)->O(n) tail-shift win is
+    // proven separately by the sqlite `preprocess-expand` phase re-measure
+    // (~4.3s -> ~3.3s this cycle) + the independently-audited front-consumed design.
+    EXPECT_EQ(r.macroTokenMoves, 2 * N)
+        << "the macro pass must do exactly 2 front-splice moves per expansion "
+           "(2*N total, linear); got " << r.macroTokenMoves << " for N=" << N;
+}
+
+// AUDIT FIX #1 correctness pin (the one silent-miscompile seam of the deque
+// rewrite). A function-like macro invoked with the WRONG arity fails loud, emits
+// the NAME verbatim, and DROPS the whole malformed `(...)` call -- while any
+// TRAILING tokens after the call survive. In the front-consumed-deque model the
+// arity-bad arm must pop `past` tokens TOTAL off the front (the name + the
+// malformed call); a no-op (or popping only the name) would re-scan/re-expand
+// the dropped args -- a SILENT divergence (and, for a pure no-op, an infinite
+// loop). RED-ON-DISABLE: revert the arm to leave the malformed args on the
+// stream and `(`, `1`, `)` leak into the output (or the pass hangs) -- either
+// way `lexs` is no longer exactly {M, tail_ok}.
+TEST(Preprocessor, ArityMismatchDropsMalformedCallKeepsTrailingTokens) {
+    PreprocessResult r;
+    // M expects 2 args; invoked with 1 -> arity mismatch. `tail_ok` trails the
+    // malformed call and must survive.
+    auto lexs = ppLexemes("#define M(a,b) a b\nM(1) tail_ok\n", r);
+
+    // (1) the arity diagnostic fires.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "a 2-parameter macro called with 1 argument must fail loud";
+
+    // (2)+(3)+(4): exactly `M tail_ok` reaches the parser -- the name survives,
+    // the `(1)` is dropped, `tail_ok` survives AFTER it.
+    ASSERT_EQ(lexs.size(), 2u)
+        << "expected exactly {M, tail_ok}: the malformed (1) must be dropped and "
+           "tail_ok must survive";
+    EXPECT_EQ(lexs[0], "M") << "the macro name must be emitted verbatim";
+    EXPECT_EQ(lexs[1], "tail_ok") << "the trailing token must survive the drop";
+    // The dropped call must not leak a single token.
+    for (auto const& l : lexs) {
+        EXPECT_NE(l, "(") << "the malformed call's `(` leaked";
+        EXPECT_NE(l, "1") << "the malformed call's arg leaked";
+        EXPECT_NE(l, ")") << "the malformed call's `)` leaked";
+    }
+}
+
+// ============================================================================
+// TF-C70 (D-CPP-ERROR-WARNING) -- C23 6.10.5 `#error` / 6.10.6 `#warning`.
+//
+// The load-bearing property is TWO-DIRECTIONAL, and the SILENT half is the one
+// that carries the weight. C 6.10p1 EXECUTES a directive only when its
+// enclosing conditional group is live, so an `#error` in a NOT-TAKEN branch
+// must produce NO diagnostic at all. Every macOS SDK header depends on exactly
+// that: `sys/cdefs.h` and friends park `#error`s inside unsupported-
+// configuration branches that a supported target skips. A suite that asserted
+// only "a reached `#error` diagnoses" would be fully satisfied by an
+// implementation that fires on every LEXED `#error` -- i.e. one that cannot
+// preprocess a single system header. So the silence tests below are paired
+// with positive twins (an implementation that NEVER fires cannot pass either),
+// and each test names the concrete engine edit that turns THAT test red.
+//
+// The engine seam, for the red-on-disable notes: `MacroExpander::
+// handleDirective` (src/analysis/preprocess/preprocessor.cpp) dispatches the
+// `#if`-family UNCONDITIONALLY (they must keep `condStack_` balanced inside a
+// dead group), then hits `if (!stackActive()) return end;` -- and only BELOW
+// that gate live the `#error`/`#warning` arms. Reachability, not recognition.
+// ============================================================================
+namespace {
+
+// The FIRST diagnostic carrying `code` (nullptr if none). `firstMessageWithCode`
+// above yields only the text; `#warning`'s entire contract is its SEVERITY, so
+// these tests need the diagnostic itself.
+[[nodiscard]] ParseDiagnostic const* firstDiagWithCode(PreprocessResult const& r,
+                                                       DiagnosticCode code) {
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) return &d;
+    }
+    return nullptr;
+}
+
+// Rebind ONE `"<key>": "<word>"` string field of the shipped c-subset config to
+// `newWord` and reload. Unlike handing `reboundCSubset` a literal key-value
+// spelling, this LOCATES the value (key -> `:` -> the quoted value), so the
+// rebind survives any re-alignment of the config's columns. A missing key is an
+// ADD_FAILURE, never a silent no-op: a rebind whose `from` stopped matching
+// would otherwise re-run the BASELINE schema and pass VACUOUSLY -- the exact
+// failure mode that makes a config-driven test worthless.
+[[nodiscard]] std::shared_ptr<GrammarSchema const>
+reboundPreprocessWord(std::string const& key, std::string const& newWord,
+                      std::string const& label) {
+    std::string const text = loadShippedCSubsetText();
+    if (text.empty()) {
+        ADD_FAILURE() << "could not locate shipped c-subset config";
+        return nullptr;
+    }
+    std::string const quotedKey = "\"" + key + "\"";
+    auto const keyPos = text.find(quotedKey);
+    if (keyPos == std::string::npos) {
+        ADD_FAILURE() << "shipped c-subset config declares no " << quotedKey;
+        return nullptr;
+    }
+    auto const colon = text.find(':', keyPos + quotedKey.size());
+    auto const openQ = (colon == std::string::npos)
+                           ? std::string::npos
+                           : text.find('"', colon + 1);
+    auto const closeQ = (openQ == std::string::npos)
+                            ? std::string::npos
+                            : text.find('"', openQ + 1);
+    if (closeQ == std::string::npos) {
+        ADD_FAILURE() << quotedKey << " is not a `\"key\": \"value\"` pair";
+        return nullptr;
+    }
+    return reboundCSubset(text.substr(keyPos, closeQ + 1 - keyPos),
+                          quotedKey + ": \"" + newWord + "\"", label);
+}
+
+// `lexs` is EXACTLY the five lexemes of `int x=1;` -- the whole program once the
+// directive lines are gone. Pins consumption as well as (non-)diagnosis: a
+// directive whose `#`/word leaked into the parser stream fails here even when
+// the diagnostic assertions pass.
+[[nodiscard]] ::testing::AssertionResult isIntXAssignOne(
+    std::vector<std::string> const& lexs) {
+    static char const* const kWant[] = {"int", "x", "=", "1", ";"};
+    if (lexs.size() != 5) {
+        return ::testing::AssertionFailure()
+               << "expected exactly 5 lexemes (`int x = 1 ;`), got "
+               << lexs.size();
+    }
+    for (std::size_t i = 0; i < 5; ++i) {
+        if (lexs[i] != kWant[i]) {
+            return ::testing::AssertionFailure()
+                   << "lexeme " << i << ": expected '" << kWant[i] << "', got '"
+                   << lexs[i] << "'";
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+} // namespace
+
+// ── SILENCE (the load-bearing half) ─────────────────────────────────────────
+
+// (1) `#if 0` elides its group, so the `#error` inside is never EXECUTED
+// (C 6.10p1) -- no diagnostic of any kind, and the surviving program is exactly
+// `int x = 1 ;`.
+// RED-ON-DISABLE: move the `#error` arm out of the `else if` chain in
+// `handleDirective` and up into the UNCONDITIONAL `#if`-family dispatch above
+// `if (!stackActive()) return end;` -- the directive is then diagnosed on
+// RECOGNITION rather than reachability and this test reds on every assertion.
+TEST(Preprocessor, TfC70ErrorDirectiveInIfZeroIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 0\n#error must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "an `#error` in a NOT-TAKEN `#if 0` group must never fire -- every "
+           "macOS SDK header parks `#error`s in branches a supported target "
+           "skips";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "nor may it be downgraded into a warning: a skipped group produces "
+           "NO diagnostic";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a dead-branch `#error` must be completely silent (got "
+        << r.diagnostics->all().size() << " diagnostics)";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// (2) The `#ifdef` path is a SEPARATE evaluator arm from `#if` (`SbIfKind::
+// Ifdef` reads definedness DIRECTLY; `#if 0` runs the ICE expression
+// evaluator), so the silence contract is pinned once per arm. An undefined
+// macro name leaves the group dead.
+// RED-ON-DISABLE: same edit as (1) (hoisting the arm above the `stackActive()`
+// gate); additionally red if `sbHandleIf`'s `Ifdef` branch ever pushed an
+// ACTIVE frame for an undefined name.
+TEST(Preprocessor, TfC70ErrorDirectiveInIfdefUndefinedMacroIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef DSS_NEVER_DEFINED\n#error must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "`#ifdef <undefined>` is a dead group -- its `#error` is not "
+           "executed (the `#ifdef` evaluator arm, distinct from `#if 0`)";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// (3) The NOT-TAKEN `#else` arm: the group's `#if 1` already took, so the
+// `#else` body never executes. Distinct frame state from (1)/(2) -- here the
+// frame was pushed ACTIVE and is later turned off by `sbHandleElse`, so this
+// pins the `#else` transition rather than the open.
+// RED-ON-DISABLE: same hoist as (1); also red if `sbHandleElse` stopped
+// clearing `thisBranchActive` once `anyBranchTaken`.
+TEST(Preprocessor, TfC70ErrorDirectiveInNotTakenElseIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 1\nint x;\n#else\n#error dead else\n#endif\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "the `#else` arm of an already-taken group is dead -- its `#error` "
+           "must not fire";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    ASSERT_EQ(lexs.size(), 3u) << "only the taken arm `int x ;` survives";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "x");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// (4) ★ NESTED: an `#if 1` whose own controlling expression is TRUE, sitting
+// inside a dead `#if 0`. Liveness is a property of the WHOLE frame chain, not
+// of the innermost directive -- the shape that appears in real headers as a
+// feature test nested under a platform guard.
+// RED-ON-DISABLE: the (1) hoist reds this too. The nesting-specific pin is the
+// CONJUNCTION of two engine facts, and the test reds if BOTH are undone:
+// `sbHandleIf` pushing `thisBranchActive = enclosing && cond`
+// (preprocessor.cpp:287) AND `sbStackActive` walking every frame
+// (preprocessor.cpp:204-209). Undoing either ALONE leaves the composite
+// predicate correct -- they are observationally equivalent by construction,
+// which is why no test can separate them; what this test pins is that at least
+// one of the two survives, i.e. that a live-looking inner group inside a dead
+// outer group stays dead. No other test in this file exercises the nested
+// shape.
+TEST(Preprocessor, TfC70ErrorDirectiveNestedInDeadOuterBranchStaysSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n#if 1\n#error inner live but outer dead\n#endif\n#endif\n"
+        "int x=1;\n",
+        r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "the inner `#if 1` is nested inside a dead `#if 0`: liveness is the "
+           "conjunction over EVERY open frame, so the `#error` is not executed";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "got " << r.diagnostics->all().size() << " diagnostics";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// ── POSITIVE TWINS (so a never-fires implementation cannot pass) ────────────
+
+// (5) A REACHED `#error` fails loud, at Error severity, and its message carries
+// the author's `pp-tokens` verbatim (C 6.10.5p1 makes including them a
+// CONSTRAINT, not a nicety). The directive line itself is consumed -- a
+// directive is not program text.
+// RED-ON-DISABLE: delete the `else if (... word == cfg().errorDirective)` arm
+// in `handleDirective` -- the line falls through to the generic
+// `P_PreprocessorUnsupported` (P0015) fail-loud, whose message is "unsupported
+// preprocessor directive ...: error" and carries none of the user's text.
+TEST(Preprocessor, TfC70ErrorDirectiveReachedFailsLoudWithUserText) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#error unsupported configuration for this target\n"
+                  "int x=1;\n",
+                  r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "a REACHED `#error` must fail loud";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "it must route to the `#error` arm, not the generic "
+           "unsupported-directive fail-loud";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#error` is fatal: translation does not continue (C 6.10.5)";
+    auto const* d =
+        firstDiagWithCode(r, DiagnosticCode::P_PreprocessorErrorDirective);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Error)
+        << "`#error` is an ERROR, not a warning";
+    EXPECT_NE(d->actual.find("unsupported configuration"), std::string::npos)
+        << "the message must INCLUDE the author's pp-tokens (C 6.10.5p1); got: "
+        << d->actual;
+    EXPECT_TRUE(isIntXAssignOne(lexs))
+        << "the `#error` line is consumed, never forwarded to the parser";
+}
+
+// (6) The positive twin of (4): two LIVE frames. Proves the liveness walk does
+// not spuriously report a nested group dead -- the direction that would make
+// `#error` unreachable-by-construction and silently satisfy every silence test
+// above.
+// RED-ON-DISABLE: make `sbStackActive` return false for any non-empty stack
+// (the over-conservative mirror of the (1) hoist) -- (1)-(4) stay green and
+// ONLY this test reds.
+TEST(Preprocessor, TfC70ErrorDirectiveLiveInNestedTakenBranchStillFires) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#if 1\n#if 1\n#error live through two frames\n#endif\n#endif\n"
+        "int x=1;\n",
+        r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "both enclosing frames are TAKEN, so the `#error` IS executed";
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// ── SEMANTICS ───────────────────────────────────────────────────────────────
+
+// (7) C23 6.10.5 spells the directive `# error pp-tokens_opt` -- the operand is
+// OPTIONAL, so a BARE `#error` is well-formed and still fires, with empty user
+// text. It must NOT be reported as a malformed directive
+// (`P_PreprocessorDirective`, P0013).
+// RED-ON-DISABLE: add an "operand required" check to the `#error` arm (the
+// obvious-looking `if (operand.empty()) emit(P_PreprocessorDirective)`), which
+// is what the `pp-tokens_opt` grammar forbids -- the code assertion reds.
+TEST(Preprocessor, TfC70ErrorDirectiveWithNoOperandStillFires) {
+    PreprocessResult r;
+    (void)ppLexemes("#error\nint x=1;\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+        << "`# error pp-tokens_opt`: a bare `#error` is well-formed and fires";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "an absent operand is NOT a malformed directive (C23 6.10.5's "
+           "`pp-tokens_opt`)";
+    EXPECT_EQ(firstMessageWithCode(
+                  r, DiagnosticCode::P_PreprocessorErrorDirective),
+              "#error: ")
+        << "the message is the fixed label plus EMPTY user text";
+}
+
+// (8) The operand is NOT macro-expanded. C 6.10.5 requires the message to
+// include "the specified pp-tokens" -- the tokens as WRITTEN. A directive line
+// is never run through the expander (C 6.10.3p11), so `X` stays `X`.
+// RED-ON-DISABLE: expand the operand before building the message (route it
+// through the macro pass instead of `directiveOperandText`'s verbatim slice) --
+// the message becomes "#error: 1 is bad" and both assertions red.
+TEST(Preprocessor, TfC70ErrorDirectiveOperandIsNotMacroExpanded) {
+    PreprocessResult r;
+    (void)ppLexemes("#define X 1\n#error X is bad\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective));
+    std::string const msg = firstMessageWithCode(
+        r, DiagnosticCode::P_PreprocessorErrorDirective);
+    EXPECT_NE(msg.find("X is bad"), std::string::npos)
+        << "the pp-tokens are reported AS WRITTEN; got: " << msg;
+    EXPECT_EQ(msg.find("1 is bad"), std::string::npos)
+        << "the operand must NOT be macro-expanded; got: " << msg;
+}
+
+// OPERAND FORMS the bare-prose tests above do NOT reach. C23 6.10.5p1/6.10.6
+// require the pp-tokens VERBATIM, and a trailing LITERAL used to be a special
+// case: the tokenizer split a literal into a StringStart token holding only the
+// opening quote plus a coalesced BODY token covering the bytes BETWEEN the
+// quotes, so the CLOSING quote belonged to no token's span and a naive
+// first..last span join stopped one byte short.
+//
+// ★ WHY THIS TEST EXISTS AT ALL: every other TfC70 operand test uses bare prose,
+// and bare prose is exactly the form that does NOT expose the bug — as does
+// `"abc" tail`, because there the join ends on `tail`. The suite was green over
+// that subset while `#warning "Unsupported compiler detected"` — sys/cdefs.h:81,
+// the literal shape that motivated this whole feature — silently reported a
+// truncated `"Unsupported compiler detected` with no closing quote. A
+// multi-FORM contract needs a test per form, not per site.
+//
+// ★ RENEGOTIATED — D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. This test stayed GREEN
+// across the anchor's fix, but its RED-ON-DISABLE instruction went stale and had
+// to be rewritten rather than left to rot. It used to read:
+//
+//     "delete the closing-delimiter re-consume in `directiveOperandText`
+//      (the `tail[0] == '\"'` guard) -> (A) and (B) red."
+//
+// That guard NO LONGER EXISTS. It was one of the four hand-compensations the
+// anchor catalogued, and closing the anchor at the ROOT deleted it: the closing
+// delimiter is now a token of its own, so `last - 1` (the line's last
+// non-trivia token) IS the closer and the span join reaches it BY CONSTRUCTION.
+// An instruction to disable deleted code cannot be followed, and a
+// RED-ON-DISABLE note that cannot be followed is worse than none — it reads as
+// verified when nothing is verifying it.
+//
+// WHAT THIS TEST GUARDS NOW: that the operand text still reaches the closing
+// delimiter, whatever mechanism supplies it. It is no longer a pin on a guard;
+// it is a pin on the OBSERVABLE CONTRACT (C23 6.10.5p1/6.10.6), which is the
+// more durable thing to assert and is why the test survived the mechanism
+// change unedited. RED-ON-DISABLE today: revert the tokenizer's closer emit —
+// the closer stops being a token, `last - 1` falls back to the body, and (A),
+// (B) and (C) all go red together. Note that is strictly BROADER coverage than
+// before: one revert now fails all three delimiter forms, where the old guard
+// had to be disabled per-byte.
+//
+// The negative cases (D)/(E) guard the OTHER direction — that nothing appends a
+// phantom byte past the operand — and (F) guards the trailing-trivia policy.
+TEST(Preprocessor, TfC70OperandKeepsClosingStringDelimiter) {
+    auto msgOf = [](char const* src) {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        return firstMessageWithCode(
+            r, DiagnosticCode::P_PreprocessorWarningDirective);
+    };
+    // (A) THE sys/cdefs.h:81 SHAPE — operand is a lone string literal.
+    EXPECT_NE(msgOf("#warning \"Unsupported compiler detected\"\n")
+                  .find("\"Unsupported compiler detected\""),
+              std::string::npos)
+        << "the closing quote is part of the pp-tokens and must be reported";
+    // (B) char-literal twin: the same span shortfall applies to `'`.
+    EXPECT_NE(msgOf("#warning 'q'\n").find("'q'"), std::string::npos);
+    // (C) ANGLE delimiter — the THIRD form, and not hypothetical: the word
+    // `include` earlier on the line arms the tokenizer's header-context, so the
+    // path lexes as HeaderStart + coalesced HeaderPath, which had the same
+    // token-less close. Reported `<stdio.h` before the fix; the `>` is now a
+    // `HeaderEnd` token and the span join reaches it like any other token.
+    EXPECT_NE(msgOf("#warning please include <stdio.h>\n").find("<stdio.h>"),
+              std::string::npos)
+        << "the header-path close `>` is part of the pp-tokens too";
+    // (D) NEGATIVE: the span join must stop exactly at the last non-trivia
+    // token. `a > b` ends on `b`, and this `>` is an ordinary operator, not a
+    // header-path closer — nothing may append a phantom `>` past the operand.
+    // (This used to read "the guard has nothing to extend", naming the
+    // `tail[0] == '"'` re-consume in `directiveOperandText`. That guard is
+    // DELETED — see the RENEGOTIATED note above. The assertion is unchanged
+    // because it always pinned the OBSERVABLE, not the mechanism.)
+    {
+        std::string const m = msgOf("#warning use a > b\n");
+        EXPECT_NE(m.find("use a > b"), std::string::npos) << m;
+        EXPECT_EQ(m.find("b>"), std::string::npos)
+            << "nothing may append a phantom byte past the operand; got: " << m;
+    }
+    // (E) NEGATIVE: an UNTERMINATED literal. The stray quote must be reported
+    // exactly once, never doubled. NOTE this program is rejected anyway — the
+    // tokenizer fails loud with P0010 `EOF inside lexer mode 'string'` — so this
+    // pins message shape only, not acceptance. (TWO earlier claims here have now
+    // been corrected by measurement: that the stray quote "ends on a StringStart
+    // whose own span covers it", and that a "delimiter re-consume" is what must
+    // not double it — that re-consume no longer exists. What survives both
+    // corrections is the observable: no doubled delimiter byte.)
+    {
+        std::string const m = msgOf("#warning abc\"\n");
+        EXPECT_EQ(m.find("abc\"\""), std::string::npos)
+            << "the closing delimiter must appear exactly once; got: " << m;
+    }
+    // (F) NEGATIVE: the trailing-trivia policy still wins — a trailing comment
+    // is one space in phase 3, long before phase-4 directive execution, so it
+    // is never part of the pp-tokens.
+    {
+        std::string const m = msgOf("#warning nope // TODO\n");
+        EXPECT_NE(m.find("nope"), std::string::npos) << m;
+        EXPECT_EQ(m.find("TODO"), std::string::npos)
+            << "a trailing comment is not part of the pp-tokens; got: " << m;
+    }
+}
+
+// ── ★ CONFIG-DRIVEN: REBIND, not merely strip ───────────────────────────────
+
+// (9) The directive WORD comes from `preprocess.errorDirective`, never a
+// hard-coded "error". Rebound off "error" -> "errr": `#error` becomes an
+// UNKNOWN directive (P0015) and `#errr` drives the `#error` handler. Follows
+// FC179EmbedDirectiveIsConfigDrivenNotHardcoded.
+// ★ A strip-only test (asserting `#error` fails loud once the field is empty)
+// would be INADEQUATE: an implementation that consults the config solely for
+// the `.empty()` guard while MATCHING a hard-coded "error" literal passes it.
+// Only the rebind's second half -- `#errr` DRIVING the handler -- excludes that.
+// RED-ON-DISABLE: replace `word == cfg().errorDirective` with `word == "error"`
+// in `handleDirective`. The rebind is then ignored: `#error` still fires
+// P001E (first sub-case reds) and `#errr` reaches the generic fail-loud
+// (second sub-case reds).
+TEST(Preprocessor, TfC70ErrorDirectiveIsConfigDrivenNotHardcoded) {
+    auto schema =
+        reboundPreprocessWord("errorDirective", "errr", "<rebound-error>");
+    ASSERT_TRUE(schema != nullptr);
+    ASSERT_EQ(schema->preprocess().errorDirective, "errr")
+        << "the rebound schema must carry the NEW directive word";
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString("#error x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with the word rebound, `#error` is an unknown directive (P0015)";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "a hard-coded \"error\" literal would still fire P001E here";
+    }
+    {
+        auto buf = SourceBuffer::fromString("#errr x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "the rebound `#errr` word now drives the `#error` handler";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported));
+    }
+}
+
+// (10) The `#warning` twin of (9), with the same reasoning: rebound off
+// "warning" -> "warnn", `#warning` is unknown (P0015) and `#warnn` drives the
+// warning handler.
+// RED-ON-DISABLE: replace `word == cfg().warningDirective` with
+// `word == "warning"`.
+TEST(Preprocessor, TfC70WarningDirectiveIsConfigDrivenNotHardcoded) {
+    auto schema =
+        reboundPreprocessWord("warningDirective", "warnn", "<rebound-warning>");
+    ASSERT_TRUE(schema != nullptr);
+    ASSERT_EQ(schema->preprocess().warningDirective, "warnn");
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString("#warning x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with the word rebound, `#warning` is an unknown directive";
+        EXPECT_FALSE(
+            hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "a hard-coded \"warning\" literal would still fire P001F here";
+    }
+    {
+        auto buf = SourceBuffer::fromString("#warnn x\nint v=1;\n", "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(
+            hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "the rebound `#warnn` word now drives the `#warning` handler";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported));
+    }
+}
+
+// ── `#warning` (the half that unblocks sys/cdefs.h) ─────────────────────────
+
+// (11) ★ A reached `#warning` is NON-FATAL: it is reported, carries the user's
+// text, and translation CONTINUES (C23 6.10.6) -- `hasErrors()` stays FALSE and
+// the program still reaches the parser intact. This is the whole point of the
+// directive: `sys/cdefs.h` emits `#warning`s on paths a build must survive.
+// RED-ON-DISABLE: drop the explicit `DiagnosticSeverity::Warning` argument from
+// the `#warning` `emitPP` call (every other `emitPP` in the file DEFAULTS to
+// Error) -- `hasErrors()` flips true and the severity assertion reds.
+TEST(Preprocessor, TfC70WarningDirectiveReachedIsNonFatal) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#warning deprecated path\nint x=1;\n", r);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "a REACHED `#warning` must be reported";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "`#warning` must NOT bump errorCount -- translation continues "
+           "(C23 6.10.6); a fatal `#warning` breaks every build that uses one";
+    auto const* d =
+        firstDiagWithCode(r, DiagnosticCode::P_PreprocessorWarningDirective);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Warning);
+    EXPECT_NE(d->actual.find("deprecated path"), std::string::npos)
+        << "the message must include the author's pp-tokens; got: " << d->actual;
+    EXPECT_TRUE(isIntXAssignOne(lexs))
+        << "translation continues: the whole program still reaches the parser";
+}
+
+// (12) The `#warning` silence twin. Note `hasErrors()` is false either way for
+// a warning, so the load-bearing assertions here are the CODE's absence and the
+// empty diagnostic list -- not the error flag.
+// RED-ON-DISABLE: hoist the `#warning` arm above `if (!stackActive()) return
+// end;` (or handle it in the unconditional `#if`-family block) -- the dead
+// group's `#warning` then fires and both assertions red.
+TEST(Preprocessor, TfC70WarningDirectiveInDeadBranchIsSilent) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#if 0\n#warning must not fire\n#endif\nint x=1;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "a `#warning` in a NOT-TAKEN group is not executed (C 6.10p1)";
+    EXPECT_TRUE(r.diagnostics->all().empty())
+        << "a dead-branch `#warning` must be completely silent (got "
+        << r.diagnostics->all().size() << " diagnostics)";
+    EXPECT_TRUE(isIntXAssignOne(lexs));
+}
+
+// ── PRE-SCAN PROSE GUARD ────────────────────────────────────────────────────
+
+// (13) The `#error`/`#warning` MESSAGE BODY is prose, never directives. This is
+// a real seam, not a hypothetical: `SynthBuilder`'s include pre-scan
+// (preprocessor.cpp ~:1136) scans for the intro token with NO `firstOnLine`
+// guard -- unlike the authoritative `MacroExpander` loop -- so any `#` EMBEDDED
+// in the prose is read as a directive of its own unless the whole line is
+// skipped. The consequences are one-sided and LOUD-but-WRONG: a phantom macro
+// harvested into `localMacros` flips a later guard, and the include arm then
+// eagerly resolves a header the program never asked for (P0016 on a file the
+// authoritative pass never looks at).
+//
+// ★ RED-ON-DISABLE — HONEST STATEMENT, corrected after measurement. The
+// pre-scan now carries TWO guards that each independently prevent this shape:
+// (1) `sbFirstOnLine` on the hash test (a `#` is a directive intro only when
+// FIRST on its line, C 6.10p1), and (2) the unhandled-directive line skip.
+// MEASURED: disabling EITHER one alone leaves this test GREEN — they overlap
+// here, so this test does NOT pin either individually and it is honest to say
+// so rather than claim a red-on-disable it does not have. It reds only when
+// BOTH are removed. The guard that IS uniquely pinned by a single test is
+// `sbFirstOnLine`, by `TfC70StrayHashInOrdinaryTextIsNotADirective` below —
+// a stray `#` in ORDINARY TEXT, which the line skip structurally cannot cover
+// because there is no directive word to match. NOTE the skip is deliberately
+// stated as the GENERAL invariant
+// (any directive this pre-scan does not itself process gets its line skipped,
+// D-PP-PRESCAN-UNHANDLED-DIRECTIVE-LINE-SKIP), NOT as an
+// `errorDirective`/`warningDirective` special case: an enumerated list left
+// `#pragma`/`#line`/`#embed` carrying the identical exposure. So this test
+// guards the whole class, and the sub-cases below are merely the two shapes
+// that were empirically reproduced. Each sub-case reds:
+//   (A) the prose `#define POISON` is harvested (the define arm is live here),
+//       `#if defined(POISON)` folds TRUE in the pre-scan only, and
+//       `#include "missing.h"` is resolved -> P0016;
+//   (B) the prose `#endif` POPS the dead frame in the pre-scan (the conditional
+//       arm runs UNCONDITIONALLY, by design, to keep nesting balanced), so the
+//       following dead `#include "missing.h"` becomes "confident-live" and is
+//       resolved -> P0016;
+//   (C) the `#warning` twin of (A) -- pins that the skip covers BOTH words, not
+//       just `#error`.
+// The skip must NOT be gated on `sbStackActive`: sub-case (B) is a DEAD group.
+TEST(Preprocessor, TfC70ErrorMessageBodyIsNotScannedAsDirectives) {
+    // (A) LIVE `#error`, prose containing a `#define`.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#error do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
+            << "non-vacuous: the `#error` itself IS reached and fires";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#define POISON` must not be harvested by the "
+               "pre-scan -- doing so flips `#if defined(POISON)` and resolves "
+               "an include the authoritative pass never executes";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (B) DEAD `#error`, prose containing an `#endif` (the conditional arms run
+    // unconditionally, so this shape corrupts the frame stack without the skip).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "#error remove this #endif marker\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` must not pop the pre-scan's conditional "
+               "frame -- doing so makes the DEAD include look live and "
+               "resolves a header that does not exist";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "the whole group is dead: nothing at all is reported (got "
+            << r.diagnostics->all().size() << ")";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (C) LIVE `#warning`, prose containing a `#define` -- the skip covers both
+    // directive words. Here the fixed engine reports NOTHING fatal, so the
+    // error flag itself is a red-on-disable witness.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#warning do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+            << "non-vacuous: the `#warning` itself IS reached and reported";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the `#warning` prose must be skipped by the pre-scan too";
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a `#warning` alone is non-fatal; a spurious P0016 from the "
+               "prose would make this compile fail";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+}
+
+// ★ THE `sbFirstOnLine` PIN — the one guard no other test isolates.
+// C 6.10p1: a `#` introduces a directive only when it is FIRST on its line.
+// The authoritative `MacroExpander` loop always enforced that; the include
+// PRE-SCAN did not, so a `#` ANYWHERE — in ordinary program text, not merely in
+// a directive payload — was read as a directive of its own. The
+// unhandled-directive line skip cannot reach this shape: there is no directive
+// word on the line to match, so the skip never fires. That makes this the ONLY
+// discriminating witness between the two overlapping guards.
+//
+// RED-ON-DISABLE (DEMONSTRATED): drop `|| !sbFirstOnLine(i)` from the pre-scan's
+// hash test and this test fails — with the line skip still fully in place.
+// Before the guard, the prose `#endif` POPPED the pre-scan's conditional frame
+// (the conditional arms run UNCONDITIONALLY, by design, to keep nesting
+// balanced), so the DEAD `#include` below it looked live and was eagerly
+// resolved: a hard `P0016` on a header the authoritative pass never looks at.
+TEST(Preprocessor, TfC70StrayHashInOrdinaryTextIsNotADirective) {
+    // A bare `#` mid-line in ORDINARY TEXT, inside a dead group.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "x # endif y\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` that is not first on its line is NOT a directive: the "
+               "prose `#endif` must not pop the pre-scan's frame and make the "
+               "dead include look live";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // The same stray `#` in a LIVE region must also stay inert for the
+    // pre-scan (it is ordinary text; the parser may reject it later, but the
+    // pre-scan must not resolve an include off it).
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#define GUARD 1\n"
+                        "a # include \"missing.h\" b\n"
+                        "int x=1;\n",
+                        r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a mid-line `# include` is ordinary text, not a directive -- "
+               "the pre-scan must not resolve it";
+    }
+}
+
+// The SAME class, for the two OTHER directive words whose payload the pre-scan
+// does not interpret: `#pragma` and `#line`
+// (D-PP-PRESCAN-UNHANDLED-DIRECTIVE-LINE-SKIP).
+//
+// WHY THIS TEST EXISTS SEPARATELY FROM THE `#error`/`#warning` ONE ABOVE. The
+// first cut of the fix ENUMERATED `errorDirective`/`warningDirective`, which
+// was correct-but-incomplete: `#pragma`/`#line`/`#embed` kept the identical
+// exposure, and the suite was green over that SUBSET. The fix is now the
+// general invariant — "any directive this pre-scan does not itself process
+// gets its line skipped" — but an invariant stated only in a comment decays.
+// These cases pin the OTHER forms so a future narrowing back to an enumerated
+// list cannot pass. `#pragma` is the realistic one: C 6.10.6 makes its payload
+// implementation-defined token soup, and the authoritative pass consumes-and-
+// drops it, so a bare `#` in a payload is entirely plausible.
+//
+// ★ RED-ON-DISABLE — CORRECTED AFTER MEASUREMENT, and the correction matters.
+// An earlier version of this comment claimed each sub-case reds when the
+// unhandled-directive line skip is collapsed to a bare `continue`. That WAS
+// true when the skip was the only guard; it is FALSE now. `sbFirstOnLine` was
+// added to the pre-scan's hash test afterwards, and every payload `#` here is
+// BY DEFINITION not first on its line — so `sbFirstOnLine` alone keeps (A)-(D)
+// green and the line skip has NO single-test pin at all. These sub-cases pin
+// the PAIR, exactly like their `#error`/`#warning` sibling above; they red only
+// when BOTH guards are removed.
+//
+// The skip is deliberately KEPT despite being behaviourally subsumed: it states
+// the intent locally ("this pass does not interpret that payload") and it
+// advances `i` past the whole line instead of stepping token-by-token. But it
+// is defence-in-depth plus a small win, NOT the load-bearing guard — do not
+// claim a red-on-disable for it, and do not let its presence excuse weakening
+// `sbFirstOnLine`, which IS uniquely pinned (by
+// `TfC70StrayHashInOrdinaryTextIsNotADirective`).
+// ★ A first attempt at (C) used `#line 7 "x #define POISON"` and did NOT red —
+// the `#define` sat inside a STRING LITERAL and lexes as one token, so the
+// pre-scan never saw a `#`. The bare-`#` form below is the one that bites;
+// keep it that way or this sub-case silently stops testing anything.
+TEST(Preprocessor, TfC70PragmaAndLinePayloadsAreNotScannedAsDirectives) {
+    // (A) `#pragma` payload carrying a prose `#define`.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#pragma GCC poison do not #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` inside a `#pragma` payload must not be read as a "
+               "directive: harvesting the prose `#define POISON` flips "
+               "`#if defined(POISON)` in the PRE-SCAN ONLY and resolves an "
+               "include the authoritative pass never executes";
+        // ★ TF-C82: assert the diagnostic SET, not `hasErrors()`. `GCC poison`
+        // now matches an `unsupported` registry row and is LOUD — a REACHED
+        // pragma with real semantics DSS has not built. That is this cycle
+        // working, and it is orthogonal to what THIS test is about, so the
+        // expectation names both codes instead of collapsing them into a
+        // hasErrors() that would silently absorb a future regression.
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+            << "`GCC poison` is an `unsupported` row — reached, it fails loud";
+        for (auto const& d : r.diagnostics->all()) {
+            EXPECT_EQ(d.code, DiagnosticCode::P_PreprocessorPragma)
+                << "the ONLY diagnostic this input may produce is the pragma "
+                   "refusal; anything else means the payload was scanned";
+        }
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (B) `#pragma` payload carrying a prose `#endif`, inside a DEAD group that
+    // guards an include. Worse than (A): the conditional arms run
+    // UNCONDITIONALLY (by design, to keep nesting balanced), so a prose
+    // `#endif` POPS the frame and makes the dead include look live.
+    {
+        PreprocessResult r;
+        // ★ BARE prose, NOT `/* ... */`. An earlier version wrapped the stray
+        // `#endif` in a block comment and was INERT: comment bodies are
+        // trivia-kind tokens, so the pre-scan never sees the `#` at all and the
+        // sub-case passed with or without the guard. Exactly the trap this
+        // file documents for the string-literal attempt a few tests below —
+        // keep the payload bare or this stops testing anything.
+        auto lexs = ppLexemes("#if 0\n"
+                              "#pragma once stray #endif marker\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` must not pop the pre-scan's conditional "
+               "frame";
+        EXPECT_TRUE(r.diagnostics->all().empty())
+            << "the whole group is dead: nothing at all is reported (got "
+            << r.diagnostics->all().size() << ")";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (C) `#line` payload carrying a prose `#define`. Malformed as C, but the
+    // pre-scan must be robust to it — it runs BEFORE any directive is
+    // validated, so it cannot assume well-formedness.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#line 7 #define POISON\n"
+                              "#if defined(POISON)\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "a `#` inside a `#line` payload must not be read as a directive";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+    // (D) `#line` payload carrying a prose `#endif`, in a dead group.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0\n"
+                              "#line 7 #endif\n"
+                              "#include \"missing.h\"\n"
+                              "#endif\n"
+                              "int x=1;\n",
+                              r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "the prose `#endif` in a `#line` payload must not pop the "
+               "pre-scan's conditional frame";
+        EXPECT_TRUE(isIntXAssignOne(lexs));
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C74 — PER-ARCHITECTURE identity predefined macros from the TARGET config.
+//
+// Predefines now come from TWO config families: the LANGUAGE
+// (`preprocess.predefinedMacros`) and the TARGET (`predefinedMacros` in
+// `<arch>.target.json`). They are merged ONCE, at `preprocess()` entry, by
+// `mergePredefinedMacros` — which is also the ONE place the per-format
+// availability filter now runs. All FOUR predefine seed sites then iterate that
+// single effective list, so the include-gating pre-scan and the authoritative
+// MacroExpander can no longer disagree (a divergence there is a silent P0016
+// seam: the pre-scan resolving a gated `#include` the real pass reads dead).
+//
+// ★ The four seed sites are pinned INDIVIDUALLY below. A naive implementation
+// wires only the MacroExpander (#2), and a test suite that only checked
+// `#if defined(X)` would pass on it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Build a target-side predefine row without going through a .target.json — so
+// these tests pin the ENGINE contract, not the shipped config's current
+// contents (which `test_target_schema.cpp` pins separately).
+[[nodiscard]] PredefinedMacroDef targetMacro(
+    std::string name, std::string value,
+    std::vector<std::string> formats = {}) {
+    PredefinedMacroDef pm;
+    pm.name                   = std::move(name);
+    pm.kind                   = PredefinedMacroKind::Constant;
+    pm.value                  = std::move(value);
+    pm.availableObjectFormats = std::move(formats);
+    return pm;
+}
+
+// `ppLexemes`, but with an active object format + a TARGET predefine list.
+[[nodiscard]] std::vector<std::string> ppLexemesForTarget(
+    std::string text, std::optional<ObjectFormatKind> fmt,
+    std::span<PredefinedMacroDef const> targetMacros, PreprocessResult& out,
+    std::span<std::filesystem::path const> includeDirs = {}) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::string> noDefines;
+    out = preprocess(buf, schema, includeDirs, {}, fmt, noDefines, targetMacros);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+
+}  // namespace
+
+// ── SEED SITE #2: the authoritative MacroExpander `predefined_` map ───────
+// Ordinary expansion of a target predefine in normal code. This is the site a
+// naive implementation wires FIRST (and often only).
+// RED-ON-DISABLE: revert the `merged.effective` loop in the MacroExpander ctor
+// to `cfg().predefinedMacros` and the token comes back as the identifier.
+TEST(Preprocessor, TFC74TargetPredefineExpandsSeedSiteExpander) {
+    std::vector<PredefinedMacroDef> tms{targetMacro("__ARCHPROBE__", "7")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("int x = __ARCHPROBE__;\n",
+                                   ObjectFormatKind::Elf, tms, r);
+    // EXACT surviving token stream, not a count: `7` must have REPLACED the
+    // identifier, not been appended alongside it.
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "7", ";"}));
+}
+
+// ── SEED SITE #1: the include-gating pre-scan's definedness oracle ────────
+// A `#ifdef`-gated QUOTE-include whose gate is a FUNCTION-LIKE target
+// predefine. The pre-scan decides whether to SPLICE the header long before the
+// MacroExpander runs, so it needs its own view of the predefines
+// (`SynthBuilder::sbNameDefined`).
+//
+// ★ The gate MUST be function-like to ISOLATE this seed site. MEASURED while
+// verifying red-on-disable: with an OBJECT-like gate, reverting `sbNameDefined`
+// alone leaves the test GREEN — the pre-scan VALUE prefix (seed site #4) also
+// materializes object-like predefines into `localMacros`, which `sbNameDefined`
+// consults first, so the two sites mask each other. Function-like predefines
+// are EXCLUDED from the value prefix (FINDING-A: value-seeding a call macro
+// would make a bare `#if NAME` fold more-live in the pre-scan than in the
+// authoritative pass — a P0016 re-open), so ONLY the predefined arm of
+// `sbNameDefined` can report this one DEFINED.
+//
+// RED-ON-DISABLE (VERIFIED): revert `sbNameDefined`'s loop to
+// `schema->preprocess().predefinedMacros` — the header is not spliced and
+// `MARKER_FROM_HEADER` never appears.
+TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tfc74_prescan_ifdef";
+    std::error_code ec;
+    fs::create_directories(dir);
+    {
+        std::ofstream h(dir / "arch_gated.h");
+        h << "int MARKER_FROM_HEADER = 1;\n";
+    }
+    std::vector<fs::path> const dirs{dir};
+
+    PredefinedMacroDef fn;
+    fn.name           = "__ARCHFNPROBE__";
+    fn.kind           = PredefinedMacroKind::Constant;
+    fn.value          = "";
+    fn.params         = {"x"};
+    fn.isFunctionLike = true;
+    std::vector<PredefinedMacroDef> tms{fn};
+
+    static constexpr char const* kSrc = "#ifdef __ARCHFNPROBE__\n"
+                                        "#include \"arch_gated.h\"\n"
+                                        "#endif\n";
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget(kSrc, ObjectFormatKind::Elf, tms, r, dirs);
+    EXPECT_NE(std::find(lexs.begin(), lexs.end(), "MARKER_FROM_HEADER"),
+              lexs.end())
+        << "an `#ifdef`-gated quote-#include must SPLICE when the gate is a "
+           "FUNCTION-LIKE TARGET predefine — the pre-scan's definedness oracle "
+           "is a seed site the value prefix cannot cover";
+
+    // Mirror: with NO target list the same source must NOT splice — proving the
+    // splice above came from the target predefine and not from something else.
+    PreprocessResult r2;
+    auto lexs2 = ppLexemesForTarget(kSrc, ObjectFormatKind::Elf, {}, r2, dirs);
+    EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_FROM_HEADER"),
+              lexs2.end());
+    // `ec` overload, like the other 50 cleanup calls in this file: a teardown
+    // hiccup must not throw out of a test body that has already made every
+    // assertion it exists to make. (This site and its twin below were the two
+    // that still threw — MEASURED as `filesystem error: in remove_all: No such
+    // file or directory` when a colliding sibling process removed the directory
+    // first, back when the path was a constant.)
+    fs::remove_all(dir, ec);
+}
+
+// ── SEED SITE #4: the pre-scan's VALUE prefix ─────────────────────────────
+// A `#if <macro> == N`-gated QUOTE-include. Definedness is not enough here: the
+// pre-scan must know the macro's VALUE. A `#ifdef`-only test would pass with
+// site #4 unwired (the value would fold to 0 and the include would be skipped).
+// RED-ON-DISABLE: revert the `preScanDefinePrefix` loop to
+// `schema->preprocess().predefinedMacros` — the gate folds 0 and the header is
+// silently dropped.
+TEST(Preprocessor, TFC74TargetPredefineValueGatesIncludeSeedSitePreScanValue) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tfc74_prescan_value";
+    std::error_code ec;
+    fs::create_directories(dir);
+    {
+        std::ofstream h(dir / "value_gated.h");
+        h << "int MARKER_VALUE_GATED = 1;\n";
+    }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> tms{targetMacro("__ARCHPROBE__", "7")};
+
+    // TRUE arm: value 7 == 7 ⇒ splice.
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("#if __ARCHPROBE__ == 7\n"
+                                   "#include \"value_gated.h\"\n"
+                                   "#endif\n",
+                                   ObjectFormatKind::Elf, tms, r, dirs);
+    EXPECT_NE(std::find(lexs.begin(), lexs.end(), "MARKER_VALUE_GATED"),
+              lexs.end())
+        << "a VALUE-gated quote-#include must see the target predefine's VALUE, "
+           "not merely its definedness";
+
+    // FALSE arm: same macro, wrong value ⇒ no splice. This is what proves the
+    // value actually arrived (a definedness-only seed would make BOTH arms
+    // behave the same way).
+    PreprocessResult r2;
+    auto lexs2 = ppLexemesForTarget("#if __ARCHPROBE__ == 8\n"
+                                    "#include \"value_gated.h\"\n"
+                                    "#endif\n",
+                                    ObjectFormatKind::Elf, tms, r2, dirs);
+    EXPECT_EQ(std::find(lexs2.begin(), lexs2.end(), "MARKER_VALUE_GATED"),
+              lexs2.end());
+    fs::remove_all(dir, ec);   // `ec` overload — see the twin site above
+}
+
+// ── SEED SITE #3: the "<built-in>" prologue (FUNCTION-LIKE predefines) ────
+// A function-like target predefine is NOT seeded into `predefined_`; it lowers
+// to a `#define name(params) value` line in the synthetic "<built-in>"
+// prologue. RED-ON-DISABLE: revert the builtin-prologue loop to
+// `schema->preprocess().predefinedMacros` and `__ARCHATTR__(x)` survives
+// unexpanded, breaking the exact token comparison.
+TEST(Preprocessor, TFC74FunctionLikeTargetPredefineSeedSiteBuiltinPrologue) {
+    PredefinedMacroDef fn;
+    fn.name           = "__ARCHATTR__";
+    fn.kind           = PredefinedMacroKind::Constant;
+    fn.value          = "";              // erase the call entirely
+    fn.params         = {"x"};
+    fn.isFunctionLike = true;
+    std::vector<PredefinedMacroDef> tms{fn};
+
+    PreprocessResult r;
+    auto lexs = ppLexemesForTarget("__ARCHATTR__(unused) int x = 1;\n",
+                                   ObjectFormatKind::Elf, tms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "1", ";"}))
+        << "a FUNCTION-LIKE target predefine must reach the \"<built-in>\" "
+           "prologue and erase its call";
+}
+
+// ── the per-format filter, on TARGET entries, in BOTH directions ──────────
+// This is what keeps the Apple-only `__arm64__` spelling off the ELF leg.
+TEST(Preprocessor, TFC74TargetPredefineHonoursAvailableObjectFormats) {
+    std::vector<PredefinedMacroDef> tms{
+        targetMacro("__APPLEONLYPROBE__", "1", {"macho"})};
+
+    // macho ⇒ DEFINED and expanded.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       ObjectFormatKind::MachO, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "1", ";"}));
+    }
+    // elf ⇒ UNDEFINED: the identifier survives verbatim (leaking the Apple
+    // spelling onto ELF is the exact defect the gate exists to prevent).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       ObjectFormatKind::Elf, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=",
+                                                  "__APPLEONLYPROBE__", ";"}));
+    }
+    // nullopt (no target selected) ⇒ UNDEFINED: a format-restricted macro is
+    // meaningless without a format.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesForTarget("int x = __APPLEONLYPROBE__;\n",
+                                       std::nullopt, tms, r);
+        EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=",
+                                                  "__APPLEONLYPROBE__", ";"}));
+    }
+}
+
+// ── the COLLISION policy ──────────────────────────────────────────────────
+// A name owned by BOTH config families is FATAL. Neither may silently win:
+// picking either quietly is a wrong-value miscompile with no diagnostic.
+TEST(Preprocessor, TFC74CollidingPredefineFailsLoudNamingBothPaths) {
+    auto schema = cSubset();
+    // `__LINE__` is declared by the shipped c-subset language config.
+    std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+
+    EXPECT_TRUE(r.fatal)
+        << "a language/target predefine collision must abort the pass, not "
+           "silently resolve to one side";
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+
+    // The message must name BOTH declaring config paths — a diagnostic that
+    // says only "conflict" leaves the maintainer to guess which file to edit.
+    bool named = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+        named = d.actual.find("/preprocess/predefinedMacros") != std::string::npos
+             && d.actual.find("/predefinedMacros") != std::string::npos
+             && d.actual.find("__LINE__") != std::string::npos;
+        if (named) break;
+    }
+    EXPECT_TRUE(named)
+        << "the collision message must name the macro AND both declaring "
+           "config paths";
+}
+
+// ★ The collision scan runs BEFORE the format filter. `_WIN32` is declared
+// pe-GATED by the shipped c-subset language config, so on an ELF target the
+// language entry is filtered OUT — yet an ungated TARGET `_WIN32` must STILL
+// collide. Otherwise a maintainer could ship the conflict and only ever see it
+// on the one leg where both entries survive the filter.
+// RED-ON-DISABLE: move the collision scan in `mergePredefinedMacros` below the
+// filter loops and this test goes green-but-wrong.
+TEST(Preprocessor, TFC74CollisionDetectedBeforeFormatFilter) {
+    auto schema = cSubset();
+    std::vector<PredefinedMacroDef> tms{targetMacro("_WIN32", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    // ELF: the language's pe-gated `_WIN32` would NOT survive the filter.
+    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+    EXPECT_TRUE(r.fatal);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro))
+        << "a pe-GATED language `_WIN32` must still collide with an UNGATED "
+           "target `_WIN32` on an ELF build — gating decides which formats SEE "
+           "a macro, not who OWNS the name";
+}
+
+// ── the NO-REGRESSION invariant: empty target span == legacy ──────────────
+// An empty target list must produce a token stream BYTE-IDENTICAL to the
+// pre-TF-C74 engine, on every format. This is the guarantee that lets the
+// feature ship without re-verifying every existing preprocessor test.
+TEST(Preprocessor, TFC74EmptyTargetSpanIsByteIdenticalToLegacy) {
+    // Source that touches predefines the shipped language config gates
+    // differently per format (`_WIN32` is pe-only, `__APPLE__` macho-only) plus
+    // an ungated one, so a filter regression on ANY leg would show up.
+    static constexpr char const* kSrc =
+        "#ifdef _WIN32\nint w = 1;\n#endif\n"
+        "#ifdef __APPLE__\nint a = 1;\n#endif\n"
+        "long v = __STDC_VERSION__;\n";
+
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{}}) {
+        auto schema = cSubset();
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+
+        // LEGACY shape: the 6-arg overload, exactly as every pre-TF-C74 caller
+        // spells it (the target-predefine parameter defaulted away).
+        auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult legacy =
+            preprocess(legacyBuf, schema, noDirs, {}, fmt, noDefines);
+
+        // NEW shape: explicitly empty target span.
+        auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
+        std::vector<PredefinedMacroDef> none;
+        PreprocessResult withEmpty =
+            preprocess(newBuf, schema, noDirs, {}, fmt, noDefines, none);
+
+        ASSERT_FALSE(legacy.fatal);
+        ASSERT_FALSE(withEmpty.fatal);
+        // Compare the SYNTH TEXT byte-for-byte, not just the token count — the
+        // prologues and the pre-scan value prefix are text, and a regression
+        // there would be invisible to a token-count comparison.
+        EXPECT_EQ(legacy.synthBuffer->text(), withEmpty.synthBuffer->text())
+            << "an empty target span must leave the synthesized text "
+               "byte-identical to the legacy call shape";
+        ASSERT_EQ(legacy.tokens.size(), withEmpty.tokens.size());
+        for (std::size_t i = 0; i < legacy.tokens.size(); ++i) {
+            EXPECT_EQ(legacy.tokens[i].span, withEmpty.tokens[i].span);
+            EXPECT_EQ(legacy.tokens[i].coreKind, withEmpty.tokens[i].coreKind);
+        }
+    }
+}
+
+// ── `mergePredefinedMacros` unit contract ────────────────────────────────
+// Order is language-first-then-target, and stable within each side. The seed
+// sites depend on this: the "<built-in>" prologue and the pre-scan value prefix
+// are `#define` STREAMS, so order is observable behaviour, not an accident.
+TEST(Preprocessor, TFC74MergeOrderIsLanguageThenTargetStable) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("L1", "1"),
+                                         targetMacro("L2", "2")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("T1", "3"),
+                                        targetMacro("T2", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::Elf);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"L1", "L2", "T1", "T2"}));
+}
+
+// The filter is applied ONCE, here — so `effective` contains ONLY entries
+// available on the active format, from BOTH sides.
+TEST(Preprocessor, TFC74MergeAppliesFormatFilterOnceToBothSides) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("LPE", "1", {"pe"}),
+                                         targetMacro("LANY", "2")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("TMACHO", "3", {"macho"}),
+                                        targetMacro("TANY", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::MachO);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"LANY", "TMACHO", "TANY"}))
+        << "the pe-gated language entry must be filtered out and the "
+           "macho-gated target entry kept — one filter, both sides";
+}
+
+// A conflict leaves `effective` EMPTY — there is no partially-merged state a
+// caller could mistake for usable.
+TEST(Preprocessor, TFC74MergeConflictYieldsNoUsableList) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("DUP", "1")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("DUP", "2")};
+    auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::Elf);
+    EXPECT_EQ(merged.conflicts.size(), 1u);
+    EXPECT_TRUE(merged.effective.empty());
+}
+
+// ── shipped-config sibling pins: language ⊕ arm64 and language ⊕ x86_64 ───
+// The EFFECTIVE arch-identity set a real macho/elf build sees. EXACT SETS, not
+// counts — the whole point of the cycle is which SPELLINGS reach the source.
+TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+
+    auto namesOfTargetHalf = [](MergedPredefinedMacros const& m,
+                                std::size_t langCount) {
+        std::vector<std::string> out;
+        for (std::size_t i = langCount; i < m.effective.size(); ++i) {
+            out.push_back(m.effective[i].name);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto langSurviving = [&](std::optional<ObjectFormatKind> fmt) {
+        return mergePredefinedMacros((*c)->preprocess().predefinedMacros, {}, {}, fmt)
+            .effective.size();
+    };
+
+    // arm64 on MACHO: all four spellings, including the Apple-only pair.
+    {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*arm)->predefinedMacros(), {},
+                                       ObjectFormatKind::MachO);
+        ASSERT_TRUE(m.conflicts.empty())
+            << "the shipped language and arm64 configs must not collide";
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::MachO)),
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__",
+                                            "__arm64", "__arm64__"}));
+    }
+    // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
+    // APPEARS — the two gates point in OPPOSITE directions on the same target,
+    // which is the whole reason the gate is per-entry.
+    //
+    // ★ `__CHAR_UNSIGNED__` is not an identity spelling: it is the
+    // PREPROCESSOR-VISIBLE face of the target's `charIsUnsigned` key
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM), whose `default` is `true` and
+    // whose macho/pe overrides are `false`. So it must be defined on exactly
+    // the leg where the default is the effective answer. MEASURED 2026-07-28
+    // with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang
+    // 21.0.0): DEFINED for aarch64-linux-gnu; NOT defined for
+    // arm64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc.
+    {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*arm)->predefinedMacros(), {},
+                                       ObjectFormatKind::Elf);
+        ASSERT_TRUE(m.conflicts.empty());
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
+                                            "__CHAR_UNSIGNED__",
+                                            "__aarch64__"}))
+            << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
+               "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
+               "there — it is the preprocessor face of the target's "
+               "`charIsUnsigned` default, which macho/pe override to signed";
+    }
+    // x86_64: the same four spellings on every format.
+    for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
+                                 ObjectFormatKind::Pe}) {
+        auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                       (*x86)->predefinedMacros(), {}, fmt);
+        ASSERT_TRUE(m.conflicts.empty())
+            << "the shipped language and x86_64 configs must not collide";
+        EXPECT_EQ(namesOfTargetHalf(m, langSurviving(fmt)),
+                  (std::vector<std::string>{"__amd64", "__amd64__", "__x86_64",
+                                            "__x86_64__"}));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TF-C86 (D-CSUBSET-STDARG-F001A) — the conditional-inclusion OPERATORS are
+// DEFINED NAMES, and are not names a program may take over.
+//
+// WHAT WAS BROKEN. `sbNameDefined` (pre-scan) and `MacroExpander::isDefined`
+// (authoritative) both answered FALSE for `__has_include`. The universal
+// portability shim
+//     #ifndef __has_include
+//     #define __has_include(x) 0
+//     #endif
+// — Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc, musl,
+// Boost — therefore went LIVE, shadowing an operator DSS actually implements
+// with a function-like macro that answers 0 forever. The damage was not the 0:
+// it was that the pre-scan's FIX-3 arm (preprocessor.cpp, "a function-like-macro
+// invocation in the guard is NOT evaluated by this weaker pre-scan") then went
+// conservative-UNCERTAIN on every `#if __has_include(<h>)`, which skipped the
+// angle SOURCE splice, which left the directive verbatim, which made the
+// post-parse import resolver hard-fail it as `F001A` — a MISSING-HEADER error
+// for headers sitting readable on the include path. MEASURED on the sqlite
+// corpus at bb75fb8: 5 of the 7 macho `F001A` were this, all of them reached
+// through `malloc/_platform.h`.
+//
+// THE CONTRACT HAS FORMS, AND EVERY FORM IS TESTED BELOW: three declared
+// operators x {#ifdef, #ifndef, defined(), !defined(), #elifdef, #elifndef},
+// plus the `defined` NEGATIVE pin, plus the end-to-end splice witness, plus
+// both `#define` and `#undef` refusals, plus the config opt-out.
+// ════════════════════════════════════════════════════════════════════════════
+
+// The three spellings the shipped c-subset declares. Read from CONFIG, so a
+// grammar that renames one is covered and this test cannot drift from the
+// engine's own notion of the set.
+namespace {
+[[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
+    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: NAME the owning handle. The
+    // one-liner `auto const& pp = cSubset()->preprocess();` binds a reference
+    // INTO a schema owned only by a temporary `shared_ptr`, which dies at the
+    // end of that full-expression -> `pp` dangles for every read below.
+    auto schema = cSubset();
+    auto const& pp = schema->preprocess();
+    std::vector<std::string> names;
+    for (std::string const* s : {&pp.hasIncludeOperator, &pp.hasEmbedOperator,
+                                 &pp.hasCAttributeOperator}) {
+        if (!s->empty()) names.push_back(*s);
+    }
+    return names;
+}
+} // namespace
+
+// FORM 1-4: `#ifdef` / `#ifndef` / `#if defined()` / `#if !defined()`.
+// MEASURED against the host toolchain (`clang -std=c2x -E`): `#ifdef
+// __has_include` is TAKEN, and likewise `__has_embed` and `__has_c_attribute`.
+// RED-ON-DISABLE: drop the `isConditionalInclusionOperator` arm from
+// `MacroExpander::isDefined` -> every `yes` below becomes `no`.
+TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedEveryForm) {
+    auto const ops = tfc86DeclaredOperators();
+    ASSERT_EQ(ops.size(), 3u)
+        << "the shipped c-subset must declare all three operators; if one was "
+           "removed this test is measuring less than it claims";
+    for (std::string const& op : ops) {
+        {   // FORM 1 — #ifdef NAME -> taken
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes")
+                << "#ifdef " << op << " must be TAKEN — the implementation "
+                   "provides the operator";
+        }
+        {   // FORM 2 — #ifndef NAME -> NOT taken. This is the exact shape of
+            //          the shim that caused the F001A cascade.
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#ifndef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no")
+                << "#ifndef " << op << " must NOT be taken — this is the arm "
+                   "the sys/cdefs.h shadowing shim lives in";
+        }
+        {   // FORM 3 — #if defined(NAME) -> true
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if defined(" + op + ")\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes")
+                << "defined(" << op << ") must agree with #ifdef " << op;
+        }
+        {   // FORM 4 — #if !defined(NAME) -> false (the inverted polarity: a
+            //          predicate that only fixed the positive direction reds here)
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if !defined(" + op + ")\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no") << "!defined(" << op << ") must be FALSE";
+        }
+    }
+}
+
+// FORMS 5-6: the C23 `#elifdef` / `#elifndef` spellings route through the SAME
+// definedness callbacks (`handleElif`, "the definedness callbacks are the SAME
+// ones handleIf binds"). Tested separately anyway: "routes through the same
+// code" is a claim, and an untested claim is how a multi-form contract ends up
+// half-implemented.
+TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        {   // #elifdef NAME -> taken (the leading #if is false)
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if 0\nint first;\n#elifdef " + op
+                + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "yes") << "#elifdef " << op << " must be TAKEN";
+        }
+        {   // #elifndef NAME -> NOT taken
+            PreprocessResult r;
+            auto lexs = ppLexemes(
+                "#if 0\nint first;\n#elifndef " + op
+                + "\nint yes;\n#else\nint no;\n#endif\n", r);
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << op;
+            ASSERT_EQ(lexs.size(), 3u) << op;
+            EXPECT_EQ(lexs[1], "no")
+                << "#elifndef " << op << " must NOT be taken";
+        }
+    }
+}
+
+// ★ THE NEGATIVE PIN. `defined` is an OPERATOR SPELLING, not a macro name, and
+// `definedOperator` is deliberately NOT a member of
+// `isConditionalInclusionOperator`. MEASURED on the host clang: `#ifdef defined`
+// is NOT taken. RED-ON-DISABLE: add `definedOperator` to the predicate -> this
+// reds. Without this test an over-broad predicate would pass every assertion
+// above while quietly changing what `#ifdef defined` means.
+TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
+    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: see the note in
+    // `tfc86DeclaredOperators` — the owning handle must outlive `pp`.
+    auto schema = cSubset();
+    auto const& pp = schema->preprocess();
+    ASSERT_FALSE(pp.definedOperator.empty());
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef " + pp.definedOperator + "\nint yes;\n#else\nint no;\n#endif\n", r);
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "`" << pp.definedOperator << "` is an operator spelling, NOT a macro "
+           "name — #ifdef of it must be FALSE (measured: clang agrees)";
+}
+
+// ★★ THE END-TO-END WITNESS — the property the whole cycle is about, and the
+// one no definedness assertion above can see. Reproduces `sys/cdefs.h`'s shim
+// VERBATIM, then guards a real angle SOURCE include with `__has_include`, and
+// requires the header to be TEXTUALLY SPLICED (its macro must EXPAND — a
+// symbol-only cross-ref would carry no macros).
+//
+// RED-ON-DISABLE, MEASURED: with the `isDefined` arm reverted, the shim goes
+// live, `__has_include` becomes a function-like macro, the pre-scan's FIX-3 arm
+// bails uncertain, the splice is skipped, `MARKER_OK` never expands and the
+// directive's `#` survives verbatim — which is exactly the state that produced
+// `F001A: got mach/boolean.h` on a header that was present the whole time.
+TEST(Preprocessor, TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_tfc86_shim_endtoend";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "guarded.h", std::ios::binary)
+        << "#define MARKER_OK 4242\nint guarded_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        // The shim, byte-for-byte as the SDK writes it ...
+        "#ifndef __has_include\n"
+        "#define __has_include(x) 0\n"
+        "#endif\n"
+        // ... then the guarded include it is supposed to leave alone.
+        "#if __has_include(<guarded.h>)\n"
+        "#include <guarded.h>\n"
+        "#endif\n"
+        "int u = MARKER_OK;\n",
+        r, {inc}, {});
+
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the shim is DEAD code here (its #ifndef is false), so nothing in "
+           "this TU may error";
+    EXPECT_FALSE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "the GUARDED shim must never trip the redefinition refusal — the "
+           "belt must not break the world's most common portability idiom";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("guarded_sym"))
+        << "the guarded header must be textually spliced despite the shim";
+    EXPECT_TRUE(has("4242"))
+        << "MARKER_OK must EXPAND — proving a real textual splice, which is the "
+           "property F001A's cascade destroyed";
+    EXPECT_FALSE(has("#"))
+        << "the include directive must be consumed, not left verbatim for the "
+           "import resolver to hard-fail as a missing system header";
+    fs::remove_all(inc, ec);
+}
+
+// The `#define` refusal, for EVERY declared operator. An UNGUARDED shadow is a
+// silent miscompile (the guard would answer 0 while `#include` still splices),
+// so it is refused loudly and the operator KEEPS working.
+TEST(Preprocessor, TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define " + op + "(x) 0\n"
+            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "#define " << op << " must fail LOUD";
+        ASSERT_EQ(lexs.size(), 3u) << op;
+        EXPECT_EQ(lexs[1], "yes")
+            << op << " must STILL be the operator after the refusal — a "
+                     "refusal that also dropped the name would leave the "
+                     "program in the shadowed state it was refused for";
+    }
+}
+
+// The `#undef` half. Symmetric, and equally load-bearing: an `#undef` that
+// SUCCEEDED would turn the operator back into an ordinary identifier folding
+// to 0 — the same include-vs-guard disagreement by a different route.
+TEST(Preprocessor, TFC86UndefOfOperatorFailsLoudEveryOperator) {
+    for (std::string const& op : tfc86DeclaredOperators()) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#undef " + op + "\n"
+            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "#undef " << op << " must fail LOUD";
+        ASSERT_EQ(lexs.size(), 3u) << op;
+        EXPECT_EQ(lexs[1], "yes")
+            << op << " must survive the refused #undef";
+    }
+}
+
+// The refusal is UNSUPPRESSABLE: `--suppress` of it would restore exactly the
+// silent include-vs-guard disagreement it exists to prevent.
+TEST(Preprocessor, TFC86OperatorNameRefusalIsUnsuppressable) {
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "suppressing this code re-opens the silent miscompile channel";
+}
+
+// AGNOSTICISM (opt-OUT). With `hasIncludeOperator` stripped from config, DSS no
+// longer provides the operator — so `#ifndef __has_include` becomes TRUE and the
+// shim is correct to fire, exactly as it is on a compiler that lacks it. Pins
+// that the definedness comes from the CONFIG-DECLARED set and not from a
+// hard-coded `__has_include` lexeme. RED-ON-DISABLE: hard-code the name in
+// `isConditionalInclusionOperator` -> the stripped grammar still reports it
+// defined -> `no`.
+TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (std::string const& line :
+         {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
+          std::string{"    \"hasIncludeAngleOpenToken\":  \"LtOp\",\n"},
+          std::string{"    \"hasIncludeAngleCloseToken\": \"GtOp\",\n"}}) {
+        auto const pos = text.find(line);
+        ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
+        text.erase(pos, line.size());
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    ASSERT_TRUE(loaded.has_value());
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_TRUE(schema->preprocess().hasIncludeOperator.empty());
+
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#ifndef __has_include\nint yes;\n#else\nint no;\n#endif\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "yes")
+        << "with the operator stripped from CONFIG, DSS does not provide it, so "
+           "#ifndef __has_include is TRUE and the portability shim correctly "
+           "fires — the definedness must follow config, never a baked-in name";
+}
+
+// ★ THE PRE-SCAN'S OWN PIN — added because the first red-on-disable pass
+// MEASURED that it was MISSING. Reverting `SynthBuilder::sbNameDefined`'s
+// operator arm left all eight tests above GREEN, because the pre-scan carries
+// TWO independent guards (this one, and the define-TRACKING refusal that keeps
+// a shadowing `#define` out of `localMacros`) and every test above is satisfied
+// by the second one alone. A guard whose assertion is already met by a
+// DIFFERENT mechanism on the tested path is not a guard.
+//
+// This input isolates `sbNameDefined` exactly: the include's liveness is
+// decided BY the operator's definedness, and no `#define` of the operator
+// appears anywhere, so the define-tracking arm is inert here.
+//
+// With `sbNameDefined` correct, the pre-scan reads `#ifdef __has_include` LIVE,
+// `includeResolvable()` is true, and the angle SOURCE arm splices `probe.h`
+// textually — so `PRESCAN_MARKER` EXPANDS. Reverted, the pre-scan reads the
+// group DEAD, skips the splice, leaves the directive verbatim, and the marker
+// never expands (while the authoritative pass, which has its own correct
+// `isDefined`, considers the branch live — the pre-scan/authoritative
+// DIVERGENCE that the one-directional-lockstep invariant forbids).
+//
+// RED-ON-DISABLE: MEASURED — replacing `sbNameDefined`'s operator arm with
+// `return false;` reds this test and only this test.
+TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_tfc86_prescan_gate";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "probe.h", std::ios::binary)
+        << "#define PRESCAN_MARKER 9191\nint prescan_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        // No `#define` of the operator ANYWHERE — the define-tracking arm
+        // cannot be what makes this pass.
+        "#ifdef __has_include\n"
+        "#include <probe.h>\n"
+        "#endif\n"
+        "int u = PRESCAN_MARKER;\n",
+        r, {inc}, {});
+
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("prescan_sym"))
+        << "the PRE-SCAN must read `#ifdef __has_include` as LIVE, or it never "
+           "splices the header the authoritative pass then believes is there";
+    EXPECT_TRUE(has("9191"))
+        << "PRESCAN_MARKER must EXPAND — only a real textual splice carries the "
+           "header's macros, and only a live-reading pre-scan performs one";
+    EXPECT_FALSE(has("#"))
+        << "the directive must be consumed by the pre-scan, not survive to be "
+           "hard-failed downstream as a missing system header";
+    fs::remove_all(inc, ec);
+}
+
+// The pre-scan's SECOND guard, pinned on its own for the same reason. Here the
+// shadowing `#define` IS present but UNGUARDED, so `sbNameDefined` cannot be
+// what saves it (the operator is defined either way): what must hold is that
+// the pre-scan REFUSES to record the operator into `localMacros`. If it
+// recorded it, FIX-3 would see a function-like macro in the following
+// `#if __has_include(<...>)` guard, go conservative-uncertain, and skip the
+// splice — reproducing the F001A cascade with the definedness fix in place.
+//
+// RED-ON-DISABLE: MEASURED — dropping the `isConditionalInclusionOperator`
+// filter from the pre-scan's `#define` arm reds this test.
+TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_tfc86_prescan_norecord";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+    fs::create_directories(inc);
+    { std::ofstream(inc / "norec.h", std::ios::binary)
+        << "#define NOREC_MARKER 7373\nint norec_sym;\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#define __has_include(x) 0\n"      // UNGUARDED — refused, and refused
+        "#if __has_include(<norec.h>)\n"    // loudly (asserted below)
+        "#include <norec.h>\n"
+        "#endif\n"
+        "int u = NOREC_MARKER;\n",
+        r, {inc}, {});
+
+    EXPECT_TRUE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "the unguarded shadow must be refused LOUDLY";
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("norec_sym"))
+        << "the refused #define must leave the operator INTACT in the pre-scan "
+           "too — a pre-scan that recorded it would go FIX-3-uncertain on the "
+           "next guard and skip this splice";
+    EXPECT_TRUE(has("7373"))
+        << "NOREC_MARKER must EXPAND — the splice really happened";
+    fs::remove_all(inc, ec);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) — GUARD-AWARE INCLUDE RE-ENTRY.
+//
+// ★ WHAT THIS BLOCK PINS. `includeStack` used to REFUSE re-entry into any header
+// already on the stack, emitting `P_PreprocessorIncludeError`. That rejects
+// LEGAL, STANDARD-CONFORMING C. MEASURED on the macho corpus leg at 5093341,
+// `src/mem1.c`:
+//     mach/mach_types.h -> mach/task_policy.h -> mach/mach_types.h
+// terminates perfectly under a real cpp — the second entry hits
+// `#ifndef _MACH_MACH_TYPES_H_` and expands to nothing. cpp has NO
+// refuse-re-entry rule; it has a NESTING DEPTH limit, and the include guard is
+// what terminates the cycle. That one false positive was the sole cause of the
+// leg's 4 residual `F_ShippedHeaderNotFound`.
+//
+// ★ WHY THERE IS ONE TEST PER GUARD SPELLING RATHER THAN ONE FOR "GUARDS".
+// Guard DETECTION GATES re-entry, so an unrecognised but LEGAL guard becomes a
+// REFUSED include — which presents to a user as a compiler bug. The corpus
+// exercises exactly ONE spelling (`#ifndef`); every other spelling below was
+// MEASURED in the macOS SDK and/or the sqlite tree and would otherwise ship
+// untested. Counts are from `scratchpad/guard-shape-census.py` over the 3100 SDK
+// headers + 52 sqlite headers.
+//
+// Shared shape of every POSITIVE test: `outer.h` includes `inner.h`, and
+// `inner.h` includes `outer.h` BACK. Under the old rule the back-edge was
+// refused and errored. Under the new one it is permitted, the guard empties the
+// second expansion, and `OUTER_MARK` — defined in outer.h AFTER the back-edge
+// resolves — must still reach the program text exactly once.
+
+namespace {
+
+// Build the outer/inner pair in a fresh dir and preprocess a main.c that
+// includes `outer.h`. `outerGuardOpen`/`outerGuardClose` are the SPELLING under
+// test; `outerBody` is spliced between them.
+struct ReentryFixture {
+    std::filesystem::path dir;
+    PreprocessResult      result;
+    std::vector<std::string> lexemes;
+
+    [[nodiscard]] bool has(std::string_view s) const {
+        for (auto const& l : lexemes) if (l == s) return true;
+        return false;
+    }
+    [[nodiscard]] std::size_t count(std::string_view s) const {
+        std::size_t n = 0;
+        for (auto const& l : lexemes) if (l == s) ++n;
+        return n;
+    }
+    [[nodiscard]] std::vector<std::string> messages() const {
+        std::vector<std::string> out;
+        for (auto const& d : result.diagnostics->all()) out.push_back(d.actual);
+        return out;
+    }
+    [[nodiscard]] bool anyMessageContains(std::string_view needle) const {
+        for (auto const& m : messages()) {
+            if (m.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+};
+
+// `guardedOuter` is outer.h's FULL text and must (a) include "inner.h" and
+// (b) define OUTER_MARK to 8787 after it.
+[[nodiscard]] ReentryFixture runReentry(std::string const& tag,
+                                        std::string const& guardedOuter,
+                                        std::string const& innerText) {
+    namespace fs = std::filesystem;
+    ReentryFixture f;
+    f.dir = ppScratchRoot() / ("dss_tf87_" + tag);
+    std::error_code ec;
+    fs::remove_all(f.dir, ec);
+    fs::create_directories(f.dir, ec);
+    { std::ofstream(f.dir / "outer.h", std::ios::binary) << guardedOuter; }
+    { std::ofstream(f.dir / "inner.h", std::ios::binary) << innerText; }
+    f.lexemes = ppLexemesWithDirs("#include \"outer.h\"\nint m = OUTER_MARK;\n",
+                                  f.result, {f.dir}, {});
+    fs::remove_all(f.dir, ec);   // the splice is complete; nothing re-reads it
+    return f;
+}
+
+// inner.h ALWAYS includes outer.h back — that back-edge is the whole point.
+constexpr char const* kInnerIncludesOuterBack =
+    "#include \"outer.h\"\nint inner_sym_8787;\n";
+
+// ★ ONE constant, read by BOTH the test that requires this phrase and the two
+// that require its ABSENCE. Two hand-typed copies is how a message-assertion
+// goes vacuous: the `EXPECT_FALSE` half passes for free the moment the phrasing
+// drifts, and nothing says so. (TF-C86 shipped exactly that gap once.)
+constexpr char const* kNoMechanismPhrase = "include-once mechanism was found";
+constexpr char const* kDepthCapPhrase    = "include nesting deeper than";
+constexpr char const* kRefusalPhrase     = "refusing to re-enter";
+
+// Assert the POSITIVE contract: no diagnostic at all, the back-edge produced no
+// duplicate text, and the marker really expanded.
+void expectReentryPermitted(ReentryFixture const& f, char const* what) {
+    EXPECT_FALSE(f.result.diagnostics->hasErrors())
+        << what << ": re-entry into a GUARDED header must be PERMITTED — the "
+                   "guard is what makes the second expansion empty, exactly as "
+                   "in cpp. First diagnostic: "
+        << (f.messages().empty() ? std::string{"<none>"} : f.messages().front());
+    EXPECT_EQ(f.count("8787"), 1u)
+        << what << ": OUTER_MARK must expand EXACTLY ONCE — 0 means the header "
+                   "was dropped, >1 means the guard failed to empty the "
+                   "re-entered copy and the text was spliced twice";
+    EXPECT_EQ(f.count("inner_sym_8787"), 1u)
+        << what << ": inner.h's own text must appear exactly once";
+}
+
+}  // namespace
+
+// ── FORM 1: canonical `#ifndef X` / `#define X`. ────────────────────────────
+// MEASURED 2942 of 3100 SDK headers and 35 of 52 sqlite headers. THE corpus
+// shape (`mach/mach_types.h`).
+TEST(Preprocessor, Tf87ReentryPermittedForCanonicalIfndefGuard) {
+    auto f = runReentry("ifndef",
+                        "#ifndef OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#ifndef X / #define X");
+}
+
+// ── FORM 2: `#if !defined(X)` / `#define X`. ────────────────────────────────
+// MEASURED 10 SDK headers (`_inttypes.h`, `odmodule/*`) + 1 sqlite
+// (`ext/expert/sqlite3expert.h`).
+TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedParenGuard) {
+    auto f = runReentry("ifnotdef_paren",
+                        "#if !defined(OUTER_H)\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined(X) / #define X");
+}
+
+// ── FORM 3: `#if !defined X` — NO PARENTHESES. ──────────────────────────────
+// MEASURED as real SDK vocabulary (`math.h:809`, `libxslt/xsltconfig.h:173`,
+// `Spatial/SPPose3D.h:23` …) though never as a first-line guard in this tree.
+// Supported because a spelling that is legal C must not become a refused
+// include the day someone uses it as a guard.
+TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedNoParenGuard) {
+    auto f = runReentry("ifnotdef_noparen",
+                        "#if !defined OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined X (no parens) / #define X");
+}
+
+// ── FORM 4: COMPOUND, all-negative. ─────────────────────────────────────────
+// MEASURED verbatim in `pcap/bpf.h`:
+//   #if !defined(_NET_BPF_H_) && !defined(_BPF_H_) && … && !defined(lib_pcap_bpf_h)
+// The guard name is the LAST of five, so a detector that only reads the first
+// operand refuses this header.
+TEST(Preprocessor, Tf87ReentryPermittedForCompoundAllNegativeGuard) {
+    auto f = runReentry("compound_neg",
+                        "#if !defined(_ALT_A) && !defined(_ALT_B) "
+                        "&& !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if !defined(A) && !defined(B) && !defined(X)");
+}
+
+// ── FORM 5: COMPOUND with MIXED polarity. ───────────────────────────────────
+// MEASURED in the sqlite corpus ITSELF — `ext/misc/windirent.h`:
+//   #if defined(_WIN32) && defined(_MSC_VER) && !defined(SQLITE_WINDIRENT_H)
+// and `ext/session/sqlite3session.h`:
+//   #if !defined(__SQLITESESSION_H_) && defined(SQLITE_ENABLE_SESSION)
+// A detector that pattern-matches "the condition is a negation" fails both.
+TEST(Preprocessor, Tf87ReentryPermittedForCompoundMixedPolarityGuard) {
+    auto f = runReentry("compound_mixed",
+                        "#define GATE_ON 1\n"
+                        "#if defined(GATE_ON) && !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#if defined(ON) && !defined(X)");
+}
+
+// ── FORM 6: the `#define` is NOT the next line. ─────────────────────────────
+// MEASURED 15 headers (libc++ `inttypes.h` / `stdint.h` put it 5 logical lines
+// down; `sys/_types/_os_inline.h` 2). Comments, blank lines AND a nested `#if`
+// all sit between the guard open and its `#define` here.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardDefineIsNotAdjacent) {
+    auto f = runReentry("define_far",
+                        "#ifndef OUTER_H\n"
+                        "\n"
+                        "/* a banner comment\n   spanning lines */\n"
+                        "#if 1\n"
+                        "#endif\n"
+                        "\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard #define 6 lines below the #ifndef");
+}
+
+// ── FORM 7: the guard is NOT the FIRST conditional in the file. ─────────────
+// MEASURED 9 SDK + 2 sqlite headers. `netinet6/in6.h` opens with
+// `#ifndef __KAME_NETINET_IN_H_INCLUDED_` (an umbrella check with no matching
+// `#define`) and only THEN opens the real guard. A "the first conditional is
+// the guard" rule refuses every one of these.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardIsNotFirstConditional) {
+    auto f = runReentry("guard_not_first",
+                        "#ifndef _UMBRELLA_CHECK_\n"
+                        "#endif\n"
+                        "#ifdef SOMETHING_ELSE\n"
+                        "#endif\n"
+                        "#ifndef OUTER_H\n#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard preceded by two unrelated conditionals");
+}
+
+// ── FORM 8: the controlling name arrives on an `#elif`, not the `#if`. ──────
+// The `#elif`/`#elifdef`/`#elifndef` operands are further controlling
+// expressions of the SAME group, so they must extend that group's name set.
+// Pins the elif arm of the detector, which no other test in this block reaches.
+TEST(Preprocessor, Tf87ReentryPermittedWhenGuardNameComesFromElif) {
+    auto f = runReentry("guard_via_elif",
+                        "#if defined(NEVER_DEFINED_ZZZ)\n"
+                        "#elif !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "#elif !defined(X) / #define X");
+}
+
+// ── THE NEGATIVE: an UNGUARDED self-including header is REFUSED, LOUDLY, ────
+// and with a message a reader can act on. Refusing immediately beats churning
+// to the depth cap: this names the header on the first back-edge.
+//
+// ★ THE MESSAGE ASSERTIONS ARE THE POINT, not decoration. Because guard
+// detection GATES re-entry, a DETECTOR GAP and a REAL CYCLE produce the same
+// refusal — so the message must say which one the compiler believes it saw and
+// must not be confusable with the depth-cap backstop.
+TEST(Preprocessor, Tf87UnguardedSelfIncludeIsRefusedLoudlyAndDiagnosably) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_unguarded";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    // No conditional names a macro this header then #defines, and no
+    // include-once #pragma: nothing terminates the cycle.
+    { std::ofstream(dir / "loop.h", std::ios::binary)
+          << "int loop_sym;\n#include \"loop.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"loop.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    // ★ THE CODE IS THE MACHINE-READABLE HALF OF THE DISTINGUISHABILITY
+    // REQUIREMENT. `P_PreprocessorIncludeError` (0x0016) is four-way overloaded
+    // — not found, unreadable, this refusal, and the depth cap — so a shared
+    // code leaves every census / log filter / tool unable to tell a GUARD-
+    // DETECTOR GAP from "your includes nest too deeply". The refusal therefore
+    // has its OWN code and the depth cap keeps 0x0016.
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "an unguarded self-including header IS an infinite cycle and must be "
+           "refused LOUDLY, under the refusal's OWN diagnostic code";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "and NOT under the overloaded include-error code — sharing it with "
+           "the depth cap is exactly what makes a detector gap undiagnosable";
+    bool sawRefusal = false, sawDepthCap = false, sawDetectorGapHint = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) != std::string::npos) {
+            sawRefusal = true;
+            if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+                sawDetectorGapHint =
+                    d.actual.find("GAP IN THE GUARD DETECTOR")
+                    != std::string::npos;
+            }
+        }
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+    }
+    EXPECT_TRUE(sawRefusal)
+        << "the refusal must NAME the header and say it is refusing to re-enter";
+    EXPECT_TRUE(sawDetectorGapHint)
+        << "the refusal must say WHY (no include-once mechanism found) AND tell "
+           "the reader that a guarded header reaching this message is a DETECTOR "
+           "GAP, not a cycle in their code — without that a detector gap is "
+           "indistinguishable from a real cycle";
+    EXPECT_FALSE(sawDepthCap)
+        << "an immediate refusal must NOT be reported as the depth-cap backstop "
+           "— the two are different failures and must read differently";
+}
+
+// ── `#pragma once` — RECOGNISED as a mechanism, and refused with its OWN ────
+// message. MEASURED: 21 macOS SDK headers carry `#pragma once`, 18 of them
+// (AppleArchive/*) with NO macro guard at all. DSS declares `once` `includeOnce`
+// in `preprocess.pragmaEffects` and has NOT built include-once dedup, so it
+// cannot make the repeat expansion empty — but reporting "no include guard
+// detected" would be a FALSE accusation that sends the reader hunting a
+// detector gap that is not there.
+TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_pragma_once";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "once.h", std::ios::binary)
+          << "#pragma once\nint once_sym;\n#include \"once.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"once.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "the `#pragma once` re-entry refusal is a REFUSAL and must carry the "
+           "refusal code, not the overloaded include-error code";
+    // ★ AND THE PRAGMA ITSELF IS STILL LOUD. `includeOnce` is a REFINEMENT of
+    // `unsupported`, not an escape from it: this cycle must not let `#pragma
+    // once` quietly start working as a side effect of teaching the guard
+    // detector to recognise it.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "`#pragma once` must STILL fail loud at its own line — the registry "
+           "row says DSS has not built include-once dedup, and recognising the "
+           "shape in the guard detector changes nothing about that";
+    bool sawOnceRefusal = false, sawNoMechanismClaim = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) == std::string::npos) continue;
+        if (d.actual.find("'includeOnce'") != std::string::npos) {
+            sawOnceRefusal = true;
+        }
+        if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawNoMechanismClaim = true;
+        }
+    }
+    EXPECT_TRUE(sawOnceRefusal)
+        << "a `#pragma once` header's re-entry refusal must NAME the mechanism "
+           "and the registry verb that declares it";
+    EXPECT_FALSE(sawNoMechanismClaim)
+        << "it must NOT claim no include-once mechanism was found — the header "
+           "carries one; this implementation just has not built it. Saying "
+           "otherwise sends the reader hunting a detector gap that is not there";
+}
+
+// ── THE DEPTH CAP REALLY FIRES on a GUARDED-BUT-STILL-RECURSIVE header. ─────
+// The detector is deliberately GENEROUS (over-recognition is the safe direction
+// under PERMIT), so a value-default `#ifndef MIN` / `#define MIN` — MEASURED as
+// a real shape in `sqlite/src/btreeInt.h` — reads as a guard. Here the
+// self-include sits OUTSIDE that region, so the guard cannot empty anything and
+// the recursion is real. The BACKSTOP must catch it, LOUDLY, and say something
+// different from the refusal.
+TEST(Preprocessor, Tf87DepthCapFiresLoudlyOnGuardedButStillRecursiveHeader) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_depthcap";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "rec.h", std::ios::binary)
+          << "#ifndef REC_MIN\n#define REC_MIN 1\n#endif\n"
+             "#include \"rec.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"rec.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(r.fatal)
+        << "an include nesting that reaches the backstop TRUNCATES the splice, "
+           "so the preprocess result must be fatal — a truncated splice reported "
+           "as merely 'an error' would let a partial TU flow downstream";
+    // ★ THE CODE SPLIT, FROM THE OTHER SIDE. The depth cap is a genuine
+    // resource/structure limit and makes NO claim about guards, so it keeps
+    // `P_PreprocessorIncludeError`; the guard-detection refusal must NOT appear
+    // here. Together with the negative test's mirror assertions this pins the
+    // separation in BOTH directions — either code leaking into the other case
+    // reds exactly one of the two.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the depth-cap backstop keeps the include-error code";
+    EXPECT_FALSE(hasPPCode(r,
+                           DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "a depth-cap failure must NOT be reported as a refused re-entry: a "
+           "guard WAS detected here, and telling the reader otherwise sends them "
+           "hunting a detector gap that does not exist";
+    bool sawDepthCap = false, sawNoMechanismClaim = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+        if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawNoMechanismClaim = true;
+        }
+    }
+    EXPECT_TRUE(sawDepthCap)
+        << "the guarded-but-recursive case must reach the DEPTH CAP and say so";
+    EXPECT_FALSE(sawNoMechanismClaim)
+        << "the depth cap must not be reported as a missing guard — a guard WAS "
+           "detected here; it simply did not neutralize the repeat include";
+}
+
+// ── THE BACKSTOP MUST TERMINATE THE WHOLE SPLICE, NOT JUST ONE ARM. ────────
+// `fatal` is shared by reference across the builder tree, but before TF-C87 it
+// only truncated the recursion that hit the cap. A header that includes a
+// recursive sibling TWICE then re-enters the cap path down BOTH arms at every
+// level — 2^64 builds. `build()` now returns immediately once `fatal` is set.
+//
+// ★ RED-ON-DISABLE IS A HANG, NOT A FAILURE: delete `if (fatal) return;` from
+// `SynthBuilder::build` and this test does not finish (ctest reports a timeout).
+// That is the honest red for an exponential-blowup guard; there is no cheaper
+// witness, because the blowup is only reachable AT the cap depth.
+TEST(Preprocessor, Tf87DepthCapShortCircuitsTheWholeSpliceNotJustOneArm) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_depthcap_branch";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "rec2.h", std::ios::binary)
+          << "#ifndef REC2_MIN\n#define REC2_MIN 1\n#endif\n"
+             "#include \"rec2.h\"\n#include \"rec2.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"rec2.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    EXPECT_TRUE(r.fatal)
+        << "the backstop must still fire on the branching shape";
+    fs::remove_all(dir, ec);
+}
+
+// ── THE ANGLE ARM HAS THE SAME CONTRACT. ───────────────────────────────────
+// ★ THIS IS THE ARM THE CORPUS DEFECT WAS ON. `mach/mach_types.h` is reached as
+// an ANGLE include resolved to a real source header on the -I path
+// (`AngleIncludeKind::Source`), and that arm's refusal `continue`d WITHOUT
+// dropping the directive — so the surviving `#include <…>` line reached the
+// post-parse import resolver and became `F_ShippedHeaderNotFound`. A quote-only
+// fix would have left all 4 F001A in place.
+TEST(Preprocessor, Tf87ReentryPermittedThroughTheAngleSourceIncludeArm) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_angle";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "sub", ec);
+    { std::ofstream(dir / "sub" / "outer_ang.h", std::ios::binary)
+          << "#ifndef OUTER_ANG_H\n#define OUTER_ANG_H\n"
+             "#include <sub/inner_ang.h>\n#define ANG_MARK 9191\n#endif\n"; }
+    { std::ofstream(dir / "sub" / "inner_ang.h", std::ios::binary)
+          << "#include <sub/outer_ang.h>\nint ang_inner_sym;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include <sub/outer_ang.h>\nint m = ANG_MARK;\n", r, {dir}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the ANGLE-source include arm must make the same re-entry decision as "
+           "the quote arm — this is the arm the corpus F001A came from";
+    std::size_t marks = 0, inners = 0;
+    for (auto const& l : lexs) {
+        if (l == "9191") ++marks;
+        if (l == "ang_inner_sym") ++inners;
+    }
+    EXPECT_EQ(marks, 1u) << "ANG_MARK must expand exactly once";
+    EXPECT_EQ(inners, 1u) << "the angle-spliced inner header must appear once";
+    fs::remove_all(dir, ec);
+}
+
+// ── AGNOSTICISM: the detector reads its directive vocabulary from CONFIG. ───
+// Rebind `ifndefDirective` to a non-C spelling and re-run the FORM-1 fixture
+// with that spelling. If any part of the detector hard-coded "ifndef", the
+// rebound guard goes unrecognised and the back-edge is refused.
+TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::string cfgText = loadShippedCSubsetText();
+    ASSERT_FALSE(cfgText.empty()) << "could not locate the shipped c-subset JSON";
+    const std::string from = "\"ifndefDirective\":     \"ifndef\"";
+    const std::string to   = "\"ifndefDirective\":     \"unlesseth\"";
+    auto const at = cfgText.find(from);
+    ASSERT_NE(at, std::string::npos)
+        << "shipped c-subset config no longer carries ifndefDirective=ifndef";
+    cfgText.replace(at, from.size(), to);
+
+    auto loaded =
+        GrammarSchema::loadFromText(cfgText, "<rebound-ifndef-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "the rebound config must still load — otherwise this test proves "
+           "nothing about the detector";
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_EQ(schema->preprocess().ifndefDirective, "unlesseth");
+
+    auto dir = ppScratchRoot() / "dss_tf87_agnostic";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "outer.h", std::ios::binary)
+          << "#unlesseth OUTER_H\n#define OUTER_H\n"
+             "#include \"inner.h\"\n#define OUTER_MARK 8787\n#endif\n"; }
+    { std::ofstream(dir / "inner.h", std::ios::binary)
+          << kInnerIncludesOuterBack; }
+    auto buf = SourceBuffer::fromString(
+        "#include \"outer.h\"\nint m = OUTER_MARK;\n", "main.c");
+    std::vector<fs::path> dirs{dir};
+    auto out = preprocess(buf, schema, dirs);
+    EXPECT_FALSE(out.diagnostics->hasErrors())
+        << "the guard detector must recognise the CONFIG-declared `#ifndef` "
+           "spelling — a hard-coded \"ifndef\" refuses this legal header";
+    std::size_t marks = 0;
+    for (Token const& t : out.tokens) {
+        if (std::string{out.synthBuffer->slice(t.span)} == "8787") ++marks;
+    }
+    EXPECT_EQ(marks, 1u)
+        << "the rebound-spelling guard must empty the re-entered copy exactly "
+           "as the C spelling does";
+    fs::remove_all(dir, ec);
+}
+
+// ── THE `#define` MUST BE INSIDE THE REGION THE CONDITIONAL CONTROLS. ──────
+// A `#ifndef X` group that CLOSES before `#define X` is not a guard: the define
+// runs unconditionally, so a repeat include is not emptied by anything. Pins the
+// `#endif` POP — without it the closed frame's names stay in scope, this header
+// reads as guarded, re-entry is permitted, and the failure degrades from an
+// immediate named refusal into a 64-level churn to the depth cap. That
+// degradation is precisely what the "refuse an unguarded header immediately"
+// half of this design exists to avoid.
+TEST(Preprocessor, Tf87DefineOutsideTheClosedConditionalIsNotAGuard) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_tf87_halfguard";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "half.h", std::ios::binary)
+          << "#ifndef HALF_H\n#endif\n"       // group opens AND closes
+             "#define HALF_H\n"               // …the define is OUTSIDE it
+             "int half_sym;\n#include \"half.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"half.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
+    (void)lexs;
+    bool sawRefusal = false, sawDepthCap = false;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.actual.find(kRefusalPhrase) != std::string::npos
+            && d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+            sawRefusal = true;
+        }
+        if (d.actual.find(kDepthCapPhrase) != std::string::npos) {
+            sawDepthCap = true;
+        }
+    }
+    EXPECT_TRUE(hasPPCode(r,
+                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "the refusal must carry the refusal code";
+    EXPECT_TRUE(sawRefusal)
+        << "a `#define X` OUTSIDE the closed `#ifndef X` group is not a guard — "
+           "this header must be refused by name on the first back-edge";
+    EXPECT_FALSE(sawDepthCap)
+        << "and refused IMMEDIATELY, not churned to the depth cap: naming the "
+           "header on the first back-edge is the whole point of refusing an "
+           "unguarded one";
+    fs::remove_all(dir, ec);
+}
+
+// ── A GUARD SPLIT ACROSS A LINE CONTINUATION. ──────────────────────────────
+// C 5.1.1.2 phase 2 splices `\`-newline BEFORE directives are recognised, so a
+// multi-line `#if` is ONE logical controlling line. The detector must splice
+// too: harvesting names per PHYSICAL line loses every operand past the first
+// backslash — i.e. UNDER-recognises, the direction that turns a legal header
+// into a refused include. Multi-line `#if !defined(A) && \` guards are ordinary
+// in C.
+TEST(Preprocessor, Tf87GuardSplitAcrossLineContinuationIsStillDetected) {
+    auto f = runReentry("continuation",
+                        "#if !defined(_ALT_ZZZ) && \\\n"
+                        "    !defined(OUTER_H)\n"
+                        "#define OUTER_H\n"
+                        "#include \"inner.h\"\n#define OUTER_MARK 8787\n"
+                        "#endif\n",
+                        kInnerIncludesOuterBack);
+    expectReentryPermitted(f, "guard operand on a continuation line");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES) — the FORMAT's predefines, the
+// THIRD config family.
+//
+// `<name>.format.json` may now carry `predefinedMacros`, merged with the
+// language's and the target's by the same `mergePredefinedMacros`. What the
+// format owns is the C-visible face of ITS OWN axes — `__LP64__`/`_LP64`, the
+// face of `dataModel` — which is neither a language fact nor a CPU fact: the
+// SAME x86_64 target is LP64 under elf64/macho64 and LLP64 under pe64, so a
+// target-side row would be wrong on one of its own formats.
+//
+// ★ THE DEFECT THIS CLOSED, MEASURED on `arm64:macho64-arm64-darwin-staticlib`
+// before the change: `__arm64__` and `__APPLE__` defined, `__LP64__` NOT
+// defined, `sizeof(long)==8`, `sizeof(void*)==8` — LP64 widths with ILP32
+// headers. The macOS SDK gates 234 occurrences across 91 headers on `__LP64__`;
+// `mach/port.h:113-114` then asserted the user32 struct size 12 instead of
+// user64's 16, which is sqlite `mem1.c`'s three `error[S0029]`.
+//
+// ★ WHAT THESE TESTS PIN THAT THE FORMAT-SCHEMA TESTS CANNOT
+// (tests/link/test_object_format_schema.cpp owns the loader half): that the
+// parsed rows actually REACH the preprocessor, that the NEGATIVE holds, and
+// that the collision policy covers every PAIR of the three families — the last
+// being the specific thing a two-family implementation grown by one loop
+// silently misses.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// `ppLexemesForTarget`, plus a FORMAT predefine list. Kept separate rather than
+// widening the TF-C74 helper so its ~20 existing callers stay byte-identical.
+[[nodiscard]] std::vector<std::string> ppLexemesForTargetAndFormat(
+    std::string text, std::optional<ObjectFormatKind> fmt,
+    std::span<PredefinedMacroDef const> targetMacros,
+    std::span<PredefinedMacroDef const> formatMacros, PreprocessResult& out) {
+    auto schema = cSubset();
+    auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines, targetMacros,
+                     formatMacros);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+
+}  // namespace
+
+// The channel is READ end-to-end: a format-declared predefine EXPANDS in
+// ordinary code, exactly as a target-declared one does.
+// RED-ON-DISABLE: drop `formatPredefinedMacros` from the `mergePredefinedMacros`
+// call in `preprocess()` and the token comes back as the bare identifier.
+TEST(Preprocessor, TFC97FormatPredefineExpands) {
+    std::vector<PredefinedMacroDef> fms{targetMacro("__FMTPROBE__", "9")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTargetAndFormat("int x = __FMTPROBE__;\n",
+                                            ObjectFormatKind::MachO, {}, fms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "x", "=", "9", ";"}))
+        << "a FORMAT-declared predefine must reach the MacroExpander, not just "
+           "the merge result";
+}
+
+// ...and it is visible to `#if defined()`, i.e. to the include-gating pre-scan's
+// definedness oracle — the seed site a naive wiring misses. The SDK arms this
+// unblocks are `#if defined(__LP64__)` shapes, so this is the site that matters.
+TEST(Preprocessor, TFC97FormatPredefineIsVisibleToConditionalInclusion) {
+    std::vector<PredefinedMacroDef> fms{targetMacro("__FMTPROBE__", "1")};
+    PreprocessResult r;
+    auto lexs = ppLexemesForTargetAndFormat(
+        "#if defined(__FMTPROBE__)\nint yes;\n#else\nint no;\n#endif\n",
+        ObjectFormatKind::MachO, {}, fms, r);
+    EXPECT_EQ(lexs, (std::vector<std::string>{"int", "yes", ";"}));
+}
+
+// ── the COLLISION policy, over ALL THREE PAIRS ────────────────────────────
+//
+// ★ THE TARGET×FORMAT PAIR IS THE ONE THAT WOULD BE MISSED. With two families
+// the scan was one loop; the natural way to add a third is to write one more
+// loop against the LANGUAGE, which leaves target×format silently unscanned and
+// therefore silently last-writer-wins. That is why the scan enumerates pairs
+// over a table, and why this test asserts the pair, not just the code.
+TEST(Preprocessor, TFC97CollisionCoversEveryPairOfTheThreeFamilies) {
+    auto run = [](std::span<PredefinedMacroDef const> tgt,
+                  std::span<PredefinedMacroDef const> fmt) {
+        auto schema = cSubset();
+        auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+        return preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Elf,
+                          noDefines, tgt, fmt);
+    };
+
+    // (1) LANGUAGE × FORMAT. `__LINE__` is declared by the shipped c-subset
+    // language config.
+    {
+        std::vector<PredefinedMacroDef> fms{targetMacro("__LINE__", "1")};
+        PreprocessResult r = run({}, fms);
+        EXPECT_TRUE(r.fatal);
+        ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+        bool named = false;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+            named = d.actual.find(".lang.json") != std::string::npos
+                 && d.actual.find(".format.json") != std::string::npos
+                 && d.actual.find("__LINE__") != std::string::npos;
+            if (named) break;
+        }
+        EXPECT_TRUE(named)
+            << "the message must name the macro AND both declaring config "
+               "FILES — target and format share the JSON pointer "
+               "`/predefinedMacros`, so a bare pointer would name two "
+               "different files identically";
+    }
+
+    // (2) TARGET × FORMAT — neither side is the language, so a scan written
+    // only against the language misses it entirely.
+    {
+        std::vector<PredefinedMacroDef> tms{targetMacro("__COLLIDE__", "1")};
+        std::vector<PredefinedMacroDef> fms{targetMacro("__COLLIDE__", "2")};
+        PreprocessResult r = run(tms, fms);
+        EXPECT_TRUE(r.fatal)
+            << "a TARGET/FORMAT collision must abort the pass — the language "
+               "is not involved, so a language-anchored scan would silently "
+               "resolve it to whichever side merged last";
+        ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+        bool named = false;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+            named = d.actual.find(".target.json") != std::string::npos
+                 && d.actual.find(".format.json") != std::string::npos;
+            if (named) break;
+        }
+        EXPECT_TRUE(named) << "the message must name BOTH config files";
+    }
+
+    // (3) LANGUAGE × TARGET still fires (the TF-C74 pair, unregressed).
+    {
+        std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+        PreprocessResult r = run(tms, {});
+        EXPECT_TRUE(r.fatal);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+    }
+}
+
+// The collision scan still runs BEFORE the format filter for the new family:
+// a `["pe"]`-gated FORMAT row collides with an ungated target row even on ELF,
+// where the gated entry would not survive. Gating decides which formats SEE a
+// macro, never who OWNS the name.
+TEST(Preprocessor, TFC97FormatCollisionDetectedBeforeFormatFilter) {
+    std::vector<PredefinedMacroDef> tms{targetMacro("__COLLIDE__", "1")};
+    std::vector<PredefinedMacroDef> fms{targetMacro("__COLLIDE__", "2", {"pe"})};
+    auto merged = mergePredefinedMacros({}, tms, fms, ObjectFormatKind::Elf);
+    EXPECT_FALSE(merged.conflicts.empty())
+        << "a pe-GATED format row must still collide with an UNGATED target "
+           "row on an ELF build";
+    EXPECT_TRUE(merged.effective.empty())
+        << "a failed merge must leave NO partially-merged list a caller could "
+           "mistake for usable";
+}
+
+// Order is language, then target, then format — stable within each family. The
+// seed sites lower the effective list to `#define` STREAMS, so order is
+// observable behaviour, not an accident.
+TEST(Preprocessor, TFC97MergeOrderIsLanguageThenTargetThenFormat) {
+    std::vector<PredefinedMacroDef> lang{targetMacro("L1", "1")};
+    std::vector<PredefinedMacroDef> tgt{targetMacro("T1", "2"),
+                                        targetMacro("T2", "3")};
+    std::vector<PredefinedMacroDef> fmt{targetMacro("F1", "4")};
+    auto merged = mergePredefinedMacros(lang, tgt, fmt, ObjectFormatKind::Elf);
+    ASSERT_TRUE(merged.conflicts.empty());
+    std::vector<std::string> names;
+    for (auto const& pm : merged.effective) names.push_back(pm.name);
+    EXPECT_EQ(names, (std::vector<std::string>{"L1", "T1", "T2", "F1"}));
+}
+
+// The per-entry `availableObjectFormats` filter applies to FORMAT rows too, and
+// is still applied exactly ONCE. (Shipped format rows are ungated — the file is
+// already the gate — but the mechanism must not quietly skip this family.)
+TEST(Preprocessor, TFC97FormatRowsAreFormatFilteredLikeEveryOther) {
+    std::vector<PredefinedMacroDef> fmt{targetMacro("PE_ONLY", "1", {"pe"}),
+                                        targetMacro("UNIVERSAL", "2")};
+    auto onElf = mergePredefinedMacros({}, {}, fmt, ObjectFormatKind::Elf);
+    ASSERT_TRUE(onElf.conflicts.empty());
+    ASSERT_EQ(onElf.effective.size(), 1u);
+    EXPECT_EQ(onElf.effective[0].name, "UNIVERSAL");
+
+    auto onPe = mergePredefinedMacros({}, {}, fmt, ObjectFormatKind::Pe);
+    ASSERT_EQ(onPe.effective.size(), 2u);
+}
+
+// The NO-REGRESSION invariant: an EMPTY format span leaves the synthesized text
+// byte-identical to the pre-TF-C97 call shape, on every format. This is what
+// lets the LSP and the FFI header parser keep their (deliberate) empty lists.
+TEST(Preprocessor, TFC97EmptyFormatSpanIsByteIdenticalToLegacy) {
+    static constexpr char const* kSrc =
+        "#ifdef _WIN32\nint w = 1;\n#endif\n"
+        "#ifdef __APPLE__\nint a = 1;\n#endif\n"
+        "long v = __STDC_VERSION__;\n";
+    for (std::optional<ObjectFormatKind> fmt :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::Pe},
+          std::optional<ObjectFormatKind>{}}) {
+        auto schema = cSubset();
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string>           noDefines;
+        std::vector<PredefinedMacroDef>    none;
+
+        auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult legacy = preprocess(legacyBuf, schema, noDirs, {}, fmt,
+                                             noDefines, none);
+        auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
+        PreprocessResult withEmpty = preprocess(newBuf, schema, noDirs, {}, fmt,
+                                                noDefines, none, none);
+        ASSERT_FALSE(legacy.fatal);
+        ASSERT_FALSE(withEmpty.fatal);
+        EXPECT_EQ(legacy.synthBuffer->text(), withEmpty.synthBuffer->text());
+    }
+}
+
+// ★ THE SHIPPED-CONFIG END-TO-END PIN, BOTH DIRECTIONS.
+//
+// Everything above uses hand-built rows so it pins the ENGINE. This one drives
+// the REAL shipped language + target + format configs through the real merge and
+// asserts what a C program on each leg actually sees. The negative half (pe64
+// defines NEITHER spelling) is the reason the channel is on the format, so it is
+// asserted as strictly as the positive.
+//
+// The expectation is keyed on the loaded schema's `dataModel()`, never on a
+// format name — the same discipline the config author applied.
+TEST(Preprocessor, TFC97ShippedFormatsGiveACoherentDataModelWorld) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+
+    struct Leg {
+        std::string_view formatName;
+        std::shared_ptr<TargetSchema const> target;
+        ObjectFormatKind kind;
+    };
+    std::vector<Leg> const legs{
+        {"macho64-arm64-darwin-exec",  *arm, ObjectFormatKind::MachO},
+        {"macho64-arm64-darwin-staticlib", *arm, ObjectFormatKind::MachO},
+        {"elf64-aarch64-linux-exec",   *arm, ObjectFormatKind::Elf},
+        {"elf64-x86_64-linux-exec",    *x86, ObjectFormatKind::Elf},
+        {"macho64-x86_64-darwin-exec", *x86, ObjectFormatKind::MachO},
+        {"pe64-x86_64-windows-exec",   *x86, ObjectFormatKind::Pe},
+        {"pe64-x86_64-windows-dll",    *x86, ObjectFormatKind::Pe},
+    };
+
+    std::size_t lp64Legs = 0, llp64Legs = 0;
+    for (Leg const& leg : legs) {
+        auto f = ObjectFormatSchema::loadShipped(std::string{leg.formatName});
+        ASSERT_TRUE(f.has_value()) << leg.formatName;
+        auto merged = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                            leg.target->predefinedMacros(),
+                                            (*f)->predefinedMacros(), leg.kind);
+        ASSERT_TRUE(merged.conflicts.empty())
+            << leg.formatName
+            << ": the shipped language, target and format configs must not "
+               "collide on any name";
+        auto defines = [&](std::string_view n) {
+            for (auto const& pm : merged.effective) {
+                if (pm.name == n) return true;
+            }
+            return false;
+        };
+        bool const wantLp64 = (*f)->dataModel() == DataModel::Lp64;
+        if (wantLp64) ++lp64Legs; else ++llp64Legs;
+        EXPECT_EQ(defines("__LP64__"), wantLp64) << leg.formatName;
+        EXPECT_EQ(defines("_LP64"), wantLp64) << leg.formatName;
+        // ★ The two spellings must move TOGETHER. A leg that defined one and
+        // not the other would satisfy a naive "is __LP64__ defined?" check
+        // while leaving every `#ifdef _LP64` SDK arm on the wrong branch.
+        EXPECT_EQ(defines("__LP64__"), defines("_LP64")) << leg.formatName;
+    }
+    EXPECT_EQ(lp64Legs, 5u);
+    EXPECT_EQ(llp64Legs, 2u);
 }

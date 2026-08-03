@@ -1263,17 +1263,194 @@ TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
         if (d.code == DiagnosticCode::P_UnterminatedString) { sawUnterminated = true; break; }
     EXPECT_TRUE(sawUnterminated) << "unterminated coalesced string must report P_UnterminatedString";
     // Body is one coalesced token, not per-byte: [StringStart, StringLiteral].
-    EXPECT_EQ(result.tokens.size(), 2u);
+    // ★ D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: this count stays TWO while every
+    // well-formed literal went to three, and that asymmetry is the POINT — the
+    // closer token is emitted by the mode-POP, and an EOF-truncated literal
+    // never pops. So token shape alone now distinguishes a properly-closed
+    // literal from a truncated one, which it could not before. If a closer ever
+    // appears here, the tokenizer is inventing a delimiter byte that is not in
+    // the source and every span-driven consumer would read one byte past EOF.
+    EXPECT_EQ(result.tokens.size(), 2u)
+        << "an UNTERMINATED literal must NOT gain a closer token — there is no "
+           "closing delimiter in the source to give a span to";
     EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("StringStart"));
     EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
+    EXPECT_NE(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringEnd"));
+}
+
+// ---------------------------------------------------------------------------
+// D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN — the EXACT-SPAN pins for the closer.
+//
+// NEW COVERAGE. Before this cycle, nothing anywhere asserted the byte extents of
+// a literal's three tokens; the delimiter-drop survived because every existing
+// tokenizer pin checked KINDS and body TEXT, both of which the bug left correct.
+// A missing token at the END of a stream is invisible to a test that only reads
+// tokens[0] and tokens[1].
+//
+// These pin the full byte partition of the literal: opener, body and closer must
+// TILE the source extent with no gap and no overlap. Kind checks alone cannot
+// catch a one-byte drift; span checks can, which is the point.
+//
+// RED-ON-DISABLE: revert the closer emit in the tokenizer (drop the closer token
+// on mode-pop) and every count here falls by one and every closer span vanishes.
+// ---------------------------------------------------------------------------
+
+TEST(Tokenizer, ClosingDelimiterIsItsOwnTokenWithExactSpans) {
+    // `"abc"` — 5 source bytes, partitioned across EXACTLY three tokens:
+    //   StringStart   [0,1)  `"`
+    //   StringLiteral [1,4)  `abc`   ← body span UNCHANGED by this cycle
+    //   StringEnd     [4,5)  `"`     ← previously no token at all
+    auto h      = loadCSubset("\"abc\"");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u)
+        << "a closed string is opener + body + closer";
+    EXPECT_TRUE(result.diags.empty());
+
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("StringStart"));
+    EXPECT_EQ(result.tokens[0].span.start(),  0u);
+    EXPECT_EQ(result.tokens[0].span.end(),    1u);
+
+    EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
+    EXPECT_EQ(result.tokens[1].span.start(),  1u);
+    EXPECT_EQ(result.tokens[1].span.end(),    4u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "abc")
+        << "the BODY is the invariant: giving the closer a token must not widen "
+           "the body, or every decode gains a trailing quote byte";
+
+    EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"));
+    EXPECT_EQ(result.tokens[2].span.start(),  4u);
+    EXPECT_EQ(result.tokens[2].span.end(),    5u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "\"");
+
+    // The three tokens TILE [0,5) — this is the property the anchor is about.
+    // Reconstructing the literal's source extent from its tokens must recover
+    // all 5 bytes; under the old behaviour it recovered 4 and every consumer
+    // that joined child spans came up one byte short.
+    EXPECT_EQ(result.tokens[0].span.start(), 0u);
+    EXPECT_EQ(result.tokens[2].span.end(),   5u);
+    EXPECT_EQ(result.tokens[0].span.end(), result.tokens[1].span.start());
+    EXPECT_EQ(result.tokens[1].span.end(), result.tokens[2].span.start());
+}
+
+TEST(Tokenizer, EmptyStringLiteralStillEmitsBodyAndCloser) {
+    // `""` — the degenerate case, and the one most likely to be special-cased
+    // wrong. The body is EMPTY but must still exist as a token, and the closer
+    // must still be emitted:
+    //   StringStart   [0,1)  `"`
+    //   StringLiteral [1,1)  ``     ← zero-length, NOT elided
+    //   StringEnd     [1,2)  `"`
+    // If an implementation skipped the empty body it would still "work" for the
+    // decode (empty is empty) but the closer would land at child index 1 and
+    // every index-based consumer would read the closer as the body.
+    auto h      = loadCSubset("\"\"");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u)
+        << "an empty string still has all three tokens — the body is "
+           "zero-length, not absent";
+    EXPECT_TRUE(result.diags.empty());
+
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("StringStart"));
+    EXPECT_EQ(result.tokens[0].span.start(), 0u);
+    EXPECT_EQ(result.tokens[0].span.end(),   1u);
+
+    EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
+    EXPECT_EQ(result.tokens[1].span.start(), 1u);
+    EXPECT_EQ(result.tokens[1].span.end(),   1u) << "empty body: [1,1)";
+    EXPECT_TRUE(result.tokens[1].span.isEmpty());
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "");
+
+    EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"));
+    EXPECT_EQ(result.tokens[2].span.start(), 1u) << "closer: [1,2)";
+    EXPECT_EQ(result.tokens[2].span.end(),   2u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "\"");
+}
+
+TEST(Tokenizer, CharLiteralClosingDelimiterIsItsOwnToken) {
+    // MULTI-FORM DISCIPLINE. `'c'` rides the `charBody` mode, a DIFFERENT lexer
+    // mode from `string` — a closer emitted for the string form proves nothing
+    // here. (A bare-string-only suite is exactly how the TF-C70 defect survived.)
+    //   CharStart   [0,1)  `'`
+    //   CharLiteral [1,2)  `c`
+    //   CharEnd     [2,3)  `'`
+    auto h      = loadCSubset("'c'");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u);
+    EXPECT_TRUE(result.diags.empty());
+
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("CharStart"));
+    EXPECT_EQ(result.tokens[0].span.start(), 0u);
+    EXPECT_EQ(result.tokens[0].span.end(),   1u);
+
+    EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("CharLiteral"));
+    EXPECT_EQ(result.tokens[1].span.start(), 1u);
+    EXPECT_EQ(result.tokens[1].span.end(),   2u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "c");
+
+    EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("CharEnd"));
+    EXPECT_EQ(result.tokens[2].span.start(), 2u);
+    EXPECT_EQ(result.tokens[2].span.end(),   3u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "'");
+    // CharEnd is a kind of its OWN, not StringEnd reused: a kind-filtering body
+    // reader must never be able to confuse the two families' delimiters.
+    EXPECT_NE(result.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"));
+}
+
+TEST(Tokenizer, AngleHeaderClosingDelimiterIsItsOwnToken) {
+    // MULTI-FORM DISCIPLINE, third form: `<stdio.h>` rides `header-body`, a third
+    // distinct mode, and is the only form whose open and close delimiters are
+    // DIFFERENT bytes. Offsets are into `#include <stdio.h>`:
+    //   HeaderStart [9,10)  `<`
+    //   HeaderPath  [10,17) `stdio.h`
+    //   HeaderEnd   [17,18) `>`
+    auto h      = loadCSubset("#include <stdio.h>\n");
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty());
+
+    const auto headerStart = h.schema->schemaTokens().find("HeaderStart");
+    const auto headerPath  = h.schema->schemaTokens().find("HeaderPath");
+    const auto headerEnd   = h.schema->schemaTokens().find("HeaderEnd");
+
+    Token const* open  = nullptr;
+    Token const* body  = nullptr;
+    Token const* close = nullptr;
+    for (auto const& t : result.tokens) {
+        if (t.schemaKind == headerStart) open  = &t;
+        if (t.schemaKind == headerPath)  body  = &t;
+        if (t.schemaKind == headerEnd)   close = &t;
+    }
+    ASSERT_NE(open,  nullptr);
+    ASSERT_NE(body,  nullptr);
+    ASSERT_NE(close, nullptr) << "the closing `>` must have a token of its own";
+
+    EXPECT_EQ(open->span.start(),  9u);
+    EXPECT_EQ(open->span.end(),   10u);
+    EXPECT_EQ(body->span.start(), 10u);
+    EXPECT_EQ(body->span.end(),   17u);
+    EXPECT_EQ(textOf(*h.src, *body), "stdio.h")
+        << "the path body must NOT absorb the `>` — the include resolver feeds "
+           "this raw slice to the filesystem";
+    EXPECT_EQ(close->span.start(), 17u);
+    EXPECT_EQ(close->span.end(),   18u);
+    EXPECT_EQ(textOf(*h.src, *close), ">");
+    // Tiling, as with the string form.
+    EXPECT_EQ(open->span.end(), body->span.start());
+    EXPECT_EQ(body->span.end(), close->span.start());
 }
 
 TEST(Tokenizer, WideStringOpenersTokenizeViaLongestMatch) {
     // C11/C23 6.4.5: the wide/UTF openers `L"`/`u"`/`U"`/`u8"` are multi-char
     // lexemes that START with an id-start byte. The tokenizer's longestMatchInMode
     // must make each opener beat the bare identifier run — `L"AB"` is
-    // [WideStringStart, StringLiteral], NOT [Identifier(L), StringStart, ...]. Each
-    // pushes the SAME shared `string` mode → one coalesced StringLiteral body.
+    // [WideStringStart, StringLiteral, StringEnd], NOT [Identifier(L),
+    // StringStart, ...]. Each pushes the SAME shared `string` mode → one
+    // coalesced StringLiteral body.
+    // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `"` is now its
+    // OWN token (`string` mode's `defaultToken.closeToken` = StringEnd). The
+    // opener kind — which is what this test is actually about — is unchanged;
+    // the count moved only because a third token now trails the body. Note the
+    // closer is the SAME `StringEnd` kind for every prefix: the prefix is
+    // carried entirely by the OPENER, so a per-prefix closer kind would be
+    // redundant information the grammar would then have to spell five ways.
     struct Case { char const* src; char const* opener; };
     for (auto const& c : {Case{"L\"AB\"", "WideStringStart"},
                           Case{"u\"AB\"", "Utf16StringStart"},
@@ -1281,11 +1458,17 @@ TEST(Tokenizer, WideStringOpenersTokenizeViaLongestMatch) {
                           Case{"u8\"AB\"", "Utf8StringStart"}}) {
         auto h      = loadCSubset(c.src);
         auto result = lex(h);
-        ASSERT_EQ(result.tokens.size(), 2u) << "opener=" << c.opener;
+        ASSERT_EQ(result.tokens.size(), 3u) << "opener=" << c.opener;
         EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
             << "the multi-char opener must win over the bare id-run for " << c.src;
         EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
         EXPECT_EQ(textOf(*h.src, result.tokens[1]), "AB");
+        EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"))
+            << "the closing `\"` is its own token regardless of opener prefix";
+        // The body text is UNCHANGED by the closer's arrival — that is the
+        // invariant that keeps every decoder correct. If this ever reads `AB"`,
+        // the closer was folded into the body instead of split off it.
+        EXPECT_EQ(textOf(*h.src, result.tokens[2]), "\"");
     }
 }
 
@@ -1293,12 +1476,16 @@ TEST(Tokenizer, U8StringOpenerBeatsUOpenerAndIdentifier) {
     // The `u8"` opener (3 bytes) must beat BOTH the `u"` opener (2 bytes) and the
     // `u8` identifier run — longestMatchInMode picks the longest lexeme. A
     // regression to `u"` would split `u8"…"` as [Utf16StringStart, "8…"] (wrong).
+    // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + StringEnd.
+    // The longest-match property under test is untouched; only the trailing
+    // closer token is new.
     auto h      = loadCSubset("u8\"x\"");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 2u);
+    ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8StringStart"))
         << "u8\" must win over u\" and the u8 identifier";
     EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
+    EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"));
 }
 
 TEST(Tokenizer, IdentifierStartingWithUIsNotAStringOpener) {
@@ -1316,9 +1503,15 @@ TEST(Tokenizer, IdentifierStartingWithUIsNotAStringOpener) {
 TEST(Tokenizer, WideCharOpenersTokenizeViaLongestMatch) {
     // C11/C23 6.4.4.4: the wide/UTF CHAR openers `L'`/`u'`/`U'`/`u8'` are multi-char
     // lexemes that START with an id-start byte. longestMatchInMode must make each
-    // opener beat the bare identifier run — `L'A'` is [WideCharStart, CharLiteral],
-    // NOT [Identifier(L), CharStart, ...]. Each pushes the SAME shared `charBody`
-    // mode as `'` → one coalesced CharLiteral body.
+    // opener beat the bare identifier run — `L'A'` is [WideCharStart, CharLiteral,
+    // CharEnd], NOT [Identifier(L), CharStart, ...]. Each pushes the SAME shared
+    // `charBody` mode as `'` → one coalesced CharLiteral body.
+    // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the closing `'` is now its
+    // own token — `charBody`'s `defaultToken.closeToken` = CharEnd, a kind
+    // DISTINCT from both the CharLiteral body and the string family's StringEnd.
+    // The char form is pinned here, not only the string form, on purpose: the
+    // two literal families ride separate lexer modes, so a closer emitted for
+    // one proves nothing about the other.
     struct Case { char const* src; char const* opener; };
     for (auto const& c : {Case{"L'A'", "WideCharStart"},
                           Case{"u'A'", "Utf16CharStart"},
@@ -1326,11 +1519,14 @@ TEST(Tokenizer, WideCharOpenersTokenizeViaLongestMatch) {
                           Case{"u8'A'", "Utf8CharStart"}}) {
         auto h      = loadCSubset(c.src);
         auto result = lex(h);
-        ASSERT_EQ(result.tokens.size(), 2u) << "opener=" << c.opener;
+        ASSERT_EQ(result.tokens.size(), 3u) << "opener=" << c.opener;
         EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
             << "the multi-char opener must win over the bare id-run for " << c.src;
         EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("CharLiteral"));
         EXPECT_EQ(textOf(*h.src, result.tokens[1]), "A");
+        EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("CharEnd"))
+            << "the char closer must be CharEnd, not the string family's StringEnd";
+        EXPECT_EQ(textOf(*h.src, result.tokens[2]), "'");
     }
 }
 
@@ -1338,29 +1534,42 @@ TEST(Tokenizer, U8CharOpenerBeatsUCharOpenerAndIdentifier) {
     // The `u8'` opener (3 bytes) must beat BOTH the `u'` opener (2 bytes) and the
     // `u8` identifier run. A regression to `u'` would split `u8'x'` as
     // [Utf16CharStart, "8x"] (wrong). Mirrors the wide-STRING u8" longest-match pin.
+    // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + CharEnd.
     auto h      = loadCSubset("u8'x'");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 2u);
+    ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8CharStart"))
         << "u8' must win over u' and the u8 identifier";
     EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
+    EXPECT_EQ(result.tokens[2].schemaKind, h.schema->schemaTokens().find("CharEnd"));
 }
 
 TEST(Tokenizer, CharAndStringOpenersCoexistOnSamePrefixByte) {
     // Both `u'`/`u"` (and `u8'`/`u8"`) start with `u`. longestMatchInMode must pick
     // the CHAR opener when a `'` follows and the STRING opener when a `"` follows —
     // the two literal families coexist without either shadowing the other.
+    // ★ 2 → 3 each (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): each form now ends in
+    // its own closer token. That makes this test cover MORE than it did: the two
+    // families must stay distinct at BOTH ends of the literal, so the closers are
+    // pinned to different kinds here too. A shared closer kind would let a
+    // kind-filtering consumer confuse the end of a char constant with the end of
+    // a string.
     {
         auto h = loadCSubset("u'x'");
         auto r = lex(h);
-        ASSERT_EQ(r.tokens.size(), 2u);
+        ASSERT_EQ(r.tokens.size(), 3u);
         EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16CharStart"));
+        EXPECT_EQ(r.tokens[2].schemaKind, h.schema->schemaTokens().find("CharEnd"));
     }
     {
         auto h = loadCSubset("u\"x\"");
         auto r = lex(h);
-        ASSERT_EQ(r.tokens.size(), 2u);
+        ASSERT_EQ(r.tokens.size(), 3u);
         EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16StringStart"));
+        EXPECT_EQ(r.tokens[2].schemaKind, h.schema->schemaTokens().find("StringEnd"));
+        EXPECT_NE(h.schema->schemaTokens().find("StringEnd"),
+                  h.schema->schemaTokens().find("CharEnd"))
+            << "the two families must not share a closer kind";
     }
 }
 
@@ -1372,17 +1581,57 @@ TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // breakdown:
     //   [0] `'`    StringStart   (opener)
     //   [1] `a''b` StringLiteral (coalesced body; doubled `''` kept raw)
-    // The closing `'` is consumed on mode-pop, not emitted as a token.
+    //   [2] `'`    StringEnd     (closer)
+    //
+    // ★ RENEGOTIATED — D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN. This pin used to
+    // read "the closing `'` is consumed on mode-pop, not emitted as a token",
+    // and it pinned a 2-token stream. That statement is now FALSE and the count
+    // is 3. What did NOT change is the thing the length assertion below is
+    // really about:
+    //
+    //   THE BODY SPAN STILL EXCLUDES BOTH DELIMITERS. The closer did not get
+    //   folded INTO the body — it got split OFF as its own token. So the body
+    //   is still `a''b` = 4 bytes, and `decodeDoubledDelimiterBody` still sees
+    //   exactly the bytes it saw before.
+    //
+    // The two facts are independent, which is why both are pinned separately
+    // below, and why "4" here is NOT the stale value that "2" was: the old 2 was
+    // a claim about the TOKEN STREAM (now wrong); the 4 is a claim about the
+    // BODY'S EXTENT (still right, and load-bearing).
+    //
+    // WHAT WOULD MAKE 4 WRONG — i.e. when to change this number rather than
+    // renumber around a failure:
+    //   • 5 means the closing `'` leaked into the body span. Then every
+    //     doubled-delim decode gains a trailing quote and T-SQL `'a''b'`
+    //     silently becomes `a'b'`. Fix the tokenizer, not this number.
+    //   • 3 means the doubled `''` escape was collapsed at LEX time instead of
+    //     decode time, breaking the raw-body contract HR10 depends on.
+    //   • 4 with a token count other than 3 means the opener/closer pairing
+    //     itself regressed — check the count assertion first.
     auto h      = loadTsql("'a''b'");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 2u);
+    ASSERT_EQ(result.tokens.size(), 3u)
+        << "opener + coalesced body + closer (the closer is a token since "
+           "D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN)";
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("StringStart"));
     EXPECT_EQ(result.tokens[1].schemaKind,
               h.schema->schemaTokens().find("StringLiteral"));
-    // The coalesced body spans `a''b` — 4 bytes (the doubled-delim escape
-    // kept raw; the close delimiter is not part of the body).
-    EXPECT_EQ(result.tokens[1].span.length(), 4u);
+    EXPECT_EQ(result.tokens[2].schemaKind,
+              h.schema->schemaTokens().find("StringEnd"));
+    // The coalesced body spans `a''b` — 4 bytes: the doubled-delim escape kept
+    // raw, and NEITHER delimiter included. The closer now has a token of its
+    // own, but it is a SIBLING of the body, never part of it.
+    EXPECT_EQ(result.tokens[1].span.length(), 4u)
+        << "the body span must still exclude both delimiters";
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "a''b");
+    // The closer covers exactly the one delimiter byte — the byte the body
+    // deliberately stops short of. Body-end and closer-start must MEET with no
+    // gap and no overlap: that adjacency is what makes the literal's full source
+    // extent reconstructible, which is the whole point of the anchor.
+    EXPECT_EQ(result.tokens[2].span.length(), 1u);
+    EXPECT_EQ(result.tokens[1].span.end(), result.tokens[2].span.start())
+        << "body and closer must be exactly adjacent — no byte unaccounted for";
     EXPECT_TRUE(result.diags.empty());
 }
 
@@ -2398,22 +2647,46 @@ TEST(Tokenizer, FF11AngleIncludeLexesAsOpenerPathCloser) {
     const auto includeKw   = schema->schemaTokens().find("IncludeKeyword");
     const auto headerStart = schema->schemaTokens().find("HeaderStart");
     const auto headerPath  = schema->schemaTokens().find("HeaderPath");
+    const auto headerEnd   = schema->schemaTokens().find("HeaderEnd");
     const auto ltOp        = schema->schemaTokens().find("LtOp");
+    const auto gtOp        = schema->schemaTokens().find("GtOp");
     ASSERT_TRUE(headerStart.valid());
     ASSERT_TRUE(headerPath.valid());
+    ASSERT_TRUE(headerEnd.valid());
     ASSERT_NE(headerStart, ltOp) << "HeaderStart and LtOp must be distinct kinds";
+    // ★ D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closing `>` had NO token at
+    // all; it now has one, and it must NOT be the ordinary `>` operator. A
+    // header path's closer is part of the literal, not an expression operator —
+    // conflating them would make `#include <a>` indistinguishable from a
+    // comparison at the token level, exactly the confusion HeaderStart-vs-LtOp
+    // already guards at the opening end.
+    ASSERT_NE(headerEnd, gtOp) << "HeaderEnd and GtOp must be distinct kinds";
 
     auto code = codeTokens(result);
-    // Exactly: HashOp, IncludeKeyword(Word), HeaderStart, HeaderPath.
-    ASSERT_EQ(code.size(), 4u);
+    // ★ 4 → 5 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the angle-include's
+    // closing `>` is now its own token — `header-body`'s
+    // `defaultToken.closeToken` = HeaderEnd. Exactly:
+    //   HashOp, IncludeKeyword(Word), HeaderStart, HeaderPath, HeaderEnd.
+    // The ANGLE form is pinned alongside the string and char forms deliberately:
+    // all three ride different lexer modes, and this one is the only form whose
+    // delimiters are not the same byte on both ends.
+    ASSERT_EQ(code.size(), 5u);
     EXPECT_EQ(code[0].schemaKind, hashOp);
     EXPECT_EQ(code[1].schemaKind, includeKw);
     EXPECT_EQ(code[2].schemaKind, headerStart)
         << "`<` after `#include` must be HeaderStart (RED-on-disable: would "
            "be LtOp if the include-directive mode override is unwired)";
     EXPECT_EQ(code[3].schemaKind, headerPath);
-    // The path token captures exactly the bytes between `<` and `>`.
+    EXPECT_EQ(code[4].schemaKind, headerEnd)
+        << "the closing `>` must be HeaderEnd (RED-on-disable: reverting the "
+           "closer emit drops this token entirely and the count falls to 4)";
+    // The path token captures exactly the bytes between `<` and `>` — UNCHANGED
+    // by the closer's arrival. This is the assertion that proves the closer was
+    // split OFF the body rather than the body widened to swallow it; if this
+    // ever reads `stdio.h>`, include RESOLUTION is broken, because the resolver
+    // feeds this raw slice straight to the filesystem.
     EXPECT_EQ(textOf(*srcBuf, code[3]), "stdio.h");
+    EXPECT_EQ(textOf(*srcBuf, code[4]), ">");
 }
 
 TEST(Tokenizer, FF11AngleBracketIsLtOpOutsideDirective) {

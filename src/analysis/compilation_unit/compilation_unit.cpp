@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -86,7 +87,11 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<CrossTreeRef>            crossRefs,
                                  std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                                  std::uint32_t                        typeNameReparseCount,
-                                 std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers)
+                                 std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers,
+                                 std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
+                                     pragmaPackMaps,
+                                 std::vector<std::unordered_set<std::uint32_t>>
+                                     pragmaNoOptimizeSets)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -94,7 +99,9 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , crossRefs_(std::move(crossRefs))
     , shippedLibDescriptors_(std::move(shippedLibDescriptors))
     , typeNameReparseCount_(typeNameReparseCount)
-    , auxiliaryBuffers_(std::move(auxiliaryBuffers)) {}
+    , auxiliaryBuffers_(std::move(auxiliaryBuffers))
+    , pragmaPackMaps_(std::move(pragmaPackMaps))
+    , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -109,6 +116,27 @@ std::span<ShippedDescriptorRef const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
 std::span<std::shared_ptr<SourceBuffer> const>
 CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
+
+std::unordered_map<std::uint32_t, std::uint32_t> const&
+CompilationUnit::pragmaPackFor(std::size_t treeIndex) const noexcept {
+    // TF-C82: a tree with no stamps (not preprocessed, or preprocessed with no
+    // `#pragma pack`) and an out-of-range index answer identically — the EMPTY
+    // map, i.e. "no cap anywhere", which is exactly the pre-TF-C82 layout. A
+    // shared static keeps the reference valid without a per-call allocation.
+    static std::unordered_map<std::uint32_t, std::uint32_t> const kEmpty;
+    if (treeIndex >= pragmaPackMaps_.size()) return kEmpty;
+    return pragmaPackMaps_[treeIndex];
+}
+
+std::unordered_set<std::uint32_t> const&
+CompilationUnit::pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept {
+    // TF-C85: the exact sibling of `pragmaPackFor` above — a tree with no stamps
+    // and an out-of-range index both answer the EMPTY set, i.e. "optimize
+    // everything", which is exactly the pre-TF-C85 behavior.
+    static std::unordered_set<std::uint32_t> const kEmpty;
+    if (treeIndex >= pragmaNoOptimizeSets_.size()) return kEmpty;
+    return pragmaNoOptimizeSets_[treeIndex];
+}
 
 std::string CompilationUnit::compositeSourceLanguage() const {
     std::string out;
@@ -239,7 +267,9 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         std::optional<substrate::PhaseTimers::Scope> phase;
         phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
-                                         activeFormat_, userDefines_);
+                                         activeFormat_, userDefines_,
+                                         targetPredefinedMacros_,
+                                         formatPredefinedMacros_);
         phase.reset();
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
@@ -276,7 +306,50 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
         phase.emplace(substrate::CompilePhase::Parse);
-        Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
+        // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: seed the binder sketch's global
+        // scope with the LIVE shipped-descriptor typedef NAMES (`size_t` from
+        // <stddef.h>, the stdint widths, …) BEFORE the FIRST parse. Those
+        // typedefs are injected SEMANTICALLY (post-parse), so without this the
+        // includer parsed `(size_t)(expr)` as a CALL and recorded an
+        // AmbiguousTypeNameCandidate -> UnitBuilder::finish() re-tokenized and
+        // re-parsed the WHOLE TU (~0.75s/TU on the SQLite amalgamation) just to
+        // learn the name is a type. Seeding it up front commits the cast on parse
+        // 1 (parser.cpp NameKind::Type) -> no candidate -> no reparse. This reuses
+        // the EXACT channel the finish() oracle reparse already uses
+        // (ParserConfig::seedGlobalTypeNames -> BinderSketch::seedGlobalType); the
+        // reparse is RETAINED as the residual net for in-buffer FORWARD references
+        // (a typedef used before its own definition in the synthesized buffer),
+        // which no descriptor seed can cover. Interner-free NAME harvest over the
+        // descriptors the preprocessor actually resolved (parent + transitive
+        // `includes` closure), deduped by name. A scratch reporter: a malformed
+        // descriptor is reported ONCE by the semantic read, never here.
+        // ORACLE-ALIGNED (D-PERF-2): `pp.resolvedShippedDescriptors` is now the
+        // AUTHORITATIVELY-LIVE descriptor set (the preprocessor drops a splice whose
+        // offset falls in an `#if 0` dead range), EQUAL to the finish() oracle's
+        // `shippedLibDescriptors`. So seeding resolves EXACTLY the names the finish()
+        // reparse would -- never a superset, never a name from a dead-branch include.
+        // ONE-DIRECTIONAL (P0016): a real in-source binding still SHADOWS a seed
+        // (`lookup` scans bindings newest-first; seeds precede every parse-time
+        // record), so seeding only ever turns Unknown -> Type, never overrides a
+        // Value -- it resolves MORE names, never suppresses a diagnostic.
+        ParserConfig cfg = parserConfigFor(*schema);
+        {
+            std::unordered_set<std::string> seen;
+            for (std::filesystem::path const& desc :
+                 pp.resolvedShippedDescriptors) {
+                DiagnosticReporter scratch{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                if (auto names =
+                        ffi::readShippedLibTypedefNames(desc, scratch)) {
+                    for (auto& n : *names) {
+                        if (seen.insert(n).second) {
+                            cfg.seedGlobalTypeNames.push_back(std::move(n));
+                        }
+                    }
+                }
+            }
+        }
+        Parser p{synth, schema, std::move(stream), std::move(cfg),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
         phase.reset();
@@ -295,10 +368,17 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         auto& sidecar           = sidecars_.back();
         sidecar.candidates      = std::move(result.typeNameCandidates);
         sidecar.globalTypeNames = std::move(result.globalTypeNames);
+        sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
         sidecar.source          = std::move(synth);
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
+        // TF-C82 (D-PP-PRAGMA-REGISTRY): carry the `#pragma pack` stamps to the
+        // finished CU. Empty for a TU with no `#pragma pack`, which is every TU
+        // that existed before this cycle.
+        sidecar.pragmaPack      = std::move(pp.pragmaPackByOffset);
+        // TF-C85: same hop for the `#pragma optimize` stamps.
+        sidecar.pragmaNoOptimize = std::move(pp.pragmaNoOptimizeByOffset);
         return trees_.back().id();
     }
     // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
@@ -333,6 +413,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     auto& sidecar           = sidecars_.back();
     sidecar.candidates      = std::move(result.typeNameCandidates);
     sidecar.globalTypeNames = std::move(result.globalTypeNames);
+    sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
     sidecar.source          = std::move(src);
     sidecar.schema          = std::move(schema);
     return trees_.back().id();
@@ -389,6 +470,22 @@ void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
         cuFatal("UnitBuilder::setUserDefines called after finish()");
     }
     userDefines_ = std::move(defines);
+}
+
+void UnitBuilder::setTargetPredefinedMacros(
+    std::vector<PredefinedMacroDef> macros) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setTargetPredefinedMacros called after finish()");
+    }
+    targetPredefinedMacros_ = std::move(macros);
+}
+
+void UnitBuilder::setFormatPredefinedMacros(
+    std::vector<PredefinedMacroDef> macros) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setFormatPredefinedMacros called after finish()");
+    }
+    formatPredefinedMacros_ = std::move(macros);
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
@@ -611,10 +708,38 @@ CompilationUnit UnitBuilder::finish() && {
             for (std::size_t i = 0; i < trees_.size(); ++i) {
                 auto& sc = sidecars_[i];
                 if (sc.candidates.empty()) continue;
+                // D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME: a typedef name is not
+                // in scope within its OWN declarator (C 6.2.1p7). The oracle
+                // seeds a name as a GLOBAL (position-independent) type for the
+                // whole reparse, so seeding a typedef's OWN name would make its
+                // own parenthesized-name declarator (`typedef int (F);`) reparse
+                // as an abstract function-suffix param (F a param TYPE) instead
+                // of the parenthesized declarator that NAMES F — S0017. A
+                // candidate's span IS its self-defining occurrence exactly when
+                // it equals one of THIS tree's own global-TYPE binding spans (a
+                // byte range uniquely identifies one token in the buffer, so
+                // span equality ⇒ same token ⇒ the definition site). A genuine
+                // cross-file / in-buffer-FORWARD use has a DISTINCT span from
+                // the definition (BothDirectionsResolveInlineInOneBuffer), and a
+                // cross-file typedef's binding lives in ANOTHER tree — neither
+                // is excluded here.
+                auto spanKey = [](SourceSpan s) {
+                    return (static_cast<std::uint64_t>(s.start()) << 32)
+                           | s.end();
+                };
+                std::unordered_set<std::uint64_t> ownBindingSpans;
+                ownBindingSpans.reserve(sc.globalTypeBindings.size());
+                for (auto const& [name, span] : sc.globalTypeBindings) {
+                    (void)name;
+                    ownBindingSpans.insert(spanKey(span));
+                }
                 std::vector<std::string>        seeds;
                 std::unordered_set<std::string> seen;
                 for (auto const& cand : sc.candidates) {
                     if (!oracle.contains(cand.name)) continue;
+                    if (ownBindingSpans.contains(spanKey(cand.span))) {
+                        continue;   // self-defining occurrence — C 6.2.1p7
+                    }
                     if (seen.insert(cand.name).second) {
                         seeds.push_back(cand.name);
                     }
@@ -666,6 +791,7 @@ CompilationUnit UnitBuilder::finish() && {
                 trees_[i]          = std::move(result.tree);
                 sc.candidates      = std::move(result.typeNameCandidates);
                 sc.globalTypeNames = std::move(result.globalTypeNames);
+                sc.globalTypeBindings = std::move(result.globalTypeBindings);
                 ++typeNameReparseCount;
             }
             if (typeNameReparseCount > 0) {
@@ -728,6 +854,20 @@ CompilationUnit UnitBuilder::finish() && {
         }
     }
 
+    // TF-C82: flatten the per-tree `#pragma pack` stamps out of the sidecars, in
+    // tree order. `sidecars_` is index-parallel to `trees_` by construction
+    // (`addTree` appends exactly one sidecar), so this vector is too.
+    std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps;
+    pragmaPackMaps.reserve(sidecars_.size());
+    for (auto& sc : sidecars_) pragmaPackMaps.push_back(std::move(sc.pragmaPack));
+    // TF-C85: the same flatten for the `#pragma optimize` stamps, on the same
+    // index-parallel-by-construction guarantee.
+    std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets;
+    pragmaNoOptimizeSets.reserve(sidecars_.size());
+    for (auto& sc : sidecars_) {
+        pragmaNoOptimizeSets.push_back(std::move(sc.pragmaNoOptimize));
+    }
+
     finished_ = true;
     return CompilationUnit{
         CompilationUnit::PrivateTag{},
@@ -739,6 +879,8 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(shippedLibDescriptors),
         typeNameReparseCount,
         std::move(auxiliaryBuffers_),
+        std::move(pragmaPackMaps),
+        std::move(pragmaNoOptimizeSets),
     };
 }
 

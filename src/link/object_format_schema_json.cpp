@@ -4,11 +4,14 @@
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
+#include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/predefined_macro_json.hpp"  // detail::parsePredefinedMacroArray (TF-C97 — the SHARED predefine grammar, 3rd family)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -43,6 +46,80 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
         return std::unexpected(std::move(coll).release());
+    }
+
+    // ── closed root-key vocabulary ────────────────────────────────────────
+    //
+    // ★ THE LAST UNGUARDED LOADER FAMILY, and the highest-stakes of the three.
+    // The language loader closed its root keys in TF-C72 and the TARGET loader
+    // in TF-C74; the FORMAT loader still read every root key through a bare
+    // `doc.contains(…)` and IGNORED unknowns. That matters more here than
+    // anywhere else because format keys carry SILENT-MISCOMPILE semantics:
+    // `dataModel`, `bitFieldStrategy`, `longDoubleFormat`, `externCallDispatch`,
+    // `dataImportBinding`, `tlsAccess`, `stackReserveControl`. A typo'd
+    // `"bitFieldStrateg"` in any of the shipped `.format.json` files loads
+    // perfectly clean, is never read, and the engine silently falls back to the
+    // TARGET's strategy: a wrong-LAYOUT miscompile with no diagnostic. Same
+    // helper, same `C_MalformedJson` code and same message wording as the
+    // target loader — three loaders behaving identically is the point.
+    //
+    // ★ `charSignedness` is DELIBERATELY ABSENT from this vocabulary, and its
+    // absence is load-bearing rather than an oversight. Bare-`char` signedness
+    // is declared ENTIRELY on the TARGET (`charIsUnsigned`, which carries its
+    // own per-object-format overrides); a format file that re-declares it here
+    // would be a SECOND source of truth that nothing reads, so this guard
+    // rejects it by name rather than letting it sit inert.
+    //
+    // The `$`-prefix carve-out is MANDATORY, not decorative: the shipped format
+    // files use `$comment` / `$…Comment` heavily (MEASURED: 20 distinct
+    // `$`-prefixed root keys across the 24 shipped files, `$comment` in all 24),
+    // so without it this guard would reject every shipped format on first load.
+    //
+    // ★ Every name here is a key the loader GENUINELY READS — derived by
+    // walking this function's own `doc.contains(…)` / `doc.at(…)` sites, NOT
+    // copied from a shipped file's key set (that would bake in whatever one
+    // file happens to contain and start failing legitimate keys only other
+    // files use). `relocations` is read indirectly, through the shared
+    // `loadRelocationTable(doc, …)` substrate below. RE-DERIVED (not
+    // incremented) after TF-C97 added `predefinedMacros`: 26 keys appear in a
+    // direct `doc.contains(…)`/`doc.at(…)`, plus `relocations` through the
+    // shared substrate, = 27. VERIFIED against the union of non-`$` root keys
+    // across all 24 shipped files: that union is 27 once the 18 LP64 files
+    // declare `predefinedMacros`, and the two sets are identical — no key is
+    // read-but-never-declared, and none is declared-but-never-read.
+    static constexpr std::array<std::string_view, 27> kFormatDocumentKeys{
+        // identity + loader gates
+        "dssObjectFormatVersion", "format",
+        // C-family ABI axes (every one a silent-miscompile risk if it typos)
+        "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        // the C-visible face of those axes (TF-C97 — `__LP64__`/`_LP64`)
+        "predefinedMacros",
+        // output packaging + artifact vocabulary
+        "container", "artifactProfiles",
+        // program-entry cluster
+        "entryPoint", "entryCallingConvention", "processExit", "processArgs",
+        // import / link contract
+        "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        "tlsAccess", "librarySynthesis",
+        // stack-reserve capability + its remedy axis
+        "stackReserveControl", "stackReserveUnsupportedReason",
+        // section / relocation description
+        "sections", "relocations", "supportedDataSections",
+        // per-kind identity blocks (cross-kind-guarded above)
+        "elf", "pe", "optionalHeader", "macho", "image"};
+    DSS_CHECK_KEY_VOCABULARY(kFormatDocumentKeys);
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (detail::isDocumentationKey(it.key())) continue;
+        bool known = false;
+        for (auto const& k : kFormatDocumentKeys) {
+            if (it.key() == k) { known = true; break; }
+        }
+        if (!known) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/{}", it.key()),
+                      std::format("unknown top-level key '{}' (typo "
+                                  "discriminator)", it.key()));
+        }
     }
 
     // dssObjectFormatVersion — same per-schema-file version contract
@@ -113,6 +190,30 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     if (!kindOpt.has_value()) {
         coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
                   "expected 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
+        return std::unexpected(std::move(coll).release());
+    }
+    // ★ The `unknown` SENTINEL passes the name lookup above (it is a row in
+    // `kObjectFormatKindTable`), so it must be rejected on its own. `kind` is
+    // THE load-bearing dispatcher of this whole file — the cross-kind
+    // identity-block guard below, the elf/pe/macho/image block readers, FFI
+    // C-mangling, the linker's walker selection and `TargetSchema::
+    // charIsUnsigned(ObjectFormatKind)` all switch on it — so a sentinel kind
+    // matches nothing everywhere at once.
+    //
+    // `ObjectFormatData::validate()` ALSO rejects `Unknown`, and that arm
+    // stays: it is the guard for a HAND-BUILT `ObjectFormatData` that never
+    // set the field (the zero default IS the sentinel), which no JSON path can
+    // reach. This check is the JSON-path one, and it EARLY-RETURNS on purpose.
+    // Continuing the parse under a sentinel kind would run the cross-kind guard
+    // against it and emit one spurious "identity block 'elf' is only meaningful
+    // when format.kind == 'elf'" per declared block — diagnostics that point at
+    // the BLOCKS and advise renaming them, when the single actual defect is the
+    // kind. Stopping here leaves exactly one diagnostic, naming the sentinel.
+    if (!isSelectableObjectFormatKind(*kindOpt)) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
+                  std::string{kObjectFormatKindSentinelRejection}
+                      + " — declare one of 'elf' / 'pe' / 'macho' / 'wasm' / "
+                        "'spirv'");
         return std::unexpected(std::move(coll).release());
     }
     data.kind = *kindOpt;
@@ -195,6 +296,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // model (copy relocations) is likewise an ELF/PE/Mach-O
             // dynamic-import notion — dead data on WASM/SPIR-V.
             "dataImportBinding",
+            // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the extern-
+            // ADDRESS materialization binding (GOT-slot page-pair) is
+            // likewise an ELF/PE/Mach-O native-image notion — dead data
+            // on WASM/SPIR-V (they reach imports format-natively).
+            "externAddrBinding",
             // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local access
             // model (segment-register / TEB / TLV descriptor) is an
             // ELF/PE/Mach-O native-image notion — dead data on
@@ -206,6 +312,16 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // compiler-synthesized shim) is an ELF/PE/Mach-O native-
             // runtime notion — dead data on WASM/SPIR-V.
             "librarySynthesis",
+            // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-program stack-
+            // reserve capability names an ELF/PE/Mach-O image header field.
+            // WASM/SPIR-V have no such field (a WASM module's stack is the
+            // embedder's; SPIR-V has no call stack of this shape), so a
+            // top-level declaration would be dead data whose request the
+            // walker would silently drop.
+            "stackReserveControl",
+            // ... and its remedy axis: WASM/SPIR-V do not participate in the
+            // stack-reserve conversation at all, so neither key belongs.
+            "stackReserveUnsupportedReason",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -253,6 +369,46 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   "of 'LP64', 'LLP64', 'ILP32'", s));
         } else {
             data.dataModel = *dm;
+        }
+    }
+
+    // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): OPTIONAL
+    //    `predefinedMacros` ────────────────────────────────────────────
+    //
+    // The macros this FORMAT predefines — the C-visible face of the axes
+    // declared immediately above, `dataModel` first among them
+    // (`__LP64__`/`_LP64`). Declared HERE and not on the target because the
+    // axis is per-FORMAT: one CPU (x86_64) is LP64 under elf64/macho64 and
+    // LLP64 under pe64, so a target-side row would be wrong on one of its own
+    // formats. Both `.target.json` files say exactly this in prose and defer
+    // to this key.
+    //
+    // The per-entry grammar is the SHARED parser the language and target
+    // loaders use (`parsePredefinedMacroArray`), so the closed `kind` verb
+    // set, the Constant⇒`value` rule, the function-like `params` checks, the
+    // within-array duplicate-name reject and the `availableObjectFormats`
+    // validation are INHERITED rather than re-implemented — the same argument
+    // that extracted the parser at TF-C74, now paying off a third time.
+    // Malformed entries emit `C_MalformedJson` (this family's code for a
+    // structurally-wrong value, as `dataModel`/`bitFieldStrategy` above do);
+    // MISSING required fields emit the universal `C_MissingField`.
+    //
+    // ★ THE LOADER NEVER SYNTHESIZES A MACRO NAME. It reads whatever the file
+    // declares; which names an LP64 format ought to declare is derived by the
+    // config author from that file's own `dataModel`, in the file. Deriving it
+    // here would bake a C spelling into the object-format tier — a
+    // source-language-agnosticism break, not a shortcut. OPTIONAL; absent ⇒
+    // empty ⇒ the effective predefine list is byte-identical to pre-TF-C97,
+    // which is the DECLARED answer for every LLP64/ILP32 format.
+    if (doc.contains("predefinedMacros")) {
+        json const& pms = doc.at("predefinedMacros");
+        if (!pms.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/predefinedMacros",
+                      "'predefinedMacros' must be an array");
+        } else {
+            detail::parsePredefinedMacroArray(
+                pms, "/predefinedMacros", DiagnosticCode::C_MalformedJson,
+                coll, data.predefinedMacros);
         }
     }
 
@@ -461,6 +617,37 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): `externAddrBinding`
+    // — the format's extern-ADDRESS materialization binding ("got").
+    // Optional in the JSON (only the arm64 relocatable + static-archive
+    // formats declare it; the DSS-linked exec/pie/dyn formats omit it and
+    // materialize an `&extern` value via the ordinary lea). Present-but-
+    // unknown IS a fail-loud HERE at load (a typo must NOT silently
+    // degrade to "no GOT-address support" — the externCallDispatch /
+    // dataImportBinding discipline).
+    if (doc.contains("externAddrBinding")) {
+        if (!doc.at("externAddrBinding").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/externAddrBinding",
+                      "'externAddrBinding' must be a string (\"got\")");
+        } else {
+            auto const s =
+                doc.at("externAddrBinding").get<std::string>();
+            auto const b = externAddrBindingFromName(s);
+            if (!b.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/externAddrBinding",
+                          std::format("unknown externAddrBinding '{}' "
+                                      "— accepted: \"got\" (ELF "
+                                      "relocatable GOT-slot address via "
+                                      "ADR_GOT_PAGE + LD64_GOT_LO12_NC)",
+                                      s));
+            } else {
+                data.externAddrBinding = *b;
+            }
+        }
+    }
+
     // D-CSUBSET-THREAD-LOCAL (TLS C1): `tlsAccess` block — the format's
     // thread-local access model + the x86 access-sequence values.
     // Optional in the JSON (a format whose TLS machinery has not landed
@@ -647,6 +834,204 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
             }
             if (ok) data.librarySynthesis = info;
+        }
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `stackReserveControl` block —
+    // WHETHER this format can carry a per-PROGRAM stack reserve, and (if so)
+    // WHERE it lands + the legal request range. PRESENCE is the capability:
+    // the linker gate asks `stackReserveControl().has_value()`, never a
+    // format identity, which is what lets the PE **exec** format declare it
+    // while the PE **dll** (same kind, same header struct, but the loader
+    // ignores the field) declares nothing. A PRESENT block is strict — the
+    // vehicle is a closed verb and all three bounds are REQUIRED, because a
+    // capability that does not state its own legal range cannot validate a
+    // request and a defaulted range would silently admit an absurd value.
+    if (doc.contains("stackReserveControl")) {
+        auto const& sr = doc.at("stackReserveControl");
+        if (!sr.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/stackReserveControl",
+                      "'stackReserveControl' must be an object { \"vehicle\": "
+                      "\"pe-optional-header\", \"minimumBytes\": N, "
+                      "\"maximumBytes\": N, \"granularityBytes\": N }");
+        } else {
+            StackReserveControl info{};
+            bool ok = true;
+            if (!sr.contains("vehicle") || !sr.at("vehicle").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/stackReserveControl/vehicle",
+                          "'stackReserveControl.vehicle' is required and must "
+                          "be a string — accepted: \"pe-optional-header\" "
+                          "(IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve)");
+                ok = false;
+            } else {
+                auto const s = sr.at("vehicle").get<std::string>();
+                auto const v = stackReserveVehicleFromName(s);
+                if (!v.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/stackReserveControl/vehicle",
+                              std::format("unknown stackReserveControl vehicle "
+                                          "'{}' — accepted: "
+                                          "\"pe-optional-header\". A vehicle "
+                                          "ships only WITH the walker arm that "
+                                          "writes it, so a format can never "
+                                          "declare a reserve no walker emits.",
+                                          s));
+                    ok = false;
+                } else {
+                    info.vehicle = *v;
+                }
+            }
+            // The three REQUIRED bounds. `is_number_unsigned` rejects a
+            // negative and a float in one check (nlohmann types `-1` as a
+            // SIGNED integer and `1.5` as a float), so a `"minimumBytes": -1`
+            // can never wrap into a huge u64.
+            auto const readBound = [&](char const* key, std::uint64_t& out) {
+                auto const ptr = std::string{"/stackReserveControl/"} + key;
+                if (!sr.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'stackReserveControl.{}' is required "
+                                          "— a declared capability must state "
+                                          "its own legal request range", key));
+                    ok = false;
+                    return;
+                }
+                if (!sr.at(key).is_number_unsigned()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'stackReserveControl.{}' must be a "
+                                          "non-negative integer byte count",
+                                          key));
+                    ok = false;
+                    return;
+                }
+                out = sr.at(key).get<std::uint64_t>();
+            };
+            readBound("minimumBytes",     info.minimumBytes);
+            readBound("maximumBytes",     info.maximumBytes);
+            readBound("granularityBytes", info.granularityBytes);
+
+            // Internal coherence — a range that cannot admit ANY value, or a
+            // zero granularity (a modulo-by-zero at the request gate), is
+            // dead config that would fail every request for the wrong reason.
+            if (ok && info.granularityBytes == 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/granularityBytes",
+                          "'granularityBytes' must be > 0 (a request is "
+                          "alignment-checked against it; 0 admits nothing)");
+                ok = false;
+            }
+            if (ok && info.minimumBytes == 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/minimumBytes",
+                          "'minimumBytes' must be > 0 (a zero-byte stack "
+                          "reserve cannot start a program)");
+                ok = false;
+            }
+            if (ok && info.maximumBytes < info.minimumBytes) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/maximumBytes",
+                          std::format("'maximumBytes' ({}) must be >= "
+                                      "'minimumBytes' ({}) — the declared "
+                                      "range admits no value",
+                                      info.maximumBytes, info.minimumBytes));
+                ok = false;
+            }
+            if (ok && (info.minimumBytes % info.granularityBytes) != 0) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveControl/minimumBytes",
+                          std::format("'minimumBytes' ({}) must itself be a "
+                                      "multiple of 'granularityBytes' ({}) — "
+                                      "otherwise the smallest legal request is "
+                                      "unreachable",
+                                      info.minimumBytes,
+                                      info.granularityBytes));
+                ok = false;
+            }
+            // Vehicle ↔ format.kind coherence. A vehicle NAMES a structure of
+            // one image format, so declaring `pe-optional-header` on an ELF
+            // schema is dead config whose request the ELF walker would
+            // silently drop — the exact silent-drop this capability exists to
+            // prevent. Expressed as a TABLE (the `kCrossKindRules` idiom
+            // above), not an if-chain: config vocabulary checked against
+            // config vocabulary, evaluated generically.
+            struct VehicleKindRule {
+                StackReserveVehicle vehicle;
+                ObjectFormatKind    kind;
+            };
+            constexpr VehicleKindRule kVehicleKinds[] = {
+                { StackReserveVehicle::PeOptionalHeader, ObjectFormatKind::Pe },
+            };
+            if (ok) {
+                for (auto const& rule : kVehicleKinds) {
+                    if (rule.vehicle == info.vehicle && rule.kind != data.kind) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            "/stackReserveControl/vehicle",
+                            std::format(
+                                "stackReserveControl vehicle '{}' names a "
+                                "structure of the '{}' image format, but this "
+                                "schema declares kind '{}'. The '{}' walker "
+                                "would silently DROP a stack-reserve request "
+                                "routed to it. Fix the vehicle or the "
+                                "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
+                                "DEPTH.",
+                                stackReserveVehicleName(info.vehicle),
+                                objectFormatKindName(rule.kind),
+                                objectFormatKindName(data.kind),
+                                objectFormatKindName(data.kind)));
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) data.stackReserveControl = info;
+        }
+    }
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `stackReserveUnsupportedReason` —
+    // the REMEDY axis. Not a second capability: it declares WHY this format
+    // cannot carry a reserve, so the refusal can tell the user where the
+    // property actually lives for THIS artifact (a PE dll's inert header
+    // field, a relocatable object's absent one, an ELF `ulimit`, an
+    // unimplemented Mach-O walker arm). Optional — a format that declares
+    // neither key still REFUSES a request, just with the generic message.
+    if (doc.contains("stackReserveUnsupportedReason")) {
+        auto const& sru = doc.at("stackReserveUnsupportedReason");
+        if (!sru.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/stackReserveUnsupportedReason",
+                      "'stackReserveUnsupportedReason' must be a string — "
+                      "accepted: \"runtime-controlled\", "
+                      "\"loader-ignores-field\", \"no-image-field\", "
+                      "\"walker-not-implemented\"");
+        } else if (data.stackReserveControl.has_value()) {
+            // Contradictory config: a format cannot both DECLARE the
+            // capability and explain why it lacks it. Reject rather than pick
+            // one silently — a schema in this state means the author changed
+            // their mind and left the losing key behind, and whichever the
+            // engine ignored would be a lie sitting in the config.
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      "/stackReserveUnsupportedReason",
+                      "a format must not declare BOTH 'stackReserveControl' "
+                      "(it CAN carry a stack reserve) and "
+                      "'stackReserveUnsupportedReason' (why it CANNOT) — the "
+                      "two are mutually exclusive. Delete whichever no longer "
+                      "applies. D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.");
+        } else {
+            auto const s = sru.get<std::string>();
+            auto const r = stackReserveUnsupportedReasonFromName(s);
+            if (!r.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/stackReserveUnsupportedReason",
+                          std::format("unknown stackReserveUnsupportedReason "
+                                      "'{}' — accepted: "
+                                      "\"runtime-controlled\", "
+                                      "\"loader-ignores-field\", "
+                                      "\"no-image-field\", "
+                                      "\"walker-not-implemented\"",
+                                      s));
+            } else {
+                data.stackReserveUnsupportedReason = *r;
+            }
         }
     }
 

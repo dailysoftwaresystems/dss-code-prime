@@ -65,7 +65,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         // cross-TU reference legitimately carries no library — whether it is
         // UNDEFINED depends on cross-CU resolution AND on being referenced,
         // so that surface lives at the emission head
-        // (`rejectOrDropUnboundExterns`), AFTER the multi-module reference
+        // (`rejectOrDropUnreferencedExterns`), AFTER the multi-module reference
         // resolution has had its chance.
         if (ext.mangledName.empty()) {
             report(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -78,48 +78,69 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
 }
 
-// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the UNDEFINED-SYMBOL surface —
-// ld's exact behavior for a declared-but-never-defined external reference. An
-// ExternImport with an EMPTY libraryPath is a bare-prototype cross-TU
-// reference (C 6.2.2p5): it binds to nothing at the library tier BY DESIGN.
-// Runs on the FINAL emission module (post-LK11: a sibling-CU-resolved extern
-// was already STRIPPED by the merge), so what remains splits two ways, both
-// keyed on whether anything actually REFERENCES the symbol (a relocation in
-// any function or data item targets it) — exactly ld's rule:
-//   * REFERENCED + unbound  ⇒ policy-keyed (c150 — the schema-driven
-//     `allowsUndefinedImports()` third flavor): an artifact a LATER binder
-//     resolves (relocatable .o — the final linker; ELF ET_DYN .so — ld.so's
-//     global scope at load) KEEPS the row as a legal undefined symbol; an
-//     EXEC image (nothing later binds it) rejects LOUD, naming the symbol
-//     (never an IAT/DT_NEEDED entry with no owning image, which would defer
-//     the failure to the loader or read a null slot);
-//   * UNREFERENCED + unbound ⇒ DROPPED from the module (returns false ⇒ the
-//     caller swaps in `filtered`): a bare prototype nobody calls is dead
-//     declaration surface, NOT an error (ld ignores unreferenced undefined
-//     symbols — sqlite3.h declares the whole API; a TU need not call all of
-//     it, and a config-gated symbol may be defined nowhere). Letting the row
-//     flow onward would emit a broken import group (an empty DT_NEEDED /
+// D-LINK-EXTERN-IMPORT-REFERENCE-GATE (generalizes c86's
+// D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the extern-import REFERENCE gate — ld's
+// rule for what an emitted image / relocatable object actually imports. An extern
+// import SURVIVES iff it is EAGER **or** REFERENCED; otherwise it is DROPPED.
+// Runs on the FINAL emission module (post-LK11: a sibling-CU-resolved extern was
+// already STRIPPED by the merge). "Referenced" = a relocation in ANY function or
+// data item targets the extern's symbol (an aggregate global can hold a function
+// pointer to an extern — the sqlite aSyscall[] shape — so data-item relocs count).
+// The three outcomes:
+//   * EAGER (isEagerImport) ⇒ KEEP unconditionally. A shipped-library descriptor
+//     symbol (a `#include`d library export) is bound whether or not this TU
+//     references it — the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant (the descriptor
+//     lists a real library export the loader must resolve; dropping it would
+//     under-bind a genuine dependency). Eager ⟹ library-bound by construction.
+//   * REFERENCED (non-eager) ⇒ split on library binding:
+//       - library-bound (printf from libc): KEEP — the per-format walker emits
+//         its import-table entry.
+//       - UNBOUND (empty libraryPath — a bare-prototype cross-TU reference,
+//         C 6.2.2p5): policy-keyed by the schema-driven `allowsUndefinedImports()`
+//         (c150's three flavors): a RELOCATABLE `.o` / ELF ET_DYN `.so` a LATER
+//         binder resolves KEEPS the row as a legal undefined symbol; an EXEC image
+//         (nothing later binds it) rejects LOUD, naming the symbol (never an
+//         IAT/DT_NEEDED entry with no owning image, which would defer the failure
+//         to the loader or read a null slot).
+//   * UNREFERENCED + NON-EAGER ⇒ DROPPED (bound OR unbound; returns false ⇒ the
+//     caller swaps in `filtered`): gcc's rule that an unused extern declaration
+//     emits no import. A source `extern int f(int);` never called, or a bare
+//     prototype nobody uses (sqlite3.h declares the whole API; a config-gated
+//     symbol may be defined nowhere), is dead declaration surface. ★ The
+//     LIBRARY-BOUND half of this drop is the c86→reference-gate generalization:
+//     BEFORE it, a non-eager row auto-bound to the format-default library (e.g. a
+//     3-field `HirExternRecord` defaulting `noLibraryBinding=false`) flowed to the
+//     walker and its DT_NEEDED / import entry broke the LOADER (ld.so "undefined
+//     symbol" at load, exit 127) — the sole load-blocker for the SQLite
+//     testfixture's declared-but-never-called `Sqlitetestsse_Init`. Dropping the
+//     unbound half also avoids a broken import group (an empty DT_NEEDED /
 //     IMAGE_IMPORT_DESCRIPTOR name).
-// A library-bound import (non-empty libraryPath) is never touched — the
-// per-format walkers own its import-table emission (unreferenced ones
-// included, the pre-c86 status quo). Returns true when `m` flowed through
-// untouched (no drops), false when `filtered` holds the dropped-row copy.
-[[nodiscard]] bool rejectOrDropUnboundExterns(
+// AGNOSTIC: the drop is UNIFORM across elf/pe/macho — no format-name branch. The
+// only format-keyed decision is the EXEC-vs-later-binder reject, which reads the
+// schema's `allowsUndefinedImports()` (never a format name). Returns true when `m`
+// flowed through untouched (no drops), false when `filtered` holds the dropped-row
+// copy. Rejects (if any) are reported regardless of the return value.
+[[nodiscard]] bool rejectOrDropUnreferencedExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
     bool                   allowUndefinedExterns,
     DiagnosticReporter&    reporter) {
-    bool anyUnbound = false;
+    // Candidate test: does ANY named import need the gate — i.e. is there a
+    // NON-EAGER row? An eager row is always kept, so a module whose every named
+    // import is eager has nothing to gate (the common `#include`-only fast path).
+    // This MUST fire for a library-bound non-eager row too (not just unbound
+    // ones): otherwise an unreferenced `Sqlitetestsse_Init` in a module with no
+    // unbound rows would skip the gate and survive to the loader. Every unbound
+    // row is non-eager (eager ⟹ bound), so `!isEagerImport` also covers them.
+    bool anyCandidate = false;
     for (auto const& ext : m.externImports) {
-        if (ext.libraryPath.empty() && !ext.mangledName.empty()) {
-            anyUnbound = true;
+        if (!ext.mangledName.empty() && !ext.isEagerImport) {
+            anyCandidate = true;
             break;
         }
     }
-    if (!anyUnbound) return true;   // the common path: no unbound rows at all
-    // Reference scan: every relocation target across functions AND data
-    // items (an aggregate global can hold a function pointer to an extern —
-    // the sqlite aSyscall[] shape — so data-item relocs count as references).
+    if (!anyCandidate) return true;   // all named imports eager → nothing to gate
+    // Reference scan: every relocation target across functions AND data items.
     std::unordered_set<std::uint32_t> referenced;
     for (auto const& fn : m.functions) {
         for (auto const& rel : fn.relocations) referenced.insert(rel.target.v);
@@ -129,49 +150,48 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     bool anyDrop = false;
     for (auto const& ext : m.externImports) {
-        if (!ext.libraryPath.empty()) continue;          // library-bound import
-        if (ext.mangledName.empty()) continue;           // already rejected (compound index)
+        if (ext.mangledName.empty()) continue;   // already rejected (compound index)
+        if (ext.isEagerImport) continue;         // eager law: keep even if unreferenced
         if (referenced.contains(ext.symbol.v)) {
-            // The c143 gate, generalized at c150 into a schema-driven
-            // THREE-flavor policy (`allowsUndefinedImports()`):
-            //   * RELOCATABLE (.o/.obj): a referenced no-library extern is a
-            //     LEGAL SHN_UNDEF symbol the FINAL (foreign) linker resolves
-            //     against a sibling object or library — the bare-prototype
-            //     `SQLITE_API` shape (D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE).
-            //     KEEP (the ET_REL writer's undefined-symbol loop emits it by
-            //     `mangledName` via `externName`; gcc's `ld` resolves it).
-            //   * ELF ET_DYN (.so): standard `ld -shared` semantics — a
-            //     shared library may reference symbols the EXECUTABLE (or a
-            //     sibling library) defines; ld.so resolves them from the
-            //     global scope at load. KEEP (the dyn walker emits an UNDEF
-            //     `.dynsym` entry + PLT/GOT machinery; no DT_NEEDED row).
-            //   * EXEC image: nothing later binds it — an unresolved
-            //     reference is a load-time failure; reject LOUD (unchanged).
-            //     c151 (D-LK1-4 PIE half): the ELF ET_DYN PIE is THIS flavor
-            //     — an executable, discriminated from the `.so` by its
-            //     schema's entry cluster (never a format-name check); ld.so
-            //     erroring "symbol lookup error" at ./prog time is exactly
-            //     the deferred-failure class this reject prevents.
-            if (!allowUndefinedExterns) {
-                report(reporter, DiagnosticCode::K_SymbolUndefined,
-                       DiagnosticSeverity::Error,
-                       "undefined symbol '" + ext.mangledName + "' — the symbol "
-                       "is referenced (a prototype/extern declaration with no "
-                       "import library) but no linked compilation unit defines "
-                       "it and no library import binds it. Provide a definition "
-                       "in a linked translation unit, or declare the owning "
-                       "library for the symbol.");
+            if (ext.libraryPath.empty()) {
+                // REFERENCED + UNBOUND — the c143/c150 policy, UNCHANGED. The
+                // schema-driven THREE-flavor `allowsUndefinedImports()`:
+                //   * RELOCATABLE (.o/.obj): a LEGAL SHN_UNDEF symbol the FINAL
+                //     (foreign) linker resolves (the `SQLITE_API` shape,
+                //     D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE). KEEP.
+                //   * ELF ET_DYN (.so): `ld -shared` semantics — ld.so resolves
+                //     it from the global scope at load. KEEP.
+                //   * EXEC image: nothing later binds it — reject LOUD, naming
+                //     the symbol (c151 D-LK1-4: the PIE ET_DYN executable is THIS
+                //     flavor, discriminated by its schema's entry cluster, never a
+                //     format-name check).
+                // ★★ This reject MUST stay gated on `libraryPath.empty()`: a
+                //    referenced LIBRARY-BOUND row (printf) must NEVER reach it, or
+                //    every referenced libc import on an exec would reject loud —
+                //    catastrophic. The `else` below (referenced + library-bound)
+                //    keeps the row silently.
+                if (!allowUndefinedExterns) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "undefined symbol '" + ext.mangledName + "' — the symbol "
+                           "is referenced (a prototype/extern declaration with no "
+                           "import library) but no linked compilation unit defines "
+                           "it and no library import binds it. Provide a definition "
+                           "in a linked translation unit, or declare the owning "
+                           "library for the symbol.");
+                }
+                // else: kept — resolved by the final linker (relocatable) or
+                // by ld.so's global scope at load (ELF ET_DYN).
             }
-            // else: kept — resolved by the final linker (relocatable) or
-            // by ld.so's global scope at load (ELF ET_DYN).
+            // else: referenced + library-bound (printf) → KEEP. Do nothing.
         } else {
-            anyDrop = true;   // unreferenced + unbound ⇒ drop below
+            anyDrop = true;   // unreferenced + non-eager ⇒ drop below (bound OR unbound)
         }
     }
     if (!anyDrop) return true;   // rejects (if any) reported; module unchanged
-    filtered = m;   // copy, then erase the unreferenced unbound rows
+    filtered = m;   // copy, then erase the unreferenced non-eager rows
     std::erase_if(filtered.externImports, [&](ExternImport const& ext) {
-        return ext.libraryPath.empty() && !ext.mangledName.empty()
+        return !ext.mangledName.empty() && !ext.isEagerImport
             && !referenced.contains(ext.symbol.v);
     });
     return false;
@@ -249,6 +269,28 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                            DiagnosticSeverity::Error,
                            "relocation in CU #" + std::to_string(m.cuId.v) +
                            " targets symbol #" + std::to_string(rel.target.v) +
+                           " which is not defined or imported in that CompilationUnit "
+                           "(a cross-CU reference must be declared as an extern import).");
+                }
+            }
+        }
+        // D-LINK-DATA-RELOC-TARGET-VALIDATE: DATA-item relocations get the SAME
+        // resolvability check as function relocations above — an abs64 pointer slot
+        // in a symbol-address global / function-pointer table / jump table (the c67
+        // encodeAggregateValue arm, the c70 switch table) targets a SymbolId that
+        // must be declared in this CU (the compound index covers functions, data
+        // items, block symbols, and extern imports). Closing this asymmetry makes a
+        // mis-remapped or dangling DATA reloc target fail LOUD at link
+        // (K_SymbolUndefined) instead of surfacing as a SILENT wrong/NULL pointer at
+        // runtime, exactly the class the function-reloc loop already guards.
+        for (auto const& di : m.dataItems) {
+            for (auto const& rel : di.relocations) {
+                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "data-item relocation in CU #" + std::to_string(m.cuId.v) +
+                           " (data SymbolId #" + std::to_string(di.symbol.v) +
+                           ") targets symbol #" + std::to_string(rel.target.v) +
                            " which is not defined or imported in that CompilationUnit "
                            "(a cross-CU reference must be declared as an extern import).");
                 }
@@ -539,9 +581,39 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 LinkedImage link(std::span<AssembledModule const> modules,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
-                 DiagnosticReporter&       reporter) {
+                 DiagnosticReporter&       reporter,
+                 ImageRequest const&       request) {
     LinkedImage image;
     image.format = objectFormatSchema.kind();
+
+    // ── Per-PROGRAM image-request gate (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) ──
+    //
+    // Runs FIRST, before any module work: a request the chosen format cannot
+    // honour is a build error regardless of what the modules contain, and
+    // reporting it up-front costs the user nothing.
+    //
+    // The decision itself lives in `enforceImageRequest` (link/image_request)
+    // so the gate and every walker arm share ONE implementation -- the first
+    // cut split them and the PE walker ended up checking the CAPABILITY but
+    // not the declared BOUNDS, which let a direct `pe::encode` call write an
+    // out-of-range reserve and report success.
+    //
+    // What it asks is a declared CAPABILITY, never a format identity: the
+    // capability is not even uniform within one kind -- `pe64-...-exec`
+    // declares it (the Windows loader reads SizeOfStackReserve) while
+    // `pe64-...-dll` does not (the loader IGNORES a DLL's copy of the same
+    // field), so an `if (kind == Pe)` branch here would write a field nothing
+    // reads. ELF declares nothing because no ELF image field carries a stack
+    // SIZE at all.
+    //
+    // This is the chokepoint every compile-driven emission passes through, so
+    // a request can never slip past into a walker that would drop it silently
+    // -- the whole failure mode being a build that reports success while
+    // emitting an image whose stack is not what was asked for.
+    if (!enforceImageRequest(request, objectFormatSchema, "linker", reporter)) {
+        image.resolvedFuncCount = 0;
+        return image;
+    }
 
     // D-LK4-3 — N==0 is a caller error; N>1 (cross-CU) builds the collision-proof
     // compound-key index + validates each CU, then fail-louds: the multi-CU image
@@ -566,7 +638,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
         // collide (distinct cuId), so one shared index validates every CU. An
         // empty extern libraryPath is NOT rejected here (c86): whether it is an
         // undefined symbol depends on the cross-CU resolution below — the
-        // shared post-merge `rejectOrDropUnboundExterns` owns that surface.
+        // shared post-merge `rejectOrDropUnreferencedExterns` owns that surface.
         std::unordered_map<LinkedSymbolKey, SymbolKind> compoundIndex;
         for (auto const& m : modules) buildCompoundIndex(compoundIndex, m, reporter);
         // DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) + REFERENCE
@@ -589,18 +661,21 @@ LinkedImage link(std::span<AssembledModule const> modules,
         }
         selectedInput = &mergedStorage;
     }
-    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the undefined-symbol
-    // surface, on the FINAL emission module (post-merge — a sibling-resolved
-    // no-library extern was already stripped). A REFERENCED unbound extern
-    // rejects LOUD (naming the symbol) and aborts before any emission state;
-    // an UNREFERENCED unbound one is DROPPED (ld's rule — see
-    // rejectOrDropUnboundExterns) so no walker ever sees a library-less
-    // import group. Placed BEFORE externImportNames / the data-import gate /
-    // the trampoline so every downstream consumer sees the filtered module.
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE (generalizes c86): the extern-import
+    // reference gate, on the FINAL emission module (post-merge — a sibling-
+    // resolved extern was already stripped). An import survives iff EAGER or
+    // REFERENCED: a REFERENCED unbound extern on an exec rejects LOUD (naming the
+    // symbol) and aborts before any emission state; an UNREFERENCED NON-EAGER
+    // import (library-bound OR unbound) is DROPPED (gcc's unused-decl-emits-
+    // nothing rule — see rejectOrDropUnreferencedExterns) so no walker ever
+    // emits a spurious import (the load-blocker for a defaulted `extern` the TU
+    // never calls). An EAGER `#include`d descriptor import is kept regardless.
+    // Placed BEFORE externImportNames / the data-import gate / the trampoline so
+    // every downstream consumer sees the filtered module.
     AssembledModule unboundFilteredStorage;   // populated only when rows drop
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
-        if (!rejectOrDropUnboundExterns(*selectedInput, unboundFilteredStorage,
+        if (!rejectOrDropUnreferencedExterns(*selectedInput, unboundFilteredStorage,
                                         objectFormatSchema.allowsUndefinedImports(),
                                         reporter)) {
             selectedInput = &unboundFilteredStorage;
@@ -790,7 +865,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // (cuId, SymbolId)). `buildCompoundIndex` fails loud on a duplicate compound key
     // (the same SymbolId declared twice in this CU, across any kind) and on empty
     // extern mangledName; an empty libraryPath is the c86 undefined-symbol
-    // surface, handled by `rejectOrDropUnboundExterns` at the head of this
+    // surface, handled by `rejectOrDropUnreferencedExterns` at the head of this
     // emission section (referenced ⇒ rejected loud; unreferenced ⇒ dropped).
     // Single-CU resolution here; cross-CU symbol-table merge is LK11. Externs
     // resolve against the per-format walker's import-table emission (LK6
@@ -875,6 +950,36 @@ LinkedImage link(std::span<AssembledModule const> modules,
             }
         }
         if (funcResolved) ++image.resolvedFuncCount;
+    }
+
+    // D-LINK-DATA-RELOC-TARGET-VALIDATE: DATA-item relocations get the SAME
+    // undefined-target check as the function relocations above. A symbol-address
+    // global / function-pointer table / c70 switch jump table carries abs64
+    // relocations in its DATA bytes whose target must be a declared function / data
+    // item / synthetic block symbol / extern import (all indexed in `symbolIndex` by
+    // buildCompoundIndex) or a writer-reserved singleton. Without this, a
+    // mis-remapped or dangling data-reloc target surfaced ONLY as a silent wrong /
+    // NULL pointer at runtime — the class the aSyscall Local/Global merge miscompile
+    // (D-LINK-LOCAL-FN-ADDR-STATIC-DATA-VA0) belonged to — instead of a LOUD
+    // K_SymbolUndefined at link. This is the N==1 twin of the per-CU data check the
+    // multi-module `resolveCrossCuSymbols` now runs (and the merged whole-program
+    // image flows through THIS single-CU path).
+    for (auto const& di : module.dataItems) {
+        for (auto const& reloc : di.relocations) {
+            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
+                && !isWriterReservedSymbolIdValue(reloc.target.v)) {
+                std::string msg = "data-item relocation in symbol #";
+                msg += std::to_string(di.symbol.v);
+                msg += " references undefined symbol #";
+                msg += std::to_string(reloc.target.v);
+                msg += " (not declared by any AssembledFunction, "
+                       "ExternImport, nor AssembledData item)";
+                report(reporter,
+                       DiagnosticCode::K_SymbolUndefined,
+                       DiagnosticSeverity::Error,
+                       std::move(msg));
+            }
+        }
     }
 
     // Skip walker dispatch if the cross-reference unifier failed.
@@ -989,8 +1094,15 @@ LinkedImage link(std::span<AssembledModule const> modules,
                                   objectFormatSchema, reporter);
         break;
     case ObjectFormatKind::Pe:
+        // `request` is threaded ONLY to the walkers that implement a
+        // declared vehicle for one of its fields (today: PE, for
+        // `stackReserveControl.vehicle = pe-optional-header`). The other
+        // walkers take no request BY CONSTRUCTION: their formats declare no
+        // capability, so the gate above has already refused any request that
+        // would reach them. A new vehicle lands WITH its walker's parameter,
+        // never before — so "declared but silently dropped" is unreachable.
         image.bytes = pe::encode(module, targetSchema,
-                                 objectFormatSchema, reporter);
+                                 objectFormatSchema, reporter, request);
         break;
     case ObjectFormatKind::MachO:
         image.bytes = macho::encode(module, targetSchema,
@@ -1024,6 +1136,15 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // violation. Same shape as the pre-walker gate above.
     if (reporter.errorCount() != errorsAtEntry) {
         image.resolvedFuncCount = 0;
+    } else {
+        // Clean conclusion: the walker produced bytes with no new diagnostic.
+        // This is the ONLY point that marks the link successful — every failure
+        // early-return above returns before here, leaving `linkedCleanly`
+        // false. It distinguishes a genuinely EMPTY module (a valid 0-function
+        // success — D-CSUBSET-TESTTU-SILENT-EXIT1) from a failure that also
+        // ended with `resolvedFuncCount == expectedFuncCount == 0` (e.g. the
+        // undefined-extern early-return at :610-611).
+        image.linkedCleanly = true;
     }
 
     return image;
@@ -1034,9 +1155,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
 LinkedImage link(AssembledModule const&    module,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
-                 DiagnosticReporter&       reporter) {
+                 DiagnosticReporter&       reporter,
+                 ImageRequest const&       request) {
     return link(std::span<AssembledModule const>{&module, 1},
-                targetSchema, objectFormatSchema, reporter);
+                targetSchema, objectFormatSchema, reporter, request);
 }
 
 } // namespace dss::linker

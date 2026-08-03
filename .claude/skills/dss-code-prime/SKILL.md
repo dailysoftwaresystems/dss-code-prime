@@ -24,11 +24,23 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 - **DSS Code Prime** is a universal, configurable C++ compiler frontend. Both the source language
   AND the target platform are intended to be configurable — a single C++ engine compiles *any*
   defined language to *any* supported target.
-- **Status today:** the tree/node model foundation (sub-plan T0–T12), schema-expressiveness v2
-  (PR0–PR8), and substrate hardening (SH1–SH4) are all complete and shipping. The lexer,
-  parser, semantic analyzer, IR, optimizer, and codegen layers do **not yet exist** — that's
-  the next-up parent-plan phase #5. Everything in this repo is the substrate every later layer
-  will build on.
+- **Status today: the WHOLE pipeline exists and ships.** ⚠ This bullet previously said the
+  lexer, parser, semantic analyzer, IR, optimizer and codegen "do not yet exist" — that has been
+  false for a long time and is corrected here. The real shape today is
+  tokenizer → preprocessor → parser → semantic analysis → HIR → MIR → LIR → optimizer →
+  register allocation → **DSS's own assembler** (x86_64 + arm64, with a round-trip encoding
+  oracle) → **DSS's own linker** (ELF / PE / Mach-O, static and dynamic). No `as`, no `ld`,
+  no LLVM. The tree/node foundation (T0–T12), schema-expressiveness v2 (PR0–PR8) and substrate
+  hardening (SH1–SH4) are the substrate underneath it, not the whole product.
+- **The bar it is held to:** source-language / CPU-target / object-format **agnostic** — no
+  `if (lang == …)`, `if (arch == …)` or `if (format == …)` in shared substrate
+  (`src/{opt,mir,hir,lir,core,analysis,asm,tokenizer,link,preprocess}`); vocabulary lives in
+  `.lang.json` / `.target.json` / `.format.json`. Plus: best-long-term over workarounds,
+  fail-loud over silent miscompile, strict red-on-disable tests. See the `dss-cycle` skill §A.
+- **Real-world proof lives in [`real-examples/`](../../../real-examples/)** — see §2.1 below. It
+  is the registry of known real repositories DSS compiles from **unmodified upstream source**
+  and whose **own test suites** it then runs. This is the project's primary end-to-end evidence;
+  prefer it over any claim in this skill when the two disagree.
 - **Main technologies:** C++23, CMake 4.0+, FetchContent for `nlohmann/json` 3.12.0 and
   GoogleTest 1.17.0. Local dev on Windows uses MinGW GCC 13.2 (ucrt); CI exercises
   Linux/GCC-13, Linux/Clang-19+ASan, Windows/MSVC, and macOS/AppleClang on every PR.
@@ -43,13 +55,49 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 | Directory | Purpose |
 |-----------|---------|
 | `src/core/` | The static `core` library — compiled into `libdss-code-prime.dll` |
-| `src/core/types/` | The tree/node model and friends (22 headers, 11 `.cpp` files) |
-| `src/dss-config/sources/` | Shipped `.lang.json` grammar configs (`toy`, `c-subset`, `tsql-subset`) |
-| `tests/core/` | GoogleTest unit + integration tests (one executable per file) |
-| `docs/` | User-facing onboarding docs (`tree-model.md`, `language-config-spec.md`) |
-| `.plans/` | Internal design records and roadmap (`00-compiler-implementation-plan - tbd.md`, `01-tree-node-model-plan - ok.md`, `02-schema-expressiveness-v2-plan - ok.md`) |
-| `build/` | CMake build dir (gitignored) |
-| `libs/`, `docker/`, `integrated_tests/` | Reserved for later phases |
+| `src/core/types/` | The tree/node model and friends |
+| `src/tokenizer/` | Lexing (`tokenizer`, `token_stream`, `source_reader`) |
+| `src/analysis/` | Parsing + semantic analysis; **preprocessing is `src/analysis/preprocess/`**, not a top-level `src/preprocess/` |
+| `src/hir/`, `src/mir/`, `src/lir/` | The three-tier IR |
+| `src/opt/` | The optimizer passes (`debug` / `release` pipelines) |
+| `src/asm/` | DSS's own assembler — x86_64 + arm64 byte encoding, round-trip oracle |
+| `src/link/` | DSS's own linker — ELF / PE / Mach-O, static + dynamic |
+| `src/ffi/` | FFI descriptors — how a target library's symbols are declared |
+| `src/program/`, `src/source-factory/`, `src/lsp/` | Driver / project manifest, source assembly, language server |
+| `src/dss-config/` | **The config vocabulary — this is where "target = data, not code" lives**: `sources/` (`.lang.json`), `targets/` (`.target.json`), `object-formats/` (`.format.json`), `pipelines/`, `shippedLibs/`, `schemas/` |
+| `examples/c-subset/` | The runnable corpus — each dir is `main.c` + `expected.json`, compiled → executed → exit/stdout asserted |
+| `tests/` | GoogleTest unit + integration tests (one executable per file) |
+| **`real-examples/`** | **★ The real-world repository registry — see §2.1. Known upstream projects DSS compiles from unmodified source and whose own test suites it runs** |
+| `integrated_tests/` | The CLI-subprocess examples runner (live ctest entry `integrated_tests`) — sibling of the in-process `tests/examples/examples_runner.cpp`; **a capability added to one MUST be added to the other** |
+| `docs/` | User-facing onboarding docs |
+| `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry.md` |
+| `tools/`, `scripts/`, `packaging/` | Anchor guard + build/publish tooling |
+| `build*/` | CMake build dirs (gitignored). Windows Debug gate dir is **`build-dbg`** |
+
+### 2.1 `real-examples/` — the real-world repository registry
+
+**This is the project's primary end-to-end evidence, and the answer to "what real software does
+DSS actually compile?"** It is not a snapshot of vendored source: each entry is a harness that
+**clones the real upstream repository**, builds it with DSS from **unmodified** source, and then
+runs **that project's own test suite**, classifying every failure.
+
+| Entry | What it proves |
+|---|---|
+| [`real-examples/c/sqlite`](../../../real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The amalgamation (`sqlite3.c` + `shell.c`) is compiled and run as a separate, much faster probe |
+
+Each entry ships **both drivers** — `build-and-test.sh` (Linux; adds an arm64-under-qemu leg on
+an x86_64 host) and `build-and-test.ps1` (Windows pe64). Tiers: `veryquick | quick | full | all`.
+
+Non-negotiable rules for anything under `real-examples/`:
+
+- **Never patch the upstream tree** — not the library, not the test infrastructure — and **never
+  exclude a test file to reach green**. An upstream bug is root-caused, anchored and reported
+  upstream; the harness must *survive* it, not edit it away.
+- **A "known confound" must be EARNED, per name and per platform, with a matched control** — a
+  reference `testfixture` built by the system compiler (containing no DSS code) failing the same
+  test on the same machine. Family resemblance is not a control, and a confound earned on one
+  platform does not transfer to another.
+- **Every unit gets a verdict.** Silence about a unit is a harness bug.
 
 ---
 
@@ -64,12 +112,17 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 - **Public include path** is set once via `target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)`
   — header-only additions (`tree_visitor.hpp`, `tree_attrs.hpp`, `tree_views.hpp`, `well_known_names.hpp`)
   don't need explicit registration.
-- **Build commands** (Windows / PowerShell):
+- **Build commands** (Windows / PowerShell). ⚠ **Use `build-dbg`, not `build`.** `build-dbg` is the
+  healthy single-config Ninja + g++ gate dir (no `-C <config>`); the `build` dir is an MSVC
+  configuration that goes stale and is bigobj-fragile. Building the wrong one is a recurring
+  source of false reds.
   ```powershell
-  cmake --build C:\Source\DailySoftware\dss-code-prime\build
-  cmake --build C:\Source\DailySoftware\dss-code-prime\build --target dss_core_test_tree_views
-  ctest --test-dir C:\Source\DailySoftware\dss-code-prime\build --output-on-failure
+  cmake --build C:\Source\DailySoftware\dss-code-prime\build-dbg
+  cmake --build C:\Source\DailySoftware\dss-code-prime\build-dbg --target dss_core_test_tree_views
+  ctest --test-dir C:\Source\DailySoftware\dss-code-prime\build-dbg --output-on-failure
   ```
+  Test targets are `dss_<dir>_test_<x>`; the matching ctest names are `<dir>/test_<x>`.
+  **Run a FULL build (no `--target`) whenever a shared header struct changed.**
 
 ---
 

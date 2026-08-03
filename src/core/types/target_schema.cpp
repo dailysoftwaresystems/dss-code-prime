@@ -712,6 +712,28 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             //     arithmetic-to-memory form (e.g. a future `add
             //     r/m64, imm32` with a memory dest) routes here.
             //   * Rd — fixed32 destination.
+            //   * OpcodePlusReg — x86 `+rd` destination (the register
+            //     rides the LAST OPCODE BYTE; there is no ModR/M byte
+            //     at all). D-CSUBSET-INTRINSIC-BSWAP: `bswap` is
+            //     `0F C8+rd`, so this is its ONLY possible destination
+            //     placement — a 2-addr wire on operand 0 is the only
+            //     way to declare it. This is NOT a weakening of the
+            //     rule: `isDestSlot` is reached ONLY from
+            //     `has2AddrDestWire` below, itself guarded by
+            //     `o.requires2Address`, and `requires2Address` MEANS
+            //     "result == operands[0]" — `lir_2addr_legalize`
+            //     (:146-180) inserts `mov result, operands[0]` and
+            //     rewrites operand 0 to the result register, with a
+            //     hard diagnostic (:128-144) when operand 0 is not a
+            //     register. So under that guard an operand-0 wire IS
+            //     the destination BY CONSTRUCTION. (Do NOT justify
+            //     this row as "mov r64,imm64 already places a dest
+            //     there": that variant uses `opcode.reg` as a
+            //     RESULTSLOT, which short-circuits at the
+            //     `!v.resultSlot.has_value()` test below BEFORE
+            //     `isDestSlot` is consulted — it proves the slot can
+            //     carry a destination, not that the WIRE path was
+            //     ever exercised.)
             //
             // Disp32Mem and MemBaseScale are NEVER destinations:
             // Disp32Mem carries the displacement VALUE (an immediate);
@@ -727,6 +749,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 return s == EncodingSlotKind::ModRmReg
                     || s == EncodingSlotKind::ModRmRm
                     || s == EncodingSlotKind::ModRmRmMem
+                    || s == EncodingSlotKind::OpcodePlusReg
                     || s == EncodingSlotKind::Rd;
             };
             bool const has2AddrDestWire = o.requires2Address

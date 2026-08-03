@@ -8,7 +8,7 @@ namespace dss {
 namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
-// / L / R / A) + numeric value within each phase for at-a-glance
+// / L / R / A / S / P) + numeric value within each phase for at-a-glance
 // audit. The linear scan via `std::ranges::find` is O(N) over the
 // table — still faster than hash lookup at this size + needs no
 // static-init dance.
@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -36,6 +36,19 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     DiagnosticCode::D_TargetAbiModelUnsupportedByDriver,
     DiagnosticCode::D_TargetMachineCodeMismatch,
     DiagnosticCode::D_TargetAbiModelMismatch,
+    // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
+    // D-FFI-PE-CRT-UCRT-MIGRATION, 2026-07-25): the driver's shim-synthesis
+    // seam found a `synthesize` recipe id belonging to no known shim family
+    // — a lockstep break between the descriptor loader's closed `kRecipes`
+    // guard and the family split that feeds each synth pass. Suppressed, the
+    // recipe would fall out of BOTH passes and the shim symbol would go
+    // undefined with no diagnostic — a silently-undefined function that
+    // breaks the binary's LOAD at user runtime (the eager-import law's
+    // failure mode), not the build. It also replaces both seams' former
+    // borrow of the linker-band `K_NoMatchingObjectFormat`, itself a member
+    // below — so this entry PRESERVES the non-suppressible property rather
+    // than granting a new one.
+    DiagnosticCode::D_SynthRecipeFamilyUnknown,
 
     // F_* FFI band — architectural exclusions on the FF5 ingest path
     // (WASM/SPIR-V abiModels don't take FF4 mangling; empty canonical
@@ -105,6 +118,15 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // platform — the exact wrong-platform silent miscompile this fail-loud
     // closes. A direct sibling of the three shipped-header surfaces above.
     DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
+    // F_ShippedSymbolUnavailableForTarget (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS,
+    // 2026-07-30): the per-SYMBOL sibling of the header gate directly above. The
+    // `--resolve-library` oracle judged a name KNOWN on a format its descriptors
+    // do NOT declare it for, and bound it to the format-default library; the
+    // image then LINKED CLEAN and died at LOAD with no diagnostic (MEASURED:
+    // elf-only `fdatasync` on a macho build → exit 255). Suppressing this would
+    // restore exactly that silent loader death — the class this fail-loud exists
+    // to convert into a compile-time error.
+    DiagnosticCode::F_ShippedSymbolUnavailableForTarget,
     // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
     // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
     // active (arch, format). The selection contract is exactly-one-matches;
@@ -265,6 +287,15 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // (D-LK4-RODATA-BSS-INVARIANT).
     DiagnosticCode::K_DuplicateDataSymbol,
     DiagnosticCode::K_BssDataHasBytes,
+    // K_FormatLacksStackReserveControl / K_InvalidStackReserveRequest
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) — the per-program stack-reserve
+    // request gate. Suppressing either restores EXACTLY the silent drop the
+    // capability exists to prevent: the build would report success while
+    // emitting an image whose stack is NOT the size the program asked for,
+    // and the failure surfaces later as a stack overflow at a recursion depth
+    // with no diagnostic trail back to the dropped request.
+    DiagnosticCode::K_FormatLacksStackReserveControl,
+    DiagnosticCode::K_InvalidStackReserveRequest,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
@@ -546,6 +577,13 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // a silent no-op barrier — the instructions vanish, a miscompile. Same silent-
     // miscompile-guard class as the S_Vla* / S_AtomicNonLockFree siblings above.
     DiagnosticCode::S_InlineAsmNonEmptyTemplate,
+    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
+    // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
+    // member or array-arrow base. Suppressed, the mutation falls to the generic
+    // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
+    // truncation — a silent miscompile. Same silent-miscompile-guard class as the
+    // S_Vla* / S_InlineAsmNonEmptyTemplate siblings above.
+    DiagnosticCode::S_BitfieldMutationUnsupportedBase,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.
@@ -556,6 +594,73 @@ constexpr std::array<DiagnosticCode, 123> kUnsuppressableCodes{{
     // (hasErrors() is untouched by a warning). Forcing any of them
     // unsuppressable would make `--suppress` unable to silence exactly the
     // class of diagnostic the standard defines as ignorable.
+
+    // P_* preprocessor band — the AUTHORED ABORT (D-CPP-ERROR-WARNING, C23
+    // 6.10.5). This is the FIRST P_* member of the table, and the break in the
+    // D_/F_/H_/I_/K_/L_/R_/A_/S_ family pattern is deliberate, not a stray: every
+    // other entry above is a MACHINE-detected invariant (the compiler found
+    // something it must not ship), whereas a reached `#error` is the SOURCE
+    // AUTHOR's own abort — a constraint they wrote precisely because the
+    // configuration being built is one their code cannot correctly build.
+    // Suppressing it hides no compiler opinion; it silently BUILDS the
+    // configuration the header author declared invalid, and since this reject is
+    // the only thing failing that build, it would do so GREEN — the exact
+    // ship-a-broken-artifact-green surface this closed table exists to forbid.
+    // Membership is cheap on real code because the emit site is REACHABILITY-
+    // gated (below the preprocessor's dead-branch gate): an `#error` inside a
+    // not-taken `#if` branch — the shape that dominates SDK headers — never
+    // emits at all, so it is never suppressed either.
+    // P_PreprocessorWarningDirective (C23 6.10.6) is deliberately NOT a member:
+    // translation continues, no wrong bytes ship, no build failure is hidden, and
+    // `--suppress` must stay able to silence exactly that advisory class — the
+    // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
+    DiagnosticCode::P_PreprocessorErrorDirective,
+    // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
+    // one whose operand it cannot honour. Same argument as its `#error` neighbour
+    // above, arrived at from the other direction: the author did not write this
+    // one as an abort, but the thing it asks for — `#pragma pack(4)` — CHANGES
+    // MEMORY LAYOUT, and MEASURED, ignoring it turns `sys/fcntl.h`'s `struct
+    // log2phys` from 20 bytes into 24 on a live `fcntl(F_LOG2PHYS)` syscall path.
+    // A `--suppress` of this code does not hide a compiler opinion; it re-opens
+    // exactly the silent wrong-layout channel this cycle closed, and it would do
+    // so GREEN. The RECOGNIZED-and-inert pragmas never reach here at all: they
+    // match a `pragmaEffects` row that says, in config the user reads, why
+    // ignoring them is true — so membership costs nothing on conforming input.
+    // Reachability-gated identically (a pragma in a dead `#if` branch is silent).
+    DiagnosticCode::P_PreprocessorPragma,
+    // TF-C82: the semantic-tier half of the same guarantee. A composite whose
+    // layout key is ambiguous has TWO candidate layouts with different sizes and
+    // different offsets; suppressing the refusal does not remove the ambiguity,
+    // it just picks one of them without saying so.
+    DiagnosticCode::S_PragmaPackAmbiguous,
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a label the compiler
+    // cannot turn into an
+    // assembler name, and a declarator carrying two of them. Both are RENAMES —
+    // suppressing either does not restore the intended symbol name, it emits the
+    // C-mangled name (or one of two labels) instead, silently. The failure then
+    // surfaces as a foreign linker's undefined reference with no line number, or
+    // worse: `nameOf` treats an empty name as "module-private" and DROPS the
+    // symbol-table row, so the object writer falls back to a synthetic
+    // `sym_<id>` and the build stays green all the way to link.
+    // S_AsmLabelOnAutomaticVariable is deliberately NOT a member: it is a
+    // WARNING about a construct clang also ignores, translation continues, and no
+    // wrong symbol ships — the S_DeprecatedSymbolUsed posture.
+    DiagnosticCode::S_AsmLabelInvalid,
+    DiagnosticCode::S_AsmLabelDuplicate,
+    // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
+    // conditional-inclusion OPERATOR name (`__has_include` and siblings).
+    // Suppressing it does not make the shadowing harmless — it lets the
+    // program's `__has_include(<h>)` answer 0 while `#include <h>` still
+    // splices the header, so the guard and the include it guards disagree
+    // about the same file. MEASURED, that disagreement is what turned FIVE
+    // present-and-readable SDK headers into `F001A: not found` before this
+    // cycle (`mach/boolean.h`, `mach/kern_return.h`, `mach/port.h`,
+    // `mach/vm_types.h`, `malloc/_malloc_type.h`; the sixth,
+    // `mach/mach_types.h`, is blocked by a SEPARATE guarded-include-cycle
+    // defect). The universal `#ifndef __has_include` shim never reaches this
+    // code (its guard is dead once the operator is `defined`), so membership
+    // costs conforming input nothing.
+    DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

@@ -72,15 +72,24 @@
 #include "tokenizer/token_stream.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dss {
+
+// TF-C82 (D-PP-PRAGMA-REGISTRY): the `pragmaPackByOffset` sentinel for a token
+// emitted under TWO DIFFERENT `#pragma pack` caps. Not a representable
+// alignment (the channel's domain is a power of two <= 256), so it can never
+// collide with a real cap.
+inline constexpr std::uint32_t kPragmaPackAmbiguous = 0xFFFFFFFFu;
 
 // One contiguous run of the synthesized buffer that came VERBATIM from a
 // single origin buffer. The synth buffer is a concatenation of such runs
@@ -175,12 +184,146 @@ struct DSS_EXPORT PreprocessResult {
     // error must still parse so the parse-level diagnostics surface.
     bool fatal = false;
 
+    // D-PERF-1 effectiveness metric: total front-splice token-moves in the macro
+    // pass; the O(n^2)->O(n) pin asserts this is <= k*N. Summed across every
+    // `spliceOver` in `MacroExpander::expand`; the front-consumed-deque rewrite
+    // keeps it LINEAR in the token count (zero for an identity pass or a TU with
+    // no macro expansions).
+    std::size_t macroTokenMoves = 0;
+
+    // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: the weakly-canonical paths of the
+    // AUTHORITATIVELY-LIVE shipped system descriptors this preprocess run resolved
+    // -- every angle `#include <h>` (or quote->angle fallback) the SynthBuilder
+    // SPLICED whose splice offset the AUTHORITATIVE macro pass did NOT prove dead,
+    // each expanded to its TRANSITIVE `includes` closure and DEDUPED by weakly-
+    // canonical path. This set EQUALS the finish() oracle's `shippedLibDescriptors`
+    // (built by the import resolver from the SAME authoritatively-live includes),
+    // never a superset. EMIT-ONLY -- it changes no preprocess behavior; it surfaces
+    // which descriptors' SEMANTICALLY-injected typedef surfaces are in scope so
+    // `parseAndAdd_` can SEED their typedef NAMES into the binder sketch's global
+    // scope BEFORE the FIRST parse. A shipped-typedef cast `(size_t)(expr)` then
+    // commits as a CAST on parse 1 (no AmbiguousTypeNameCandidate -> no full-file
+    // oracle reparse in UnitBuilder::finish), and because the set is oracle-aligned
+    // the seed resolves EXACTLY what the reparse would, never a name it would not.
+    // Empty for a TU that resolves no live system descriptor (every non-C language,
+    // any C TU with only quote includes, and a descriptor reached ONLY through a
+    // dead `#if 0` branch).
+    std::vector<std::filesystem::path> resolvedShippedDescriptors;
+
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` product — synth byte
+    // offset of an emitted token -> the MAXIMUM MEMBER ALIGNMENT (in bytes) in
+    // effect when the preprocessor emitted it. An offset ABSENT from the map
+    // means "no cap", so an EMPTY map (every TU that uses no `#pragma pack` —
+    // i.e. every TU before this cycle) is exactly the old behavior at zero cost.
+    //
+    // `#pragma pack` is the one pragma with real translation semantics that the
+    // sqlite corpus REACHES: MEASURED, 40 lines across 5 TUs, and `sys/fcntl.h`'s
+    // `pack(4)` region is what makes `struct log2phys` 20 bytes / align 4 instead
+    // of 24 / 8 — a struct sqlite hands to `fcntl(F_LOG2PHYS)`. Dropping the
+    // pragma is a wrong-ABI miscompile, not a missing warning.
+    //
+    // ★ KEYED PER TOKEN, NOT AS BYTE REGIONS, AND THE DIFFERENCE IS LOAD-BEARING.
+    // A region list says where the PRAGMA sits; this says what was in effect when
+    // a TOKEN was emitted. They disagree exactly when a composite arrives from a
+    // macro REPLACEMENT LIST: its tokens carry the `#define` line's span, which
+    // is nowhere near the `pack(4)` region containing the INVOCATION, so a region
+    // lookup would answer "no cap" and lay the struct out wrong in silence. The
+    // consumer looks up a composite specifier's FIRST TOKEN offset.
+    //
+    // A value of `kPragmaPackAmbiguous` means the token was emitted under TWO
+    // DIFFERENT caps (a macro replacement expanded in two pack regions). The
+    // preprocessor records that and says nothing: it cannot know which offsets
+    // are used as a LAYOUT KEY, and MEASURED, erroring here refuses programs
+    // clang compiles (a shared MEMBER macro used in two regions, where every
+    // composite is still anchored on an unambiguous `struct` keyword). The
+    // semantic tier turns it into `S_PragmaPackAmbiguous` only when a composite
+    // actually lands on such an offset.
+    std::unordered_map<std::uint32_t, std::uint32_t> pragmaPackByOffset;
+
+    // ★★ TF-C85 (`optimizerControl`): the `#pragma optimize` product — the synth
+    // byte offsets of tokens the preprocessor emitted inside a
+    // `#pragma optimize("", off)` region. An offset ABSENT from the set means
+    // "optimize normally", so an EMPTY set (every TU that uses no
+    // `#pragma optimize` — i.e. every TU before this cycle) is exactly the old
+    // behavior at zero cost.
+    //
+    // Keyed PER TOKEN for the identical reason `pragmaPackByOffset` is: a region
+    // list says where the PRAGMA sits, while this says what was in effect when a
+    // TOKEN was emitted, and the two disagree exactly when a function definition
+    // arrives from a macro replacement list. The consumer (the semantic tier's
+    // Pass 1.5) looks up a function DECLARATION's leftmost emitted token.
+    //
+    // A token emitted BOTH inside and outside a region resolves to OFF and says
+    // nothing — see `noOptimizeByOffset_` in the .cpp for why that is a sound
+    // resolution here and was NOT one for `pack`.
+    std::unordered_set<std::uint32_t> pragmaNoOptimizeByOffset;
+
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers
     // pass through untouched.
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
 };
+
+// ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS) + TF-C97
+//    (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the effective list ─────────────
+//
+// The ONE effective-predefined-macro list.
+//
+// Predefined macros come from THREE independent config families — and the three
+// are exactly the project's agnosticism axes, which is why there are three and
+// not two:
+//   • the LANGUAGE (`preprocess.predefinedMacros` in `<lang>.lang.json` —
+//     `__LINE__`, `_WIN32`, …): the SOURCE half.
+//   • the TARGET (`predefinedMacros` in `<arch>.target.json` — `__aarch64__`,
+//     `__x86_64__`, …): the PROCESSOR half. Per-CPU facts.
+//   • the FORMAT (`predefinedMacros` in `<name>.format.json` —
+//     `__LP64__`/`_LP64`): the OBJECT-FORMAT half. Facts that are neither the
+//     language's nor the CPU's, because ONE CPU answers differently on two of
+//     its own formats (x86_64 is LP64 under elf64/macho64, LLP64 under pe64).
+// All three are paired only at COMPILE time, when a (language, target, format)
+// triple actually exists, so this is where the merge — and the collision check
+// — must live.
+struct DSS_EXPORT MergedPredefinedMacros {
+    // The effective list: language entries FIRST, then target, then format,
+    // each in declaration order, with the per-entry `availableObjectFormats`
+    // filter ALREADY APPLIED. This is the single list every seed site iterates,
+    // which is why the filter is applied exactly ONCE, here — the four seed
+    // sites can no longer each apply their own copy and drift.
+    std::vector<PredefinedMacroDef> effective;
+    // One message per colliding NAME, each naming BOTH declaring config paths.
+    // NON-EMPTY ⇒ the merge FAILED: `effective` is not usable and the caller
+    // must emit `C_ConflictingPredefinedMacro` and abort the pass. There is no
+    // "merge anyway" mode — a silent last-writer-wins in any direction is
+    // the exact wrong-value miscompile this check exists to prevent.
+    std::vector<std::string> conflicts;
+};
+
+// Merge the language, target and format predefined-macro lists for
+// `activeFormat`.
+//
+// Properties (each pinned by a test):
+//  (a) a NAME present in more than one list is a conflict, compared BEFORE the
+//      format filter — so a `["pe"]`-gated language `_WIN32` still collides
+//      with an ungated target `_WIN32`. Gating is about which formats SEE a
+//      macro, not about who OWNS the name; deferring the check until after the
+//      filter would let a collision hide on every leg but one. ALL THREE PAIRS
+//      are scanned (language×target, language×format, target×format): with
+//      three families a scan that covered only two would leave one pair able to
+//      ship a silent last-writer-wins.
+//  (b) the per-format filter is applied ONCE, here. (An entry with an EMPTY
+//      `availableObjectFormats` is available on every format; a non-empty set
+//      restricts it to those formats; absent an active format only a
+//      universal entry survives.)
+//  (c) order is stable: language entries, then target, then format.
+//  (d) EMPTY `targetMacros` + EMPTY `formatMacros` yields exactly the
+//      language-only list the pre-TF-C74 engine computed — the no-regression
+//      invariant, which is also the LSP / FFI-header-parser configuration.
+[[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
+    std::span<PredefinedMacroDef const> languageMacros,
+    std::span<PredefinedMacroDef const> targetMacros,
+    std::span<PredefinedMacroDef const> formatMacros,
+    std::optional<ObjectFormatKind>     activeFormat);
 
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
 // `schema->preprocess().enabled` is true (the caller gates on it; calling
@@ -214,13 +357,27 @@ struct DSS_EXPORT PreprocessResult {
 // #undef-ability (a -D macro is an ordinary macro). Function-like predefined
 // macros (PredefinedMacroDef.isFunctionLike) ride the same mechanism via a
 // "<built-in>" prologue. Defaults to {} — every existing caller unchanged.
+// TF-C74: `targetPredefinedMacros` is the ACTIVE TARGET's `predefinedMacros`
+// list (`TargetSchema::predefinedMacros()`) — the per-architecture identity
+// macros. TF-C97: `formatPredefinedMacros` is the ACTIVE OBJECT FORMAT's
+// (`ObjectFormatSchema::predefinedMacros()`) — the data-model face,
+// `__LP64__`/`_LP64`. Note these are the format SCHEMA's rows, i.e. per format
+// FILE, while `activeFormat` is only the format KIND; the two are independent
+// inputs and a caller must not try to derive one from the other. All three
+// lists are merged ONCE at entry (`mergePredefinedMacros`), producing the
+// single effective list all four seed sites then iterate. A name declared by
+// more than one family is FATAL (`C_ConflictingPredefinedMacro`), never
+// silently resolved. Both default to {} ⇒ output byte-identical to pre-TF-C74,
+// so every existing caller compiles and behaves unchanged.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
-    std::span<std::string const>         userDefines  = {});
+    std::span<std::string const>         userDefines  = {},
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros = {},
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros = {});
 
 // FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
 // check for the cycle-1 `#embed` splice. The splice materializes the resource as

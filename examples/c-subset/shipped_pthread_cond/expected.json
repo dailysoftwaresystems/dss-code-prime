@@ -1,0 +1,15 @@
+{
+  "$comment": "TF-cycle pthread completion witness: the condvar+detach+tightened-create surface test4.c/test_thread.c need. Red-on-disable: remove pthread_cond_init/_wait/_signal/_destroy or pthread_detach from pthread.json -> S0001; loosen pthread_create's 3rd param back to ptr<void> and the bare `worker` (void*(void*)) designator stops matching the fn-ptr param. Deterministic predicate-loop cond handshake: main locks m, creates+detaches worker, cond_waits (releasing m); worker locks m, acc+=n(42), sets ready, signals, unlocks; main re-acquires m, sees ready, unlocks, destroys -> exit==acc==42 every run (a lost signal would hang/exit 0). pthread_cond_t = opaque arr<i64,6>=48B (elf glibc __SIZEOF_PTHREAD_COND_T=48 both arches; macOS 8B __sig + 40 = 48) shipped FLAT. Gated [elf,macho]; the worker must actually RUN + signal on WSL-elf + qemu-arm64. Release shippedPipeline arm witnesses the optimizer keeps the thread handshake (not folded).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

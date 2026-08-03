@@ -35,9 +35,11 @@ namespace {
         case MirOpcode::Popcount:      return "Popcount";  // FC17.9(b)
         case MirOpcode::Clz:           return "Clz";       // FC17.9(b)
         case MirOpcode::Ctz:           return "Ctz";       // FC17.9(b)
+        case MirOpcode::Bswap:         return "Bswap";     // D-CSUBSET-INTRINSIC-BSWAP
         case MirOpcode::AtomicCas:     return "AtomicCas";
         case MirOpcode::AtomicLoad:    return "AtomicLoad";   // FC17.9(d)
         case MirOpcode::AtomicStore:   return "AtomicStore";  // FC17.9(d)
+        case MirOpcode::AtomicFence:   return "AtomicFence";  // D-CSUBSET-ATOMIC-FENCE
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -309,6 +311,18 @@ enum class MnemonicSlot : std::uint8_t {
     ClzNative,
     CtzNative,
     Rbit,
+    // D-CSUBSET-INTRINSIC-BSWAP: the NATIVE byte-reverse realization MIR Bswap
+    // lowers to — a SHARED VERB across targets exactly like `clz` (x86 BSWAP
+    // 0F C8+rd, arm64 REV16/REV/REV(X)), never a per-arch mnemonic. ★ UNLIKE
+    // every other slot in this family, its capability probe is PER-WIDTH
+    // (`opcodeWithWidth`), NOT mnemonic-presence: BOTH shipped targets declare
+    // "bswap", but x86 declares only the 32- and 64-bit forms (there is no
+    // encodable `bswap r16` — MEASURED: GAS rejects `bswap %ax` with "operand
+    // size mismatch"), so a presence-only probe would emit a width-16 bswap that
+    // matches no variant and dies at A_NoMatchingEncodingVariant. A width the
+    // target does not encode falls back to the universal-ALU byte-reversal
+    // expansion — never fail-loud, never an `if (arch==…)`.
+    Bswap,
     // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
     // realizations MIR AtomicLoad/AtomicStore lower to, probed by mnemonic
     // presence (the lowerAtomicCas capability-probe — NEVER an `if (arch==)`).
@@ -335,6 +349,13 @@ enum class MnemonicSlot : std::uint8_t {
     // acquire/release/seqcst slot FAILS LOUD (reportMissingOpcode) — the one
     // forbidden miscompile direction (a silent under-fence) can never happen.
     LoadAcquire, StoreRelease, StoreSeqCst,
+    // D-CSUBSET-ATOMIC-FENCE: the STANDALONE seq_cst CPU fence realization MIR
+    // AtomicFence (__sync_synchronize) lowers to — x86 MFENCE (0F AE F0), arm64
+    // DMB ISH (0xD5033BBF). A 0-operand, no-result instruction (the xor_rdx_zero
+    // shape). Slot-presence probed like the three per-order slots above; a target
+    // that declares no realization FAILS LOUD (reportMissingOpcode) — never a
+    // silent no-op "fence".
+    AtomicFenceSeqCst,
     // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): the x87 80-bit `long double`
     // memory-sequence ops. An F80 value lives in MEMORY (never a register —
     // the x87 stack st0-7 is invisible to the flat linear-scan allocator), so
@@ -350,6 +371,18 @@ enum class MnemonicSlot : std::uint8_t {
     //     st1←st1 OP st0 + pop (0 operands).
     //   FisttpM32 — DB /1 truncating store st0→m32int + pop (the FPToSI tail).
     FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32,
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 GOT-address
+    // macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]` that
+    // materializes an undefined-extern's address as a live code-form
+    // VALUE (so a foreign default-PIE link accepts the emitted `.o`). A
+    // DISTINCT slot (the `tlsbase` precedent), NOT a new `lea` variant — a
+    // `lea` `[symbol]` variant would collide with the absolute ADRP+ADD
+    // `[symbol]` lea. Declared ONLY by arm64 (its target.json `lea_extern_
+    // got` opcode); x86_64 declares none (its cache id stays nullopt), and
+    // an `&extern` value there is already a PIE-safe rel32 lea — the
+    // value-form arm keys on the capability-derived `externAddrGotSymbols_`
+    // set (never an arch/format identity), so x86_64 never reaches it.
+    LeaExternGot,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -459,9 +492,11 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::ClzNative,          "clz"},       // FC17.9(b): x86 LZCNT / arm64 CLZ
     {MnemonicSlot::CtzNative,          "ctz"},       // FC17.9(b): x86 TZCNT
     {MnemonicSlot::Rbit,               "rbit"},      // FC17.9(b): arm64 RBIT (→ ctz via CLZ)
+    {MnemonicSlot::Bswap,              "bswap"},     // D-CSUBSET-INTRINSIC-BSWAP: x86 BSWAP / arm64 REV16|REV
     {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
     {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
     {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
+    {MnemonicSlot::AtomicFenceSeqCst,  "atomic_fence_seqcst"},  // D-CSUBSET-ATOMIC-FENCE: x86 MFENCE / arm64 DMB ISH
     // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): x87 80-bit long-double sequence ops (x86_64-only).
     {MnemonicSlot::FldM80,             "fld_m80"},
     {MnemonicSlot::FstpM80,            "fstp_m80"},
@@ -470,6 +505,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FmulP,              "fmulp"},
     {MnemonicSlot::FdivP,              "fdivp"},
     {MnemonicSlot::FisttpM32,          "fisttp_m32"},
+    {MnemonicSlot::LeaExternGot,       "lea_extern_got"},  // TF-C52: arm64 GOT-address macro
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -585,6 +621,14 @@ struct Lowerer {
     TypeInterner const& interner;
     DiagnosticReporter& reporter;
     LirBuilder          lir;
+
+    // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): one-shot latch for `reprKind`'s
+    // 128-bit width-tier wall. `reprKind` is a `const` query called from every
+    // width site, so the latch is `mutable`; without it a single leaked value
+    // would report once per width query instead of once per lowering. The
+    // per-opcode gate (`requireNativeIntWidth`) owns the precise, poisoning
+    // message for the paths a user can reach — this latch guards the backstop.
+    mutable bool reportedWideIntWidthLeak = false;
 
     // Single table of cached opcode ids. `kMnemonics[i].mnemonic` is the
     // JSON-side name, `cache_[i].id` is the resolved numeric opcode (or
@@ -722,6 +766,24 @@ struct Lowerer {
     // Empty for every non-got-indirect module ⇒ lowering byte-identical.
     std::optional<DataImportBinding> dataImportBinding_;
     std::unordered_set<std::uint32_t> externDataGotSymbols_;
+
+    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
+    // extern-ADDRESS binding + the derived set of extern SymbolIds whose
+    // ADDRESS (as a live code-form VALUE — an argument, an automatic's
+    // initializer, a returned function pointer) must materialize through
+    // a foreign-linker GOT slot (arm64 `adrp:got:` + `ldr:got_lo12:`)
+    // rather than an absolute page-pair lea. Populated at ctor as ALL
+    // extern imports (BOTH data AND function — `&abs` is a function whose
+    // address is taken) when the format declares `externAddrBinding ==
+    // Got`. Distinct from `externDataGotSymbols_` (the Mach-O DSS-local
+    // __got model, data-only): there the __got slot is DSS-bound + reached
+    // via lea+deref; HERE the FOREIGN linker owns the slot, reached via
+    // the arm64 GOT-page relocs of the `lea_extern_got` macro. The two
+    // are mutually exclusive by FORMAT (a format declares dataImportBinding
+    // OR externAddrBinding, never both), so their arms never contend.
+    // Empty for every non-`got` module ⇒ lowering byte-identical.
+    std::optional<ExternAddrBinding> externAddrBinding_;
+    std::unordered_set<std::uint32_t> externAddrGotSymbols_;
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE format's thread-local
     // access block + the ctor-populated set of THREAD-LOCAL SymbolIds
@@ -861,6 +923,7 @@ struct Lowerer {
             std::span<ExternImport const> externImports,
             std::optional<ExternCallDispatch> externCallDispatch,
             std::optional<DataImportBinding> dataImportBinding,
+            std::optional<ExternAddrBinding> externAddrBinding,
             std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes,
             std::optional<std::string> wideFloatSoftcallLibrary)
@@ -869,6 +932,7 @@ struct Lowerer {
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
+          externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
@@ -888,6 +952,24 @@ struct Lowerer {
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
                 if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
+            }
+        }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
+        // extern-address format (arm64 ELF relocatable / static-archive
+        // member), an undefined extern's ADDRESS-as-a-VALUE must
+        // materialize through a foreign-linker GOT slot (the
+        // `lea_extern_got` macro), NOT an absolute page-pair lea a foreign
+        // default-PIE link would reject. Collect ALL extern imports —
+        // BOTH data AND function (`&abs` takes a function's address) —
+        // so `lowerGlobalAddr`'s value-form arm routes them (and the
+        // riprel fold is suppressed for them). Populated ONLY under Got;
+        // every other format leaves the set empty ⇒ lowering byte-
+        // identical. (A bare `&extern` used AS A CALLEE still folds to a
+        // plain BL — `globalAddrFoldsIntoDirectCall` runs BEFORE this
+        // arm; only the value/argument use reaches the GOT macro.)
+        if (externAddrBinding_ == ExternAddrBinding::Got) {
+            for (auto const& e : externImports) {
+                externAddrGotSymbols_.insert(e.symbol.v);
             }
         }
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): collect every THREAD-LOCAL
@@ -1000,6 +1082,39 @@ struct Lowerer {
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
         return cache_[static_cast<std::size_t>(s)].id;
+    }
+
+    // D-CSUBSET-INTRINSIC-BSWAP: the WIDTH-AWARE capability probe — `opcode(s)`
+    // narrowed to "…and it declares a variant that can encode at `widthFlags`".
+    //
+    // WHY THIS EXISTS AT ALL. `opcode()` answers only "does the target name this
+    // verb?", which is the right question for a verb whose declared widths are
+    // uniform (popcount/clz/ctz/rbit each ship 32 AND 64 on every target that
+    // ships them at all). It is the WRONG question for a verb whose width
+    // coverage is RAGGED: x86 names "bswap" but encodes only 32 and 64, so a
+    // presence-only probe would route a width-16 byte-swap to the native path and
+    // the encoder would then fail A_NoMatchingEncodingVariant on an instruction
+    // the lowering itself chose to emit — a fail-loud, but at the wrong layer and
+    // for a case the substrate can serve perfectly well by expansion.
+    //
+    // `guardWidthBits == 0` = a WIDTH-ABSENT (match-any) variant, which by the
+    // schema's own overlap rule (target_schema.cpp:851-869) can only appear when
+    // NO sibling of the same operand shape is width-keyed — so it genuinely
+    // encodes every width and counts as a hit. Same scan the riprel-load fold
+    // uses (~:4256), factored so the two cannot drift.
+    [[nodiscard]] std::optional<std::uint16_t>
+    opcodeWithWidth(MnemonicSlot s, std::uint8_t widthFlags) const {
+        auto const id = opcode(s);
+        if (!id.has_value()) return std::nullopt;
+        auto const* info = target.opcodeInfo(*id);
+        if (info == nullptr) return std::nullopt;
+        std::uint8_t const widthBits = lirInstWidthBits(widthFlags);
+        for (auto const& v : info->encoding.variants) {
+            if (v.guardWidthBits == 0 || v.guardWidthBits == widthBits) {
+                return id;
+            }
+        }
+        return std::nullopt;
     }
 
     // D-CSUBSET-BITFIELD-WIDE-UNIT: does the target declare a `mov`
@@ -1224,7 +1339,32 @@ struct Lowerer {
                     "integer encodings compute 64- or 32-bit-wide, which "
                     "would silently violate the type's defined wraparound/"
                     "comparison semantics (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(reprKind(ty)),
+                    what, static_cast<unsigned>(classifyKind(ty)),
+                    target.name()));
+            poisonValue(id);
+            return false;
+        };
+        // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): a 128-bit integer has no native
+        // single-register container on either shipped arch — it is MULTI-LIMB
+        // memory, reached by ADDRESS, exactly like `_BitInt(N>64)`. Kept separate
+        // from `gatedKind` (which means "no native-width ALU FORM this cycle" — a
+        // missing ENCODING) because this is a stronger claim about the TYPE, and it
+        // gates the memory/plumbing arms below, not just compute.
+        auto const wideIntKind = [](TypeKind k) noexcept {
+            return k == TypeKind::I128 || k == TypeKind::U128;
+        };
+        auto const failWideInt = [&](TypeId ty, std::string_view what) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: 128-bit integer TypeKind ordinal {} has no native "
+                    "single-register container on target '{}' — a 128-bit "
+                    "integer is multi-limb memory (reached by ADDRESS, exactly "
+                    "like _BitInt(N>64)), so this access would silently select "
+                    "the 64-bit width form and touch 8 bytes of a 16-byte value "
+                    "(D-CSUBSET-INT128-LIR-WIDTH)",
+                    what, static_cast<unsigned>(classifyKind(ty)),
                     target.name()));
             poisonValue(id);
             return false;
@@ -1241,7 +1381,7 @@ struct Lowerer {
                     "form on target '{}' this cycle — only {} is realized; "
                     "first-match would otherwise pick a wrong-width "
                     "encoding (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(reprKind(ty)),
+                    what, static_cast<unsigned>(classifyKind(ty)),
                     target.name(), realized));
             poisonValue(id);
             return false;
@@ -1265,8 +1405,8 @@ struct Lowerer {
                 TypeId const ty = mir.instType(id);
                 // Bool ALU compute is gated too (unreachable post-
                 // promotion; reaching it = sub-int compute).
-                if (ty.valid() && (gatedKind(reprKind(ty))
-                                   || reprKind(ty) == TypeKind::Bool)) {
+                if (ty.valid() && (gatedKind(classifyKind(ty))
+                                   || classifyKind(ty) == TypeKind::Bool)) {
                     return fail(ty, mirOpcodeName(op));
                 }
                 return true;
@@ -1278,7 +1418,7 @@ struct Lowerer {
             case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge: {
                 for (MirInstId const operand : mir.instOperands(id)) {
                     TypeId const ty = mir.instType(operand);
-                    if (ty.valid() && gatedKind(reprKind(ty))) {
+                    if (ty.valid() && gatedKind(classifyKind(ty))) {
                         return fail(ty, "ICmp operand");
                     }
                 }
@@ -1299,7 +1439,7 @@ struct Lowerer {
                 // narrowing story this cycle — fail loud, never a silent narrow).
                 TypeId const ty = mir.instType(id);
                 if (ty.valid()) {
-                    TypeKind const k = reprKind(ty);
+                    TypeKind const k = classifyKind(ty);
                     // D-CSUBSET-SUBNATIVE-ALU-FORMS: a sub-native Trunc result
                     // (I8/U8/I16/U16, joining Char) routes through
                     // registerOpWidthFlags → the promoted width-32 `mov` (low bits
@@ -1327,10 +1467,10 @@ struct Lowerer {
                     // source → movsx r/m16 / SXTH; an I8 source → the byte form
                     // (movsx r/m8 / SXTB, shared with Char). I32 → movsxd / SXTW.
                     if (ty.valid()
-                        && reprKind(ty) != TypeKind::I32
-                        && reprKind(ty) != TypeKind::Char
-                        && reprKind(ty) != TypeKind::I8
-                        && reprKind(ty) != TypeKind::I16) {
+                        && classifyKind(ty) != TypeKind::I32
+                        && classifyKind(ty) != TypeKind::Char
+                        && classifyKind(ty) != TypeKind::I8
+                        && classifyKind(ty) != TypeKind::I16) {
                         return failConv(ty, "SExt source",
                                         "the I32-, I16-, and byte-source forms");
                     }
@@ -1351,22 +1491,89 @@ struct Lowerer {
                 // An I32 source stays REJECTED: C's I32→wider
                 // conversion sign-extends (mapCast routes it to SExt);
                 // a ZExt-from-I32 reaching here is a lowering bug, not
-                // a missing realization. U8/U16/Char sources through
-                // the x86 byte-form would read one byte of a wider
-                // value — fail loud until their forms are encoded.
+                // a missing realization.
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
                     // D-CSUBSET-SUBNATIVE-ALU-FORMS: unsigned narrow read-back — a U16
                     // source → movzx r/m16 / UXTH; a U8 source → movzx r/m8 / UXTB.
                     // Bool/U32 keep their existing widener forms.
+                    // D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET (TF-C56): a `Char`
+                    // source now reaches ZExt too — on an unsigned-char target
+                    // (AArch64) the char→int promotion is ZExt, and Char shares
+                    // U8's 8-bit width (`widthFlagsForType(Char)` = width-8), so it
+                    // reuses the SAME byte widener (movzx r/m8 / uxtb). The SExt
+                    // gate already accepts Char (signed-char targets, unchanged).
                     if (ty.valid()
-                        && reprKind(ty) != TypeKind::Bool
-                        && reprKind(ty) != TypeKind::U32
-                        && reprKind(ty) != TypeKind::U8
-                        && reprKind(ty) != TypeKind::U16) {
+                        && classifyKind(ty) != TypeKind::Bool
+                        && classifyKind(ty) != TypeKind::U32
+                        && classifyKind(ty) != TypeKind::U8
+                        && classifyKind(ty) != TypeKind::U16
+                        && classifyKind(ty) != TypeKind::Char) {
                         return failConv(ty, "ZExt source",
-                                        "the Bool-, U32-, U16-, and U8-source forms");
+                                        "the Bool-, U32-, U16-, U8-, and "
+                                        "Char-source forms");
+                    }
+                }
+                return true;
+            }
+            // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): the MEMORY / PLUMBING tier.
+            // Everything above gates COMPUTE (ALU, ICmp, the conversions); Load,
+            // Store, Const and Bitcast were measured UNGATED at HEAD 57eae7b, and
+            // that — combined with `reprKind` being identity for I128/U128 — is what
+            // let the `jmp_buf` probe in `reprKind`'s comment compile with ZERO
+            // diagnostics and emit an 8-byte access of each 16-byte element.
+            //
+            // ★ THESE ARMS ARE A BACKSTOP, NOT A USER-FACING PATH — corrected from
+            // the opposite claim, which a self-audit MEASURED FALSE on this tree.
+            // The earlier wording said these arms cover "the paths a USER can
+            // actually reach" and that "only a DIRECT 128-bit element access
+            // (`env[0] = 1`) mints" a 128-bit-typed Load/Store/Const. Both are wrong:
+            // the ROUTING keeps every 128-bit value multi-limb and by-ADDRESS, so a
+            // direct element access mints i64 LIMB accesses, not a U128-typed one.
+            // MEASURED on this working tree:
+            //   * `x86_64:pe64-x86_64-windows-exec`, the VERBATIM probe from
+            //     `reprKind`'s comment (`jmp_buf env; env[0]=1; env[1]=env[0];`) —
+            //     compiles with ZERO diagnostics, rc=0. These arms never fire.
+            //   * `arm64:macho64-arm64-darwin-exec`, the same shape with a SPELLED
+            //     `unsigned __int128 env[16]` and a NON-ZERO high word
+            //     (`env[0] = ((unsigned __int128)7 << 64) | 5u; env[1] = env[0];`) —
+            //     compiles clean AND RUNS CORRECTLY, exit 42, both words of the
+            //     16-byte element round-tripping. So the 8-byte-access defect is
+            //     fixed by the by-address routing, not by this gate.
+            // No user source reaches these arms today. That is exactly why they are
+            // worth keeping and exactly why they must not be described as a live
+            // wall: they convert a FUTURE routing miss into a precise, POISONING
+            // per-opcode message instead of a silent half-element access, and
+            // `reprKind`'s latch is the coarser backstop underneath them. A test
+            // that "proves" them by asserting a user program is refused would be
+            // asserting the opposite of the measurement — the MIR-tier unit test
+            // (tests/lir/test_mir_to_lir.cpp) drives them directly instead.
+            // Verified end-to-end on the pe leg by examples/c-subset/setjmp_longjmp,
+            // which still builds and runs.
+            case MirOpcode::Load: case MirOpcode::Const:
+            case MirOpcode::Bitcast: {
+                TypeId const ty = mir.instType(id);
+                if (ty.valid() && wideIntKind(classifyKind(ty))) {
+                    // `mirOpcodeName` only names the ALU/ICmp tier (everything
+                    // else is its `default: "<deferred>"`), so these three carry
+                    // explicit labels — a diagnostic that says "<deferred>" tells
+                    // the reader nothing about which access was refused.
+                    return failWideInt(ty,
+                        op == MirOpcode::Load    ? "Load result"
+                      : op == MirOpcode::Const   ? "Const value"
+                                                 : "Bitcast result");
+                }
+                return true;
+            }
+            case MirOpcode::Store: {
+                // Operand 0 is the stored VALUE (the Store itself has no result
+                // type) — that is the type whose width the emitter reads.
+                auto const operands = mir.instOperands(id);
+                if (!operands.empty()) {
+                    TypeId const ty = mir.instType(operands[0]);
+                    if (ty.valid() && wideIntKind(classifyKind(ty))) {
+                        return failWideInt(ty, "Store value");
                     }
                 }
                 return true;
@@ -1407,19 +1614,36 @@ struct Lowerer {
     // sits in its own ≥8-byte slot, so it MASKS this — caught in the FC8
     // enum review). This is the single enum→underlying resolve point for the
     // width tier: `widthFlagsForType` + `memAccessWidthFlags` (and, via the
-    // former, `registerOpWidthFlags`) all switch on `reprKind(ty)`, so the
+    // former, `registerOpWidthFlags`) all switch on `classifyKind(ty)`, so the
     // projection is by-construction at every width site. `regClassForType`
     // needs no change — `regClassForCoreType` already maps Enum → GPR; and the
     // layout authority (`computeLayout`) already sizes an enum as its
     // underlying, so field offsets and this access width can never disagree.
     // Aggregates (Struct/Union/Array) keep their own kind — they are not
     // scalars and route through the multi-leaf memory path, not these switches.
-    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
+    // The NON-FAILING classification projection. Answers "which kind does this
+    // type BEHAVE as, for a classification/detection test?" — enum → underlying
+    // scalar, `_BitInt(N≤64)` → its native container. It deliberately does NOT
+    // judge whether the result is REPRESENTABLE at the width tier, so a GATE may
+    // detect a non-representable kind (I128/U128) and report a precise, poisoning
+    // diagnostic instead of tripping `reprKind`'s wall while formatting it
+    // (D-CSUBSET-INT128-LIR-WIDTH, TF-C94 — measured: routing the gate's own
+    // `gatedKind`/`fail` sites through the walling query turned two CLEAN
+    // `L_UnsupportedLoweringForOpcode` diagnostics for a u128 Add/ICmp into a
+    // hard failure, i.e. the wall would have eaten the very message it exists to
+    // protect). `bitIntContainerKind` is left exactly as-is here: a wide `_BitInt`
+    // still fails loud through it, unchanged by this split.
+    [[nodiscard]] TypeKind classifyKind(TypeId ty) const {
         TypeKind const k = interner.kind(ty);
         if (k == TypeKind::Enum) {
             auto const sc = interner.scalars(ty);
             if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
         }
+        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
+        return k;
+    }
+
+    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
         // C23 _BitInt(N) (D-CSUBSET-BITINT, M-4): project to the signed/unsigned
         // native CONTAINER kind (N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64)
         // — the enum→underlying precedent above. This is what makes every width-tier
@@ -1431,7 +1655,55 @@ struct Lowerer {
         // i64 LIMB or a pointer, never the whole wide type as a scalar. If a wide value
         // leaked to the scalar path, `bitIntContainerKind` FAILS LOUD (M1) rather than
         // returning a garbage width. `reprKind` is identity for every other kind.
-        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
+        TypeKind const k = classifyKind(ty);
+        // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): I128/U128 have NO native single-
+        // register container on either shipped arch — exactly the `_BitInt(N>64)`
+        // situation, and they must obey the SAME discipline. Before this arm
+        // `reprKind` was IDENTITY for them, so `widthFlagsForType` and
+        // `memAccessWidthFlags` both fell to their `default: return 0` = the
+        // 64-bit width: an 8-BYTE access of a 16-BYTE value, with NO diagnostic.
+        // MEASURED at HEAD 57eae7b, no code change, on
+        // `x86_64:pe64-x86_64-windows-exec` (u128 is reachable because
+        // shippedLibs/setjmp.json declares `jmp_buf` as `arr<u128,16>`):
+        //     #include <setjmp.h>
+        //     int main(void){ jmp_buf env; env[0]=1; env[1]=env[0]; return (int)env[1]+41; }
+        // compiled with ZERO diagnostics and emitted a 3072-byte .exe whose every
+        // `env` access touched half the element. This is THE chokepoint — all three
+        // width functions route through it — so one wall closes Load, Store, Const,
+        // Bitcast, call-arg and every future width consumer at once.
+        //
+        // The wall REPORTS rather than aborts. `bitIntContainerKind`'s abort is
+        // justified because the C2 by-address diverts make a wide `_BitInt` scalar
+        // query a pure compiler-internal leak; a u128 element access, by contrast,
+        // is reachable from ORDINARY user source today (the `jmp_buf` probe above),
+        // and crashing the compiler on user source is not a diagnostic. An Error
+        // means the compile fails and NO artifact is emitted — the fail-loud
+        // contract — while the per-opcode gate below still produces the precise,
+        // poisoning message. ⚠ MEASURED (TF-C94 self-audit): this is a BACKSTOP,
+        // not the user-facing path -- the ROUTING diverts 128-bit values by
+        // address before they reach here, so no ordinary C source mints one.
+        // An earlier wording claimed it covered "every path a user can
+        // actually reach"; that was false and is corrected here and at the
+        // sibling comment above. Latched to
+        // one report per lowering so a leak surfaces once, not once per width query.
+        if (k == TypeKind::I128 || k == TypeKind::U128) {
+            if (!reportedWideIntWidthLeak) {
+                reportedWideIntWidthLeak = true;
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "128-bit integer TypeKind ordinal {} reached the LIR "
+                        "width tier on target '{}' — a 128-bit integer has no "
+                        "native single-register container (it is multi-limb "
+                        "memory, reached by ADDRESS, exactly like _BitInt(N>64)), "
+                        "so every width query for it would silently select the "
+                        "64-bit form and emit an 8-byte access of a 16-byte value "
+                        "(D-CSUBSET-INT128-LIR-WIDTH)",
+                        static_cast<unsigned>(k), target.name()));
+            }
+            return k;
+        }
         return k;
     }
 
@@ -1648,6 +1920,8 @@ struct Lowerer {
             case MirOpcode::Popcount: return lowerPopcount(id);
             case MirOpcode::Clz:      return lowerClz(id);
             case MirOpcode::Ctz:      return lowerCtz(id);
+            // D-CSUBSET-INTRINSIC-BSWAP: byte reverse (the `_byteswap_*` family).
+            case MirOpcode::Bswap:    return lowerBswap(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
             // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): per-order fence
             // matrix. Relaxed/consume reuse the plain scalar Load/Store; the
@@ -1656,6 +1930,10 @@ struct Lowerer {
             // slot — never a silent under-fence).
             case MirOpcode::AtomicLoad:  return lowerAtomicLoad(id);
             case MirOpcode::AtomicStore: return lowerAtomicStore(id);
+            // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — a standalone seq_cst
+            // CPU fence. Unlike CompilerBarrier below it emits a REAL fence
+            // instruction (the AtomicFenceSeqCst slot: x86 MFENCE, arm64 DMB ISH).
+            case MirOpcode::AtomicFence: return lowerAtomicFence(id);
             // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
             // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
             // effect (forbidding CSE/LICM from moving memory ops across it) is
@@ -1768,8 +2046,16 @@ struct Lowerer {
             case MirOpcode::Bitcast:    return lowerBitcast(id);
             case MirOpcode::IntToPtr:
             case MirOpcode::PtrToInt:
-                // Identity cast between integer and pointer on x86_64
-                // — both are 64-bit GPR-class values. Single `mov`.
+                // Identity cast between a POINTER-WIDTH integer and a pointer —
+                // both GPR-class, a single `mov`. The int→ptr source is GUARANTEED
+                // pointer-width: `combineCast` (hir_to_mir.cpp) widens a narrower int
+                // (SExt signed / ZExt unsigned) BEFORE emitting IntToPtr
+                // (D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND), so this identity mov never
+                // sees an unextended narrower source (a bare `(u8*)(-1)` is now the
+                // sign-extended all-ones pointer, not 0x0000_0000_FFFF_FFFF). A
+                // PtrToInt to a NARROWER int still emits an un-truncated mov — LATENT
+                // only (the result is narrow-typed; no consumer reads it at full
+                // pointer width), tracked by D-CSUBSET-PTR-TO-NARROW-INT-TRUNCATE.
                 return lowerCast(id, MnemonicSlot::Mov, "MIR IntToPtr/PtrToInt");
             // ── cycle 3d bitwise + Neg ─────────────────────────────
             case MirOpcode::And:    return lowerBinaryOp(id, MnemonicSlot::And);
@@ -3748,7 +4034,14 @@ struct Lowerer {
                     break;
                 case TypeKind::Char: case TypeKind::I8:
                 case TypeKind::I16:  case TypeKind::I32:
-                    widenSlot = MnemonicSlot::SExt;  // signed → sign-extend
+                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: `Char` is
+                    // bucketed SExt here TARGET-BLIND (right for signed-char
+                    // targets, but arm64's unsigned char would want ZExt). DEAD
+                    // today — C's mandatory integer promotion widens a char index
+                    // to `int` before Gep lowering (cst_to_hir combineIndex), so a
+                    // raw narrow `Char` never reaches this arm; latent only for a
+                    // future non-promoting (non-C) frontend over this substrate.
+                    widenSlot = MnemonicSlot::SExt;  // signed sub-64 → sign-extend
                     break;
                 default:
                     break;  // non-integer/unexpected — a promoted index never reaches here
@@ -3900,6 +4193,20 @@ struct Lowerer {
         if (externDataGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
             return false;
         }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): a `got` extern-
+        // address symbol is NEVER foldable, mirroring the c117 arm above.
+        // Its GlobalAddr materializes the address by LOADING a foreign-
+        // linker GOT slot (the `lea_extern_got` adrp:got:+ldr:got_lo12:
+        // macro). Folding a C-level Load into it would collapse to ONE
+        // access returning the GOT slot CONTENTS where the code wanted the
+        // object's VALUE — off by one indirection (the same silent
+        // miscompile the c117 guard closes). On arm64 the GPR-load
+        // mnemonic declares no `[symbol]` riprel variant, so this fold
+        // never fires there anyway (see the comment above) — this guard is
+        // belt-and-braces parity for any target that later did.
+        if (externAddrGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
+            return false;
+        }
         // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5): a THREAD-LOCAL
         // symbol is NEVER foldable. Its address is tp + tpoff(sym) — the
         // walker stores the SIGNED tpoff (bit-cast) into symbolVa[sym],
@@ -3954,6 +4261,41 @@ struct Lowerer {
             }
         }
         return false;
+    }
+
+    // D-ML7-2.9: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
+    // slot (operand[0] of a `Call`). `lowerCall` folds the callee's SymbolId
+    // straight into a direct branch (x86 `call rel32` / arm64 `bl` CALL26 + the
+    // undefined-extern reloc) and NEVER reads this GlobalAddr's LEA vreg — so the
+    // LEA is DEAD. Suppress it (skip `lowerGlobalAddr`'s lea emit, exactly like
+    // the riprel-load fold above, via the shared `foldedGlobalAddrs_` set).
+    //   - x86_64: the dead lea is a PIE-safe `rel32`; suppressing it is a pure
+    //     size win.
+    //   - arm64: the dead lea is `adrp`+`add` (absolute page + lo12) against the
+    //     callee. Against an UNDEFINED extern (a relocatable `.o`) those absolute
+    //     relocs are rejected by a foreign PIE link ("may bind externally … when
+    //     making a shared object"); without the lea the direct extern call is a
+    //     PLAIN `bl` (CALL26 only) that the foreign linker resolves via a veneer/
+    //     PLT — the correctness fix that unblocks a default-PIE arm64 `.o`/`.a`.
+    // SINGLE-USE is load-bearing (mirrors the riprel `count != 1` guard): the
+    // `:4655` fold routes the callee symbol into the direct branch EVEN WHEN the
+    // GlobalAddr has OTHER uses (a `&fn` value/argument), so without `count == 1`
+    // a still-needed lea would be dropped → a loud undefined-vreg fail in
+    // `regForValue`. Operand-position-0 excludes a `&fn` passed as an ARGUMENT
+    // (operand ≥ 1) of the call from being mistaken for the callee. TLS/GOT-data
+    // guards are unneeded: a function callee is never a TLS or extern-DATA symbol
+    // (see the `lowerCall` note at :4545).
+    [[nodiscard]] bool globalAddrFoldsIntoDirectCall(MirInstId gaId) {
+        auto const it = mirValueUses_.find(gaId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) {
+            return false;  // zero or multiple users — keep the lea
+        }
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::Call) return false;
+        auto const userOps = mir.instOperands(user);
+        // operand[0] is the callee slot; a GlobalAddr at operand ≥ 1 is a call
+        // ARGUMENT (`f(&g)`), not the callee — keep its lea.
+        return !userOps.empty() && userOps[0].v == gaId.v;
     }
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm.
@@ -4335,6 +4677,16 @@ struct Lowerer {
             foldedGlobalAddrs_.insert(id.v);
             return;
         }
+        // D-ML7-2.9: the sole consumer is a DIRECT call's callee slot —
+        // `lowerCall` folds the symbol straight into the direct branch and never
+        // reads this lea's vreg, so emit NO lea (dead on every target; on arm64
+        // the absolute adrp+add against an undefined extern would also break a
+        // foreign PIE link). Same `foldedGlobalAddrs_` chokepoint as the riprel
+        // fold, so the (never-defined) address vreg can never be missed.
+        if (globalAddrFoldsIntoDirectCall(id)) {
+            foldedGlobalAddrs_.insert(id.v);
+            return;
+        }
         if (!opcode(MnemonicSlot::Lea).has_value()) {
             reportMissingOpcode(MnemonicSlot::Lea, "MIR GlobalAddr");
             return;
@@ -4376,6 +4728,41 @@ struct Lowerer {
             // so a mis-typed GlobalAddr can never narrow the pointer load).
             emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
             defineValue(id, objectAddr);
+            return;
+        }
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
+        // extern-address format (arm64 ELF relocatable / static-archive
+        // member), an undefined extern's ADDRESS as a live code-form VALUE
+        // materializes through a foreign-linker GOT slot — the arm64
+        // `lea_extern_got` macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:
+        // sym]` (R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC). A
+        // foreign default-PIE link accepts this where it REJECTS the plain
+        // absolute ADRP+ADD page-pair (`lea` below) against a preemptible
+        // symbol ("may bind externally … when making a shared object").
+        // This arm fires ONLY for the value/argument case: a bare `&extern`
+        // used AS A CALLEE already folded to a plain BL above
+        // (globalAddrFoldsIntoDirectCall, ordered BEFORE this — closure
+        // gate #7). ONE opcode emits BOTH words + BOTH GOT relocs; the
+        // foreign linker synthesizes the slot + resolves. The riprel fold
+        // is suppressed for `sym` (globalAddrRiprelFoldsIntoLoad returns
+        // false) so a C-level Load stays a distinct SECOND indirection
+        // (slot → object address → object value). A `got`-declaring format
+        // whose target lacks the macro fails LOUD — never a silent
+        // absolute page-pair a foreign PIE link rejects. The DSS-linked
+        // arm64 EXEC never reaches here (its format declares no
+        // externAddrBinding → the set is empty → the plain lea path, whose
+        // absolute page-pair the DSS linker resolves against a direct VA).
+        if (externAddrGotSymbols_.contains(sym.v)) {
+            auto const gotOp = opcode(MnemonicSlot::LeaExternGot);
+            if (!gotOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::LeaExternGot,
+                                    "MIR GlobalAddr (GOT-address extern value)");
+                return;
+            }
+            LirReg const addrReg = lir.newVReg(cls);
+            std::array<LirOperand, 1> gotOps{LirOperand::makeSymbolRef(sym.v)};
+            emitInst(*gotOp, addrReg, gotOps);
+            defineValue(id, addrReg);
             return;
         }
         LirReg const result = lir.newVReg(cls);
@@ -6067,6 +6454,164 @@ struct Lowerer {
         defineValue(id, *r);
     }
 
+    // ── D-CSUBSET-INTRINSIC-BSWAP: MIR Bswap → native-or-EXPANDED ─────────────
+    //
+    // Same capability split as the bit-count trio above — probe the config-
+    // declared opcode vocabulary, emit the hardware instruction where the target
+    // has one, else build the operation out of the universal ALU verbs. NO
+    // `if (arch==…)` anywhere: which of the two arms runs is decided ENTIRELY by
+    // what the `.target.json` declares.
+    //
+    // ★★ TWO WIDTHS — AND THEY ARE GENUINELY DIFFERENT QUANTITIES. This is the
+    // one thing here that is not obvious, and collapsing them breaks the lowering
+    // in a DIFFERENT way in each direction (one loud, one silent), so both are
+    // named and threaded separately:
+    //
+    //   SEMANTIC width W = `widthFlagsForType(operand type)` ∈ {16,32,64} —
+    //     HOW MANY BYTES ARE BEING REVERSED. Drives the per-variant
+    //     `guardWidthBits` probe AND the native emission.
+    //   MACHINE width P = max(W, 32), i.e. exactly `registerOpWidthFlags` (the
+    //     SAME promotion every other register-resident sub-native value takes,
+    //     D-CSUBSET-SUBNATIVE-ALU-FORMS) — drives EVERY instruction of the
+    //     software expansion.
+    //
+    //   * Threading W into the EXPANSION fails LOUD at W=16: x86 declares no
+    //     width-8/16 ALU variants at all (`and`/`or`/`shl`/`shr_l` are 64/32
+    //     only — a sub-native value lives PROMOTED in a 32-bit register), so
+    //     every emitted instruction would miss its encoding
+    //     (A_NoMatchingEncodingVariant) and `_byteswap_ushort` would simply never
+    //     compile.
+    //   * Threading P into the PROBE fails SILENTLY at W=16: arm64 declares a
+    //     width-32 `bswap` (REV Wd,Wn — reverse all FOUR bytes of the W
+    //     register), so probing at the promoted 32 would select REV where REV16
+    //     (per-HALFWORD reverse) is required, and the 16-bit swap would return a
+    //     wrong value with no diagnostic anywhere. That is the forbidden
+    //     direction, which is why the probe is width-EXACT.
+    //
+    // ★ AND THE PROBE MUST BE PER-WIDTH, NOT PRESENCE-ONLY. `opcode(slot)`
+    // answers "does the target name this verb?", which is enough for the
+    // bit-count trio (uniform 32+64 coverage) and WRONG here: x86 names "bswap"
+    // but encodes only 32 and 64 (there is no `bswap r16` — MEASURED: GAS refuses
+    // `bswap %ax` with "operand size mismatch", and gcc emits none across 20 flag
+    // combinations). Hence `opcodeWithWidth`.
+
+    // The generic byte reversal, over the universal ALU verbs, at MACHINE width
+    // `pWidth`: reverse the low `nBytes` bytes of `x`, i.e.
+    //     OR over i∈[0,nBytes)  of  ((x >> 8i) & 0xFF) << 8(nBytes-1-i)
+    // (the shift by 0 at each end is skipped rather than emitted).
+    //
+    // ★★ IT MASKS ITS INTERMEDIATES AND NEVER ITS RESULT — that is not a style
+    // choice, it is the correctness argument. DSS's lazy-narrowing model
+    // (see the Trunc note ~:1428) permits a U16-typed value to sit in a register
+    // with STALE bits 31:16: narrowing realizes at the width-exact CONSUMER, not
+    // at the producer. So for x = [g3 g2 b1 b0] (g = garbage, b = the real
+    // halfword) the tempting two-instruction form `(x<<8)|(x>>8)` followed by a
+    // trailing `& 0xFFFF` is WRONG — after the OR, bits 15:8 hold `b0 | g2`, and
+    // no trailing mask can remove `g2`. Masking each byte BEFORE it is placed is
+    // the only form that is correct for a dirty input.
+    //   ⚠ It would be right BY LUCK on sqlite today (`get2byteAligned` is
+    //   `_byteswap_ushort(*(u16*)(x))` and x86's width-16 load is a zero-
+    //   extending movzx, so bits 31:16 happen to be clean), which means the
+    //   sqlite probe would pass over the broken form. Do not rely on it.
+    //   The runtime probe therefore feeds a value with deliberately dirty upper
+    //   bits, not a fresh 16-bit load.
+    //
+    // Conversely the RESULT is left unnarrowed on purpose: its MIR type is the
+    // operand's own (U16 here), and a U16 value's bits above 15 are insignificant
+    // by that same contract — the ZExt/UXTH at the consumer is where it narrows,
+    // exactly as for every other U16 value in the system. (This arm happens to
+    // produce a CLEAN result anyway, since every term was masked; arm64's native
+    // REV16 does not, and both are equally valid — see lowerBswap.)
+    [[nodiscard]] std::optional<LirReg> emitBswapExpansion(
+            LirReg x, unsigned nBytes, std::uint8_t pWidth) {
+        auto const andOp = opcode(MnemonicSlot::And);
+        auto const orOp  = opcode(MnemonicSlot::Or);
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "byte-swap expansion"); return std::nullopt; }
+        if (!orOp.has_value())  { reportMissingOpcode(MnemonicSlot::Or,  "byte-swap expansion"); return std::nullopt; }
+        // ONE 0xFF register, reused by every term (materializing it per byte
+        // would emit `nBytes` redundant movs for the allocator to keep live).
+        std::optional<LirReg> const byteMask = emitBareConstToFresh(0xFF);
+        if (!byteMask.has_value()) return std::nullopt;
+        std::optional<LirReg> acc;
+        for (unsigned i = 0; i < nBytes; ++i) {
+            auto const srcShift = static_cast<std::uint8_t>(8u * i);
+            auto const dstShift =
+                static_cast<std::uint8_t>(8u * (nBytes - 1u - i));
+            LirReg cur = x;
+            if (srcShift != 0) {
+                auto const sh = emitShiftConst(cur, srcShift,
+                                               MnemonicSlot::ShrL, pWidth);
+                if (!sh.has_value()) return std::nullopt;
+                cur = *sh;
+            }
+            cur = emitAluRegReg(*andOp, cur, *byteMask, pWidth);
+            if (dstShift != 0) {
+                auto const sh = emitShiftConst(cur, dstShift,
+                                               MnemonicSlot::Shl, pWidth);
+                if (!sh.has_value()) return std::nullopt;
+                cur = *sh;
+            }
+            acc = acc.has_value() ? emitAluRegReg(*orOp, *acc, cur, pWidth)
+                                  : cur;
+        }
+        // `nBytes == 0` is unreachable (lirInstWidthBits yields 8/16/32/64, so
+        // nBytes ∈ {1,2,4,8}), but returning an empty optional here without a
+        // diagnostic would be a SILENT no-lowering — fail loud instead.
+        if (!acc.has_value()) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        return acc;
+    }
+
+    void lowerBswap(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const x = regForValue(operands[0]);
+        if (!x.has_value()) return;
+        // W and P (see the block comment above). Both read from the OPERAND
+        // type: it is identical to the result type for this op, but the operand
+        // is the authority — it is where the bytes actually live.
+        TypeId const opTy = mir.instType(operands[0]);
+        std::uint8_t const wWidth = widthFlagsForType(opTy);
+        std::uint8_t const pWidth = registerOpWidthFlags(opTy);
+
+        // Rule 1 — NATIVE, probed AT THE SEMANTIC WIDTH W. x86 hits at 32/64
+        // (BSWAP 0F C8+rd) and MISSES at 16; arm64 hits at all three (REV16 Wd,Wn
+        // / REV Wd,Wn / REV Xd,Xn).
+        if (auto const nativeOp = opcodeWithWidth(MnemonicSlot::Bswap, wWidth);
+            nativeOp.has_value()) {
+            // ★ THE TWO TARGETS NEED DIFFERENT REASONING ABOUT THE UPPER BITS,
+            // and both land on "correct":
+            //   x86 — BSWAP is only reached at W∈{32,64}, i.e. the FULL register
+            //     width, so there are no upper bits outside the operation; the
+            //     32-bit form's register write additionally zero-extends.
+            //   arm64 at W=16 — REV16 Wd,Wn is PER-HALFWORD, so it reverses the
+            //     low halfword using ONLY the low halfword. Its bits 31:16 are
+            //     the (byte-swapped) garbage from the input's upper half, which
+            //     is exactly what DSS's lazy-narrowing contract permits a U16
+            //     value to carry; the consumer's ZExt/UXTH narrows it. No
+            //     trailing UXTH is emitted here — one WOULD be sufficient on
+            //     arm64 (unlike the expansion, where a trailing mask cannot
+            //     repair a dirty result), but emitting it would make this the one
+            //     U16 producer in the compiler that eagerly narrows, and the
+            //     inconsistency would be the more dangerous thing to carry.
+            auto const r = emitNativeUnary(*nativeOp, *x, wWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // Rule 2 — the generic expansion, which reverses W/8 bytes but computes
+        // at the MACHINE width P (x86 `_byteswap_ushort` is the shipped case).
+        unsigned const nBytes = lirInstWidthBits(wWidth) / 8u;
+        auto const r = emitBswapExpansion(*x, nBytes, pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): lower MIR `AtomicCas` — operands
     // [ptr, comparand, newval] → the ORIGINAL value at *ptr; newval stored iff
     // original==comparand, atomically. Two capability-probed realizations
@@ -6434,6 +6979,56 @@ struct Lowerer {
             LirOperand::makeMemOffset(0),
         };
         emitInst(*stOp, InvalidLirReg, ops, /*payload=*/0, widthFlags);
+    }
+
+    // D-CSUBSET-ATOMIC-FENCE (+ D-CSUBSET-SYNC-BUILTIN-BARRIER): lower a MIR
+    // AtomicFence (__sync_synchronize) to the target's STANDALONE seq_cst fence
+    // instruction. 0 operands, no result; the order (`payload`) is seq_cst (5)
+    // from the sole shipped producer. Slot-presence probed (the lowerAtomicLoad/
+    // Store precedent, NEVER an arch identity): the AtomicFenceSeqCst slot binds
+    // x86 MFENCE (0F AE F0) / arm64 DMB ISH (0xD5033BBF) — both MEASURED via
+    // clang -c + otool on __sync_synchronize (2026-07-30, this machine; the
+    // acquire-only cross-check dmb ishld = 0xD50339BF differs in exactly the CRm
+    // nibble). A target that declares no slot FAILS LOUD (reportMissingOpcode).
+    void lowerAtomicFence(MirInstId id) {
+        if (!mir.instOperands(id).empty()) {
+            reportUnsupported(MirOpcode::AtomicFence, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order != kAtomicOrderSeqCst) {
+            // FAIL LOUD, never a silent under-fence: no producer emits a
+            // non-seq_cst standalone fence today (__sync_synchronize is always
+            // seq_cst), and the house rule in this file is "over-fence, never
+            // under-fence" (lowerAtomicLoad/Store above). A weaker payload here
+            // means a NEW producer (atomic_thread_fence is one lang.json row
+            // away via the AtomicLoadExplicit/StoreExplicit const-fold
+            // machinery) landed WITHOUT its per-order fence matrix — refusing
+            // beats guessing a weaker dmb/no-op realization that could
+            // silently under-fence. When atomic_thread_fence lands a consumer,
+            // THAT cycle designs the per-order matrix; D-CSUBSET-ATOMIC-FENCE
+            // records only the seq_cst pair (arm64 `dmb ish` / x86 `mfence`).
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR AtomicFence (inst {}): a standalone fence with "
+                    "non-seq_cst memory order {} is not lowered on target '{}' "
+                    "— the only shipped producer (__sync_synchronize) is "
+                    "always seq_cst (payload=5), so a weaker order means a new "
+                    "producer landed without its per-order fence matrix "
+                    "(D-CSUBSET-ATOMIC-FENCE); failing loud, never a silent "
+                    "under-fence.",
+                    id.v, order, target.name()));
+            return;
+        }
+        auto const fenceOp = opcode(MnemonicSlot::AtomicFenceSeqCst);
+        if (!fenceOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::AtomicFenceSeqCst,
+                                mirOpcodeName(MirOpcode::AtomicFence));
+            return;
+        }
+        emitInst(*fenceOp, InvalidLirReg, std::span<LirOperand const>{});
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,
@@ -7253,6 +7848,13 @@ struct Lowerer {
                 break;
             case TypeKind::Char: case TypeKind::I8:
             case TypeKind::I16:  case TypeKind::I32:
+                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char`
+                // SExt here is TARGET-BLIND (arm64 unsigned char would want ZExt)
+                // but DEAD — C promotes a switch discriminant to `int` (6.8.4.2,
+                // cst_to_hir promoteSubIntArith) before this fast path, so a raw
+                // narrow `Char` never reaches it. `unsigned char` (=U8) already
+                // ZExt's above; only a future non-promoting frontend could expose
+                // the bare-Char gap.
                 discrimWidenSlot = MnemonicSlot::SExt;
                 break;
             default:
@@ -8012,7 +8614,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<DataImportBinding> dataImportBinding,
                           std::optional<TlsAccessInfo> tlsAccess,
                           std::span<MirSehScope const> sehScopes,
-                          std::optional<std::string> wideFloatSoftcallLibrary) {
+                          std::optional<std::string> wideFloatSoftcallLibrary,
+                          std::optional<ExternAddrBinding> externAddrBinding) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -8030,7 +8633,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // binds each minted extern to it; nullopt + an F128 softcall =
     // fail-loud (no unbound extern).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, dataImportBinding, tlsAccess, sehScopes,
+              externCallDispatch, dataImportBinding, externAddrBinding,
+              tlsAccess, sehScopes,
               std::move(wideFloatSoftcallLibrary)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis

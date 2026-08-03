@@ -82,6 +82,37 @@ struct DSS_EXPORT HirExternRecord {
     // read time — so it rides the `canonicalName` rail, not the folded-map rail.
     // Empty ⇒ unversioned. Threaded to FfiMetadata.version → the ELF writer.
     std::string version;
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ this is an EAGER import — a
+    // shipped-library descriptor symbol (producer C, `model.shippedExterns()`)
+    // that DSS imports even when UNREFERENCED (the D-FFI-DESCRIPTOR-EAGER-IMPORT
+    // invariant: a `#include`d descriptor lists a real library export the linker
+    // must bind whether or not this TU calls it). The linker's reference gate
+    // (`rejectOrDropUnreferencedExterns`) KEEPS an eager row unconditionally;
+    // a NON-eager import (producers A/B — a source `extern` decl or a bare-proto
+    // synthesis) survives ONLY when referenced (gcc's unused-decl-emits-nothing
+    // rule). INVARIANT: isEagerImport ⟹ library-bound (a descriptor always ships
+    // a per-format `library` map); the flag never rides an empty-library row.
+    bool isEagerImport = false;
+    // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL,
+    // GCC 6.47.5): the EXPLICIT assembler name this
+    // extern was declared with (`extern int f(int) __asm("_myextfn");`). EMPTY =
+    // none. When set it REPLACES the format's C mangling at ingest — the string is
+    // the imported symbol VERBATIM, which is how the macOS SDK's `__DARWIN_ALIAS`
+    // family binds `open` to `_open$UNIX2003`.
+    //
+    // ★ PER-DECLARATOR, unlike `libraryOverride` above. The library override is a
+    // per-DECLARATION string (one `extern … "lib.dll";` applies to every declarator
+    // in the declaration); an asm label belongs to the ONE declarator it follows,
+    // because `extern int a __asm("x"), b __asm("y");` imports two different
+    // symbols. It is read inside the declarator loop and set per row.
+    //
+    // ★ LAST FIELD ON PURPOSE: three producers build this struct with POSITIONAL
+    // aggregate initializers (the bare-proto, inline-synthesis and shipped-
+    // descriptor paths). Appending keeps all three compiling untouched and defaults
+    // the label to "" — the correct value for a synthesized row that has no
+    // declarator to read one from; each producer that DOES have a SymbolRecord sets
+    // it explicitly below.
+    std::string asmName;
 };
 
 struct DSS_EXPORT CstToHirResult {
@@ -89,6 +120,26 @@ struct DSS_EXPORT CstToHirResult {
     HirSourceMap   sourceMap;     // bound to `hir` — must stay at a stable address
     HirLinkageMap  linkageMap;    // bound to `hir` — native-decl binding/visibility
                                   // (D-CSUBSET-LINKAGE-SPECIFIERS); read at HIR→MIR
+    HirNoInlineMap noInlineMap;   // bound to `hir` — native-FUNCTION inliner opt-out
+                                  // (TF-C78, D-CSUBSET-NOINLINE); read at HIR→MIR to
+                                  // stamp MirFunc.noInline (the inliner's refusal)
+    HirAlwaysInlineMap alwaysInlineMap; // bound to `hir` — native-FUNCTION inliner
+                                  // cost-model BYPASS (TF-C81, D-CSUBSET-ALWAYS-
+                                  // INLINE); read at HIR→MIR to stamp
+                                  // MirFunc.alwaysInline (suppresses rule 6's
+                                  // size threshold, never a correctness rule)
+    HirNoOptimizeMap noOptimizeMap; // bound to `hir` — native-FUNCTION optimizer
+                                  // OPT-OUT from an MSVC `#pragma optimize("",
+                                  // off)` REGION (TF-C85); read at HIR→MIR to
+                                  // stamp MirFunc.noOptimize (the rebuilder
+                                  // copies such a function verbatim)
+    HirNoSanitizeThreadMap noSanitizeThreadMap; // bound to `hir` — native-FUNCTION
+                                  // thread-sanitizer EXCLUSION (TF-C92,
+                                  // D-CSUBSET-NO-SANITIZE-THREAD); read at HIR→MIR
+                                  // to stamp MirFunc.noSanitizeThread, which
+                                  // `mir_text` surfaces as `nosanitizethread`. Its
+                                  // sink is STORAGE, not a pass — DSS ships no
+                                  // sanitizer (see NoSanitizeThreadAttr)
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
@@ -151,8 +202,8 @@ struct DSS_EXPORT CstToHirResult {
     // shared reporter don't taint the verdict).
     bool           ok = false;
     // FF6 Slice 2 (2026-06-02): the source-declared externs the
-    // lowerer produced. Populated by `lowerExternDecl` in
-    // declaration order. Consumed by the FFI synthesis stage at
+    // lowerer produced. Populated by `lowerExternDeclInto` in
+    // declaration order (one per declarator). Consumed by the FFI synthesis stage at
     // `compileSingleUnit` between HIR and MIR lowering. Empty
     // when the source declares no externs (every existing
     // pre-FF6 test fixture).
@@ -160,7 +211,8 @@ struct DSS_EXPORT CstToHirResult {
 
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)
-        : hir(std::move(h)), sourceMap(hir), linkageMap(hir),
+        : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
+          alwaysInlineMap(hir), noOptimizeMap(hir), noSanitizeThreadMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
           returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)) {}
 

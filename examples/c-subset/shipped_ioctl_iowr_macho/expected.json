@@ -1,0 +1,12 @@
+{
+  "$comment": "TF-C92 shipped <sys/ioctl.h> request-ENCODING macros on macOS — the sqlite os_unix.c:2986 `_IOWR('z', 23, struct ByteRangeLockPB2)` shape that used to die as `error[P0009] … got 'struct'` (a type-name reaching sizeof through a function-like macro PARAMETER, with no descriptor row to expand). Pins the EXACT encoded values, not merely that it parses: _IOWR 0xc0207a17, _IOW 0x80087107, _IOR 0x40047109, _IO 0x2000710b — each measured against the real SDK sys/ioccom.h with Apple clang — plus SZ(struct/union/enum) for the sizeof-through-a-macro-param shape, and the sign-extension pin (widening to the `unsigned long` request must ZERO-extend; 0xffffffffc0207a17 is asserted impossible). Calls the real variadic libSystem `ioctl` on fd -1 (EBADF, no side effect) so the value crosses the ABI boundary for real. Single arm64-macho target → the macos-latest CI leg. exit 42 iff the macho macro variants were selected AND their direction bits stayed UNSIGNED. RED-ON-DISABLE: delete the `_IOWR` row from src/dss-config/shippedLibs/sys/ioctl.json and P0009 returns (MEASURED, no binary); drop a `u` from a direction constant and the widening asserts go RED. Release arm runs the optimizer over the folded encodings + the variadic call.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

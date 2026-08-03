@@ -21,6 +21,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/pe.hpp"
+#include "link/image_request.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
@@ -28,7 +29,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -241,8 +244,11 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     EXPECT_EQ(readI16LE(bytes, symPtr + 12), 1);
     // Type @ +14 = 0x0020 (DT_FUNCTION)
     EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x0020u);
-    // StorageClass @ +16 = 2 (IMAGE_SYM_CLASS_EXTERNAL)
-    EXPECT_EQ(bytes[symPtr + 16], 2u);
+    // StorageClass @ +16 = 3 (IMAGE_SYM_CLASS_STATIC) — this function has no
+    // ModuleSymbol row, so it is not externally visible → `definedBinding` =
+    // Local → STATIC, not EXTERNAL (TF-C54, D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION; pre-fix it was hardcoded EXTERNAL = 2).
+    EXPECT_EQ(bytes[symPtr + 16], 3u);
     // NumberOfAuxSymbols @ +17 = 0
     EXPECT_EQ(bytes[symPtr + 17], 0u);
 }
@@ -295,6 +301,65 @@ TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) 
     // Symbol 1 = fn B (static) → stays internal `sym_11`.
     EXPECT_EQ(inlineNameAt(symPtr + 18u), "sym_11")
         << "a static (Local-binding) function must stay internal in the .obj";
+
+    // Storage class (COFF symbol record byte @ +16) — TF-C54,
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. NAME and
+    // BINDING are coupled: fn A (Global) → IMAGE_SYM_CLASS_EXTERNAL (2); fn B
+    // (static, Local) → IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s
+    // unrelated `sym_<id>` can never collide with it at a FOREIGN multi-TU
+    // link. COFF has no local-first ordering (unlike ELF) — order unchanged,
+    // only the class flips. RED-ON-DISABLE: pre-fix both were EXTERNAL (2).
+    EXPECT_EQ(bytes[symPtr + 16], 2u)
+        << "externally-visible fn A is IMAGE_SYM_CLASS_EXTERNAL (2)";
+    EXPECT_EQ(bytes[symPtr + 18u + 16], 3u)
+        << "static fn B is IMAGE_SYM_CLASS_STATIC (3), not EXTERNAL — the TF-C54 fix";
+}
+
+// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
+//
+// The relocatable PE/COFF writer cannot faithfully emit a WEAK DEFINED symbol
+// (COFF weak-external — IMAGE_SYM_CLASS_WEAK_EXTERNAL + its aux record — is not
+// wired). Degrading it to IMAGE_SYM_CLASS_EXTERNAL would SILENTLY lose the
+// weak-override semantics, so the writer fails loud instead. RED-ON-DISABLE:
+// reverting the fail-loud arm makes the writer emit the weak fn as EXTERNAL (2)
+// with 0 errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat
+// citing the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) +
+// the PE/Mach-O EXEC arms (weak forced Global / merge-resolved) are unaffected.
+TEST(PeWriter, ObjectWeakDefinedFunctionFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction w;
+    w.symbol = SymbolId{10};
+    w.bytes  = {0xC3};
+    mod.functions.push_back(std::move(w));
+    // A WEAK, externally-visible defined function (the `__attribute__((weak))`
+    // shape c-subset.lang.json produces). `definedBinding` returns Weak.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined symbol must emit no bytes (loud-fail path), never a "
+           "silently-degraded EXTERNAL record";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak def";
+    bool found = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            d.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") !=
+                std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE (the "
+           "COFF weak-external deferral) for future-grep navigability";
 }
 
 // ── String table starts with 4-byte u32 size including itself ──
@@ -610,6 +675,104 @@ TEST(PeWriter, ObjRodataItemEmitsRdataSectionAndDataSymbol) {
         << "COFF data symbols are notype - DTYPE_FUNCTION is fn-only";
     EXPECT_EQ(bytes[s1 + 16], 2u);            // IMAGE_SYM_CLASS_EXTERNAL
     EXPECT_EQ(bytes[s1 + 17], 0u);            // no aux records
+}
+
+// ── D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION (TF-C54):
+//    the DATA emit site couples name+binding exactly as the function site ──
+//
+// The static→Local storage-class flip lives at a SECOND, fully-duplicated emit
+// site (the data loop), NOT shared with the function loop — the design-audit
+// flagged this data twin as unpinned. A static (Local-binding) DATA item must
+// carve to `sym_<id>` + IMAGE_SYM_CLASS_STATIC (3); the Global half is pinned
+// by ObjRodataItemEmitsRdataSectionAndDataSymbol above (EXTERNAL = 2). This is
+// NOT academic — a string-literal / `static const` rodata is exactly a Local
+// data item, and pre-fix it collided across TUs as a GLOBAL `sym_<id>` (the
+// reader witness uses a `sym_101` rodata static). RED-ON-DISABLE: reverting the
+// data-site ternary (pe.cpp) to a hardcoded EXTERNAL makes this read 2 → red.
+TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {'h', 'i', 0};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    // A STATIC (Local-binding) data item — the `static const` / string-literal
+    // shape. definedBinding → Local → name carved to `sym_42`, class STATIC.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "msg",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // Symbols: fn(0) + data(1). The data symbol record is at symPtr + 18.
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 2u);
+    std::size_t const s1 = symPtr + 18u;
+    EXPECT_TRUE(coffNameEquals(bytes, s1, "sym_42"))
+        << "a static (Local) data item stays internal `sym_<id>`, not its real name";
+    EXPECT_EQ(bytes[s1 + 16], 3u)   // IMAGE_SYM_CLASS_STATIC — THE FIX
+        << "static data emits IMAGE_SYM_CLASS_STATIC (3), not the pre-fix EXTERNAL (2)";
+}
+
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
+// data-site twin of ObjectWeakDefinedFunctionFailsLoud. The data loop has its
+// OWN weak guard (pe.cpp); reverting it silently degrades a weak data def to
+// EXTERNAL with no diagnostic. RED-ON-DISABLE: revert the data-site guard →
+// non-empty bytes + errorCount 0 → this pin goes red.
+TEST(PeWriter, ObjectWeakDefinedDataFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;   // a benign anchor fn so only the DATA is weak
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "anchor",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{10};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakdat",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "exactly one fail-loud diagnostic must fire for the weak data def";
+    bool found = false;
+    for (auto const& dg : rep.all()) {
+        if (dg.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            dg.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE at the data site";
 }
 
 // (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function
@@ -3052,7 +3215,17 @@ TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
 
 TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeTrivialModule({0xC3}, /*fnSym=*/1);
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the colliding extern must be REFERENCED
+    // to survive the reference gate and reach the compound-index duplicate check —
+    // an unreferenced non-eager import is now dropped (which also removes the
+    // collision). A relocation to SymbolId{1} keeps the extern live so the
+    // ambiguous-resolution reject (fn #1 vs extern #1) still fires.
+    AssembledModule mod = makeTrivialModule({0xE8,0,0,0,0, 0xC3}, /*fnSym=*/1);
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{1};          // references SymbolId{1} → keeps the extern live
+    rel.kind   = RelocationKind{1};
+    mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
@@ -3106,7 +3279,13 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
     fn.symbol = SymbolId{1};
-    fn.bytes  = {0xC3};
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: the extern must be REFERENCED to
+    // survive the reference gate and REACH the walker whose lazy-binding fail-loud
+    // this test exercises — an unreferenced non-eager import is now dropped (which
+    // would leave no extern for the walker to reject). CALL printf so it stays live.
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};   // call rel32 printf; ret
+    fn.relocations.push_back(
+        Relocation{1u, SymbolId{99}, RelocationKind{1}, 0});   // references printf
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
@@ -3602,3 +3781,305 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
 // (PeWriter.TdataItemRejectsLoudUntilTlsC3 removed — TLS C3 LANDED: a pe64
 // thread-local item now EMITS the .tls section + IMAGE_TLS_DIRECTORY64 +
 // _tls_index. The landed behavior is pinned by the PeExecTls.* suite above.)
+
+
+// ═════════════════════════════════════════════════════════════════
+// D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-PROGRAM stack-reserve
+// request (`ImageRequest::stackReserveBytes`), pinned END-TO-END
+// through the REAL pipeline — `linker::link` → the capability gate →
+// `pe::encode` → IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve.
+//
+// The failure mode every pin below exists to close is the KNOB THAT
+// LIES: a build that reports SUCCESS while the emitted image's stack
+// is not the number the build asked for. So each test asserts the
+// NON-DEFAULT byte value at its spec offset (a test that still passed
+// when the override never reached the header would be worthless), an
+// EXACT diagnostic code + count on every refusal, and — for the
+// unused-feature path — BYTE-IDENTITY with the pre-feature image.
+//
+// Layout (already pinned by LoadBearingOptionalHeaderFieldsPinned-
+// ByteForByte): the PE32+ optional header starts at file offset 0x98,
+// so SizeOfStackReserve (PE/COFF §3.4, optional-header +72) is the u64
+// at 0xE0 and SizeOfStackCommit (+80) the u64 at 0xE8.
+// ═════════════════════════════════════════════════════════════════
+
+namespace {
+
+// IMAGE_OPTIONAL_HEADER64 file offsets (OH64 base 0x98 + spec offset).
+constexpr std::size_t kOhStackReserveOff = 0xE0;  // +72, u64
+constexpr std::size_t kOhStackCommitOff  = 0xE8;  // +80, u64
+constexpr std::size_t kOhHeapReserveOff  = 0xF0;  // +88, u64
+constexpr std::size_t kOhSubsystemOff    = 0xDC;  // +68, u16
+constexpr std::size_t kOhDllCharacterOff = 0xDE;  // +70, u16
+
+// What the SHIPPED pe64-x86_64-windows-exec schema declares. Kept as
+// named constants so a descriptor edit that moves a bound shows up as a
+// deliberate test edit rather than a silently-still-passing assertion.
+// (The bounds themselves are pinned field-by-field in
+// tests/link/test_object_format_schema.cpp.)
+constexpr std::uint64_t kShippedDefaultReserve = 0x100000ull;      // 1 MiB
+constexpr std::uint64_t kShippedMinReserve     = 65536ull;         // 64 KiB
+constexpr std::uint64_t kShippedMaxReserve     = 4294967296ull;    // 4 GiB
+// A NON-DEFAULT, in-range, granularity-aligned request. 4 MiB is the
+// value the sqlite full-source testfixture actually needs.
+constexpr std::uint64_t kOverrideReserve       = 4194304ull;       // 4 MiB
+
+// One trivial `ret` function linked through the REAL pipeline against
+// the SHIPPED exec schema. `linker::link` — never a hand-built header —
+// is the whole point: the gate and the walker both sit on this path.
+[[nodiscard]] LinkedImage
+linkTrivialExec(Loaded const&       loaded,
+                DiagnosticReporter& rep,
+                ImageRequest const& request) {
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    return linker::link(mod, *loaded.target, *loaded.format, rep, request);
+}
+
+} // namespace
+
+TEST(PeExecWriter, StackReserveOverrideReachesHeaderAndSlidesNoOtherByte) {
+    // THE knob-that-lies guard. A 4 MiB request must be what the Windows
+    // loader reads out of SizeOfStackReserve — not the schema's declared
+    // 1 MiB default. RED-on-disable: drop the `request.stackReserveBytes
+    // .value_or(...)` in pe.cpp's encodeExec (or the ImageRequest
+    // thread-through anywhere along linker::link → pe::encode →
+    // encodeExec) and 0xE0 reads 0x100000 while the link still reports
+    // success — exactly the silent no-op this capability exists to
+    // eliminate.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter repDef;
+    LinkedImage const def = linkTrivialExec(loaded, repDef, ImageRequest{});
+    for (auto const& d : repDef.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repDef.errorCount(), 0u);
+    ASSERT_TRUE(def.ok());
+    ASSERT_GT(def.bytes.size(), kOhStackReserveOff + 8u);
+
+    DiagnosticReporter repReq;
+    LinkedImage const got = linkTrivialExec(
+        loaded, repReq, ImageRequest{.stackReserveBytes = kOverrideReserve});
+    for (auto const& d : repReq.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repReq.errorCount(), 0u);
+    ASSERT_TRUE(got.ok());
+    ASSERT_GT(got.bytes.size(), kOhStackReserveOff + 8u);
+
+    // (1) The requested value — NOT the default — is in the header.
+    EXPECT_EQ(readU64LE(got.bytes, kOhStackReserveOff), kOverrideReserve)
+        << "the per-PROGRAM request must reach "
+           "IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve";
+    EXPECT_NE(readU64LE(got.bytes, kOhStackReserveOff), kShippedDefaultReserve)
+        << "a header still carrying the schema default means the override "
+           "was silently dropped";
+
+    // (2) The override wrote the RIGHT field: the neighbours on either
+    //     side of it keep their shipped values (a u64 written one slot
+    //     early/late would show up here even if 0xE0 happened to match).
+    EXPECT_EQ(readU16LE(got.bytes, kOhSubsystemOff), 3u);        // WINDOWS_CUI
+    EXPECT_EQ(readU16LE(got.bytes, kOhDllCharacterOff), 0x8160u);
+    EXPECT_EQ(readU64LE(got.bytes, kOhStackCommitOff), 0x1000ull)
+        << "SizeOfStackCommit must be untouched by a RESERVE request";
+    EXPECT_EQ(readU64LE(got.bytes, kOhHeapReserveOff), 0x100000ull)
+        << "SizeOfHeapReserve is a different knob entirely";
+
+    // (3) The strongest layout pin available: the override image and the
+    //     default image are the same SIZE, and EVERY byte that differs
+    //     between them lies inside the 8-byte SizeOfStackReserve field.
+    //     Nothing slid, no second field was quietly co-written, no
+    //     size/checksum/alignment recompute leaked out. (The differing
+    //     COUNT is not 8 — 0x100000 and 0x400000 happen to share seven of
+    //     their eight bytes — so the subset relation, plus the exact u64
+    //     equality above, is what states the invariant honestly.)
+    ASSERT_EQ(got.bytes.size(), def.bytes.size())
+        << "a stack-reserve request must not change the image SIZE";
+    std::vector<std::size_t> differing;
+    for (std::size_t i = 0; i < got.bytes.size(); ++i) {
+        if (got.bytes[i] != def.bytes[i]) differing.push_back(i);
+    }
+    EXPECT_FALSE(differing.empty())
+        << "the override produced a byte-identical image -- it never "
+           "reached the header at all";
+    for (std::size_t const off : differing) {
+        EXPECT_TRUE(off >= kOhStackReserveOff
+                    && off < kOhStackReserveOff + 8u)
+            << "byte at file offset 0x" << std::hex << off << std::dec
+            << " changed, but only SizeOfStackReserve [0xE0,0xE8) may";
+    }
+}
+
+TEST(PeExecWriter, AbsentStackReserveRequestIsByteIdenticalToTheDefaultPath) {
+    // The feature must be provably INERT when unused: every pre-existing
+    // build is byte-for-byte what it was before the knob existed. Three
+    // call shapes are compared — the pre-feature 4-argument call, an
+    // explicitly EMPTY ImageRequest, and an EXPLICIT request that happens
+    // to equal the schema default (which proves the override path writes
+    // that field and nothing else).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    // The pre-feature call shape: NO request argument at all.
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter repNoArg;
+    LinkedImage const noArg =
+        linker::link(mod, *loaded.target, *loaded.format, repNoArg);
+    for (auto const& d : repNoArg.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(repNoArg.errorCount(), 0u);
+    ASSERT_TRUE(noArg.ok());
+    ASSERT_GT(noArg.bytes.size(), kOhStackReserveOff + 8u);
+    EXPECT_EQ(readU64LE(noArg.bytes, kOhStackReserveOff),
+              kShippedDefaultReserve)
+        << "an unrequested reserve must stay the schema's declared 1 MiB";
+
+    DiagnosticReporter repEmpty;
+    LinkedImage const empty = linkTrivialExec(loaded, repEmpty, ImageRequest{});
+    ASSERT_EQ(repEmpty.errorCount(), 0u);
+    EXPECT_EQ(empty.bytes, noArg.bytes)
+        << "an EMPTY ImageRequest must produce a byte-identical image";
+
+    // An explicit request equal to the declared default is legal (in
+    // range, 4096-aligned) and must land on the same bytes.
+    DiagnosticReporter repSame;
+    LinkedImage const same = linkTrivialExec(
+        loaded, repSame,
+        ImageRequest{.stackReserveBytes = kShippedDefaultReserve});
+    ASSERT_EQ(repSame.errorCount(), 0u);
+    EXPECT_EQ(same.bytes, noArg.bytes)
+        << "requesting exactly the default must write exactly the default "
+           "-- the override touches SizeOfStackReserve and nothing else";
+}
+
+TEST(PeExecWriter, OutOfRangeOrMisalignedStackReserveRequestFailsLoud) {
+    // The request is REFUSED, never clamped and never rounded: an image
+    // whose stack silently differs from the number the build asked for is
+    // undiagnosable at runtime. Each row must produce a FAILED link with
+    // EXACTLY ONE K_InvalidStackReserveRequest — asserting the code, not
+    // merely that "an error happened" (a K_SymbolUndefined would satisfy
+    // the weaker form while the range check was gone).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    struct Row { std::uint64_t want; char const* why; };
+    for (Row const row : {
+             // Below minimumBytes (65536). Page-aligned + under the cap,
+             // so ONLY the minimum check can reject it.
+             Row{4096ull,
+                 "4096 is below the declared minimumBytes (65536)"},
+             // Above maximumBytes (4 GiB). Page-aligned + over the
+             // minimum, so ONLY the maximum check can reject it.
+             Row{8589934592ull,
+                 "8 GiB is above the declared maximumBytes (4 GiB)"},
+             // In range on BOTH bounds but off the 4096-byte
+             // granularity by one byte — the silent-round trap.
+             Row{4194305ull,
+                 "4 MiB + 1 is in range but off the 4096-byte granularity"}}) {
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, *loaded.target, *loaded.format, rep,
+                         ImageRequest{.stackReserveBytes = row.want});
+        EXPECT_FALSE(img.ok()) << row.why;
+        EXPECT_TRUE(img.bytes.empty())
+            << row.why << " -- a refused request must emit NO image";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_InvalidStackReserveRequest),
+                  1u)
+            << row.why;
+        EXPECT_EQ(rep.errorCount(), 1u)
+            << row.why << " -- the gate runs FIRST and returns, so the "
+                          "refusal is the only diagnostic";
+    }
+}
+
+TEST(PeExecWriter, DllAndObjSchemasRefuseAStackReserveRequest) {
+    // CAPABILITY, not KIND, is what gates. All three shipped pe64
+    // schemas are `kind: pe` and the dll even carries the very same
+    // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve field — but only the
+    // EXEC schema declares `stackReserveControl`, because the Windows
+    // loader ignores a DLL's copy (the .exe's value governs the main
+    // thread) and a relocatable .obj has no optional header at all.
+    // An `if (kind == pe)` engine branch would happily write a field
+    // nothing reads; these pins are what forbid one.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto dll = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dll.has_value());
+    auto obj = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(obj.has_value());
+
+    // The asymmetry, stated: same kind, opposite answers.
+    auto exec = loadShippedExec();
+    ASSERT_TRUE(exec.format);
+    EXPECT_EQ(exec.format->kind(), ObjectFormatKind::Pe);
+    EXPECT_TRUE(exec.format->stackReserveControl().has_value());
+
+    for (ObjectFormatSchema const* fmt : {&**dll, &**obj}) {
+        EXPECT_EQ(fmt->kind(), ObjectFormatKind::Pe) << fmt->name();
+        ASSERT_FALSE(fmt->stackReserveControl().has_value())
+            << fmt->name() << " must declare NO stackReserveControl";
+
+        // (a) The linker gate — the single chokepoint every image
+        //     emission passes through.
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, **target, *fmt, rep,
+                         ImageRequest{.stackReserveBytes = kOverrideReserve});
+        EXPECT_FALSE(img.ok()) << fmt->name();
+        EXPECT_TRUE(img.bytes.empty()) << fmt->name();
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << fmt->name() << " must refuse the request, not drop it";
+        EXPECT_EQ(rep.errorCount(), 1u) << fmt->name();
+
+        // (b) The WALKER's own re-check. `pe::encode` is a PUBLIC entry
+        //     point, so a caller that bypasses linker::link must still be
+        //     refused — the same walker serves exec/dll/obj and only the
+        //     declared capability tells them apart.
+        DiagnosticReporter repW;
+        auto const bytes =
+            pe::encode(mod, **target, *fmt, repW,
+                       ImageRequest{.stackReserveBytes = kOverrideReserve});
+        EXPECT_TRUE(bytes.empty())
+            << fmt->name() << " -- pe::encode must refuse a request it "
+                              "cannot honour, even off the linker path";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      repW, DiagnosticCode::K_FormatLacksStackReserveControl),
+                  1u)
+            << fmt->name();
+    }
+}
+
+TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
+    // minimumBytes and maximumBytes are INCLUSIVE: the gate compares
+    // `want < min` / `want > max`, never `<=` / `>=`. RED-on-disable:
+    // flip either comparison to its non-strict form and the matching
+    // boundary request is refused, failing here. Both values also land
+    // in the header, so an "accepted but dropped" regression is caught
+    // by the same test.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    for (std::uint64_t const want : {kShippedMinReserve, kShippedMaxReserve}) {
+        AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        DiagnosticReporter rep;
+        LinkedImage const img =
+            linker::link(mod, *loaded.target, *loaded.format, rep,
+                         ImageRequest{.stackReserveBytes = want});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual << " (want=" << want << ")";
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << want << " sits exactly ON a declared bound and must be "
+                       "ACCEPTED";
+        ASSERT_TRUE(img.ok()) << want;
+        ASSERT_GT(img.bytes.size(), kOhStackReserveOff + 8u) << want;
+        EXPECT_EQ(readU64LE(img.bytes, kOhStackReserveOff), want)
+            << "the boundary value must reach the header verbatim";
+        EXPECT_NE(readU64LE(img.bytes, kOhStackReserveOff),
+                  kShippedDefaultReserve)
+            << want << " must not silently fall back to the default";
+    }
+}

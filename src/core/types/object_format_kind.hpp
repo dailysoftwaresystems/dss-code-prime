@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -71,6 +72,55 @@ objectFormatKindName(ObjectFormatKind k) noexcept {
 objectFormatKindFromName(std::string_view s) noexcept {
     return kObjectFormatKindTable.fromName(s);
 }
+
+// ★ THE SENTINEL SPELLS CORRECTLY. `Unknown` carries the name "unknown" in the
+// table above, so `objectFormatKindFromName("unknown")` SUCCEEDS. A config site
+// that validates a format name ONLY through that function therefore accepts the
+// project's universal invalid sentinel as if it named a real format — and every
+// downstream per-kind dispatch then matches NOTHING and silently takes a default
+// arm. That is a DIFFERENT species from a typo hole (`"elff"` fails the name
+// lookup and is caught): the sentinel passes the lookup and dies later, quietly.
+//
+// So EVERY config surface that resolves a declared object-format NAME must ALSO
+// ask `isSelectableObjectFormatKind` and reject the sentinel explicitly — the
+// `bitFieldStrategy` "none" discipline (object_format_schema_json.cpp), applied
+// to this vocabulary. `kObjectFormatKindSentinelRejection` is the shared wording
+// so the diagnostics cannot drift site to site; each site supplies its own
+// diagnostic CODE and JSON path.
+[[nodiscard]] constexpr bool
+isSelectableObjectFormatKind(ObjectFormatKind k) noexcept {
+    return k != ObjectFormatKind::Unknown;
+}
+
+inline constexpr std::string_view kObjectFormatKindSentinelRejection =
+    "'unknown' is the invalid sentinel, not a selectable object format — it "
+    "names no real format, so a declaration under it could never fire";
+
+// The number of `ObjectFormatKind` enumerators INCLUDING the `Unknown`
+// sentinel — i.e. one past the largest ordinal, so an
+// `std::array<T, kObjectFormatKindCount>` indexed by
+// `static_cast<std::size_t>(kind)` is always in range. Derived from the name
+// table rather than written as a literal, so adding an enumerator cannot leave
+// a per-kind array one slot short (which would silently truncate the new kind
+// to whatever the bounds check does). Consumed by `TargetSchema`'s per-format
+// `charIsUnsigned` override table.
+inline constexpr std::size_t kObjectFormatKindCount =
+    kObjectFormatKindTable.rows.size();
+
+// The derivation above is only a SAFE array size while every enumerator's
+// ordinal is < the row count (the ordinals are dense from 0 today). A future
+// sparse enumerator would make `array[ordinal]` an out-of-range index that no
+// runtime bounds check on the array's own `.size()` could catch — so the
+// density is asserted here, at the one place the count is derived.
+static_assert([] {
+    for (auto const& r : kObjectFormatKindTable.rows) {
+        if (static_cast<std::size_t>(r.first) >= kObjectFormatKindCount) {
+            return false;
+        }
+    }
+    return true;
+}(), "ObjectFormatKind ordinals must stay dense from 0 — a per-kind array "
+     "sized by the name-table row count would otherwise index out of range");
 
 // ── Extern-call dispatch model (D-FFI-EXTERN-CALL-DISPATCH) ────────
 //
@@ -174,6 +224,59 @@ dataImportBindingName(DataImportBinding b) noexcept {
 [[nodiscard]] constexpr std::optional<DataImportBinding>
 dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
+}
+
+// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-
+//     ADDR-PIE-GOT, TF-C52) ───────────────────────────────────────
+//
+// How code MATERIALIZES the ADDRESS of an undefined/preemptible extern
+// (function OR data) as a LIVE code-form VALUE — an argument, an
+// initializer of an automatic, a returned function pointer: any use
+// that is NOT a call (that folds to a direct branch) and NOT a
+// static-data-item initializer (a separate abs64 data reloc). A
+// property of the OBJECT FORMAT's link contract, exactly like
+// `ExternCallDispatch` / `DataImportBinding` above.
+//
+//   * `got` (ELF relocatable / static-archive member): materialize the
+//     address THROUGH a GOT slot the FINAL (foreign) linker synthesizes
+//     — arm64 `adrp x,:got:sym` (R_AARCH64_ADR_GOT_PAGE) + `ldr x,
+//     [x,:got_lo12:sym]` (R_AARCH64_LD64_GOT_LO12_NC). A relocatable
+//     `.o`/`.a` is linked by a foreign default-PIE toolchain (gcc/clang
+//     with no `-no-pie`): an ABSOLUTE `adrp`+`add` (ADR_PREL_PG_HI21 +
+//     ADD_ABS_LO12_NC) against a symbol that may bind externally is
+//     REJECTED ("relocation ... which may bind externally can not be
+//     used when making a shared object"). The GOT indirection is what
+//     gcc/clang themselves emit for `&extern` in a default-PIE `.o`, so
+//     it links cleanly. Distinct from `DataImportBinding::GotIndirect`
+//     (the Mach-O __got model, a DSS-resolved lea-of-slot + deref): here
+//     the FOREIGN linker owns the slot, reached via the arm64 GOT-page
+//     relocs, not a DSS-local slot.
+//
+// A format that declares NO `externAddrBinding` materializes an
+// `&extern` value via the ordinary lea (an absolute page-pair on arm64;
+// a PC-relative rel32 on x86_64 — already foreign-PIE-safe there). The
+// DSS-linked EXEC formats never declare it (they use
+// `dataImportBinding: "copy-relocation"` for data + a direct address for
+// functions); the PIE/dyn formats use the c117 DSS-local-slot path. Only
+// the arm64 relocatable + static-archive formats declare `got`. Consumed
+// by MIR→LIR `lowerGlobalAddr` (the value-form arm, keyed on the
+// derived symbol set — never a format/arch identity branch). An unknown
+// VALUE fails loud at load (the closed-enum check).
+enum class ExternAddrBinding : std::uint8_t {
+    Got = 1,  // ELF relocatable: address via a foreign-linker GOT slot
+};
+
+inline constexpr EnumNameTable<ExternAddrBinding, 1> kExternAddrBindingTable{{{
+    { ExternAddrBinding::Got, "got" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+externAddrBindingName(ExternAddrBinding b) noexcept {
+    return kExternAddrBindingTable.name(b);
+}
+[[nodiscard]] constexpr std::optional<ExternAddrBinding>
+externAddrBindingFromName(std::string_view s) noexcept {
+    return kExternAddrBindingTable.fromName(s);
 }
 
 // ── Thread-local access model (D-CSUBSET-THREAD-LOCAL, TLS C1) ─────
@@ -345,6 +448,190 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
 struct DSS_EXPORT LibrarySynthesis {
     LibrarySynthVehicle vehicle = LibrarySynthVehicle::Win32;
     std::string         libraryPath;
+};
+
+// ── Per-PROGRAM stack-reserve control (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) ─
+//
+// WHERE — if anywhere — an object format can record "this PROGRAM needs N
+// bytes of stack". The required stack is a property of the PROGRAM (its
+// deepest call chain), not of the format, so it cannot live as a fixed
+// number in a `.format.json`: the measured motivating case is sqlite's
+// `e_fkey-63.1.1` (1000 levels of nested trigger recursion), which
+// stack-overflows at the Windows 1 MiB default even when built by GCC.
+// Every real toolchain exposes it as a link-time request (MSVC `/STACK`,
+// GNU ld `-Wl,--stack`); this block is how a format DECLARES that it can
+// carry one, so the engine asks the CAPABILITY and never the identity.
+//
+// The capability is NOT uniform across formats, and — critically — not even
+// uniform within one format KIND:
+//   * PE **executable** — IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve is
+//     exactly this field, read by the Windows loader when it commits the
+//     initial thread's stack. Declares the block.
+//   * PE **dll** — has the same header field, but the loader IGNORES it
+//     (the .exe's value governs the main thread; other threads take the
+//     .exe default or an explicit CreateThread size). Declares NOTHING: an
+//     `if (kind == pe)` engine branch would silently write a field nothing
+//     reads. This asymmetry is the reason the capability is per-FORMAT
+//     config rather than a kind test.
+//   * Mach-O executable — `LC_MAIN.stacksize` is a genuine equivalent.
+//     NOT declared yet: no walker arm implements it (see the vehicle enum).
+//   * ELF — has NO image field for stack SIZE. `PT_GNU_STACK` encodes
+//     EXECUTABILITY, not size; the size comes from the kernel/`ulimit -s`
+//     (or `-z stacksize` on the few linkers that honour it). Declares
+//     nothing, so a request on an ELF target fails LOUD.
+//
+// WHICH header field / load command a declared reserve lands in. A vehicle
+// names a structure of ONE image format, so the loader cross-checks it
+// against `format.kind` (a config-coherence rule, not an engine branch):
+// declaring `pe-optional-header` on an ELF schema is dead config whose
+// request the ELF walker would silently drop.
+//
+// Exactly ONE vehicle ships today because exactly one walker arm
+// implements one (`src/link/format/pe.cpp`). `macho-lc-main` is the
+// natural second row and lands WITH its walker arm — never before it, or
+// a Mach-O schema could declare a reserve that is silently dropped.
+enum class StackReserveVehicle : std::uint8_t {
+    // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve (PE/COFF §3.4), at
+    // optional-header offset +72. Implemented by pe.cpp's image arm.
+    PeOptionalHeader = 1,
+};
+
+inline constexpr EnumNameTable<StackReserveVehicle, 1> kStackReserveVehicleTable{{{
+    { StackReserveVehicle::PeOptionalHeader, "pe-optional-header" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveVehicleName(StackReserveVehicle v) noexcept {
+    return kStackReserveVehicleTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<StackReserveVehicle>
+stackReserveVehicleFromName(std::string_view s) noexcept {
+    return kStackReserveVehicleTable.fromName(s);
+}
+
+// The format's stack-reserve capability block (`"stackReserveControl"` in
+// `.format.json`). Presence IS the capability: a format that omits it
+// cannot express a per-program stack reserve, and a request against it
+// fails loud (`K_FormatLacksStackReserveControl`) rather than being
+// silently dropped.
+//
+// The three bounds make the REQUEST validation config-driven: the engine
+// range-checks a request against the numbers the FORMAT declares, so no
+// PE-specific constant is baked into shared substrate. All three are
+// REQUIRED when the block is present — a capability that does not state
+// its own legal range cannot validate anything, and a defaulted range
+// would silently admit an absurd value.
+// ── WHY a format cannot carry a stack reserve (the remedy axis) ─────
+//
+// The refusal above is only half the job. A user who asked for 4 MiB needs to
+// know WHERE the property actually lives for THIS artifact, and that differs
+// sharply between formats that all merely "declare no capability":
+//
+//   * a PE **dll** HAS the header field and it is INERT (measured: 12
+//     unrelated Microsoft system DLLs -- ntdll, ucrtbase, kernel32, msvcrt,
+//     shell32, crypt32, ... -- all carry the IDENTICAL untuned 0x40000, while
+//     8 system EXEs carry tuned, VARYING values [0x80000 / 0x100000] with
+//     SizeOfStackCommit spread across 8 KiB..1008 KiB. Uniformity across
+//     unrelated DLLs versus per-program tuning on EXEs is the signature of a
+//     field nothing reads. Documented Win32 semantics agree: CreateThread's
+//     `dwStackSize` "uses the default size for the EXECUTABLE" when zero --
+//     the executable's, not the loaded module's). Remedy: the host .exe.
+//   * a relocatable object / static archive / dylib has NO such field at all.
+//     Remedy: the final link that produces the executable.
+//   * ELF has no image field on ANY flavor -- the size is set by the OS at
+//     process/thread start. Remedy: `ulimit -s` / setrlimit.
+//   * Mach-O exec COULD carry it (`LC_MAIN.stacksize`) but no DSS walker arm
+//     writes it. Remedy: none -- an honest, named compiler gap.
+//
+// Those four remedies cannot be derived from any other declared verb without
+// asking WHICH FORMAT this is, so the reason is DECLARED, one closed verb per
+// schema, and the engine looks the remedy up in the table below. Declaring the
+// reason is OPTIONAL: a format that omits it still fails LOUD, just with the
+// generic message (fail-closed degrades to less-specific, never to silent).
+enum class StackReserveUnsupportedReason : std::uint8_t {
+    // The OS sets the stack at process/thread start; no image field has a say.
+    RuntimeControlled   = 1,
+    // The header HAS the field, but this platform's loader does not read it.
+    LoaderIgnoresField  = 2,
+    // This artifact form has no header field for a stack size at all.
+    NoImageField        = 3,
+    // The format CAN express it, but no DSS walker arm writes it yet.
+    // UNLIKE the three verbs above — which are PERMANENT facts about a
+    // platform — this one names a gap that is OURS and is CLOSABLE, so it is
+    // tracked as a real backlog item with a trigger and defined closing work:
+    // D-LK-MACHO-STACK-RESERVE-LC-MAIN. A comment tells whoever HITS the gap;
+    // the registry row is what keeps it from being forgotten.
+    WalkerNotImplemented = 4,
+};
+
+inline constexpr EnumNameTable<StackReserveUnsupportedReason, 4>
+kStackReserveUnsupportedReasonTable{{{
+    { StackReserveUnsupportedReason::RuntimeControlled,    "runtime-controlled"    },
+    { StackReserveUnsupportedReason::LoaderIgnoresField,   "loader-ignores-field"  },
+    { StackReserveUnsupportedReason::NoImageField,         "no-image-field"        },
+    { StackReserveUnsupportedReason::WalkerNotImplemented, "walker-not-implemented"},
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveUnsupportedReasonName(StackReserveUnsupportedReason r) noexcept {
+    return kStackReserveUnsupportedReasonTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<StackReserveUnsupportedReason>
+stackReserveUnsupportedReasonFromName(std::string_view s) noexcept {
+    return kStackReserveUnsupportedReasonTable.fromName(s);
+}
+
+// The REMEDY prose, one row per declared reason. Kept beside the vocabulary so
+// the verb and its explanation cannot drift apart, and looked up by the
+// diagnostic through a generic table walk — the engine never asks which format
+// it is holding, only which reason that format DECLARED.
+inline constexpr EnumNameTable<StackReserveUnsupportedReason, 4>
+kStackReserveUnsupportedRemedyTable{{{
+    { StackReserveUnsupportedReason::RuntimeControlled,
+      "on this platform the stack size is a RUNTIME property, not an image "
+      "property: the kernel sizes the initial thread's stack from the process "
+      "limit (`ulimit -s` / setrlimit RLIMIT_STACK) and additional threads "
+      "from pthread_attr_setstacksize. Nothing the linker writes can change "
+      "it, so raise the limit where the program RUNS." },
+    { StackReserveUnsupportedReason::LoaderIgnoresField,
+      "this artifact's header does contain the field, but the platform loader "
+      "IGNORES it for a module of this kind -- a thread's stack is sized from "
+      "the EXECUTABLE that loads this module (its own header) or explicitly "
+      "at thread creation (Win32 CreateThread `dwStackSize`). Writing the "
+      "field here would produce a build that reports success and changes "
+      "NOTHING, so request the reserve on the EXECUTABLE instead." },
+    { StackReserveUnsupportedReason::NoImageField,
+      "this artifact form carries no image header field for a stack size at "
+      "all -- it is an input to a later link, not a loadable program. Request "
+      "the reserve on the build that produces the final EXECUTABLE image." },
+    { StackReserveUnsupportedReason::WalkerNotImplemented,
+      "this format CAN express a stack reserve, but no DSS walker arm writes "
+      "it yet, so the request cannot be honoured. This is a named compiler "
+      "gap, not a property of the platform -- the request is refused rather "
+      "than silently dropped so the gap stays visible. Tracked as "
+      "D-LK-MACHO-STACK-RESERVE-LC-MAIN." },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+stackReserveUnsupportedRemedy(StackReserveUnsupportedReason r) noexcept {
+    return kStackReserveUnsupportedRemedyTable.name(r);
+}
+
+struct DSS_EXPORT StackReserveControl {
+    StackReserveVehicle vehicle = StackReserveVehicle::PeOptionalHeader;
+    // Smallest honourable request. Below this the image is legal but the
+    // program cannot start (the loader must still commit the initial
+    // stack pages), so a smaller request is rejected rather than emitted.
+    std::uint64_t minimumBytes     = 0;
+    // Largest honourable request — the "absurd value" boundary. A reserve
+    // is VIRTUAL address space, so a generous cap is correct; the point is
+    // that a fat-fingered 0x100000000000 fails loud at link instead of
+    // producing an image the loader refuses to start.
+    std::uint64_t maximumBytes     = 0;
+    // Required alignment of a request, in bytes (page granularity on PE).
+    // A misaligned request is rejected rather than silently rounded — a
+    // silent round is the knob-that-lies class.
+    std::uint64_t granularityBytes = 0;
 };
 
 // THE single source of truth for the extern-call-site SHAPE selection

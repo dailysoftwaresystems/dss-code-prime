@@ -47,6 +47,26 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_PreprocessorPredefinedMacro: return "P_PreprocessorPredefinedMacro";
         case DiagnosticCode::P_PreprocessorHasInclude:   return "P_PreprocessorHasInclude";
         case DiagnosticCode::P_PreprocessorEmbed:        return "P_PreprocessorEmbed";
+        case DiagnosticCode::P_PreprocessorErrorDirective:
+            return "P_PreprocessorErrorDirective";
+        case DiagnosticCode::P_PreprocessorWarningDirective:
+            return "P_PreprocessorWarningDirective";
+        case DiagnosticCode::P_PreprocessorPragma:
+            return "P_PreprocessorPragma";
+        case DiagnosticCode::P_PreprocessorOperatorNameNotDefinable:
+            return "P_PreprocessorOperatorNameNotDefinable";
+        case DiagnosticCode::P_PreprocessorIncludeReentryRefused:
+            return "P_PreprocessorIncludeReentryRefused";
+        case DiagnosticCode::S_PragmaPackAmbiguous:
+            return "S_PragmaPackAmbiguous";
+        case DiagnosticCode::S_AsmLabelInvalid:
+            return "S_AsmLabelInvalid";
+        case DiagnosticCode::S_AsmLabelDuplicate:
+            return "S_AsmLabelDuplicate";
+        case DiagnosticCode::S_AsmLabelOnAutomaticVariable:
+            return "S_AsmLabelOnAutomaticVariable";
+        case DiagnosticCode::S_AttributeIgnoredForDeclarationKind:
+            return "S_AttributeIgnoredForDeclarationKind";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -86,6 +106,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidTargetName:        return "C_InvalidTargetName";
         case DiagnosticCode::C_InvalidFormatName:        return "C_InvalidFormatName";
         case DiagnosticCode::C_InvalidPreprocess:        return "C_InvalidPreprocess";
+        case DiagnosticCode::C_ConflictingPredefinedMacro: return "C_ConflictingPredefinedMacro";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -221,6 +242,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_LongDoubleFormatUndeclared";
         case DiagnosticCode::S_InlineAsmNonEmptyTemplate:
             return "S_InlineAsmNonEmptyTemplate";
+        case DiagnosticCode::S_BitfieldMutationUnsupportedBase:
+            return "S_BitfieldMutationUnsupportedBase";
+        case DiagnosticCode::S_InlineNonFunction:
+            return "S_InlineNonFunction";
+        case DiagnosticCode::S_ConflictingInlineAttributes:
+            return "S_ConflictingInlineAttributes";   // TF-C81
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -332,6 +359,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_ArtifactProfileFormatMismatch: return "D_ArtifactProfileFormatMismatch";
         case DiagnosticCode::D_DefineRequiresPreprocess:     return "D_DefineRequiresPreprocess";
         case DiagnosticCode::D_StaticLibFatArchiveUnsupported: return "D_StaticLibFatArchiveUnsupported";
+        case DiagnosticCode::D_CompileUnitNullNoDiagnostic:  return "D_CompileUnitNullNoDiagnostic";
+        case DiagnosticCode::D_ArtifactNameEscapesOutputDir: return "D_ArtifactNameEscapesOutputDir";
+        case DiagnosticCode::D_SynthRecipeFamilyUnknown:     return "D_SynthRecipeFamilyUnknown";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
@@ -375,6 +405,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_FfiResolveLibrarySymbolAbsent";
         case DiagnosticCode::F_ShippedTypeIdentityConflict:
             return "F_ShippedTypeIdentityConflict";
+        case DiagnosticCode::F_ShippedSymbolUnavailableForTarget:
+            return "F_ShippedSymbolUnavailableForTarget";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch
@@ -392,6 +424,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ArchiveMemberNameInvalid";
         case DiagnosticCode::K_ArchiveFieldOverflow:
             return "K_ArchiveFieldOverflow";
+        case DiagnosticCode::K_FormatLacksStackReserveControl:
+            return "K_FormatLacksStackReserveControl";
+        case DiagnosticCode::K_InvalidStackReserveRequest:
+            return "K_InvalidStackReserveRequest";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

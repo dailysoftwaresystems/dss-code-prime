@@ -192,6 +192,80 @@ public:
         return false;
     }
 
+    // Q4 — does `blk` lie on a cycle that does NOT pass through `avoid`?
+    // (an invalid `avoid` ⇒ plain self-reachability). Forward walk from `blk`'s
+    // successors that never expands THROUGH `avoid`, asking whether `blk` is
+    // re-reached.
+    //
+    // WHY THIS EXISTS: a two-program-point Load query (CSE) decomposes the
+    // canonical→use region into slices, and that decomposition is complete only
+    // for an ACYCLIC path. When the use sits on a canonical-free cycle, execution
+    // WRAPS and the use block's TAIL runs before the NEXT execution of the use —
+    // so the caller must scan that tail too. This predicate is the trigger.
+    // Reachability (not `mirNaturalLoops`) is deliberate: DSS has computed goto /
+    // IndirectBr, so an IRREDUCIBLE cycle yields no natural loop and any
+    // loop-structure-based trigger would silently miss it.
+    //
+    // ★ NOT `reach_(blk, /*forward=*/true)[blk.v]` — that bitmap PRE-MARKS ITS OWN
+    // ROOT (see `reach_`), so such a predicate is CONSTANT-TRUE. It would still be
+    // sound, but would silently degrade Load CSE to "never CSE across any later
+    // clobber" — an unmeasured optimization loss no test could observe.
+    //
+    // Same step-cap + fail-loud discipline as `reach_`; not memoized (called only
+    // after a cheap tail scan already found a candidate clobber).
+    [[nodiscard]] bool blockReachesItselfAvoiding(MirBlockId blk,
+                                                  MirBlockId avoid) const {
+        checkModule_();
+        if (!blk.valid() || blk.v >= blockCount_) return false;
+        // Degenerate query: with `avoid == blk` the walk can never expand
+        // through `avoid`, so it would answer "no" even for a genuine self
+        // edge. Unreachable from the CSE call site (guarded by
+        // `canonicalBlock.v != B.v`), but this method is public — be explicit
+        // rather than accidentally correct.
+        if (avoid.valid() && avoid.v == blk.v) return false;
+        // Stamp-compare scratch, NOT a per-call zero-filled vector:
+        // `blockCount_` is the WHOLE MODULE's block arena (see the ctor), so a
+        // fresh `vector<uint8_t>(blockCount_)` would allocate + memset hundreds
+        // of KB per qualifying Load candidate on a merged amalgamation, while
+        // the walk only ever touches the CURRENT function's blocks. Same
+        // mutable-memo pattern as `fwdMemo_`/`bwdMemo_` below. The `== 0u`
+        // arm covers both the first call and stamp wrap-around.
+        if (++reachSelfStamp_ == 0u || reachSelfSeen_.size() != blockCount_) {
+            reachSelfSeen_.assign(blockCount_, 0u);
+            reachSelfStamp_ = 1u;
+        }
+        std::vector<MirBlockId> work;
+        // Returns true the moment `blk` is re-reached.
+        auto step = [&](MirBlockId s) -> bool {
+            if (!s.valid() || s.v >= blockCount_) return false;
+            if (avoid.valid() && s.v == avoid.v) return false;  // never expand through
+            if (s.v == blk.v) return true;
+            if (reachSelfSeen_[s.v] != reachSelfStamp_) {
+                reachSelfSeen_[s.v] = reachSelfStamp_;
+                work.push_back(s);
+            }
+            return false;
+        };
+        for (MirBlockId const s : mir_.blockSuccessors(blk))
+            if (step(s)) return true;
+        std::uint32_t const stepCap = blockCount_ * 4u + 4u;
+        std::uint32_t steps = 0;
+        while (!work.empty()) {
+            if (++steps > stepCap) {
+                std::fprintf(stderr,
+                    "dss::opt::analysis::MirMemoryClobbers fatal: step-cap "
+                    "exceeded in self-reach walk from #%u — malformed CFG (the "
+                    "verifier should have caught this).\n", blk.v);
+                std::abort();
+            }
+            MirBlockId const b = work.back();
+            work.pop_back();
+            for (MirBlockId const s : mir_.blockSuccessors(b))
+                if (step(s)) return true;
+        }
+        return false;
+    }
+
 private:
     // Design-audit F3: the optimizer mints a fresh MirModuleId per rebuild and
     // `mir = std::move(builder).finish()` reassigns the SAME variable this
@@ -260,6 +334,12 @@ private:
     std::vector<std::uint32_t>                  clobberBearingBlocks_;  // sorted
     mutable std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> fwdMemo_;
     mutable std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> bwdMemo_;
+    // Stamp-compare scratch for `blockReachesItselfAvoiding` — reused across
+    // calls so the walk costs O(touched blocks), not O(module blocks), per
+    // query. Not a memo: the ANSWER is not cached (it depends on `avoid`),
+    // only the visited-set storage is.
+    mutable std::vector<std::uint32_t>          reachSelfSeen_;
+    mutable std::uint32_t                       reachSelfStamp_ = 0u;
 };
 
 } // namespace dss::opt::analysis

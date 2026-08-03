@@ -628,6 +628,18 @@ struct IntKindInfo {
     return v >= 0 && v <= hi;
 }
 
+// ⚠ INT64-DOMAIN HELPER (D-CSUBSET-INT128-CONSTFOLD, TF-C94). `v` is an
+// `std::int64_t`, so this can only ever express a 64-bit result: for
+// `target.bits >= 64` it returns `v` UNCHANGED, which is right for a 64-bit
+// target and for a signed 128-bit one (every int64 is already its own 128-bit
+// value), but is NOT a general 128-bit wrap — `wrapToIntTarget(-1, {128,false})`
+// would have to yield 2^128-1, which no `std::int64_t` can hold. That case is
+// unreachable rather than handled: `valueFitsInIntTarget(v, {128,false})` is
+// `v >= 0`, so a negative value is REFUSED before any caller wraps it, and every
+// 128-bit fold now routes through the bignum (`foldBitIntBinary` /
+// the 128-bit cast arms) long before reaching here. Keep it that way — a caller
+// that wraps a 128-bit target through this function silently truncates to 64
+// bits, and there is no failure channel here to say so.
 [[nodiscard]] inline std::int64_t wrapToIntTarget(std::int64_t v, IntKindInfo target) noexcept {
     if (target.bits >= 64) return v;
     std::uint64_t const mask = (std::uint64_t{1} << target.bits) - 1;
@@ -649,6 +661,13 @@ struct IntKindInfo {
 // bignum fold AT THAT width — NOT naively at an operand width (which miscompiles
 // `15wb + 1`, whose int-outranked-BitInt result is a plain `int`, no wrap → 16).
 
+// True for the two 128-bit standard integer kinds — the widths that are STANDARD
+// (not bit-precise) yet still too wide for the int64/uint64 literal arms, so they
+// must stay in the `BitIntValue` bignum arm (D-CSUBSET-INT128-CONSTFOLD, TF-C94).
+[[nodiscard]] inline bool isInt128Kind(TypeKind k) noexcept {
+    return k == TypeKind::I128 || k == TypeKind::U128;
+}
+
 // A `_BitInt`-UAC operand descriptor. A standard integer arm's (width, signed)
 // come from its `core` via `intKindInfo` (the CST leaf tags integer literals I32;
 // sizeof → U64; a cast → its target). nullopt for a non-integer arm.
@@ -656,6 +675,18 @@ struct BitIntOperandType { std::uint32_t width; bool isSigned; bool isBitPrecise
 
 [[nodiscard]] inline std::optional<BitIntOperandType>
 bitIntOperandType(HirLiteralValue const& v) noexcept {
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): `core` is consulted BEFORE the variant
+    // arm, because after this cycle the two no longer determine each other. A
+    // folded 128-bit STANDARD value rides the `BitIntValue` payload (nothing
+    // narrower holds 128 bits) while carrying an I128/U128 core, so a
+    // variant-first test would report `isBitPrecise = true` for it and
+    // `packBitIntResult` would then retag the result `_BitInt` — a `__int128`
+    // expression silently changing type mid-fold. Ordering the checks this way
+    // makes `core` the authority on bit-preciseness and the variant merely the
+    // storage. `bitIntIsSigned` for these kinds is the kind's own signedness.
+    if (isInt128Kind(v.core)) {
+        return BitIntOperandType{128, v.core == TypeKind::I128, false};
+    }
     if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
         return BitIntOperandType{bv->width(), bv->isSigned(), true};
     }
@@ -719,21 +750,38 @@ bitIntUac(BitIntOperandType a, BitIntOperandType b) noexcept {
     return {a.width, a.isSigned && b.isSigned, false};
 }
 
-// The core TypeKind for a standard (non-bit-precise) result (width ∈ {8,16,32,64}).
+// The core TypeKind for a standard (non-bit-precise) result
+// (width ∈ {8,16,32,64,128}).
 [[nodiscard]] inline TypeKind intKindFromWidth(std::uint32_t width, bool isSigned) noexcept {
     switch (width) {
         case 8:  return isSigned ? TypeKind::I8  : TypeKind::U8;
         case 16: return isSigned ? TypeKind::I16 : TypeKind::U16;
         case 32: return isSigned ? TypeKind::I32 : TypeKind::U32;
+        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): 128 is a REAL standard width now
+        // (`__int128`/`__uint128_t` bind to I128/U128 and `intKindInfo` already
+        // reports {128, signed}). Before this arm it fell to the `default` and a
+        // 128-bit result was mislabelled I64/U64 — the root of the silent 64-bit
+        // wrap, since `packBitIntResult` then extracted only the low 64 bits.
+        case 128: return isSigned ? TypeKind::I128 : TypeKind::U128;
         default: return isSigned ? TypeKind::I64 : TypeKind::U64;   // 64 (and any residue)
     }
 }
 
 // Package a folded `BitIntValue` into a HirLiteralValue: a bit-precise result
-// keeps the `BitIntValue` arm (`core == BitInt`); a standard result (width ≤ 64)
+// keeps the `BitIntValue` arm (`core == BitInt`); a standard result of width ≤ 64
 // extracts to the int64/uint64 arm with its `core` kind (so downstream int64
 // bridges + the narrow-cast paths see a plain integer, exactly as the typed side
 // produces a standard type for an int-outranked BitInt).
+//
+// D-CSUBSET-INT128-CONSTFOLD (TF-C94): a 128-bit STANDARD result is the third
+// case. It is not bit-precise (its core is I128/U128, never BitInt), but it does
+// NOT fit the int64/uint64 arms either — `asI64()`/`low64()` would silently drop
+// the high 64 bits, which is exactly the mod-2^64 wrap this cycle exists to
+// prevent. It therefore keeps the `BitIntValue` payload while carrying an
+// I128/U128 core. That deliberately breaks the old
+// "BitIntValue arm ⟺ core == BitInt" invariant, so every consumer that keys on
+// the VARIANT to say something `_BitInt`-specific must key on `core` instead —
+// see the audit note at the `BitIntValue` arm in asm.cpp.
 [[nodiscard]] inline HirLiteralValue
 packBitIntResult(BitIntValue const& r, BitIntOperandType rt) {
     HirLiteralValue out;
@@ -743,6 +791,10 @@ packBitIntResult(BitIntValue const& r, BitIntOperandType rt) {
         return out;
     }
     out.core = intKindFromWidth(rt.width, rt.isSigned);
+    if (isInt128Kind(out.core)) {
+        out.value = r;              // 128 bits — the bignum arm is the only one wide enough
+        return out;
+    }
     if (rt.isSigned) out.value = r.asI64();
     else             out.value = r.low64();
     return out;
@@ -760,10 +812,23 @@ struct BitIntBinaryFold {
 };
 [[nodiscard]] inline BitIntBinaryFold
 foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) {
-    bool const aBit = std::holds_alternative<BitIntValue>(a.value);
-    bool const bBit = std::holds_alternative<BitIntValue>(b.value);
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): entry is by "does this fold need MORE
+    // than 64 bits?", not by "is a `BitIntValue` variant present?". The old
+    // variant-only predicate was the reason a PURE 128-bit fold silently wrapped
+    // at 64: `__uint128_t` values whose magnitude fits in 64 bits carry a plain
+    // u64/i64 arm and NO `BitIntValue`, so the bignum was never entered and the
+    // caller's int64 path folded them mod 2^64. Keying on `core` as well catches
+    // them. The downstream machinery already handles these operands with no
+    // change — `bitIntOperandType` reads {128, signed} straight out of
+    // `intKindInfo(core)`, `asBitIntValue` widens the int64 arm to a 128-bit
+    // bignum, and `bitIntUac`'s two-standard branch ranks 128 above every
+    // narrower kind — so this predicate is the whole of the entry fix.
+    bool const aBit = std::holds_alternative<BitIntValue>(a.value)
+                   || isInt128Kind(a.core);
+    bool const bBit = std::holds_alternative<BitIntValue>(b.value)
+                   || isInt128Kind(b.core);
     BitIntBinaryFold r;
-    if (!aBit && !bBit) return r;    // not a BitInt fold — caller's normal path
+    if (!aBit && !bBit) return r;    // not a wide fold — caller's normal path
     r.applies = true;
     auto at = bitIntOperandType(a);
     auto bt = bitIntOperandType(b);
@@ -840,17 +905,32 @@ struct BitIntUnaryFold {
 [[nodiscard]] inline BitIntUnaryFold
 foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
     BitIntUnaryFold r;
-    auto const* bv = std::get_if<BitIntValue>(&inner.value);
-    if (bv == nullptr) return r;    // not a BitInt operand — caller's normal path
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the binary entry's twin — enter for a
+    // 128-bit STANDARD operand too, not only for a `BitIntValue` variant, or
+    // `-(__int128)x` / `~(__uint128_t)x` fall to the caller's int64 path and wrap
+    // at 64 bits. `bitIntOperandType` supplies the operand's true (width, signed,
+    // isBitPrecise) triple, and threading that triple into `packBitIntResult` —
+    // instead of the hard-coded `true` this used to pass — is what keeps a 128-bit
+    // result labelled I128/U128 rather than mislabelled `_BitInt`.
+    bool const isBitVariant = std::holds_alternative<BitIntValue>(inner.value);
+    if (!isBitVariant && !isInt128Kind(inner.core)) {
+        return r;                   // not a wide operand — caller's normal path
+    }
     r.applies = true;
-    std::uint32_t const w = bv->width();
-    bool const s = bv->isSigned();
+    auto ot = bitIntOperandType(inner);
+    auto bv = asBitIntValue(inner);
+    if (!ot.has_value() || !bv.has_value()) {
+        r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
+        return r;
+    }
+    std::uint32_t const w = ot->width;
+    bool const s = ot->isSigned;
     switch (op) {
         case HirOpKind::Neg:
-            r.value = packBitIntResult(BitIntValue::neg(*bv, w, s), {w, s, true});
+            r.value = packBitIntResult(BitIntValue::neg(*bv, w, s), *ot);
             r.ok = true; return r;
         case HirOpKind::BitNot:
-            r.value = packBitIntResult(BitIntValue::bitNot(*bv, w, s), {w, s, true});
+            r.value = packBitIntResult(BitIntValue::bitNot(*bv, w, s), *ot);
             r.ok = true; return r;
         case HirOpKind::Not:
             r.value = makeBoolLiteral(bv->isZero() ? 1 : 0);

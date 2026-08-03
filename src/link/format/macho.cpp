@@ -1339,14 +1339,60 @@ encode(AssembledModule const&    module,
     // `_sym_<id>` fallback for static/local/synthesized symbols.
     link::format::ObjectSymbolNames const objNames{module};
 
-    // Defined function symbols: N_SECT|N_EXT, n_sect=1, n_value=offset.
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
+    // symbol cannot round-trip a Mach-O RELOCATABLE (MH_OBJECT) object today.
+    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
+    // externally-visible `__attribute__((weak))` def; a faithful weak def needs
+    // N_WEAK_DEF (n_desc) + MH_WEAK_DEFINES machinery that is NOT wired. Emitting
+    // it strong (N_SECT|N_EXT) would SILENTLY drop the weak-override semantics,
+    // so fail loud instead — the exact posture the MH_DYLIB export arm already
+    // takes on this case (macho::encodeExecDynamic, D-LK3-DYLIB-WEAK-EXPORT).
+    // Each writer owns its own fail-loud + vocabulary; the Weak decision is the
+    // one shared `definedBinding`, so no `if(format)` leaks into the substrate.
+    auto emitWeakDefinedRelocatableError =
+        [&](std::string_view symName, char const* symKind) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "macho::encode (MH_OBJECT): defined {} symbol '{}' has "
+                     "WEAK binding -- a weak DEFINED symbol cannot be emitted "
+                     "to a Mach-O RELOCATABLE object until N_WEAK_DEF (n_desc) "
+                     "+ MH_WEAK_DEFINES machinery ships "
+                     "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
+                     "(N_SECT|N_EXT) would silently lose weak-override "
+                     "semantics.",
+                     symKind, symName));
+        };
+
+    // Defined function symbols: n_sect=1, n_value=offset. n_type binding is
+    // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
+    // COLLISION, TF-C54): a static/synthesized `_sym_<id>` def is Local → bare
+    // N_SECT (NO N_EXT), so a sibling `.o`'s unrelated `_sym_<id>` can never
+    // bind to it at a FOREIGN link; an externally-visible def keeps N_SECT|N_EXT.
+    // A Mach-O RELOCATABLE object carries no LC_DYSYMTAB (no local/extern range
+    // split to keep in sync — see the symtab-order note above), so the emission
+    // order is unchanged; only the N_EXT bit flips. A WEAK def FAILS LOUD here
+    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c-subset DOES produce weak defined
+    // symbols (`__attribute__((weak))` → SymbolBinding::Weak, per
+    // `c-subset.lang.json` + examples/c-subset/attributes_syntax's `weak_helper`
+    // and weak_inline_crosscu), but they reach a Mach-O binary ONLY via the EXEC
+    // arms (encodeExec/encodeExecDynamic — `encode` dispatches to them above),
+    // where a weak def is merge-resolved strong-over-weak / forced Global before
+    // the writer. A weak def routed to THIS relocatable path cannot round-trip
+    // until the N_WEAK_DEF machinery ships, so the writer fails loud rather than
+    // silently degrade it to N_SECT|N_EXT (see the lambda + the MH_DYLIB arm).
     for (auto const& f : funcSyms) {
         std::string const symName = objNames.definedName(f.symId, "_sym_");
+        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "function");
+            return {};
+        }
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff,
-                    static_cast<std::uint8_t>(N_SECT | N_EXT),
-                    kTextSectionNumber,
-                    /*n_desc=*/0,
+        std::uint8_t const nType =
+            (binding == SymbolBinding::Local)
+                ? N_SECT
+                : static_cast<std::uint8_t>(N_SECT | N_EXT);
+        appendNlist(nameOff, nType, kTextSectionNumber, /*n_desc=*/0,
                     f.valueInText);
     }
     // Synthetic per-block symbols (computed-goto labels / dense-switch
@@ -1374,16 +1420,26 @@ encode(AssembledModule const&    module,
     // st_value). Emission order matches the symIdxBySymbol registration
     // above (functions → blocks → data → externs) so relocation r_symbolnum
     // indices line up. Externally-visible items carry their real
-    // (pre-mangled) name; static/synthesized ones keep `_sym_<id>` (the
-    // same carve-out the function loop above uses).
+    // (pre-mangled) name + N_SECT|N_EXT; static/synthesized ones keep
+    // `_sym_<id>` + Local → bare N_SECT, NO N_EXT (the same name+binding
+    // coupling the function loop above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION, TF-C54).
+    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
+    // as the function loop above (a Mach-O relocatable object has no N_WEAK_DEF
+    // path yet; degrading it to N_SECT|N_EXT would silently drop the semantics).
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "_sym_");
+        SymbolBinding const binding = objNames.definedBinding(d.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "data");
+            return {};
+        }
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff,
-                    static_cast<std::uint8_t>(N_SECT | N_EXT),
-                    d.sectOrdinal,
-                    /*n_desc=*/0,
-                    d.flatAddr);
+        std::uint8_t const nType =
+            (binding == SymbolBinding::Local)
+                ? N_SECT
+                : static_cast<std::uint8_t>(N_SECT | N_EXT);
+        appendNlist(nameOff, nType, d.sectOrdinal, /*n_desc=*/0, d.flatAddr);
     }
     // Undefined extern symbols: N_UNDF|N_EXT, n_sect=0, n_value=0.
     // D-LK-OBJECT-EXTERN-CALL-MACHO: the undefined extern carries its REAL
@@ -3178,39 +3234,83 @@ encodeExecDynamic(AssembledModule const&    module,
     //       resolved.
 
     // ── (h) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ────────
+    //
+    // D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD (the Mach-O sibling of the ELF
+    // DT_NEEDED-per-referenced-library walker D-FFI-MATH-LIBM-DT-NEEDED):
+    // the emitted LC_LOAD_DYLIB set is the schema's `image.loadDylibs`
+    // UNION the DISTINCT libraries referenced by extern imports
+    // (`externImports[].libraryPath`, collected into `libraryOrder`
+    // above). Before this walker the loop here merely VALIDATED that
+    // every referenced library was already declared in the schema and
+    // REJECTED otherwise — and the shipped exec schema declares only
+    // libSystem, so a program importing a non-libSystem dylib (e.g.
+    // `/usr/lib/libz.1.dylib` via zlib.json) could not link. Now a
+    // referenced non-schema library is AUTO-EMITTED as its own
+    // LC_LOAD_DYLIB, exactly as ELF auto-emits a DT_NEEDED. Order is
+    // STABLE: the schema libraries FIRST (at their fixed ordinals —
+    // libSystem stays ordinal 1, so the `_exit`/TLV-bootstrap binds are
+    // unmoved), then the referenced extras sorted lexicographically +
+    // deduped (the ELF DT_NEEDED ordering discipline — deterministic and
+    // config-agnostic). AGNOSTIC: the set is driven entirely by
+    // descriptor-supplied paths; no arch / format / library-name
+    // identity appears here.
+    std::vector<std::string> emittedDylibs;
+    emittedDylibs.reserve(im.loadDylibs.size() + libraryOrder.size());
+    std::unordered_set<std::string> emittedSet;
+    for (auto const& d : im.loadDylibs) {
+        if (emittedSet.insert(d.path).second) emittedDylibs.push_back(d.path);
+    }
+    // Referenced libraries not already declared by the schema, collected
+    // then sorted + deduped (lexicographic, matching the ELF DT_NEEDED
+    // order). An EMPTY referenced path is FAIL-LOUD: Mach-O's two-level
+    // namespace binds every import against a NAMED dylib ordinal, so a
+    // library-less import cannot be resolved by dyld (the ELF
+    // `numLibs == 0` guard's Mach-O analog; upstream the exec linker
+    // already rejects such rows via allowsUndefinedImports()==false —
+    // this is the belt, and unlike ELF's `.so` arm Mach-O grants no
+    // library-less exemption to either image flavor).
+    std::vector<std::string> referencedExtra;
+    referencedExtra.reserve(libraryOrder.size());
+    for (auto const& lib : libraryOrder) {
+        if (lib.empty()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: an extern import declares an "
+                 "empty libraryPath — Mach-O's two-level namespace binds "
+                 "every import against a NAMED dylib ordinal, so dyld "
+                 "cannot resolve a library-less import. "
+                 "D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD.");
+            return {};
+        }
+        if (!emittedSet.contains(lib)) referencedExtra.push_back(lib);
+    }
+    std::sort(referencedExtra.begin(), referencedExtra.end());
+    referencedExtra.erase(
+        std::unique(referencedExtra.begin(), referencedExtra.end()),
+        referencedExtra.end());
+    for (auto const& lib : referencedExtra) {
+        emittedSet.insert(lib);
+        emittedDylibs.push_back(lib);
+    }
+
     std::size_t const dylinkerCmdSize =
         commandSizeWithPath(12, im.dylinkerPath);
     std::size_t totalDylibCmdSize = 0;
-    for (auto const& d : im.loadDylibs) {
-        totalDylibCmdSize += commandSizeWithPath(24, d.path);
+    for (auto const& path : emittedDylibs) {
+        totalDylibCmdSize += commandSizeWithPath(24, path);
     }
-    // Linker validates non-empty loadDylibs upstream; defense-in-
-    // depth makes sure every library referenced by an externImport
-    // is in loadDylibs. dyld rejects bind opcodes referring to
-    // ordinals not present in LC_LOAD_DYLIB[].
-    std::unordered_set<std::string> declaredLibs;
-    declaredLibs.reserve(im.loadDylibs.size());
-    for (auto const& d : im.loadDylibs) declaredLibs.insert(d.path);
-    for (auto const& lib : libraryOrder) {
-        if (!declaredLibs.contains(lib)) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExecDynamic: extern "
-                             "imports reference library '"} + lib +
-                 "' but it is not declared in image.loadDylibs — "
-                 "dyld rejects bind opcodes referring to undeclared "
-                 "dylib ordinals.");
-            return {};
-        }
-    }
-    // Stable map: library → dylib ordinal (1-based per dyld).
+    // Stable map: library → dylib ordinal (1-based per dyld). Keyed off
+    // `emittedDylibs` (schema ∪ referenced) so a referenced non-schema
+    // library resolves to ITS ordinal (not libSystem's) — each import's
+    // BIND_OPCODE_SET_DYLIB_ORDINAL then targets the dylib that actually
+    // exports it.
     auto dylibOrdinal = [&](std::string const& path)
                           -> std::uint32_t {
-        for (std::size_t i = 0; i < im.loadDylibs.size(); ++i) {
-            if (im.loadDylibs[i].path == path) {
+        for (std::size_t i = 0; i < emittedDylibs.size(); ++i) {
+            if (emittedDylibs[i] == path) {
                 return static_cast<std::uint32_t>(i + 1);
             }
         }
-        return 0;  // unreachable — declaredLibs check above
+        return 0;  // unreachable — every libraryOrder entry is in emittedDylibs
     };
 
     // ── (i) Build dyld-binding bytes ─────────────────────────────
@@ -3626,7 +3726,7 @@ encodeExecDynamic(AssembledModule const&    module,
         + (emitDylinker ? 1u : 0u)
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
-        + im.loadDylibs.size() + 1u
+        + emittedDylibs.size() + 1u    // N × LC_LOAD_DYLIB (schema ∪ referenced)
         + (useChainedFixups ? 0u : 1u)
         + (emitCodeSig ? 1u : 0u)
         + (emitBuildVersion ? 1u : 0u));
@@ -4478,17 +4578,21 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU64LE(bytes, 0);
     }
 
-    // LC_LOAD_DYLIB[]
-    for (auto const& d : im.loadDylibs) {
+    // LC_LOAD_DYLIB[] — one per dylib in the emitted set (schema ∪
+    // referenced import libraries; D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD).
+    // timestamp / current_version / compatibility_version are 0 (dyld
+    // accepts 0 and resolves a `/usr/lib/...` dylib by path even when it
+    // lives only in the dyld shared cache).
+    for (auto const& path : emittedDylibs) {
         std::size_t const cmdStart = bytes.size();
-        std::size_t const cmdSize = commandSizeWithPath(24, d.path);
+        std::size_t const cmdSize = commandSizeWithPath(24, path);
         appendU32LE(bytes, LC_LOAD_DYLIB);
         appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
         appendU32LE(bytes, 24);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
-        for (char c : d.path)
+        for (char c : path)
             appendU8(bytes, static_cast<std::uint8_t>(c));
         appendU8(bytes, 0);
         while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);

@@ -149,7 +149,14 @@ using CstSymbolValueResolver =
 struct CstCastTarget {
     bool   isPointer = false;
     bool   isInteger = false;
-    int    intBits   = 0;       // integer target width (8/16/32/64)
+    // Integer target width: 1 (Bool) / 8 / 16 / 32 / 64, and — since
+    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — 128 for the two STANDARD 128-bit kinds
+    // (`__int128` / `unsigned __int128`, which are NOT bit-precise and so are NOT
+    // carried in the `isBitPrecise` triple below). The 128 case is the ONLY width
+    // that does not fold through `narrowIntToBits`: the Cast arm routes it through
+    // the bignum instead, because narrowing it into an int64 IS the silent mod-2^64
+    // wrap. See the `intBits == 128` arm in cst_const_eval.cpp's Cast fold.
+    int    intBits   = 0;
     bool   intSigned = false;
     TypeId pointeeType{};       // a pointer target's pointee (retype / future stride)
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast target — the

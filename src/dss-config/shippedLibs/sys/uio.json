@@ -1,0 +1,15 @@
+{
+  "$comment": "Neutral shipped <sys/uio.h> (POSIX) — SQLite testfixture arc (F001A blocker clear, 2026-07-18). test1.c is the sole consumer, and it references EXACTLY ONE thing from this header: `struct iovec` — its `.iov_base`/`.iov_len` members + `sizeof(struct iovec)` in the sqlite3_carray scatter/gather glue (test1.c lines ~4500/4644/4653/4718). It NEVER calls readv/writev. So this descriptor ships the STRUCT ALONE — no `symbols`, no `library` — a TYPE-ONLY descriptor exactly like sys/types.json: need-driven, zero over-ship, and (crucially) with NO eager-imported function to plant an undefined import in every including binary (D-FFI-DESCRIPTOR-EAGER-IMPORT). readv/writev/preadv/pwritev stay OUT until a real consumer references them. ★ The iovec-redefinition NON-conflict: test1.c defines its OWN `struct iovec` ONLY under `#ifdef _WIN32` (test1.c line ~4382); the `#else` arm does `#include <sys/uio.h>` and relies on the header to supply it. On the elf/macho targets `_WIN32` is undefined, so test1.c takes the `#else`, does NOT define its own iovec, and this descriptor supplies it — no clash. On a pe target `<sys/uio.h>` is unavailable (below) so the descriptor is never injected and test1.c's own `#ifdef _WIN32` definition wins — again no clash. `struct iovec` = `{ void *iov_base; size_t iov_len; }` (glibc bits/types/struct_iovec.h, byte-identical on Darwin) → `{ ptr<void>, u64 }`; a FLAT single layout (the {ptr,size_t} 16-byte shape is byte-identical on every LP64 ABI — elf x86_64/arm64 + macho arm64/x86_64 — so no per-target `variants`). availableObjectFormats:[elf,macho]: a windows-pe `#include <sys/uio.h>` fails loud (Windows has no <sys/uio.h> — scatter/gather I/O is POSIX; test1.c's `#ifdef _WIN32` local struct is precisely that portability shim), mirroring sys/mman.json.",
+  "header": "sys/uio.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "structs": [
+    {
+      "name": "iovec",
+      "fields": [
+        { "name": "iov_base", "type": "ptr<void>" },
+        { "name": "iov_len",  "type": "u64" }
+      ]
+    }
+  ]
+}

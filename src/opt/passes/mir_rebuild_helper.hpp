@@ -245,6 +245,51 @@ public:
     [[nodiscard]] virtual bool recordTerminatorInRewrite() const noexcept {
         return true;
     }
+
+    // ★★ TF-C85: "this function is `noOptimize`; your hooks will NOT be called
+    // for it." Fired by `MirFunctionRebuilder::rebuildFunction` immediately
+    // before it swaps in the identity policy, i.e. BEFORE the block walk and
+    // AFTER the pass's own per-function analysis has already run.
+    //
+    // Default no-op, and that is CORRECT for every policy whose per-function
+    // state is consumed ONLY through the hooks above: not calling the hooks IS
+    // the neuter, and the unused analysis is simply discarded.
+    //
+    // It exists for the one shape where that is not true — a policy that also
+    // has a POST-rebuild step reading state the hooks were supposed to produce.
+    // `Mem2Reg` is exactly that: its `analyze` plans IDF phis, `onBlockBegin`
+    // emits them, and `finalizePhiIncomings` (called by the pass driver after
+    // the rebuild) wires their incomings. MEASURED on the real pe64 sqlite
+    // corpus, neutering without this hook aborts loudly in that finalize step
+    // ("phi marker has incomings but no emitted phi") — so the hook is not
+    // defensive tidiness, it is the fix for a reproduced crash. Such a policy
+    // overrides this to DROP the per-function plan.
+    virtual void onFunctionNeutered(MirFuncId /*oldFn*/) {}
+
+    // ★★ TF-C85: "I am a MANDATORY NORMALIZATION, not an optimization — do not
+    // neuter me for a `noOptimize` function." Default FALSE, because the
+    // overwhelmingly common case is a policy that IS an optimization.
+    //
+    // ★ WHY THE EXEMPTION EXISTS, MEASURED RATHER THAN ANTICIPATED. The first
+    // implementation of the neuter had no exemption, and the real pe64 sqlite
+    // corpus went from 2135 pragma errors to FOUR `I_UnreachableBlock` verifier
+    // errors in `ext/misc/totype.c` — reproduced on that TU alone. The cause:
+    // `PruneUnreachable` is not an optimization at all (its own header says
+    // MANDATORY, its anchor is D-MIR-UNREACHABLE-PRUNE-NORMALIZE, and it is not
+    // even listed in `release.pipeline.json`). It is the post-lowering pass that
+    // funnels every eager-continuation construct — dead code after `return`,
+    // `break`, `&&`/`||` — into a CFG the MIR verifier will accept. Neutering it
+    // does not "leave the function unoptimized", it leaves the function
+    // ILL-FORMED.
+    //
+    // ★ AND THAT IS THE HONEST LINE, NOT A CONVENIENT ONE: `#pragma optimize`
+    // switches OPTIMIZATION off, and it has never meant "emit invalid code".
+    // MSVC at `/Od` still produces a well-formed function. A pass that
+    // establishes an IR invariant every downstream tier depends on is outside
+    // what the pragma controls, and it says so here rather than by omission.
+    [[nodiscard]] virtual bool mandatoryNormalization() const noexcept {
+        return false;
+    }
 };
 
 // The concrete rebuilder. Owns the rewrite map + block map. Drives
@@ -252,11 +297,30 @@ public:
 // points. Pass-specific counters live on the policy (the rebuilder
 // is policy-agnostic about WHY a hook returned false; counting is the
 // policy's concern).
+// ★★ TF-C85: THE NEUTERED POLICY. Every hook above already has an
+// identity/verbatim DEFAULT — this class is nothing but those defaults plus the
+// one hook that has no default (`selectBlocks`, answered with ALL of the
+// function's blocks in natural order). Driving `rebuildFunction` with THIS
+// policy therefore produces an exact copy of the source function: no fold, no
+// promotion, no skip, no absorb, no redirect, no operand substitution.
+//
+// It is what a `MirFunc.noOptimize` function gets, and it is why the opt-out can
+// be honored WITHOUT the rebuilder ever skipping a function: skipping the
+// `rebuildFunction` call would not preserve the function, it would DELETE it
+// from the rebuilt module (`dst_` is a fresh builder — a function that is never
+// added simply does not exist downstream, and its callers would then reference a
+// symbol with no definition).
+class DSS_EXPORT MirIdentityRebuildPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override;
+};
+
 class DSS_EXPORT MirFunctionRebuilder {
 public:
     MirFunctionRebuilder(Mir const& src, MirBuilder& dst,
                          MirRebuildPolicy& policy)
-        : src_(src), dst_(dst), policy_(policy) {}
+        : src_(src), dst_(dst), policy_(policy), active_(&policy) {}
 
     // Run the 3-phase rebuild for a single old-module function.
     void rebuildFunction(MirFuncId oldFn);
@@ -280,15 +344,24 @@ private:
     // for future general copy-prop). Single helper at every operand-
     // resolution site so the 3-step composition stays uniform.
     [[nodiscard]] MirInstId mapOperand(MirInstId oldOp) const {
-        return policy_.substituteOperand(
-            rewriteOperand(policy_.substituteOldOperand(oldOp)));
+        return active_->substituteOperand(
+            rewriteOperand(active_->substituteOldOperand(oldOp)));
     }
     void emitValue(MirOpcode op, MirInstId oldId);
     void emitTerminator(MirOpcode op, MirInstId oldId);
 
     Mir const&        src_;
     MirBuilder&       dst_;
+    // The pass's own policy — the one this rebuilder was constructed with.
     MirRebuildPolicy& policy_;
+    // ★★ TF-C85: the policy IN EFFECT for the function currently being rebuilt.
+    // `&policy_` normally; `&identity_` for the duration of a `noOptimize`
+    // function. EVERY hook call in the rebuild goes through this pointer, which
+    // is the property that makes the neuter total: a hook still reached through
+    // `policy_` would be a pass-specific edit applied to a function the source
+    // excluded from optimization.
+    MirRebuildPolicy* active_ = nullptr;
+    MirIdentityRebuildPolicy identity_;
     std::unordered_map<std::uint32_t, MirInstId>  rewrite_;
     std::unordered_map<std::uint32_t, MirBlockId> blockMap_;
 };

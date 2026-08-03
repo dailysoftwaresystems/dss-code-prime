@@ -2938,6 +2938,27 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // a ByValueStackAgg marker, two operands but ONE arg). The forced-
                 // vararg boundary + the pre-scan both index by this, so they agree.
                 std::uint32_t argRegionIdx = 0;
+                // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE (with c77
+                // D-AS-REGALLOC-DIRECT-ARG-RELOAD): the SysV variadic vector-count
+                // (AL, emitted at step 13.4 below) is accumulated HERE, at the
+                // arg-PLACEMENT decision — one increment per FP vararg the ABI routes
+                // into a vector ARG register. Counting at placement is RESIDENCY-
+                // INDEPENDENT: it fires identically whether the vararg's post-regalloc
+                // operand is a live FPR `Reg` (register-resident) or a non-`Reg`
+                // `SpillSlotRef` (a spilled register-passed FP vararg the rewriter
+                // deferred, reloaded into its XMM arg register by callconv's mem-src
+                // move). The OLD step-13.4 re-scan counted only `Reg`-kind operands, so
+                // a SPILLED FP vararg dropped out → AL undercounted (AL=0 for the lone
+                // FP vararg) → glibc's variadic prologue `test al,al` skipped saving
+                // xmm0-7 → `va_arg(double)` read garbage from the unsaved register-save
+                // area (the fpconv1 release miscompile; Mem2Reg-gated because promotion
+                // is what makes the value span the intervening call + spill — SysV has
+                // no callee-saved XMM). Agnostic: a generic FP/vector-class vararg tally
+                // with no arch/format branch — CONSUMED only when the config's
+                // `variadicVectorCountReg` is set (SysV declares rax; ms_x64 uses the
+                // FP-dup path and AAPCS64/Apple arm64 always-stack, none of which read
+                // this counter).
+                std::uint32_t fpVarargsInVectorArgRegs = 0;
                 for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
                     // FC12a-struct: the ByValueStackAgg marker is consumed WITH its
@@ -3035,6 +3056,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             argPassingReg(schema, cc, argIndex, cls,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
+                        // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE: a VARARG
+                        // (argRegionIdx >= fixedOperandCnt) that landed in a vector ARG
+                        // register (this branch, class FPR) consumes one vector arg
+                        // register → count it toward the SysV variadic vector-count
+                        // (AL). This fires for BOTH a register-resident FP vararg (a
+                        // live FPR `srcReg`) AND a spilled one (`isSpillRef` — the c77
+                        // direct-arg-reload form, `destReg` filled by the mem-src move
+                        // pushed below), so the count no longer depends on the operand's
+                        // post-regalloc residency. Gated on `isVariadicCall` because a
+                        // non-variadic call has `fixedOperandCnt == 0`, which would make
+                        // the `argRegionIdx >= fixedOperandCnt` vararg predicate true for
+                        // every FP arg. It is the SAME vararg predicate the Win64 FP-dup
+                        // below uses; a by-value MEMORY-class struct vararg never reaches
+                        // this branch (it `continue`s into byValStackCopies) and an FP
+                        // vararg past the SSE pool falls to the overflow branch — both
+                        // correctly excluded.
+                        if (isVariadicCall && cls == LirRegClass::FPR
+                            && argRegionIdx >= fixedOperandCnt) {
+                            ++fpVarargsInVectorArgRegs;
+                        }
                         // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef arg
                         // becomes a MEM-SOURCE arg move — `frame_load destReg, [slot]`
                         // — sequenced by emitParallelRegMoves as a sink (after any
@@ -3452,29 +3493,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // converts any regression into a loud error.)
                 if (::dss::call_payload::isVariadic(payload)
                     && cc.variadicVectorCountReg.has_value()) {
-                    std::uint32_t const fixedCount =
-                        ::dss::call_payload::fixedOperandCount(payload);
-                    std::uint32_t vectorArgsInVararg = 0;
-                    for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
-                        // ops[0] is the callee; an x8-sret call also has the sret
-                        // pointer at ops[1] (firstArgIdx==2) — skip it so the
-                        // operand index counts only arg-region operands. `fixedCount`
-                        // is in OPERAND units (a by-value struct fixed param expands
-                        // to several scalar register-piece operands — FC12a-struct),
-                        // so this boundary is the count of operands the FIXED params
-                        // produced, not the param count.
-                        std::size_t const argIdx = i - firstArgIdx;
-                        if (argIdx < fixedCount) continue;
-                        // FC12a-struct: a by-value-stack aggregate is a (Reg,
-                        // ByValueStackAgg) pair — the GPR-class address Reg fails the
-                        // FPR test below, and the marker is non-Reg, so NEITHER inflates
-                        // the SSE/AL count (a by-value MEMORY-class struct vararg has no
-                        // SSE register pieces — SysV §3.5.7). No special-case needed.
-                        if (ops[i].kind != LirOperandKind::Reg) continue;
-                        if (ops[i].reg.regClass() == LirRegClass::FPR) {
-                            ++vectorArgsInVararg;
-                        }
-                    }
+                    // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE: the vector-arg count
+                    // is the number of FP varargs the arg-placement loop above routed
+                    // into vector ARG registers (`fpVarargsInVectorArgRegs`) — a
+                    // RESIDENCY-INDEPENDENT tally taken at the ABI classification, NOT a
+                    // re-scan of post-regalloc operands. The old re-scan skipped every
+                    // non-`Reg` operand (`if (ops[i].kind != LirOperandKind::Reg)
+                    // continue;`), which DROPPED a SPILLED FP vararg (a `SpillSlotRef`
+                    // after regalloc — the c77 direct-arg-reload form) from the count →
+                    // AL undercounted (AL=0 for the lone FP vararg) → glibc's variadic
+                    // prologue `test al,al` skipped saving xmm0-7 → `va_arg(double)`
+                    // read garbage (the fpconv1 release miscompile). The placement tally
+                    // counts a spilled FP vararg IDENTICALLY (it still consumed a vector
+                    // arg register), still EXCLUDES a by-value MEMORY-class struct vararg
+                    // (never register-resident — it `continue`s into byValStackCopies)
+                    // and any FP vararg past the SSE pool (routed to overflow), and is
+                    // capped at the pool bound by construction (only the register-
+                    // resident branch increments it).
+                    std::uint32_t const vectorArgsInVararg = fpVarargsInVectorArgRegs;
                     // D-LANG-VARIADIC (step 13.4) post-fold (type-design
                     // analyzer rec): derive the countReg's class from
                     // the SCHEMA's register-table entry, NOT a
@@ -3990,7 +4026,13 @@ materializeCallingConvention(Lir const&           src,
             }
         }
     }
-    // `ok()` is derived from output shape — no stored bool to drift.
+    // Reached ONLY on full success: every failure path above returns early
+    // (an empty/partial result), so this is the single point that marks the
+    // pass complete. `ok()` = allFunctionsLaidOut && (perFunc.size() ==
+    // moduleFuncCount()); the flag distinguishes a genuinely EMPTY module
+    // (a valid 0-function success — D-CSUBSET-TESTTU-SILENT-EXIT1) from a
+    // failure that also returned an empty module (0 == 0).
+    out.allFunctionsLaidOut = true;
     return out;
 }
 

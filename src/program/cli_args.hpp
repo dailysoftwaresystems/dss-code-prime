@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/input_resolver.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -83,6 +84,17 @@ struct DSS_EXPORT CliArgs {
     // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
     std::vector<std::string> resolveLibraries;  // --resolve-library <path>
 
+    // `-I<dir>` / `-I <dir>` / `--include-dir <dir>` (repeatable): the C
+    // quote-include search path (gcc/clang's `-I`). Each dir is threaded to
+    // every CompilationUnit's include dirs (UnitBuilder::addIncludeDir),
+    // searched AFTER the including file's own directory (C 6.10.2 quote form).
+    // Needed for multi-directory source trees — e.g. SQLite's testfixture
+    // compiles `src/test*.c` with `-I. -I<src> -I<ext/...>` so a TU's
+    // `#include "sqlite3.h"` reaches the generated header in the build dir.
+    // Carried verbatim; the driver resolves each to an absolute path (relative
+    // dirs are cwd-relative, gcc semantics) when it threads them to the builder.
+    std::vector<std::string> includeDirs;       // -I<dir> / --include-dir <dir>
+
     // ── Output routing (D-LK10-ENTRY Slice C companion) ─────────
     //
     // `--output <dir>` (or `--output=<dir>`) routes every emitted
@@ -128,6 +140,35 @@ struct DSS_EXPORT CliArgs {
     // compile finishes (any compile-producing mode). Diagnostic-neutral, off by
     // default; `--time` with no mode flag is a hard NoModeSelected error.
     bool                          time = false;
+
+    // `--jobs N` / `--jobs=N` (D-PERF-4-CU-PARALLELISM): worker-thread count for
+    // the per-CU build pool (the multi-TU `compileUnits` path builds each CU's
+    // MIR concurrently). 0 (the default / absent) = AUTO = min(hardware_
+    // concurrency, CU count, 16). `--jobs 1` forces a single-worker (serialized)
+    // build — the deterministic baseline. A non-numeric or zero value fails loud
+    // (InvalidJobs); the number is stored verbatim and clamped to the CU count at
+    // pool construction. Threaded to `Program::setJobs`.
+    unsigned                      jobs = 0;
+
+    // `--stack-reserve <bytes>` / `--stack-reserve=<bytes>`
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH): the per-PROGRAM stack reserve
+    // this build asks the emitted image to carry, in BYTES. nullopt (the
+    // default / absent) = take the object format's declared default.
+    //
+    // The required stack is a property of the PROGRAM (its deepest call
+    // chain), not of the format, which is why it cannot be a fixed number in
+    // a `.format.json` — MSVC spells the same request `/STACK`, GNU ld
+    // `-Wl,--stack`. Zero, non-numeric, and trailing junk fail loud
+    // (InvalidStackReserve); the value is NOT rounded here — whether it is
+    // in range and correctly aligned is decided at the linker gate against
+    // the bounds the chosen FORMAT declares, and a format that declares no
+    // stack-reserve capability at all REFUSES the request rather than
+    // dropping it. Threaded to `Program::setStackReserveBytes`.
+    //
+    // PRECEDENCE: this CLI flag WINS over a project manifest's
+    // `stackReserve` key when both are present (see
+    // `Program::compileProject`).
+    std::optional<std::uint64_t>  stackReserveBytes;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the
@@ -148,6 +189,13 @@ enum class CliArgsError : std::uint8_t {
     InvalidDefine       = 12,   // c105: --define with an empty NAME, or a '('
                                 // in NAME (a function-like --define is not
                                 // supported — use a config predefine)
+    InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
+                                // zero, or trailing junk (`--jobs 0`, `--jobs x`)
+    InvalidStackReserve = 14,   // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH:
+                                // --stack-reserve with a non-numeric value, a
+                                // zero, or trailing junk. RANGE/alignment is
+                                // NOT decided here — that is the linker gate's
+                                // job, against the format's declared bounds.
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

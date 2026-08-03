@@ -202,6 +202,39 @@ public:
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
         return funcArena_.at(id).visibility;
     }
+    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff the source declared this function
+    // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
+    // splice such a callee — the sibling of the `funcBinding == Weak` refusal,
+    // and read at the same site. See `detail::MirFunc::noInline`.
+    [[nodiscard]] bool funcNoInline(MirFuncId id) const {
+        return funcArena_.at(id).noInline;
+    }
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): TRUE iff the source declared this
+    // function `__attribute__((always_inline))`. The inliner's §2.9 legality gate
+    // SKIPS its size-based cost model (rule 6) for such a callee — the mirror of
+    // `funcNoInline`'s refusal, read at the same gate. Every correctness rule
+    // still applies. See `detail::MirFunc::alwaysInline`.
+    [[nodiscard]] bool funcAlwaysInline(MirFuncId id) const {
+        return funcArena_.at(id).alwaysInline;
+    }
+    // ★★ TF-C85: TRUE iff the source defined this function inside an MSVC
+    // `#pragma optimize("", off)` region. `MirFunctionRebuilder` (the shared
+    // substrate under all 8 rebuild passes) swaps in an IDENTITY policy for such
+    // a function so it is copied verbatim, and the inliner refuses it in BOTH
+    // directions. See `detail::MirFunc::noOptimize`.
+    [[nodiscard]] bool funcNoOptimize(MirFuncId id) const {
+        return funcArena_.at(id).noOptimize;
+    }
+    // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): TRUE iff the source declared this
+    // function `__attribute__((no_sanitize_thread))`. ★ NO OPTIMIZER PASS READS
+    // THIS — DSS ships no sanitizer (MEASURED: `grep -rni sanitiz src/` is empty).
+    // Its observable consumer is `mir_text`'s `appendFuncAttrs`, which prints it as
+    // the `nosanitizethread` function attribute so the per-function fact is
+    // queryable and survives a `.dssir` round trip. See
+    // `detail::MirFunc::noSanitizeThread`.
+    [[nodiscard]] bool funcNoSanitizeThread(MirFuncId id) const {
+        return funcArena_.at(id).noSanitizeThread;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -363,9 +396,50 @@ public:
     // Open a function. Closes any open function first (which requires its current
     // block be terminated and the function have ≥1 block). `signature` is the
     // FnSig TypeId; `symbol` the declared SymbolId.
+    // TF-C78 (D-CSUBSET-NOINLINE): `noInline` stamps the per-function
+    // inliner opt-out. DEFAULTED to false so a SYNTHESIZED function (a shim,
+    // a funclet, a startup thunk — none of which the source annotated) reads
+    // naturally; every site that COPIES an existing MirFunc must pass the
+    // source function's `funcNoInline(...)` explicitly, exactly as it already
+    // passes `funcBinding`/`funcVisibility`.
+    // TF-C81 (D-CSUBSET-ALWAYSINLINE): `alwaysInline` stamps the per-function
+    // cost-model bypass, on the same terms.
+    //
+    // ★ THE TWO TRAILING BOOLS ARE ADJACENT AND OPPOSITE IN MEANING, so a swapped
+    // pair at a copy site would compile silently and invert the directive. That
+    // hazard is covered by TEST DESIGN rather than by types: every propagation
+    // pin sets exactly ONE of the two and asserts the OTHER is still clear, so a
+    // transposition fails a test instead of shipping. Keep that property when
+    // adding pins — a test that sets both flags cannot detect a swap.
+    // TF-C85: `noOptimize` stamps the per-function optimizer opt-out, on the
+    // same terms — a SYNTHESIZED function was never inside a source region, so
+    // the default reads naturally, and every site that COPIES an existing
+    // MirFunc must pass `funcNoOptimize(...)` explicitly.
+    // TF-C92: `noSanitizeThread` stamps the per-function thread-sanitizer
+    // exclusion, on the same terms — a SYNTHESIZED function carries no source
+    // attribute, so the default reads naturally, and every site that COPIES an
+    // existing MirFunc must pass `funcNoSanitizeThread(...)` explicitly. ★ THE
+    // TRAILING-BOOL RUN IS NOW FOUR WIDE (noInline, alwaysInline, noOptimize,
+    // noSanitizeThread), so the anti-swap discipline stated above for the first pair
+    // applies to the whole run: every SWAP-DETECTION record sets EXACTLY ONE of the
+    // four and asserts the other three are clear. ★ "Swap-detection record", NOT
+    // "every pin" — the distinction is deliberate and the stronger wording was
+    // FALSE. Some records exist precisely to prove these axes COMPOSE, and they must
+    // set more than one: `MirText.NoSanitizeThreadAttributeSurvivesRoundTrip`'s
+    // function %3 carries noInline AND noSanitizeThread together on purpose (this
+    // axis contradicts nothing, unlike the noinline/always_inline pair, so both
+    // keywords must print and re-parse on one function). Such a record is not a swap
+    // detector and cannot be one; the rule is that EVERY axis is covered by at least
+    // one single-flag record somewhere, not that every record is single-flag. For
+    // THIS flag that discipline is the only detector available at all, since no
+    // codegen difference exists to observe.
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
-                          SymbolBinding    binding    = SymbolBinding::Global,
-                          SymbolVisibility visibility = SymbolVisibility::Default);
+                          SymbolBinding    binding      = SymbolBinding::Global,
+                          SymbolVisibility visibility   = SymbolVisibility::Default,
+                          bool             noInline     = false,
+                          bool             alwaysInline = false,
+                          bool             noOptimize   = false,
+                          bool             noSanitizeThread = false);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

@@ -230,10 +230,10 @@ parseTextDocumentPosition(Request const& req) {
 
 } // namespace
 
-LspServer::LspServer(std::unique_ptr<LspTransport> transport,
-                     std::unique_ptr<IExecutor>    executor,
-                     SchemaCache&                  schemaCache,
-                     LspServerOptions              options)
+LspServer::LspServer(std::unique_ptr<LspTransport>         transport,
+                     std::unique_ptr<substrate::IExecutor> executor,
+                     SchemaCache&                          schemaCache,
+                     LspServerOptions                      options)
     : transport_(std::move(transport))
     , executor_(std::move(executor))
     , schemaCache_(schemaCache)
@@ -421,6 +421,19 @@ void LspServer::enqueueParse_(std::string uri) {
         // analysis. The CU must outlive the SemanticModel (its side-tables
         // hold raw Tree*), so we wrap it in a shared_ptr and hand it to
         // analyze(), which keeps its own shared_ptr inside the model.
+        // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — the LSP has no
+        // active target (it also sets no `setActiveFormat`), so the effective
+        // predefined-macro list is the LANGUAGE's alone, exactly as before this
+        // cycle. An editor session is not a compile: picking a target here would
+        // make `#ifdef __aarch64__` resolve differently in the editor than in
+        // the build, which is worse than resolving neither arm. Trigger to
+        // revisit: the day the LSP learns the workspace's active target.
+        // TF-C97: likewise no `setFormatPredefinedMacros`. The argument is the
+        // same one, and the format half is if anything stronger: with no active
+        // format there is no `dataModel`, so guessing `__LP64__` would make the
+        // editor take LP64 header arms in a workspace that might build LLP64.
+        // Same trigger — both channels light up together the day the LSP learns
+        // the workspace's `<target>:<format>` pair.
         dss::UnitBuilder builder{snap.schema};
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(

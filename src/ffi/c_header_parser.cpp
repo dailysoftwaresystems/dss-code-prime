@@ -278,6 +278,21 @@ readCHeaderFromText(std::string_view    text,
             reporter));
     }
 
+    // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — this reader parses a
+    // shipped FFI header for its DECLARATIONS, not for a specific machine, and
+    // it takes no target parameter to supply. The effective predefined-macro
+    // list stays the LANGUAGE's alone, exactly as before this cycle. Trigger to
+    // revisit: the first shipped header whose declarations are gated on an
+    // architecture macro.
+    //
+    // TF-C97: and DELIBERATELY no `setFormatPredefinedMacros` either, for the
+    // SAME reason and with a DIFFERENT trigger. This reader takes no object
+    // FORMAT parameter, so there is no `dataModel` to speak for; a shipped
+    // descriptor whose declarations differ by data model already expresses that
+    // through `signatureByDataModel`, which is resolved downstream against the
+    // real format rather than through the preprocessor. Trigger to revisit: the
+    // first shipped header that gates a DECLARATION (not a signature) on
+    // `__LP64__`.
     UnitBuilder builder{*loaded};
     builder.addInMemory(std::string{text}, std::string{headerPathLabel});
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

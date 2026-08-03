@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture 2026-07-17): RUN witness for file-scope `extern struct/union/const-struct/pointer-to-struct` declarations (the aggregate-typed extern forms that P0009'd before C6 — the dominant sqlite-testfixture compile blocker, hit by 19/44 src/test*.c via sqliteInt.h's `extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`). Each aggregate is extern-declared then defined + read; 15+12+10+5 = exit 42. The `release` optimizedPipeline arm witnesses the full shipped optimizer over the aggregate-global-read shapes. All 4 targets (no new target-specific codegen — this is a front-end/parse fix). The extern ENUM form parses (parse-pin ExternAggregateSpecifiersParse) but its GLOBAL codegen is a separate pre-existing gap (D-CSUBSET-ENUM-GLOBAL-CODEGEN), so it is not a runtime arm here. RED-ON-DISABLE: revert typeBase's alt list -> the extern struct/union lines P0009.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

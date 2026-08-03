@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -26,10 +27,23 @@
 //     code paths (`findShippedConfig` walks UP from cwd looking for
 //     `src/dss-config/`), because a temp-rooted scratch breaks the walk.
 //
-// PID-seed + atomic counter guarantee unique paths across parallel
-// `ctest -j` runs (different processes against the same base dir) AND
-// sequential runs (stack-address reuse from `reinterpret_cast<uintptr_t>(this)`
-// would have collided with reclaimed addresses).
+// UNIQUENESS (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, corrected
+// TF-C58 2026-07-24). A PID seed plus an atomic counter is NOT by itself a
+// guarantee, and this docblock used to claim it was. The original code built
+// the path from PID+counter and called `create_directories`, which reports
+// SUCCESS when the directory ALREADY EXISTS. Windows recycles PIDs freely, and
+// the dtor's `remove_all` can fail (a spawned example binary still holding a
+// handle, antivirus, a killed run), so stale directories accumulate under the
+// base — 55 of them were sitting in `test-scratch/examples/` when this was
+// found. A new process that drew a recycled PID and the same counter value
+// therefore SILENTLY SHARED a stale directory, and the next `copy_file` failed
+// with "File exists" — surfacing as a non-deterministic ctest red on a
+// DIFFERENT example each run, in parallel AND serial runs alike.
+//
+// The claim is now true by CONSTRUCTION: the ctor loops on `create_directory`
+// (singular) and accepts only a slot it actually created. That check-and-create
+// is atomic in the OS, so it is race-free across concurrent `ctest -j`
+// processes and it steps over stale directories rather than reusing them.
 //
 // `useAsCwd()` is the second policy axis: tests that drive
 // `compileFiles` (which computes output paths cwd-rooted) need cwd
@@ -90,13 +104,38 @@ public:
                 "ScratchDir ctor: create_directories('"
                 + base.generic_string() + "') failed: " + ec.message());
         }
-        path_ = base / (std::to_string(pid) + "-"
-                        + std::to_string(counter.fetch_add(1)));
-        std::filesystem::create_directories(path_, ec);
-        if (ec) {
-            throw std::runtime_error(
-                "ScratchDir ctor: create_directories('"
-                + path_.generic_string() + "') failed: " + ec.message());
+        // Claim a unique directory ATOMICALLY — see the uniqueness note in the
+        // class docblock for why `create_directories` cannot do this job.
+        // `create_directory` (SINGULAR) returns true only when THIS call
+        // created the directory; that check-and-create is atomic at the OS
+        // level, so it is race-free against concurrent `ctest -j` processes
+        // AND it detects a stale directory left by an earlier run instead of
+        // silently sharing it.
+        for (std::uint32_t attempt = 0;; ++attempt) {
+            if (attempt > 10000u) {
+                throw std::runtime_error(
+                    "ScratchDir ctor: could not claim a unique scratch dir "
+                    "under '" + base.generic_string() + "' after 10000 "
+                    "attempts. Stale directories are accumulating — an "
+                    "earlier run's destructor could not remove them (see the "
+                    "remove_all warning on stderr). Delete the directory and "
+                    "re-run.");
+            }
+            auto candidate = base / (std::to_string(pid) + "-"
+                                     + std::to_string(counter.fetch_add(1)));
+            std::error_code cec;
+            if (std::filesystem::create_directory(candidate, cec)) {
+                path_ = std::move(candidate);
+                break;
+            }
+            if (cec) {
+                throw std::runtime_error(
+                    "ScratchDir ctor: create_directory('"
+                    + candidate.generic_string() + "') failed: "
+                    + cec.message());
+            }
+            // Otherwise the path already exists (a stale dir from a killed
+            // run, or a live sibling that won the race) — take the next slot.
         }
     }
 
@@ -105,7 +144,19 @@ public:
         // Restore cwd before removing the scratch dir; some platforms
         // refuse to remove a dir that's the current process cwd.
         std::filesystem::current_path(originalCwd_, ec);
+        ec.clear();
         std::filesystem::remove_all(path_, ec);
+        // A dtor must not throw, but it must not hide this either: every
+        // silent failure here leaves a directory behind forever, and it was
+        // exactly that accumulation which made the (now-fixed) path-collision
+        // bug fire. Warn so the leak is visible while it is still small.
+        if (ec) {
+            std::fprintf(stderr,
+                "ScratchDir: WARNING — could not remove scratch dir '%s': %s. "
+                "Stale scratch directories accumulate under the base dir; "
+                "delete them if the count grows.\n",
+                path_.generic_string().c_str(), ec.message().c_str());
+        }
     }
 
     ScratchDir(ScratchDir const&)            = delete;

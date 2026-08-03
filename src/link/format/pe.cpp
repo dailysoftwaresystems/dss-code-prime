@@ -545,14 +545,16 @@ encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& fmt,
            ObjectFormatSectionInfo const& secText,
-           DiagnosticReporter&       reporter);
+           DiagnosticReporter&       reporter,
+           ImageRequest const&       request);
 } // namespace
 
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter) {
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request) {
     auto const& fmt = objectFormatSchema;
     if (fmt.kind() != ObjectFormatKind::Pe) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -574,6 +576,53 @@ encode(AssembledModule const&    module,
                                           "PE writer", reporter);
     if (!secText) return {};
 
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — the walker's OWN enforcement of
+    // the per-program image request, deliberately NOT delegated to the linker
+    // gate. Two reachable paths need it:
+    //   * `pe::encode` is a PUBLIC entry point; a caller that bypasses
+    //     `linker::link` bypasses that gate.
+    //   * this same walker serves the `.obj` AND `.dll` flavors, neither of
+    //     which declares `stackReserveControl` (a relocatable object has no
+    //     optional header at all; a DLL has the field but the loader IGNORES
+    //     it -- the .exe's value governs the main thread). Writing the field
+    //     for them would be precisely the silent no-op knob this capability
+    //     exists to eliminate.
+    //
+    // It calls the SAME `enforceImageRequest` the gate calls, rather than
+    // re-deriving the rules: an earlier cut hand-rolled a capability-only
+    // check here and silently accepted an out-of-range value (an 8 GiB
+    // request -- double the declared maximum -- was written verbatim into the
+    // header). One implementation, two call sites; the belt cannot be
+    // half-fastened again.
+    if (!enforceImageRequest(request, fmt, "pe::encode", reporter)) {
+        return {};
+    }
+    // The vehicle assertion is the one PE-specific part, and it belongs to
+    // the walker rather than the shared validator: it says "I implement THIS
+    // vehicle". Today the loader's vehicle-to-kind coherence rule makes a
+    // mismatch unreachable, but it becomes live the moment a second PE
+    // vehicle exists -- and an unimplemented vehicle must refuse, not write
+    // the wrong field. Still no flavor branch: exec/dll/obj diverge because
+    // their SCHEMAS differ, not because this code asks which one it holds.
+    if (request.stackReserveBytes.has_value()) {
+        auto const cap = fmt.stackReserveControl();
+        if (cap.has_value()
+         && cap->vehicle != StackReserveVehicle::PeOptionalHeader) {
+            emit(reporter, DiagnosticCode::K_FormatLacksStackReserveControl,
+                 std::format(
+                     "pe::encode: format '{}' declares stackReserveControl "
+                     "vehicle '{}', but this walker writes a stack reserve "
+                     "only through '{}' "
+                     "(IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve). The "
+                     "request is refused rather than written into the wrong "
+                     "field. D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.",
+                     fmt.name(), stackReserveVehicleName(cap->vehicle),
+                     stackReserveVehicleName(
+                         StackReserveVehicle::PeOptionalHeader)));
+            return {};
+        }
+    }
+
     // Dispatch between .obj (Obj) and PE32+ image (Exec / Dll). The
     // two paths share only `secText` lookup + the schema kind check
     // — every other byte differs (.obj has no MS-DOS stub / PE sig /
@@ -590,7 +639,8 @@ encode(AssembledModule const&    module,
     // data-directory[0], and the extern-address / text-abs-reloc
     // fail-loud belts.
     if (fmt.pe().objectType != PeObjectType::Obj) {
-        return encodeExec(module, targetSchema, fmt, *secText, reporter);
+        return encodeExec(module, targetSchema, fmt, *secText, reporter,
+                          request);
     }
     // NOTE: the Obj path does not APPLY relocations (the assembler
     // stamped the bytes; the .obj writer serializes them + the
@@ -1202,15 +1252,63 @@ encode(AssembledModule const&    module,
     // static/local/synthesized symbols.
     link::format::ObjectSymbolNames const objNames{module};
 
-    // Defined function symbols (GLOBAL EXTERNAL, type=FUNCTION,
-    // SectionNumber=1 for `.text`).
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
+    // symbol cannot round-trip a PE/COFF RELOCATABLE (.obj) object today.
+    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
+    // externally-visible `__attribute__((weak))` def; a faithful COFF weak def
+    // needs an IMAGE_SYM_CLASS_WEAK_EXTERNAL record + its weak-external aux
+    // (tagging the default resolution) that is NOT wired. Emitting it strong
+    // (EXTERNAL) would SILENTLY drop the weak-override semantics, so fail loud
+    // instead — the same posture the Mach-O MH_DYLIB export arm takes on this
+    // case (D-LK3-DYLIB-WEAK-EXPORT). Each writer owns its own fail-loud +
+    // vocabulary; the Weak decision is the one shared `definedBinding`.
+    auto emitWeakDefinedRelocatableError =
+        [&](std::string_view symName, char const* symKind) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::string{"pe::encode (Obj): defined "} + symKind
+                     + " symbol '" + std::string{symName}
+                     + "' has WEAK binding -- a weak DEFINED symbol cannot be "
+                       "emitted to a PE/COFF RELOCATABLE object until COFF weak-"
+                       "external (IMAGE_SYM_CLASS_WEAK_EXTERNAL + its weak-"
+                       "external aux record) machinery ships "
+                       "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
+                       "(IMAGE_SYM_CLASS_EXTERNAL) would silently lose weak-"
+                       "override semantics.");
+        };
+
+    // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
+    // Storage class is coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION, TF-C54): a static/synthesized `sym_<id>` def is
+    // Local → IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s unrelated
+    // `sym_<id>` can never collide with it at a FOREIGN multi-TU link; an
+    // externally-visible def keeps EXTERNAL (2). COFF has NO local-first
+    // ordering rule (unlike ELF), so the emission order is unchanged — only the
+    // storage class flips. A WEAK def FAILS LOUD (D-LK-OBJECT-WEAK-DEF-
+    // RELOCATABLE): the c-subset DOES produce weak defined symbols
+    // (`__attribute__((weak))` → SymbolBinding::Weak, per `c-subset.lang.json` +
+    // examples/c-subset/attributes_syntax's `weak_helper` and
+    // weak_inline_crosscu), but they reach a PE binary ONLY via the EXEC/DLL arm
+    // (encodeExec — `encode` dispatches to it above when objectType != Obj),
+    // where a weak def is merge-resolved strong-over-weak / forced Global before
+    // the writer. A weak def routed to THIS relocatable path cannot round-trip
+    // until the COFF weak-external machinery ships, so the writer fails loud
+    // rather than silently degrade it to EXTERNAL.
     for (auto const& f : funcSyms) {
         std::string const symName = objNames.definedName(f.symId, "sym_");
+        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "function");
+            return {};
+        }
+        std::uint8_t const storageClass =
+            (binding == SymbolBinding::Local)
+                ? IMAGE_SYM_CLASS_STATIC
+                : IMAGE_SYM_CLASS_EXTERNAL;
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(f.valueInText),
                         kTextSectionNumber,
                         IMAGE_SYM_DTYPE_FUNCTION,
-                        IMAGE_SYM_CLASS_EXTERNAL);
+                        storageClass);
     }
     // Synthetic per-block symbols (computed-goto labels / dense-switch
     // jump-table targets): IMAGE_SYM_CLASS_STATIC — deliberately LOCAL,
@@ -1237,15 +1335,29 @@ encode(AssembledModule const&    module,
     // External`; NOT Mach-O's flat-address n_value), type = 0 (COFF
     // data symbols are `notype`; DTYPE_FUNCTION is functions-only).
     // Externally-visible items carry their real (identity-mangled)
-    // name; static/synthesized ones keep `sym_<id>` (the same carve-out
-    // the function loop above uses).
+    // name + EXTERNAL; static/synthesized ones keep `sym_<id>` + Local →
+    // IMAGE_SYM_CLASS_STATIC (the same name+binding coupling the function loop
+    // above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
+    // TF-C54; the design-audit caught this DATA site as the omitted twin).
+    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
+    // as the function loop above (COFF weak-external is not wired; degrading it
+    // to EXTERNAL would silently drop the weak-override semantics).
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "sym_");
+        SymbolBinding const binding = objNames.definedBinding(d.symId);
+        if (binding == SymbolBinding::Weak) {
+            emitWeakDefinedRelocatableError(symName, "data");
+            return {};
+        }
+        std::uint8_t const storageClass =
+            (binding == SymbolBinding::Local)
+                ? IMAGE_SYM_CLASS_STATIC
+                : IMAGE_SYM_CLASS_EXTERNAL;
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(d.sectionRelOffset),
                         d.sectionNumber,
                         /*type=*/0,
-                        IMAGE_SYM_CLASS_EXTERNAL);
+                        storageClass);
     }
     // Undefined extern symbols (SectionNumber=0=UNDEF, type=0,
     // value=0). D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the
@@ -1565,12 +1677,42 @@ encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& fmt,
            ObjectFormatSectionInfo const& secText,
-           DiagnosticReporter&       reporter) {
+           DiagnosticReporter&       reporter,
+           ImageRequest const&       request) {
     auto const& id = fmt.pe();
     auto const& oh = fmt.peOptionalHeader();
     // c152 (D-LK2-4): the dll-arm discriminator — schema-declared
     // objectType, mirroring elf.cpp's `isDyn`.
     bool const isDll = id.objectType == PeObjectType::Dll;
+
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the EFFECTIVE SizeOfStackReserve.
+    // The per-PROGRAM request OVERRIDES the schema's declared default; absent
+    // a request the shipped default (1 MiB, the MSVC/Windows convention)
+    // stands, so every existing build is byte-identical. `pe::encode` has
+    // already proved the schema declares the `pe-optional-header` vehicle,
+    // and `linker::link` has already range-checked the value against the
+    // bounds that capability declares — what remains is the IMAGE invariant
+    // only this walker owns.
+    std::uint64_t const stackReserve =
+        request.stackReserveBytes.value_or(oh.sizeOfStackReserve);
+    // PE/COFF §3.4: the initial thread's stack is COMMITTED out of the
+    // RESERVED range, so a commit exceeding the reserve is an image the
+    // loader cannot honour. The schema's own pair is already validated at
+    // load; an OVERRIDE can newly violate it, so re-check with the effective
+    // value and fail loud rather than emit a header the loader rejects with
+    // an opaque STATUS_INVALID_IMAGE_FORMAT.
+    if (oh.sizeOfStackCommit > stackReserve) {
+        emit(reporter, DiagnosticCode::K_InvalidStackReserveRequest,
+             std::format(
+                 "pe::encodeExec: requested stack reserve of {} bytes is "
+                 "smaller than this format's SizeOfStackCommit ({} bytes) -- "
+                 "PE/COFF §3.4 commits the initial thread's stack out of the "
+                 "RESERVED range, so the Windows loader cannot honour "
+                 "commit > reserve. Request at least {} bytes. "
+                 "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.",
+                 stackReserve, oh.sizeOfStackCommit, oh.sizeOfStackCommit));
+        return {};
+    }
 
     // ── (a) Build .text body + per-function start map ─────────
     std::vector<std::uint8_t> text;
@@ -3566,7 +3708,10 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, 0);                     // CheckSum (loader allows 0)
     appendU16LE(bytes, oh.subsystem);
     appendU16LE(bytes, oh.dllCharacteristics);
-    appendU64LE(bytes, oh.sizeOfStackReserve);
+    // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the EFFECTIVE reserve (the
+    // per-program request when one was made, else the schema default) —
+    // computed + invariant-checked at the top of this function.
+    appendU64LE(bytes, stackReserve);
     appendU64LE(bytes, oh.sizeOfStackCommit);
     appendU64LE(bytes, oh.sizeOfHeapReserve);
     appendU64LE(bytes, oh.sizeOfHeapCommit);

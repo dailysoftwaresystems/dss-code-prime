@@ -17,7 +17,7 @@
 **   target sizeof(int*)==8 => szOk contributes 0 when right, wrecks the sum
 **   when wrong. 10+5+20+7 = 42.
 **
-** RED-ON-DISABLE: drop `arrayToPointer` from the c-subset `param` row ->
+** RED-ON-DISABLE: drop `paramAdjustments` from the c-subset `param` row ->
 **   `int a[]` errors S000B (S_NonConstantArrayLength) and the `p+1`/`&a4[1]`
 **   pointer args error S0003 against the array-typed params — the example no
 **   longer COMPILES. gcc -std=c17 cross-checked: same source exits 42.

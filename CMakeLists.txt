@@ -96,6 +96,25 @@ if(MSVC)
     add_compile_options(/bigobj)
 endif()
 
+# ── GNU-on-Windows (MinGW/binutils): -Wa,-mbig-obj (COFF section limit) ──
+# D-BUILD-GNU-WINDOWS-BIGOBJ-SCOPE. The SAME COFF object-section-count cap the
+# MSVC /bigobj above raises also hits the GNU-on-Windows assembler (binutils
+# `as`) on large TUs — and NOW on large TEST TUs too (`tests/lir/test_mir_to_lir.cpp`,
+# ~6.7k lines, overflows in Debug: "can't write … 'file too big'"). The MSVC
+# /bigobj above is PROJECT-WIDE (it reaches every src/ + tests/ target, added
+# below), but the GNU-on-Windows remedy was scoped per-FILE to ONE TU
+# (grammar_schema_json.cpp) in src/core/CMakeLists.txt — leaving every OTHER large
+# TU (notably test TUs) exposed, an asymmetry that broke the local GNU-on-Windows
+# (MinGW/Strawberry-g++) Debug ctest build. Apply it PROJECT-WIDE here (mirroring
+# /bigobj), gated GNU AND Windows via the generator expression so it expands to
+# NOTHING for MSVC, Clang, and Linux/macOS GCC — CRUCIAL because the Linux/macOS
+# GNU `as` REJECTS -mbig-obj ("unrecognized option"), and GNU-on-Linux shares the
+# same CXX_COMPILER_ID:GNU as MinGW. A COFF-object-size accommodation, not a
+# language/CPU/format branch. This generalizes (and makes redundant) the per-file
+# scoping in src/core/CMakeLists.txt, which is retained there as a defensive
+# belt for that one critical generated TU.
+add_compile_options("$<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:-Wa,-mbig-obj>")
+
 # ── Precompiled headers (build-time only — D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING) ──
 # The windows-msvc-release CI leg re-parses the same heavy, templated STL
 # headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280

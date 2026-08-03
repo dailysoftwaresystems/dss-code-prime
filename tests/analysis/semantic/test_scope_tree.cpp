@@ -168,3 +168,73 @@ TEST(ScopeTree, ReleaseHandsOverRecords) {
     auto records = std::move(st).release();
     ASSERT_EQ(records.size(), 3u) << "sentinel + root + one child";
 }
+
+// TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION)
+// substrate: `lookupIf` is `lookup` with a per-hop ACCEPTANCE predicate —
+// a hop whose binding is rejected is SKIPPED and the walk CONTINUES OUTWARD.
+// This is what lets a caller honor C 6.2.1p7 ("the scope of an identifier
+// declared by a declarator begins just after the completion of its declarator")
+// in a tree that binds a whole file's declarations up front: the outer binding
+// is reachable exactly while the inner one is not yet usable.
+//
+// TWO-SIDED: the SAME tree is probed with `lookup` (must return the INNER id)
+// and `lookupIf` rejecting the inner (must return the OUTER id). A `lookupIf`
+// that quietly behaved like `lookup` would pass a one-sided "found something"
+// check; it cannot pass both of these.
+TEST(ScopeTree, LookupIfSkipsRejectedHopAndContinuesOutward) {
+    ScopeTree st;
+    const auto root  = st.root();
+    const auto inner = st.pushScope(root, NodeId{1, 1}, TreeId{1});
+    EXPECT_FALSE(st.bind(root,  "x", SymbolId{10}).valid());
+    EXPECT_FALSE(st.bind(inner, "x", SymbolId{20}).valid());
+
+    // Unfiltered: the innermost binding wins (unchanged contract).
+    auto plain = st.lookup(inner, "x");
+    ASSERT_TRUE(plain.valid());
+    EXPECT_EQ(plain.v, 20u);
+
+    // Rejecting the inner id walks OUT to the root binding.
+    auto skipped = st.lookupIf(inner, "x",
+                               [](SymbolId s) { return s.v != 20u; });
+    ASSERT_TRUE(skipped.valid());
+    EXPECT_EQ(skipped.v, 10u) << "the rejected inner hop must not stop the walk";
+
+    // Accepting everything is identical to `lookup`.
+    auto acceptAll = st.lookupIf(inner, "x", [](SymbolId) { return true; });
+    ASSERT_TRUE(acceptAll.valid());
+    EXPECT_EQ(acceptAll.v, 20u);
+}
+
+// The fail path: when NO hop's binding is accepted, `lookupIf` returns
+// InvalidSymbol so the caller still fails loud. Widening WHERE a binding may be
+// found must never widen WHETHER a miss is reported.
+TEST(ScopeTree, LookupIfRejectingEveryHopMissesCleanly) {
+    ScopeTree st;
+    const auto root  = st.root();
+    const auto inner = st.pushScope(root, NodeId{1, 1}, TreeId{1});
+    EXPECT_FALSE(st.bind(root,  "x", SymbolId{10}).valid());
+    EXPECT_FALSE(st.bind(inner, "x", SymbolId{20}).valid());
+    EXPECT_FALSE(st.lookupIf(inner, "x", [](SymbolId) { return false; }).valid())
+        << "no accepted hop must report a clean MISS, never a rejected id";
+}
+
+// `lookupIf` honors the C 6.2.3 namespace exactly as `lookup` does — the shared
+// per-scope probe means the two walks cannot drift on which map they read. An
+// Ordinary binding is invisible to a Tag-namespace filtered walk even when the
+// predicate would have accepted it.
+TEST(ScopeTree, LookupIfHonorsNamespace) {
+    ScopeTree st;
+    const auto root = st.root();
+    EXPECT_FALSE(st.bind(root, "Pair", SymbolId{10},
+                         SymbolNamespace::Ordinary).valid());
+    EXPECT_FALSE(st.bind(root, "Pair", SymbolId{20},
+                         SymbolNamespace::Tag).valid());
+    auto ord = st.lookupIf(root, "Pair", [](SymbolId) { return true; },
+                           SymbolNamespace::Ordinary);
+    auto tag = st.lookupIf(root, "Pair", [](SymbolId) { return true; },
+                           SymbolNamespace::Tag);
+    ASSERT_TRUE(ord.valid());
+    ASSERT_TRUE(tag.valid());
+    EXPECT_EQ(ord.v, 10u);
+    EXPECT_EQ(tag.v, 20u);
+}

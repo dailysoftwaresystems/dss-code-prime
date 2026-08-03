@@ -1,0 +1,14 @@
+{
+  "$comment": "TF-C50 (D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH + D-ML7-2.9): a DIRECT call to an undefined extern function. In an arm64 RELOCATABLE .o this lowers to a plain BL + R_AARCH64_CALL26 (foreign linker inserts the veneer) with the dead callee-address lea suppressed -- witnessed structurally by test_elf_writer's ObjectExternCallEmitsUndefImportNameAndCall26RelocOnAarch64 pin + the foreign gcc-PIE/qemu probe. THIS runnable example proves the direct extern call RUNS end-to-end on each shipped target: abs(argc-43) with argc==1 -> abs(-42) == 42 -> exit 42. `argc` (runtime) blocks const-folding so the `release` arm exercises the real BL/CALL, not a folded literal. RED-ON-DISABLE: a mis-materialized callee makes the call land elsewhere -> not 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -25,6 +25,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time pin
+#include "core/substrate/thread_pool.hpp"    // D-PERF-4: executor injection (pool vs synchronous)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -45,12 +46,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -167,6 +170,61 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     EXPECT_EQ(hdr[3], 'F');
 }
 
+// ── D-CSUBSET-TESTTU-SILENT-EXIT1: a declaration-only / empty TU ─────
+//
+// A translation unit with NO function or object DEFINITIONS (empty after
+// preprocessing — only declarations, or all `#if 0`'d out) MUST compile to a
+// VALID EMPTY relocatable object and exit 0, exactly as gcc/clang do. SQLite's
+// testfixture depends on this: several `#if defined(SQLITE_TEST)`-gated test
+// TUs (test_wsd.c, test6.c, …) are empty in a standard build, yet their `.o`
+// files must still be produced and linked. Before the fix such a TU SILENTLY
+// exited 1 with ZERO diagnostics — a fail-loud violation AND wrong behavior —
+// because four sequential `expectedFuncCount > 0` gates (legalize → callconv →
+// assemble → link) each rejected the 0-function module.
+//
+// RED-ON-DISABLE: restore ANY of the four `> 0` clauses (in
+// LirTwoAddrLegalizeResult / LirCallconvResult / AssembledModule / LinkedImage
+// ::ok()) — or drop the empty early-return's `allFunctionsLegalized = true` in
+// legalizeTwoAddress — and this test fails: `compileFiles` returns 1 and NO
+// `.o` is written.
+TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // A declaration-only TU: an extern DATA declaration (not a definition)
+    // plus an all-`#if 0`'d-out block. NOTHING is defined ⇒ 0 functions.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "decl_only.c",
+        "extern int shared_counter;   /* a declaration, not a definition */\n"
+        "#if 0\n"
+        "int never_compiled = 1;      /* preprocessed out */\n"
+        "#endif\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+
+    ASSERT_EQ(rc, 0)
+        << "an empty/declaration-only TU must compile to a valid empty "
+           "relocatable object and exit 0 (D-CSUBSET-TESTTU-SILENT-EXIT1)";
+
+    auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
+    auto const out    = outDir / "decl_only.o";
+    ASSERT_TRUE(fs::exists(out)) << "the empty object must be emitted";
+    ASSERT_GT(fs::file_size(out), 0u)
+        << "even an empty module yields a real ELF (header + section table), "
+           "never zero bytes";
+    // Valid ELF magic — a real relocatable object the system linker accepts.
+    std::ifstream in(out, std::ios::binary);
+    char hdr[4] = {0};
+    in.read(hdr, 4);
+    EXPECT_EQ(static_cast<unsigned char>(hdr[0]), 0x7Fu);
+    EXPECT_EQ(hdr[1], 'E');
+    EXPECT_EQ(hdr[2], 'L');
+    EXPECT_EQ(hdr[3], 'F');
+}
+
 // ── c97: per-phase --time accumulators ─────────────────────────
 //
 // Pin for the PhaseTimers substrate the `--time` report reads: after ONE
@@ -176,9 +234,12 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
 // pipeline necessarily runs recorded at least one run, and (c) the
 // attributed total is a plausible nonzero. RED-on-disable: deleting any
 // instrumented Scope zeroes that phase's run count and the matching
-// EXPECT fails. (Phases a trivial source legitimately skips — tokenize
-// [c-subset preprocesses], reparse [no ambiguous cast], synthesize-ffi
-// [no externs] — are deliberately un-asserted.)
+// EXPECT fails — including the three preprocess sub-phases (splice /
+// tokenize / expand, D-PERF-1), which run for ANY C compile. (Phases a
+// trivial source legitimately skips — the STANDALONE tokenize [c-subset
+// preprocesses, so its tokenize is the preprocess-tokenize sub-phase],
+// reparse [no ambiguous cast], synthesize-ffi [no externs] — are
+// deliberately un-asserted.)
 TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     using dss::substrate::CompilePhase;
     using dss::substrate::PhaseTimers;
@@ -208,7 +269,11 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     }
 
     // (b) the phases this compile necessarily exercises each recorded a run.
-    for (CompilePhase p : {CompilePhase::Preprocess, CompilePhase::Parse,
+    for (CompilePhase p : {CompilePhase::Preprocess,
+                           CompilePhase::PreprocessSplice,
+                           CompilePhase::PreprocessTokenize,
+                           CompilePhase::PreprocessExpand,
+                           CompilePhase::Parse,
                            CompilePhase::ResolveImports, CompilePhase::Semantic,
                            CompilePhase::LowerHir, CompilePhase::LowerMir,
                            CompilePhase::Optimize, CompilePhase::LowerLir,
@@ -322,6 +387,61 @@ TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
     EXPECT_NE(data.find(std::string("_forty_two")), std::string::npos)
         << "single-CU Mach-O .o must carry the leading-underscore mangled "
            "symbol name (ld64 convention) — proves the single-CU nameOf mangle";
+}
+
+// ── TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the SINGLE-CU definition rail ──
+//
+// ★ THIS TEST EXISTS BECAUSE THE CORPUS EXAMPLE CANNOT REACH THIS CODE PATH, AND
+// THE RED-ON-DISABLE BATTERY IS WHAT PROVED IT. `examples/c-subset/asm_label` is
+// a TWO-CU program, so its definitions are named by `program.cpp`'s cross-CU
+// merge-key lambda and `compile_pipeline`'s MERGED arm (which reads
+// `merged.symbolNames`); the SINGLE-CU `nameOf` at compile_pipeline.cpp is never
+// entered. Disabling the label in that lambda alone left the example GREEN — a
+// vacuous guard over the exact rail an asm label is most likely to be used on.
+//
+// The assertion is on the emitted BYTES, and it is two-sided on purpose:
+//   * `dss_c88_single` MUST appear   — the label is the on-binary name;
+//   * `_dss_c88_single` must NOT     — the label REPLACES the Mach-O mangling
+//     rather than being mangled on top of it, which is the plausible wrong
+//     implementation and the one that silently breaks `__DARWIN_ALIAS` headers
+//     (they write their own leading underscore).
+// A one-sided "contains the label" check would pass under the double-mangle,
+// because `_dss_c88_single` contains `dss_c88_single` as a substring.
+//
+// RED-ON-DISABLE (re-verified against the final build): drop `r->asmName` from
+// the single-CU `nameOf` and the .o carries `_labelled_fn` instead.
+TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "labelled.c",
+        "int labelled_fn(void) __asm(\"dss_c88_single\");\n"
+        "int labelled_fn(void) { return 42; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwin"});
+    ASSERT_EQ(rc, 0);
+    auto const obj = outDir / "labelled.o";
+    ASSERT_TRUE(fs::exists(obj));
+
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+
+    EXPECT_NE(data.find(std::string("dss_c88_single")), std::string::npos)
+        << "the asm label must BE the emitted symbol name";
+    EXPECT_EQ(data.find(std::string("_dss_c88_single")), std::string::npos)
+        << "the label REPLACES applyCMangling — it must not be underscored on "
+           "top (MEASURED against clang: `int gv __asm(\"myglobal\");` emits "
+           "`myglobal`, and every __DARWIN_ALIAS header writes its own `_`)";
+    EXPECT_EQ(data.find(std::string("_labelled_fn")), std::string::npos)
+        << "the C identifier must NOT reach the object once a label renames it";
 }
 
 // ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling emits a real .o ──
@@ -1105,6 +1225,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      cuMirs[0].cuId,
                                      /*externCallDispatch=*/std::nullopt,
                                      /*dataImportBinding=*/std::nullopt,
+                                     /*externAddrBinding=*/std::nullopt,
                                      /*tlsAccess=*/std::nullopt,
                                      /*sehScopes=*/{},
                                      /*wideFloatSoftcallLibrary=*/std::nullopt, rep);
@@ -1905,4 +2026,1016 @@ TEST(Program_CompileFiles, Alignas32ThreadLocalPAlignAndLayoutE2E) {
     std::size_t const t = static_cast<std::size_t>(pOff);
     EXPECT_EQ(bytes[t + 0], 9u);
     EXPECT_EQ(bytes[t + 4], 7u);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// D-PERF-4-CU-PARALLELISM — per-CU build parallelism: CONCURRENCY
+// correctness + DETERMINISM. compileOneTarget builds every CU's MIR up
+// front; for N>1 the builds run on a thread pool, each writing its OWN
+// result slot + scratch DiagnosticReporter, and the driver merges the
+// scratches into the run-wide reporter in CU (index) ORDER after the
+// join. These pins compare the real ThreadPool path against a
+// SynchronousExecutor (single-threaded, always CU-ordered) reference:
+// same diagnostics in the same order, and byte-identical artifacts.
+// ═══════════════════════════════════════════════════════════════════
+
+// THE load-bearing determinism pin. FOUR TUs, each with a DISTINCT
+// undeclared-identifier — a SEMANTIC error (parse-clean) whose `actual`
+// is the identifier name, so it is produced INSIDE the per-CU build loop
+// (parse errors would short-circuit before it). The pool run's diagnostic
+// stream must equal the SynchronousExecutor baseline EXACTLY and be in CU
+// (source) order.
+//
+// RED-on-disable: change the merge in compileOneTarget to completion order
+// (or drain one shared reporter from the jobs) → the pool run interleaves
+// by thread finish-time → it diverges from the always-CU-ordered
+// synchronous baseline → the vector-equality below fails.
+TEST(Program_CuParallelism, MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < 4; ++i) {
+        auto const body = "int f" + std::to_string(i)
+                        + "(void) { return zzundef_cu" + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "cu" + std::to_string(i) + ".c", body).generic_string());
+    }
+    scratch.useAsCwd();
+
+    auto runAndCollect = [&](substrate::IExecutor* exec) {
+        Program prog;
+        prog.setExecutor(exec);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        EXPECT_NE(rc, 0) << "every CU has an undeclared identifier — must fail loud";
+        std::vector<std::pair<DiagnosticCode, std::string>> out;
+        for (auto const& d : rep.all()) out.emplace_back(d.code, d.actual);
+        return out;
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{4};   // 4 workers: force real concurrency
+    auto const seq = runAndCollect(&sync);
+    auto const par = runAndCollect(&pool);
+
+    // (1) Determinism: the pool stream is element-for-element the sync stream.
+    ASSERT_EQ(seq.size(), par.size())
+        << "pool + synchronous must surface the SAME number of diagnostics";
+    EXPECT_EQ(seq, par)
+        << "pool diagnostics must match the single-threaded reference EXACTLY "
+           "— a mismatch means the merge is completion-ordered, not CU-ordered";
+
+    // (2) The four CUs' markers appear in CU (source) ORDER in the stream.
+    std::string concat;
+    for (auto const& d : par) { concat += d.second; concat += '\n'; }
+    std::size_t prev = 0;
+    for (int i = 0; i < 4; ++i) {
+        auto const pos = concat.find("zzundef_cu" + std::to_string(i));
+        ASSERT_NE(pos, std::string::npos)
+            << "CU " << i << "'s diagnostic (zzundef_cu" << i << ") is missing";
+        if (i > 0) {
+            EXPECT_GT(pos, prev)
+                << "CU " << i << "'s diagnostic must FOLLOW CU " << (i - 1)
+                << "'s — the merge order must be CU (index) order";
+        }
+        prev = pos;
+    }
+}
+
+// Byte-identical artifacts. A VALID 3-TU program of only named global
+// functions (no synthesized-symbol or timestamp bytes ⇒ the relocatable
+// ELF .o is reproducible across compiles) built via the pool + via the
+// SynchronousExecutor must produce IDENTICAL output bytes. The N>1 merge
+// folds CUs in index order and everything after it is serial, so thread
+// scheduling cannot perturb the image.
+TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+        "int a(void); int b(void);\nint main(void) { return a() + b(); }\n");
+    auto const fa = writeCSubsetSource(scratch.path(), "a.c",
+        "int a(void) { return 20; }\n");
+    auto const fb = writeCSubsetSource(scratch.path(), "b.c",
+        "int b(void) { return 22; }\n");
+    scratch.useAsCwd();
+    std::vector<std::string> const files{
+        m.generic_string(), fa.generic_string(), fb.generic_string()};
+
+    auto compileTo = [&](substrate::IExecutor* exec, fs::path const& outDir) {
+        Program prog;
+        prog.setExecutor(exec);
+        prog.setOutputDir(outDir);
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"});
+        EXPECT_EQ(rc, 0) << "the 3-TU program must link + emit an artifact";
+        return readAllBytes(outDir / "main.o");
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{4};
+    auto const seqBytes = compileTo(&sync, scratch.path() / "out_sync");
+    auto const parBytes = compileTo(&pool, scratch.path() / "out_pool");
+
+    ASSERT_FALSE(seqBytes.empty()) << "the artifact must be non-empty";
+    EXPECT_EQ(seqBytes, parBytes)
+        << "the pool-built image must be BYTE-IDENTICAL to the single-threaded "
+           "build — the only observable difference parallelism may introduce is "
+           "speed, never bytes";
+}
+
+// Repeat-stability (a probabilistic race catcher): the SAME multi-TU input
+// built via the pool K=20 times must yield identical artifact bytes AND a
+// clean diagnostic sequence every time. A latent data race in the per-CU
+// build would eventually perturb one of the K runs.
+TEST(Program_CuParallelism, MultiTuPoolCompileIsRepeatStable) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+        "int a(void); int b(void); int c(void);\n"
+        "int main(void) { return a() + b() + c(); }\n");
+    auto const fa = writeCSubsetSource(scratch.path(), "a.c", "int a(void) { return 10; }\n");
+    auto const fb = writeCSubsetSource(scratch.path(), "b.c", "int b(void) { return 14; }\n");
+    auto const fc = writeCSubsetSource(scratch.path(), "c.c", "int c(void) { return 18; }\n");
+    scratch.useAsCwd();
+    std::vector<std::string> const files{
+        m.generic_string(), fa.generic_string(),
+        fb.generic_string(), fc.generic_string()};
+
+    substrate::ThreadPool pool{4};   // one pool reused across all K runs
+    auto const outDir = scratch.path() / "out";
+
+    std::vector<std::uint8_t> firstBytes;
+    for (int k = 0; k < 20; ++k) {
+        Program prog;
+        prog.setExecutor(&pool);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
+        EXPECT_EQ(rep.errorCount(), 0u) << "run " << k << " must be diagnostic-clean";
+        auto const bytes = readAllBytes(outDir / "main.o");
+        ASSERT_FALSE(bytes.empty()) << "run " << k << " produced no artifact";
+        if (k == 0) {
+            firstBytes = bytes;
+        } else {
+            EXPECT_EQ(bytes, firstBytes)
+                << "run " << k << " diverged from run 0 — a data race in the "
+                   "per-CU build pool perturbed the image";
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C74 — the CU cache key must include the TARGET, not just the object format.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Read a whole file as a byte STRING so a test can look for a symbol NAME in
+// the emitted object's string table. (Distinct from the file-scope
+// `readAllBytes`, which yields `vector<uint8_t>` for magic-number checks.)
+[[nodiscard]] std::string readFileAsString(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+}
+
+// Where two ARTIFACTS first diverge, rendered for a `<<` failure message.
+// `EXPECT_EQ` on two object files would dump both blobs verbatim — pages of
+// unreadable bytes — so the equality is asserted on the strings and this says
+// WHERE it broke, which is the part a reader can act on.
+[[nodiscard]] std::string byteDiffSummary(std::string_view lhsName,
+                                          std::string const& lhs,
+                                          std::string_view rhsName,
+                                          std::string const& rhs) {
+    std::string out;
+    out += "\n  ";
+    out += lhsName;
+    out += ": " + std::to_string(lhs.size()) + " bytes\n  ";
+    out += rhsName;
+    out += ": " + std::to_string(rhs.size()) + " bytes";
+    std::size_t const common = std::min(lhs.size(), rhs.size());
+    for (std::size_t i = 0; i < common; ++i) {
+        if (lhs[i] != rhs[i]) {
+            out += "\n  first differing byte at offset " + std::to_string(i)
+                   + ": "
+                   + std::to_string(static_cast<unsigned>(
+                         static_cast<unsigned char>(lhs[i])))
+                   + " vs "
+                   + std::to_string(static_cast<unsigned>(
+                         static_cast<unsigned char>(rhs[i])));
+            return out;
+        }
+    }
+    out += lhs.size() == rhs.size()
+               ? "\n  (identical)"
+               : "\n  the shorter artifact is a prefix of the longer one";
+    return out;
+}
+
+}  // namespace
+
+// ★ THE CRUX of TF-C74. `arm64:elf64-aarch64-linux` and
+// `x86_64:elf64-x86_64-linux` are DIFFERENT architectures that share ONE object
+// format. The front-end CU cache used to be keyed by object format ALONE, which
+// was correct only while the preprocessed text depended on nothing else
+// per-target. Now that each target contributes its own architecture identity
+// macros, a format-only key would hand the second target the FIRST target's
+// preprocessed text — baking the wrong architecture's macros into the second
+// image. That is a SILENT MISCOMPILE, strictly worse than the loud `#error` the
+// cycle set out to clear, which is why widening the key is a required
+// correctness change rather than an optimization.
+//
+// OBSERVABLE (half 1): one source, two arch-gated function definitions, ONE
+// compileFiles call. Each emitted object must carry ITS OWN architecture's
+// symbol and NOT the other's.
+//
+// ★★ OBSERVABLE (half 2) — the STRONGER property: each target's artifact must
+// be BYTE-IDENTICAL to the artifact that same target produces when built
+// ALONE. Half 1 pins the defect we actually saw; half 2 pins the CONTRACT —
+// that routing N targets through ONE `compileFiles` call is indistinguishable
+// from N solo calls. It therefore catches divergences that leave both expected
+// symbols intact and half 1 green: front-end state mutated by whichever target
+// built first, a constant folded from the wrong target's macro VALUE (as
+// opposed to a wrongly-taken `#ifdef`), an ordering effect inside the cache.
+//
+// The two halves share ONE multi-target build deliberately. Asserting them
+// against separate builds would let each certify a different byte sequence;
+// this way half 2 is a statement about the very artifacts half 1 inspected.
+// The solo rebuilds run from the SAME cwd, source path and output path, so the
+// only variable between the compared images is multi-target vs solo — nothing
+// path-derived can leak into the comparison.
+//
+// RED-ON-DISABLE (verified, not assumed — re-measured when half 2 landed):
+// narrow `CuBuildKey`'s `operator<` in src/program/program.cpp back to
+// `return format < o.format;`, making the key format-only again. BOTH halves
+// then fail, on the x86_64 side. The CU build walks `targets` IN ORDER and the
+// first insertion for a key wins, so arm64 — listed first below — is the one
+// whose CU the cache hands to x86_64: the x86_64 object loses
+// `probe_is_x86_64` entirely
+// and grows `probe_is_aarch64` at offset 185 (half 1), and diverges from its
+// solo build at offset 194 — 'a' vs 'x', the first character that tells the
+// two symbol names apart (half 2). The arm64 object, built from its own CU,
+// stays correct and byte-identical; both halves stay green on that side. That
+// asymmetry is why every assertion here is per-target rather than one verdict
+// over the pair.
+//
+// Note what half 2 survives that a cheaper check would not: BOTH images are
+// 712 bytes in the broken state. Section padding absorbs the one-character
+// length difference between the two symbol names, so a size comparison — or
+// any digest of the artifact's shape rather than its content — reads clean
+// through this miscompile. Only the bytes themselves show it.
+//
+// ── WHY NO `examples/**` CORPUS EXAMPLE COVERS THIS ─────────────────────────
+// Recorded HERE because this is where the next reader will come looking. (Also
+// anchored in `.plans/`.) Two independent reasons, both measured:
+//
+//   (1) STRUCTURAL — the corpus runner cannot reach the multi-target CU cache
+//       at all. `tests/examples/examples_runner.cpp` compiles each manifest
+//       target ROW in its own call with a SINGLE-element target vector:
+//       `prog.compileFiles(srcPaths, m.language, {t.spec}, rep)`, and the
+//       multi-CU arm `prog.compileUnits(srcPaths, m.language, {t.spec}, rep)`
+//       likewise. Every corpus build is therefore a one-target build whose
+//       `CuBuildKey` is unique by construction, and no example — however it is
+//       written — can produce the two-distinct-keys-one-format situation this
+//       test needs. Driver-level tests like this one are the ONLY reachable
+//       surface for it.
+//
+//   (2) OBSERVABILITY — even in a hypothetical multi-target corpus run, a C
+//       program cannot self-detect the defect while every architecture route
+//       yields the SAME exit code. Measured: patching `arm64.target.json`'s
+//       predefines to x86_64's rows leaves every `#if` guard in the source
+//       silent and the program still exits 42 — green, and wrong. The
+//       `examples/c-subset/arch_identity_predefines` example works around (2)
+//       by making the architecture OBSERVABLE in program OUTPUT (per-target
+//       `expectedStdout` arch tags) rather than in the exit code. Nothing an
+//       example can do works around (1).
+TEST(Program_CompileFiles, TFC74CuCacheKeyIsPerTargetNotPerObjectFormat) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "archprobe.c",
+        "#ifdef __aarch64__\n"
+        "int probe_is_aarch64(void) { return 1; }\n"
+        "#endif\n"
+        "#ifdef __x86_64__\n"
+        "int probe_is_x86_64(void) { return 1; }\n"
+        "#endif\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"arm64:elf64-aarch64-linux", "x86_64:elf64-x86_64-linux"});
+    ASSERT_EQ(rc, 0);
+
+    auto const armObj =
+        scratch.path() / "target" / "elf64-aarch64-linux" / "archprobe.o";
+    auto const x86Obj =
+        scratch.path() / "target" / "elf64-x86_64-linux" / "archprobe.o";
+    ASSERT_TRUE(fs::exists(armObj));
+    ASSERT_TRUE(fs::exists(x86Obj));
+
+    std::string const armBytes = readFileAsString(armObj);
+    std::string const x86Bytes = readFileAsString(x86Obj);
+
+    EXPECT_NE(armBytes.find("probe_is_aarch64"), std::string::npos)
+        << "the arm64 object must define the __aarch64__-gated function";
+    EXPECT_EQ(armBytes.find("probe_is_x86_64"), std::string::npos)
+        << "the arm64 object must NOT carry the x86_64-gated function — that "
+           "would mean it reused the x86_64 target's preprocessed CU";
+
+    EXPECT_NE(x86Bytes.find("probe_is_x86_64"), std::string::npos)
+        << "the x86_64 object must define the __x86_64__-gated function";
+    EXPECT_EQ(x86Bytes.find("probe_is_aarch64"), std::string::npos)
+        << "the x86_64 object must NOT carry the aarch64-gated function — that "
+           "would mean it reused the arm64 target's preprocessed CU";
+
+    // ── half 2: multi-target output == solo output, byte for byte ──────────
+    struct SoloCase {
+        std::string_view   label;
+        std::string        spec;
+        fs::path           obj;
+        std::string const& multiTargetBytes;
+    };
+    SoloCase const cases[]{
+        {"arm64", "arm64:elf64-aarch64-linux", armObj, armBytes},
+        {"x86_64", "x86_64:elf64-x86_64-linux", x86Obj, x86Bytes},
+    };
+
+    for (auto const& c : cases) {
+        SCOPED_TRACE(c.label);
+        // DELETE the multi-target artifact before rebuilding over it. Without
+        // this the comparison is not a test: a solo build that wrote NOTHING
+        // would leave the multi-target file in place and the bytes would match
+        // themselves. The removal is asserted, not attempted.
+        std::error_code ec;
+        fs::remove(c.obj, ec);
+        ASSERT_FALSE(ec) << "could not remove " << c.obj << ": " << ec.message();
+        ASSERT_FALSE(fs::exists(c.obj))
+            << "the multi-target artifact must be off disk before the solo "
+               "build, or the comparison proves nothing";
+
+        // A FRESH `Program` — a solo build is a separate driver invocation,
+        // and reusing `prog` would carry the multi-target run's state into it.
+        Program solo;
+        ASSERT_EQ(solo.compileFiles({src.generic_string()}, "c-subset",
+                                    {c.spec}),
+                  0)
+            << "the solo build of " << c.spec << " must succeed";
+        ASSERT_TRUE(fs::exists(c.obj))
+            << "the solo build of " << c.spec << " wrote no artifact at "
+            << c.obj;
+
+        std::string const soloBytes = readFileAsString(c.obj);
+        ASSERT_FALSE(soloBytes.empty())
+            << "the solo artifact at " << c.obj << " is empty";
+        EXPECT_TRUE(c.multiTargetBytes == soloBytes)
+            << "the " << c.label
+            << " artifact from the TWO-target build differs from the artifact "
+               "that same target produces ALONE — one `compileFiles` call over "
+               "N targets must be indistinguishable from N solo calls"
+            << byteDiffSummary("multi-target", c.multiTargetBytes, "solo",
+                               soloBytes);
+    }
+}
+
+// The other half of the key contract: widening it must NOT make a plain
+// single-target build rebuild anything. One target ⇒ one CU ⇒ one artifact,
+// exactly as before TF-C74. (A cache key that over-partitions is a performance
+// regression, not a correctness one — but on the 189-TU sqlite corpus it is a
+// large enough one to matter, so it is pinned.)
+TEST(Program_CompileFiles, TFC74SingleTargetStillBuildsOnce) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(scratch.path(), "onekey.c",
+                                        "int forty_two() { return 42; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+                                     {"x86_64:elf64-x86_64-linux"});
+    ASSERT_EQ(rc, 0);
+    EXPECT_TRUE(fs::exists(scratch.path() / "target" / "elf64-x86_64-linux"
+                           / "onekey.o"));
+}
+
+namespace {
+
+// The SET of distinct diagnostic codes a reporter carries, by NAME. Names (not
+// raw enum values) so a failed set comparison prints something a reader can
+// act on — gtest renders `DiagnosticCode` as an opaque integer.
+[[nodiscard]] std::set<std::string_view>
+diagnosticCodeSet(DiagnosticReporter const& r) {
+    std::set<std::string_view> s;
+    for (auto const& d : r.all()) s.insert(diagnosticCodeName(d.code));
+    return s;
+}
+
+// Every diagnostic, one per line, for the `<<` failure message. A set-equality
+// failure tells you WHICH code is unexpected; this tells you what it SAID.
+[[nodiscard]] std::string diagnosticDump(DiagnosticReporter const& r) {
+    std::string out = "\n  diagnostics (" + std::to_string(r.all().size()) + "):";
+    for (auto const& d : r.all()) {
+        out += "\n    ";
+        out += diagnosticCodeName(d.code);
+        out += ": ";
+        out += d.actual;
+    }
+    return out;
+}
+
+}  // namespace
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-PROGRAM-TARGET-LOAD-ORDER — THE CLOSING WITNESS.
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The anchor's claim has TWO halves, and they are DIFFERENT claims:
+//
+//   (a) an unloadable `--target` produces the AUTHORITATIVE diagnostic
+//       (`D_SchemaLoadFailed`), and
+//   (b) ★ the error CASCADE IS GONE — zero `#error`-class diagnostics
+//       accompany it.
+//
+// Asserting only (a) is the trap this test exists to avoid: the good
+// diagnostic APPEARING does not prove the cascade STOPPED. Under the old
+// ordering both could be true at once — the pre-flight could emit
+// `D_SchemaLoadFailed` and the front-end could still run and pile a hundred
+// header `#error`s on top of it. An (a)-only test stays GREEN through exactly
+// the regression it is supposed to catch. Only (b) proves the hoist.
+//
+// The source is shaped like the SDK header ladders that produced the original
+// cascade: every arm gated on an ARCHITECTURE identity macro, with a fail-loud
+// `#else`. With a bad `--target` there are no architecture predefines at all,
+// so under the PRE-hoist ordering the front-end built first, took the `#else`,
+// and fired `P_PreprocessorErrorDirective` — the user saw header-internal
+// noise and never the one sentence naming the real mistake. Under the hoist
+// the pre-flight fails FIRST and the front-end never runs, so the `#error` is
+// not merely outranked, it is never reached.
+//
+// (b) is asserted as a SET EQUALITY over the diagnostic codes, not as a count
+// on any single code. A count of `P_PreprocessorErrorDirective` would pin only
+// the one cascade class we happen to have seen; the set pins that NOTHING else
+// rides along either, so a future re-ordering that swaps the `#error` cascade
+// for some other front-end noise class still goes red.
+//
+// RED-ON-DISABLE (verified, not assumed): move the pre-flight target
+// resolution at src/program/program.cpp:992-1012 back below the CU build (or
+// merely drop its `if (rep.hasErrors()) { … return 1; }` gate at :1013-1016 so
+// the front-end runs anyway) and the front-end preprocesses with no
+// architecture predefines → `P_PreprocessorErrorDirective` joins the set and
+// the set equality fails. Half (a) keeps passing in that state, which is the
+// point.
+TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // An architecture ladder in a HEADER — the real cascade came from headers,
+    // and a quote-`#include` is what puts the `#error` behind the front-end
+    // rather than in the driver's own hands.
+    writeCSubsetSource(scratch.path(), "archgate.h",
+                       "#if defined(__aarch64__)\n"
+                       "#define ARCH_GATE_OK 1\n"
+                       "#elif defined(__x86_64__)\n"
+                       "#define ARCH_GATE_OK 1\n"
+                       "#else\n"
+                       "#error architecture not supported\n"
+                       "#endif\n");
+    // `ARCH_GATE_OK` is load-bearing, not decoration: the body does not PARSE
+    // unless the header was really included AND really took an architecture
+    // arm. That makes the control below a live test of the ladder rather than
+    // a test that trivially passes on a header nobody read.
+    auto const src =
+        writeCSubsetSource(scratch.path(), "cascade.c",
+                           "#include \"archgate.h\"\n"
+                           "int forty_two(void) { return ARCH_GATE_OK + 41; }\n");
+    scratch.useAsCwd();
+
+    // ── CONTROL: the ladder is LIVE ──────────────────────────────────────
+    // A GOOD target defines its architecture macro, takes an arm, and the TU
+    // compiles clean. Without this, a source whose `#error` could never fire
+    // under ANY target would make half (b) vacuously true.
+    {
+        DiagnosticReporter ok{DiagnosticReporter::Config{}};
+        Program            prog;
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"x86_64:elf64-x86_64-linux"}, ok), 0)
+            << "the arch ladder must be SATISFIABLE by a good target, else the "
+               "cascade assertion below proves nothing" << diagnosticDump(ok);
+        ASSERT_TRUE(diagnosticCodeSet(ok).empty()) << diagnosticDump(ok);
+    }
+
+    // ── THE WITNESS ──────────────────────────────────────────────────────
+    DiagnosticReporter rep{DiagnosticReporter::Config{}};
+    Program            prog;
+    int const          rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"no_such_arch:elf64-x86_64-linux"},
+        rep);
+    EXPECT_EQ(rc, 1) << diagnosticDump(rep);
+
+    // (a) the authoritative diagnostic fires, EXACTLY once — one bad target,
+    // one emit, no duplication from a re-diagnosing downstream path.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::D_SchemaLoadFailed), 1u)
+        << "an unknown target name must be reported as a target-schema load "
+           "failure, not as whatever the front-end happened to produce"
+        << diagnosticDump(rep);
+
+    // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
+    //
+    // MEASURED, not guessed: exactly two codes, and BOTH name the target. The
+    // config tier says WHAT it could not find (`C_InvalidTargetName`, forwarded
+    // verbatim by `forwardConfigDiagnostics` so the loader's own reason is not
+    // swallowed); the driver says what that MEANS for this build
+    // (`D_SchemaLoadFailed`). There is no third code, and in particular no
+    // `P_PreprocessorErrorDirective` — the front-end never ran.
+    EXPECT_EQ(diagnosticCodeSet(rep),
+              (std::set<std::string_view>{"C_InvalidTargetName",
+                                          "D_SchemaLoadFailed"}))
+        << "a bad `--target` must produce TARGET diagnostics alone — any "
+           "front-end diagnostic here means the CU build ran before the target "
+           "was resolved, which is the ordering defect this anchor closed"
+        << diagnosticDump(rep);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C74 (D-PROGRAM-UNKNOWN-OBJECT-FORMAT-SILENT) — THE CLOSING WITNESS for the
+// OBJECT-FORMAT half of the same two-halved defect.
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Same two claims as the target-name sibling above, over the OTHER half of the
+// `<targetName>:<formatName>` spec:
+//
+//   (a) an unloadable `--target` FORMAT produces the authoritative diagnostic
+//       (`D_SchemaLoadFailed`, naming the format), and
+//   (b) ★ nothing else rides along — asserted as a SET EQUALITY over
+//       diagnostic code names, over a source that genuinely WOULD cascade.
+//
+// MEASURED before the fix, with this exact source: `--target
+// arm64:macho64-arm64-darwn` (one letter dropped) produced EXACTLY
+// `{P_PreprocessorErrorDirective}` and rc 1 — the run failed while saying
+// nothing whatsoever about the format it could not load. The user is shown
+// their own header failing and never the one sentence naming the real mistake.
+// On the sqlite amalgamation the same mechanism produced 114 of those.
+//
+// WHY THE GATE IS THE FORMAT AND NOT THE ARCHITECTURE: the front-end's output
+// depends on the ACTIVE OBJECT FORMAT, because a predefined macro may declare
+// `availableObjectFormats` and `mergePredefinedMacros` drops every gated macro
+// when no format resolved. So an unknown format silently preprocesses the TU
+// with the gated macros MISSING — the source takes its fail-loud `#else`. That
+// is a strictly per-FORMAT cascade: the target name here is perfectly valid and
+// its schema loads, which is exactly why the sibling's fix did not close this.
+//
+// The set is TWO codes, MEASURED, and both are load-bearing — the same shape
+// the target half settled on. `C_InvalidFormatName` is the config loader's own
+// reason (WHAT it could not find, forwarded verbatim by
+// `forwardConfigDiagnostics` rather than swallowed); `D_SchemaLoadFailed` is
+// the driver's verdict (what that means for this build, and which file to go
+// look for). A one-code assertion here would be wrong, not stricter.
+//
+// RED-ON-DISABLE (verified by reverting, not assumed) — BOTH failure modes:
+//   * full revert (drop the format load from the pre-flight at
+//     src/program/program.cpp): the set becomes `{P_PreprocessorErrorDirective}`
+//     — (a) AND (b) both fail.
+//   * ★ halfway (keep the emit, let control reach the CU build anyway): the set
+//     becomes `{C_InvalidFormatName, D_SchemaLoadFailed,
+//     P_PreprocessorErrorDirective}` — (a) still passes, and ONLY the set
+//     equality fails. That middle state is why (b) is a set and not a count:
+//     a count on `D_SchemaLoadFailed` stays green there while the cascade is
+//     back in the user's face.
+TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCascade) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // A FORMAT ladder in a header, gated on a macro the target config declares
+    // `availableObjectFormats`-restricted. Under a format of that kind the
+    // macro is defined and the ladder passes; under any other resolved format,
+    // and under NO resolved format, it fires. This is the header-ladder shape
+    // that produced the original 114-error cascade.
+    writeCSubsetSource(scratch.path(), "fmtgate.h",
+                       "#if defined(__arm64__)\n"
+                       "#define FMT_GATE_OK 1\n"
+                       "#else\n"
+                       "#error object format not supported\n"
+                       "#endif\n");
+    // `FMT_GATE_OK` is load-bearing: the body does not PARSE unless the header
+    // was really included AND really took the gated arm.
+    auto const src =
+        writeCSubsetSource(scratch.path(), "fmtcascade.c",
+                           "#include \"fmtgate.h\"\n"
+                           "int forty_two(void) { return FMT_GATE_OK + 41; }\n");
+    scratch.useAsCwd();
+
+    // ── CONTROL 1: the ladder is SATISFIABLE ─────────────────────────────
+    // A good (target, format) pair whose format carries the gate compiles
+    // clean, with an EMPTY diagnostic set. Without this, a source whose
+    // `#error` could never be avoided would make half (b) vacuous.
+    {
+        DiagnosticReporter ok{DiagnosticReporter::Config{}};
+        Program            prog;
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"arm64:macho64-arm64-darwin"}, ok), 0)
+            << "the format ladder must be SATISFIABLE by a good target spec, "
+               "else the cascade assertion below proves nothing"
+            << diagnosticDump(ok);
+        ASSERT_TRUE(diagnosticCodeSet(ok).empty()) << diagnosticDump(ok);
+    }
+
+    // ── CONTROL 2: the ladder is FORMAT-SENSITIVE, and the cascade is LIVE ─
+    // The SAME source under a different, perfectly VALID format of another
+    // kind: the gated macro is absent, so the `#error` fires and the ONLY
+    // diagnostic is the front-end's. This proves two things control 1 cannot:
+    // that the cascade path really is reachable in this build (so its absence
+    // in the witness below is the fix working, not the source being inert),
+    // and that the gate is on the FORMAT. If a future config change ungated
+    // that macro, THIS control goes red — the witness announces that it lost
+    // its teeth instead of silently passing forever.
+    {
+        DiagnosticReporter live{DiagnosticReporter::Config{}};
+        Program            prog;
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"arm64:elf64-aarch64-linux-exec"}, live), 1)
+            << diagnosticDump(live);
+        EXPECT_EQ(diagnosticCodeSet(live),
+                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+            << "the ladder must still be gated on the OBJECT FORMAT — if this "
+               "compiles clean, the gated macro is no longer format-restricted "
+               "and this witness can no longer detect the cascade it exists to "
+               "forbid"
+            << diagnosticDump(live);
+    }
+
+    // ── THE WITNESS ──────────────────────────────────────────────────────
+    DiagnosticReporter rep{DiagnosticReporter::Config{}};
+    Program            prog;
+    int const          rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwn"}, rep);
+    EXPECT_EQ(rc, 1) << diagnosticDump(rep);
+
+    // (a) the authoritative diagnostic fires, EXACTLY once — one bad format,
+    // one emit, no duplication from a re-diagnosing downstream path.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::D_SchemaLoadFailed), 1u)
+        << "an unknown object-format name must be reported as a schema load "
+           "failure, not as whatever the front-end happened to produce"
+        << diagnosticDump(rep);
+
+    // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
+    EXPECT_EQ(diagnosticCodeSet(rep),
+              (std::set<std::string_view>{"C_InvalidFormatName",
+                                          "D_SchemaLoadFailed"}))
+        << "a bad `--target` FORMAT must produce FORMAT diagnostics alone — a "
+           "front-end diagnostic here means the CU build ran before the format "
+           "was resolved, which is the ordering defect this anchor closed"
+        << diagnosticDump(rep);
+
+    // The message must NAME the offending format: the whole point of the
+    // anchor is that the operator was never told which string was wrong.
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::D_SchemaLoadFailed
+            && d.actual.find("macho64-arm64-darwn") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the diagnostic must quote the format name the user typed"
+        << diagnosticDump(rep);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TF-C74 (D-PROGRAM-TARGET-FORMAT-PAIR-VALIDATED-LATE) — THE CLOSING WITNESS
+// for FACET 3 of the same driver-ordering defect: the (target, format) PAIR.
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Facets 1 and 2 check each HALF of `<targetName>:<formatName>` in isolation,
+// and neither can see this one: `arm64:elf64-x86_64-linux-exec` names a REAL
+// target and a REAL object format, so BOTH pre-flight half-checks PASS. Only
+// their COMBINATION is nonsense — a component-wise validation pass is
+// structurally blind to a relational constraint.
+//
+// Same two claims as the two siblings above, over the PAIR:
+//
+//   (a) a mutually-invalid pair produces the authoritative pair diagnostic
+//       (`D_TargetMachineCodeMismatch`), and
+//   (b) ★ nothing else rides along — asserted as a SET EQUALITY over
+//       diagnostic code names, over a source that genuinely WOULD cascade.
+//
+// MEASURED before the fix, through the real CLI, with this exact source shape:
+// `--target arm64:elf64-x86_64-linux-exec` produced EXACTLY
+// `{P_PreprocessorErrorDirective}` and rc 1 — the header `#error` alone, with
+// not one word about the mismatch. The SAME spec over a header-LESS source
+// printed the full `D_TargetMachineCodeMismatch`, which is the tell: the
+// diagnostic was never missing or badly worded, it was merely unreachable —
+// `crossValidateTargetFormat` sat inside `compileOneTarget`, downstream of the
+// CU build and behind the `if (rep.hasErrors()) return 1;` drain. This is a
+// PURE POSITION defect.
+//
+// WHY THE GATE IS THE ARCHITECTURE HERE (and why that is the honest shape):
+// the plausible operator mistake is wanting an x86_64 build and mistyping the
+// TARGET half while getting the FORMAT half right. The source is then an
+// x86_64-only header ladder — the overwhelmingly common real-world shape — so
+// the arm64 predefines take the fail-loud `#else`. Control 2 below proves that
+// cascade is live rather than assumed.
+//
+// The set is ONE code, MEASURED, not assumed — and that differs from both
+// siblings, which measured TWO. The reason is structural and worth stating so
+// nobody "fixes" it later: the half-checks fail inside the CONFIG LOADER, so
+// they carry the loader's own reason (`C_InvalidTargetName` /
+// `C_InvalidFormatName`) forwarded verbatim alongside the driver's verdict.
+// Nothing fails to LOAD here — both schemas load perfectly — so there is no
+// config-tier reason to forward. `D_TargetMachineCodeMismatch` is the whole
+// answer, and it already names the target, the field and both machine codes.
+//
+// RED-ON-DISABLE (verified by reverting, not assumed) — BOTH failure modes:
+//   * full revert (drop the pair check from the pre-flight, leaving only
+//     `compileOneTarget`'s call): the set becomes
+//     `{P_PreprocessorErrorDirective}` — (a) AND (b) both fail.
+//   * ★ halfway (keep the pre-flight emit, but let control reach the CU build
+//     anyway): the set becomes `{D_TargetMachineCodeMismatch,
+//     P_PreprocessorErrorDirective}` — (a) still passes, and ONLY the set
+//     equality fails. That middle state is why (b) is a set and not a count:
+//     a count on `D_TargetMachineCodeMismatch` stays green there while the
+//     cascade is back in the user's face.
+TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // An x86_64-ONLY architecture ladder in a HEADER. A quote-`#include` is
+    // what puts the `#error` genuinely behind the front-end rather than in the
+    // driver's own hands — without that, half (b) is vacuous.
+    writeCSubsetSource(scratch.path(), "pairgate.h",
+                       "#if defined(__x86_64__)\n"
+                       "#define PAIR_GATE_OK 1\n"
+                       "#else\n"
+                       "#error architecture not supported\n"
+                       "#endif\n");
+    // `PAIR_GATE_OK` is load-bearing, not decoration: the body does not PARSE
+    // unless the header was really included AND really took the x86_64 arm.
+    auto const src =
+        writeCSubsetSource(scratch.path(), "paircascade.c",
+                           "#include \"pairgate.h\"\n"
+                           "int forty_two(void) { return PAIR_GATE_OK + 41; }\n");
+    scratch.useAsCwd();
+
+    // ── CONTROL 1: the ladder is SATISFIABLE, under a GOOD pair ───────────
+    // The same source under the pair the operator MEANT compiles clean, with
+    // an EMPTY diagnostic set. Without this, a source whose `#error` could
+    // never be avoided would make half (b) vacuous.
+    {
+        DiagnosticReporter ok{DiagnosticReporter::Config{}};
+        Program            prog;
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"x86_64:elf64-x86_64-linux-exec"}, ok), 0)
+            << "the arch ladder must be SATISFIABLE by a good (target, format) "
+               "pair, else the cascade assertion below proves nothing"
+            << diagnosticDump(ok);
+        ASSERT_TRUE(diagnosticCodeSet(ok).empty()) << diagnosticDump(ok);
+    }
+
+    // ── CONTROL 2: the cascade is LIVE, and the gate is the ARCHITECTURE ──
+    // The SAME source under a perfectly VALID pair of the other arch: both
+    // halves load, the PAIR agrees (arm64 ↔ EM_AARCH64), so the pre-flight
+    // passes and the front-end really runs — and the ladder fires. This proves
+    // what control 1 cannot: that the cascade path is reachable in this build,
+    // so its ABSENCE in the witness below is the hoist working rather than the
+    // source being inert. If a future config change gave arm64 an `__x86_64__`
+    // predefine, or the pair stopped being validated at all, THIS control goes
+    // red — the witness announces that it lost its teeth instead of silently
+    // passing forever.
+    {
+        DiagnosticReporter live{DiagnosticReporter::Config{}};
+        Program            prog;
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"arm64:elf64-aarch64-linux-exec"}, live), 1)
+            << diagnosticDump(live);
+        EXPECT_EQ(diagnosticCodeSet(live),
+                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+            << "the ladder must still be gated on the ARCHITECTURE and the "
+               "cascade must still be reachable — if this compiles clean, this "
+               "witness can no longer detect the cascade it exists to forbid"
+            << diagnosticDump(live);
+    }
+
+    // ── THE WITNESS ──────────────────────────────────────────────────────
+    // Individually valid, mutually invalid: `arm64` is a shipped target and
+    // `elf64-x86_64-linux-exec` is a shipped format, so both half-checks pass.
+    DiagnosticReporter rep{DiagnosticReporter::Config{}};
+    Program            prog;
+    int const          rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"arm64:elf64-x86_64-linux-exec"}, rep);
+    EXPECT_EQ(rc, 1) << diagnosticDump(rep);
+
+    // (a) the authoritative pair diagnostic fires, EXACTLY once — one bad
+    // pair, one emit, no duplication from the still-live downstream call in
+    // `compileOneTarget`.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::D_TargetMachineCodeMismatch), 1u)
+        << "a mutually-invalid (target, format) pair must be reported as a "
+           "machine-code mismatch, not as whatever the front-end happened to "
+           "produce"
+        << diagnosticDump(rep);
+
+    // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
+    EXPECT_EQ(diagnosticCodeSet(rep),
+              (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+        << "a mutually-invalid pair must produce PAIR diagnostics alone — a "
+           "front-end diagnostic here means the CU build ran before the pair "
+           "was cross-validated, which is the ordering defect this anchor "
+           "closed"
+        << diagnosticDump(rep);
+
+    // The message must NAME both halves of the disagreement. The pair check
+    // is the only one of the three whose message does NOT quote the format
+    // NAME, so the `[target=<spec>]` stamp is what makes it attributable —
+    // pinned separately in the multi-target test below.
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::D_TargetMachineCodeMismatch
+            && d.actual.find("arm64") != std::string::npos
+            && d.actual.find("elf.machine") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the diagnostic must name the target and the format field that "
+           "disagree"
+        << diagnosticDump(rep);
+}
+
+// ── TF-C74 (D-PROGRAM-TARGET-FORMAT-PAIR-VALIDATED-LATE): THE DEDUPE KEY ────
+//
+// The pre-flight de-duplicates each check so one typo yields one diagnostic,
+// and the KEY is where this class of bug hides: the object-format check had to
+// be given its own `formatChecked` set because the target-name dedupe keys on
+// the TARGET, so a format check placed behind it would skip every format after
+// the first — silently.
+//
+// The pair check's verdict is a RELATION over BOTH names, so the only
+// non-lossy key is the ORDERED PAIR. Either half alone silently skips distinct
+// pairs that share the other half, and this test measures BOTH orientations
+// with a two-target invocation whose SECOND pair is the bad one:
+//
+//   * same TARGET, differing FORMAT — a target-keyed dedupe skips spec 2.
+//   * same FORMAT, differing TARGET — a format-keyed dedupe skips spec 2.
+//
+// Both legs use the arm64-cascading source and put a VALID pair first, so a
+// skipped spec 2 does not merely lose a diagnostic — it lets the CU build run
+// and the header `#error` come back. MEASURED with the correct key: each leg
+// yields exactly `{D_TargetMachineCodeMismatch}`, stamped with the offending
+// spec. RED-ON-DISABLE (verified): narrowing `pairChecked` to the target name
+// reds leg A with `{P_PreprocessorErrorDirective}`; narrowing it to the format
+// name reds leg B the same way — each wrong key reds exactly the leg that
+// targets it, which is what makes this a measurement rather than a ritual.
+TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    writeCSubsetSource(scratch.path(), "pairgate.h",
+                       "#if defined(__x86_64__)\n"
+                       "#define PAIR_GATE_OK 1\n"
+                       "#else\n"
+                       "#error architecture not supported\n"
+                       "#endif\n");
+    auto const src =
+        writeCSubsetSource(scratch.path(), "paircascade.c",
+                           "#include \"pairgate.h\"\n"
+                           "int forty_two(void) { return PAIR_GATE_OK + 41; }\n");
+    scratch.useAsCwd();
+
+    // ── LEG A: the two specs share a TARGET; the SECOND pair is the bad one.
+    {
+        DiagnosticReporter rep{DiagnosticReporter::Config{}};
+        Program            prog;
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"arm64:elf64-aarch64-linux-exec",
+                                     "arm64:elf64-x86_64-linux-exec"}, rep), 1)
+            << diagnosticDump(rep);
+        EXPECT_EQ(diagnosticCodeSet(rep),
+                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+            << "a dedupe keyed on the TARGET would have skipped the second "
+               "spec — its target was already resolved by the first — and the "
+               "front-end would have run and cascaded"
+            << diagnosticDump(rep);
+        // The stamp is what makes a multi-target pair diagnostic attributable:
+        // the message names the target but NOT the format, so without
+        // `[target=<spec>]` the operator cannot tell which of two arm64 specs
+        // was rejected.
+        bool stamped = false;
+        for (auto const& d : rep.all()) {
+            if (d.contextPrefix.find("arm64:elf64-x86_64-linux-exec")
+                != std::string::npos) {
+                stamped = true;
+            }
+        }
+        EXPECT_TRUE(stamped)
+            << "the pair diagnostic must carry the `[target=<spec>]` stamp "
+               "naming the OFFENDING spec, not merely the target name"
+            << diagnosticDump(rep);
+    }
+
+    // ── LEG B: the two specs share a FORMAT; the SECOND pair is the bad one.
+    {
+        DiagnosticReporter rep{DiagnosticReporter::Config{}};
+        Program            prog;
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+                                    {"arm64:elf64-aarch64-linux-exec",
+                                     "x86_64:elf64-aarch64-linux-exec"}, rep), 1)
+            << diagnosticDump(rep);
+        EXPECT_EQ(diagnosticCodeSet(rep),
+                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+            << "a dedupe keyed on the FORMAT would have skipped the second "
+               "spec — its format was already checked by the first — and the "
+               "front-end would have run and cascaded"
+            << diagnosticDump(rep);
+    }
+
+    // ── NO ARTIFACT ESCAPES A REJECTED MULTI-TARGET BUILD ────────────────
+    // The pre-flight rejects before ANY target is compiled, so a build with one
+    // bad pair writes nothing at all. Under the pre-hoist ordering the good
+    // target compiled and committed its artifact first, and only then did the
+    // bad pair fail — a half-written multi-target output tree. This is the one
+    // consequence of the hoist that the diagnostic set cannot express.
+    EXPECT_FALSE(fs::exists(scratch.path() / "target"))
+        << "a multi-target build rejected at the pre-flight must not have "
+           "compiled ANY target — no output tree should exist";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TF-C75 (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM) — the END-TO-END chain the
+// production wiring actually walks: a SHIPPED `.format.json` → its declared
+// `kind` → `TargetSchema::charIsUnsigned(kind)`.
+//
+// The unit-level quadrants live in tests/core/test_target_schema.cpp (hand-
+// built schemas, both override directions, every fail-loud shape). What is
+// pinned HERE is the part those cannot reach: that the SHIPPED format files
+// carry the kinds this resolution depends on, and that the ONE production call
+// site — `mirCfg.charIsUnsigned = target.charIsUnsigned(format.kind())` in
+// compile_pipeline.cpp — therefore resolves the real platform matrix.
+//
+// A resolver correct on hand-built schemas and wrong on the shipped ones is
+// still a miscompile, and the shipped chain has an extra failure mode all its
+// own: a format file whose `kind` drifted would silently pick up the WRONG
+// override row while every unit test stayed green.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★ `arm64` × `macho64-arm64-darwin-exec` is THE row: the arm64 processor's
+// default says UNSIGNED, Apple's platform ABI says SIGNED, and the target's own
+// `byObjectFormat` override is what has to win. It was the shipped miscompile
+// before this arc.
+//
+// RED-ON-DISABLE (both verified against the final build):
+//   (1) delete the `"macho": false` row from arm64.target.json → that row
+//       resolves true (unsigned) and this fails;
+//   (2) make `TargetSchema::charIsUnsigned(kind)` ignore its argument and
+//       return the default → the same row fails, and so do the codegen matrix
+//       in tests/mir and the exact-set matrix in tests/core.
+TEST(Program_CharSignedness, ShippedFormatKindsResolveThePlatformMatrix) {
+    struct Row {
+        std::string_view target;
+        std::string_view format;
+        bool             unsignedChar;
+        std::string_view why;
+        bool operator==(Row const&) const = default;
+    };
+    std::vector<Row> const expected{
+        {"arm64", "macho64-arm64-darwin-exec", false,
+         "Apple arm64: the target's macho override makes bare `char` SIGNED, "
+         "beating its own unsigned default"},
+        {"arm64", "macho64-arm64-darwin-dylib", false,
+         "the override is per FORMAT KIND, so every macho artifact profile "
+         "inherits it — not just the one exec file"},
+        {"arm64", "elf64-aarch64-linux-exec", true,
+         "Linux arm64: no override for elf, so AAPCS64's unsigned default "
+         "stands — CORRECT, never flip this"},
+        {"arm64", "elf64-aarch64-linux-pie", true,
+         "same, across artifact profiles"},
+        {"x86_64", "pe64-x86_64-windows-exec", false,
+         "Windows x86_64: signed (x86_64 declares no key at all)"},
+        {"x86_64", "macho64-x86_64-darwin-exec", false,
+         "Darwin x86_64: signed"},
+        {"x86_64", "elf64-x86_64-linux-exec", false,
+         "Linux x86_64: signed"},
+    };
+
+    std::vector<Row> actual;
+    for (auto const& row : expected) {
+        auto t = TargetSchema::loadShipped(std::string{row.target});
+        auto f = ObjectFormatSchema::loadShipped(std::string{row.format});
+        ASSERT_TRUE(t.has_value()) << row.target;
+        ASSERT_TRUE(f.has_value()) << row.format;
+        actual.push_back(Row{row.target, row.format,
+                             (*t)->charIsUnsigned((*f)->kind()), row.why});
+    }
+    EXPECT_EQ(actual, expected)
+        << "the shipped (target × format) bare-`char` matrix drifted";
+}
+
+// The two arm64 legs must DISAGREE. Stated as its own assertion because it is
+// the fact a single per-processor boolean could not hold, and because a
+// resolution that collapsed to "always the default" or "always the override"
+// would satisfy plenty of individual rows above while failing this.
+TEST(Program_CharSignedness, TheTwoArm64LegsDisagreeByPlatform) {
+    auto t     = TargetSchema::loadShipped("arm64");
+    auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    auto elf   = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(t.has_value());
+    ASSERT_TRUE(macho.has_value());
+    ASSERT_TRUE(elf.has_value());
+    EXPECT_NE((*t)->charIsUnsigned((*macho)->kind()),
+              (*t)->charIsUnsigned((*elf)->kind()))
+        << "ONE processor, TWO platforms, OPPOSITE answers — if these ever "
+           "agree, the format half of the resolution has stopped being read "
+           "and bare `char` is being mis-extended on one of the two legs";
 }

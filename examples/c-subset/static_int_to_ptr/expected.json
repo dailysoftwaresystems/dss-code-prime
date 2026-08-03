@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE (TF-C38, SQLite testfixture-link sub-arc): RUN witness for an explicit integer-constant -> pointer cast in a STATIC/global initializer — `(void*)0x5`. C permits an integer-constant address in a static-storage pointer initializer (6.6 / 6.3.2.3); the value IS the integer, an ABSOLUTE address with NO symbol and NO relocation (gcc/clang emit the same bytes). Real trigger: tcl.h `((Tcl_ChannelTypeVersion)0x5)` inside a `static Tcl_ChannelType {…}` initializer, the LAST error blocking the SQLite testfixture MAIN TU (tclsqlite-ex.c). const-eval refuses a cast-to-pointer, so tryClassifyIntToPtrConst folds the Cast's integer operand to a plain uint64 pointer leaf (the encoder's scalar-leaf arm writes 8 raw LE bytes). One exit code covers every reached shape: p (top-level scalar), X.b (aggregate member), X.a (a SYMBOL-address string member BESIDE the int->ptr leaf — the mix proves the int arm does not cannibalize the reloc arm; X.a[0]=='h' is checked at runtime so the reloc leaf is LIVE), arr[] (array of int->ptr), q (block-scope static int->ptr, which lowers to a module global). 5+7+1+2+3 = 18. The `release` optimizedPipeline arm witnesses the shipped optimizer over the new const-init MIR global shape. All 4 targets: a MIR-globals classifier change, target/format-agnostic. RED-ON-DISABLE: remove either wiring of tryClassifyIntToPtrConst -> each int->ptr initializer falls to runtimeInit -> the aggregate fail-loud (H_UnsupportedLoweringForKind) -> this TU no longer COMPILES.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 18,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -3,10 +3,14 @@
 #include "hir/hir.hpp"   // HirAttribute<T>
 
 #include "hir/attributes/alignment_attr.hpp"
+#include "hir/attributes/always_inline_attr.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/mutability_attr.hpp"
+#include "hir/attributes/no_inline_attr.hpp"
+#include "hir/attributes/no_optimize_attr.hpp"
+#include "hir/attributes/no_sanitize_thread_attr.hpp"
 #include "hir/attributes/returns_twice_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
@@ -44,6 +48,46 @@ using HirFfiMap = HirAttribute<FfiMetadata>;
 // lowering to stamp `MirFunc`/`MirGlobal` binding+visibility — the input the
 // optimizer's DCE-protect predicate `isExternallyVisible()` consults.
 using HirLinkageMap = HirAttribute<LinkageAttr>;
+
+// TF-C78 (D-CSUBSET-NOINLINE): native FUNCTION declarations the source marked
+// `__attribute__((noinline))`. Populated by CST→HIR lowering from the bound
+// symbol's `SymbolRecord.isNoInline`; read by HIR→MIR lowering to stamp
+// `MirFunc.noInline` — the input the optimizer's inlining legality gate refuses
+// on, beside the Weak-binding rule. Keyed on the same DECLARATION node as
+// `HirLinkageMap`, but a distinct axis (see `NoInlineAttr`).
+using HirNoInlineMap = HirAttribute<NoInlineAttr>;
+
+// TF-C81 (D-CSUBSET-ALWAYSINLINE): native FUNCTION declarations the source
+// marked `__attribute__((always_inline))`. Populated by CST→HIR lowering from
+// the bound symbol's `SymbolRecord.isAlwaysInline`; read by HIR→MIR lowering to
+// stamp `MirFunc.alwaysInline` — the input that SUPPRESSES the inlining legality
+// gate's size threshold (rule 6), the mirror image of what `HirNoInlineMap`
+// feeds. Keyed on the same DECLARATION node as `HirLinkageMap` /
+// `HirNoInlineMap`, and a third distinct axis (see `AlwaysInlineAttr`, which
+// states precisely what the attribute does and does not promise).
+using HirAlwaysInlineMap = HirAttribute<AlwaysInlineAttr>;
+
+// ★★ TF-C85: native FUNCTION declarations that sat inside an MSVC
+// `#pragma optimize("", off)` region. Populated by CST→HIR lowering from the
+// bound symbol's `SymbolRecord.isNoOptimize`; read by HIR→MIR lowering to stamp
+// `MirFunc.noOptimize` — the input that makes the optimizer's shared function
+// rebuilder copy the function VERBATIM (an identity policy in place of the
+// pass's own) and makes the inliner leave it alone in both directions. Keyed on
+// the same DECLARATION node as the three maps above, and a FOURTH distinct axis:
+// unlike them it originates in a preprocessor REGION, not an attribute (see
+// `NoOptimizeAttr`, which also states plainly what this sink is not).
+using HirNoOptimizeMap = HirAttribute<NoOptimizeAttr>;
+
+// TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): native FUNCTION declarations the source
+// marked `__attribute__((no_sanitize_thread))`. Populated by CST→HIR lowering from
+// the bound symbol's `SymbolRecord.isNoSanitizeThread`; read by HIR→MIR lowering to
+// stamp `MirFunc.noSanitizeThread` — which `mir_text`'s `appendFuncAttrs` surfaces
+// as the `nosanitizethread` function attribute. Keyed on the same DECLARATION node
+// as the four maps above, and a FIFTH distinct axis: unlike them its consumer is
+// STORAGE, not a pass — DSS ships no sanitizer (MEASURED: `grep -rni sanitiz src/`
+// is empty), so the observable property is that the fact survives and is queryable
+// (see `NoSanitizeThreadAttr`, which refuses to overstate that).
+using HirNoSanitizeThreadMap = HirAttribute<NoSanitizeThreadAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

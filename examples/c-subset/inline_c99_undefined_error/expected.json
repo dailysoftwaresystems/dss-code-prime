@@ -1,0 +1,18 @@
+{
+  "$comment": "TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline definition that is CALLED but whose external definition exists in no linked TU must fail LOUD at the link tier, naming the symbol. The negative half of `inline_c99_inline_definition_crosscu` -- same source shape, sibling CU removed. \u2605 'Emits nothing' is only a safe decision if the omission is DETECTABLE: encoding the state as a weak binding, or as a silently dropped declaration, would turn this program into a wrong-body call or a mysterious crash instead of a diagnostic. Fail-loud here is the contract that makes the no-emit decision safe everywhere else, and it is the same contract a bare prototype with no definition already has. MEASURED: `/usr/bin/clang -std=c99 -O0` on this exact file also fails to link, with `Undefined symbols: _missing_body`.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolUndefined",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

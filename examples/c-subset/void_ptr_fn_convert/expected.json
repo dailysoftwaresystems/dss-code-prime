@@ -1,0 +1,17 @@
+{
+  "$comment": "D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a BARE function DESIGNATOR (a function name, no `&`) converted IMPLICITLY to a `void*` — the gcc/POSIX dlsym / Tcl ClientData idiom. sqlite test_md5.c hits it 4x: `Tcl_CreateCommand(interp, \"md5\", MD5DigestToBase16, ...)` passes the bare function as a `void*` ClientData argument -> S0003 without this conversion. Fn-pointer <-> void* is UB in ISO C but POSIX-required and representation-identical on LP64/LLP64 (same width/bits) -> never a miscompile. Gated on `allowVoidPtrFnConvert` (c-subset opts in; default false = strict), the SINGLE authoritative gate for the whole fn<->void* class (Option B). Three legs: (1) bare designator passed DIRECTLY as a `void*` CALL ARGUMENT (the exact test_md5 Tcl_CreateCommand shape), (2) bare designator INIT into void*, (3) a typed Ptr<FnSig> -> void* (Option-B re-homing); each round-trips through void*, casts back, and is CALLED -> all 42. RED-ON-DISABLE: flip the flag off (or revert the isAssignable FnSig->void* arm) -> the bare `register_and_call(add40, 2)` call-arg fails to compile (S0003) -> the example no longer BUILDS. Pure c-subset -> all 4 targets; pe RUNS on Windows. arm64 under qemu; macho on macos-latest.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
