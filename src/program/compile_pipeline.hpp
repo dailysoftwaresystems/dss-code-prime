@@ -314,41 +314,59 @@ struct DSS_EXPORT CuMirModule {
     // exact for the active format. The target's alignment params come from
     // `*target`; this overlays the per-format bit-field rule onto them.
     BitFieldStrategy bitFieldStrategy = BitFieldStrategy::None;
-    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> shim SymbolId.v →
-    // recipe id, carried from the BUILD half's `CstToHirResult.synthRecipeBySymbol` so
-    // the LOWER half's `synthesizeThreadsShim` (fired at the synthesizePeStartup seam)
-    // can supply each shim function's definition. Empty for every elf/macho + every
-    // non-threads pe TU (the overwhelming majority — a bare default-constructed map).
-    std::unordered_map<std::uint32_t, std::string> threadsRecipes;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
+    // shim SymbolId.v → recipe id for EVERY `synthesize`-tagged shipped-library symbol this
+    // CU touched, carried from the BUILD half's `CstToHirResult.synthRecipeBySymbol` so the
+    // LOWER half can supply each shim function's definition. ONE map, MULTIPLE families —
+    // pe64 <threads.h> (mtx_lock…) and pe64 <stdio.h> (printf…) both land here; the LOWER
+    // half partitions it by `dss::ffi::shimFamilyOf` and hands each part to its own synth
+    // pass. Named for the MECHANISM (a library shim) rather than for one family, because
+    // the name `threadsRecipes` became a lie the moment the stdio family joined — a field
+    // whose name contradicts its contents is how the wrong pass ends up reading it.
+    // Empty for every elf/macho + every pe TU that touches neither family (the
+    // overwhelming majority — a bare default-constructed map).
+    std::unordered_map<std::uint32_t, std::string> libraryShimRecipes;
     // D-CSUBSET-C11-THREADS-MACHO: the active format's shipped-library synth vehicle
     // (win32 / pthread + import library), captured here for the SAME reason as
     // `tlsAccess` — the LOWER half sees only this struct, and `synthesizeThreadsShim`
     // reads it to pick the primitive family it emits over. nullopt on elf (direct FFI →
-    // `threadsRecipes` is empty there anyway); a non-empty `threadsRecipes` with a
+    // `libraryShimRecipes` is empty there anyway); a non-empty THREADS partition with a
     // nullopt vehicle is a fail-loud in the synth pass (never a silently-assumed vehicle).
     std::optional<LibrarySynthesis> librarySynthesis;
     // D-CSUBSET-C11-THREADS-MACHO: the active object format's kind, captured here so the
     // LOWER half's `synthesizeThreadsShim` can C-mangle its native helper-import names for
     // the format (macho prepends `_`) — the SAME applyCMangling the FFI ingest uses.
     ObjectFormatKind objectFormat = ObjectFormatKind::Unknown;
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's va_list
-    // lowering strategy, captured here for the SAME reason as `librarySynthesis`/
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's WHOLE
+    // `vaListLayout` block, captured here for the SAME reason as `librarySynthesis`/
     // `objectFormat` — the LOWER half sees only this struct, and `synthesizeStdioShim`'s
     // variadic-forwarding arm (a printf-family shim forwards its caller's va_list into the
     // UCRT `__stdio_common_v*` core) needs the target's va_list model to pick the right MIR
-    // leaf (VaHomeArgAreaAddr on HomogeneousPointer/Win64) or fail loud (SysVRegisterSave —
-    // no stdio-synthesize descriptor exists on that model yet).
+    // leaf, or to fail loud on a model it has no arm for.
+    //
+    // ★ THE WHOLE BLOCK, NOT JUST `.strategy` — and that is a CORRECTNESS requirement, not
+    // tidiness. This field used to be a bare `std::optional<VaListStrategy>`, which was
+    // enough only for as long as `HomogeneousPointer` meant Win64. It does not:
+    // `arm64.target.json`'s `apple_arm64` CC declares `homogeneous_pointer` WITH
+    // `variadicUsesOverflowBase: true`, and that second field is what decides between
+    // `VaHomeArgAreaAddr` and `VaOverflowArgAreaAddr` in `hir_to_mir`'s real `va_start`
+    // lowering. Passing the strategy alone dropped it on the floor, so the shim could only
+    // ever emit the home leaf — silently pointing `ap` at named-arg storage on any
+    // overflow-base target. Threading the layout WHOLE means the shim and the real lowering
+    // read the same field off the same struct: one source of truth, no rule to drift.
     //
     // ★ OPTIONAL, DEFAULTED EMPTY — deliberately, and for the same reason its two siblings
     // above keep "absent" representable (`librarySynthesis` is an optional; `objectFormat`
-    // defaults to an `Unknown` SENTINEL, not to a real format). A default of any REAL
-    // strategy would make "the resolved CC declares no `vaListLayout`" indistinguishable
-    // downstream from "the resolved CC declares SysVRegisterSave": a config gap would then
-    // arrive at the synth pass wearing a legitimate strategy's face and be refused (or, one
-    // day, ACCEPTED) for the wrong reason, with a diagnostic pointing at the wrong end of
-    // the pipeline. `synthesizeStdioShim` fails loud on nullopt. Consulted only when a
-    // stdio recipe actually appears — an empty recipe map is a clean no-op either way.
-    std::optional<VaListStrategy> vaListStrategy;
+    // defaults to an `Unknown` SENTINEL, not to a real format). A default-constructed
+    // `VaListLayout` is a REAL one (its `strategy` defaults to SysVRegisterSave for
+    // pre-FC12b back-compat), so defaulting rather than emptying would make "the resolved
+    // CC declares no `vaListLayout`" indistinguishable downstream from "the resolved CC
+    // declares SysVRegisterSave": a config gap would then arrive at the synth pass wearing a
+    // legitimate model's face and be refused (or, one day, ACCEPTED) for the wrong reason,
+    // with a diagnostic pointing at the wrong end of the pipeline. `synthesizeStdioShim`
+    // fails loud on nullopt. Consulted only when a stdio recipe actually appears — an empty
+    // recipe map is a clean no-op either way.
+    std::optional<VaListLayout> vaListLayout;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the

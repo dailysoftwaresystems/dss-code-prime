@@ -61,9 +61,24 @@ function Get-Anchors([string]$Path, [string[]]$Filters) {
 #     potential false-POSITIVE (an anchor cited only in a non-`.md` plan file
 #     would red here and green there). Inert today ONLY because `.plans/`
 #     currently contains zero non-`.md` files; nothing enforces that.
-$AnchorFileFilters = @('*.cpp', '*.hpp', '*.json', '*.c')
-$srcAnchors = (Get-Anchors 'src'      $AnchorFileFilters) +
-              (Get-Anchors 'examples' $AnchorFileFilters)
+# ── real-examples/ ADDED 2026-08-03 (TF-C111), D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS.
+# The guard covered `src/ examples/` only, so every `D-*` cited in a HARNESS
+# DRIVER resolved to nothing and failed nothing. That is not hypothetical: the
+# name `D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE` was carried in two
+# hand-off documents AS THOUGH TRACKED and had, measured, ZERO hits repo-wide
+# and no registry row — invisible to this guard, to the plan sweep, and to
+# every cycle's orient step. An unenforced citation is a citation that rots.
+# The drivers are SCRIPTS, so they need their own filter set — reusing
+# $AnchorFileFilters would have scanned real-examples/ for *.cpp and found
+# nothing, which is the silent no-op version of this fix.
+# ⚠ Dry-run before widening further: measured at 22 anchors cited across the
+# drivers, ALL 22 already resolving, so this landed green. A future root that
+# reds must be closed by REGISTERING the rows, never by narrowing the guard.
+$AnchorFileFilters     = @('*.cpp', '*.hpp', '*.json', '*.c')
+$HarnessFileFilters    = @('*.sh', '*.ps1', '*.py')
+$srcAnchors = (Get-Anchors 'src'           $AnchorFileFilters) +
+              (Get-Anchors 'examples'      $AnchorFileFilters) +
+              (Get-Anchors 'real-examples' $HarnessFileFilters)
 $srcAnchors = $srcAnchors | Sort-Object -Unique
 
 # Read every plan-file's raw content for substring matching. Substring
@@ -94,8 +109,10 @@ foreach ($a in $missing) {
     # Same scanned set as the collection above — a citation this guard FOUND
     # must also be LOCATABLE here, or the FAIL output names an anchor with no
     # "cited in:" line and the fix is a guessing game.
-    $files = Get-ChildItem -Path 'src', 'examples' -Recurse -File `
-                           -Include $AnchorFileFilters -ErrorAction SilentlyContinue
+    $files = (Get-ChildItem -Path 'src', 'examples' -Recurse -File `
+                            -Include $AnchorFileFilters  -ErrorAction SilentlyContinue) +
+             (Get-ChildItem -Path 'real-examples'  -Recurse -File `
+                            -Include $HarnessFileFilters -ErrorAction SilentlyContinue)
     foreach ($f in $files) {
         if (Select-String -LiteralPath $f.FullName -Pattern $a -SimpleMatch -Quiet) {
             Write-Host "    cited in: $($f.FullName.Replace($RepoRoot + [IO.Path]::DirectorySeparatorChar, ''))"

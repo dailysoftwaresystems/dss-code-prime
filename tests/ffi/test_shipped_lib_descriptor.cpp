@@ -2806,7 +2806,19 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     EXPECT_FALSE(rep.hasErrors());
     // The neutral descriptor names the correct runtime per format — the whole
     // point of Model 3. RED if a future edit reverts to one string or swaps them.
-    EXPECT_EQ(desc->library.at("pe"),    "msvcrt.dll");
+    //
+    // ★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) FLIPPED the pe entry msvcrt.dll →
+    // ucrtbase.dll, so this is a RE-AIM of an exact-string pin, not a relaxation:
+    // it is still one `EXPECT_EQ` per format and a revert to msvcrt still reds
+    // here. stdio is one of NINE descriptors that flipped ATOMICALLY (stdio, io,
+    // errno, stdlib, malloc, string, direct, process, sys/stat) because they share
+    // CRT co-state — FILE buffers, `errno`, the heap, the fd table — and a split
+    // bind would silently read one runtime's state through the other's API.
+    // setjmp.json deliberately stays on msvcrt (ucrtbase exports no `_setjmp`, and
+    // `jmp_buf` is caller-owned, so it carries no cross-runtime state). The
+    // GROUP-WIDE atomicity is pinned in tests/ffi/test_pe_crt_costate_binding.cpp;
+    // this test keeps its original single-descriptor scope.
+    EXPECT_EQ(desc->library.at("pe"),    "ucrtbase.dll");
     EXPECT_EQ(desc->library.at("elf"),   "libc.so.6");
     EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
 }
@@ -4493,22 +4505,42 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // … + the 3 trampolines.
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
-    // <stdio.h> printf family over the UCRT __stdio_common_v* cores. `sprintf` is the
-    // ONLY one: the increment deliberately ships one recipe with a runtime witness rather
-    // than four speculative bodies. snprintf/fprintf/vfprintf appear in the NEGATIVE list
-    // below precisely so re-adding a body without re-pinning it here reds.
-    {"sprintf", ShimFamily::Stdio},
+    // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — FIVE recipes
+    // as of D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3), where `sprintf` was previously the only
+    // one. ucrtbase.dll exports NOT ONE of these five names (in a real MSVC build each is
+    // a header inline over a `__stdio_common_v*` core), so once the pe CRT flipped off
+    // msvcrt — which DID export all five — a compiler that binds by export table has
+    // nothing to import and must synthesize the body. Each arrived WITH its descriptor row
+    // and its core's symbol row, which is what the backward pin below re-checks.
+    //
+    // ★ `snprintf` is DELIBERATELY ABSENT and stays in the NEGATIVE list below: no
+    // stdio.json row declares it, so a body sneaking into `kRecipes` ahead of its
+    // descriptor row must red. That negative pin is load-bearing — do not "tidy" it away
+    // just because its four former neighbours graduated.
+    {"printf", ShimFamily::Stdio},          {"fprintf", ShimFamily::Stdio},
+    {"sprintf", ShimFamily::Stdio},         {"vfprintf", ShimFamily::Stdio},
+    {"sscanf", ShimFamily::Stdio},
 };
 
 // Ids that must NOT be recipes. Three groups, each catching a different regression:
-//   * the RETIRED stdio ids — a speculative body sneaking back into `kRecipes` reds here;
+//   * the UNSHIPPED stdio id — a speculative body sneaking into `kRecipes` reds here;
 //   * DEFERRED threads ids (thrd_sleep + the timed waits stay elf-FFI-only) — promoting
 //     one to a synth recipe without a body reds here;
 //   * ordinary near-misses: plain libc names, a typo, case variants, the empty string.
+//
+// ★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) MOVED `printf`/`fprintf`/`vfprintf`/`sscanf`
+// from this negative list into `kPinnedRecipes` above. That is a STRENGTHENING, not a
+// removal: each went from "must not be known" to "must be known AND classify as Stdio
+// AND be declared by exactly one shipped descriptor row" (the backward pin below), which
+// is a strictly narrower constraint. `snprintf` did NOT graduate — stdio.json still
+// declares no row for it — so it stays here as the live guard against a body landing
+// ahead of its descriptor row. `puts`/`fputs`/`__stdio_common_vsprintf` likewise remain:
+// they are REAL ucrtbase exports imported directly, and a recipe id for any of them would
+// mean the loader had started synthesizing over a symbol it can simply import.
 constexpr char const* kNonRecipes[] = {
-    "snprintf", "fprintf", "vfprintf",                       // retired stdio arms
+    "snprintf",                                              // unshipped stdio arm
     "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
-    "printf", "sscanf", "puts", "fputs", "__stdio_common_vsprintf",
+    "puts", "fputs", "__stdio_common_vsprintf",
     "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
 };
 
@@ -4537,9 +4569,11 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
     }
     // The shape of the vocabulary itself, so a silent addition/removal is visible.
     EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
-    EXPECT_EQ(stdio, 1u)
-        << "the <stdio.h> family ships EXACTLY `sprintf` — one recipe with a runtime "
-           "witness, not four speculative bodies";
+    EXPECT_EQ(stdio, 5u)
+        << "the <stdio.h> family ships EXACTLY printf/fprintf/sprintf/vfprintf/sscanf "
+           "(D-FFI-PE-CRT-UCRT-MIGRATION P3 grew it from 1) — a SIXTH would mean a body "
+           "landed ahead of its stdio.json row, and a FOURTH that one was retired without "
+           "retiring its descriptor row";
 }
 
 // THE LOCKSTEP INVARIANT, asserted as the biconditional the header documents rather than
@@ -4838,11 +4872,31 @@ TEST(ShippedLibDescriptor, SetjmpPeMacroExpandsToUnderscoreSetjmp) {
 // spawn with `ld.so: symbol lookup error: undefined symbol: atexit`. That break is
 // invisible to compile-time CI (the compile succeeds; only the spawn fails), so the
 // availability sets are load-bearing runtime-correctness config, not documentation.
-// msvcrt.dll and libSystem DO export `atexit` (the pe arm is runtime-witnessed:
-// atexit handler runs at ExitProcess via msvcrt's DLL-detach onexit walk).
-// RED-ON-DISABLE: adding "elf" to atexit's set (the naive "fix" for an elf atexit
-// user) or widening __cxa_atexit beyond elf flips the exact-set asserts here before
-// the regression can reach a spawn-time failure.
+// libSystem DOES export `atexit`, so macho keeps the direct symbol.
+//
+// ★★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) TURNED A TWO-WAY SPLIT INTO A THREE-WAY ONE,
+// and this test grew a third arm rather than dropping the arm that changed. `atexit`
+// narrowed from ["pe","macho"] to ["macho"] ALONE because ucrtbase.dll exports NO
+// `atexit` at all (MEASURED, objdump -p) — the UCRT's `atexit` is a static-lib shim over
+// the exported `_crt_atexit`, EXACTLY the shape glibc's libc_nonshared.a shim has over
+// `__cxa_atexit`. So the pe arm did not disappear; it moved to its own real export, and
+// pinning all THREE sets exactly is what makes that visible. Note the failure modes are
+// now symmetric and both spawn/load-time, i.e. both invisible to a compile-only CI: an
+// elf `atexit` import dies at spawn with ld.so's undefined-symbol error, and under
+// D-FFI-DESCRIPTOR-EAGER-IMPORT a pe `atexit` import breaks EVERY pe binary's LOAD with
+// 0xC0000139. The availability sets are load-bearing runtime-correctness config.
+//
+// The pe arm's DELIVERY is verified elsewhere and is deliberately not re-derived here:
+// `_crt_atexit` registers handlers that only the ucrtbase `exit` path drains, so
+// pe64-x86_64-windows-exec.format.json's `processExit` had to be repointed off kernel32
+// `ExitProcess` in the SAME commit (tests/link/test_object_format_schema.cpp pins that
+// row; examples/c-subset/shipped_atexit is the byte-exact runtime witness).
+//
+// RED-ON-DISABLE: adding "elf" to atexit's set (the naive "fix" for an elf atexit user),
+// re-widening it back to include "pe" (the naive "fix" for a pe atexit user, which would
+// break every pe binary's load), widening __cxa_atexit beyond elf, or widening
+// _crt_atexit beyond pe — each flips an exact-set assert here before the regression can
+// reach a spawn/load-time failure.
 TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
     fs::path const shippedRoot = shippedLibsRoot();
     ASSERT_FALSE(shippedRoot.empty())
@@ -4865,30 +4919,45 @@ TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
 
     std::vector<std::string> atexitSet;
     std::vector<std::string> cxaSet;
+    std::vector<std::string> crtSet;
     bool sawAtexit = false;
     bool sawCxa    = false;
+    bool sawCrt    = false;
     for (auto const& s : desc->symbols) {
         if (s.name == "atexit")        { sawAtexit = true; atexitSet = s.availableObjectFormats; }
         if (s.name == "__cxa_atexit")  { sawCxa    = true; cxaSet    = s.availableObjectFormats; }
+        if (s.name == "_crt_atexit")   { sawCrt    = true; crtSet    = s.availableObjectFormats; }
     }
     ASSERT_TRUE(sawAtexit) << "atexit absent from stdlib.json symbols";
     ASSERT_TRUE(sawCxa)    << "__cxa_atexit absent from stdlib.json symbols";
+    ASSERT_TRUE(sawCrt)
+        << "_crt_atexit absent from stdlib.json symbols — the pe arm of the split has no "
+           "registration primitive at all, so pe `atexit(f)` cannot resolve";
 
-    EXPECT_EQ(atexitSet, (std::vector<std::string>{"pe", "macho"}))
-        << "atexit must stay OFF elf: glibc's libc.so.6 has no `atexit` dynsym "
-           "export -- an elf by-name import dies loud at spawn (ld.so symbol "
-           "lookup error), witnessed c155 on glibc 2.39";
+    EXPECT_EQ(atexitSet, (std::vector<std::string>{"macho"}))
+        << "atexit must stay OFF elf (glibc's libc.so.6 has no `atexit` dynsym export -- "
+           "an elf by-name import dies loud at spawn with ld.so's symbol lookup error, "
+           "witnessed c155 on glibc 2.39) AND OFF pe (ucrtbase.dll exports no `atexit` "
+           "either, and under D-FFI-DESCRIPTOR-EAGER-IMPORT that breaks every pe binary's "
+           "LOAD with 0xC0000139) -- macho alone ships the direct libSystem symbol";
     EXPECT_EQ(cxaSet, (std::vector<std::string>{"elf"}))
         << "__cxa_atexit is the elf-only registration primitive (GLIBC_2.2.5 "
-           "dynsym export); pe/macho ship the standard `atexit` instead";
+           "dynsym export); pe uses _crt_atexit and macho the standard `atexit`";
+    EXPECT_EQ(crtSet, (std::vector<std::string>{"pe"}))
+        << "_crt_atexit is the pe-only registration primitive (a real ucrtbase.dll "
+           "export); it must never widen to elf/macho, where it does not exist";
 
-    // The gate the injector consults, asserted directly for both directions.
+    // The gate the injector consults, asserted directly for every arm x every format —
+    // the full 3x3, so no arm can quietly widen into another's territory.
     EXPECT_FALSE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::Elf));
-    EXPECT_TRUE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::Pe));
     EXPECT_TRUE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::MachO));
     EXPECT_TRUE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::Elf));
     EXPECT_FALSE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::Pe));
     EXPECT_FALSE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::MachO));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(crtSet, ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(crtSet, ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(crtSet, ObjectFormatKind::MachO));
 }
 
 // ── D-LANG-TYPE-IDENTITY-VOCABULARY: the per-DATA-MODEL `when` selector ────

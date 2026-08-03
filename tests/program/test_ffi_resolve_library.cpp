@@ -410,11 +410,35 @@ TEST(FfiResolveLibraryRoundTrip, ShippedSymbolFormatOracleContract) {
     EXPECT_FALSE(availableOn("fdatasync", ObjectFormatKind::Pe));
 
     // (e) An ASYMMETRIC per-symbol gate that excludes a format the descriptor
-    //     itself allows: stdlib.json's `atexit` is ["pe","macho"] (elf routes
-    //     through __cxa_atexit instead).
-    EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::Pe));
+    //     itself allows: stdlib.json's `atexit` is ["macho"] ALONE — elf routes
+    //     through __cxa_atexit and pe through _crt_atexit, each a per-format
+    //     macro over a DIFFERENT real export.
+    //
+    //     ★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) NARROWED this from
+    //     ["pe","macho"], and the pin is TIGHTENED to match: the three
+    //     membership probes are now backed by an EXACT set equality (the (d)/(g)
+    //     form), so a future row that re-widens `atexit` to any extra format
+    //     reds here even if the three probes below would still pass. That
+    //     narrowing is load-bearing, not bookkeeping: ucrtbase.dll exports NO
+    //     `atexit` at all (MEASURED, objdump -p), and under
+    //     D-FFI-DESCRIPTOR-EAGER-IMPORT a pe-available row for an absent export
+    //     breaks EVERY pe binary's LOAD with 0xC0000139. The pe replacement is
+    //     the real ucrtbase export `_crt_atexit`, pinned immediately below —
+    //     WITHOUT that second block this case would merely record that pe lost a
+    //     symbol, and a migration that dropped `atexit` and forgot its
+    //     replacement would look identical.
+    ASSERT_NE(availability("atexit"), nullptr);
+    EXPECT_EQ(*availability("atexit"), (std::vector<std::string>{"macho"}));
+    EXPECT_FALSE(availableOn("atexit", ObjectFormatKind::Pe));
     EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::MachO));
     EXPECT_FALSE(availableOn("atexit", ObjectFormatKind::Elf));
+
+    //     The pe arm's replacement export, gated the mirror-image way.
+    ASSERT_NE(availability("_crt_atexit"), nullptr);
+    EXPECT_EQ(*availability("_crt_atexit"), (std::vector<std::string>{"pe"}));
+    EXPECT_TRUE(availableOn("_crt_atexit", ObjectFormatKind::Pe));
+    EXPECT_FALSE(availableOn("_crt_atexit", ObjectFormatKind::MachO));
+    EXPECT_FALSE(availableOn("_crt_atexit", ObjectFormatKind::Elf));
 
     // (f) FALLBACK TIER 3 — a row with NO per-symbol gate in a descriptor with
     //     NO document gate is available EVERYWHERE, spelled as the EMPTY set

@@ -64,15 +64,18 @@ struct MergeCuInput {
     TypeInterner const*                  interner = nullptr;
     std::function<std::string(SymbolId)> nameOf;
     std::span<ExternImport const>        externImports;
-    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): this CU's pe64 <threads.h> SHIM
-    // symbols (SymbolId.v → recipe id). These are REFERENCED-ONLY in `mir` (CST→HIR
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
+    // this CU's shipped-library SHIM symbols (SymbolId.v → recipe id) — BOTH families,
+    // pe64 <threads.h> (mtx_lock…) and pe64 <stdio.h> (printf…); the merge treats them
+    // identically and the per-family split happens after it, at the synth seam. These are
+    // REFERENCED-ONLY in `mir` (CST→HIR
     // skipped their import; the def is synthesized POST-merge), so the def/global/extern
     // planning never assigns them a merged id — without this the merge ABORTS
     // (`mergedSymbolOf`) on a cloned caller's `GlobalAddr(shimSym)`. The merge registers
     // each with a merged id (unified by name across CUs) so the clone remaps and the
     // merged id reaches `symbolNames` for the post-merge shim synthesis. nullptr / empty
-    // for every non-threads TU (the overwhelming majority). Non-owning — the map lives
-    // on the caller's `CuMirModule.threadsRecipes`, which outlives the merge.
+    // for every TU touching neither family (the overwhelming majority). Non-owning — the
+    // map lives on the caller's `CuMirModule.libraryShimRecipes`, which outlives the merge.
     std::unordered_map<std::uint32_t, std::string> const* synthRecipes = nullptr;
 };
 

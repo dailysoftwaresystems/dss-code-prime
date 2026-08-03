@@ -2491,6 +2491,24 @@ std::optional<MirFuncId> findFuncBySymbol(Mir const& mir, std::uint32_t symV) {
     return std::nullopt;
 }
 
+// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — WHY THESE TESTS PASS A WHOLE `VaListLayout`
+// AND NOT THE `VaListStrategy` THEY USED TO. The strategy ALONE does not determine the
+// va leaf: `HomogeneousPointer` forks on `variadicUsesOverflowBase` into the Win64 home
+// base (`VaHomeArgAreaAddr`) and the Apple-arm64 overflow base (`VaOverflowArgAreaAddr`)
+// — see src/mir/merge/synth_stdio_shim.hpp. So the layout is spelled out FIELD BY FIELD
+// here, and `variadicUsesOverflowBase = false` is written explicitly rather than left to
+// the struct's default: it is the field that makes `VaHomeArgAreaAddr` the RIGHT leaf
+// below instead of an accident. `namedArgSlotBytes` is filled so the layout is a
+// plausible whole, not a one-field stub. The overflow-base twin arm is pinned by its own
+// dedicated suite (tests/mir/test_synth_stdio_shim_valist.cpp).
+VaListLayout vaListLayoutOf(VaListStrategy strategy) {
+    VaListLayout l;
+    l.strategy                 = strategy;
+    l.namedArgSlotBytes        = 8;
+    l.variadicUsesOverflowBase = false;
+    return l;
+}
+
 } // namespace
 
 // The HAPPY PATH, asserted STRUCTURALLY rather than "it returned true": the referenced
@@ -2510,7 +2528,8 @@ TEST(SynthStdioShim, SprintfSynthesizesVariadicBodyOverImportedUcrtCore) {
     std::vector<ExternImport> externs = ucrtCoreImports();
     std::vector<ExternImport> const before = externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes,
+                                    vaListLayoutOf(VaListStrategy::HomogeneousPointer),
                                     externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2603,7 +2622,8 @@ TEST(SynthStdioShim, UnknownRecipeIdFailsLoud) {
     std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "no_such_recipe"}};
     std::vector<ExternImport> externs = ucrtCoreImports();
     DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
+                                     vaListLayoutOf(VaListStrategy::HomogeneousPointer),
                                      externs, rep))
         << "a recipe with no synth arm MUST fail loud, never silently skip the definition";
     EXPECT_TRUE(rep.hasErrors())
@@ -2620,18 +2640,22 @@ TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
     std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
     std::vector<ExternImport> externs;   // NO __stdio_common_vsprintf
     DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::HomogeneousPointer,
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
+                                     vaListLayoutOf(VaListStrategy::HomogeneousPointer),
                                      externs, rep))
         << "an unimported UCRT core MUST fail loud (descriptor/pass drift)";
     EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }
 
-// FAIL-LOUD (3/3): NO va-list strategy resolved. `CuMirModule::vaListStrategy` is
-// `std::optional` precisely so UNRESOLVED is distinguishable from resolved — the shape it
-// replaced defaulted a missing strategy to SysVRegisterSave, which READS as "the target
-// declared SysV" when the truth is "nobody ever asked the target". With a real stdio
-// recipe in hand that ambiguity must be an ERROR: the alternative is forwarding a va_list
-// under a guessed ABI, which miscompiles silently.
+// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout` (D-FFI-PE-CRT-
+// UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
+// `optional<VaListLayout>`) is `std::optional` precisely so UNRESOLVED is distinguishable
+// from resolved — and widening it did NOT weaken that, because a default-constructed
+// `VaListLayout` is a REAL one: its `strategy` defaults to SysVRegisterSave, so a
+// non-optional field would READ as "the target declared SysV" when the truth is "nobody
+// ever asked the target". With a real stdio recipe in hand that ambiguity must be an
+// ERROR: the alternative is forwarding a va_list under a guessed ABI, which miscompiles
+// silently.
 TEST(SynthStdioShim, NulloptVaListStrategyWithRecipesFailsLoud) {
     TypeInterner in{CompilationUnitId{1}};
     Mir mir = buildSprintfCaller(in);
@@ -2645,10 +2669,12 @@ TEST(SynthStdioShim, NulloptVaListStrategyWithRecipesFailsLoud) {
 }
 
 // FAIL-LOUD (bonus): a RESOLVED but unimplemented strategy. Only the HomogeneousPointer
-// (Win64) arm is built — no elf/macho descriptor declares a stdio synthesize recipe, so a
-// SysVRegisterSave arm would be a speculative build. Refusing is right; silently emitting
-// the Win64 forward under a SysV target would be a wrong-ABI miscompile. Distinct from the
-// nullopt case above: this one is "the target ANSWERED, with a model we don't implement".
+// arm is built (both of its bases — see `vaListLayoutOf` above); no elf/macho descriptor
+// declares a stdio synthesize recipe, so the SysVRegisterSave and Aapcs64DualCursor arms
+// would be speculative builds. Refusing is right; silently emitting the pointer-shaped
+// forward under a register-save-area target would be a wrong-ABI miscompile. Distinct from
+// the nullopt case above: this one is "the target ANSWERED, with a model we don't
+// implement".
 TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
     TypeInterner in{CompilationUnitId{1}};
     Mir mir = buildSprintfCaller(in);
@@ -2656,7 +2682,8 @@ TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
     std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
     std::vector<ExternImport> externs = ucrtCoreImports();
     DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, VaListStrategy::SysVRegisterSave,
+    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
+                                     vaListLayoutOf(VaListStrategy::SysVRegisterSave),
                                      externs, rep))
         << "an unimplemented va_list model MUST fail loud, never forward under a wrong ABI";
     EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";

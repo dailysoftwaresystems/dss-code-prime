@@ -705,11 +705,12 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             return std::string{};
         };
         in.externImports = cuMir.externImports;
-        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): this CU's referenced-only pe64
-        // <threads.h> shim symbols, so the merge planning assigns them a merged id
-        // (else the clone aborts on a shim GlobalAddr — the multi-CU threads defect).
+        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
+        // this CU's referenced-only shipped-library shim symbols (BOTH the <threads.h> and
+        // <stdio.h> families), so the merge planning assigns them a merged id (else the
+        // clone aborts on a shim GlobalAddr — the multi-CU threads defect).
         // Non-owning; `cuMir` (in `cuMirs`) outlives the merge.
-        in.synthRecipes = &cuMir.threadsRecipes;
+        in.synthRecipes = &cuMir.libraryShimRecipes;
         mergeInputs.push_back(std::move(in));
     }
 
@@ -797,7 +798,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION the reconstructed recipe map by
         // `dss::ffi::shimFamilyOf` BEFORE calling either synth pass — the SAME split
-        // `lowerCuMirToAssembly` applies to the single-CU `threadsRecipes` map
+        // `lowerCuMirToAssembly` applies to the single-CU `libraryShimRecipes` map
         // (compile_pipeline.cpp), for the identical reason: each pass fails loud on a
         // recipe id it has no switch arm for (its own anti-vocab-drift backstop), so one
         // pass seeing the other family's ids would abort a build that never should have
@@ -840,20 +841,23 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         }
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
-        // `mergedStdioRecipes` is empty. The va_list strategy is read from the SAME
+        // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
         // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
-        // index was derived from — no second lookup, no format-name branch. A CC that
-        // declares no `vaListLayout` propagates as `nullopt`, NOT as a defaulted strategy:
+        // index was derived from — no second lookup, no format-name branch. It is passed
+        // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
+        // the shim's va leaf, and dropping it here would silently emit the home-base leaf
+        // on an overflow-base target (see `CuMirModule::vaListLayout`). A CC that declares
+        // no `vaListLayout` propagates as `nullopt`, NOT as a default-constructed layout:
         // "nothing declared" must stay distinguishable from a real declaration all the way
         // to the synth pass, which refuses it loudly (the single-CU seam threads the same
-        // optional through `CuMirModule::vaListStrategy`). Consulted only if a stdio recipe
+        // optional through `CuMirModule::vaListLayout`). Consulted only if a stdio recipe
         // actually appears.
-        std::optional<VaListStrategy> vaListStrategy;
+        std::optional<VaListLayout> vaListLayout;
         if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
-            vaListStrategy = abi->cc->vaListLayout->strategy;
+            vaListLayout = *abi->cc->vaListLayout;
         }
         if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
-                                 mergedStdioRecipes, vaListStrategy,
+                                 mergedStdioRecipes, vaListLayout,
                                  merged->externImports, reporter)) {
             return false;  // recipe/helper-import/va-strategy mismatch — reported.
         }

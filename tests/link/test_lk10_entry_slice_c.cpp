@@ -12,10 +12,21 @@
 //       functions[0]).
 //   (b) The run-harness GENUINELY spawns the file and asserts the
 //       OS exit code — not mocked, not in-memory.
-//   (c) The synthetic ExitProcess ExternImport threads correctly
+//   (c) The synthetic process-exit ExternImport threads correctly
 //       through the existing PE IAT writer (LK6 cycle 2a) — the
 //       produced binary has a real IAT slot resolving to
-//       kernel32!ExitProcess at load time.
+//       ucrtbase!exit at load time.
+//
+// ★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) REPOINTED THE PE SPINE from
+// kernel32!ExitProcess to ucrtbase!exit, so every "ExitProcess" below
+// became "exit". This is NOT cosmetic and the pins here are NOT
+// loosened to absorb it: the old spine worked only because msvcrt's
+// DLL-detach handler happened to drain the app's onexit table, and
+// ucrtbase's does not — under ExitProcess, `_crt_atexit`-registered
+// handlers would stay registered and never run (a silent behavioural
+// regression). Each assertion below still pins ONE exact library +
+// ONE exact mangled name, so a drift back to kernel32/ExitProcess —
+// or a slip to any other CRT export — reds immediately.
 
 #include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -49,7 +60,8 @@ namespace {
 // emitter wraps this with the Slice C `_start` trampoline that
 // calls into it, moves the return value (rax = 42) into the
 // status-arg register (rcx on MS x64), and invokes
-// kernel32!ExitProcess(42) via the IAT.
+// ucrtbase!exit(42) via the IAT (D-FFI-PE-CRT-UCRT-MIGRATION P3;
+// was kernel32!ExitProcess).
 //
 // Hand-assembled bytes (NOT through MIR/LIR — the test fixture
 // stands alone for substrate clarity):
@@ -57,9 +69,9 @@ namespace {
 //   C3                 ret
 //
 // The trampoline does NOT emit a trailing `ret`: its control flow
-// is `call user_entry → mov ecx, eax → call ExitProcess →
+// is `call user_entry → mov ecx, eax → call exit →
 // unreachable`. Under direct-plt (D-FFI-PE-IMPORT-THUNK) the
-// ExitProcess call is a plain `call rel32` (E8) to the synthesized
+// process-exit call is a plain `call rel32` (E8) to the synthesized
 // import thunk — was `call_indirect_via_extern` (FF 15) under the
 // retired indirect-slot model. The user fn's `ret` IS reached
 // (returning into the trampoline body), but no `ret` is reachable
@@ -268,9 +280,13 @@ TEST(LK10EntrySliceC, ImageEntryOverrideOptionalDiscriminantMatters) {
            "has_value() (NOT by a 0-sentinel — see field docblock)";
 }
 
+// NOTE the TEST NAME still says "ExitProcess": it is referenced by name from
+// tests/link/test_elf_dyn_writer.cpp's exec-arm cross-reference, so it is left
+// alone deliberately rather than renamed here and orphaned there. What the test
+// PINS is the current spine, below.
 TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     // (c) invariant pin: the trampoline's synthetic
-    // ExternImport{kernel32.dll, ExitProcess} must be injected so
+    // ExternImport{ucrtbase.dll, exit} must be injected so
     // the PE walker's existing IAT writer (LK6 cycle 2a) emits a
     // real IAT slot. Verify by inspecting the post-link module's
     // externImports after running the trampoline emitter directly
@@ -287,14 +303,18 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     ASSERT_TRUE(linker::injectEntryTrampoline(
         mod, **target, **format, rep));
     EXPECT_EQ(rep.errorCount(), 0u);
-    // Post-injection: 1 synthetic ExternImport for ExitProcess.
+    // Post-injection: 1 synthetic ExternImport for the CRT `exit`
+    // (D-FFI-PE-CRT-UCRT-MIGRATION P3 repointed this pair from
+    // kernel32.dll/ExitProcess; the pin stays an EXACT match on BOTH
+    // halves, so neither a stale kernel32 nor a wrong CRT export
+    // passes).
     ASSERT_EQ(mod.externImports.size(), 1u);
-    EXPECT_EQ(mod.externImports[0].libraryPath, "kernel32.dll");
-    EXPECT_EQ(mod.externImports[0].mangledName, "ExitProcess");
+    EXPECT_EQ(mod.externImports[0].libraryPath, "ucrtbase.dll");
+    EXPECT_EQ(mod.externImports[0].mangledName, "exit");
     // The trampoline at functions[0] has a Relocation targeting the
     // synthetic ExternImport's SymbolId — that reloc patches the call
     // disp32 (E8 disp32 under direct-plt; was FF 15 disp32 under the
-    // retired indirect-slot model) to the ExitProcess import thunk's
+    // retired indirect-slot model) to the `exit` import thunk's
     // RVA at link time.
     ASSERT_GE(mod.functions.size(), 2u);
     auto const& tramp = mod.functions[0];
@@ -307,7 +327,7 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     }
     EXPECT_TRUE(found)
         << "trampoline must have a Relocation targeting the "
-           "synthetic ExitProcess SymbolId — that's what threads "
+           "synthetic process-exit SymbolId — that's what threads "
            "through the PE walker's IAT writer";
     // The trampoline must also have a Relocation targeting the
     // user function (the direct `call user_entry`).
@@ -328,7 +348,7 @@ TEST(LK10EntrySliceC, MaxExistingSymbolIdScansDataItems) {
     // D-LK4-RODATA-PRODUCER-STRING audit-fold pin (2026-06-02):
     // `entry_trampoline.cpp::maxExistingSymbolIdV` was extended to
     // scan `module.dataItems` so the trampoline's synthetic _start
-    // and ExitProcess SymbolId mints can't collide with a string-
+    // and process-exit SymbolId mints can't collide with a string-
     // literal-promoted rodata global. Without this scan, the
     // collision would surface as `K_DuplicateDataSymbol` in the PE
     // walker's symbolVa loop (loud but root-cause-distant). This
@@ -351,7 +371,7 @@ TEST(LK10EntrySliceC, MaxExistingSymbolIdScansDataItems) {
         mod, **target, **format, rep));
     EXPECT_EQ(rep.errorCount(), 0u);
     // Trampoline injection adds a synthetic _start at functions[0]
-    // and a synthetic ExitProcess extern. Both SymbolIds must be
+    // and a synthetic process-exit extern. Both SymbolIds must be
     // strictly greater than 100 (the rodata item's SymbolId).
     ASSERT_GE(mod.functions.size(), 2u);
     EXPECT_GT(mod.functions[0].symbol.v, 100u)
@@ -360,7 +380,7 @@ TEST(LK10EntrySliceC, MaxExistingSymbolIdScansDataItems) {
            "bearing defense against K_DuplicateDataSymbol";
     ASSERT_GE(mod.externImports.size(), 1u);
     EXPECT_GT(mod.externImports[0].symbol.v, 100u)
-        << "synthetic ExitProcess SymbolId must also exceed "
+        << "synthetic process-exit SymbolId must also exceed "
            "rodata item's SymbolId";
     // Cross-check: the rodata symbol itself must remain in dataItems
     // with its original ID (the audit-fold extension is a SCAN, not
@@ -452,7 +472,7 @@ TEST(LK10EntrySliceC, SyscallArmInjectsCleanlyOnElfExec) {
         << "Syscall arm must NOT inject a synthetic ExternImport "
            "— that's only the ByNameImport arm's behavior.";
     // Trampoline at functions[0] has the relocation to user_entry
-    // (REL32 for the direct `call`). No ExitProcess reloc.
+    // (REL32 for the direct `call`). No process-exit reloc.
     ASSERT_GE(mod.functions[0].relocations.size(), 1u);
     bool userCallFound = false;
     for (auto const& r : mod.functions[0].relocations) {
@@ -510,8 +530,10 @@ TEST(LK10EntrySliceC, MsX64TrampolinePrologueIsSubRsp0x28) {
     // imm32 LE). Encoded bytes: `48 81 EC 28 00 00 00`.
     //
     // A regression to this number re-opens STATUS_ACCESS_VIOLATION
-    // (0xC0000005) on ExitProcess's aligned-SSE stores — the exact
-    // bug closed by D-LK10-ENTRY-TRAMP-PROLOGUE.
+    // (0xC0000005) on the process-exit callee's aligned-SSE stores —
+    // the exact bug closed by D-LK10-ENTRY-TRAMP-PROLOGUE (first seen
+    // in kernel32!ExitProcess; the callee is now ucrtbase!exit, which
+    // has the same Win64 stack-alignment requirement).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
@@ -970,11 +992,11 @@ TEST(LK10EntrySliceC, RunnableBinaryExitFortyTwo) {
            "Windows loader level (D-LK10-ENTRY substrate gap). "
            "Diagnostic: " << result.diagnostic;
     EXPECT_FALSE(result.timedOut)
-        << "binary should exit promptly via ExitProcess(42)";
+        << "binary should exit promptly via exit(42)";
     EXPECT_EQ(result.exitCode, 42u)
         << "THE acceptance criterion: OS-reported exit code must "
            "be 42 (the user fn's return value, threaded through "
-           "the Slice C trampoline → mov ecx, eax → ExitProcess "
+           "the Slice C trampoline → mov ecx, eax → ucrtbase!exit "
            "via IAT). Got: " << result.exitCode;
 }
 #endif

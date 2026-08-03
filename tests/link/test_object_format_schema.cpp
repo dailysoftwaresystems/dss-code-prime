@@ -526,6 +526,24 @@ inline void expectRejected(std::string_view jsonText,
 }
 }  // namespace
 
+// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) REPOINTED THIS PAIR from kernel32
+// `ExitProcess` to ucrtbase `exit`, and the pin is re-aimed, not relaxed —
+// still two EXACT string equalities, so a drift back to the OS primitive
+// reds on the first one.
+//
+// WHY the shipped format had to change: the old spine delivered C's
+// return-from-main semantics only as a SIDE EFFECT of msvcrt's DLL-detach
+// handler draining the app's onexit table. ucrtbase's detach flushes streams
+// but does NOT run that table (in a real MSVC program `exit()` drains it, in
+// the static startup code). So once stdlib.json's `atexit` became
+// `_crt_atexit`, an `ExitProcess` spine would have left every registered
+// handler UNCALLED — silently, with no diagnostic. This row and that macro
+// are one change and must stay in lock-step.
+//
+// RED-on-disable: revert pe64-x86_64-windows-exec.format.json's processExit
+// to kernel32/ExitProcess and BOTH string EXPECTs fail here — plus
+// examples/c-subset/shipped_atexit goes red end-to-end on the Windows leg,
+// which is the runtime witness this unit pin stands in for.
 TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(r.has_value());
@@ -533,8 +551,12 @@ TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     ASSERT_TRUE(pe.has_value())
         << "PE Exec must declare processExit (D-LK10-ENTRY Slice B)";
     EXPECT_EQ(pe->mechanism, ExitMechanism::ByNameImport);
-    EXPECT_EQ(pe->importLibraryPath, "kernel32.dll");
-    EXPECT_EQ(pe->importMangledName, "ExitProcess");
+    EXPECT_EQ(pe->importLibraryPath, "ucrtbase.dll")
+        << "the pe spine terminates through the CRT the program is bound to, "
+           "NOT kernel32 (D-FFI-PE-CRT-UCRT-MIGRATION P3)";
+    EXPECT_EQ(pe->importMangledName, "exit")
+        << "the canonical C name `exit` — pe adds no leading underscore; this "
+           "is what drains the `_crt_atexit` table before the streams flush";
     EXPECT_EQ((*r)->entryCallingConvention(), "ms_x64");
 }
 

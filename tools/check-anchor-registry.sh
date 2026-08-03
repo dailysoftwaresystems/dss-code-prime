@@ -28,8 +28,27 @@ cd "${REPO_ROOT}"
 # treated as informal; the registry contract enforces ≥3 segments.
 ANCHOR_REGEX='\<D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
 
-SRC_ANCHORS="$(grep -rEoh "${ANCHOR_REGEX}" src/ examples/ \
-    --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null \
+# ── real-examples/ ADDED 2026-08-03 (TF-C111), D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS.
+# The guard covered `src/ examples/` only, so every `D-*` cited in a HARNESS
+# DRIVER resolved to nothing and failed nothing. Measured instance: the name
+# `D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE` was carried in two hand-off
+# documents AS THOUGH TRACKED, with ZERO hits repo-wide and no registry row.
+# An unenforced citation is a citation that rots.
+# The drivers are SCRIPTS and need their own --include set; reusing the source
+# filters would scan real-examples/ for *.cpp, find nothing, and be the silent
+# no-op version of this fix. Kept as a SEPARATE grep rather than widening the
+# first one, so the two roots cannot cross-contaminate filters.
+# ⚠ Measured before landing: 22 anchors cited across the drivers, all 22 already
+# resolving. A future root that reds is closed by REGISTERING the rows, never by
+# narrowing the guard.
+# ★ The .ps1 sibling MUST scan the identical set (D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED
+# records that the pairing is unenforced — pairing by EXISTENCE is not pairing by
+# BEHAVIOUR), so this change is mirrored there in the same commit, in BOTH the
+# collection above and the FAIL-path "cited in:" locator.
+SRC_ANCHORS="$( { grep -rEoh "${ANCHOR_REGEX}" src/ examples/ \
+        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null; \
+      grep -rEoh "${ANCHOR_REGEX}" real-examples/ \
+        --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null; } \
     | sort -u || true)"
 
 # For each src anchor, check substring presence in any .plans/*.md.
@@ -57,9 +76,14 @@ echo "have no matching row/citation in any .plans/*.md file:"
 echo ""
 for anchor in "${MISSING[@]}"; do
     echo "  ${anchor}"
-    grep -rln "${anchor}" src/ examples/ \
-        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' \
-        2>/dev/null | sed 's/^/    cited in: /'
+    # Same scanned set as the collection above — an anchor this guard FOUND must
+    # also be LOCATABLE here, or the FAIL output names a name with no "cited in:"
+    # line and the fix becomes a guessing game.
+    { grep -rln "${anchor}" src/ examples/ \
+        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null; \
+      grep -rln "${anchor}" real-examples/ \
+        --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null; } \
+        | sed 's/^/    cited in: /'
 done
 echo ""
 echo "Fix: either"
