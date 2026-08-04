@@ -32,10 +32,12 @@ namespace dss::ffi {
 // corruption (an out-of-section address, an out-of-range `n_sect`, an
 // empty resolved name) is skipped + summarized.
 //
-// 64-bit Mach-O only (`mach_header_64` / magic `0xFEEDFACF`). FAT
-// universal binaries (`0xCAFEBABE`) and 32-bit Mach-O (`0xFEEDFACE`)
-// are dispatched to `UnsupportedFormat` upstream -- anchors
-// D-FF1-MACHO-FAT and D-FF1-MACHO-32 reserved.
+// 64-bit Mach-O only (`mach_header_64` / magic `0xFEEDFACF`, stored
+// little-endian). FAT universal binaries (`0xCAFEBABE` / `0xCAFEBABF`,
+// stored BIG-endian -- `fat_header` is big-endian on disk regardless of
+// its slices) and 32-bit Mach-O (`0xFEEDFACE`) are dispatched to
+// `UnsupportedFormat` upstream -- anchors D-FF1-MACHO-FAT and
+// D-FF1-MACHO-32 reserved.
 //
 // Kind classification (c160): a section carrying instruction attributes
 // (`S_ATTR_PURE_INSTRUCTIONS` / `S_ATTR_SOME_INSTRUCTIONS`) is code ->

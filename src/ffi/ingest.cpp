@@ -235,6 +235,12 @@ ingest(std::span<IngestionSource const> sources,
     struct TaggedRow {
         ImportSurface row;
         bool fromBinary = false;
+        // D-FFI-DECLARED-IMPORT-NAME: the caller-STATED runtime identity of the
+        // SOURCE this row came from (`BinaryLibrarySource::declaredImportName`;
+        // empty == not stated). Carried per-row because the precedence is
+        // decided per-EXTERN below, where only the matched row is in scope --
+        // the source it came from is no longer reachable there.
+        std::string declaredImportName;
     };
     std::vector<TaggedRow> aggregated;
 
@@ -250,15 +256,19 @@ ingest(std::span<IngestionSource const> sources,
         // import records the loader-resolvable soname/DLL-name (the file's
         // basename) rather than the absolute build-time path. Empty leaves
         // the reader's label intact (the pre-c162 header/JSON behavior).
+        // This is precedence LEVEL 3 -- levels 1 + 2 are ranked over it at
+        // the per-extern decision site below.
+        std::string declaredImportName;  // D-FFI-DECLARED-IMPORT-NAME (level 1)
         if (fromBinary) {
             auto const& bin = std::get<BinaryLibrarySource>(src);
             if (!bin.importName.empty()) {
                 for (auto& r : rows) r.libraryPath = bin.importName;
             }
+            declaredImportName = bin.declaredImportName;
         }
         aggregated.reserve(aggregated.size() + rows.size());
         for (auto& r : rows) {
-            aggregated.push_back({std::move(r), fromBinary});
+            aggregated.push_back({std::move(r), fromBinary, declaredImportName});
         }
         ++result.sourcesProcessed;
     }
@@ -361,21 +371,36 @@ ingest(std::span<IngestionSource const> sources,
         meta.mangledName   = linkerName;
         meta.linkage       = toFfiLinkage(matched.row.linkage);
         meta.visibility    = toFfiVisibility(matched.row.visibility);
-        // D-FF1-READER-SONAME (c171): PREFER the binary's OWN embedded identity
-        // (ELF DT_SONAME / Mach-O LC_ID_DYLIB install name / PE export DllName,
-        // extracted by the FF1 readers into `row.soname`) as the recorded
-        // import library — it is exactly what a real linker records as the
-        // DT_NEEDED / LC_LOAD_DYLIB / import DllName the LOADER resolves at
-        // runtime. Falls back to the reader's `libraryPath` label (the c162
-        // driver-supplied basename stand-in, `BinaryLibrarySource.importName`)
-        // when the binary declares no soname. This COMPLETES the "honest
-        // stand-in until FF1 extracts them" transition the c162 importName
-        // override documented (ingest.hpp). The linker's DT_NEEDED is emitted
-        // from `ExternImport.libraryPath` == this field, so preferring the
-        // soname HERE is what makes the runtime dependency correct.
-        meta.importLibrary = matched.row.soname.empty()
-                                 ? matched.row.libraryPath
-                                 : matched.row.soname;
+        // ★ THE RECORDED-IMPORT-IDENTITY DECISION SITE ★ — the ONE place the
+        // three levels documented on `BinaryLibrarySource` (ingest.hpp) are
+        // ranked. The linker's DT_NEEDED / LC_LOAD_DYLIB / PE import-descriptor
+        // name is emitted from `ExternImport.libraryPath` == this field, so
+        // this expression IS the artifact's runtime dependency.
+        //
+        //   1. D-FFI-DECLARED-IMPORT-NAME — the caller STATED the identity.
+        //      Beats everything: the file we READ may be a cross-compilation
+        //      STAND-IN whose own embedded identity names a path that will not
+        //      exist on the target (a MacPorts `/opt/local/...` LC_ID_DYLIB
+        //      read on a Windows host). Symbols from the file, identity from
+        //      the declaration -- the sysroot-stub / `.tbd` / `-dylib_file`
+        //      contract. Empty == not stated, so it falls through.
+        //   2. D-FF1-READER-SONAME (c171) — the binary's OWN embedded identity
+        //      (ELF DT_SONAME / Mach-O LC_ID_DYLIB install name / PE export
+        //      DllName, all normalised into `row.soname` by the FF1 readers).
+        //      Exactly what a real linker records when it is handed the real
+        //      library, so it is right whenever no declaration overrides it.
+        //   3. the reader's `libraryPath` label — the c162 driver-supplied
+        //      basename stand-in (`BinaryLibrarySource::importName`), for a
+        //      library that declares no soname at all (the `gcc -shared`
+        //      no-`-soname` shape).
+        //
+        // FORMAT-BLIND: no arm of this branches on ObjectFormatKind -- the
+        // readers already collapsed all three formats' embedded identities
+        // into `row.soname`.
+        meta.importLibrary =
+            !matched.declaredImportName.empty() ? matched.declaredImportName
+          : !matched.row.soname.empty()         ? matched.row.soname
+          :                                       matched.row.libraryPath;
         // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the required symbol
         // version (parity with the FF5 source-decl path). Dormant today
         // (FF1 is the binary-reader ingestion path), but a versioned
@@ -386,11 +411,19 @@ ingest(std::span<IngestionSource const> sources,
         // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
         // eager ExternDeclRef routed here must not silently drop the field.
         meta.isEagerImport = ext.isEagerImport;
-        // The raw embedded soname, at its semantic home (the DT_SONAME of
-        // `importLibrary`). Populated now that the FF1 readers extract it;
-        // `ExternImport` carries no separate soname yet, so DT_NEEDED rides
-        // `importLibrary` above (a distinct ExternImport.soname path is the
-        // future refinement, not needed for the runtime-correct dependency).
+        // The raw OBSERVED embedded soname of the binary that was READ.
+        // Populated now that the FF1 readers extract it; `ExternImport` carries
+        // no separate soname yet, so DT_NEEDED rides `importLibrary` above (a
+        // distinct ExternImport.soname path is the future refinement, not
+        // needed for the runtime-correct dependency).
+        //
+        // NOT re-pointed by a level-1 declaration (D-FFI-DECLARED-IMPORT-NAME):
+        // this field answers "what did the file we read declare about itself",
+        // `importLibrary` answers "what identity do we RECORD". When a caller
+        // states an identity the two legitimately differ (that is the whole
+        // point of a stand-in binary), and forging this one to match would
+        // destroy the only evidence of which file was actually read. Consumed
+        // today only by the HIR text dump (`hir_text.cpp`).
         meta.soname = matched.row.soname;
 
         ffiMap.set(ext.node, std::move(meta));

@@ -397,8 +397,14 @@ TEST(BinaryReader, PeMagicTooShortToBeValidIsCorrupted) {
 // route to UnsupportedFormat with remediation-specific messages —
 // anchors D-FF1-MACHO-FAT and D-FF1-MACHO-32).
 TEST(BinaryReader, MachoFatMagicDispatchesToUnsupportedFormat) {
-    // 0xCAFEBABE LE — universal/FAT binary header.
-    std::vector<std::uint8_t> fat = {0xBE, 0xBA, 0xFE, 0xCA, 0x00};
+    // FAT_MAGIC on disk. `struct fat_header` is BIG-ENDIAN ON DISK by
+    // definition (Apple <mach-o/fat.h>), so 0xCAFEBABE is the byte
+    // sequence CA FE BA BE — NOT the BE BA FE CA this fixture used to
+    // carry. That stale spelling was the byte-swapped FAT_CIGAM view, and
+    // it made this test green against a `guessFormat` that could never
+    // classify a real universal binary. See the D-FF1-MACHO-FAT block in
+    // tests/ffi/test_binary_reader_macho.cpp for the full fixtures.
+    std::vector<std::uint8_t> fat = {0xCA, 0xFE, 0xBA, 0xBE, 0x00};
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(fat, "fake.dylib", rep);
     ASSERT_FALSE(r.has_value());
@@ -406,6 +412,44 @@ TEST(BinaryReader, MachoFatMagicDispatchesToUnsupportedFormat) {
     EXPECT_NE(r.error().detail.find("FAT"), std::string::npos)
         << "operator must see remediation guidance (lipo -thin)";
     EXPECT_NE(r.error().detail.find("D-FF1-MACHO-FAT"), std::string::npos);
+}
+
+// The byte-SWAPPED spelling (FAT_CIGAM, 0xBEBAFECA) is what a
+// little-endian host computes when it loads a real `fat_header` in HOST
+// order — it is never the on-disk byte sequence of a universal binary.
+// A file that literally starts BE BA FE CA is therefore NOT fat and must
+// not borrow the `lipo -thin` remediation. This is exactly the input the
+// pre-fix little-endian `readU32(b,0) == 0xCAFEBABE` test was matching.
+TEST(BinaryReader, ByteSwappedFatSpellingIsNotAcceptedAsFat) {
+    std::vector<std::uint8_t> swapped = {0xBE, 0xBA, 0xFE, 0xCA, 0x00};
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(swapped, "swapped.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnknownFormat)
+        << "BE BA FE CA is FAT_CIGAM (a host-order artifact), not a "
+           "universal binary — accepting it as fat would hand the "
+           "operator a `lipo -thin` instruction that cannot work";
+}
+
+// Diagnostic honesty: the UnknownFormat message enumerates what IS
+// recognised, and `ar` archives ARE (FormatGuess::Ar → readAr). Omitting
+// them told an operator holding a `.a` that static archives are not
+// understood, which is false.
+TEST(BinaryReader, UnknownFormatMessageEnumeratesEveryRecognisedMagic) {
+    std::vector<std::uint8_t> garbage = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(garbage, "garbage.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    auto const& d = r.error().detail;
+    EXPECT_NE(d.find("\\x7FELF"), std::string::npos) << d;
+    EXPECT_NE(d.find("MZ"), std::string::npos) << d;
+    EXPECT_NE(d.find("!<arch>"), std::string::npos)
+        << "`ar` archives dispatch to readAr — the recognised list must "
+           "say so: " << d;
+    EXPECT_NE(d.find("0xFEEDFACF"), std::string::npos) << d;
+    EXPECT_NE(d.find("0xCAFEBABE"), std::string::npos) << d;
+    EXPECT_NE(d.find("0xCAFEBABF"), std::string::npos)
+        << "FAT_MAGIC_64 is recognised too (fat_arch_64 entries): " << d;
 }
 
 TEST(BinaryReader, Macho32MagicDispatchesToUnsupportedFormat) {

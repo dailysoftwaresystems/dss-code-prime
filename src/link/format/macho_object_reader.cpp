@@ -242,8 +242,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     std::uint32_t const magic = rdU32(bytes, kHdrMagicOff);
     if (magic != kMachOMagic64) {
-        // Reject FAT (0xCAFEBABE), big-endian (0xCEFAEDFE), and 32-bit
-        // (0xFEEDFACE) up front -- this reader is 64-bit LE Mach-O only.
+        // Reject FAT/universal, big-endian, and 32-bit up front -- this
+        // reader is 64-bit LE Mach-O only. Stated as ON-DISK BYTES,
+        // because `rdU32` is little-endian and the three do not agree on
+        // byte order: 32-bit thin is CE FA ED FE (LE-reads 0xFEEDFACE),
+        // big-endian thin is FE ED FA CE (LE-reads 0xCEFAEDFE), and a
+        // universal header is CA FE BA BE / CA FE BA BF -- which
+        // LE-reads 0xBEBAFECA / 0xBFBAFECA, NOT the 0xCAFEBABE the
+        // format names it by, since `fat_header` is big-endian on disk.
+        // (See ffi/binary_readers/reader_common.hpp: naming the wrong
+        // one of that pair in an equality test is a bug that already
+        // happened once.) All three fall out of the single
+        // `!= 0xFEEDFACF` gate above; none needs its own arm.
         return fail(DiagnosticCode::F_UnknownBinaryFormat,
             "macho::readRelocatableObject: header magic is not 0xFEEDFACF "
             "(64-bit little-endian Mach-O) -- FAT / big-endian / 32-bit are "

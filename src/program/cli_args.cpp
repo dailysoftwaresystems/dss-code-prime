@@ -132,6 +132,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidDefine:        return "InvalidDefine";
         case CliArgsError::InvalidJobs:          return "InvalidJobs";
         case CliArgsError::InvalidStackReserve:  return "InvalidStackReserve";
+        case CliArgsError::InvalidResolveLibrary: return "InvalidResolveLibrary";
     }
     return "Unknown";
 }
@@ -183,9 +184,15 @@ std::string cliHelpText() {
             "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
             "Only the multi-source build parallelizes; the `=`-form is "
             "also accepted.\n"
-        "  --resolve-library <path>  read a binary's (.so/.dll/.dylib) "
-            "export table to resolve + validate this build's externs "
-            "against it (repeatable; typically a DSS-built library)\n"
+        "  --resolve-library <path>[=<import-name>]  read a binary's "
+            "(.so/.dll/.dylib) export table to resolve + validate this "
+            "build's externs against it (repeatable; typically a DSS-built "
+            "library). The optional `=<import-name>` STATES the runtime "
+            "identity to record (DT_NEEDED / LC_LOAD_DYLIB / PE import "
+            "name) instead of the binary's own embedded soname — for "
+            "cross-compiling against a stand-in library whose on-disk "
+            "identity is not the target's. Split on the LAST `=`; both "
+            "sides must be non-empty.\n"
         "  --stack-reserve <bytes>  stack reserve to request in the emitted "
             "image, in bytes (e.g. 4194304 = 4 MiB). Overrides the object "
             "format's default; a project manifest's `stackReserve` key is "
@@ -532,10 +539,60 @@ parseCliArgs(int argc, char* argv[]) {
             // is opened + read at compile time by the FF5 ingest consumer,
             // which fails loud on a missing/unreadable file or an absent
             // symbol.
+            //
+            // D-FFI-DECLARED-IMPORT-NAME: the value's OPTIONAL `=<import-name>`
+            // suffix STATES the runtime identity to record for every symbol
+            // read out of `<path>`, outranking the binary's own embedded
+            // soname (`ffi::BinaryLibrarySource` docblock). SPELLING CHOICE:
+            // `<path>[=<import-name>]` reuses this file's ONE value-bearing-
+            // flag convention verbatim -- `valueFlag` already accepts both
+            // `--resolve-library V` and `--resolve-library=V`, and `--define
+            // NAME[=VALUE]` already establishes "an OPTIONAL `=`-separated
+            // second component inside the value". So no new flag, no new
+            // shape, and the `=`-form of the flag composes for free
+            // (`--resolve-library=/p/lib.dylib=libtcl8.6.dylib` -- `equalsValue`
+            // strips only the flag's own first `=`).
             auto m = valueFlag(a, i, "--resolve-library");
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
-                out.resolveLibraries.push_back(std::move(**m));
+                std::string v = std::move(**m);
+                ResolveLibrarySpec spec;
+                // LAST `=`, not the first: an import name (a soname / DLL name
+                // / install name) does not contain `=`, whereas a PATH can.
+                // The opposite direction from `--define`, where the VALUE is
+                // the `=`-tolerant side -- documented on `CliArgs::
+                // resolveLibraries` together with the residual ambiguity.
+                auto const eq = v.rfind('=');
+                if (eq == std::string::npos) {
+                    spec.path = std::move(v);   // plain form: nothing stated
+                } else {
+                    std::string path = v.substr(0, eq);
+                    std::string name = v.substr(eq + 1);
+                    // Both sides fail LOUD. An empty path reads nothing; an
+                    // empty name would record an import library the loader can
+                    // never resolve -- a link that succeeds and an artifact
+                    // that dies at load, the exact silent failure this flag
+                    // exists to prevent.
+                    if (path.empty()) {
+                        return std::unexpected(CliArgsErrorInfo{
+                            CliArgsError::InvalidResolveLibrary,
+                            "--resolve-library requires a non-empty PATH before "
+                            "the '=' (--resolve-library <path>[=<import-name>]); "
+                            "got: '" + v + "'"});
+                    }
+                    if (name.empty()) {
+                        return std::unexpected(CliArgsErrorInfo{
+                            CliArgsError::InvalidResolveLibrary,
+                            "--resolve-library requires a non-empty IMPORT NAME "
+                            "after the '=' (--resolve-library "
+                            "<path>[=<import-name>]); got: '" + v
+                            + "'. Omit the '=' entirely to record the binary's "
+                              "own embedded soname."});
+                    }
+                    spec.path               = std::move(path);
+                    spec.declaredImportName = std::move(name);
+                }
+                out.resolveLibraries.push_back(std::move(spec));
                 continue;
             }
         }

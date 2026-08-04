@@ -77,3 +77,10 @@ __pycache__/
 .claude/scheduled_tasks.lock
 
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
+
+# Operator connection data for tools/ssh-*.{ps1,sh} — hosts, logins, key PATHS.
+# NEVER tracked: this repo is slated to go public (PR #37) and these name real machines.
+# ★ PATHS ONLY. No private key material and no passwords belong here or anywhere in
+#   the working tree — the ssh tooling is key-based (BatchMode=yes) precisely so that
+#   no secret ever has to be stored to make automation work.
+.secrets/

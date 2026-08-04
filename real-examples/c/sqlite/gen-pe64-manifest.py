@@ -45,14 +45,56 @@ def strip_d(d):
     return d[2:] if d.startswith("-D") else d   # tus/defines files are pre-stripped; defensive
 
 
+def resolve_library_entry(spec):
+    """D-FFI-DECLARED-IMPORT-NAME: one `--resolve-library` argument -> one
+    `resolveLibraries` manifest entry.
+
+    `PATH`                  -> the PLAIN string entry (nothing stated). Byte-for-byte
+                               what this generator has always emitted, so every
+                               existing leg's manifest is unchanged.
+    `PATH=IMPORT_NAME`      -> the EXTENDED object entry
+                               `{"path": …, "importName": …}`, which STATES the runtime
+                               identity to record (DT_NEEDED / LC_LOAD_DYLIB / PE import
+                               name) instead of the binary's own embedded soname.
+
+    Needed for CROSS-BUILDS off a stand-in library: a MacPorts `libtcl8.6.dylib`
+    carries `LC_ID_DYLIB = /opt/local/lib/libtcl8.6.dylib`, so a testfixture linked
+    against it would demand MacPorts at that prefix on the target Mac. Symbols from
+    the downloaded dylib, install name from the declaration.
+
+    Split on the LAST `=`, matching the DSS CLI's `--resolve-library
+    <path>[=<import-name>]`: the PATH is the `=`-tolerant side, an import name is not.
+    Both sides must be non-empty — a driver that emitted `{"path": ""}` would only move
+    the failure into the compiler, and the point of generating the manifest here is to
+    fail where the operator can see which argument was wrong.
+    """
+    path, sep, name = spec.rpartition("=")
+    if not sep:
+        return spec                      # no '=' at all: the plain form
+    if not path or not name:
+        raise SystemExit(
+            "gen-pe64-manifest: --resolve-library '%s' has an empty %s; the form is "
+            "PATH[=IMPORT_NAME] and both sides must be non-empty (omit '=' entirely "
+            "to record the binary's own embedded soname)."
+            % (spec, "PATH" if not path else "IMPORT_NAME"))
+    return {"path": path, "importName": name}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gen-pe64-manifest.py")
     p.add_argument("--tus", required=True, help="file: one absolute TU path per line")
     p.add_argument("--includes", required=True, help="file: one include dir per line")
     p.add_argument("--defines", required=True, help="file: one NAME[=VALUE] per line")
     p.add_argument("--target", required=True, help="<targetName>:<formatName> spec")
-    p.add_argument("--resolve-library", action="append", default=[], metavar="PATH",
-                   help="a resolve-library binary (repeatable) — the tcl + zlib DLLs")
+    p.add_argument("--resolve-library", action="append", default=[],
+                   metavar="PATH[=IMPORT_NAME]",
+                   help="a resolve-library binary (repeatable) — the tcl + zlib DLLs. "
+                        "The optional '=IMPORT_NAME' STATES the runtime identity to "
+                        "record (DT_NEEDED / LC_LOAD_DYLIB / PE import name) instead of "
+                        "the binary's own embedded soname — for cross-building against "
+                        "a stand-in library (e.g. a MacPorts dylib whose LC_ID_DYLIB is "
+                        "/opt/local/lib/...). Split on the LAST '=', matching the DSS "
+                        "CLI's --resolve-library <path>[=<import-name>].")
     p.add_argument("--artifact-name", default="testfixture")
     p.add_argument("--extra-define", action="append", default=[], metavar="NAME[=VALUE]",
                    help="an extra define prepended to the recipe defines (opt-in shim only)")
@@ -176,7 +218,10 @@ def main(argv=None):
         "sources":          sources,
         "includes":         includes,
         "defines":          defines,
-        "resolveLibraries": args.resolve_library,
+        # D-FFI-DECLARED-IMPORT-NAME: a bare PATH stays a plain string (every
+        # existing leg's manifest byte-identical); `PATH=IMPORT_NAME` becomes the
+        # extended `{"path", "importName"}` object.
+        "resolveLibraries": [resolve_library_entry(s) for s in args.resolve_library],
     }
     if args.stack_reserve > 0:
         manifest["stackReserve"] = args.stack_reserve

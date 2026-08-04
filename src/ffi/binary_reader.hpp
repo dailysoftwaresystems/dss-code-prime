@@ -16,23 +16,26 @@
 //
 // Format-blind dispatch: the entry point `readImports(path, reporter)`
 // detects the format from the file's first bytes (ELF magic
-// `\x7FELF`, PE `MZ`...`PE\0\0`, Mach-O `0xFEEDFACF` /
-// `0xCAFEBABE` / `0xFEEDFACE`) and routes to the per-format
-// implementation. ELF / PE / Mach-O 64-bit dispatch into their
-// respective readers; Mach-O FAT (`0xCAFEBABE`) and Mach-O 32-bit
-// (`0xFEEDFACE`) are recognised at dispatch but reject loud as
-// `UnsupportedFormat` with remediation-specific detail (anchors
-// D-FF1-MACHO-FAT and D-FF1-MACHO-32). Adding a new format = add a
-// magic check in `guessFormat` + a per-format reader implementation
-// in `ffi/binary_readers/<format>_reader.{hpp,cpp}` + a dispatch arm
-// in `readImportsFromBytes`.
+// `\x7FELF`, PE `MZ`...`PE\0\0`, ar `!<arch>\n`, Mach-O `0xFEEDFACF` /
+// `0xFEEDFACE` stored little-endian, Mach-O universal `0xCAFEBABE` /
+// `0xCAFEBABF` stored BIG-endian) and routes to the per-format
+// implementation. ELF / PE / ar / Mach-O 64-bit dispatch into their
+// respective readers; Mach-O FAT and Mach-O 32-bit are recognised at
+// dispatch but reject loud as `UnsupportedFormat` with
+// remediation-specific detail (anchors D-FF1-MACHO-FAT and
+// D-FF1-MACHO-32). Adding a new format = add a magic check in
+// `guessFormat` + a per-format reader implementation in
+// `ffi/binary_readers/<format>_reader.{hpp,cpp}` + a dispatch arm in
+// `readImportsFromBytes`.
 //
 // **Closure scope (FF1)**: ELF + PE + Mach-O readers shipped
 // (FF1-ELF 2026-06-01, FF1-PE 2026-06-01, FF1-MachO 2026-06-01).
-// Mach-O FAT (`0xCAFEBABE` universal) and 32-bit Mach-O
-// (`0xFEEDFACE`) recognised but route to `UnsupportedFormat`
-// with remediation-specific messages — anchors D-FF1-MACHO-FAT
-// and D-FF1-MACHO-32 reserve the future arms.
+// Mach-O FAT (universal — `0xCAFEBABE` / `0xCAFEBABF`, both stored
+// big-endian on disk) and 32-bit Mach-O (`0xFEEDFACE`) recognised but
+// route to `UnsupportedFormat` with remediation-specific messages —
+// anchors D-FF1-MACHO-FAT and D-FF1-MACHO-32 reserve the future arms.
+// FAT is DETECTED, never READ: `readImports` carries no target, so it
+// has nothing to select a slice with.
 //
 // D-FF1-NEST CLOSED (FF1-MachO cycle 2026-06-01): per-format reader
 // TUs live in `binary_readers/{elf,pe,macho}_reader.{hpp,cpp}` —

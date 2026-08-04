@@ -23,6 +23,10 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/binary_reader.hpp"
+// Internal reader header — pulled in so the fat-header detection tests can
+// pin `guessFormat` DIRECTLY, not just through the dispatch it feeds. Same
+// precedent as tests/ffi/test_binary_reader_ar.cpp including ar_reader.hpp.
+#include "ffi/binary_readers/reader_common.hpp"
 #include "byte_emit.hpp"
 #include "diagnostic_count.hpp"
 
@@ -1426,4 +1430,238 @@ TEST(BinaryReaderMacho, ReexportOrdinalSpansAllDylibLoadCommands) {
         << "ordinal 2 must index the SECOND dylib-load command; a "
            "regression that skipped LC_LAZY_LOAD_DYLIB in the ordinal "
            "space would resolve the wrong dylib";
+}
+
+// ====================================================================
+// UNIVERSAL ("fat") HEADER DETECTION -- D-FF1-MACHO-FAT reachability.
+//
+// `struct fat_header` is BIG-ENDIAN ON DISK, always, whatever the byte
+// order of the slices it wraps (Apple <mach-o/fat.h>; dyld and lipo both
+// read it through OSSwapBigToHostInt32). The THIN mach_header_64 magic,
+// by contrast, is stored in the slice's own byte order -- little-endian
+// on every target DSS emits. That asymmetry is the whole point of this
+// section: `guessFormat` used to match FAT_MAGIC through the LITTLE-endian
+// `readU32`, which computes 0xBEBAFECA on a real universal binary, so
+// `FormatGuess::MachOFat` was UNREACHABLE and the carefully-worded
+// `lipo -thin` remediation in `readImportsFromBytes` was dead code --
+// operators got the misleading "no recognised magic" instead (MEASURED
+// on a MacPorts universal libtcl8.6.dylib).
+//
+// The fixtures build a REAL universal wrapper (big-endian fat_header +
+// fat_arch entries) around thin slices from the existing
+// `buildMinimalMacho64` builder -- no multi-megabyte .dylib fixture, and
+// no second Mach-O byte builder.
+//
+// SCOPE: this pins DETECTION only. Fat READING is still not shipped --
+// `readImports(path, reporter)` takes no target, so it could not pick a
+// slice even if it wanted to. The contract under test is "recognised,
+// rejected loud, with the actionable remediation".
+// ====================================================================
+
+namespace {
+
+constexpr std::uint32_t kFatMagic   = 0xCAFEBABEu;   // fat_arch    entries
+constexpr std::uint32_t kFatMagic64 = 0xCAFEBABFu;   // fat_arch_64 entries
+
+// Append a u32/u64 BIG-endian. Deliberately local, and deliberately NOT
+// hoisted into tests/test_support/byte_emit.hpp (which is the
+// LITTLE-endian fixture kit): the fat header is the only big-endian
+// structure any of these fixtures emit, and spelling the byte order at
+// the emit site is exactly the distinction under test.
+void appU32BE(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    for (int i = 3; i >= 0; --i)
+        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu));
+}
+void appU64BE(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    for (int i = 7; i >= 0; --i)
+        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu));
+}
+
+struct FatSlice {
+    std::uint32_t             cputype    = 0;
+    std::uint32_t             cpusubtype = 0;
+    std::vector<std::uint8_t> bytes;
+};
+
+// Assemble a Mach-O universal binary the way `lipo -create` lays one out:
+// a big-endian fat_header (magic + nfat_arch), one big-endian fat_arch
+// (20 bytes) -- or fat_arch_64 (32 bytes) when `use64` -- per slice, then
+// the slice images at 2^12-aligned file offsets.
+[[nodiscard]] std::vector<std::uint8_t>
+buildFatMacho(std::vector<FatSlice> const& slices, bool use64 = false) {
+    constexpr std::uint32_t kAlignPow2 = 12;                  // 2^12 = 4 KiB
+    constexpr std::size_t   kAlign     = std::size_t{1} << kAlignPow2;
+    std::size_t const archSize = use64 ? 32u : 20u;
+    auto const roundUp = [](std::size_t v) {
+        return ((v + kAlign - 1u) / kAlign) * kAlign;
+    };
+
+    // Lay the slices out first so each fat_arch can carry a real offset.
+    std::size_t cursor = roundUp(8u + slices.size() * archSize);
+    std::vector<std::size_t> offsets;
+    offsets.reserve(slices.size());
+    for (auto const& s : slices) {
+        offsets.push_back(cursor);
+        cursor = roundUp(cursor + s.bytes.size());
+    }
+
+    std::vector<std::uint8_t> hdr;
+    appU32BE(hdr, use64 ? kFatMagic64 : kFatMagic);
+    appU32BE(hdr, static_cast<std::uint32_t>(slices.size()));   // nfat_arch
+    for (std::size_t i = 0; i < slices.size(); ++i) {
+        appU32BE(hdr, slices[i].cputype);
+        appU32BE(hdr, slices[i].cpusubtype);
+        if (use64) {
+            appU64BE(hdr, offsets[i]);
+            appU64BE(hdr, slices[i].bytes.size());
+            appU32BE(hdr, kAlignPow2);
+            appU32BE(hdr, 0u);                                  // reserved
+        } else {
+            appU32BE(hdr, static_cast<std::uint32_t>(offsets[i]));
+            appU32BE(hdr, static_cast<std::uint32_t>(slices[i].bytes.size()));
+            appU32BE(hdr, kAlignPow2);
+        }
+    }
+
+    std::vector<std::uint8_t> out(cursor, 0);
+    for (std::size_t i = 0; i < hdr.size(); ++i) out[i] = hdr[i];
+    for (std::size_t i = 0; i < slices.size(); ++i)
+        for (std::size_t k = 0; k < slices[i].bytes.size(); ++k)
+            out[offsets[i] + k] = slices[i].bytes[k];
+    return out;
+}
+
+// The x86_64 + arm64 pair every `lipo -create` on modern macOS produces
+// (and the exact shape of the MacPorts libtcl8.6.dylib that surfaced the
+// bug). Both slices are the SAME thin image -- what the wrapper carries is
+// irrelevant to detection, and reusing one keeps the fixture honest about
+// what it pins.
+[[nodiscard]] std::vector<FatSlice> twoRealSlices() {
+    auto const thin = buildMinimalMacho64({sect(1)}, {"_exported"});
+    return {
+        FatSlice{0x01000007u, 0x00000003u, thin},   // CPU_TYPE_X86_64
+        FatSlice{0x0100000Cu, 0x00000000u, thin},   // CPU_TYPE_ARM64
+    };
+}
+
+} // namespace
+
+// (a) FAT_MAGIC, as it actually sits on disk.
+TEST(BinaryReaderMachoFat, FatMagicBigEndianOnDiskClassifiesAsMachOFat) {
+    auto const fat = buildFatMacho(twoRealSlices());
+    ASSERT_GE(fat.size(), 4u);
+    // Guard the FIXTURE first: a fixture that emitted the magic
+    // little-endian would test nothing.
+    EXPECT_EQ(fat[0], 0xCAu);
+    EXPECT_EQ(fat[1], 0xFEu);
+    EXPECT_EQ(fat[2], 0xBAu);
+    EXPECT_EQ(fat[3], 0xBEu)
+        << "fixture must carry the REAL on-disk fat magic byte sequence";
+    EXPECT_EQ(guessFormat(fat), FormatGuess::MachOFat)
+        << "a little-endian readU32 of CA FE BA BE yields 0xBEBAFECA, so a "
+           "`== 0xCAFEBABE` LE comparison never fires on a real universal "
+           "binary -- fat_header is big-endian ON DISK by definition";
+}
+
+// (b) FAT_MAGIC_64 (fat_arch_64 entries) -- unhandled entirely pre-fix.
+TEST(BinaryReaderMachoFat, FatMagic64BigEndianOnDiskClassifiesAsMachOFat) {
+    auto const fat = buildFatMacho(twoRealSlices(), /*use64=*/true);
+    ASSERT_GE(fat.size(), 4u);
+    EXPECT_EQ(fat[0], 0xCAu);
+    EXPECT_EQ(fat[1], 0xFEu);
+    EXPECT_EQ(fat[2], 0xBAu);
+    EXPECT_EQ(fat[3], 0xBFu) << "FAT_MAGIC_64 differs only in the last byte";
+    EXPECT_EQ(guessFormat(fat), FormatGuess::MachOFat)
+        << "0xCAFEBABF (fat_arch_64 entries, needed once a slice exceeds "
+           "4 GiB) is a universal binary too -- it was not handled at all";
+}
+
+// (c) End-to-end: the ALREADY-INTENDED remediation is now reachable.
+TEST(BinaryReaderMachoFat, FatBinaryReachesUnsupportedFormatWithLipoRemediation) {
+    auto const fat = buildFatMacho(twoRealSlices());
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(fat, "libtcl8.6.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnsupportedFormat)
+        << "a universal binary must hit the D-FF1-MACHO-FAT arm, NOT the "
+           "UnknownFormat catch-all that told the operator the file had "
+           "'no recognised magic' while listing 0xCAFEBABE as recognised";
+    EXPECT_NE(r.error().detail.find("lipo -thin"), std::string::npos)
+        << r.error().detail;
+    EXPECT_NE(r.error().detail.find("D-FF1-MACHO-FAT"), std::string::npos)
+        << r.error().detail;
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnknownBinaryFormat), 0u)
+        << "the honest code is F_UnsupportedBinaryFormat -- 'we recognised "
+           "it, we do not read it', not 'we cannot even guess'";
+}
+
+TEST(BinaryReaderMachoFat, Fat64BinaryReachesUnsupportedFormatWithLipoRemediation) {
+    auto const fat = buildFatMacho(twoRealSlices(), /*use64=*/true);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(fat, "libbig.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnsupportedFormat);
+    EXPECT_NE(r.error().detail.find("lipo -thin"), std::string::npos)
+        << r.error().detail;
+    EXPECT_NE(r.error().detail.find("0xCAFEBABF"), std::string::npos)
+        << "the message must name BOTH universal magics now that both "
+           "route here: " << r.error().detail;
+}
+
+// (d) No regression: a THIN 64-bit Mach-O still classifies + still reads.
+TEST(BinaryReaderMachoFat, ThinMacho64StillClassifiesAndReadsAfterFatFix) {
+    auto const thin = buildMinimalMacho64({sect(1)}, {"_exported"});
+    ASSERT_GE(thin.size(), 4u);
+    // 0xFEEDFACF stored LITTLE-endian -- the asymmetry, spelled out.
+    EXPECT_EQ(thin[0], 0xCFu);
+    EXPECT_EQ(thin[1], 0xFAu);
+    EXPECT_EQ(thin[2], 0xEDu);
+    EXPECT_EQ(thin[3], 0xFEu);
+    EXPECT_EQ(guessFormat(thin), FormatGuess::MachO64);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(thin, "thin.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "kind=" << binaryReadErrorKindName(r.error().kind);
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].mangledName, "_exported");
+}
+
+// (e) The byte-SWAPPED spelling must NOT be accepted as fat. FAT_CIGAM
+// (0xBEBAFECA) / FAT_CIGAM_64 (0xBFBAFECA) are the values a little-endian
+// host computes after loading a real fat_header in HOST order; they are
+// never the on-disk byte sequence of a universal binary. These are the
+// exact inputs the pre-fix little-endian comparison was really matching,
+// so a "fix" that merely ADDED the big-endian arm without removing the
+// little-endian one would leave them wrongly classified.
+TEST(BinaryReaderMachoFat, ByteSwappedFatCigamSpellingIsNotFat) {
+    std::vector<std::uint8_t> cigam   = {0xBE, 0xBA, 0xFE, 0xCA, 0, 0, 0, 2};
+    std::vector<std::uint8_t> cigam64 = {0xBF, 0xBA, 0xFE, 0xCA, 0, 0, 0, 2};
+    EXPECT_EQ(guessFormat(cigam), FormatGuess::Unknown)
+        << "BE BA FE CA is FAT_CIGAM, a host-order artifact -- not a file "
+           "any producer writes; classifying it fat hands the operator a "
+           "`lipo -thin` instruction that cannot possibly work";
+    EXPECT_EQ(guessFormat(cigam64), FormatGuess::Unknown);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(cigam, "cigam.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnknownFormat);
+}
+
+// Neighbour-magic guard: 0xCAFEBABD / 0xCAFEBAC0 bracket the two real
+// magics. A fix written as a RANGE check (or a 3-byte prefix compare on
+// CA FE BA) would swallow them; both must stay Unknown.
+TEST(BinaryReaderMachoFat, AdjacentMagicsAreNotFat) {
+    std::vector<std::uint8_t> below = {0xCA, 0xFE, 0xBA, 0xBD, 0, 0, 0, 2};
+    std::vector<std::uint8_t> above = {0xCA, 0xFE, 0xBA, 0xC0, 0, 0, 0, 2};
+    EXPECT_EQ(guessFormat(below), FormatGuess::Unknown);
+    EXPECT_EQ(guessFormat(above), FormatGuess::Unknown);
+}
+
+// Short-buffer guard: `guessFormat` reads 4 bytes only under a size>=4
+// check. A 3-byte prefix of the fat magic must be Unknown, never a
+// read past the end.
+TEST(BinaryReaderMachoFat, ThreeBytePrefixOfFatMagicIsUnknown) {
+    std::vector<std::uint8_t> tiny = {0xCA, 0xFE, 0xBA};
+    EXPECT_EQ(guessFormat(tiny), FormatGuess::Unknown);
 }

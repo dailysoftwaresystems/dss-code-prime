@@ -454,13 +454,18 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // unreadable path stays DYNAMIC -- the dynamic path's eager open-probe
     // (compile_pipeline step 2.5-pre) fails it loud, so a bad path is never
     // silently dropped.
+    // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
+    // the DYNAMIC side (it names a runtime dependency); a static archive is
+    // merged into the image and records no import at all. The partition keeps
+    // the whole spec on the dynamic side and takes only the PATH for archives,
+    // so nothing is silently dropped where it would have had an effect.
     std::vector<std::filesystem::path> staticArchives;
     CompileOptions perCuOpts = compileOpts;
     {
-        std::vector<std::filesystem::path> dynamicLibs;
+        std::vector<ResolveLibrarySpec> dynamicLibs;
         for (auto const& lib : compileOpts.resolveLibraries) {
-            if (isArArchiveFile(lib)) staticArchives.push_back(lib);
-            else                      dynamicLibs.push_back(lib);
+            if (isArArchiveFile(lib.path)) staticArchives.push_back(lib.path);
+            else                           dynamicLibs.push_back(lib);
         }
         perCuOpts.resolveLibraries = std::move(dynamicLibs);
     }
@@ -1031,7 +1036,7 @@ int runCusToTargets(
     bool                                        perFormatOutputSubdir,
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
-    std::vector<std::filesystem::path> const&   resolveLibraries,
+    std::vector<ResolveLibrarySpec> const&      resolveLibraries,
     // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
     // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
     substrate::IExecutor*                       executor,
@@ -1357,14 +1362,11 @@ int Program::run(int argc, char* argv[]) {
     setStackReserveBytes(args.stackReserveBytes);
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
-    // surface to resolve + validate this run's externs. Map the CLI strings to
-    // filesystem paths (the same setOutputDir/setCompileConfig stamp pattern).
-    {
-        std::vector<std::filesystem::path> libs;
-        libs.reserve(args.resolveLibraries.size());
-        for (auto const& s : args.resolveLibraries) libs.emplace_back(s);
-        setResolveLibraries(std::move(libs));
-    }
+    // surface to resolve + validate this run's externs. The parser already
+    // produced `ResolveLibrarySpec`s (path + the OPTIONAL declared import
+    // name, D-FFI-DECLARED-IMPORT-NAME), so this is a straight stamp — no
+    // re-parse, and no layer in between can drop the declared name.
+    setResolveLibraries(args.resolveLibraries);
     // `--time`: report the compilation's wall-clock to stderr when this run
     // returns — covers EVERY compile-producing mode (project / transpile /
     // directory / compile) via ONE scoped reporter, no per-mode duplication.
@@ -1570,9 +1572,14 @@ int Program::compileProject(
                              pc.defines.begin(), pc.defines.end());
         setUserDefines(std::move(mergedDefines));
 
-        std::vector<fs::path> mergedLibs = resolveLibraries();
+        // D-FFI-DECLARED-IMPORT-NAME: the manifest parses into the SAME
+        // `ResolveLibrarySpec` the CLI does, so the merge is a plain append —
+        // a manifest entry's declared import name survives the join with the
+        // CLI-stamped entries instead of being flattened back to a bare path.
+        std::vector<ResolveLibrarySpec> mergedLibs = resolveLibraries();
         mergedLibs.reserve(mergedLibs.size() + pc.resolveLibraries.size());
-        for (auto const& s : pc.resolveLibraries) mergedLibs.emplace_back(s);
+        mergedLibs.insert(mergedLibs.end(),
+                          pc.resolveLibraries.begin(), pc.resolveLibraries.end());
         setResolveLibraries(std::move(mergedLibs));
     }
 

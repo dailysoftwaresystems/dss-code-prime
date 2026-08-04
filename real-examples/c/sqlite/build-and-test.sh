@@ -58,10 +58,14 @@
 #      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
 #      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
 #      (tcl, z) library pair from the provider its catalogue entry declares
-#      (`host-system` | `ubuntu-ports-arm64` | `search-paths`). A leg whose pair
-#      cannot be resolved on this machine records `skipped-build-input-missing`
-#      NAMING what was searched — the run continues, and the other legs are
-#      unaffected.
+#      (`host-system` | `ubuntu-ports-arm64` | `search-paths` | `pinned-archive`).
+#      A leg whose pair cannot be resolved on this machine records
+#      `skipped-build-input-missing` NAMING what was searched — the run continues,
+#      and the other legs are unaffected. `pinned-archive` is the GENERAL form:
+#      the leg declares digest-pinned third-party archives and the members to take,
+#      harness_legs.py `--acquire` fetches/verifies/extracts/slices them once for
+#      both drivers, and Step 7 stages the result BESIDE the artefact because such
+#      a library is a stand-in whose declared runtime identity is `@loader_path/…`.
 #   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
 #      from a generated `.dss-project.json` manifest (dss --project mode). Every
 #      declared leg is attempted, on every host. Each leg's manifest declares
@@ -393,12 +397,20 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
            LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
-           LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=()
+           LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=() \
+           LEG_LIB_TCL_IMPORT_NAME=() LEG_LIB_Z_IMPORT_NAME=()
 # Resolved by this driver: the leg's chosen target compiler, its (tcl, z) pair, and
 # its VERDICT — one name from the closed vocabulary in
 # tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
 # in flight"; Step 9 refuses to let any declared leg end that way.
 declare -A LEG_CC=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+# For a leg whose libraries were ACQUIRED (`pinned-archive`): where they landed,
+# and the "<as>\t<path>" lines the resolver reported. Kept because the artefact is
+# not finished when the link is — an acquired library is a STAND-IN whose declared
+# runtime identity is `@loader_path/<name>`, so a copy of it has to be staged
+# BESIDE the binary at Step 7 or the artefact fails at load time on the target
+# machine. Empty for every other provider.
+declare -A LEG_ACQ_DIR=() LEG_ACQ_LIBS=()
 # LEG_DECLARED = every leg the catalogue declares (the ledger's denominator).
 # LEG_ORDER    = the subset this invocation actually processes (DSS_LEGS filter).
 declare -a LEG_ORDER=() LEG_DECLARED=()
@@ -2161,6 +2173,55 @@ ensure_arm64_libs() {
   info "arm64 libs staged: $(ls "$ARM64_LIBDIR" | tr '\n' ' ')"
 }
 
+# ── `pinned-archive` — the GENERAL, DECLARED library-acquisition route ───────
+# [D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER]
+# `ensure_arm64_libs` above is a whole acquisition mechanism — fetch, extract,
+# stage — that exists for ONE leg, in ONE driver, with the archive layout welded
+# into this file. `pinned-archive` is the same idea DECLARED: the archives, their
+# PINNED sha256, the members to take and the runtime identity to record all live
+# in $LEG_CATALOGUE, and the fetch/verify/extract/slice is implemented ONCE in
+# $LEG_RESOLVER (`--acquire`) so this driver and the .ps1 acquire identically
+# instead of each growing its own. That is what makes "any leg builds on any
+# host" true rather than aspirational: the macho legs used to declare
+# `host-system`, i.e. "hope this box has a Darwin libtcl", which meant they built
+# nowhere but a Mac.
+#
+# NOTHING HERE IS KEYED ON THE HOST. The provider is a property of the LEG.
+#
+# acquire_leg_libs <leg> — the resolver's acquisition report, as JSON, on stdout.
+# Diagnostics go to STDERR (the caller redirects them to a log), so stdout is the
+# report and nothing else. Called from a COMMAND SUBSTITUTION, which is a
+# subshell — the same isolation `ensure_arm64_libs` gets from `( … )` and for the
+# same reason: a leg whose archive cannot be fetched, whose digest does not
+# match, or whose declared member is absent costs THAT LEG a
+# `skipped-build-input-missing`, never the other four. rc is taken DIRECTLY off
+# the substitution, never through a pipe.
+#
+# No `--cache-root`: WHERE the cache lives is a host fact the resolver already
+# decides (`cache_root()`: $DSS_HARNESS_CACHE_ROOT, else ~/.cache/dss-code-prime),
+# and a second opinion here is exactly the fork this route exists to delete.
+acquire_leg_libs() {            # acquire_leg_libs <leg>  -> acquisition JSON
+  local leg="$1"
+  ensure_cmd python3 python3
+  python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --acquire "$leg"
+}
+# acq_field <json> cacheDir    -> the one string
+# acq_field <json> libraries   -> one "<as>\t<path>" line per ACQUIRED library
+# A READER, never a second opinion: every value it returns was decided by
+# $LEG_RESOLVER. Each driver parses the report in its own language (the .ps1 uses
+# ConvertFrom-Json); what neither driver is allowed to do is re-derive a value.
+# ⚠ TAB-separated and read with `IFS=$'\t'`, because a cache path may contain
+# spaces — the same reason `LEG_LIB_PATHS` is newline-separated.
+acq_field() {                   # acq_field <json> <cacheDir|libraries>
+  python3 -c 'import json, sys
+report = json.load(sys.stdin)
+if sys.argv[1] == "libraries":
+    for lib in report["libraries"]:
+        sys.stdout.write("%s\t%s\n" % (lib["as"], lib["path"]))
+else:
+    sys.stdout.write("%s\n" % report[sys.argv[1]])' "$2" <<< "$1"
+}
+
 # ── resolve EVERY declared leg's build inputs ────────────────────────────────
 # ★ ONE VERDICT PER LEG, AND THE RUN CONTINUES. A leg whose DECLARED inputs are
 # absent from this machine is recorded `skipped-build-input-missing` — an
@@ -2218,9 +2279,48 @@ for leg in "${LEG_ORDER[@]}"; do
       z_lib="$(find_first_in ${_paths[@]+"${_paths[@]}"} -- ${_znames[@]+"${_znames[@]}"})"
       searched="provider 'search-paths'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; paths searched: ${_paths[*]:-<none declared or all \${env:...} unset>}"
       ;;
+    pinned-archive)
+      # DECLARED archives, PINNED digests, materialised by $LEG_RESOLVER — see
+      # `acquire_leg_libs`. COMMAND SUBSTITUTION IS A SUBSHELL, so a failed fetch,
+      # a checksum mismatch, an absent member or a missing architecture slice
+      # costs THIS LEG and no other; rc is taken DIRECTLY off the `if`, never
+      # through a pipe. The resolver's own (loud) diagnostic is kept, verbatim, in
+      # a per-leg log and named in the skip reason — this driver never
+      # paraphrases it and never falls back to "whatever else is on this machine".
+      _acq_log="$OUT_DIR/acquire-$leg.log"; _acq_stage="--acquire"
+      if _acq_json="$(acquire_leg_libs "$leg" 2>"$_acq_log")"; then _acq_rc=0; else _acq_rc=$?; fi
+      declare -a _tnames=(); read -r -a _tnames <<< "${LEG_LIB_TCL_NAMES[$leg]}"
+      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
+      _acq_dir=""; _acq_libs=""
+      if [[ "$_acq_rc" -eq 0 ]]; then
+        # Reading the report can itself fail (a truncated or reshaped report), and
+        # that must not read as "no library on this machine" — so its rc is taken
+        # too, and it demotes the leg exactly like a failed acquisition.
+        if _acq_dir="$(acq_field "$_acq_json" cacheDir)" \
+           && _acq_libs="$(acq_field "$_acq_json" libraries)" \
+           && [[ -n "$_acq_dir" && -n "$_acq_libs" ]]; then
+          LEG_ACQ_DIR["$leg"]="$_acq_dir"; LEG_ACQ_LIBS["$leg"]="$_acq_libs"
+          # The (tcl, z) pair is picked out of the acquired cache with the leg's
+          # OWN declared names, by the same helper the other providers use — the
+          # driver never decides which acquired file is the Tcl one from its shape.
+          tcl_lib="$(find_first_in "$_acq_dir" -- ${_tnames[@]+"${_tnames[@]}"})"
+          z_lib="$(find_first_in "$_acq_dir" -- ${_znames[@]+"${_znames[@]}"})"
+        else
+          # NAMED SEPARATELY from a failed acquisition: `--acquire` returned 0 and
+          # the archives really are on disk, so a skip reason that blamed the
+          # download would send the next reader to the wrong place.
+          _acq_rc=$?; _acq_dir=""; _acq_stage="reading the --acquire report"
+          warn "[$leg] the acquisition report from $(basename "$LEG_RESOLVER") could not be read (rc=$_acq_rc)"
+          printf '%s\n' "$_acq_json" | sed 's/^/      /' >&2
+        fi
+      else
+        [[ ! -s "$_acq_log" ]] || sed 's/^/      /' "$_acq_log" >&2
+      fi
+      searched="provider 'pinned-archive' ($_acq_stage rc=$_acq_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; acquired under: ${_acq_dir:-<nothing acquired — see $_acq_log>}"
+      ;;
     *)
       die "[$leg] declares library provider '$provider', which this driver does not implement.
-      Known: host-system | ubuntu-ports-arm64 | search-paths (see $LEG_CATALOGUE and
+      Known: host-system | ubuntu-ports-arm64 | search-paths | pinned-archive (see $LEG_CATALOGUE and
       LIBRARY_PROVIDERS in $LEG_RESOLVER). A provider the driver silently ignored would
       resolve to an empty library pair and read as a missing input — so it fails loud here."
       ;;
@@ -2730,7 +2830,10 @@ done
 # and gives the .sh both capabilities. Everything leg-specific is an ARGUMENT, read
 # from the leg's own declaration in legs.json:
 #   · --target            the leg's <targetName>:<formatName> spec
-#   · --resolve-library   its resolved (tcl, z) pair
+#   · <library argv>      its resolved (tcl, z) pair — see `leg_resolve_library_argv`.
+#                         Passed through as TOKENS built by $LEG_RESOLVER, not
+#                         spelled here, because the flag carries an optional
+#                         runtime-identity override this file must not know about.
 #   · --recipe-transform  `none` | `windows-selfconfig`  (build.recipeTransform)
 #   · --stack-reserve     bytes; 0 omits the key           (build.stackReserveBytes)
 #   · --includes          THIS LEG's include list — the one carrying the zlib
@@ -2738,19 +2841,56 @@ done
 #                         build.headerStageKey). Not one shared file: that is
 #                         D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED.
 # rc is taken DIRECTLY off python3 by the caller's `if`, never through a pipe.
-generate_manifest() {
-  local leg="$1" out="$2"
+generate_manifest() {           # generate_manifest <leg> <out-manifest> <library-argv>...
+  local leg="$1" out="$2"; shift 2
   python3 "$MANIFEST_GEN" \
     --tus       "$RECIPE_TUS_FILE" \
     --includes  "${LEG_INC_FILE[$leg]}" \
     --defines   "$RECIPE_DEFS_FILE" \
     --target    "${LEG_SPEC[$leg]}" \
-    --resolve-library "${LEG_TCL_LIB[$leg]}" \
-    --resolve-library "${LEG_Z_LIB[$leg]}" \
+    "$@" \
     --artifact-name   testfixture \
     --recipe-transform "${LEG_RECIPE_TRANSFORM[$leg]}" \
     --stack-reserve    "${LEG_STACK_RESERVE[$leg]}" \
     --output    "$out"
+}
+# leg_resolve_library_argv <leg> — the argv that hands DSS this leg's two resolved
+# libraries, ONE TOKEN PER LINE, on stdout. Diagnostics to stderr; rc is the
+# resolver's own.
+#
+# ★★ THE FLAG IS SPELLED IN $LEG_RESOLVER, NOT HERE, and that is the whole point.
+# A resolved library may carry a DECLARED RUNTIME IDENTITY (`LEG_LIB_*_IMPORT_NAME`,
+# from the leg's `importName`): an ACQUIRED library is a STAND-IN — we read its
+# export surface on this host, but the target machine loads its OWN copy — so the
+# identity recorded in the artefact (DT_NEEDED / LC_LOAD_DYLIB / PE import name)
+# must be the one the leg declares, not the packager's embedded install name.
+# ✔MEASURED 2026-08-04: the MacPorts dylibs carry `LC_ID_DYLIB = /opt/local/lib/…`,
+# so a naive link produces a Mach-O that demands MacPorts on the target Mac and
+# dies in dyld — a LOAD failure, not a build error, and one this host cannot
+# observe. A driver that spelled the override itself would be a capability that
+# exists in one driver and not the other, which is precisely
+# D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER.
+#
+# `--dss` makes the resolver PROBE this run's compiler for the override and REFUSE
+# (non-zero, with a diagnostic) if it cannot record the identity. Dropping the
+# override silently is not on the table: it would link clean here and fail at load
+# there. A leg with NO declared identity gets `--resolve-library <path>` — byte
+# for byte what every leg passed before this route existed.
+#
+# ⚠ These tokens go to $MANIFEST_GEN, not to $DSS_BIN: in this driver EVERY leg is
+# built through a `--project` manifest, and the generator's `--resolve-library`
+# deliberately mirrors the DSS CLI's own `<path>[=<import-name>]` so it is a
+# pass-through of the same vocabulary (gen-pe64-manifest.py `resolve_library_entry`
+# -> the manifest's `resolveLibraries`). There is no second, argv-only path to keep
+# in step.
+leg_resolve_library_argv() {    # leg_resolve_library_argv <leg>  -> one token per line
+  local leg="$1"
+  python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+      --resolve-library-argv "${LEG_TCL_LIB[$leg]}" \
+      --import-name "${LEG_LIB_TCL_IMPORT_NAME[$leg]}" --dss "$DSS_BIN" \
+    && python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+      --resolve-library-argv "${LEG_Z_LIB[$leg]}" \
+      --import-name "${LEG_LIB_Z_IMPORT_NAME[$leg]}" --dss "$DSS_BIN"
 }
 compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
 # >>> dss:fresh-inode >>>
@@ -2877,9 +3017,34 @@ for leg in "${LEG_ORDER[@]}"; do
   # <<< dss:preflight <<<
   info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "${LEG_TCL_LIB[$leg]}"), $(basename "${LEG_Z_LIB[$leg]}"); transform: ${LEG_RECIPE_TRANSFORM[$leg]}; stackReserve: ${LEG_STACK_RESERVE[$leg]})"
   info "[$leg] zlib headers: ${LEG_ZINC_DIR[$leg]}  [${LEG_ZCONF_GUARDS[$leg]}]"
+  # THE LIBRARY ARGV, BUILT BY THE RESOLVER (see `leg_resolve_library_argv`).
+  # `mapfile` because the tokens are NEWLINE-separated and a token may contain
+  # spaces (a cache path) or `=` (the identity override) — word-splitting them
+  # would corrupt exactly the paths this harness works hardest to keep intact.
+  # rc DIRECTLY off the substitution; stderr to a per-leg log so the resolver's own
+  # refusal is quoted verbatim and never paraphrased.
+  _argv_log="$outd/resolve-library-argv.log"
+  declare -a _lib_argv=()
+  if _argv_raw="$(leg_resolve_library_argv "$leg" 2>"$_argv_log")" && [[ -n "$_argv_raw" ]]; then
+    mapfile -t _lib_argv <<< "$_argv_raw"
+  else
+    # `poisoned`, NOT a skip. The resolver refuses when a leg DECLARES a runtime
+    # identity this compiler cannot record — and the only alternative is to build
+    # an artefact that links clean here and dies in the target's loader, which is
+    # the one failure this host cannot observe. A defect, so it reads as one.
+    # The resolver's own words, flattened to one line for the ledger. A SILENT
+    # refusal would be the worst outcome here, so an empty log is itself named.
+    _argv_msg="$(tr '\n' ' ' < "$_argv_log" 2>/dev/null || true)"
+    [[ -n "${_argv_msg// /}" ]] || _argv_msg="<the resolver refused with no diagnostic on stderr — see $_argv_log>"
+    COMPILE_FAILS=$((COMPILE_FAILS + 1))
+    LEG_VERDICT["$leg"]="poisoned"
+    LEG_VERDICT_DETAIL["$leg"]="the DSS argv for this leg's resolved libraries could not be built (declared runtime identities: tcl='${LEG_LIB_TCL_IMPORT_NAME[$leg]:-<none>}', z='${LEG_LIB_Z_IMPORT_NAME[$leg]:-<none>}') — $_argv_msg"
+    warn "[$leg] POISONED — ${LEG_VERDICT_DETAIL[$leg]}"
+    continue
+  fi
   # rc DIRECTLY off the generator (the `if` also keeps errexit out of it). It emits
   # two lines — the transform summary and the counts — so both are surfaced.
-  if counts="$(generate_manifest "$leg" "$manifest")"; then
+  if counts="$(generate_manifest "$leg" "$manifest" "${_lib_argv[@]}")"; then
     while IFS= read -r _cl; do [[ -z "$_cl" ]] || info "[$leg] manifest: $_cl"; done <<< "$counts"
     info "[$leg] manifest → $manifest"
   else
@@ -2906,6 +3071,41 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
     fi
   else
+    # ── STAGE THE ACQUIRED LIBRARIES BESIDE THE ARTEFACT ──────────────────────
+    # ★ THE LINK IS NOT THE END OF THE BUILD FOR AN ACQUIRING LEG. The runtime
+    # identity such a leg declares is `@loader_path/<name>` — TRUE BY
+    # CONSTRUCTION only if the library sits in the directory holding the
+    # EXECUTABLE. dyld resolves `@loader_path` against that directory (not the
+    # cwd), and the fixture is exec'd in place from `<outd>/<fmt>/` with its cwd
+    # set to the run dir, so `<outd>/<fmt>/` is where the copies belong. Without
+    # them the artefact is a load failure waiting to happen on a machine this
+    # host cannot observe — the same class of silent breakage the identity
+    # override exists to prevent, re-introduced one step later.
+    # FROM THE DECLARATION, never a name list in this file: the `as` and `path`
+    # of every library `--acquire` reported, so a leg that declares a third
+    # archive member gets it staged with no edit here. Empty for every
+    # non-acquiring provider, whose libraries the target machine already has.
+    _stage_dir="$(dirname "$bin")"; _stage_bad=""
+    while IFS=$'\t' read -r _as _src; do
+      [[ -n "$_as" && -n "$_src" ]] || continue
+      if cp -p "$_src" "$_stage_dir/$_as"; then
+        info "[$leg] staged beside the artefact: $_as  (from $_src)"
+      else
+        _stage_bad="$_stage_bad $_as"
+        warn "[$leg] could NOT stage '$_as' beside the artefact: $_src -> $_stage_dir/$_as"
+      fi
+    done <<< "${LEG_ACQ_LIBS[$leg]:-}"
+    if [[ -n "$_stage_bad" ]]; then
+      # Per-leg, and `poisoned` rather than a skip: the compile succeeded, so this
+      # is a defect in the artefact we produced, not an absent input. Refusing to
+      # register the fixture is the point — an incomplete artefact must not be
+      # handed to Step 8 or shipped as a verified leg.
+      COMPILE_FAILS=$((COMPILE_FAILS + 1))
+      LEG_VERDICT["$leg"]="poisoned"
+      LEG_VERDICT_DETAIL["$leg"]="the fixture built for ${LEG_SPEC[$leg]}, but its ACQUIRED librar(y/ies)$_stage_bad could not be staged into $_stage_dir. The artefact records '@loader_path/<name>' for them, so without the copies it fails in the target's loader — see the warnings above."
+      warn "[$leg] POISONED — ${LEG_VERDICT_DETAIL[$leg]}"
+      continue
+    fi
     # >>> dss:fresh-inode-install >>>
     # Give the just-built fixture a BRAND-NEW inode before anyone execs it —
     # D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE (rationale + the

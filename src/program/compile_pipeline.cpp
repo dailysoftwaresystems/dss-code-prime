@@ -327,7 +327,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe(lib, std::ios::binary);
+            std::ifstream probe(lib.path, std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -336,7 +336,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     "--resolve-library: failed to open '{}' for reading "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    lib.generic_string());
+                    lib.path.generic_string());
                 reporter.report(std::move(d));
             }
         }
@@ -517,15 +517,22 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     .push_back(refs[i]);
             }
 
-            // The resolve-library binaries become `ingest()` sources. The
-            // file BASENAME is the loader-resolvable identity recorded in
-            // the import (DT_NEEDED / import descriptor) -- see
-            // BinaryLibrarySource::importName.
+            // The resolve-library binaries become `ingest()` sources. Three
+            // levels decide the identity recorded in the import (DT_NEEDED /
+            // LC_LOAD_DYLIB / PE import descriptor), ranked in `ingest()` and
+            // documented on `ffi::BinaryLibrarySource`:
+            //   1. `declaredImportName` -- what the CLI/manifest STATED for
+            //      this entry (D-FFI-DECLARED-IMPORT-NAME; empty = unstated);
+            //   2. the binary's own embedded soname, read by FF1;
+            //   3. the file BASENAME supplied here as the last-resort fallback.
+            // All three are plain strings: no arm of this is language-,
+            // target-, or object-format-keyed.
             std::vector<ffi::IngestionSource> binarySources;
             binarySources.reserve(opts.resolveLibraries.size());
-            for (auto const& libPath : opts.resolveLibraries) {
+            for (auto const& lib : opts.resolveLibraries) {
                 binarySources.push_back(ffi::BinaryLibrarySource{
-                    libPath, libPath.filename().string()});
+                    lib.path, lib.path.filename().string(),
+                    lib.declaredImportName});
             }
 
             // (i) `ingest()` BINDS every governed extern the named binaries

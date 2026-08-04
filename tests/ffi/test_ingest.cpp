@@ -718,6 +718,132 @@ TEST(FfiIngest, IngestPrefersSonameOverBasenameForImportLibrary) {
     EXPECT_TRUE(fallback.soname.empty());
 }
 
+// ── D-FFI-DECLARED-IMPORT-NAME: the caller-STATED identity outranks both ──
+//
+// Reading a library answers two separate questions: WHICH SYMBOLS exist (the
+// file at `path`) and WHAT IDENTITY to record for them. Until this landed only
+// the file could answer the second, which makes a cross-compilation STAND-IN
+// binary unusable: a MacPorts `.dylib` whose LC_ID_DYLIB is
+// `/opt/local/lib/libtcl8.6.dylib` would stamp that MacPorts prefix into the
+// artifact's LC_LOAD_DYLIB, and the artifact would then demand MacPorts at
+// that exact path on the target Mac (a dyld load failure at RUNTIME, with no
+// build error anywhere).
+//
+// The precedence, highest first: declaredImportName > row.soname > basename.
+// The sibling test above pins levels 2 vs 3; this one pins level 1 over BOTH,
+// plus the empty-means-unstated fallthrough that keeps every pre-existing
+// build byte-identical.
+//
+// FORMAT-BLIND by construction: the fixture drives ELF because that is the
+// format `buildElfSo` can synthesize in-process, but the production decision
+// site reads `row.soname`, which the ELF / Mach-O / PE readers all populate
+// from their own embedded identity -- there is no per-format arm to test.
+TEST(FfiIngest, IngestDeclaredImportNameOutranksSonameAndBasename) {
+    ScratchDir scratch{Location::Temp, "ff5-declared-import"};
+    auto const dir = scratch.path();
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+
+    // Build a `.so` exporting `puts` (optionally carrying `soname`), run
+    // ingest() against it with `importName` = "widget-basename.so" (level 3)
+    // and the given `declared` (level 1), and return the resolved metadata.
+    auto runIngest = [&](std::string const& fileName,
+                         std::string const& soname,
+                         std::string const& declared) -> FfiMetadata {
+        auto const path = dir / fileName;
+        {
+            auto const bytes = buildElfSo("puts", soname);
+            std::ofstream out{path, std::ios::binary};
+            out.write(reinterpret_cast<char const*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        TypeInterner ti = makeInterner();
+        auto built = buildModuleWithExtern(ti);
+        HirFfiMap ffi{built.hir};
+        DiagnosticReporter rep;
+        std::array sources{IngestionSource{BinaryLibrarySource{
+            path, "widget-basename.so", declared}}};
+        std::array externs{ExternDeclRef{built.externNode, "puts"}};
+        auto result = ingest(sources, externs, **target, **format, ffi, rep);
+        EXPECT_TRUE(result.ok()) << "rep.errorCount=" << rep.errorCount();
+        EXPECT_EQ(result.externsAnnotated, 1u);
+        auto const* meta = ffi.tryGet(built.externNode);
+        EXPECT_NE(meta, nullptr);
+        return meta ? *meta : FfiMetadata{};
+    };
+
+    // (a) LEVEL 1 BEATS LEVEL 2: the binary declares DT_SONAME
+    // `/opt/local/lib/libwidget.so.2` (the MacPorts-shaped absolute install
+    // name that motivates the whole capability) AND the caller states
+    // `libwidget.so.2`. The STATED name must win.
+    // RED-ON-DISABLE: drop the level-1 arm from the decision site and this
+    // reads the `/opt/local/...` soname -- exactly the artifact that would
+    // fail to load on the target.
+    FfiMetadata const stated =
+        runIngest("libwidget.so", "/opt/local/lib/libwidget.so.2",
+                  "libwidget.so.2");
+    EXPECT_EQ(stated.importLibrary, "libwidget.so.2")
+        << "a caller-STATED import name must outrank the embedded DT_SONAME";
+    // The OBSERVED embedded identity is NOT forged to match: it still records
+    // what the file we actually read declared about itself. Losing this would
+    // destroy the only evidence of which binary was read.
+    EXPECT_EQ(stated.soname, "/opt/local/lib/libwidget.so.2")
+        << "meta.soname records the file's OWN identity, not the declaration";
+
+    // (b) LEVEL 1 BEATS LEVEL 3: no DT_SONAME at all, so level 2 is out of the
+    // way and the STATED name must still beat the basename fallback.
+    FfiMetadata const statedNoSoname =
+        runIngest("libplain.so", "", "libwidget.so.2");
+    EXPECT_EQ(statedNoSoname.importLibrary, "libwidget.so.2")
+        << "a caller-STATED import name must outrank the basename fallback";
+    EXPECT_TRUE(statedNoSoname.soname.empty());
+
+    // (c) EMPTY == NOT STATED ⇒ falls through to LEVEL 2. This is the arm that
+    // keeps every build predating this capability byte-identical.
+    // RED-ON-DISABLE: make the level-1 arm unconditional (`declaredImportName`
+    // always wins, even empty) and this reads "" instead of the soname.
+    FfiMetadata const unstated =
+        runIngest("libwidget2.so", "libwidget.so.2", "");
+    EXPECT_EQ(unstated.importLibrary, "libwidget.so.2")
+        << "an EMPTY declaration means NOT STATED -- fall through to the soname";
+
+    // (d) EMPTY declaration AND no soname ⇒ all the way down to LEVEL 3.
+    FfiMetadata const unstatedNoSoname = runIngest("libplain2.so", "", "");
+    EXPECT_EQ(unstatedNoSoname.importLibrary, "widget-basename.so")
+        << "nothing stated + no soname ⇒ the basename fallback still applies";
+}
+
+// The STRUCT contract, independent of any binary read: the new field exists,
+// defaults EMPTY (== not stated, so a positional aggregate initializer written
+// before this capability keeps its exact old meaning), and survives into the
+// IngestionSource variant. Pins the FIELD ORDER too -- `declaredImportName` is
+// LAST, so `BinaryLibrarySource{path, basename}` still means "basename is the
+// level-3 fallback", not "basename is the level-1 declaration". Getting that
+// backwards would silently promote every existing caller's basename to the top
+// of the precedence.
+TEST(FfiIngest, BinaryLibrarySourceDeclaredImportNameDefaultsEmptyAndIsLast) {
+    BinaryLibrarySource none{"/tmp/libdsslib.so"};
+    EXPECT_TRUE(none.importName.empty());
+    EXPECT_TRUE(none.declaredImportName.empty());
+
+    BinaryLibrarySource twoArg{"/build/abs/libdsslib.so", "libdsslib.so"};
+    EXPECT_EQ(twoArg.importName, "libdsslib.so")
+        << "the SECOND positional is still the level-3 basename fallback";
+    EXPECT_TRUE(twoArg.declaredImportName.empty())
+        << "a two-arg initializer states NOTHING -- old callers unchanged";
+
+    BinaryLibrarySource declared{"/opt/local/lib/libtcl8.6.dylib",
+                                 "libtcl8.6.dylib", "@rpath/libtcl8.6.dylib"};
+    EXPECT_EQ(declared.declaredImportName, "@rpath/libtcl8.6.dylib");
+    IngestionSource src{declared};
+    ASSERT_TRUE(std::holds_alternative<BinaryLibrarySource>(src));
+    EXPECT_EQ(std::get<BinaryLibrarySource>(src).declaredImportName,
+              "@rpath/libtcl8.6.dylib");
+}
+
 // ── FF3 (resolveAbi) gate: bad (target, format) pair fails ingest ─
 
 TEST(FfiIngest, AbiResolveFailureSkipsIngestion) {

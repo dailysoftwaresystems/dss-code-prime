@@ -71,6 +71,17 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             // dedicated `readArArchive` (ar_reader.hpp).
             return readAr(bytes, libraryPathLabel, reporter);
         case FormatGuess::MachOFat:
+            // Reachability note (the fat-detection fix): this arm was
+            // DEAD CODE until `guessFormat` learned that `fat_header`
+            // is big-endian on disk — a universal binary used to fall
+            // through to the UnknownFormat catch-all below, so the one
+            // message that tells the operator what to DO could never
+            // fire. Nothing here changed its contract: universal
+            // binaries are still NOT read (`readImports` takes no
+            // target, so it could not pick a slice); the fix only makes
+            // the already-intended, already-anchored failure path
+            // reachable.
+            //
             // D-FF1-MACHO-FAT anchor: universal binaries package
             // multiple per-arch slices behind one outer wrapper.
             // v1 expects the caller to extract the desired arch
@@ -91,7 +102,8 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::UnsupportedFormat,
                 std::string{"readImports: '"} + std::string{libraryPathLabel}
-                + "' is a Mach-O FAT/universal binary (magic 0xCAFEBABE). "
+                + "' is a Mach-O FAT/universal binary (big-endian "
+                  "fat_header magic 0xCAFEBABE or 0xCAFEBABF). "
                   "v1 supports single-arch Mach-O only — slice the "
                   "required arch first (e.g. `lipo -thin arm64 in.dylib "
                   "-output out.dylib`). Anchor D-FF1-MACHO-FAT.",
@@ -116,11 +128,21 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
         case FormatGuess::Unknown:
             break;
     }
+    // This message enumerates what `guessFormat` RECOGNISES, and it must
+    // keep saying only that. Two ways it has been dishonest: it omitted
+    // `ar` (which IS dispatched, to readAr — an operator holding a `.a`
+    // was told static archives are gibberish), and it advertised
+    // 0xCAFEBABE while the fat arm was unreachable, so the one file it
+    // named by magic was the one file it rejected here. Recognised is
+    // NOT the same as read, so each entry says which it is.
     return std::unexpected(emitAndReturn(
         BinaryReadErrorKind::UnknownFormat,
         std::string{"readImports: '"} + std::string{libraryPathLabel}
-        + "' has no recognised magic (expected ELF '\\x7FELF', PE 'MZ', "
-          "or Mach-O 0xFEEDFACF/0xCAFEBABE/0xFEEDFACE).",
+        + "' has no recognised magic. Recognised: ELF '\\x7FELF' (read), "
+          "PE 'MZ' (read), ar archive '!<arch>' (read), thin Mach-O "
+          "0xFEEDFACF (64-bit, read); recognised but NOT read: thin "
+          "Mach-O 0xFEEDFACE (32-bit) and the big-endian Mach-O "
+          "universal headers 0xCAFEBABE / 0xCAFEBABF.",
         reporter));
 }
 

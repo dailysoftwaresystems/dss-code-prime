@@ -111,13 +111,40 @@
       "runOn": ["darwin"],
       "launchers": [],
       "build": {
+        "$recipeTransformComment": "⚠ `none` IS WRONG HERE, and TF-C117 is the cycle that could finally SEE it. Until this cycle the leg died at Step 6 — no Darwin libtcl on a non-Mac — so nothing downstream was ever exercised. With the libraries acquired it reaches Step 7 and compiles all 189 TUs, and ✔MEASURED it then fails with 8 diagnostics, of which the load-bearing ones are `error[S0001] got pread64`, `got pwrite64` and `error[S0006] got off64_t`. Those are LINUX names. They arrive because the recipe is derived from a POSIX `make -n` on the deriving Linux host and `_HAVE_SQLITE_CONFIG_H` is passed through verbatim, so this Darwin build inherits THAT host's `HAVE_PREAD64` / `HAVE_OFF64_T` configure answers — the exact cross-compile category error the pe64 leg's `windows-selfconfig` exists to fix, one platform over. The remaining diagnostics (`sysctlbyname`, `CTL_HW`, `HW_AVAILCPU`, `HW_NCPU`) are a separate and genuine gap: a Darwin `<sys/sysctl.h>` descriptor DSS does not ship. Both are tracked as D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES; the value stays `none` until the transform is designed, because guessing one here would stage a header configuration nobody has measured.",
         "recipeTransform": "none",
         "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "$librariesComment": "★ THIS LEG ACQUIRES ITS LIBRARIES (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER). It used to declare `host-system`, which on any non-Mac means 'hope this box has a Darwin libtcl' — i.e. it never built anywhere but a Mac, in flat contradiction of the harness's own contract that every leg is BUILT everywhere and only RUN is gated. MacPorts publishes unauthenticated-HTTPS binary archives, and the two we need are UNIVERSAL (one download carries both the arm64 and the x86_64 slice, which is why the sibling macho leg names the SAME url + digest and differs only in the slice it takes). ✔MEASURED 2026-08-04: 110/110 required symbols present on BOTH arches — all 102 `Tcl*` the testfixture imports, 0 missing, plus 8/8 zlib — so there is no eager-import hazard [[D-FFI-DESCRIPTOR-EAGER-IMPORT]].",
         "libraries": {
-          "provider": "host-system",
+          "provider": "pinned-archive",
+          "$acquireComment": "`universal: true` is not a formality. ✔MEASURED: handed the UNIVERSAL file, DSS refuses it — `error[F_UnsupportedBinaryFormat] readImports: '<path>' is a Mach-O FAT/universal binary (big-endian fat_header magic 0xCAFEBABE or 0xCAFEBABF). v1 supports single-arch Mach-O only — slice the required arch first (e.g. `lipo -thin arm64 in.dylib -output out.dylib`). Anchor D-FF1-MACHO-FAT.` — and handed the thin arm64 slice OF THE SAME FILE it succeeds with rc=0. So slicing is the contract that anchor states, performed here because the harness is the only layer that knows which arch this leg wants (`readImports(path, reporter)` takes no target). ⚠ THE REFUSAL'S SPELLING CHANGED INSIDE THIS CYCLE, and the first draft of this comment quoted the older one: `guessFormat` read the fat magic little-endian, so a real universal binary could never reach the arm above and fell into the unknown-magic catch-all instead — the anchor's own remediation was unreachable. That detection bug was fixed in the same cycle; the quote above is the post-fix message. ★ Slicing would be right even if DSS read fat files: a leg's build input should be a library FOR THAT LEG'S TARGET, not a container that also holds a foreign architecture, or 'which architecture did this leg resolve against?' has no answer from the input.",
+          "$importNameComment": "★★ THE TRAP, AND WHY THE ANSWER IS `@loader_path` AND NOT A SYSTEM PATH. Both archives' LC_ID_DYLIB reads `/opt/local/lib/…` (✔MEASURED: `/opt/local/lib/libtcl8.6.dylib`, `/opt/local/lib/libz.1.dylib`), and DSS records a resolved library's EMBEDDED identity as the LC_LOAD_DYLIB — so linking naively produces a Mach-O that demands MacPorts at that prefix on the target Mac. That is a dyld LOAD failure, not a build error, so nothing on this host would catch it. The obvious fix is to record the system path instead — and this project cannot HONESTLY do that for Tcl: nobody here has measured what a Mac carries at /usr/lib for Tcl 8.6, and this repo's own darwin path installs Tcl through Homebrew, whose current `tcl-tk` is 9.x — so `/usr/lib/libtcl8.6.dylib` would be an unverified claim about someone else's machine, and a wrong one costs a dyld failure. `@loader_path/<name>` is TRUE BY CONSTRUCTION: dyld resolves it against the directory holding the executable, the driver stages the acquired dylib there beside the artefact, and the result assumes NOTHING about the target Mac's prefix layout or Tcl version. ⚠ For zlib a system path WOULD be defensible — this harness has measured that `/usr/lib/libz.1.dylib` resolves out of the dyld shared cache even though it cannot be opened as a file (see build-and-test.sh's darwin branch) — but mixing the two policies inside one artefact buys nothing and makes the rule harder to state. Flipping either back to a system path is a one-line edit HERE, which is the point of declaring it.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://packages.macports.org/tcl/tcl-8.6.17_0+corefoundation+threads+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "47efa8a687d614d8c3c1c4bca19cfe9f1e95efd093ee3f31b9ff1c6d43306d0f",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib" }
+                ]
+              },
+              {
+                "$memberComment": "The archive ships `libz.1.dylib` as a SYMLINK to `libz.1.3.2.dylib`. The declaration names the link, and the resolver follows it inside the archive and materialises the TARGET's bytes under the `as` name — a symlink is not creatable on Windows without privilege and is not a library DSS can read, so one declaration has to work on every host.",
+                "url": "https://packages.macports.org/zlib/zlib-1.3.2_0+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "0461347fb0ac90cefe12e1be1bcc16d0b159649f322b2c3e03e9bcf33476bbc2",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
+                    "universal": true, "importName": "@loader_path/libz.1.dylib" }
+                ]
+              }
+            ]
+          },
           "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
           "zNames": ["libz.dylib", "libz.1.dylib"],
           "searchPaths": []
@@ -140,8 +167,32 @@
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "$librariesComment": "The SAME two MacPorts archives as macho64-arm64 — same url, same pinned digest — because they are UNIVERSAL. What differs is only which slice this leg takes, and that is DERIVED from the leg's own target arch rather than spelled here (see harness_legs.py MACHO_CPU_TYPES). The download is content-addressed by its digest, so the two legs share one fetch and the second is a cache hit with no network at all.",
         "libraries": {
-          "provider": "host-system",
+          "provider": "pinned-archive",
+          "$importNameComment": "See macho64-arm64's $importNameComment — same trap, same answer, and deliberately the same policy on both macho legs so the artefact's dependency shape does not depend on which architecture it was built for.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://packages.macports.org/tcl/tcl-8.6.17_0+corefoundation+threads+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "47efa8a687d614d8c3c1c4bca19cfe9f1e95efd093ee3f31b9ff1c6d43306d0f",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib" }
+                ]
+              },
+              {
+                "url": "https://packages.macports.org/zlib/zlib-1.3.2_0+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "0461347fb0ac90cefe12e1be1bcc16d0b159649f322b2c3e03e9bcf33476bbc2",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
+                    "universal": true, "importName": "@loader_path/libz.1.dylib" }
+                ]
+              }
+            ]
+          },
           "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
           "zNames": ["libz.dylib", "libz.1.dylib"],
           "searchPaths": []

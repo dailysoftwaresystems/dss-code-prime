@@ -48,16 +48,25 @@
 #      (`search-paths`) `--resolve-library` reads a DLL's EXPORT table (`.edata`)
 #      — so it points at real DLLs (tcl86.dll + zlib1.dll), NOT an import .lib;
 #      git-for-Windows ships both with the full public API; override with
-#      $env:TCL_DLL/$env:ZLIB_DLL. A leg whose DECLARED inputs are not on this
-#      machine records `skipped-build-input-missing` — LOUDLY, naming every name
-#      and path it searched — and the run continues with the other legs.
+#      $env:TCL_DLL/$env:ZLIB_DLL. A leg declaring `pinned-archive` has its
+#      libraries ACQUIRED — downloaded from a checksum-PINNED archive, sliced to
+#      that leg's target arch and cached outside the repo — by the SHARED
+#      resolver (`harness_legs.py --acquire`), which is how a Windows box obtains
+#      Darwin dylibs for the macho legs. A leg whose DECLARED inputs are not on
+#      this machine (or cannot be acquired) records `skipped-build-input-missing`
+#      — LOUDLY, naming every name and path it searched, or quoting the
+#      resolver's refusal — and the run continues with the other legs.
 #   7. PER LEG, generate a `.dss-project.json` (language c-subset / profile cli /
 #      the leg's target spec / artifactName testfixture / the 185 TUs as absolute
 #      `sources` / the sqlite+tcl+zlib include dirs / the recipe defines / that
-#      leg's two libraries as resolveLibraries) and build it:
+#      leg's two libraries as resolveLibraries — each carrying the leg's DECLARED
+#      runtime identity when its library is an acquired STAND-IN, so the artefact
+#      does not record the packager's own install name) and build it:
 #        dss-code-prime --project <manifest> --config=release --output <out>/<leg>
 #      → <out>/<leg>/<format>/testfixture[.exe]   (the `.exe` suffix is DERIVED
-#      from the leg's object format, never hardcoded)
+#      from the leg's object format, never hardcoded). An ACQUIRED library is then
+#      copied BESIDE the artefact, because a `@loader_path/<name>` identity is a
+#      claim about that directory and this is what makes it true.
 #   8. PER LEG THAT THIS HOST CAN EXECUTE (run.mode native | launched), run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture
 #      (DSS_TIER: veryquick[default] | quick | full | all), parse
@@ -1698,7 +1707,39 @@ function Find-DeclaredLib($names, $roots) {
   }
   return ''
 }
-# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Tcl; Z; Detail }.
+# ── ONE call into the shared resolver ────────────────────────────────────────
+# The PowerShell native-command traps this file has already paid for, handled in
+# ONE place instead of being rediscovered at every new call site:
+#   · the rc is taken DIRECTLY off the call ($LASTEXITCODE on the very next
+#     statement, NEVER after a pipe — a pipe reports the PIPE's status);
+#   · `2>&1` wraps the callee's stderr in ErrorRecords, so STDOUT (the JSON, the
+#     argv tokens) must be separated from it — while the FULL text, stderr
+#     included, is kept, because a refusal's entire value is its diagnostic and
+#     that diagnostic has to survive into the leg's Detail;
+#   · PowerShell 7.3+ can make a nonzero-exiting native command THROW while
+#     $ErrorActionPreference is 'Stop', which would abort the whole run with a
+#     stack trace instead of failing the ONE leg that asked for this.
+# Every caller decides for itself what a non-zero rc means for ITS leg; this
+# function never dies, because the whole point is per-leg isolation.
+function Invoke-LegResolver([string[]]$callArgs) {
+  try {
+    $out = @(& $python3.Source $LegsPy @callArgs 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc  = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  return @{
+    Rc     = $rc
+    Stdout = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+                      ForEach-Object { "$_".TrimEnd() })
+    Text   = (@($out | ForEach-Object { "$_".TrimEnd() }) -join "`n")
+  }
+}
+
+# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Tcl; Z; Detail } — plus,
+# for a provider that ACQUIRED its libraries, `Acquired` (the resolver's own
+# per-library records, which Step 7 stages beside the artefact).
 # Ok=$false is ALWAYS `skipped-build-input-missing` with a Detail that names the
 # provider, every candidate NAME and every candidate PATH — a reader must be able
 # to act on it without reading this script.
@@ -1740,14 +1781,167 @@ function Resolve-LegLibraries($leg) {
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
       return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'host-system' found no $($missing -join ' and no ') under any candidate root [$($roots -join ' ; ')] — this machine has no copy of that target's tcl/zlib runtime; put one anywhere and name the directory in `$env:DSS_HOST_LIBDIR" }
     }
+    'pinned-archive' {
+      # ★ THE LEG'S DECLARED ROUTE, PERFORMED BY THE RESOLVER — never by this
+      # driver. `--acquire` downloads the archives legs.json PINS, verifies the
+      # declared sha256, extracts the declared members (following an
+      # intra-archive symlink), slices a Mach-O universal archive to THIS LEG's
+      # target arch, and materialises the result in a cache OUTSIDE the repo.
+      # This driver does not know what HTTP, bzip2 or a fat header are, and that
+      # is the entire point: acquisition implemented once, in the file both
+      # drivers already hard-require, cannot exist in one driver and not the
+      # other (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER).
+      #
+      # NOT host-keyed and NOT conditional: every host runs this for a leg that
+      # declares it. A machine with no network and a cold cache gets the
+      # resolver's REFUSAL — which is a `skipped-build-input-missing` for THIS
+      # leg with the resolver's own diagnostic, never a fallback to "whatever
+      # tcl is on this box" (that fallback would build the leg against a foreign
+      # library and report it green).
+      Info "[$($leg.label)] provider 'pinned-archive' — acquiring this leg's DECLARED libraries via harness_legs.py --acquire (cached after the first run; a cold cache downloads)"
+      $acqRun = Invoke-LegResolver @('--acquire', "$($leg.label)")
+      if ($acqRun.Rc -ne 0) {
+        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) FAILED (rc=$($acqRun.Rc)). The declared route could not be completed and nothing was improvised in its place:`n$(($acqRun.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
+      }
+      $acq = $null
+      try { $acq = ($acqRun.Stdout -join "`n") | ConvertFrom-Json } catch {
+        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) exited 0 but did not print the JSON report this driver reads ($($_.Exception.Message)). Output was:`n$(($acqRun.Text -split "`n" | Select-Object -First 20 | ForEach-Object { "        $_" }) -join "`n")" }
+      }
+      $cdir = "$($acq.cacheDir)"
+      if (-not $cdir) { return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': the acquisition report for $($leg.label) carries no cacheDir, so there is no directory to resolve this leg's libraries out of." } }
+      # ★ THE SUBSTITUTION IS STATED, NEVER HIDDEN. An acquired library is a
+      # STAND-IN: we read its export surface here, and the target machine loads
+      # its OWN copy. Its embedded identity is the PACKAGER's (MEASURED: the
+      # MacPorts dylibs say `/opt/local/lib/…`), so the leg DECLARES the identity
+      # to record instead. A build log that did not print the displacement could
+      # not show it actually happened.
+      #
+      # `remediated` is printed FIRST and unconditionally: it is the resolver
+      # saying a cached file was absent, or did not hash to what it hashed to when
+      # it was extracted, and was restored from the digest-verified archive. Not
+      # an error — but a cache that repaired itself silently is exactly the kind
+      # of fact this harness refuses to keep to itself.
+      foreach ($rem in @($acq.remediated | Where-Object { $_ })) {
+        Warn "[$($leg.label)] cache REMEDIATED — $rem (restored from the pinned, digest-verified archive)"
+      }
+      foreach ($libRec in @($acq.libraries | Where-Object { $_ })) {
+        $displaced = if ("$($libRec.embeddedIdentity)") { "displacing the packager's own '$($libRec.embeddedIdentity)'" } else { 'the file carries no embedded identity' }
+        # BOTH digests, by the names the resolver reports them under: the ARCHIVE's
+        # (what the catalogue pins) and the extracted FILE's (what the compiler is
+        # actually handed). A missing one is SAID, never printed as a blank — a
+        # digest field that quietly went empty is how a report stops meaning
+        # anything while still looking like one.
+        $aSha = if ("$($libRec.archiveSha256)") { "archive sha256 $($libRec.archiveSha256)" } else { 'archive sha256 <not reported by this resolver>' }
+        $fSha = if ("$($libRec.fileSha256)")    { "file sha256 $($libRec.fileSha256)" }       else { 'file sha256 <not reported by this resolver>' }
+        Info "[$($leg.label)] acquired $($libRec.as) -> $($libRec.path)"
+        Info "[$($leg.label)]   recorded as '$($libRec.importName)' ($displaced)"
+        Info "[$($leg.label)]   $aSha; $fSha; from $($libRec.sourceUrl)"
+      }
+      # Resolved out of the ACQUIRED cache by the leg's OWN declared names — the
+      # same Find-DeclaredLib the other providers use, so "which file is the tcl
+      # one" is answered identically everywhere.
+      $tcl = Find-DeclaredLib $tclNames @($cdir)
+      $z   = Find-DeclaredLib $zNames   @($cdir)
+      if ($tcl -and $z) {
+        return @{ Ok = $true; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
+                  Detail = "provider 'pinned-archive' — $(@($acq.libraries | Where-Object { $_ }).Count) declared library(ies) materialised for target arch $($acq.targetArch) in $cdir ($(if ($acq.fromCache) { 'from cache, no network' } else { 'freshly downloaded + checksum-verified' }))" }
+      }
+      $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
+      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
+    }
     default {
-      # A provider this driver has NO implementation for. Named out loud rather
-      # than crashed on or silently passed: the leg is declared, it is real, and
-      # the gap is THIS DRIVER's — say which provider, so the next cycle knows
-      # exactly what to write.
-      return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "library provider '$provider' is NOT IMPLEMENTED by build-and-test.ps1 (implemented: search-paths, host-system). The leg is declared and its build would be attempted; this driver simply cannot obtain its declared inputs (tcl: $($tclNames -join ' | ') / z: $($zNames -join ' | ')). build-and-test.sh is where 'ubuntu-ports-arm64' is implemented today." }
+      # A provider this driver has NO dispatch arm for. Named out loud rather than
+      # crashed on or silently passed: the leg is declared, it is real, and the gap
+      # is THIS DRIVER's.
+      #
+      # ★ WHAT THIS ARM NO LONGER MEANS. It used to read "…is NOT IMPLEMENTED by
+      # build-and-test.ps1 … build-and-test.sh is where acquisition lives", which
+      # made a working provider Linux-driver-only. That is over: ACQUISITION IS NOT
+      # DRIVER-LOCAL ANY MORE. `pinned-archive` is performed by the SHARED resolver
+      # (`harness_legs.py --acquire`) and is dispatched right here, on every host —
+      # which is how a Windows box acquires Darwin dylibs for the macho legs.
+      #
+      # ★ EXACTLY ONE DECLARED PROVIDER STILL REACHES THIS ARM, BY NAME:
+      # ubuntu-ports-arm64, the bespoke ancestor of `pinned-archive`.
+      # build-and-test.sh performs it inline with curl + dpkg-deb, and generalising
+      # it into the shared resolver needs a .deb reader — MEASURED 2026-08-04, not
+      # safely doable yet: a modern .deb's inner archive can be zstd, whose stdlib
+      # module arrived only in Python 3.14 (this Windows host has 3.14, the WSL leg
+      # has 3.12), so that route would be a capability that exists on one HOST and
+      # not another — the same defect one level down. It is therefore named here,
+      # with its anchor, instead of quietly passing, and
+      # tests/harness/test_sqlite_harness_legs.cpp carries the self-retiring
+      # exemption that reds the day it IS implemented in both drivers.
+      # D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+      return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "library provider `"$provider`" has no dispatch arm in build-and-test.ps1, so this driver cannot obtain this leg's declared inputs (tcl: $($tclNames -join ' | ') / z: $($zNames -join ' | ')). ACQUISITION ITSELF IS NOT DRIVER-LOCAL — pinned-archive is performed HERE, by harness_legs.py --acquire, on every host. Exactly one DECLARED provider still lands in this arm: ubuntu-ports-arm64, whose .deb route build-and-test.sh performs inline with curl + dpkg-deb and which is not generalised into the shared resolver yet (a .deb's inner archive can be zstd, whose stdlib module arrived only in Python 3.14 — a route that works on one HOST and not another is the same defect one level down). D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE. If the provider named above is a DIFFERENT one, the catalogue (or LIBRARY_PROVIDERS in harness_legs.py) grew a provider and this driver was not extended in the same change — add the arm to BOTH drivers, because a capability in one driver and not the other is this project's canonical silent harness bug." }
     }
   }
+}
+
+# ── The argv that hands this leg's two resolved libraries to the build ───────
+# ★ THE COMPILER'S FLAG IS NOT SPELLED IN THIS FILE, AND MUST NOT BE — the same
+# argument `--translate-path` makes for `wslpath`. It is named ONCE, in
+# harness_legs.py, and both drivers ask that file to build the argv. A driver
+# that spelled it itself would be a capability that can exist in one driver and
+# not the other, which is precisely
+# D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER.
+#
+# ★ WHY THIS MATTERS BEYOND TIDINESS — THE `importName` OVERRIDE. An ACQUIRED
+# library is a STAND-IN: this host reads its export surface, the target machine
+# loads its OWN copy. Its embedded identity (Mach-O LC_ID_DYLIB / ELF DT_SONAME /
+# PE export DllName) is therefore a fact about whoever PACKAGED it — MEASURED
+# 2026-08-04: the MacPorts dylibs say `/opt/local/lib/…`, and a Mach-O cross-built
+# against them records `LC_LOAD_DYLIB=/opt/local/lib/libtcl8.6.dylib`, demanding
+# MacPorts on the target Mac. That is a dyld LOAD failure: not a build error, and
+# NOT observable on this host. So a leg that needs a different runtime identity
+# DECLARES it (plan `libraries.tclImportName` / `zImportName`, "" everywhere the
+# library already carries the right one) and the resolver — which also PROBES the
+# compiler for the capability — decides how to say it.
+#
+# ★ REFUSAL, NEVER A DROPPED OVERRIDE. If the resolver exits non-zero (this
+# compiler cannot record the identity), the leg is POISONED. Building anyway
+# would produce an artefact that links clean here and dies at load time on a
+# machine this run cannot observe — the one failure mode nothing downstream
+# would catch.
+#
+# ★ WHERE THESE TOKENS ACTUALLY GO, and why that is not a mismatch: this driver
+# builds through the `--project` MANIFEST, so the argv is handed to
+# gen-pe64-manifest.py, not straight to the compiler. That generator's
+# `--resolve-library PATH[=IMPORT_NAME]` deliberately mirrors the DSS CLI's own
+# flag and value grammar (gen-pe64-manifest.py `resolve_library_entry`), turning
+# a bare PATH into the plain string entry it has always emitted and a
+# `PATH=IMPORT_NAME` into the extended `{"path", "importName"}` object that
+# src/program/project_config.cpp reads. So the SAME tokens carry the override all
+# the way into `resolveLibraries` with no manifest-schema change of any kind.
+#
+# Returns @{ Ok; Tokens; Detail }. Never dies: a failure belongs to ONE leg.
+function Get-ResolveLibraryArgv($leg, $legLibs) {
+  $libs   = $leg.build.libraries
+  $tokens = @()
+  $notes  = @()
+  foreach ($w in @(
+      @{ What = 'tcl'; Path = "$($legLibs.Tcl)"; Import = "$($libs.tclImportName)" },
+      @{ What = 'z';   Path = "$($legLibs.Z)";   Import = "$($libs.zImportName)" })) {
+    $call = @('--resolve-library-argv', "$($w.Path)")
+    # --dss is passed exactly when there is an identity to record: that is the
+    # only case the resolver probes the compiler for, and a leg needing no
+    # override must keep paying nothing for one.
+    if ($w.Import) { $call += @('--import-name', "$($w.Import)", '--dss', "$DssBin") }
+    $res = Invoke-LegResolver $call
+    if ($res.Rc -ne 0) {
+      return @{ Ok = $false; Tokens = @(); Detail = "the resolver REFUSED to build the library argv for this leg's $($w.What) library (rc=$($res.Rc); path $($w.Path)$(if ($w.Import) { "; declared runtime identity '$($w.Import)'" })). Dropping the override and building anyway is not an option — the artefact would link clean here and fail at LOAD time on the target machine:`n$(($res.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
+    }
+    $toks = @($res.Stdout)
+    # ONE TOKEN PER LINE is the contract, and it is why the output is never
+    # re-split on whitespace here: a token legitimately contains '=' and a path
+    # legitimately contains spaces.
+    if ($toks.Count -lt 2 -or @($toks | Where-Object { -not $_ }).Count -gt 0) {
+      return @{ Ok = $false; Tokens = @(); Detail = "the resolver exited 0 for this leg's $($w.What) library but printed $($toks.Count) usable token(s) (expected at least the flag and its value, one per line). Refusing to build with an argv this driver cannot account for. Output was:`n$(($res.Text -split "`n" | Select-Object -First 10 | ForEach-Object { "        $_" }) -join "`n")" }
+    }
+    $tokens += $toks
+    if ($w.Import) { $notes += "$($w.What) recorded as '$($w.Import)' (the leg's DECLARED runtime identity, displacing the acquired file's own)" }
+  }
+  return @{ Ok = $true; Tokens = $tokens; Detail = $(if ($notes.Count) { $notes -join '; ' } else { 'no runtime-identity override declared — each library is recorded under its own embedded identity' }) }
 }
 
 # ── Can this driver express THIS leg's manifest correctly? ───────────────────
@@ -2226,14 +2420,26 @@ foreach ($leg in $BuildableLegs) {
   # ★ THIS LEG'S OWN INCLUDE LIST — the base recipe dirs plus the zinc/ staged for
   # ITS recipeTransform. Not one shared includes.txt: that is what made every leg
   # compile against the pe leg's zlib header.
+  # ★ THE TWO LIBRARY ARGUMENTS COME FROM THE RESOLVER — see Get-ResolveLibraryArgv
+  # for why this driver must not spell the flag, and why a leg whose declared
+  # runtime identity cannot be recorded is POISONED rather than built. With no
+  # override declared the tokens are byte-identical to the pair this call site has
+  # always passed, so the pe64/elf legs' generator invocation is unchanged.
+  $libArgvRes = Get-ResolveLibraryArgv $leg $LegLibs[$lbl]
+  if (-not $libArgvRes.Ok) {
+    Set-LegVerdict $lbl 'poisoned' "the library argv could not be built: $($libArgvRes.Detail)"
+    Warn "[$lbl] POISONED — refusing to build an artefact whose runtime library identity would be wrong:"
+    foreach ($l in ("$($libArgvRes.Detail)" -split "`n")) { Warn "      $l" }
+    continue
+  }
+  Info "[$lbl] resolve-library: $($libArgvRes.Detail)"
   $genArgs = @(
     $GenPy,
     '--tus',      (Join-Path $Stage 'tus.txt'),
     '--includes', $LegIncludes[$lbl],
     '--defines',  (Join-Path $Stage 'defines.txt'),
-    '--target',   $leg.spec,
-    '--resolve-library', $LegLibs[$lbl].Tcl,
-    '--resolve-library', $LegLibs[$lbl].Z,
+    '--target',   $leg.spec
+  ) + @($libArgvRes.Tokens) + @(
     '--artifact-name', 'testfixture'
   )
   if ($GenCaps.RecipeTransform) { $genArgs += @('--recipe-transform', "$($leg.build.recipeTransform)") }
@@ -2268,6 +2474,47 @@ foreach ($leg in $BuildableLegs) {
     Warn "[$lbl] BUILD FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture$sfx. See $clog"
     continue
   }
+
+  # ── the acquired libraries go BESIDE the artefact ──────────────────────────
+  # ★ `@loader_path/<name>` IS FALSE WITHOUT THIS STEP. A leg whose libraries were
+  # ACQUIRED records a runtime identity that is true BY CONSTRUCTION — dyld
+  # resolves `@loader_path` against the directory holding the executable — which
+  # makes it a claim about THIS DIRECTORY, and the claim has to be made true here.
+  # Skipping it produces a binary that links clean, passes every check this host
+  # can perform, and dies at load time on the target machine.
+  #
+  # DRIVEN BY THE ACQUISITION REPORT (`libraries[].path` / `.as`), never by a name
+  # list written here: the file that is copied is exactly the file the build
+  # resolved against, under exactly the name the leg declared it would be recorded
+  # as. A hardcoded list would be a second place to keep in step with legs.json.
+  #
+  # A COPY FAILURE IS `poisoned`, NOT A WARNING. The artefact exists but is
+  # unloadable, and "built" would be a false statement about it.
+  # `@(… | Where-Object { $_ })` is load-bearing, not defensive noise: a hashtable
+  # returns $null for an absent key and `@($null)` is an array of ONE $null, so the
+  # unfiltered form would report one acquired library for every non-acquiring leg.
+  $acquiredLibs = @($LegLibs[$lbl].Acquired | Where-Object { $_ })
+  if ($acquiredLibs.Count) {
+    $artDir    = Split-Path -Parent $fixture
+    $stageFail = ''
+    $stagedAs  = @()
+    foreach ($al in $acquiredLibs) {
+      $src = "$($al.path)"; $as = "$($al.as)"
+      if (-not $src -or -not $as) { $stageFail = "the acquisition report carries a library with no path and/or no 'as' name (path='$src', as='$as'), so it cannot be staged beside the artefact"; break }
+      $dst = Join-Path $artDir $as
+      try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop } catch { $stageFail = "could not copy $src -> $dst : $($_.Exception.Message)"; break }
+      if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) { $stageFail = "copied $src -> $dst but the destination is not there afterwards"; break }
+      $stagedAs += $as
+    }
+    if ($stageFail) {
+      Set-LegVerdict $lbl 'poisoned' "built OK$ctimeSuffix, but its ACQUIRED libraries could not be staged beside the artefact in $artDir — $stageFail. The leg records '$($leg.build.libraries.tclImportName)'-style runtime identities that are only true when the library sits next to the executable, so shipping this binary would produce a LOAD failure on the target machine that nothing on this host can observe."
+      Warn "[$lbl] POISONED — built, but its acquired libraries are not beside the artefact:"
+      Warn "      $stageFail"
+      continue
+    }
+    Info "[$lbl] staged beside the artefact ($artDir): $($stagedAs -join ' ') — this is what makes the recorded @loader_path identities true"
+  }
+
   $LegLedger[$lbl].Built = $true
   $LegLedger[$lbl].CompileLog = $clog
   $BuiltLegs += $leg

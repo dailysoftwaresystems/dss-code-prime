@@ -92,8 +92,48 @@ VERDICTS = [
 
 # Closed vocabularies for the catalogue's own keys. Anything outside them is a
 # LOUD lint failure rather than a silently-ignored typo.
-LIBRARY_PROVIDERS = {"host-system", "ubuntu-ports-arm64", "search-paths"}
+#
+# ★ `pinned-archive` IS THE GENERAL FORM OF `ubuntu-ports-arm64`
+# (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER). Operator
+# principle, 2026-08-04: "we should be able to build macho on linux. ANY LEG MUST
+# BE ABLE TO BUILD TO ANY LEG." The drivers already AGREE in design — every leg's
+# plan line reads "build here", with only the RUN gated — so a leg that cannot
+# BUILD violates the harness's own contract. The mechanism was never the problem:
+# `build-and-test.sh` has downloaded Ubuntu ports `.deb`s for the arm64 leg since
+# TF-C68. What it lacked was (a) generality — one hand-written provider serving
+# one leg — and (b) a second implementation, because `build-and-test.ps1` could
+# not acquire AT ALL ("library provider '$provider' is NOT IMPLEMENTED by
+# build-and-test.ps1"), which is this project's canonical silent-harness-bug shape.
+#
+# So `pinned-archive` is DECLARED (url + sha256 + members, in legs.json) and
+# IMPLEMENTED HERE, once, in the file both drivers already hard-require — exactly
+# the argument this module's header makes for putting the leg DECISION here. A
+# driver calls `--acquire <leg>` and reads the resulting JSON; neither driver
+# knows what HTTP is. That is what makes the capability-pair gap unrepeatable
+# rather than merely repaired.
+LIBRARY_PROVIDERS = {"host-system", "ubuntu-ports-arm64", "search-paths",
+                     "pinned-archive"}
 RECIPE_TRANSFORMS = {"none", "windows-selfconfig"}
+
+# The archive kinds `--acquire` can open, and the `tarfile` mode that opens each.
+# CLOSED on purpose: a `.deb` (an `ar` archive) and a `.pkg.tar.zst` (needs zstd,
+# which is not in the stdlib before 3.14) are NOT here, so a catalogue that
+# declares one fails the lint LOUDLY instead of failing at download time on some
+# other machine, months later.
+ARCHIVE_FORMATS = {
+    "tar.bz2": "r:bz2",
+    "tar.gz":  "r:gz",
+    "tar.xz":  "r:xz",
+}
+
+# Mach-O `cpu_type_t` per TARGET ARCH — the key that picks a slice out of a
+# universal archive. Keyed on the leg's own target arch, never on the host: a
+# universal file contains both slices wherever it is sitting, and which one THIS
+# LEG needs is a property of the leg.
+MACHO_CPU_TYPES = {
+    "x86_64": 0x01000007,
+    "arm64":  0x0100000C,
+}
 
 # ── Launcher path translation ───────────────────────────────────────────────
 #
@@ -421,6 +461,562 @@ def launcher_available(command, available):
     return shutil.which(exe) is not None
 
 
+# ── Declared library acquisition ────────────────────────────────────────────
+#
+# D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. A leg whose
+# target libraries this machine does not carry ACQUIRES them, from a source the
+# CATALOGUE declares, against a checksum the catalogue PINS.
+#
+# THE FOUR RULES, all of them load-bearing:
+#
+#  1. PINNED CHECKSUM. A build that fetches third-party binaries is a
+#     supply-chain surface. Every archive declares its sha256 and is verified
+#     BEFORE anything is extracted from it — and the download cache is
+#     CONTENT-ADDRESSED (`downloads/<sha256>.<ext>`), so "is the cached copy the
+#     thing we pinned?" is answered by re-hashing, not by trusting a file name.
+#  2. FAIL LOUD, NEVER A SILENT FALLBACK. A checksum mismatch, an absent member,
+#     a missing slice, an unreachable host with a cold cache — each raises with
+#     the URL, the expected and actual digest, and what was being looked for.
+#     Nothing here EVER degrades to "use whatever is already on disk".
+#  3. OFFLINE WORKS. The network is touched only when the content-addressed
+#     download is absent. A populated cache + `--offline` completes with no
+#     round-trip at all, which is what makes this usable on a gate machine.
+#  4. TARGET-KEYED, NEVER HOST-KEYED. The route is a property of the LEG's
+#     target. The only host input is WHERE this machine keeps caches
+#     (`cache_root`), which is the same kind of fact as `searchPaths`.
+#
+# ★ AND THE PART THAT IS NOT OBVIOUS: `importName`. An acquired library is a
+# STAND-IN — we read its export surface, but the target machine will load ITS
+# OWN copy from ITS OWN prefix. The embedded identity (Mach-O LC_ID_DYLIB / ELF
+# DT_SONAME / PE export DllName) is therefore a fact about the PACKAGER, not
+# about the target: MacPorts' libtcl8.6.dylib says `/opt/local/lib/...`, and a
+# binary that records that demands MacPorts on the target Mac. So every acquired
+# member DECLARES the identity to record, the lint REQUIRES it, and `--acquire`
+# reports the declared name beside the embedded one it is displacing, so a build
+# log always states the substitution instead of hiding it.
+
+
+def cache_root(explicit=None):
+    """Where THIS MACHINE keeps caches. A host fact, in the same category as
+    `searchPaths` — it decides nothing about which legs exist. Precedence:
+    an explicit --cache-root, then DSS_HARNESS_CACHE_ROOT, then the
+    `~/.cache/dss-code-prime` the pe64 leg's declared search paths already
+    name, spelled through the variable that exists on this host."""
+    if explicit:
+        return os.path.abspath(explicit)
+    env = os.environ.get("DSS_HARNESS_CACHE_ROOT")
+    if env:
+        return os.path.abspath(env)
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if not home:
+        raise LegError(
+            "cannot locate a cache root: neither DSS_HARNESS_CACHE_ROOT nor "
+            "HOME nor USERPROFILE is set. The acquisition cache lives OUTSIDE "
+            "the repository on purpose (a downloaded third-party binary is not "
+            "a source artefact), so there is no in-tree fallback to take.")
+    return os.path.join(os.path.abspath(home), ".cache", "dss-code-prime")
+
+
+def leg_cache_dir(leg, root):
+    """The directory a leg's acquired libraries are materialised into. DERIVED
+    from the leg label rather than declared: one fewer thing a catalogue can get
+    wrong, and two legs can never collide on it."""
+    return os.path.join(root, "harness-libs", leg["label"])
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _fat_slices(buf):
+    """[(cputype, offset, size)] for a Mach-O universal archive, or [] if `buf`
+    is not one. The fat header is BIG-ENDIAN by definition (both magics), which
+    is why the struct format is fixed and not host-derived."""
+    import struct
+    if len(buf) < 8:
+        return []
+    magic, count = struct.unpack(">II", buf[:8])
+    if magic == 0xCAFEBABE:          # fat_arch (32-bit offsets)
+        out, off = [], 8
+        for _ in range(count):
+            cputype, _sub, offset, size, _align = struct.unpack(">IIIII", buf[off:off + 20])
+            out.append((cputype, offset, size))
+            off += 20
+        return out
+    if magic == 0xCAFEBABF:          # fat_arch_64
+        out, off = [], 8
+        for _ in range(count):
+            cputype, _sub, offset, size, _align, _res = struct.unpack(">IIQQII", buf[off:off + 32])
+            out.append((cputype, offset, size))
+            off += 32
+        return out
+    return []
+
+
+def _macho_install_name(buf):
+    """The LC_ID_DYLIB install name of a THIN 64-bit little-endian Mach-O, or ""
+    when there is none / this is not one. Read for REPORTING only: it is the
+    identity `importName` displaces, and a build log that does not print it
+    cannot show the substitution actually happened."""
+    import struct
+    if len(buf) < 32:
+        return ""
+    magic, = struct.unpack("<I", buf[:4])
+    if magic != 0xFEEDFACF:
+        return ""
+    ncmds, = struct.unpack("<I", buf[16:20])
+    p = 32
+    for _ in range(ncmds):
+        if p + 8 > len(buf):
+            return ""
+        cmd, cmdsize = struct.unpack("<II", buf[p:p + 8])
+        if cmdsize < 8:
+            return ""
+        if cmd == 0xD:               # LC_ID_DYLIB
+            nameoff, = struct.unpack("<I", buf[p + 8:p + 12])
+            return buf[p + nameoff:p + cmdsize].split(b"\0")[0].decode("utf-8", "replace")
+        p += cmdsize
+    return ""
+
+
+def _thin_for_arch(blob, target_arch, where):
+    """The slice of `blob` this leg's TARGET needs.
+
+    A universal archive is not a library a cross-compiler can be handed: DSS's
+    Mach-O reader recognises the THIN 64-bit magic (0xFEEDFACF) and nothing else
+    (`src/ffi/binary_readers/macho_reader.cpp` — there is no 0xCAFEBABE arm), and
+    even a reader that DID accept one would have to be told which slice, which
+    `readImports(path, reporter)` has no parameter for. Slicing here is not a
+    workaround for that: a LEG's build input is a library FOR THAT LEG'S TARGET,
+    and handing macho64-arm64 a file that also contains x86_64 code makes "which
+    architecture did this leg actually resolve against?" unanswerable from the
+    input. `lipo -thin` exists for exactly this reason — and it is the very
+    remediation DSS's own dispatcher names in its `D-FF1-MACHO-FAT` arm, so
+    slicing here is the CONTRACT that anchor states, not a way around it."""
+    slices = _fat_slices(blob)
+    if not slices:
+        return blob, False
+    want = MACHO_CPU_TYPES.get(target_arch)
+    if want is None:
+        raise LegError(
+            "%s is a Mach-O universal archive with %d slice(s), but this "
+            "resolver has no cpu_type for target arch %r (known: %s) — it "
+            "cannot pick the right one, and picking the wrong one would produce "
+            "a build that resolves against a foreign architecture"
+            % (where, len(slices), target_arch, ", ".join(sorted(MACHO_CPU_TYPES))))
+    for cputype, offset, size in slices:
+        if cputype == want:
+            if offset + size > len(blob):
+                raise LegError("%s: the %s slice runs past the end of the file "
+                               "(offset %d + size %d > %d)"
+                               % (where, target_arch, offset, size, len(blob)))
+            return blob[offset:offset + size], True
+    raise LegError(
+        "%s is a universal archive that does NOT contain a %s slice (has: %s). "
+        "The declaration says this leg's library comes from here; it does not."
+        % (where, target_arch,
+           ", ".join(sorted(_arch_name(c) for c, _o, _s in slices))))
+
+
+def _arch_name(cputype):
+    for name, value in MACHO_CPU_TYPES.items():
+        if value == cputype:
+            return name
+    return "cpu_type=0x%08X" % cputype
+
+
+def _download(url, dest, timeout=120):
+    """Fetch `url` to `dest`. Deliberately the ONLY network call in this file, so
+    `--offline` has exactly one thing to refuse."""
+    import urllib.request
+    # ★ THE PART FILE IS PER-PROCESS, NOT PER-DESTINATION. The download cache is
+    # SHARED between legs (two macho legs slice the same universal archive) and
+    # this project's rule is that legs and drivers may run CONCURRENTLY — a fixed
+    # `<dest>.part` would let two processes interleave writes into one file and
+    # then both rename it, producing a digest mismatch that looks like a supply-
+    # chain event instead of a race. `os.replace` is atomic, so a unique temp per
+    # process makes the last writer win with a WHOLE file, and the digest check
+    # still guards the content.
+    tmp = "%s.%d.part" % (dest, os.getpid())
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp, \
+                open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    except Exception as exc:            # noqa: BLE001 — re-raised as LegError
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise LegError("download failed: %s\n  %s: %s"
+                       % (url, type(exc).__name__, exc))
+    os.replace(tmp, dest)
+
+
+def acquire_plan(leg, root):
+    """What `--acquire` WOULD do, as data: the declared archives, the cache paths
+    they land in, and the (as-name -> importName) map. Pure — no filesystem, no
+    network — so the self-test can assert the plan on any machine."""
+    libs = leg.get("build", {}).get("libraries", {})
+    acq = libs.get("acquire", {})
+    target_arch = spec_target_arch(leg.get("spec", ""))
+    cdir = leg_cache_dir(leg, root)
+    ddir = os.path.join(root, "harness-libs", "downloads")
+    archives = []
+    for a in acq.get("archives", []):
+        fmt = a.get("archiveFormat", "")
+        ext = fmt if fmt else "bin"
+        archives.append({
+            "url": a.get("url", ""),
+            "sha256": a.get("sha256", ""),
+            "archiveFormat": fmt,
+            "download": os.path.join(ddir, "%s.%s" % (a.get("sha256", "nohash"), ext)),
+            "members": [{
+                "member": m.get("member", ""),
+                "as": m.get("as", ""),
+                "universal": bool(m.get("universal", False)),
+                "importName": m.get("importName", ""),
+                "path": os.path.join(cdir, m.get("as", "")),
+            } for m in a.get("members", [])],
+        })
+    return {
+        "leg": leg.get("label", ""),
+        "targetArch": target_arch,
+        "cacheDir": cdir,
+        "downloadDir": ddir,
+        "archives": archives,
+    }
+
+
+# Bumped when the MATERIALISATION changes shape (a new slicing rule, a new
+# archive kind, a new stamp field). A stamp written by an older resolver is
+# re-materialised rather than trusted — the alternative is a stale cache that
+# looks current.
+#   1 -> 2: the stamp records each MATERIALISED file's own sha256. Pinning only
+#           the archive left a hole one run wide: after the first acquisition the
+#           extracted libraries were trusted by stamp alone, so a cache whose
+#           libtcl8.6.dylib had been swapped would be handed to the compiler
+#           without a murmur. The digest pin has to survive extraction or it only
+#           protects the download.
+ACQUIRE_STAMP_VERSION = 2
+
+
+def acquire(leg, root, offline=False, downloader=_download):
+    """Materialise a `pinned-archive` leg's declared libraries and return the
+    report. Raises LegError — loudly, naming the URL/digest/member — on any
+    failure. `downloader` is injected so the self-test can assert the OFFLINE and
+    CACHE-HIT paths without a network (and prove they take no round-trip)."""
+    import json as _json
+    import tarfile
+
+    libs = leg.get("build", {}).get("libraries", {})
+    if libs.get("provider") != "pinned-archive":
+        raise LegError("leg '%s' declares provider %r, not 'pinned-archive' — "
+                       "--acquire is the implementation of ONE declared route, "
+                       "not a general 'go and find it somewhere' verb"
+                       % (leg.get("label", "?"), libs.get("provider")))
+    plan_ = acquire_plan(leg, root)
+    cdir, ddir = plan_["cacheDir"], plan_["downloadDir"]
+    stamp_path = os.path.join(cdir, ".acquired.json")
+
+    want_stamp = {
+        "stampVersion": ACQUIRE_STAMP_VERSION,
+        "targetArch": plan_["targetArch"],
+        "archives": [{"sha256": a["sha256"], "url": a["url"],
+                      "members": [{"member": m["member"], "as": m["as"],
+                                   "universal": m["universal"],
+                                   "importName": m["importName"]}
+                                  for m in a["members"]]}
+                     for a in plan_["archives"]],
+    }
+    # The DECLARATION half of the stamp must match exactly; the `materialised`
+    # half is the digest of each extracted file, checked below.
+    stamp = None
+    if os.path.isfile(stamp_path):
+        try:
+            with open(stamp_path, "r", encoding="utf-8") as f:
+                stamp = _json.load(f)
+        except (OSError, ValueError):
+            stamp = None
+    fresh = bool(stamp) and stamp.get("declaration") == want_stamp
+    # Why a re-materialisation happened, so a build log never has to guess. A
+    # non-empty list is not an error: the content is restored FROM THE
+    # DIGEST-VERIFIED ARCHIVE, which is the pinned thing. It is reported because
+    # a cache that silently repaired itself is a fact worth seeing.
+    remediated = []
+    if fresh:
+        have = stamp.get("materialised", {})
+        for a in plan_["archives"]:
+            for m in a["members"]:
+                if not os.path.isfile(m["path"]):
+                    remediated.append("%s: absent" % m["as"])
+                    fresh = False
+                elif _sha256_file(m["path"]) != have.get(m["as"]):
+                    # ★ THE PIN HAS TO SURVIVE EXTRACTION. Verifying only the
+                    # archive protects the download and nothing after it: from
+                    # the second run on, the compiler is handed the EXTRACTED
+                    # file, and if that is not what came out of the pinned
+                    # archive then the pin bought nothing.
+                    remediated.append("%s: content does not match the digest "
+                                      "recorded when it was extracted" % m["as"])
+                    fresh = False
+
+    if not fresh:
+        # EVERY declaration is validated, and OFFLINE refuses, BEFORE anything is
+        # created or fetched. A run that cannot possibly succeed must not first
+        # leave a half-built cache tree behind it, and an unopenable
+        # archiveFormat should not be discovered after a 5 MB download.
+        for a in plan_["archives"]:
+            if a["archiveFormat"] not in ARCHIVE_FORMATS:
+                raise LegError(
+                    "leg '%s': archive %s declares archiveFormat %r, which this "
+                    "resolver cannot open (known: %s)"
+                    % (plan_["leg"], a["url"], a["archiveFormat"],
+                       ", ".join(sorted(ARCHIVE_FORMATS))))
+            if offline and not os.path.isfile(a["download"]):
+                raise LegError(
+                    "leg '%s': --offline, but the pinned archive is not in the "
+                    "cache.\n  need : %s\n  from : %s\n  Run once without "
+                    "--offline to populate it; this refuses rather than falling "
+                    "back to whatever else is on this machine."
+                    % (plan_["leg"], a["download"], a["url"]))
+        # ✔MEASURED, and reported independently by BOTH driver implementations:
+        # an unusable cache root (a path whose parent is a regular file, a
+        # read-only volume) escaped as a raw Python traceback with rc=1 instead
+        # of this file's own `harness_legs.py: FATAL: …` shape — so the driver
+        # dutifully quoted a stack trace at the operator. Loud, but below the bar
+        # the rest of this module holds itself to: every refusal names the thing
+        # that failed and what to do about it.
+        try:
+            os.makedirs(ddir, exist_ok=True)
+            os.makedirs(cdir, exist_ok=True)
+        except OSError as exc:
+            raise LegError(
+                "leg '%s': the acquisition cache root is not usable.\n  root : "
+                "%s\n  error: %s\n  The cache lives OUTSIDE the repository by "
+                "design; point DSS_HARNESS_CACHE_ROOT (or --cache-root) at a "
+                "writable directory." % (plan_["leg"], root, exc))
+        for a in plan_["archives"]:
+            mode = ARCHIVE_FORMATS[a["archiveFormat"]]
+            dl = a["download"]
+            if os.path.isfile(dl):
+                got = _sha256_file(dl)
+                if got != a["sha256"]:
+                    # A content-addressed name that does not match its content is
+                    # a corrupt or tampered cache, never something to reuse.
+                    os.remove(dl)
+                    if offline:
+                        raise LegError(
+                            "leg '%s': --offline, and the cached archive is "
+                            "CORRUPT (its content does not hash to the name it "
+                            "is filed under).\n  file     : %s\n  expected : "
+                            "%s\n  actual   : %s\n  It has been removed; re-run "
+                            "with network access."
+                            % (plan_["leg"], dl, a["sha256"], got))
+            if not os.path.isfile(dl):
+                downloader(a["url"], dl)
+                got = _sha256_file(dl)
+                if got != a["sha256"]:
+                    os.remove(dl)
+                    raise LegError(
+                        "CHECKSUM MISMATCH — refusing to use this download.\n"
+                        "  url      : %s\n  expected : %s\n  actual   : %s\n"
+                        "  The catalogue PINS the digest precisely so a changed "
+                        "or substituted third-party binary stops the build "
+                        "instead of entering it."
+                        % (a["url"], a["sha256"], got))
+            with tarfile.open(dl, mode) as tf:
+                for m in a["members"]:
+                    blob = _extract_member(tf, m["member"], a["url"])
+                    where = "%s :: %s" % (os.path.basename(a["url"]), m["member"])
+                    if m["universal"]:
+                        blob, was_fat = _thin_for_arch(blob, plan_["targetArch"], where)
+                        if not was_fat:
+                            raise LegError(
+                                "%s is declared `universal: true` but is NOT a "
+                                "Mach-O universal archive. The declaration and "
+                                "the file disagree; slicing silently skipped "
+                                "would hand this leg a library of unknown "
+                                "architecture." % where)
+                    elif _fat_slices(blob):
+                        raise LegError(
+                            "%s IS a Mach-O universal archive but is not "
+                            "declared `universal: true`. DSS's Mach-O reader "
+                            "accepts only a thin image, so this would fail at "
+                            "--resolve-library time with a format error that "
+                            "says nothing about the declaration." % where)
+                    dest = m["path"]
+                    if os.path.exists(dest):
+                        os.chmod(dest, 0o644)
+                        os.remove(dest)
+                    with open(dest, "wb") as f:
+                        f.write(blob)
+        with open(stamp_path, "w", encoding="utf-8") as f:
+            _json.dump({"declaration": want_stamp,
+                        "materialised": {m["as"]: _sha256_file(m["path"])
+                                         for a in plan_["archives"]
+                                         for m in a["members"]}},
+                       f, indent=1, sort_keys=True)
+
+    libraries = []
+    for a in plan_["archives"]:
+        for m in a["members"]:
+            with open(m["path"], "rb") as f:
+                head = f.read(1 << 16)
+            libraries.append({
+                "as": m["as"],
+                "path": m["path"],
+                "importName": m["importName"],
+                # The identity being DISPLACED, so a build log states the
+                # substitution instead of hiding it.
+                "embeddedIdentity": _macho_install_name(head),
+                "sourceUrl": a["url"],
+                "archiveSha256": a["sha256"],
+                "fileSha256": _sha256_file(m["path"]),
+            })
+    return {
+        "leg": plan_["leg"],
+        "targetArch": plan_["targetArch"],
+        "cacheDir": cdir,
+        "fromCache": fresh,
+        "remediated": remediated,
+        "libraries": libraries,
+    }
+
+
+def _extract_member(tf, name, url):
+    """One member's BYTES, following an intra-archive symlink.
+
+    Symlinks are not incidental: MacPorts ships `libz.1.dylib -> libz.1.3.2.dylib`,
+    and a symlink extracted as a symlink is (a) not creatable on Windows without
+    privilege and (b) not a library DSS can read. Materialising the LINK TARGET
+    under the declared `as` name is what makes one declaration work on every
+    host."""
+    seen = []
+    cur = name
+    for _ in range(8):
+        try:
+            member = tf.getmember(cur)
+        except KeyError:
+            # Archives commonly prefix `./`; try that spelling before failing.
+            try:
+                member = tf.getmember("./" + cur)
+            except KeyError:
+                raise LegError(
+                    "member not found in %s: %r%s\n  A declared member that is "
+                    "not in the archive is a stale declaration, not something to "
+                    "search around for."
+                    % (os.path.basename(url), name,
+                       ("  (followed: %s)" % " -> ".join(seen)) if seen else ""))
+        if member.issym() or member.islnk():
+            seen.append(cur)
+            target = member.linkname
+            cur = target if target.startswith("/") else \
+                os.path.normpath(os.path.join(os.path.dirname(cur), target)).replace("\\", "/")
+            continue
+        f = tf.extractfile(member)
+        if f is None:
+            raise LegError("member %r in %s is not a regular file"
+                           % (cur, os.path.basename(url)))
+        return f.read()
+    raise LegError("member %r in %s: symlink chain too deep (%s)"
+                   % (name, os.path.basename(url), " -> ".join(seen)))
+
+
+# ── The DSS argv for one resolved library ───────────────────────────────────
+#
+# ★ NAMED IN ONE FILE, NOT IN TWO DRIVERS — the same argument `--translate-path`
+# makes for `wslpath`. A driver that spelled the compiler flag itself would be a
+# capability that can exist in one driver and not the other, which is this
+# project's canonical silent-harness-bug shape and the very defect
+# D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER names.
+#
+# ⚠ THE OVERRIDE IS NOT OPTIONAL WHERE IT IS DECLARED. A leg whose library is an
+# ACQUIRED STAND-IN and whose compiler cannot record the declared identity must
+# NOT be built: the artefact would link clean and fail at dyld/loader time on the
+# target machine, which is the one failure this host cannot observe. So
+# `resolve_library_argv` REFUSES rather than dropping the override.
+DSS_RESOLVE_LIBRARY_FLAG = "--resolve-library"
+# The override is a SUFFIX on the flag's value, not a second flag:
+# `--resolve-library <path>[=<import-name>]`, split by the compiler on the LAST
+# `=`. This marker is what `--help` must show for the capability to be present;
+# probing for the bare flag name would find the pre-override compiler too, which
+# is exactly the silent-drop this refuses to allow.
+DSS_IMPORT_NAME_HELP_MARKER = "--resolve-library <path>[=<import-name>]"
+
+
+def dss_supports_import_name(dss_path, runner=None):
+    """Does this compiler accept the import-name override? Probed from its own
+    --help, never assumed — the compiler and the harness land in different
+    commits, and a driver that assumed the newer compiler would silently emit an
+    artefact with the packager's install name baked in."""
+    argv = [dss_path, "--help"]
+    if runner is not None:
+        return DSS_IMPORT_NAME_HELP_MARKER in runner(argv)
+    import subprocess
+    try:
+        out = subprocess.run(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LegError("cannot probe %r for --help: %s" % (dss_path, exc))
+    return DSS_IMPORT_NAME_HELP_MARKER in out.stdout.decode("utf-8", "replace")
+
+
+def resolve_library_argv(path, import_name="", supported=True):
+    """The argv tokens that hand DSS one resolved library. Without an override
+    that is the plain `--resolve-library <path>` every leg has always used, so a
+    provider that needs no override emits byte-identical arguments to before."""
+    if not import_name:
+        return [DSS_RESOLVE_LIBRARY_FLAG, path]
+    if not supported:
+        raise LegError(
+            "this compiler does not accept `%s`, but the leg DECLARES the "
+            "runtime identity %r for %s.\n  Dropping the override is not an "
+            "option: the binary would record the packager's own install name "
+            "(the acquired library is a STAND-IN, not the copy the target "
+            "machine loads), link clean here, and fail at LOAD time on a machine "
+            "this host cannot observe.\n  Build a compiler that carries it, or "
+            "change the leg's provider."
+            % (DSS_IMPORT_NAME_HELP_MARKER, import_name, path))
+    if "=" in path:
+        # The compiler splits the value on its LAST `=`, so a path containing one
+        # cannot carry an override on the command line at all — it would silently
+        # truncate the path and record a nonsense identity. REFUSE, with the way
+        # out: this is a property of where the cache lives, and DSS_HARNESS_CACHE_
+        # ROOT moves it. (The project manifest's object form has no separator and
+        # is the other escape hatch, for a driver that builds via --project.)
+        raise LegError(
+            "the resolved library path contains '=', which `%s` cannot express: "
+            "the compiler splits the value on its LAST '=', so this path would "
+            "be truncated and the recorded identity would be wrong.\n  path : "
+            "%s\n  want : %s\n  Move the acquisition cache somewhere without an "
+            "'=' (DSS_HARNESS_CACHE_ROOT), or build this leg through a project "
+            "manifest, whose object form needs no separator."
+            % (DSS_IMPORT_NAME_HELP_MARKER, path, import_name))
+    return [DSS_RESOLVE_LIBRARY_FLAG, "%s=%s" % (path, import_name)]
+
+
+def acquired_import_names(leg):
+    """(tclImportName, zImportName) for a leg, matched from its acquire members'
+    `as` names against its own declared tclNames/zNames. Computed HERE so the two
+    drivers never each decide which acquired file is the Tcl one."""
+    libs = leg.get("build", {}).get("libraries", {})
+    tcl_names = set(libs.get("tclNames", []))
+    z_names = set(libs.get("zNames", []))
+    tcl = z = ""
+    for a in libs.get("acquire", {}).get("archives", []):
+        for m in a.get("members", []):
+            if m.get("as") in tcl_names:
+                tcl = m.get("importName", "")
+            elif m.get("as") in z_names:
+                z = m.get("importName", "")
+    return tcl, z
+
+
 # ── Path translation ────────────────────────────────────────────────────────
 
 def path_translation(verb):
@@ -622,6 +1218,13 @@ def plan_leg(leg, host_os, host_arch, available):
         if expanded:
             paths.append(expanded)
     libs["searchPaths"] = paths
+    # The RUNTIME IDENTITY each acquired library must be recorded under, resolved
+    # to the (tcl, z) pair the drivers actually pass to DSS. Host-free: it is a
+    # property of the TARGET's library layout, and it is "" for every provider
+    # that hands over a library already carrying the right embedded identity.
+    tcl_import, z_import = acquired_import_names(leg)
+    libs["tclImportName"] = tcl_import
+    libs["zImportName"] = z_import
     build["libraries"] = libs
 
     return {
@@ -707,6 +1310,12 @@ def emit_sh(resolved):
         put("LEG_LIB_TCL_NAMES", " ".join(libs.get("tclNames", [])))
         put("LEG_LIB_Z_NAMES", " ".join(libs.get("zNames", [])))
         put("LEG_LIB_PATHS", "\n".join(libs.get("searchPaths", [])))
+        # The runtime identity DSS must record for each acquired library, when
+        # the file we can READ is a stand-in whose embedded identity belongs to
+        # its packager. "" = the library's own identity is the right one. The
+        # driver passes it to DSS; it never invents one.
+        put("LEG_LIB_TCL_IMPORT_NAME", libs.get("tclImportName", ""))
+        put("LEG_LIB_Z_IMPORT_NAME", libs.get("zImportName", ""))
     return "\n".join(out) + "\n"
 
 
@@ -739,6 +1348,133 @@ def sh_statements(text):
 
 
 # ── Lint ────────────────────────────────────────────────────────────────────
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _lint_acquire(label, spec, libs):
+    """The `acquire` block's own defects. Split out because there are enough of
+    them that inlining would bury the rest of the leg lint — and because every
+    one of these is a rule that, unchecked, ships a build that fetches an
+    unverified binary or records a wrong runtime identity."""
+    out = []
+    provider = libs.get("provider")
+    acq = libs.get("acquire")
+    if provider == "pinned-archive":
+        if not acq:
+            out.append("leg '%s': provider 'pinned-archive' declares no "
+                       "`acquire` block — the provider IS the declaration; "
+                       "without it there is nothing to fetch" % label)
+            return out
+    elif acq:
+        out.append("leg '%s': provider %r ignores `acquire`, but one is declared "
+                   "— a reader would think it is used" % (label, provider))
+        return out
+    else:
+        return out
+
+    archives = acq.get("archives")
+    if not isinstance(archives, list) or not archives:
+        out.append("leg '%s': acquire.archives is empty" % label)
+        return out
+    tcl_names = set(libs.get("tclNames", []))
+    z_names = set(libs.get("zNames", []))
+    saw_tcl = saw_z = False
+    for a in archives:
+        url = a.get("url", "")
+        who = "leg '%s' archive %r" % (label, url or "<no url>")
+        if not url:
+            out.append("%s: no url" % who)
+        elif not url.startswith("https://"):
+            # A pinned digest makes the TRANSPORT less critical, but plain http
+            # also gives an attacker the URL-shape and the timing, and every
+            # source this project uses offers TLS. Requiring it costs nothing.
+            out.append("%s: url is not https:// — the digest pin authenticates "
+                       "the CONTENT, TLS authenticates the SOURCE, and both are "
+                       "cheap" % who)
+        digest = a.get("sha256", "")
+        if not _SHA256_RE.match(digest or ""):
+            out.append("%s: sha256 %r is not 64 lowercase hex digits. A build "
+                       "that fetches a third-party binary MUST pin it — this is "
+                       "the whole supply-chain surface of the harness" % (who, digest))
+        fmt = a.get("archiveFormat", "")
+        if fmt not in ARCHIVE_FORMATS:
+            out.append("%s: archiveFormat %r is not one this resolver can open "
+                       "(known: %s). Declaring an unopenable kind fails on some "
+                       "other machine, months later, instead of here"
+                       % (who, fmt, ", ".join(sorted(ARCHIVE_FORMATS))))
+        members = a.get("members")
+        if not isinstance(members, list) or not members:
+            out.append("%s: no members — an archive nothing is taken from is a "
+                       "download for its own sake" % who)
+            continue
+        for m in members:
+            as_name = m.get("as", "")
+            if not m.get("member"):
+                out.append("%s: a member declares no `member` path" % who)
+            if not as_name:
+                out.append("%s: a member declares no `as` name — the name it is "
+                           "materialised under is what tclNames/zNames match" % who)
+                continue
+            if "universal" not in m:
+                out.append("%s member %r: no `universal` key. Whether the file is "
+                           "a Mach-O universal archive that must be sliced to this "
+                           "leg's arch is a CLAIM about the artefact, and `false` "
+                           "is as much a claim as `true` — a reader must not have "
+                           "to know a default" % (who, as_name))
+            elif not isinstance(m["universal"], bool):
+                out.append("%s member %r: `universal` is %r, not a JSON boolean"
+                           % (who, as_name, m["universal"]))
+            imp = m.get("importName", "")
+            if not imp:
+                out.append(
+                    "%s member %r: no `importName`. An ACQUIRED library is a "
+                    "STAND-IN — the target machine loads its own copy — so the "
+                    "identity to record (DT_NEEDED / LC_LOAD_DYLIB / import DLL "
+                    "name) is a fact about the TARGET, never about whoever "
+                    "packaged the download. Leaving it out is how a binary comes "
+                    "to demand /opt/local on a Mac that has no MacPorts."
+                    % (who, as_name))
+            elif imp.strip() != imp:
+                # `not imp.strip()` is deliberately NOT tested here: an
+                # all-whitespace importName is already caught by `not imp` being
+                # false and this branch reporting the whitespace. Testing it
+                # again would be a dead condition that also makes the rule above
+                # look optional — and it made a red-on-disable measurement lie
+                # once already (disabling `if not imp:` still refused, through
+                # this branch, with a message about whitespace on an EMPTY
+                # string, so the mutation looked like a passing test).
+                out.append("%s member %r: importName %r has leading/trailing "
+                           "whitespace" % (who, as_name, imp))
+            if as_name in tcl_names:
+                saw_tcl = True
+            elif as_name in z_names:
+                saw_z = True
+            else:
+                out.append(
+                    "%s member %r: the `as` name matches neither this leg's "
+                    "tclNames (%s) nor its zNames (%s), so nothing will ever "
+                    "resolve to it — an acquired file no search can find is a "
+                    "download that silently does nothing"
+                    % (who, as_name, ", ".join(sorted(tcl_names)) or "<none>",
+                       ", ".join(sorted(z_names)) or "<none>"))
+    if not saw_tcl:
+        out.append("leg '%s': provider 'pinned-archive' acquires no member "
+                   "matching tclNames (%s)" % (label, ", ".join(sorted(tcl_names))))
+    if not saw_z:
+        out.append("leg '%s': provider 'pinned-archive' acquires no member "
+                   "matching zNames (%s)" % (label, ", ".join(sorted(z_names))))
+    # Slicing needs a cpu_type for the leg's own arch, and the failure mode of
+    # not having one is "cannot pick a slice" at acquisition time on a machine
+    # that may be nowhere near a developer.
+    arch = spec_target_arch(spec)
+    if any(m.get("universal") for a in archives for m in a.get("members", [])) \
+            and arch not in MACHO_CPU_TYPES:
+        out.append("leg '%s': declares a `universal` member but its target arch "
+                   "%r has no cpu_type in this resolver (known: %s)"
+                   % (label, arch, ", ".join(sorted(MACHO_CPU_TYPES))))
+    return out
+
 
 def lint(path=CATALOGUE):
     """Catalogue defects, host-independently. Returns a list of strings."""
@@ -923,6 +1659,7 @@ def lint(path=CATALOGUE):
                             % (label, provider))
         if not libs.get("tclNames") or not libs.get("zNames"):
             findings.append("leg '%s': libraries declare no tclNames/zNames" % label)
+        findings.extend(_lint_acquire(label, spec, libs))
         if not build.get("targetCc", {}).get("candidates"):
             findings.append("leg '%s': no targetCc candidates — the corpus's "
                             "dlopen()ed helper extension could not be built for it"
@@ -1324,7 +2061,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 22,
+          len(statements) == 1 + len(labels) * 24,
           "got %d statements for %d legs" % (len(statements), len(labels)))
     check("the sh emitter carries the launcher's path namespace",
           "LEG_PATH_TRANSLATION[" in sh and "LEG_PATH_TRANSLATOR[" in sh,
@@ -1332,17 +2069,184 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter carries the launcher's environment namespace",
           "LEG_ENV_TRANSFER[" in sh,
           "build-and-test.sh cannot forward its run environment without it")
+    check("the sh emitter carries each leg's declared runtime identity",
+          "LEG_LIB_TCL_IMPORT_NAME[" in sh and "LEG_LIB_Z_IMPORT_NAME[" in sh,
+          "a driver cannot record the target's library identity without it")
     for stmt in statements:
         check("the sh emitter emits assignments only",
               ASSIGNMENT_RE.match(stmt) is not None, stmt)
+
+    # ── Declared library acquisition ────────────────────────────────────────
+    # D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. Everything
+    # here is PURE — `acquire_plan` touches neither the network nor the disk —
+    # so the properties hold on a gate machine with no connectivity at all. The
+    # end-to-end fetch is exercised by the drivers, which is the right place for
+    # it: a unit test that downloaded 5 MB would be a unit test that fails when
+    # MacPorts is slow.
+    acquiring = [leg for leg in legs
+                 if leg["build"]["libraries"].get("provider") == "pinned-archive"]
+    check("some leg actually declares the acquisition route",
+          bool(acquiring),
+          "the whole mechanism would be untested by these assertions otherwise")
+    # A cache root that does not exist, so a machine whose REAL cache happens to
+    # be populated still exercises the cold-cache refusal. Nothing creates it:
+    # `acquire` validates and refuses before it makes a single directory, which
+    # is itself one of the properties asserted below.
+    #
+    # ★ UNIQUE PER RUN, and that is not tidiness. A fixed name made this
+    # self-test HISTORY-DEPENDENT: a red-on-disable experiment that deliberately
+    # broke the offline refusal created the directory, and every later run then
+    # failed the non-vacuity guard below for a reason that had nothing to do with
+    # the code under test. A fixture whose outcome depends on what ran before it
+    # is a fixture that will eventually be "fixed" by deleting the guard.
+    import tempfile
+    import uuid
+    root = os.path.join(tempfile.gettempdir(),
+                        "dss-harness-legs-selftest-%d-%s"
+                        % (os.getpid(), uuid.uuid4().hex))
+    check("the self-test's cache root really is absent", not os.path.exists(root),
+          "%s exists — the cold-cache assertions below would be vacuous" % root)
+    seen_digests = {}
+    for leg in acquiring:
+        lbl = leg["label"]
+        ap = acquire_plan(leg, root)
+        check("acquire plan targets the LEG's arch, not the host's (%s)" % lbl,
+              ap["targetArch"] == spec_target_arch(leg["spec"]),
+              "plan says %r" % ap["targetArch"])
+        check("the acquisition cache is OUTSIDE the repository (%s)" % lbl,
+              HERE not in ap["cacheDir"] and ap["cacheDir"].startswith(root),
+              ap["cacheDir"])
+        check("two legs cannot collide on one cache dir (%s)" % lbl,
+              lbl in ap["cacheDir"], ap["cacheDir"])
+        for a in ap["archives"]:
+            check("every acquired archive is content-addressed by its digest (%s)"
+                  % lbl, a["sha256"] in a["download"], a["download"])
+            check("a pinned digest is 64 hex chars (%s)" % lbl,
+                  _SHA256_RE.match(a["sha256"]) is not None, a["sha256"])
+            seen_digests.setdefault(a["sha256"], set()).add(a["url"])
+            for m in a["members"]:
+                check("every acquired member declares the identity to RECORD "
+                      "(%s :: %s)" % (lbl, m["as"]),
+                      bool(m["importName"]),
+                      "an acquired library is a stand-in; its embedded identity "
+                      "belongs to the packager, not to the target")
+                check("an acquired member materialises inside its leg's cache "
+                      "dir (%s :: %s)" % (lbl, m["as"]),
+                      m["path"].startswith(ap["cacheDir"]), m["path"])
+    # A digest reused ACROSS legs is correct and deliberate — the macho archives
+    # are universal, so one download serves both legs and the second is a cache
+    # hit. A digest naming two different URLs is not: content addressing would
+    # then be a lie, and whichever URL was fetched first would win silently.
+    check("one digest never names two different URLs",
+          all(len(u) == 1 for u in seen_digests.values()),
+          "%r" % {d: sorted(u) for d, u in seen_digests.items() if len(u) > 1})
+    declared_archives = sum(len(acquire_plan(l, root)["archives"]) for l in acquiring)
+    check("a universal archive is DOWNLOADED ONCE and shared by the legs slicing it",
+          len(seen_digests) < declared_archives if len(acquiring) > 1 else True,
+          "%d distinct digests across %d declared archives — each leg carrying "
+          "its own private copy would double the fetch"
+          % (len(seen_digests), declared_archives))
+    for leg in acquiring:
+        tcl_i, z_i = acquired_import_names(leg)
+        check("the resolver decides WHICH acquired file is the Tcl one (%s)"
+              % leg["label"], bool(tcl_i) and bool(z_i),
+              "tcl=%r z=%r — a driver must never make this match itself"
+              % (tcl_i, z_i))
+    # A provider with no acquisition route must produce no acquisition plan, or
+    # a driver would call --acquire on a leg that declares nothing.
+    for leg in legs:
+        if leg["build"]["libraries"].get("provider") == "pinned-archive":
+            continue
+        check("a non-acquiring leg declares no archives (%s)" % leg["label"],
+              not acquire_plan(leg, root)["archives"])
+        tcl_i, z_i = acquired_import_names(leg)
+        check("a non-acquiring leg overrides no identity (%s)" % leg["label"],
+              not tcl_i and not z_i,
+              "a host-supplied library already carries the right one")
+
+    # `--offline` must REFUSE, never fall back. Asserted against a cache root
+    # that cannot exist, so a machine that happens to have the real cache
+    # populated still exercises the refusal.
+    # `_forbidden_downloader` raises a NON-LegError, and `_raises` only counts a
+    # LegError — so this single assertion covers both halves at once: it is TRUE
+    # only if acquisition refused loudly AND never reached for the network.
+    if acquiring:
+        check("--offline with a cold cache REFUSES loudly and takes no "
+              "round-trip",
+              _raises(lambda: acquire(acquiring[0], root, offline=True,
+                                      downloader=_forbidden_downloader)))
+        check("--acquire on a leg that declares no route is a refusal, not a "
+              "search",
+              _raises(lambda: acquire(
+                  [l for l in legs
+                   if l["build"]["libraries"].get("provider") != "pinned-archive"][0],
+                  root, offline=True, downloader=_forbidden_downloader)))
+
+    # ── The DSS argv for one resolved library ───────────────────────────────
+    check("no override => the argv every leg has always used",
+          resolve_library_argv("/tmp/libz.so.1") == ["--resolve-library", "/tmp/libz.so.1"])
+    check("an override is passed through the one named flag",
+          resolve_library_argv("/tmp/libz.1.dylib", "@loader_path/libz.1.dylib")
+          == [DSS_RESOLVE_LIBRARY_FLAG,
+              "/tmp/libz.1.dylib=@loader_path/libz.1.dylib"])
+    check("a path the override spelling CANNOT express is a refusal, not a "
+          "truncation",
+          _raises(lambda: resolve_library_argv("/tmp/a=b/libz.1.dylib",
+                                               "@loader_path/libz.1.dylib")),
+          "the compiler splits on the LAST '=', so this path would be silently "
+          "cut and the recorded identity would be nonsense")
+    check("a path containing '=' is fine when nothing is overridden",
+          resolve_library_argv("/tmp/a=b/libz.so.1")
+          == [DSS_RESOLVE_LIBRARY_FLAG, "/tmp/a=b/libz.so.1"],
+          "there is no separator to be confused by when there is no suffix")
+    check("a compiler without the flag REFUSES rather than dropping the override",
+          _raises(lambda: resolve_library_argv("/tmp/x.dylib", "@loader_path/x.dylib",
+                                               supported=False)),
+          "dropping it would bake the packager's install name into the artefact "
+          "and fail at LOAD time on a machine this host cannot observe")
+    check("an unsupported compiler is irrelevant when nothing is overridden",
+          resolve_library_argv("/tmp/x.so", "", supported=False)
+          == ["--resolve-library", "/tmp/x.so"])
+    # ★ The probe must distinguish a compiler that has the OVERRIDE from one that
+    # merely has `--resolve-library` — every DSS ever built has the latter, so a
+    # probe for the bare flag name would report support that is not there and
+    # bake the packager's install name into the artefact.
+    check("override support is PROBED from the compiler's own --help",
+          dss_supports_import_name(
+              "dss", runner=lambda a: DSS_IMPORT_NAME_HELP_MARKER)
+          and not dss_supports_import_name(
+              "dss", runner=lambda a: "  --resolve-library <path>  read a binary"),
+          "assuming it would silently emit an artefact with the wrong identity")
 
     out.write("passed=%d failed=%d\n" % (passed, failed))
     return 0 if failed == 0 else 1
 
 
+def _forbidden_downloader(url, dest, timeout=120):
+    """Injected where a network call would be a DEFECT. Raises something that is
+    NOT a LegError, so a test asserting `LegError` cannot pass by accident when
+    the code under test does reach for the network."""
+    raise AssertionError("network round-trip taken where none is permitted: %s" % url)
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
+    # ✔MEASURED 2026-08-04, and it is PRE-EXISTING (reproduced at HEAD, rc=1):
+    # `harness_legs.py --help` CRASHES on a Windows console. Python picks the
+    # console's cp1252 for stdout, this file's prose is full of `→`/`★`/`—`, and
+    # argparse's write raises UnicodeEncodeError before a single line of help
+    # appears. The same mechanism was quietly degrading every diagnostic: the
+    # `CHECKSUM MISMATCH — refusing` refusal printed as `CHECKSUM MISMATCH ?
+    # refusing`. A tool whose --help cannot run on one of its two supported hosts
+    # is a tool nobody reads the help of, so this is fixed rather than worked
+    # around by de-punctuating the prose. `errors="replace"` keeps the old
+    # degrade-don't-die behaviour for anything a terminal still cannot render.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass   # a redirected/wrapped stream that cannot be reconfigured
     p = argparse.ArgumentParser(prog="harness_legs.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--catalogue", default=CATALOGUE)
@@ -1393,6 +2297,39 @@ def main(argv=None):
     p.add_argument("--carrier-current", default="", metavar="VALUE",
                    help="the carrier variable's existing value, so an operator's "
                         "own setting is merged rather than clobbered")
+    p.add_argument("--acquire", default=None, metavar="LABEL",
+                   help="materialise LABEL's declared `pinned-archive` libraries "
+                        "(download -> verify pinned sha256 -> extract -> slice to "
+                        "this leg's arch) into the cache and print the result as "
+                        "JSON. IDEMPOTENT and OFFLINE-CAPABLE: a populated cache "
+                        "makes no network call. Implemented HERE, once, so both "
+                        "drivers acquire identically.")
+    p.add_argument("--acquire-plan", default=None, metavar="LABEL",
+                   help="print, as JSON, what --acquire WOULD do for LABEL — the "
+                        "archives, digests and cache paths — touching neither the "
+                        "network nor the filesystem")
+    p.add_argument("--cache-root", default=None, metavar="DIR",
+                   help="where acquired libraries are cached (default: "
+                        "$DSS_HARNESS_CACHE_ROOT, else ~/.cache/dss-code-prime). "
+                        "OUTSIDE the repository, always.")
+    p.add_argument("--offline", action="store_true",
+                   help="refuse to reach the network: --acquire completes from "
+                        "the cache or FAILS naming what is missing. It never "
+                        "falls back to whatever else is on the machine.")
+    p.add_argument("--resolve-library-argv", default=None, metavar="PATH",
+                   help="print, one token per line, the argv that hands DSS the "
+                        "library at PATH — including the import-name override "
+                        "when --import-name is given. THIS is what keeps the "
+                        "compiler flag named in one file instead of two drivers.")
+    p.add_argument("--import-name", default="", metavar="NAME",
+                   help="the runtime identity to record for --resolve-library-argv "
+                        "(a leg plan's LEG_LIB_TCL_IMPORT_NAME / _Z_IMPORT_NAME). "
+                        "Empty = the library's own embedded identity is correct.")
+    p.add_argument("--dss", default="", metavar="PATH",
+                   help="the compiler --resolve-library-argv is being built for. "
+                        "Given with a non-empty --import-name, its --help is "
+                        "PROBED for override support and a compiler without it is "
+                        "a LOUD refusal, never a silently dropped override.")
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -1408,11 +2345,12 @@ def main(argv=None):
     if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
             or args.header_stages or args.path_translations
             or args.translate_path or args.assert_translated
-            or args.env_transfers or args.env_transfer):
+            or args.env_transfers or args.env_transfer
+            or args.acquire or args.acquire_plan or args.resolve_library_argv):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
-                "--assert-translated / --env-transfers / --env-transfer is "
-                "required")
+                "--assert-translated / --env-transfers / --env-transfer / "
+                "--acquire / --acquire-plan / --resolve-library-argv is required")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -1445,6 +2383,27 @@ def main(argv=None):
                                                 args.forward or [],
                                                 args.carrier_current):
                 sys.stdout.write("%s\n" % line)
+            return 0
+        if args.resolve_library_argv:
+            supported = True
+            if args.import_name and args.dss:
+                supported = dss_supports_import_name(args.dss)
+            for tok in resolve_library_argv(args.resolve_library_argv,
+                                            args.import_name, supported):
+                sys.stdout.write("%s\n" % tok)
+            return 0
+        if args.acquire or args.acquire_plan:
+            label = args.acquire or args.acquire_plan
+            legs = load_catalogue(args.catalogue)
+            matches = [l for l in legs if l.get("label") == label]
+            if not matches:
+                raise LegError("no leg labelled %r in %s (declared: %s)"
+                               % (label, args.catalogue,
+                                  ", ".join(l.get("label", "?") for l in legs)))
+            root = cache_root(args.cache_root)
+            result = (acquire_plan(matches[0], root) if args.acquire_plan
+                      else acquire(matches[0], root, offline=args.offline))
+            sys.stdout.write(json.dumps(result, indent=1, sort_keys=True) + "\n")
             return 0
         if args.header_stages:
             for key, guards in header_stages(load_catalogue(args.catalogue)).items():

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +49,30 @@ enum class CompileConfig : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::string_view
     compileConfigName(CompileConfig c) noexcept;
 
+// ── ResolveLibrarySpec (D-FFI-DECLARED-IMPORT-NAME) ─────────────────
+//
+// ONE `--resolve-library` entry: the binary to READ, plus the OPTIONAL
+// runtime identity to RECORD for the symbols read out of it. The two are
+// separate questions and a stand-in binary answers them differently — see
+// the three-level precedence docblock on `ffi::BinaryLibrarySource`
+// (`src/ffi/ingest.hpp`), which is where the ranking is decided.
+//
+// ONE type for the whole driver tier: the CLI parses into it, the project
+// manifest parses into it, `Program` stores it, and `CompileOptions` carries
+// it to the pipeline — so no layer can drop the declared name in transit.
+// Source / target / object-format agnostic: two opaque strings, no arm of
+// either field branches on language, CPU, or format.
+struct DSS_EXPORT ResolveLibrarySpec {
+    // The on-disk binary whose EXPORT SURFACE is read. Always required.
+    std::filesystem::path path;
+    // The runtime identity to record (ELF DT_NEEDED / Mach-O LC_LOAD_DYLIB /
+    // PE import-descriptor name). EMPTY = NOT STATED ⇒ the binary's own
+    // embedded soname wins, else the file basename. Guaranteed non-degenerate
+    // when non-empty: the CLI + manifest boundaries reject an empty side LOUD
+    // rather than storing a value the loader could never resolve.
+    std::string declaredImportName;
+};
+
 struct DSS_EXPORT CliArgs {
     // ── Mode flags (mutually exclusive at dispatch time) ────────
     bool                     lspMode     = false;
@@ -82,7 +107,27 @@ struct DSS_EXPORT CliArgs {
     // DSS-built library has no shipped JSON descriptor, so reading its real
     // export table is the only way to link against it (a genuine,
     // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
-    std::vector<std::string> resolveLibraries;  // --resolve-library <path>
+    //
+    // D-FFI-DECLARED-IMPORT-NAME: the full spelling is
+    // `--resolve-library <path>[=<import-name>]`, mirroring `--define
+    // NAME[=VALUE]` -- one value-bearing flag whose value carries an OPTIONAL
+    // `=`-separated second component, so no new flag enters the surface. With
+    // the suffix, `<import-name>` is the runtime identity RECORDED for every
+    // symbol read out of `<path>`, outranking the binary's own embedded
+    // soname; without it, nothing is stated and the pre-existing precedence
+    // stands byte-for-byte.
+    //
+    // SPLIT ON THE LAST `=`, the OPPOSITE of `--define` (which splits on the
+    // first, because a macro VALUE may contain `=`). Here it is the PATH that
+    // may contain `=` while an import name -- a soname / DLL name / install
+    // name -- realistically never does. A Windows drive letter uses `:`, not
+    // `=`, so `C:\lib\foo.dll` is unaffected. RESIDUAL, and LOUD not silent: a
+    // path that really does contain `=` AND no intended override is split at
+    // that `=`, and the truncated path then fails the compile-time open probe
+    // with `F_FileOpenFailed` naming the truncated path (see
+    // `compile_pipeline.cpp` step 2.5-pre). Use the project-manifest object
+    // form, which has no separator at all, for such a path.
+    std::vector<ResolveLibrarySpec> resolveLibraries;
 
     // `-I<dir>` / `-I <dir>` / `--include-dir <dir>` (repeatable): the C
     // quote-include search path (gcc/clang's `-I`). Each dir is threaded to
@@ -196,6 +241,15 @@ enum class CliArgsError : std::uint8_t {
                                 // zero, or trailing junk. RANGE/alignment is
                                 // NOT decided here — that is the linker gate's
                                 // job, against the format's declared bounds.
+    InvalidResolveLibrary = 15, // D-FFI-DECLARED-IMPORT-NAME:
+                                // `--resolve-library <path>=<import-name>` with
+                                // an EMPTY side — `=libfoo.so` (no path to read)
+                                // or `libfoo.so=` (no identity to record).
+                                // Neither is usable and neither is silently
+                                // droppable: an empty path would read nothing,
+                                // an empty name would record an unresolvable
+                                // DT_NEEDED. A value with NO `=` at all is the
+                                // plain form and is NOT an error.
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

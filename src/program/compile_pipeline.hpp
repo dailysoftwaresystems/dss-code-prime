@@ -171,7 +171,13 @@ struct CompileOptions {
     // on the trusting `synthesizeFfiFromSourceDecls` path. Empty (the
     // default) ⇒ every build before c162 is byte-identical (synthesize over
     // all externs). See the step-2.5 precedence docblock.
-    std::vector<std::filesystem::path> resolveLibraries;
+    //
+    // D-FFI-DECLARED-IMPORT-NAME: an entry may additionally STATE the runtime
+    // identity to RECORD for the symbols read out of it, which the pipeline
+    // hands to `ffi::BinaryLibrarySource::declaredImportName` — the top of the
+    // three-level recorded-identity precedence (`src/ffi/ingest.hpp`). Empty
+    // (the default) leaves that precedence exactly as it was.
+    std::vector<ResolveLibrarySpec> resolveLibraries;
 };
 
 // Resolve `CompileConfig` to a shipped pipeline name. Uses a

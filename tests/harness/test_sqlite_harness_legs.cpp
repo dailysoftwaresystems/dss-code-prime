@@ -58,6 +58,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1669,5 +1670,394 @@ TEST_F(HarnessLegs, NeitherDriverCallsAZeroFileRunGreen) {
                " GREEN on the strength of tester.tcl's summary line — measured"
                " 2026-08-04, `corpus GREEN — 0 errors out of 1 tests` beside `0"
                " test file(s) completed`.";
+    }
+}
+
+// ── 8. The declared library-acquisition route ──────────────────────────────
+//
+// D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. Operator
+// principle, 2026-08-04: "we should be able to build macho on linux. ANY LEG
+// MUST BE ABLE TO BUILD TO ANY LEG."
+//
+// The catalogue already says every leg is BUILT on every host and only the RUN
+// is gated (§2/§3 above), so a leg whose libraries exist only on one kind of
+// machine made that promise false in practice: before this, both macho legs
+// were `host-system`, which off a Mac means "hope this box has a Darwin
+// libtcl". The mechanism was never missing — `build-and-test.sh` had downloaded
+// Ubuntu ports `.deb`s for the arm64 leg since TF-C68 — what was missing was
+// GENERALITY (one hand-written provider serving one leg) and a SECOND
+// IMPLEMENTATION (`build-and-test.ps1` could not acquire at all).
+//
+// These pins hold the general form to account: the route is DECLARED, it is
+// CHECKSUM-PINNED, it REFUSES rather than improvising, the identity an acquired
+// stand-in is recorded under is DECLARED rather than inherited from whoever
+// packaged it, and — the anti-regression pin that matters most — BOTH drivers
+// implement every provider the catalogue declares.
+
+namespace {
+
+// Every provider name the catalogue actually uses.
+[[nodiscard]] std::set<std::string> declaredProviders(fs::path const& catalogue) {
+    std::set<std::string> out;
+    auto const doc = json::parse(fileText(catalogue));
+    for (auto const& leg : doc.at("legs")) {
+        out.insert(leg.at("build").at("libraries").at("provider")
+                       .get<std::string>());
+    }
+    return out;
+}
+
+// The label of the first leg declaring the acquisition route, or "".
+[[nodiscard]] std::string firstAcquiringLeg(fs::path const& catalogue) {
+    auto const doc = json::parse(fileText(catalogue));
+    for (auto const& leg : doc.at("legs")) {
+        if (leg.at("build").at("libraries").at("provider").get<std::string>()
+            == "pinned-archive") {
+            return leg.at("label").get<std::string>();
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+// AN ACQUIRED LIBRARY IS A STAND-IN, AND ITS EMBEDDED IDENTITY IS THE
+// PACKAGER'S, NOT THE TARGET'S.
+//
+// MEASURED 2026-08-04 on this host, and it is the whole reason the key exists:
+// the MacPorts Tcl/zlib dylibs carry `LC_ID_DYLIB = /opt/local/lib/...`, DSS
+// records a resolved library's embedded identity as the LC_LOAD_DYLIB, and a
+// Mach-O cross-built against them came out demanding
+// `/opt/local/lib/libtcl8.6.dylib`. That is a dyld LOAD failure on the target
+// Mac — not a build error, and not something this host can observe. So the
+// identity to record is DECLARED per acquired member, and the plan carries it
+// to the drivers so neither has to decide it.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): remove an
+// `importName` from any acquired member and the lint refuses the catalogue —
+// asserted here directly rather than described.
+TEST_F(HarnessLegs, AnAcquiredLibraryDeclaresTheIdentityItIsRecordedUnder) {
+    auto const r = run({"--plan", "--host-os", "linux", "--host-arch", "x86_64"});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_EQ(r.exitCode, 0u) << r.output;
+    auto const plan = json::parse(r.output);
+    unsigned acquiring = 0;
+    for (auto const& leg : plan.at("legs")) {
+        auto const  label    = leg.at("label").get<std::string>();
+        auto const& libs     = leg.at("build").at("libraries");
+        auto const  provider = libs.at("provider").get<std::string>();
+        auto const  tcl      = libs.value("tclImportName", std::string{});
+        auto const  z        = libs.value("zImportName", std::string{});
+        if (provider == "pinned-archive") {
+            ++acquiring;
+            EXPECT_FALSE(tcl.empty())
+                << label << " acquires its Tcl but declares no identity to"
+                            " record it under. The downloaded file's own"
+                            " LC_ID_DYLIB/DT_SONAME belongs to whoever packaged"
+                            " it, so inheriting it bakes that packager's prefix"
+                            " into the artefact and fails at LOAD time on the"
+                            " target machine.";
+            EXPECT_FALSE(z.empty()) << label << " (zlib): same.";
+        } else {
+            EXPECT_TRUE(tcl.empty() && z.empty())
+                << label << " uses provider '" << provider << "', which hands"
+                            " over a library already carrying the right embedded"
+                            " identity — overriding it would replace a true name"
+                            " with a declared one.";
+        }
+    }
+    EXPECT_GT(acquiring, 0u)
+        << "no leg declares the acquisition route, so this test asserts nothing."
+           " If the last acquiring leg was deliberately removed, remove this pin"
+           " in the same commit rather than leaving it vacuous.";
+
+    // The refusal, witnessed rather than asserted about.
+    MutatedCatalogue m{catalogue_, "legs-no-import-name"};
+    bool stripped = false;
+    for (auto& leg : m.doc().at("legs")) {
+        auto& libs = leg.at("build").at("libraries");
+        if (libs.at("provider").get<std::string>() != "pinned-archive") continue;
+        for (auto& a : libs.at("acquire").at("archives")) {
+            for (auto& mem : a.at("members")) {
+                mem.erase("importName");
+                stripped = true;
+            }
+        }
+        break;
+    }
+    ASSERT_TRUE(stripped) << "nothing to strip — the mutation is vacuous";
+    auto const bad = runResolver({"--lint"}, m.commit());
+    ASSERT_TRUE(bad.spawned) << bad.diagnostic;
+    EXPECT_NE(bad.exitCode, 0u)
+        << "the lint accepted an acquired member with no declared identity:\n"
+        << bad.output;
+    EXPECT_NE(bad.output.find("importName"), std::string::npos) << bad.output;
+}
+
+// A BUILD THAT FETCHES THIRD-PARTY BINARIES IS A SUPPLY-CHAIN SURFACE.
+// Every archive pins a sha256, the download is filed UNDER that digest (so "is
+// the cached copy the thing we pinned?" is answered by re-hashing rather than by
+// trusting a file name), and the source is https.
+//
+// RED-ON-DISABLE: replace any `sha256` with a non-digest and the lint refuses —
+// asserted here.
+TEST_F(HarnessLegs, TheAcquisitionRouteIsChecksumPinnedAndContentAddressed) {
+    auto const providers = declaredProviders(catalogue_);
+    ASSERT_TRUE(providers.count("pinned-archive"))
+        << "no leg declares 'pinned-archive'; this pin would be vacuous";
+    auto const doc      = json::parse(fileText(catalogue_));
+    unsigned   archives = 0;
+    for (auto const& leg : doc.at("legs")) {
+        auto const  label = leg.at("label").get<std::string>();
+        auto const& libs  = leg.at("build").at("libraries");
+        if (libs.at("provider").get<std::string>() != "pinned-archive") continue;
+        auto const r = run({"--acquire-plan", label});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const  ap   = json::parse(r.output);
+        auto const  spec = leg.at("spec").get<std::string>();
+        std::string const specArch = spec.substr(0, spec.find(':'));
+        EXPECT_EQ(ap.at("targetArch").get<std::string>(), specArch)
+            << label << ": the slice taken must be the LEG's target arch, never"
+                        " anything about the host doing the acquiring.";
+        for (auto const& a : ap.at("archives")) {
+            ++archives;
+            auto const url = a.at("url").get<std::string>();
+            auto const sha = a.at("sha256").get<std::string>();
+            EXPECT_EQ(sha.size(), 64u) << label << " " << url;
+            EXPECT_EQ(sha.find_first_not_of("0123456789abcdef"),
+                      std::string::npos)
+                << label << " " << url << ": sha256 is not lowercase hex";
+            EXPECT_EQ(url.rfind("https://", 0), 0u)
+                << label << ": " << url << " is not https. The digest"
+                                           " authenticates the CONTENT; TLS"
+                                           " authenticates the SOURCE.";
+            EXPECT_NE(a.at("download").get<std::string>().find(sha),
+                      std::string::npos)
+                << label << ": the download is not filed under its digest, so a"
+                            " corrupt cache entry cannot be detected by name.";
+        }
+    }
+    EXPECT_GT(archives, 0u) << "no archives inspected — vacuous";
+
+    MutatedCatalogue m{catalogue_, "legs-unpinned"};
+    bool             unpinned = false;
+    for (auto& leg : m.doc().at("legs")) {
+        auto& libs = leg.at("build").at("libraries");
+        if (libs.at("provider").get<std::string>() != "pinned-archive") continue;
+        libs.at("acquire").at("archives").at(0)["sha256"] = "not-a-digest";
+        unpinned = true;
+        break;
+    }
+    ASSERT_TRUE(unpinned) << "nothing to unpin — the mutation is vacuous";
+    auto const bad = runResolver({"--lint"}, m.commit());
+    ASSERT_TRUE(bad.spawned) << bad.diagnostic;
+    EXPECT_NE(bad.exitCode, 0u)
+        << "the lint accepted an archive with no pinned digest:\n" << bad.output;
+}
+
+// THE CAPABILITY-PAIR PIN — the half of this anchor that is about the DRIVERS.
+//
+// `build-and-test.ps1` used to end its provider switch with "library provider
+// '$provider' is NOT IMPLEMENTED by build-and-test.ps1", which made the one
+// working provider Linux-driver-only. This project's rule is that a capability
+// in one driver and not the other is a SILENT harness bug, and this is the third
+// time that shape has cost a cycle.
+//
+// The check is deliberately STRUCTURAL — a provider must appear as a real ARM of
+// each driver's provider dispatch, not merely as a word somewhere in the file.
+// Naming it inside a "not implemented" message would otherwise satisfy a naive
+// substring search, which is exactly the state being repaired.
+//
+// ★ ONE PROVIDER IS EXEMPT, AND THE EXEMPTION RETIRES ITSELF.
+// `ubuntu-ports-arm64` is the ORIGINAL bespoke provider — `build-and-test.sh`
+// implements it with `curl` + `dpkg-deb`, and neither tool is a thing the .ps1
+// can call. Absorbing it into the general route needs a `.deb` reader in the
+// resolver, and MEASURED 2026-08-04 that is not safely doable yet: a modern
+// `.deb`'s inner archive can be zstd, whose stdlib module arrived in Python
+// 3.14 — this Windows host has 3.14, the WSL leg has 3.12 — so a zstd-based
+// route would be a capability that exists on one host and not another, which is
+// the same defect one level down. It is therefore listed HERE, by name, with
+// the anchor, rather than quietly passing.
+//
+// The exemption cannot rot: the loop below asserts a listed provider is STILL
+// missing from exactly one driver. Implement it and this test REDS, demanding
+// the entry be deleted. Add a second entry and the size assertion reds. An
+// allow-list that can only shrink is a ratchet; one that can grow is a licence.
+[[nodiscard]] std::set<std::string> knownDriverLocalProviders() {
+    // D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+    return {"ubuntu-ports-arm64"};
+}
+
+// RED-ON-DISABLE: delete either driver's arm for any declared provider and this
+// fails naming the driver and the provider.
+TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
+    auto const providers = declaredProviders(catalogue_);
+    ASSERT_GE(providers.size(), 2u) << "one provider — the pin proves nothing";
+    auto const exempt = knownDriverLocalProviders();
+    EXPECT_EQ(exempt.size(), 1u)
+        << "the driver-local exemption list may only SHRINK. A second entry"
+           " means a new capability was added to one driver and not the other,"
+           " which is the defect D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-"
+           "LEG-IN-ONE-DRIVER exists to end.";
+    struct Driver {
+        char const* name;
+        bool        powershell;
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
+                                   {"build-and-test.ps1", true}};
+    std::map<std::string, unsigned> armsFor;
+    for (auto const& d : kDrivers) {
+        auto const lines = liveLines(harnessDir() / d.name, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+        for (auto const& p : providers) {
+            // `<provider>)` opens a bash case arm; `'<provider>' {` opens a
+            // PowerShell switch arm. Both ARE the dispatch.
+            std::string const needle =
+                d.powershell ? ("'" + p + "'") : (p + ")");
+            bool arm = false;
+            for (auto const& line : lines) {
+                auto const at = line.find(needle);
+                if (at == std::string::npos) continue;
+                if (d.powershell
+                    && line.find('{', at + needle.size()) == std::string::npos) {
+                    continue;   // a mention, not a switch arm
+                }
+                arm = true;
+                break;
+            }
+            if (arm) ++armsFor[p];
+            if (exempt.count(p)) continue;
+            EXPECT_TRUE(arm)
+                << d.name << " has no dispatch arm for library provider '" << p
+                << "', which the catalogue DECLARES. A leg is then buildable"
+                   " from one driver and not the other — the silent harness-bug"
+                   " shape this anchor exists to end.";
+        }
+    }
+    // The exemption retires itself: a listed provider must STILL be missing
+    // from exactly one driver. The day it is implemented, this reds and the
+    // entry has to go.
+    for (auto const& p : exempt) {
+        if (!providers.count(p)) {
+            ADD_FAILURE()
+                << "provider '" << p << "' is exempted but no longer declared by"
+                   " the catalogue — delete the exemption.";
+            continue;
+        }
+        EXPECT_EQ(armsFor[p], 1u)
+            << "provider '" << p << "' is on the driver-local exemption list but"
+               " now has " << armsFor[p] << " driver arm(s) instead of 1. If it"
+               " was implemented in both drivers, DELETE it from"
+               " knownDriverLocalProviders() — a stale exemption is how a closed"
+               " gap comes to look open.";
+    }
+}
+
+// IT REFUSES RATHER THAN IMPROVISING.
+// Offline with a cold cache is the case that matters: the tempting behaviour is
+// to fall back to "whatever tcl is on this machine", which would build the leg
+// against a foreign library and report it green.
+TEST_F(HarnessLegs, AcquisitionRefusesRatherThanImprovisingWithAColdCache) {
+    auto const label = firstAcquiringLeg(catalogue_);
+    ASSERT_FALSE(label.empty()) << "no acquiring leg — vacuous";
+    auto const cold = scratch_->path() / "cold-cache";
+    ASSERT_FALSE(fs::exists(cold)) << "the cache root must be absent: " << cold;
+
+    auto const r =
+        run({"--acquire", label, "--offline", "--cache-root", cold.string()});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_NE(r.exitCode, 0u)
+        << "--offline with a cold cache SUCCEEDED. Somewhere it improvised:\n"
+        << r.output;
+    EXPECT_NE(r.output.find("https://"), std::string::npos)
+        << "the refusal must name the source it could not reach:\n" << r.output;
+
+    // And it refused BEFORE creating anything: a run that cannot succeed must
+    // not leave a half-built cache tree behind for the next run to trust.
+    EXPECT_FALSE(fs::exists(cold))
+        << "a failed offline acquisition created " << cold;
+}
+
+// THE COMPILER FLAG IS NAMED IN ONE FILE, NOT IN TWO DRIVERS — the same argument
+// `--translate-path` makes for `wslpath`. A driver that spelled it itself is a
+// capability that can exist in one driver and not the other.
+TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
+    // Without an override, the argv is what every leg has always passed.
+    auto const plain = run({"--resolve-library-argv", "/tmp/libz.so.1"});
+    ASSERT_TRUE(plain.spawned) << plain.diagnostic;
+    ASSERT_EQ(plain.exitCode, 0u) << plain.output;
+    auto const plainTokens = splitLines(plain.output);
+    ASSERT_EQ(plainTokens.size(), 2u) << plain.output;
+    EXPECT_EQ(plainTokens[0], "--resolve-library");
+    EXPECT_EQ(plainTokens[1], "/tmp/libz.so.1");
+
+    // With one, the flag appears — and it is the RESOLVER that chose it.
+    auto const over = run({"--resolve-library-argv", "/tmp/libz.1.dylib",
+                           "--import-name", "@loader_path/libz.1.dylib"});
+    ASSERT_TRUE(over.spawned) << over.diagnostic;
+    ASSERT_EQ(over.exitCode, 0u) << over.output;
+    // ★ THE OVERRIDE IS A VALUE SUFFIX, NOT A SECOND FLAG:
+    // `--resolve-library <path>[=<import-name>]`, which the compiler splits on
+    // its LAST `=`. An earlier draft of this test asserted the opposite — that
+    // the first token must NOT be `--resolve-library` — which was a guess made
+    // before the compiler side landed, and it went red against a correct
+    // resolver. The shape below is the one that is actually true, and it is
+    // asserted on the TOKENS rather than on the joined string so a change in
+    // either half reds here, in the one place that has to be updated.
+    auto const overTokens = splitLines(over.output);
+    ASSERT_EQ(overTokens.size(), 2u) << over.output;
+    EXPECT_EQ(overTokens[0], "--resolve-library") << over.output;
+    EXPECT_EQ(overTokens[1], "/tmp/libz.1.dylib=@loader_path/libz.1.dylib")
+        << "the identity must ride as a `=<import-name>` suffix on the path:\n"
+        << over.output;
+
+    // A compiler whose --help does not carry the flag is a LOUD refusal. The
+    // stand-in is the python interpreter: a real executable whose help text
+    // certainly lacks it, so the probe is exercised rather than mocked.
+    auto const py = pythonPath();
+    ASSERT_FALSE(py.empty());
+    auto const refused = run({"--resolve-library-argv", "/tmp/libz.1.dylib",
+                              "--import-name", "@loader_path/libz.1.dylib",
+                              "--dss", py});
+    ASSERT_TRUE(refused.spawned) << refused.diagnostic;
+    EXPECT_NE(refused.exitCode, 0u)
+        << "a compiler that cannot record the declared identity was accepted."
+           " Dropping the override links clean here and fails at LOAD time on a"
+           " machine this host cannot observe:\n"
+        << refused.output;
+
+    // Neither driver may spell the compiler's flag itself — it must come from
+    // the resolver. Matched as a WHOLE TOKEN: `--resolve-library-argv` is the
+    // RESOLVER's own subcommand and a driver has to spell that to call it, so a
+    // naive substring scan would forbid the very thing being required. (That is
+    // not hypothetical — the first draft of this check did exactly that.)
+    struct Driver {
+        char const* name;
+        bool        powershell;
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
+                                   {"build-and-test.ps1", true}};
+    std::string const compilerFlag = "--resolve-library";
+    for (auto const& d : kDrivers) {
+        for (auto const& line : liveLines(harnessDir() / d.name, d.powershell)) {
+            for (std::size_t at = line.find(compilerFlag);
+                 at != std::string::npos;
+                 at = line.find(compilerFlag, at + 1)) {
+                char const next = at + compilerFlag.size() < line.size()
+                                      ? line[at + compilerFlag.size()]
+                                      : '\0';
+                if (next == '-' || std::isalnum(static_cast<unsigned char>(next))) {
+                    continue;   // `--resolve-library-argv`, the resolver's verb
+                }
+                ADD_FAILURE()
+                    << d.name << " spells the COMPILER's --resolve-library flag"
+                                 " itself:\n  " << line
+                    << "\nIt belongs in harness_legs.py alone (--resolve-library"
+                       "-argv), so the two drivers cannot drift and so the"
+                       " import-name suffix can never be silently dropped by"
+                       " one of them.";
+            }
+        }
     }
 }

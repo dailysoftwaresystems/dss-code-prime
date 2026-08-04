@@ -22,7 +22,7 @@
   "artifactName":     "myapp",                          // optional — binary base NAME (no ext / path sep); see §5
   "includes":         ["vendor/include"],               // optional — quote-include dirs   (mirrors CLI -I)
   "defines":          ["NDEBUG", "MAX=64"],             // optional — NAME[=VALUE] macros   (mirrors CLI --define)
-  "resolveLibraries": ["dist/libfoo.so"]                // optional — extern-resolving libs (mirrors CLI --resolve-library)
+  "resolveLibraries": ["dist/libfoo.so"]                // optional — extern-resolving libs (mirrors CLI --resolve-library); see §2.3 for the extended entry
 }
 ```
 
@@ -43,7 +43,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag (or the default `<cwd>/target`). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
 | `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
 | `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). |
-| `resolveLibraries` | no | array of non-empty strings | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>` (`Program::setResolveLibraries`). |
+| `resolveLibraries` | no | array of non-empty strings **or `{"path","importName"}` objects** | Library paths whose export surfaces resolve + validate this build's externs. The file-driven form of the CLI `--resolve-library <path>[=<import-name>]` (`Program::setResolveLibraries`). See §2.3. |
 
 **The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
 empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
@@ -53,6 +53,51 @@ that is not an array, or an entry that is not a non-empty string, fails loud (`C
 
 **Unknown top-level keys are rejected** (`C_MalformedJson`) — a typo like `"ouput"` fails loud rather
 than being silently ignored, matching the grammar/target/format loaders.
+
+### 2.3 `resolveLibraries` — declaring the recorded import identity (`D-FFI-DECLARED-IMPORT-NAME`)
+
+Reading a library binary answers **two** questions, and an entry can now answer both:
+
+* **which symbols exist** — always the file at `path`;
+* **what identity to record for them** — the ELF `DT_NEEDED` / Mach-O `LC_LOAD_DYLIB` / PE
+  import-descriptor name the *loader* resolves at runtime.
+
+An entry is therefore **either** shape:
+
+```jsonc
+"resolveLibraries": [
+  "dist/libfoo.so",                                    // PLAIN — nothing stated
+  { "path": "/opt/local/lib/libtcl8.6.dylib",          // EXTENDED — identity stated
+    "importName": "@rpath/libtcl8.6.dylib" }
+]
+```
+
+The recorded identity follows a **three-level precedence**, highest first:
+
+1. the entry's **`importName`** (this field, or the CLI's `=<import-name>` suffix);
+2. the binary's **own embedded soname** — ELF `DT_SONAME` / Mach-O `LC_ID_DYLIB` install name /
+   PE export DllName, read by the FF1 binary readers (`D-FF1-READER-SONAME`);
+3. the **file basename** fallback (`D-FF1-READER-CONSUMER`).
+
+The plain string form is level 2/3 only and is **unchanged** — every manifest written before this
+capability behaves byte-for-byte as it did.
+
+**Why level 1 exists:** cross-compiling from a *stand-in* library. Reading Tcl symbols out of a
+MacPorts `.dylib` whose `LC_ID_DYLIB` is `/opt/local/lib/libtcl8.6.dylib` would otherwise stamp that
+MacPorts prefix into the artifact's `LC_LOAD_DYLIB`, and the artifact would then demand MacPorts at
+that exact path on the target Mac — a dyld load failure at runtime, with no build error anywhere.
+This is the mechanism a conventional toolchain spells as a sysroot stub, a `.tbd`, or `-dylib_file`:
+**symbols from the file you can read, identity from the declaration.** It is object-format agnostic —
+the readers normalise all three formats' embedded identities into one field.
+
+The object form also has **no separator character**, so it is the way to express a `path` that itself
+contains `=` (which the CLI's last-`=` split cannot).
+
+**Fail-loud rules for the extended entry** (all `C_MalformedJson`): an entry that is neither a string
+nor an object; a missing, non-string, or empty `path`; a missing, non-string, or empty `importName`
+(the object form exists *solely* to state an identity — use the plain string when stating none); and
+any **unknown member** inside the object, so a mistyped `"importname"` cannot silently discard the
+identity the entry exists to carry.
 
 ### 2.1 `sources[]` glob expansion (`D-AP2-SOURCES-GLOB`)
 
