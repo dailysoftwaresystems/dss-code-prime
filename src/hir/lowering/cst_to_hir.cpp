@@ -7231,9 +7231,13 @@ struct Lowerer {
         // implicit-by-type (the value's HIR type identifies WHICH
         // variant); a future explicit-tag substrate can layer an
         // index attribute when codegen needs it.
+        // D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: same span attachment as the
+        // struct/array arm — the union's top-level aggregate is what later tiers
+        // report against, so it must be locatable in the source.
         std::vector<HirNodeId> children{ valueNode };
-        return builder.makeConstructAggregate(children, contextType,
-                                              HirFlags::Synthetic);
+        return track(builder.makeConstructAggregate(children, contextType,
+                                                    HirFlags::Synthetic),
+                     braceInitListNode);
     }
 
     // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
@@ -7644,8 +7648,16 @@ struct Lowerer {
         children.reserve(slotCount);
         for (auto const& s : rootSlots)
             children.push_back(flattenInitSlot(braceInitListNode, s));
-        return builder.makeConstructAggregate(children, contextType,
-                                              HirFlags::Synthetic);
+        // D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: `track` the TOP-LEVEL aggregate at
+        // the brace-init list's CST span. The node is `Synthetic` (it has no 1:1
+        // source token of its own), but it IS the node every later tier reports
+        // AGAINST — the MIR brace-init lowering's refusals name it, and without a span
+        // those diagnostics print with no `--> file:line`, leaving the user to grep for
+        // the construct by hand. The nested zero-fill children stay span-less: they are
+        // C's implicit defaults, not text the user wrote.
+        return track(builder.makeConstructAggregate(children, contextType,
+                                                    HirFlags::Synthetic),
+                     braceInitListNode);
     }
 
     // A fresh SymbolId for a lowering-synthesized temporary, minted above the

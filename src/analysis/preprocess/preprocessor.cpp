@@ -4525,14 +4525,26 @@ private:
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
             const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
-            char buf[16];
+            // Sized for the format's WORST CASE over arbitrary `int`, not for a
+            // well-formed date: `%s`(3) + ' ' + `%2d`(<=11, "-2147483648") + ' '
+            // + `%04d`(<=11) + NUL = 28. Truncation is therefore structurally
+            // impossible rather than merely improbable, which is the stronger
+            // property — `tm_mon` is range-checked just above, but `tm_mday` and
+            // `tm_year` are not, so a hostile/broken `localtime` could otherwise
+            // silently truncate `__DATE__` to a wrong spelling (snprintf would
+            // not overflow, so this is a correctness bug, never a memory one).
+            // ★ Surfaced by gcc-13 -Wformat-truncation on an aarch64 host, which
+            // inlines this far enough to see the bound; the x86_64 legs do not
+            // report it. D-PP-DATETIME-BUF-SIZED-FOR-VALID-TM-ONLY.
+            char buf[32];
             // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
             std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
                           lt->tm_mday, lt->tm_year + 1900);
             dateString_ = buf;
         }
         if (needTime) {
-            char buf[16];
+            // Same worst-case sizing: three `%02d` at <=11 each + 2 ':' + NUL = 36.
+            char buf[40];
             std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
                           lt->tm_min, lt->tm_sec);
             timeString_ = buf;

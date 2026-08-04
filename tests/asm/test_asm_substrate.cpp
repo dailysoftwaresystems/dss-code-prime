@@ -21,6 +21,10 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+// D-MIR-OVERLAP-STRUCT-ZERO-INIT: `computeLayout` (the DECLARED size/offsets a
+// byte pin must be measured against) + `compositeFieldsOverlap` (the single
+// overlap authority, so a fixture's precondition is asserted, never assumed).
+#include "core/types/type_lattice/type_layout.hpp"
 #include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
@@ -1050,6 +1054,11 @@ struct LoweredAgg {
     std::vector<AssembledData> items;
     std::size_t                errors;
     std::string                messages;   // C4b (I2): concatenated diag text for substring pins
+    // A1 (audit fold): the CODE half, so a refusal pin can assert code AND text.
+    // Text alone would go green on a diagnostic that says the right words under a
+    // wrong code; a code alone cannot tell two arms of this function apart (every
+    // arm of `lowerMirGlobalsToDataItems` shares `K_NoMatchingObjectFormat`).
+    std::vector<DiagnosticCode> codes;
 };
 [[nodiscard]] LoweredAgg lowerOneAggGlobal(
         TypeInterner const& ti, TypeId type, MirLiteralValue init,
@@ -1062,9 +1071,13 @@ struct LoweredAgg {
     Mir const m = std::move(b).finish();
     DiagnosticReporter rep;
     auto items = lowerMirGlobalsToDataItems(m, ti, lp, dm, rep);
-    std::string msgs;
-    for (auto const& d : rep.all()) msgs += d.actual;
-    return {std::move(items), rep.errorCount(), std::move(msgs)};
+    std::string                 msgs;
+    std::vector<DiagnosticCode> codes;
+    for (auto const& d : rep.all()) {
+        msgs += d.actual;
+        codes.push_back(d.code);
+    }
+    return {std::move(items), rep.errorCount(), std::move(msgs), std::move(codes)};
 }
 
 // A scalar field literal of `kind` carrying integer bits `v`.
@@ -1665,4 +1678,266 @@ TEST(AsmAggregateGlobal, MissingAggregateLayoutFailsLoud) {
         std::nullopt, DataModel::Lp64);   // no layout params declared
     EXPECT_EQ(r.errors, 1u);
     EXPECT_TRUE(r.items.empty());
+}
+
+// ── D-MIR-OVERLAP-STRUCT-ZERO-INIT: the STATIC-DATA encoder's THREE outcomes ──
+//
+// `encodeAggregateValue`'s struct arm used to refuse EVERY explicit-offset struct
+// outright (`if (in.hasExplicitOffsets(ty)) return false;`). It now asks the
+// narrower — and correct — question: do the members ACTUALLY share bytes. That
+// splits the one blanket refusal into THREE outcomes, and MOVES two of them:
+//   (a) OVERLAP + all-zero initializer → ENCODES, as the layout-sized pre-zeroed
+//       buffer (was: refused). `{0}`/`{}` denote a whole object of zero bytes,
+//       unambiguous however many members alias them.
+//   (b) DISJOINT explicit offsets      → ENCODES MEMBER-WISE at the DECLARED
+//       offsets (was: refused — a FALSE refusal). This is a brand-new code path:
+//       `lay->fieldOffsets[i]` had never been reached for an explicit-offset
+//       struct, and for such a struct those offsets come from the descriptor
+//       verbatim (type_layout.cpp's explicit-offset arm), not from alignment.
+//   (c) OVERLAP + any non-zero leaf    → still REFUSED, loud (the rule is
+//       unchanged; A1 gave it an ACCURATE diagnostic instead of the caller's
+//       generic "shape mismatch or unencodable leaf" text, which named none of
+//       the actual cause).
+//
+// WHY THESE LIVE HERE AND NOT ONLY IN THE CORPUS: an overlapping struct cannot be
+// SPELLED in C — the explicit offsets arrive only from a shipped-library
+// descriptor — and until this cycle the corpus example declared only LOCALS, so
+// nothing reached the static-data encoder for any of the three shapes. These are
+// the always-on guards, independent of whether a pe/darwin corpus arm runs on the
+// host executing this suite. The runtime twins are
+// `tests/mir/test_overlap_struct_zero_init.cpp` (MIR tier) and
+// `examples/c-subset/overlap_struct_zero_init/` (end-to-end).
+//
+// Two further pins guard the machinery the three outcomes rest on, each covering
+// code this cycle introduced and nothing else reaches: the `-0.0` arm of the new
+// `isAllZeroMirLiteral` (numerically zero, NOT all-zero bytes — the one shape
+// where a wrong answer is a SILENT miscompile), and the recursion threading of the
+// A1 `why` reason (an overlap one level down must still report accurately).
+//
+// Every pin asserts BYTES (or a code+message), never a bare "it returned true".
+
+namespace {
+
+// The real `windows.json` shape: `ULARGE_INTEGER {QuadPart u64@0, LowPart u32@0,
+// HighPart u32@4}` — both 32-bit halves live INSIDE the 64-bit whole (size 8,
+// align 8). Byte-identical to the MIR twin's `ulargeStruct` fixture on purpose:
+// the two tiers must be arguing about the SAME type, or "the twins agree" is not
+// a statement about anything.
+[[nodiscard]] TypeId ulargeOverlayStruct(TypeInterner& ti) {
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 3>        const fields{u64, u32, u32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 3> const offsets{0, 0, 4};
+    return ti.structType("ULARGE_INTEGER", fields, noWidths, offsets);
+}
+
+// A DOUBLE overlaid by the integer that reads its bits: `{f64@0, u64@0}` (size 8,
+// align 8). The vehicle for the `-0.0` pin — the one initializer that is
+// numerically zero but whose OBJECT REPRESENTATION is not all-zero bytes.
+[[nodiscard]] TypeId doubleOverlayStruct(TypeInterner& ti) {
+    TypeId const f64 = ti.primitive(TypeKind::F64);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::array<TypeId, 2>        const fields{f64, u64};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 2> const offsets{0, 0};
+    return ti.structType("DoubleOverlay", fields, noWidths, offsets);
+}
+
+// A double leaf carrying exactly `d` (so `-0.0` keeps its sign bit — `intField`
+// could not express it, and a `0.0` literal would silently lose the distinction).
+[[nodiscard]] MirLiteralValue doubleField(double d) {
+    MirLiteralValue f;
+    f.value = d;
+    f.core  = TypeKind::F64;
+    return f;
+}
+
+// Explicit offsets that are DISJOINT — `{u32@0, u32@8}` → size 12, align 4. A
+// foreign layout that simply is not the natural one; nothing about it is
+// ambiguous. The NATURAL layout of the same two fields is {0, 4} at size 8, so a
+// walk that ignored the declared offsets emits a DIFFERENT byte string of a
+// DIFFERENT length — which is what makes the (b) pin a real offset assertion.
+[[nodiscard]] TypeId disjointOffsetStruct(TypeInterner& ti) {
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2>        const fields{u32, u32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 2> const offsets{0, 8};
+    return ti.structType("Disjoint", fields, noWidths, offsets);
+}
+
+} // namespace
+
+// (a) OVERLAP + ALL-ZERO → encodes the FULL declared size as zero bytes.
+// RED-ON-DISABLE (MEASURED): restore `if (in.hasExplicitOffsets(ty)) return
+// false;` and this errors (1 diagnostic, 0 items) instead of emitting 8 bytes.
+// The assertion is the SIZE and the CONTENT together: the buffer is pre-zeroed by
+// the caller, so "all zero" alone would be satisfied by an encoder that emitted
+// nothing at all — it is `bytes.size() == computeLayout(...)->size` that rejects a
+// short (or absent) object, whose tail an aliasing member would read out of the
+// next object in the section.
+TEST(AsmAggregateGlobal, OverlappingStructAllZeroInitEncodesFullSizeZeroBytes) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const s = ulargeOverlayStruct(ti);
+    ASSERT_TRUE(compositeFieldsOverlap(s, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: these members must ACTUALLY share bytes";
+    auto const lay = computeLayout(s, ti, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(lay.has_value());
+    ASSERT_EQ(lay->size, 8u) << "fixture precondition: the overlay is 8 bytes";
+
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(0, TypeKind::U64), intField(0, TypeKind::U32),
+               intField(0, TypeKind::U32)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+
+    ASSERT_EQ(r.errors, 0u)
+        << "an ALL-ZERO static initializer of an overlapping struct must ENCODE — "
+           "zeroed bytes read the same through every aliasing member: " << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect(static_cast<std::size_t>(lay->size), 0u);
+    EXPECT_EQ(r.items[0].bytes, expect) << "every byte of the object must be zero";
+    EXPECT_EQ(r.items[0].bytes.size(), static_cast<std::size_t>(lay->size))
+        << "the object must span its FULL declared size, not the first member's width";
+    EXPECT_TRUE(r.items[0].relocations.empty())
+        << "an all-zero object carries no load-time fixups";
+}
+
+// (b) DISJOINT explicit offsets → encodes MEMBER-WISE, each member's bytes at its
+// DECLARED offset. RED-ON-DISABLE (MEASURED): restore `if
+// (in.hasExplicitOffsets(ty)) return false;` and this errors instead of emitting.
+// The byte vector is also an OFFSET assertion, not merely a content one: under the
+// NATURAL offsets {0,4} the same two values encode as {44 33 22 11 88 77 66 55}
+// (8 bytes), so any walk that derived offsets from alignment rather than reading
+// `lay->fieldOffsets` fails here on both length and content.
+TEST(AsmAggregateGlobal, DisjointExplicitOffsetStructEncodesAtDeclaredOffsets) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const s = disjointOffsetStruct(ti);
+    ASSERT_TRUE(ti.hasExplicitOffsets(s))
+        << "fixture precondition: the offsets must be EXPLICIT";
+    ASSERT_FALSE(compositeFieldsOverlap(s, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: and they must NOT overlap";
+    auto const lay = computeLayout(s, ti, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(lay.has_value());
+    ASSERT_EQ(lay->size, 12u) << "fixture precondition: 0..4 + a 4-byte gap + 8..12";
+    ASSERT_EQ(lay->fieldOffsets.size(), 2u);
+    EXPECT_EQ(lay->fieldOffsets[0], 0u);
+    EXPECT_EQ(lay->fieldOffsets[1], 8u) << "the DECLARED offset, not the natural 4";
+
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(0x11223344, TypeKind::U32),
+               intField(0x55667788, TypeKind::U32)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+
+    ASSERT_EQ(r.errors, 0u)
+        << "disjoint explicit offsets are unambiguous — member-wise is correct: "
+        << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{
+        0x44, 0x33, 0x22, 0x11,          // field 0 @ declared offset 0 (LE)
+        0,    0,    0,    0,             // the descriptor's 4-byte hole stays zero
+        0x88, 0x77, 0x66, 0x55};         // field 1 @ declared offset 8 (LE)
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// (c) OVERLAP + a NON-ZERO leaf → still REFUSED, loud, with the A1 diagnostic.
+// `{0, 1, 0}` sets `LowPart = 1`, which aliases `QuadPart`'s low four bytes: a
+// positional walk's result would depend on declaration order. Exactly the
+// ambiguity the refusal exists for, and it must survive the zero-init relaxation.
+// RED-ON-DISABLE, two independent halves (both MEASURED):
+//   * the REFUSAL — drop the `!isAllZeroMirLiteral(v)` test (make the overlap arm
+//     `return true`) and this emits 8 wrong bytes with 0 errors;
+//   * the DIAGNOSTIC — drop the `why = …` assignment and the caller falls back to
+//     its generic text, which names f16/f80/f128 and address-relocated leaves,
+//     none of which is the cause; the three message assertions below then fail.
+TEST(AsmAggregateGlobal, NonZeroInitIntoOverlappingStructFailsLoudWithOverlapReason) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const s = ulargeOverlayStruct(ti);
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(0, TypeKind::U64), intField(1, TypeKind::U32),
+               intField(0, TypeKind::U32)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+
+    EXPECT_EQ(r.errors, 1u) << "a non-zero overlapping static init must be REFUSED";
+    EXPECT_TRUE(r.items.empty())
+        << "a refused initializer must emit NO partial member bytes";
+    ASSERT_EQ(r.codes.size(), 1u);
+    EXPECT_EQ(r.codes[0], DiagnosticCode::K_NoMatchingObjectFormat);
+    EXPECT_NE(r.messages.find("overlapping explicit-offset struct is unsupported"),
+              std::string::npos)
+        << "the refusal must name the ACTUAL cause: " << r.messages;
+    EXPECT_NE(r.messages.find("its members share bytes; assign the members individually"),
+              std::string::npos)
+        << "…and carry the same remedy the MIR twin gives: " << r.messages;
+    EXPECT_EQ(r.messages.find("unencodable leaf"), std::string::npos)
+        << "the generic enumerating text names causes this user does NOT have: "
+        << r.messages;
+}
+
+// `-0.0` — the SILENT-MISCOMPILE arm of the new `isAllZeroMirLiteral` helper, and
+// a MATCHED-CONTROL pair: the same struct, the same member, `+0.0` versus `-0.0`.
+// `-0.0` compares EQUAL to zero yet its object representation is 0x8000000000000000,
+// so treating it as an all-zero fill would emit eight 0x00 bytes and silently drop
+// the sign — no diagnostic, wrong data, exactly the failure class the pre-zeroed
+// buffer makes easy to fall into. It must be REFUSED; `+0.0` must still encode.
+// RED-ON-DISABLE: weaken the helper's double arm to `return *d == 0.0;` (drop the
+// `!std::signbit(*d)` conjunct) and the `-0.0` half goes green-with-wrong-bytes,
+// which this pin catches as 0 errors + an emitted item. The `+0.0` half is the
+// control that keeps the fix from being "refuse all doubles".
+TEST(AsmAggregateGlobal, NegativeZeroIntoOverlappingStructIsNotAZeroFill) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const s = doubleOverlayStruct(ti);
+    ASSERT_TRUE(compositeFieldsOverlap(s, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: the double and the integer must share bytes";
+
+    // CONTROL: +0.0 IS all-zero bytes → encodes, eight zero bytes.
+    auto const plus = lowerOneAggGlobal(
+        ti, s, aggOf({doubleField(0.0), intField(0, TypeKind::U64)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(plus.errors, 0u) << "+0.0 IS all-zero bytes: " << plus.messages;
+    ASSERT_EQ(plus.items.size(), 1u);
+    std::vector<std::uint8_t> const zero8(8, 0u);
+    EXPECT_EQ(plus.items[0].bytes, zero8);
+
+    // THE PIN: -0.0 is numerically zero but byte 7 is 0x80 → must be REFUSED.
+    auto const minus = lowerOneAggGlobal(
+        ti, s, aggOf({doubleField(-0.0), intField(0, TypeKind::U64)}, TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    EXPECT_EQ(minus.errors, 1u)
+        << "-0.0 has its sign bit SET — a zero-fill would silently drop it";
+    EXPECT_TRUE(minus.items.empty())
+        << "a refused initializer must emit NO bytes, least of all wrong ones";
+    EXPECT_NE(minus.messages.find("overlapping explicit-offset struct is unsupported"),
+              std::string::npos)
+        << "and it must be refused for the OVERLAP reason: " << minus.messages;
+}
+
+// A1, recursion half: the reason is threaded, so an overlapping struct nested as a
+// MEMBER of an ordinary struct still reports the accurate cause at the top. Without
+// the shared `why` reference this would silently degrade to the generic text — the
+// only witness for the threading itself. RED-ON-DISABLE: pass a local `std::string`
+// at either recursion site instead of `why` and the specific substring vanishes.
+TEST(AsmAggregateGlobal, NestedOverlappingMemberReportsOverlapReasonAtTopLevel) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const inner = ulargeOverlayStruct(ti);
+    std::array<TypeId, 1> const f{inner};
+    TypeId const outer = ti.structType("Outer", f);
+    ASSERT_FALSE(compositeFieldsOverlap(outer, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: the OUTER struct is naturally laid out — the "
+           "overlap is one level down, so only the recursion can find it";
+
+    auto const r = lowerOneAggGlobal(
+        ti, outer,
+        aggOf({aggOf({intField(0, TypeKind::U64), intField(1, TypeKind::U32),
+                      intField(0, TypeKind::U32)}, TypeKind::Struct)},
+              TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+
+    EXPECT_EQ(r.errors, 1u);
+    EXPECT_TRUE(r.items.empty());
+    EXPECT_NE(r.messages.find("overlapping explicit-offset struct is unsupported"),
+              std::string::npos)
+        << "a nested cause must reach the caller unchanged: " << r.messages;
 }

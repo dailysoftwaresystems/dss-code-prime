@@ -146,6 +146,59 @@ TEST(TypeLayout, ExplicitOffsetsWithBitfieldsFailsLoud) {
     EXPECT_FALSE(computeLayout(bad, ti, p, DataModel::Lp64).has_value());
 }
 
+// D-MIR-OVERLAP-STRUCT-ZERO-INIT: `compositeFieldsOverlap` is THE authority for
+// "these members share bytes" — the single predicate the MIR brace-init lowering
+// and the static-data encoder both consult before deciding whether a positional
+// member-wise write is meaningful. It answers a purely STRUCTURAL question about a
+// LAID-OUT type: no target/format/language identity, the ABI entering only through
+// `params`/`dm` exactly as `computeLayout`'s does.
+TEST(TypeLayout, CompositeFieldsOverlapDetectsSharedBytes) {
+    auto ti = makeInterner(1);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<std::int64_t, 0> const noWidths{};
+
+    // ULARGE_INTEGER {QuadPart u64@0, LowPart u32@0, HighPart u32@4} — both 32-bit
+    // halves live INSIDE the 64-bit whole, so the field set overlaps.
+    std::array<TypeId, 3>        const ovFields{u64, u32, u32};
+    std::array<std::uint64_t, 3> const ovOffsets{0, 0, 4};
+    TypeId const ov = ti.structType("ULARGE", ovFields, noWidths, ovOffsets);
+    EXPECT_TRUE(compositeFieldsOverlap(ov, ti, kNatural16, DataModel::Lp64));
+
+    // Explicit offsets that are DISJOINT: {u32@0, u32@8} — a foreign layout that
+    // simply is not the natural one. Nothing shares a byte, so member-wise writes
+    // are exactly right. RED-ON-DISABLE for the "actual overlap, not merely
+    // explicit offsets" rule: keying on `hasExplicitOffsets` makes this TRUE.
+    std::array<TypeId, 2>        const djFields{u32, u32};
+    std::array<std::uint64_t, 2> const djOffsets{0, 8};
+    TypeId const dj = ti.structType("Disjoint", djFields, noWidths, djOffsets);
+    EXPECT_TRUE(ti.hasExplicitOffsets(dj));
+    EXPECT_FALSE(compositeFieldsOverlap(dj, ti, kNatural16, DataModel::Lp64));
+
+    // ADJACENT-but-not-overlapping is the off-by-one boundary: {u32@0, u32@4} —
+    // `[0,4)` ends exactly where `[4,8)` begins, so they touch and do NOT overlap.
+    std::array<std::uint64_t, 2> const adjOffsets{0, 4};
+    TypeId const adj = ti.structType("Adjacent", djFields, noWidths, adjOffsets);
+    EXPECT_FALSE(compositeFieldsOverlap(adj, ti, kNatural16, DataModel::Lp64));
+
+    // A NATURALLY laid-out struct can never overlap (the engine places each field
+    // at or after the previous field's end), and neither can a non-composite.
+    EXPECT_FALSE(compositeFieldsOverlap(ti.structType("Nat", ovFields), ti,
+                                        kNatural16, DataModel::Lp64));
+    EXPECT_FALSE(compositeFieldsOverlap(u64, ti, kNatural16, DataModel::Lp64));
+
+    // Overlap is ABI-DEPENDENT, so it must be asked of a LAID-OUT type: the same
+    // field list `{ptr@0, u32@4}` overlaps under LP64 (an 8-byte pointer covers
+    // [0,8), swallowing [4,8)) but NOT under ILP32 (a 4-byte pointer stops at 4).
+    // RED-ON-DISABLE for computing sizes from the bare field list.
+    TypeId const p = ti.pointer(ti.primitive(TypeKind::I32));
+    std::array<TypeId, 2>        const pFields{p, u32};
+    std::array<std::uint64_t, 2> const pOffsets{0, 4};
+    TypeId const ps = ti.structType("PtrThenU32", pFields, noWidths, pOffsets);
+    EXPECT_TRUE(compositeFieldsOverlap(ps, ti, kNatural16, DataModel::Lp64));
+    EXPECT_FALSE(compositeFieldsOverlap(ps, ti, kNatural16, DataModel::Ilp32));
+}
+
 // D-CSUBSET-MEMBER-ALIGNAS: a member `alignas(16)` RAISES the field's (and thus the
 // struct's) alignment, padding the struct up to 16. `struct{alignas(16) int x;}`:
 // x@0 (int align raised to 16), struct align 16, size rounded up to 16.

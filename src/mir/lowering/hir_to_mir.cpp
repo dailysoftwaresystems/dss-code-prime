@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
 #include <format>
 #include <limits>
 #include <map>       // FC17.5 F2: the string-global byte-content memo
@@ -19,6 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace dss {
@@ -6374,6 +6376,75 @@ struct Lowerer {
         return true;
     }
 
+    // D-MIR-OVERLAP-STRUCT-ZERO-INIT: is EVERY element this initializer supplies a
+    // compile-time ZERO whose object representation is all-zero BYTES — i.e. is the
+    // whole initializer equivalent to zeroing the object?
+    //
+    // `{}` and `{0}` both normalize at CST→HIR into a POSITIONAL, COMPLETE child list
+    // (`lowerBraceInit` zero-fills every unmentioned slot via `synthZeroOrError`), so
+    // "all zero" is answerable STRUCTURALLY, with no const-eval: every child is a zero
+    // literal, a value-preserving Cast of one, or a nested all-zero ConstructAggregate.
+    //
+    // CONSERVATIVE by construction — an unrecognized shape answers FALSE, so the
+    // caller keeps its loud refusal. Notable deliberate rejections:
+    //   * `-0.0` — numerically zero but its sign bit is SET, so its bytes are NOT all
+    //     zero; a zero-fill would silently change the stored value.
+    //   * a folded symbol ADDRESS (`HirAddressValue`), a `_BitInt`/wide-float value, a
+    //     string literal — each would need its own representation proof; none arises
+    //     from a zero-fill, so none is admitted on a guess.
+    // Pure HIR/literal shape — no target, format, or language identity.
+    [[nodiscard]] bool isAllZeroAggregateInit(HirNodeId node) const {
+        switch (hir.kind(node)) {
+            case HirKind::ConstructAggregate: {
+                for (HirNodeId child : hir.children(node))
+                    if (!isAllZeroAggregateInit(child)) return false;
+                return true;
+            }
+            case HirKind::Cast: {
+                // Every scalar conversion C admits maps zero to zero (int↔int,
+                // int↔float, int↔pointer, →bool), so a cast is transparent HERE.
+                auto kids = hir.children(node);
+                return kids.size() == 1 && isAllZeroAggregateInit(kids[0]);
+            }
+            case HirKind::Literal: {
+                HirLiteralValue const& v = literals.at(hir.payload(node));
+                if (auto const* b = std::get_if<bool>(&v.value))
+                    return !*b;
+                if (auto const* i = std::get_if<std::int64_t>(&v.value))
+                    return *i == 0;
+                if (auto const* u = std::get_if<std::uint64_t>(&v.value))
+                    return *u == 0;
+                if (auto const* d = std::get_if<double>(&v.value))
+                    return *d == 0.0 && !std::signbit(*d);   // rejects -0.0
+                if (auto const* a = std::get_if<HirAggregateValue>(&v.value)) {
+                    // A CONST-FOLDED aggregate literal — same recursion, one tier down.
+                    for (HirLiteralValue const& f : a->fields)
+                        if (!isAllZeroLiteral(f)) return false;
+                    return true;
+                }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // The literal-pool half of `isAllZeroAggregateInit` — same admissions, same
+    // conservative default — for a const-folded `HirAggregateValue`'s leaves.
+    [[nodiscard]] static bool isAllZeroLiteral(HirLiteralValue const& v) {
+        if (auto const* b = std::get_if<bool>(&v.value))          return !*b;
+        if (auto const* i = std::get_if<std::int64_t>(&v.value))  return *i == 0;
+        if (auto const* u = std::get_if<std::uint64_t>(&v.value)) return *u == 0;
+        if (auto const* d = std::get_if<double>(&v.value))
+            return *d == 0.0 && !std::signbit(*d);
+        if (auto const* a = std::get_if<HirAggregateValue>(&v.value)) {
+            for (HirLiteralValue const& f : a->fields)
+                if (!isAllZeroLiteral(f)) return false;
+            return true;
+        }
+        return false;
+    }
+
     // FC7 (D-FC7-MEMBER-ACCESS): lower a struct/union ConstructAggregate
     // initializer ELEMENT-WISE into the slot at `allocaPtr` — one
     // `Store(lowerExpr(child_i), Gep(allocaPtr, Const(fieldByteOffset_i)))`
@@ -6398,17 +6469,46 @@ struct Lowerer {
         if (hasBitfieldMember(aggTy)) {
             return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy, vf);
         }
-        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): brace-initializing an explicit-offset
-        // (overlapping) struct would positionally Store each field, so a later field
-        // silently clobbers an earlier one that shares its bytes — a wrong-but-runs
-        // aggregate. An FFI overlap type (ULARGE_INTEGER) is only ever member-assigned
-        // (overlap-immune, indexed offsets), never brace-inited; refuse LOUD rather
-        // than miscompile. (Materially strip volatile via the interner's own view.)
-        if (interner.hasExplicitOffsets(aggTy)) {
-            unsupported(aggNode, "brace-initialization of an overlapping "
-                                 "explicit-offset struct is unsupported — its members "
-                                 "share bytes; assign the members individually");
-            return false;
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): brace-initializing a struct whose
+        // members SHARE BYTES would positionally Store each field, so a later field
+        // silently clobbers an earlier one that overlaps it — a wrong-but-runs
+        // aggregate. Refuse LOUD rather than miscompile.
+        //
+        // D-MIR-OVERLAP-STRUCT-ZERO-INIT: except when the initializer is ALL ZERO.
+        // `{}` (C23 6.7.10p11) and `{0}` (6.7.9p21 — the first member set to 0, every
+        // remaining byte zero-filled) both denote a WHOLE-OBJECT of zero bytes, and
+        // zero bytes are unambiguous no matter how many members alias them: read
+        // through `st_mtim_sec` or through `st_mtimespec`, zeroed bytes are zero
+        // either way. There is no member ORDER to get wrong, so the ambiguity that
+        // motivates the refusal does not exist — lower it as one zero-fill of the
+        // struct's full size and bypass member-wise assignment entirely. A NON-zero
+        // element keeps the refusal, because that genuinely is ambiguous.
+        //
+        // Both halves of the gate are properties of the TYPE and the INITIALIZER —
+        // "do these fields overlap" and "is every supplied element zero". No target,
+        // format, or language identity enters (the ABI reaches `compositeFieldsOverlap`
+        // only through the config-declared layout params, as everywhere else).
+        //
+        // NOTE this keys on ACTUAL overlap, not on the mere presence of explicit
+        // offsets: a descriptor may pin non-overlapping offsets (a foreign layout that
+        // simply is not natural), and positional Stores at disjoint offsets are exactly
+        // right — that case falls through to the member-wise path below.
+        if (compositeFieldsOverlap(aggTy, interner, config.aggregateLayout,
+                                   config.dataModel)) {
+            if (!isAllZeroAggregateInit(aggNode)) {
+                unsupported(aggNode, "brace-initialization of an overlapping "
+                                     "explicit-offset struct is unsupported — its members "
+                                     "share bytes; assign the members individually");
+                return false;
+            }
+            StructLayout const* layout = cachedLayout(aggTy);
+            if (layout == nullptr) {
+                unsupported(aggNode, "all-zero brace-initialization of an overlapping "
+                                     "explicit-offset struct requires a sizeable layout "
+                                     "(target 'aggregateLayout' / complete type)");
+                return false;
+            }
+            return lowerByteWiseZeroFill(allocaPtr, layout->size, vf);
         }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
@@ -6585,7 +6685,7 @@ struct Lowerer {
         // every member access of a volatile aggregate is volatile, C 6.7.3), passed
         // by the AssignStmt/VarDecl-init callers. Every STRUCTURAL caller (brace-
         // init field copy, by-value arg/return, sret) keeps the default None.
-        auto emit = [&](TypeKind chunkKind, std::uint64_t off) -> bool {
+        return walkByteChunks(size, [&](TypeKind chunkKind, std::uint64_t off) -> bool {
             TypeId const chunkTy = interner.primitive(chunkKind);
             TypeId const ptrTy   = interner.pointer(chunkTy);
             MirInstId const offK = constInt(static_cast<std::int64_t>(off));
@@ -6603,17 +6703,55 @@ struct Lowerer {
             std::array<MirInstId, 2> st{v, dp};
             mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
             return true;
-        };
+        });
+    }
+
+    // The I64 → I32 → Char chunk walk shared by the byte-wise COPY above and the
+    // byte-wise ZERO-FILL below: it visits `size` bytes as the widest available
+    // integer chunk at each step — I64 (8B) while 8 fit, then at most one I32 (4B),
+    // then `Char` (1B) for the 0–3 byte tail — calling `emitChunk(kind, byteOffset)`
+    // once per chunk and aborting (false) the moment one fails. ONE chunking policy
+    // for both whole-object primitives, so a copy and a zero-fill of the same object
+    // touch byte-IDENTICAL ranges and a future widening (a 2-byte tail chunk) lands
+    // in both at once. Pure arithmetic — no target/format/language identity.
+    template <typename EmitChunk>
+    [[nodiscard]] static bool walkByteChunks(std::uint64_t size,
+                                             EmitChunk&& emitChunk) {
         std::uint64_t off = 0;
         for (; off + 8 <= size; off += 8)
-            if (!emit(TypeKind::I64, off)) return false;
+            if (!emitChunk(TypeKind::I64, off)) return false;
         if (off + 4 <= size) {
-            if (!emit(TypeKind::I32, off)) return false;
+            if (!emitChunk(TypeKind::I32, off)) return false;
             off += 4;
         }
         for (; off < size; off += 1)
-            if (!emit(TypeKind::Char, off)) return false;
+            if (!emitChunk(TypeKind::Char, off)) return false;
         return true;
+    }
+
+    // D-MIR-OVERLAP-STRUCT-ZERO-INIT: write `size` ZERO bytes at `dstPtr` — the
+    // whole-object twin of `lowerByteWiseCopy`, sharing its exact chunk walk (so
+    // the two primitives cover byte-identical ranges) but storing a typed constant
+    // 0 instead of a loaded chunk. Used where an object must be zeroed as ONE
+    // object rather than member-by-member: an ALL-ZERO brace initializer of a
+    // struct whose members SHARE bytes, where a member-wise write order is
+    // meaningless but "every byte is 0" is exact. Returns false on any failure.
+    [[nodiscard]] bool lowerByteWiseZeroFill(MirInstId dstPtr, std::uint64_t size,
+                                             MirInstFlags vf = MirInstFlags::None) {
+        return walkByteChunks(size, [&](TypeKind chunkKind, std::uint64_t off) -> bool {
+            TypeId const chunkTy = interner.primitive(chunkKind);
+            TypeId const ptrTy   = interner.pointer(chunkTy);
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> dg{dstPtr, offK};
+            MirInstId const dp = mir.addInst(MirOpcode::Gep, dg, ptrTy);
+            if (!dp.valid()) return false;
+            MirInstId const z = constIntOfType(0, chunkTy);
+            if (!z.valid()) return false;
+            std::array<MirInstId, 2> st{z, dp};
+            mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
+            return true;
+        });
     }
 
     // FC7: copy an aggregate value from `srcPtr` to `dstPtr`.

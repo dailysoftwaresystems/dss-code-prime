@@ -19,6 +19,12 @@ dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.
 # Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
 dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)
 
+# D-MIR-OVERLAP-STRUCT-ZERO-INIT — brace-init of a struct whose members SHARE
+# BYTES (a c107 explicit-offset overlay). Hand-built HIR, because explicit offsets
+# cannot be spelled in C source — they arrive only from a shipped descriptor.
+dss_add_test(NAME mir/test_overlap_struct_zero_init
+             SOURCES test_overlap_struct_zero_init.cpp)
+
 # D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 — synthesizeStdioShim's va_list ARM
 # SELECTION, pinned at the operand the synthesized call forwards. Separate from
 # test_mir_merge (which pins the shim's SHAPE) because the two HomogeneousPointer

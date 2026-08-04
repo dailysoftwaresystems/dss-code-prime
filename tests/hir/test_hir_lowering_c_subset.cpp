@@ -5205,6 +5205,58 @@ namespace {
 
 } // namespace
 
+// D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: the TOP-LEVEL `ConstructAggregate` a
+// brace initializer lowers to MUST carry a source span. It is the node every later
+// tier reports AGAINST — the MIR brace-init refusals name it — and before this pin
+// `lowerBraceInit` returned it WITHOUT `track(...)`, so those diagnostics printed
+// with no `--> file:line` and the offending construct had to be found by grepping
+// the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c:25283`
+// `struct stat x = {0};` had to be located.
+//
+// RED-ON-DISABLE: drop the `track(...)` wrapper on either `lowerBraceInit`'s or
+// `lowerUnionBraceInit`'s returned aggregate and the matching arm below goes red.
+TEST(HirLoweringCSubset, BraceInitAggregateCarriesASourceSpan) {
+    SemanticModel model = analyzeCSubset(
+        "struct S { int a; int b; };\n"
+        "union U { int i; };\n"
+        "int f(void) {\n"
+        "  struct S s = {1, 2};\n"
+        "  int arr[3] = {7};\n"
+        "  union U u = {5};\n"
+        "  return s.a + arr[0] + u.i;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // The three top-level aggregates are the ones whose TYPE is the declared
+    // struct / array / union — i.e. the direct init child of a VarDecl. Nested
+    // zero-fill children are C's implicit defaults and stay span-less on purpose.
+    unsigned checked = 0;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+        HirNodeId const n{i};
+        if (res->hir.kind(n) != HirKind::VarDecl) continue;
+        auto const kids = res->hir.children(n);
+        if (kids.empty()) continue;
+        HirNodeId const init = kids.back();
+        if (res->hir.kind(init) != HirKind::ConstructAggregate) continue;
+        auto const* loc = res->sourceMap.tryGet(init);
+        ASSERT_NE(loc, nullptr)
+            << "a brace-init aggregate with NO source-map entry makes every "
+               "diagnostic reported against it unlocatable";
+        EXPECT_TRUE(loc->isPresent())
+            << "the aggregate's span must name a real buffer";
+        EXPECT_TRUE(loc->spansText())
+            << "the span must cover the `{...}` text, not be an empty caret";
+        ++checked;
+    }
+    EXPECT_EQ(checked, 3u)
+        << "expected the struct, array, and union brace inits to be checked";
+}
+
 TEST(HirLoweringCSubset, GoldenRepresentativeProgram) {
     SemanticModel model = analyzeCSubset(
         "int add(int a, int b) {\n"

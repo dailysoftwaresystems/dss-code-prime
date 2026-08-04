@@ -54,6 +54,13 @@ file(GLOB_RECURSE EXAMPLE_MANIFESTS
     CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
 
+# D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint is a
+# CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 558.
+# The per-example entries exclude it; the lint entry selects it and receives the
+# corpus ROOT as argv[1] instead of an example dir. The filter goes AFTER the
+# directory argument so argv[1] keeps its meaning in both shapes.
+set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
+
 foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     get_filename_component(EXAMPLE_DIR ${MANIFEST} DIRECTORY)
     get_filename_component(EXAMPLE_NAME ${EXAMPLE_DIR} NAME)
@@ -62,5 +69,12 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     set(TEST_NAME "examples/${LANG_NAME}/${EXAMPLE_NAME}")
     add_test(NAME ${TEST_NAME}
              COMMAND dss_examples_runner ${EXAMPLE_DIR}
+                     --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    dss_strict_arm_verdicts(${TEST_NAME})
 endforeach()
+
+add_test(NAME "examples/manifest-emulator-lint"
+         COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
+                 --gtest_filter=${EXAMPLES_LINT_SUITE}.*
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

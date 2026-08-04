@@ -38,3 +38,9 @@ add_test(
             $<TARGET_FILE:dss-code-prime>
             ${CMAKE_SOURCE_DIR}/examples
 )
+
+# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the same strict-arm-verdict wiring
+# the in-process corpus entries get. The capability MUST land on both harnesses
+# together — one runner enforcing an arm's verdict while its sibling shrugs is a
+# silent harness bug, which is the class this whole change closes.
+dss_strict_arm_verdicts(integrated_tests)

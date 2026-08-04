@@ -173,4 +173,31 @@ isByValueClass(TypeInterner const& interner, TypeId id) noexcept;
 computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm);
 
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY) / D-MIR-OVERLAP-STRUCT-ZERO-INIT: do two
+// DISTINCT fields of composite `id` occupy INTERSECTING byte ranges — i.e. is
+// `[off_i, off_i+size_i)` ∩ `[off_j, off_j+size_j)` non-empty for some i≠j? THE
+// single authority for "this struct's members share bytes", consumed by every
+// tier that must refuse (or specially handle) a positional member-wise write:
+// the MIR brace-init lowering and the static-data encoder.
+//
+// A purely STRUCTURAL question about the type under one ABI — no target, format,
+// or language identity enters (the ABI arrives only through `params`/`dm`, exactly
+// as `computeLayout`'s does). Field SIZES are ABI-dependent (`long` is 4 or 8), so
+// overlap must be asked of a LAID-OUT type, never of the bare field list.
+//
+// Only the explicit-offset channel can answer true: natural layout places each
+// field at or after the previous field's end (the engine's monotonic invariant),
+// so a composite with no explicit offsets short-circuits to `false` in O(1).
+// A UNION's members overlap BY DEFINITION — but a union is not laid out
+// field-wise by its consumers, so it is reported through the same explicit-offset
+// gate as a struct and answers `false` unless it actually carries offsets.
+//
+// Zero-SIZE fields occupy no bytes and can never overlap; they are skipped.
+// An UN-COMPUTABLE layout (incomplete/out-of-scope field) answers `true` — the
+// CONSERVATIVE direction, so a caller keeps its LOUD refusal rather than silently
+// admitting a layout it could not verify.
+[[nodiscard]] DSS_EXPORT bool
+compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
+                       AggregateLayoutParams params, DataModel dm);
+
 } // namespace dss

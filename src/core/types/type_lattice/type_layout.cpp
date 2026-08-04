@@ -966,4 +966,44 @@ computeLayout(TypeId id, TypeInterner const& interner,
     }
 }
 
+bool compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
+                            AggregateLayoutParams params, DataModel dm) {
+    // O(1) short-circuit: natural layout is MONOTONIC (each field is placed at or
+    // after the previous field's end), so only the c107 explicit-offset channel can
+    // ever produce an intersection. `hasExplicitOffsets` is Struct/Union-only and
+    // false for every naturally-laid-out composite, so this also filters out the
+    // scalars/arrays/pointers a caller may hand us.
+    if (!interner.hasExplicitOffsets(id)) return false;
+    auto const fields = interner.operands(id);
+    // Collect each field's occupied byte range. A field whose layout is
+    // un-computable makes the answer CONSERVATIVELY `true` (see the header): the
+    // caller must keep refusing rather than admit an unverified layout.
+    struct Range {
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::vector<Range> ranges;
+    ranges.reserve(fields.size());
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        auto const off = interner.explicitFieldOffset(id, i);
+        if (!off) return true;                       // partial offsets: malformed
+        auto const fl = computeLayout(fields[i], interner, params, dm);
+        if (!fl) return true;                        // un-sizeable field
+        if (fl->size == 0) continue;                 // occupies no bytes
+        ranges.push_back(Range{*off, *off + fl->size});
+    }
+    // Sort by start offset, then a single adjacent-pair sweep: with the ranges
+    // ordered, ANY intersection shows up between neighbours (a later range that
+    // reaches back into an earlier one must start before that one's end, and the
+    // running max-end below carries a long field over the short ones it swallows).
+    std::sort(ranges.begin(), ranges.end(),
+              [](Range const& a, Range const& b) { return a.begin < b.begin; });
+    std::uint64_t reach = 0;   // max `end` seen so far
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (i != 0 && ranges[i].begin < reach) return true;
+        reach = std::max(reach, ranges[i].end);
+    }
+    return false;
+}
+
 } // namespace dss
