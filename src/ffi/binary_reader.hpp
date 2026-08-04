@@ -79,7 +79,16 @@ struct DSS_EXPORT BinaryReadError {
 // past the pre-fold check). Indirect ELF-synthesis coverage is
 // fragile against parser-order refactors. (pr-test-analyzer Gap 1
 // priority 9, post-fold #2.)
-[[nodiscard]] DSS_EXPORT constexpr bool
+//
+// Deliberately NOT DSS_EXPORT (D-BUILD-DSS-EXPORT-ON-FREE-CONSTEXPR-IGNORED).
+// It is a free constexpr function DEFINED here, so it is implicitly inline and
+// every consumer emits its own copy — there is no DLL symbol to import. The
+// attribute was therefore dead, and dllimport on a free constexpr function is
+// diagnosed rather than silently dropped (-Wattributes). Public-header exposure
+// is unaffected: visibility here comes from the definition being in the header,
+// never from the macro. Same rule the tree_node.hpp free operators already
+// follow (see .plans/01-tree-node-model-plan - ok.md:459).
+[[nodiscard]] constexpr bool
 rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
                    std::uint64_t totalSize) noexcept {
     return off > totalSize || size > totalSize - off;

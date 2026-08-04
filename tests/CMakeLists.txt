@@ -21,9 +21,27 @@ function(dss_add_test)
     # Reuse the shared test PCH (heavy STL + <gtest/gtest.h>). All test
     # targets compile with identical flags (DSS_SHARED_BUILD via the lib's
     # PUBLIC define, the same includes), so the one precompiled header is
-    # valid for every one of them. No-op in Debug (CMAKE_DISABLE_PRECOMPILE_
-    # HEADERS), so the linux-clang-asan leg builds PCH-free.
-    target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+    # valid for every one of them.
+    #
+    # GUARDED, not unconditional (D-BUILD-PCH-REUSE-FROM-UNGUARDED-IN-DEBUG).
+    # The Debug canary sets CMAKE_DISABLE_PRECOMPILE_HEADERS (../CMakeLists.txt
+    # ~:162) so the linux-clang-asan leg builds PCH-free — but REUSE_FROM is NOT
+    # a no-op under it the way a producer call is. CMake still records the
+    # property, then complains at generate time that the producer has PCH
+    # disabled: MEASURED on a Debug Ninja configure, 633 `CMake Warning ...
+    # "PRECOMPILE_HEADERS_REUSE_FROM" ... has set "DISABLE_PRECOMPILE_HEADERS";
+    # ignoring` lines (3 per consumer x 211 dss_add_test targets), and they were
+    # 633 of the configure's 633 warnings — i.e. the entire warning channel was
+    # this one line, which is exactly where a real warning goes unseen.
+    #
+    # Same predicate as the sibling on the next line: dss_pch_reproducible opens
+    # with `if(CMAKE_DISABLE_PRECOMPILE_HEADERS) return()`. Both must key off the
+    # one variable, because both are about the same fact ("there is no PCH here");
+    # this one reads inverted only because a function body follows it and there is
+    # nothing to early-return from mid-helper.
+    if(NOT CMAKE_DISABLE_PRECOMPILE_HEADERS)
+        target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+    endif()
     dss_pch_reproducible(${target})  # consumer must match producer's PCH flags
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})

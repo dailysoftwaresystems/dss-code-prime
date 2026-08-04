@@ -15138,3 +15138,131 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignasAndAttributeCompose) {
     EXPECT_TRUE(p->isNoreturn)
         << "and the attribute branch beside it must still reach its own";
 }
+
+// ── TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): a goal-2 SUPPRESSED descriptor row
+//    must carry its REALIZATION, not just its library ────────────────────────
+//
+// A descriptor row declares two independent things: WHERE the symbol resolves
+// (`library`) and WHETHER it is an import at all (`synthesize`). Goal-2 hands a
+// user re-declaration authority over the SIGNATURE — never over the platform's
+// realization — so a suppressed row has to forward BOTH or the second property
+// is silently lost for the declarations users write most often.
+//
+// The cost of losing it is not theoretical and not graceful. `ucrtbase.dll`
+// exports none of printf/fprintf/sprintf/vfprintf/sscanf (only the
+// `__stdio_common_v*` cores), so those five pe rows are compiler-SYNTHESIZED.
+// A suppressed row forwarding only the library made the user's prototype
+// re-export the name as a raw eager import, and DSS eager-imports every
+// declared shipped extern — so `#include <stdio.h>` + `int printf(const char*,
+// ...);` compiled rc=0, emitted no diagnostic anywhere, and died at PROCESS
+// START with 0xC0000139 (MEASURED at the TF-C111 HEAD).
+//
+// These pins are the SEMANTIC half of the fix: the row's recipe id and its
+// declared signature survive suppression. The HIR half (recipe → shim, never an
+// import row; and the signature refusal) is pinned in test_hir_lowering_c_subset.
+
+namespace {
+
+// Build + analyze `mainSrc` against the REAL src/dss-config/shippedLibs under a
+// GIVEN object format — the `analyzeRealTgmath` shape, re-declared here so these
+// pins read against the descriptors the production driver ships (a regression in
+// stdio.json itself flips them red rather than being mirrored green by a scratch
+// copy). The format is threaded to BOTH the UnitBuilder (macro `variants` splice)
+// and `analyze` (the per-symbol availability gate) exactly as the driver does —
+// which is load-bearing here: stdio.json carries TWO `printf` rows, and only the
+// pe one has a `synthesize` tag.
+[[nodiscard]] SemanticModel analyzeRealStdio(std::string mainSrc,
+                                             ObjectFormatKind format,
+                                             DataModel dataModel,
+                                             std::string_view arch) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, arch);
+}
+
+// The reproducer, verbatim: legal C that clang and GCC both accept, and the
+// single most-redeclared identifier in the language.
+constexpr char const* kPrintfRedeclSrc =
+    "#include <stdio.h>\n"
+    "int printf(const char *fmt, ...);\n"
+    "int main(void) { return printf(\"hi\n\"); }\n";
+
+} // namespace
+
+// PE: the suppressed row keeps its `synthesize` recipe. RED before TF-C112 —
+// `SuppressedShippedSymbol` had no such field, so the answer was structurally
+// unavailable.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
+                                  DataModel::Llp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr)
+        << "goal-2 suppressed the descriptor's printf — the row must be recorded";
+    EXPECT_EQ(sup->recipeId, "printf")
+        << "the pe row is realized as a compiler-synthesized shim; a suppressed "
+           "copy that forgets the recipe re-exports it as a ucrtbase import that "
+           "cannot load (0xC0000139)";
+    // The per-format library still rides too — the c86/c156 contract is intact,
+    // not replaced. Which ROW was recorded is decided by the availability gate,
+    // and `ucrtbase.dll` here proves the PE row won (the elf/macho `printf` row
+    // carries no recipe, so recording it would have looked identical to the
+    // pre-fix bug).
+    ASSERT_TRUE(sup->library.contains("pe"));
+    EXPECT_EQ(sup->library.at("pe"), "ucrtbase.dll");
+}
+
+// PE: and the row's DECLARED SIGNATURE, which is the shim-compatibility oracle.
+// Two-sided on purpose — "valid" alone would pass on any type at all. The pin is
+// that it is EXACTLY the type the user's own prototype resolved to, because that
+// identity is what licenses the lowerer to hand this prototype the shim.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedRowSignatureMatchesTheUserPrototype) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
+                                  DataModel::Llp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr);
+    ASSERT_TRUE(sup->signature.valid())
+        << "without the declared signature there is no oracle to judge a "
+           "re-declaration against, and the shim would be handed out blind";
+    auto const* user = findSymbolNamed(model, "printf");
+    ASSERT_NE(user, nullptr);
+    ASSERT_TRUE(user->type.valid());
+    EXPECT_EQ(user->type.v, sup->signature.v)
+        << "`int printf(const char*, ...)` IS stdio.json's `fn(ptr<char>, ...) "
+           "-> i32` — interner TypeId equality is structural FnSig equality, and "
+           "`const` is not interned. If this ever diverges the lowerer starts "
+           "REFUSING the commonest legal declaration in C, so it is pinned here "
+           "rather than left to the refusal path to discover.";
+    // Exactly ONE printf symbol exists: goal-2 deleted the descriptor's own
+    // injection, so the user's prototype is the sole declaration and the only
+    // thing that can carry the call.
+    EXPECT_EQ(countSymbolsNamed(model, "printf"), 1u);
+}
+
+// ELF: the SAME source, and the row that wins there carries NO recipe — glibc
+// exports a real `printf`, so it stays an ordinary FFI import. This is the
+// agnosticism pin: the recipe comes from per-format DESCRIPTOR DATA selected by
+// the availability gate, never from a format test in the compiler.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Elf,
+                                  DataModel::Lp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr);
+    EXPECT_TRUE(sup->recipeId.empty())
+        << "the elf printf row is a plain libc.so.6 import — tagging it would "
+           "drop a working import in favour of a shim nothing asked for";
+    ASSERT_TRUE(sup->library.contains("elf"));
+    EXPECT_EQ(sup->library.at("elf"), "libc.so.6");
+}

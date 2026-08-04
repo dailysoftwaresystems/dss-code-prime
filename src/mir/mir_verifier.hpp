@@ -117,6 +117,48 @@ private:
     // I_ExtensionTypeInMir.
     void checkTypeInvariants(DiagnosticReporter& reporter) const;
 
+    // TF-C112 (D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK): the CALL-SITE
+    // signature belt. `checkTypeInvariants` checks an `Arg` against the
+    // ENCLOSING function's FnSig; nothing checked a `Call`'s operands against
+    // its CALLEE's FnSig, so every hand-built call in every MIR-tier synthesis
+    // pass (synth_stdio_shim / synth_threads_shim / synth_pe_startup / anything
+    // added later) could pass the wrong number of arguments, or the wrong type
+    // at a position, with no tier objecting. The frontend path was already
+    // covered — `HirVerifier::checkCallArguments` runs the same arity +
+    // per-position rule on every cst_to_hir-produced call — but a pass that
+    // emits MIR DIRECTLY bypasses HIR entirely, which is precisely the closure
+    // that rule's own comment defers ("when the first non-cst_to_hir producer
+    // arrives"). Emits I_CallSignatureMismatch. Interner-gated.
+    //
+    // ⚠ THE RULE'S OWN LIMITS — it covers strictly less than "the call is
+    // wired correctly", and must not be read as covering more:
+    //   * TYPE-BLIND TRANSPOSITION. Two operands whose declared parameter
+    //     types are the SAME TypeId are interchangeable to this rule BY
+    //     CONSTRUCTION. The bug that motivated it — swapping `buf` and `fmt`
+    //     in synthesizeStdioShim's `sprintf` arm, both `char*` at parameters
+    //     1 and 3 of one signature — is INVISIBLE here and stays invisible:
+    //     only POSITION distinguishes them, and no type check at any tier can
+    //     read position. Only a per-body test pin catches that shape.
+    //   * SHARED-SIGNATURE CALLEES. `__stdio_common_vsprintf` and
+    //     `__stdio_common_vsscanf` deliberately share ONE FnSig TypeId
+    //     (synth_stdio_shim.cpp) because their parameter lists are identical,
+    //     so mis-wiring a recipe to the wrong one of that pair is a SYMBOL-
+    //     level error this rule cannot see — again, only a test can.
+    //   * `void*` POINTEE SLACK. A `ptr<void>` on EITHER side matches any
+    //     pointer. MEASURED, not assumed: `Mem2Reg` promoting a `va_list ap`
+    //     local forwards the `VaHomeArgAreaAddr` leaf (typed `ptr<void>`)
+    //     straight into a parameter declared `ptr<i8>`, erasing the pointee
+    //     with no retagging Cast — so pointee identity is NOT a MIR invariant
+    //     after optimization. Every other pointee mismatch is still rejected.
+    //   * ABI-LOWERED OPERAND LISTS. A MIR Call's operand list is PHYSICAL,
+    //     not semantic: a by-value aggregate parameter expands to a variable
+    //     number of register pieces / carriers, and a by-value-class return
+    //     may PREPEND an sret pointer with no marker on the SysV/Win64 hidden-
+    //     arg path. Where the 1:1 operand↔parameter correspondence therefore
+    //     cannot be established, the call is SKIPPED WHOLE rather than
+    //     guessed at (see the gate in the .cpp). Those calls get no coverage.
+    void checkCallSignatures(DiagnosticReporter& reporter) const;
+
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt. A plain
     // `Load` (accessed type = its result type) or `Store` (accessed type = the
     // pointee of its address operand) whose accessed type `isAtomicQualified` is a

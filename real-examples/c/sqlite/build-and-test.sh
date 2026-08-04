@@ -14,8 +14,12 @@
 #
 #   1. verify the host is Linux / WSL / macOS and online
 #   2. use the dss-code-prime checkout at ~/src AS-IS on its CURRENT branch —
-#      NEVER switched or pulled (a probe tests the working tree exactly as it is);
-#      an ABSENT dir is freshly cloned (default branch)
+#      NEVER switched or pulled (a probe tests the working tree exactly as it is).
+#      An ABSENT (or non-checkout) dir is a REFUSAL, never a silent clone of the
+#      default branch: DSS_ALLOW_FRESH_CLONE=1 opts in and DSS_BRANCH says which
+#      branch. DSS_BRANCH/DSS_COMMIT, when set, are VERIFIED against the checkout,
+#      and every provenance line carries how far the working tree diverges from the
+#      HEAD it names (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE)
 #   3. clone-or-update  sqlite/sqlite    into  ~/src
 #   4. configure SQLite + derive the FULL-SOURCE `testfixture` recipe from the
 #      canonical `make -n testfixture USE_AMALGAMATION=0` — the exact TU list
@@ -66,6 +70,7 @@
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
 #                      ARM64_LIBDIR  DSS_TCL_VERSION
+#                      DSS_BRANCH  DSS_COMMIT  DSS_ALLOW_FRESH_CLONE
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -91,6 +96,40 @@ OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 LANGUAGE="c-subset"
 MIN_CMAKE_MAJOR=4
+# ── WHICH dss-code-prime IS UNDER TEST — declared, not inferred ───────────────
+# D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE. Step 2 used to decide this from
+# ONE filesystem fact — "does $SRC_DIR/.git exist?" — and a corpus run is hours
+# long, so an answer that is merely PLAUSIBLE is worse here than almost anywhere
+# else in the project: the result gets quoted later as evidence about a commit.
+#
+# DSS_BRANCH  — the branch you INTEND to test. Unset (default) = whatever the
+#               checkout is on, exactly as before. Set, it is ASSERTED against the
+#               checkout (die on mismatch) and is also the branch a fresh clone
+#               checks out — clone_or_update has always taken a wanted-branch third
+#               argument; Step 2 simply never passed one.
+# DSS_COMMIT  — the commit you INTEND to test (full or abbreviated). Unset = no
+#               assertion. Set, it must RESOLVE in $SRC_DIR *and* equal HEAD.
+#               ⚠ It pins HEAD, not the working tree — an uncommitted edit still
+#               satisfies it, which is why the divergence count below is reported
+#               alongside rather than folded into this check.
+# DSS_ALLOW_FRESH_CLONE — 1 permits Step 2 to CLONE when $SRC_DIR is absent.
+#               Default 0 = refuse. A silent clone lands on the repo's DEFAULT
+#               branch (main), so on a clean machine the harness would spend hours
+#               validating a compiler nobody asked for and then print that commit
+#               as the verdict's provenance.
+DSS_BRANCH="${DSS_BRANCH:-}"
+DSS_COMMIT="${DSS_COMMIT:-}"
+DSS_ALLOW_FRESH_CLONE="${DSS_ALLOW_FRESH_CLONE:-0}"
+# The checkout THIS SCRIPT lives in, offered as the suggestion when SRC_DIR points
+# nowhere — the newcomer who clones the repo and runs the script is shape (a)'s
+# most likely victim, and "$SRC_DIR does not exist" is only half an answer.
+# ⚠ Deliberately NOT the default for SRC_DIR: that has always been
+# $HOME/src/dss-code-prime, and silently changing WHICH TREE gets built (on this
+# workstation, the WSL gate tree vs a /mnt/c one) would be the same class of
+# surprise this gate exists to remove. Empty unless it really is a checkout, so a
+# script copied out of the repo suggests nothing rather than something wrong.
+SELF_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || SELF_REPO=""
+[[ -n "$SELF_REPO" && -e "$SELF_REPO/.git" ]] || SELF_REPO=""
 # DSS_TCL_VERSION: OPTIONAL pin for the Tcl the fixture is staged against (e.g.
 # "8.6", "9.0"). UNSET — the default — means VERSION-AGNOSTIC: Step 6 discovers
 # whatever Tcl the host actually has, from that installation's OWN tclConfig.sh.
@@ -470,6 +509,100 @@ ensure_cmd() {                  # ensure_cmd <command> <apt-pkg> [<brew-pkg>]
   command -v "$1" >/dev/null 2>&1 || pkg_install "$2" "${3:-$2}"
 }
 
+# ── checkout provenance — REPORTED, never inferred ───────────────────────────
+# >>> dss:src-provenance >>>
+# WHY THIS EXISTS — D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE (and its
+# measured sibling D-HARNESS-WSL-TREE-PROVENANCE-UNVERIFIABLE).
+# A verdict line that names a commit is a CITATION: later cycles quote it as "the
+# compiler that ran the corpus". This driver emitted two kinds of false citation.
+#   · It printed `git rev-parse HEAD` for $SRC_DIR unconditionally. The WSL ctest
+#     gate rsyncs the working tree with `--exclude=/.git` (deliberately — the rsync
+#     exists to gate UNCOMMITTED work that no commit can represent), so a STALE
+#     .git survives beside CURRENT sources and HEAD names a commit that was never
+#     built. MEASURED: a run reported 5093341d while the tree was fb555bc0 + two
+#     days of newer work. The RESULT was valid; only the LABEL lied.
+#   · Those rev-parses sat inside `printf`/`info` ARGUMENTS, where a failing
+#     command substitution does NOT trip `set -e`. The field simply came out EMPTY,
+#     which a human skims straight past as "fine".
+# ★ A stale-.git tree and a legitimate uncommitted-work probe are INDISTINGUISHABLE
+# from inside the tree — both are "sources that differ from HEAD". So the honest fix
+# is to REPORT the divergence and let the reader judge. Guessing which one it is
+# would only trade a confident wrong label for a confident wrong story, and hard-
+# failing on a dirty tree would break the pre-commit probe this harness exists for.
+#
+# Every function here returns a NON-EMPTY, self-describing string on every path,
+# so it is safe to call from inside `printf` arguments.
+git_head_short() {              # git_head_short <dir> -> short sha | UNKNOWN(<why>)
+  local d="$1" sha=""
+  # `-e`: a worktree/submodule checkout has .git as a FILE (see clone_or_update).
+  [[ -e "$d/.git" ]] || { printf 'UNKNOWN(no .git under %s)' "$d"; return 0; }
+  sha="$(git -C "$d" rev-parse --short HEAD 2>/dev/null)" || sha=""
+  [[ -n "$sha" ]] || { printf 'UNKNOWN(rev-parse HEAD failed in %s)' "$d"; return 0; }
+  printf '%s' "$sha"
+}
+git_head_branch() {             # git_head_branch <dir> -> branch | DETACHED-HEAD | UNKNOWN
+  local b=""
+  b="$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null)" || b=""
+  [[ -n "$b" ]] || { printf 'UNKNOWN'; return 0; }
+  # A detached HEAD prints the literal string "HEAD" here, which reads like a branch
+  # named HEAD and would make a DSS_BRANCH mismatch message nonsense.
+  [[ "$b" != "HEAD" ]] || { printf 'DETACHED-HEAD'; return 0; }
+  printf '%s' "$b"
+}
+git_tree_divergence() {         # git_tree_divergence <dir> -> N | "" when uncomputable
+  local out=""
+  # `--no-optional-locks` because this is a READ of a checkout the harness promises
+  # not to touch ("current checkout, untouched") and a plain `status` refreshes and
+  # REWRITES .git/index. Git < 2.14 rejects the flag, so fall back rather than lose
+  # the count on an old host. ★ rc is captured DIRECTLY off git, never through a
+  # pipe — a `| wc -l` would report wc's success as git's.
+  out="$(git -C "$1" --no-optional-locks status --porcelain 2>/dev/null)" \
+    || out="$(git -C "$1" status --porcelain 2>/dev/null)" \
+    || { printf ''; return 0; }
+  # `status --porcelain` honours .gitignore, so this harness's own output tree
+  # ($SRC_DIR/build/…, and the repo ignores build/ + build-*/) cannot inflate the
+  # count. It DOES list untracked files, which is exactly right: a source file a
+  # stale HEAD never knew about is divergence, and it is precisely what the rsync
+  # gate leaves behind. "" (uncomputable) is kept DISTINCT from "0" (clean) —
+  # collapsing them would report an unmeasurable tree as pristine.
+  [[ -n "$out" ]] || { printf '0'; return 0; }
+  local -a lines=(); mapfile -t lines <<< "$out"
+  printf '%d' "${#lines[@]}"
+}
+dir_has_entries() {             # dir_has_entries <dir> -> true if it holds ANY entry
+  # Shape (c) of the anchor: a populated directory that is NOT a checkout — exactly
+  # what `rsync --exclude=/.git` produces. `git clone` refuses such a target, so
+  # without this the situation surfaced as a git error from inside a helper.
+  # Dotfiles count: an rsync'd tree can plausibly hold only hidden entries, and
+  # "empty except for .github" is still not clonable-into.
+  local e
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [[ -e "$e" || -L "$e" ]]; then return 0; fi
+  done
+  return 1
+}
+# The provenance of $SRC_DIR, read ONCE (Step 2) and reused verbatim by the Step-9
+# summary — so the opening banner and the closing verdict cannot drift apart, and
+# the `status` walk (which re-hashes every file whose mtime the rsync changed) is
+# paid once, up front, instead of at the end of a multi-hour run.
+SRC_HEAD=""; SRC_HEAD_LONG=""; SRC_BRANCH=""; SRC_DIVERGE=""; SRC_DIVERGE_NOTE=""
+read_src_provenance() {         # read_src_provenance <dir>
+  SRC_HEAD="$(git_head_short "$1")"
+  SRC_HEAD_LONG="$(git -C "$1" rev-parse HEAD 2>/dev/null)" || SRC_HEAD_LONG=""
+  SRC_BRANCH="$(git_head_branch "$1")"
+  SRC_DIVERGE="$(git_tree_divergence "$1")"
+  if [[ -z "$SRC_DIVERGE" ]]; then
+    SRC_DIVERGE_NOTE=" (divergence from HEAD UNVERIFIED — git status failed in $1)"
+  elif [[ "$SRC_DIVERGE" != "0" ]]; then
+    SRC_DIVERGE_NOTE=" (+$SRC_DIVERGE file(s) differ from HEAD — the sources built are NOT exactly this commit)"
+  else
+    SRC_DIVERGE_NOTE=""
+  fi
+}
+# <<< dss:src-provenance <<<
+
+# >>> dss:src-clone >>>  (extracted by test-confound-scope.sh together with the
+# provenance block above and the Step-2 gate below — the three are one decision)
 default_branch() {              # origin/HEAD (sqlite's may be master/trunk, not main)
   local r=""
   r="$(git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" || true
@@ -477,7 +610,12 @@ default_branch() {              # origin/HEAD (sqlite's may be master/trunk, not
 }
 clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-empty>
   local url="$1" dir="$2" want="${3:-}"
-  if [[ -d "$dir/.git" ]]; then
+  # `-e`, not `-d`: in a `git worktree` (and in a submodule) `.git` is a FILE that
+  # points at the real gitdir. Under `-d` such a checkout looked like "not a repo",
+  # so this helper tried to CLONE over a populated directory — git refuses, and the
+  # ERR trap then reported a git error instead of the situation. `-d` implies `-e`,
+  # so the only behaviour that changes is the one that used to fail.
+  if [[ -e "$dir/.git" ]]; then
     info "updating $(basename "$dir") in $dir"
     git -C "$dir" fetch --all --prune --quiet
     local branch="${want:-$(default_branch "$dir")}"
@@ -490,8 +628,11 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
     git clone --quiet "$url" "$dir"
     [[ -z "$want" ]] || git -C "$dir" checkout --quiet "$want"
   fi
-  info "  at $(git -C "$dir" rev-parse --short HEAD) on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+  # Through the guarded helpers: a bare `$(git rev-parse …)` inside an argument list
+  # prints an EMPTY field when it fails, and `set -e` never sees it.
+  info "  at $(git_head_short "$dir") on $(git_head_branch "$dir")"
 }
+# <<< dss:src-clone <<<
 
 # ── Step 0 — SELF-TEST the driver's own late-stage logic ─────────────────────
 # >>> dss:selftest >>>
@@ -506,7 +647,11 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 # So the driver now REFUSES TO START if its own end-of-run logic is broken. The
 # check reuses test-confound-scope.sh, which EXTRACTS the shipped classifier and
 # executes it at top level under these same shell options — no duplicated logic to
-# drift, and it is already demonstrated red-on-disable. Cost: well under a second.
+# drift, and it is already demonstrated red-on-disable. It also covers the Step-2
+# source gate + provenance helpers, which it exercises against throwaway git repos
+# (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE). Cost: MEASURED 0.20 s for 46
+# assertions on Linux (WSL, bash 5.2.21, git 2.43) — up from 22 ms / 20 assertions
+# before the gate was covered, and still nothing against a run measured in hours.
 #
 # This matters most on a NEW HOST (macOS, a fresh Linux box), where the first run
 # is the one you least want to lose. A portability defect in the late-stage code
@@ -531,7 +676,33 @@ else
   # running, so the self-test always gets the same validated shell. Correct on
   # Linux too, where it simply resolves to the same bash that is already running.
   if _st_out="$("$BASH" "$_selftest" 2>&1)"; then
-    info "driver self-test: OK ($(printf '%s\n' "$_st_out" | sed -n 's/^passed=\([0-9]*\).*/\1/p') assertions)"
+    # ★ The SKIP COUNT is part of the result, not a footnote. The self-test runs at
+    # Step 0 and `ensure_cmd git` is Step 1, so on a git-less host its two git-gated
+    # blocks (26 of 46 assertions — the provenance helpers and the whole Step-2
+    # source gate) SKIP. The old form printed only `passed=`, so that host read
+    # "driver self-test: OK (20 assertions)" — the exact number that at HEAD meant
+    # the ENTIRE battery — over 43% of it. A partial run must never READ as a full
+    # one, so a nonzero skip count is a WARN naming what went unproven.
+    # BSD-portable sed: one `-e` per expression, no `;`-chained scripts.
+    _st_pass="$(printf '%s\n' "$_st_out" | sed -n -e 's/^passed=\([0-9][0-9]*\) .*/\1/p')"
+    _st_skip="$(printf '%s\n' "$_st_out" | sed -n -e 's/^passed=[0-9][0-9]* failed=[0-9][0-9]* skipped=\([0-9][0-9]*\)$/\1/p')"
+    if [[ -z "$_st_pass" || -z "$_st_skip" ]]; then
+      printf '%s\n' "$_st_out" | sed 's/^/      /' >&2
+      die "driver self-test exited 0 but printed no readable summary line.
+      Expected a final 'passed=N failed=N skipped=N'; parsed passed=[${_st_pass:-<none>}] skipped=[${_st_skip:-<none>}].
+      Its assertions may well have passed — but a self-test whose RESULT cannot be read
+      proves nothing, and this guard will not report OK over an unparseable one. Either
+      test-confound-scope.sh's summary format changed (update this parse with it) or it
+      died before printing it."
+    fi
+    if [[ "$_st_skip" == "0" ]]; then
+      info "driver self-test: OK ($_st_pass assertions, 0 skipped)"
+    else
+      warn "driver self-test: OK ($_st_pass assertions) — but $_st_skip assertion(s) SKIPPED on this host
+      (an unmet prerequisite, normally 'no git on PATH' at Step 0, before Step 1 installs it).
+      That part of the late-stage logic is UNPROVEN for this run — re-run the self-test by hand
+      once git is present if you want the full battery: $_selftest"
+    fi
   else
     printf '%s\n' "$_st_out" | sed 's/^/      /' >&2
     die "DRIVER SELF-TEST FAILED — refusing to start.
@@ -568,15 +739,103 @@ else
   ensure_cmd ar binutils
 fi
 
-# ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
-if [[ -d "$SRC_DIR/.git" ]]; then
+# ── Step 2 — dss-code-prime (current checkout, VERIFIED, untouched) ──────────
+# WHAT THIS GATE REPLACED, AND WHY IT IS WORTH THE LINES
+# (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE). The old form decided the whole
+# question — WHICH COMPILER a multi-hour corpus run is about to validate — from one
+# filesystem fact, `[[ -d $SRC_DIR/.git ]]`, and had exactly two outcomes: use it, or
+# clone with an EMPTY wanted-branch. Three shapes came out of that:
+#   (a) $SRC_DIR ABSENT (any clean machine) -> silent clone, and because the third
+#       argument was "" the clone landed on the repo's DEFAULT branch, main. Hours
+#       spent on a compiler nobody asked for, Step 9 printing that commit as the
+#       provenance of the verdict, and one easily-missed banner as the only signal.
+#   (b) a STALE .git beside CURRENT sources — precisely what the WSL ctest gate's
+#       `rsync --exclude=/.git` leaves behind. The run is VALID and its LABEL lies.
+#   (c) $SRC_DIR populated but NOT a checkout — the same rsync, onto a machine that
+#       never had the .git. `git clone` refuses a non-empty target, so the harness
+#       died inside a helper with a git error that names none of this.
+# Now: (a) is a refusal that says what to type, (b) is self-labelling, (c) names the
+# scenario. ⚠ NONE of this rsyncs .git — it is 959 MB, and the rsync exists to gate
+# UNCOMMITTED work that no commit can represent.
+#
+# ★ This region is EXTRACTED and executed by test-confound-scope.sh (the Step-0
+# self-test) against real throwaway repos, at top level under these same shell
+# options — so all four shapes are exercised in under a second before any run
+# starts, rather than discovered on the one machine that hits them.
+# >>> dss:src-gate >>>
+if [[ -e "$SRC_DIR/.git" ]]; then
+  # `-e`, not `-d` — a `git worktree` checkout keeps .git as a FILE, and under `-d`
+  # such a tree fell through to shape (c) and was refused for no reason.
   step "2/9  Use dss-code-prime at $SRC_DIR (current checkout, untouched)"
-  info "  at $(git -C "$SRC_DIR" rev-parse --short HEAD) on $(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD)"
+elif dir_has_entries "$SRC_DIR"; then
+  die "$SRC_DIR exists and is NOT a git checkout (no .git entry).
+      That is the tree the WSL ctest gate produces: it rsyncs the working tree with
+      --exclude=/.git, so you get real sources and no repository. The harness will
+      NOT clone over it — git clone refuses a non-empty directory anyway, which is
+      how this used to surface (an opaque git error from inside a helper).
+      Point SRC_DIR at a real checkout:
+        SRC_DIR=${SELF_REPO:-/path/to/dss-code-prime} $0
+      or, if this tree is disposable, remove it and opt in to a clone:
+        DSS_ALLOW_FRESH_CLONE=1 DSS_BRANCH=<branch> $0"
+elif [[ "$DSS_ALLOW_FRESH_CLONE" == "1" ]]; then
+  step "2/9  Clone dss-code-prime -> $SRC_DIR (DSS_ALLOW_FRESH_CLONE=1, branch: ${DSS_BRANCH:-<repo default>})"
+  # ★ The third argument is the entire fix for shape (a): clone_or_update has always
+  # accepted a wanted branch and honoured it (see its `else` arm) — this call site
+  # passed "" and let default_branch() resolve origin/HEAD to main.
+  clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
 else
-  step "2/9  Clone dss-code-prime -> $SRC_DIR (absent — fresh clone, default branch)"
-  clone_or_update "$DSS_REPO_URL" "$SRC_DIR" ""
+  die "no dss-code-prime checkout at $SRC_DIR, and this harness will NOT clone one silently.
+      A fresh clone takes $DSS_REPO_URL at its DEFAULT branch (main) unless told
+      otherwise — so an unattended multi-hour corpus run would validate a compiler
+      that is not the branch you are working on, and Step 9 would print that commit
+      as if it were the one under test. Say which you want:
+        SRC_DIR=${SELF_REPO:-/path/to/your/checkout} $0   # use a checkout you have
+        DSS_ALLOW_FRESH_CLONE=1 DSS_BRANCH=<branch> $0    # clone, and NAME the branch
+      ⚠ SRC_DIR defaults to \$HOME/src/dss-code-prime, which is NOT necessarily the
+      tree this script was run from — that mismatch is the usual way a run lands here.
+      (DSS_ALLOW_FRESH_CLONE=1 without DSS_BRANCH does clone the default branch —
+      the point is that you asked for it, not that it is forbidden.)"
+fi
+# One read, one banner, on every path — including the fresh clone, whose DSS_COMMIT
+# must be checked too. $SRC_HEAD / $SRC_DIVERGE_NOTE are what Step 9 reprints.
+read_src_provenance "$SRC_DIR"
+info "  at $SRC_HEAD on $SRC_BRANCH$SRC_DIVERGE_NOTE"
+# ── the DECLARED ref, ASSERTED against the checkout ──────────────────────────
+# Intent the operator states beats intent inferred from the filesystem. Both unset
+# (the default) leaves behaviour exactly as it was: use the checkout as it is.
+if [[ -n "$DSS_BRANCH" && "$SRC_BRANCH" != "$DSS_BRANCH" ]]; then
+  die "DSS_BRANCH='$DSS_BRANCH' but $SRC_DIR is on '$SRC_BRANCH'.
+      Refusing to spend a multi-hour corpus run on a branch you did not ask for.
+      Check the branch out yourself — this harness NEVER switches our own repo, so
+      that a probe tests the working tree exactly as it is — or drop DSS_BRANCH."
+fi
+if [[ -n "$DSS_COMMIT" ]]; then
+  # `--verify … ^{commit}` both resolves an abbreviation and proves the object is a
+  # commit that EXISTS here; a typo or an unfetched sha fails loud instead of
+  # silently comparing two strings that were never going to match.
+  DSS_COMMIT_FULL="$(git -C "$SRC_DIR" rev-parse --verify --quiet "${DSS_COMMIT}^{commit}" 2>/dev/null)" || DSS_COMMIT_FULL=""
+  [[ -n "$DSS_COMMIT_FULL" ]] || \
+    die "DSS_COMMIT='$DSS_COMMIT' does not resolve to a commit in $SRC_DIR — fetch it, or fix the value."
+  [[ -n "$SRC_HEAD_LONG" ]] || \
+    die "DSS_COMMIT='$DSS_COMMIT' cannot be verified: rev-parse HEAD failed in $SRC_DIR."
+  [[ "$DSS_COMMIT_FULL" == "$SRC_HEAD_LONG" ]] || \
+    die "DSS_COMMIT='$DSS_COMMIT' ($DSS_COMMIT_FULL) but $SRC_DIR is at $SRC_HEAD_LONG.
+      The run would have validated the checkout, not the commit you named."
+  info "  DSS_COMMIT verified: HEAD is $DSS_COMMIT_FULL"
+fi
+# The divergence is REPORTED, never fatal — a dirty tree is the NORMAL shape of a
+# pre-commit probe, and refusing it would delete the harness's main use.
+if [[ -z "$SRC_DIVERGE" ]]; then
+  warn "could not measure how far $SRC_DIR diverges from HEAD (git status failed) — the commit in the Step-9 verdict is UNVERIFIED."
+elif [[ "$SRC_DIVERGE" != "0" ]]; then
+  warn "$SRC_DIVERGE file(s) in $SRC_DIR differ from HEAD ($SRC_HEAD) — the compiler this run builds is NOT that commit.
+      Not an error, and never a blocker. Two situations produce it: uncommitted work
+      you are deliberately gating, and a STALE .git left beside fresh sources by the
+      ctest gate's rsync. They are INDISTINGUISHABLE from inside the tree, so the
+      count rides along on the Step-9 verdict rather than the harness guessing."
 fi
 pass "dss-code-prime ready"
+# <<< dss:src-gate <<<
 
 # ── Step 2b — take the RUN LOCK on the output tree ───────────────────────────
 # MEASURED FAILURE (2026-07-26, on the pe64 twin of this harness) this exists to
@@ -2415,8 +2674,21 @@ done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
 step "9/9  Results"
-printf '   compiler : %s @ %s\n' "$DSS_BIN" "$(git -C "$SRC_DIR" rev-parse --short HEAD)"
-printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git -C "$SQLITE_DIR" rev-parse --short HEAD)"
+# PROVENANCE — the one line later cycles quote as "the compiler that ran this".
+# D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE, items (3) and (5):
+#   · the sha is the string Step 2 already read and VERIFIED, not a fresh rev-parse.
+#     A command substitution that fails inside printf's ARGUMENTS does not trip
+#     `set -e`; the old form printed an EMPTY field, which reads as "clean". Reusing
+#     Step 2's value also makes it impossible for the banner and the verdict to
+#     disagree about the same run.
+#   · $SRC_DIVERGE_NOTE states how far the sources that were BUILT sit from that
+#     commit, so a stale-.git run (or an uncommitted-work probe) labels itself
+#     instead of quietly asserting a hash it cannot stand behind.
+# sqlite gets no divergence count on purpose: Steps 3-6 run configure/make INSIDE
+# that clone and generate sources there, so its working tree always differs from
+# HEAD by construction and a number would carry no information.
+printf '   compiler : %s @ %s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE"
+printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git_head_short "$SQLITE_DIR")"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 # The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will see it.
 # Its ABSENCE is printed too, and loudly: a missing oracle is the difference

@@ -13337,12 +13337,25 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // versioned symbol (realpath over `#include <stdlib.h>`)
                     // whose user prototype loses the version would silently
                     // misbind the oldest compat instance.
+                    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): and so does the
+                    // row's REALIZATION — `sym.synthesize` (the shim recipe id)
+                    // plus `sym.signature` (what that recipe's fixed body
+                    // answers to). A LIBRARY alone describes where an ordinary
+                    // import resolves; it says nothing about whether the row is
+                    // an import AT ALL. Post-UCRT-flip five stdio rows are
+                    // compiler-SYNTHESIZED (ucrtbase exports no bare printf),
+                    // and a suppressed row that forwarded only the library made
+                    // the user's prototype re-export the name as a raw import —
+                    // a binary that fails to LOAD (0xC0000139) with no
+                    // diagnostic. Both properties travel or neither is honest.
                     if (!s.activeFormat.has_value()
                         || ffi::objectFormatInAvailabilitySet(
                                sym.availableObjectFormats, *s.activeFormat)) {
                         suppressedShippedLibraries.emplace(sym.name,
                             SuppressedShippedSymbol{std::move(effectiveLibrary),
-                                                    sym.version});
+                                                    sym.version,
+                                                    sym.synthesize,
+                                                    sym.signature});
                     }
                     continue;
                 }

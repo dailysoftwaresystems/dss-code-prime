@@ -598,6 +598,13 @@ struct DSS_EXPORT ShippedExternSymbol {
 // unversioned reference to the library's OLDEST compat instance (the exact
 // D-LK-ELF-SYMBOL-VERSIONING realpath@GLIBC_2.2.5 bug the descriptor path
 // fixes). Availability-gated + first-wins at record time (mirroring injection).
+//
+// TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): and so must the row's REALIZATION —
+// its `synthesize` recipe id plus the declared signature that recipe answers
+// to. A suppressed row is the ONLY channel by which a descriptor symbol reaches
+// the link WITHOUT passing through `SemanticModel::shippedExterns()`, so every
+// property the injected path reads off a row has to ride here too or that
+// property is silently dropped for exactly the declarations users write most.
 struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor's per-object-format `library` map ("pe"/"elf"/"macho" →
     // runtime image), carried verbatim; folded to one string per target
@@ -606,6 +613,34 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // The required ELF symbol version, already resolved for the active target
     // (e.g. "GLIBC_2.3"); EMPTY ⇒ unversioned (D-LK-ELF-SYMBOL-VERSIONING).
     std::string version;
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the suppressed row's `synthesize`
+    // RECIPE id (`ShippedExternSymbol::recipeId`'s sibling), or EMPTY for an
+    // ordinary FFI-import row. ★ THIS FIELD IS THE FIX FOR A HARD LOAD FAILURE,
+    // not a convenience: the LIBRARY and the REALIZATION are two independent
+    // properties of a descriptor row, and carrying only the first is what made
+    // the pe UCRT flip lethal on the redeclaration path. `ucrtbase.dll` exports
+    // NONE of printf/fprintf/sprintf/vfprintf/sscanf — only the
+    // `__stdio_common_v*` cores — so those five rows are COMPILER-SYNTHESIZED
+    // shims, not imports. Pre-flip the same rows bound `msvcrt.dll`, which does
+    // export all five, so a suppressed row re-exported as a plain import was
+    // inert; post-flip it plants an `ExternImport{printf, ucrtbase.dll}` that
+    // the loader rejects with 0xC0000139 (D-FFI-DESCRIPTOR-EAGER-IMPORT) — at
+    // PROCESS START, with rc=0 and no diagnostic at any compile stage.
+    // MEASURED at TF-C112 HEAD on the three-line reproducer
+    // (`#include <stdio.h>` + `int printf(const char*, ...);` + one call).
+    std::string recipeId;
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the descriptor row's DECLARED
+    // signature, interned in THIS model's lattice (the `ShippedExternSymbol::
+    // signature` discipline — the same interner the CST→HIR lowerer lowers
+    // through, so a TypeId comparison against a user prototype's resolved type
+    // is meaningful). It is the SHIM-COMPATIBILITY ORACLE: the synth pass emits
+    // one FIXED body per recipe id, matching this row, so a user prototype that
+    // suppresses a recipe row may inherit the shim ONLY if it agrees with this
+    // signature — otherwise the call would be made under the user's ABI and
+    // answered under the descriptor's. Carried for EVERY suppressed row (a
+    // recipe-less row's copy is simply unread today) so the field's meaning is
+    // "what the descriptor declared", never "what one consumer needed".
+    TypeId signature;
 };
 
 class DSS_EXPORT SemanticModel {
@@ -753,6 +788,11 @@ public:
     // misbind) or as an undefined symbol. Availability-gated + first-wins at
     // record time (exactly mirroring injection). Returns nullptr when no
     // suppressed descriptor symbol carries this name.
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the same reader also asks whether
+    // the suppressed row carried a `synthesize` RECIPE — a row realized as a
+    // compiler-emitted shim must not be re-exported as a raw import merely
+    // because the user re-declared its name (`ucrtbase.dll` exports no bare
+    // `printf`, so that import fails the LOAD at 0xC0000139).
     [[nodiscard]] SuppressedShippedSymbol const*
     suppressedShippedSymbolFor(std::string const& name) const noexcept {
         auto const it = suppressedShippedLibraries_.find(name);

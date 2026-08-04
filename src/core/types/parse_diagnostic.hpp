@@ -1645,6 +1645,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   stack. Runs fine when no VLA scope is involved. Mirrors the SEH
     //   H_SehEarlyExit IndirectGotoStmt arm.
     H_VlaComputedGotoInScope      = 0xF019,
+    // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
+    //   user prototype re-declares — and therefore goal-2 SUPPRESSES — a shipped
+    //   descriptor row that is realized as a COMPILER-SYNTHESIZED shim rather than
+    //   an FFI import (a row carrying `synthesize`), but the prototype's resolved
+    //   FnSig is NOT the row's declared signature.
+    //   The user's declaration legitimately wins on the SIGNATURE (goal 2) and the
+    //   platform legitimately owns the REALIZATION — orthogonal properties, and
+    //   normally both are honoured at once by synthesizing the shim for the user's
+    //   own prototype. They become irreconcilable exactly here: the synth pass emits
+    //   ONE FIXED body per recipe id, built against the DESCRIPTOR's signature, so
+    //   binding a divergent prototype to it would have the caller marshal arguments
+    //   under one ABI and the callee read them under another — a wrong-ABI call with
+    //   no diagnostic at any stage. Refusing is the only honest answer, and the
+    //   refused set is essentially clang's own "conflicting types for 'printf'": the
+    //   header this suppresses declares the standard signature.
+    //   NOT a substitute for the ordinary import path — an ordinary (recipe-less)
+    //   suppressed row is untouched by this check.
+    H_ShippedShimSignatureMismatch = 0xF01A,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -1784,6 +1802,29 @@ enum class DiagnosticCode : std::uint16_t {
     // are the ONE exemption and do not trip it. Interner-gated (needs
     // isAtomicQualified). Caught at every verify point (verify-after-every-pass).
     I_AtomicAccessNotLowered       = 0xA018,
+    // TF-C112 (D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK): a MIR `Call` whose
+    // operands do not match its STATICALLY-RESOLVED callee's FnSig — either the
+    // wrong number of argument operands (fewer than the fixed parameters for a
+    // variadic callee; not exactly equal for a non-variadic one) or an operand
+    // whose type is neither identical to, same-representation as, nor
+    // `void*`-slack-compatible with the parameter declared at that POSITION
+    // (a `ptr<void>` on either side matches any pointer — MEASURED: Mem2Reg
+    // erases a `va_list` operand's pointee to the frame leaf's `ptr<void>`).
+    // `HirVerifier::checkCallArguments`
+    // enforces this on every frontend-produced call; a MIR-tier synthesis pass
+    // (synth_stdio_shim / synth_threads_shim / synth_pe_startup / …) emits MIR
+    // DIRECTLY and so bypassed it entirely — a mis-wired shim would silently
+    // call the C runtime with arguments in the wrong slots, which is a wrong-
+    // BYTES miscompile with no build-time symptom at all. Only STATICALLY
+    // resolvable callees are checked (an indirect call through a register has
+    // no signature to check against and is skipped cleanly), and only where the
+    // Call's PHYSICAL operand list is provably 1:1 with the FnSig's parameters
+    // (a by-value aggregate parameter expands to a variable number of ABI
+    // pieces; a by-value-class return may prepend an unmarked sret pointer).
+    // ⚠ It cannot see a transposition of two operands whose parameter types are
+    // the same TypeId — that is a POSITION error no type check can read — so it
+    // supplements, never replaces, the per-body shim test pins.
+    I_CallSignatureMismatch        = 0xA019,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

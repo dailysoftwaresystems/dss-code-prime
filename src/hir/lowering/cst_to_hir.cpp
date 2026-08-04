@@ -306,6 +306,15 @@ struct Lowerer {
     // site when its `SymbolRecord.vlaTypedefOrigin` is set; moved onto the result's
     // `typedefVlaOriginBySymbol` AFTER finish(). Sparse: only VLA-typedef objects.
     std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOriginAcc;
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): shared accumulator of (shim SymbolId.v
+    // → `synthesize` recipe id) pairs — the SAME vector the shipped-descriptor
+    // injection loop in `lowerCstToHir` fills, moved onto
+    // `CstToHirResult::synthRecipeBySymbol` after finish(). The Lowerer contributes
+    // the SUPPRESSED half: a user prototype that re-declares (and so goal-2
+    // suppresses) a recipe-carrying descriptor row inherits the row's REALIZATION,
+    // so its symbol must reach the synth pass exactly as an injected one does.
+    // Sparse: only shim symbols.
+    std::vector<std::pair<std::uint32_t, std::string>>& synthRecipeAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -1088,7 +1097,8 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
             std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
-            std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin)
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin,
+            std::vector<std::pair<std::uint32_t, std::string>>& synthRecipe)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
@@ -1096,7 +1106,8 @@ struct Lowerer {
           noSanitizeThreadAcc(nosanthr),
           threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
-          sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
+          sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin),
+          synthRecipeAcc(synthRecipe) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -2148,6 +2159,127 @@ struct Lowerer {
     void unsupported(NodeId node, std::string detail) {
         emitH(DiagnosticCode::H_UnsupportedLoweringForKind,
               node, std::move(detail));
+    }
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): WHICH axis of a function signature
+    // diverges — for the shipped-shim compatibility refusal below, whose whole value
+    // is telling the author what to change. There is no shared type PRINTER in the
+    // tree (`S_IncompatibleRedeclaration` reports only the name), and adding a second
+    // type-spelling grammar here would be a surface that can drift from hir_text's;
+    // so this names the differing AXIS instead, which is what an author acts on.
+    // Checked in the order a reader would: arity, then variadic-ness, then the first
+    // differing parameter, then the return type. Reaching the last line means the two
+    // FnSigs agree on every axis this walks yet interned DIFFERENTLY — possible only
+    // via an axis the interner keys on that this does not enumerate (today: the
+    // FnSig's `cc` scalar), so it says exactly that rather than claiming they match.
+    // ── TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): THE SUPPRESSED-SHIM CLAIM ──────
+    //
+    // A shipped descriptor row carries TWO INDEPENDENT properties: WHERE the
+    // symbol resolves (`library`) and WHETHER it is an import at all
+    // (`synthesize`). Goal-2 hands a user declaration authority over the
+    // SIGNATURE — it never handed it authority over the platform's REALIZATION —
+    // but every extern-synthesis site that consulted `suppressedShippedSymbolFor`
+    // conflated the two: it forwarded the library and then emitted a plain
+    // `ExternImport` regardless. On a `synthesize` row that is a HARD LOAD
+    // FAILURE, not a degradation. `ucrtbase.dll` exports none of
+    // printf/fprintf/sprintf/vfprintf/sscanf (only the `__stdio_common_v*` cores
+    // those five are shimmed over) and DSS eager-imports every declared shipped
+    // extern (D-FFI-DESCRIPTOR-EAGER-IMPORT), so
+    //     #include <stdio.h>
+    //     int printf(const char *, ...);   /* legal C, and ubiquitous */
+    // compiled rc=0, emitted no diagnostic at any stage, and died at PROCESS
+    // START with 0xC0000139 (MEASURED at the TF-C111 HEAD; `objdump -p` showed
+    // `printf` in the ucrtbase import table beside its four correctly-shimmed
+    // siblings). Pre-flip the identical path bound `msvcrt.dll`, which DOES
+    // export all five — the channel was always open, the UCRT flip is what made
+    // it lethal, and the name it most exposes is the most-redeclared identifier
+    // in C.
+    //
+    // ★ ONE HELPER, TWO CALLERS, AND THAT IS THE POINT. There is more than one
+    // place a user declaration displaces a shipped row and then synthesizes an
+    // extern for it: the bare-prototype arm, and the C99 6.7.4p7 inline-definition
+    // arm (`lowerInlineDefinitionAsDeclaration`, which suppresses the body and
+    // leaves a declaration behind). BOTH were live instances of this defect —
+    // `inline int printf(const char *, ...) { … }` was MEASURED producing the same
+    // 0xC0000139 — and they were two instances precisely because the decision was
+    // written inline rather than shared. Any future site that consults
+    // `suppressedShippedSymbolFor` must route through here too.
+    //
+    // WHAT IT DOES. Returns TRUE when it CLAIMED the symbol, meaning the caller
+    // must emit NO extern node and NO import row:
+    //   * signature AGREES ⇒ the symbol is recorded into the SAME
+    //     `synthRecipeBySymbol` map the injected path fills. The call then lowers
+    //     to `GlobalAddr(sym)` against a not-yet-defined callee (HIR→MIR's shim
+    //     pre-pass seeds it) and the family's synth pass supplies the body. Both
+    //     downstream seams work unchanged: single-CU reads this map, and the
+    //     merged N>1 seam (program.cpp) reconstructs recipes from names that are
+    //     neither defined NOR imported — which such a symbol now correctly is not.
+    //   * signature DIVERGES ⇒ reported LOUD, nothing emitted.
+    // FALSE means "not a shim row" — the caller's ordinary import synthesis runs
+    // untouched, which covers every recipe-less suppressed row (`puts`, `realpath`)
+    // and every non-shipped bare prototype.
+    //
+    // ★ THE SIGNATURE GATE. Each recipe emits ONE FIXED body built against the
+    // DESCRIPTOR's declared signature, so inheriting the shim is sound only while
+    // the user's declaration AGREES with that signature. Interner TypeId identity
+    // IS structural FnSig equality (the interner dedups identical signatures) —
+    // the SAME oracle the analyzer's function-redeclaration compatibility sweep
+    // uses, deliberately not a bespoke comparison — and `const` is not interned,
+    // so the ordinary `int printf(const char *, ...)` matches the row's
+    // `fn(ptr<char>, ...) -> i32` exactly. A declaration that does NOT match
+    // cannot be reconciled: binding it to the shim would marshal the call under
+    // the user's ABI and answer it under the descriptor's, silently. Refusing is
+    // the only honest answer, and the refused set is essentially clang's own
+    // "conflicting types for 'printf'" — the header being suppressed here declares
+    // the standard signature.
+    //
+    // AGNOSTIC: the trigger is a non-empty descriptor-carried recipe tag plus a
+    // declared signature — both DATA on the row, already per-format-selected by
+    // the availability gate the analyzer applied. No format / arch / language
+    // identity test anywhere, and no symbol name is special-cased.
+    [[nodiscard]] bool
+    claimSuppressedShimSymbol(SuppressedShippedSymbol const* shipped, NodeId at,
+                              SymbolId sym, std::string const& name,
+                              TypeId declaredType) {
+        if (shipped == nullptr || shipped->recipeId.empty()) return false;
+        if (declaredType.v == shipped->signature.v) {
+            synthRecipeAcc.emplace_back(sym.v, shipped->recipeId);
+            return true;
+        }
+        // Phrased as a NOUN PHRASE: the reporter renders a bare `actual` as
+        // "got <actual>" (the house convention every H_* message writes to).
+        emitH(DiagnosticCode::H_ShippedShimSignatureMismatch, at,
+              std::format(
+                  "a declaration of '{}' that suppresses the platform's own — and "
+                  "the platform realizes that symbol as the compiler-synthesized "
+                  "'{}' shim, not as a library import, but {}; the shim therefore "
+                  "cannot answer calls made through this declaration, and the "
+                  "platform exports no such symbol to import instead "
+                  "(D-FFI-PE-CRT-UCRT-MIGRATION)",
+                  name, shipped->recipeId,
+                  fnSignatureDivergence(declaredType, shipped->signature)));
+        return true;
+    }
+    [[nodiscard]] std::string fnSignatureDivergence(TypeId user, TypeId declared) {
+        if (interner.kind(user) != TypeKind::FnSig
+            || interner.kind(declared) != TypeKind::FnSig)
+            return "one of the two declarations is not a function type";
+        auto const userParams = interner.fnParams(user);
+        auto const declParams = interner.fnParams(declared);
+        if (userParams.size() != declParams.size())
+            return std::format("it takes {} parameter(s) where the platform "
+                               "declaration takes {}",
+                               userParams.size(), declParams.size());
+        if (interner.fnIsVariadic(user) != interner.fnIsVariadic(declared))
+            return interner.fnIsVariadic(user)
+                       ? "it is variadic and the platform declaration is not"
+                       : "the platform declaration is variadic and it is not";
+        for (std::size_t i = 0; i < userParams.size(); ++i)
+            if (userParams[i].v != declParams[i].v)
+                return std::format("parameter {} has a different type", i + 1);
+        if (interner.fnResult(user).v != interner.fnResult(declared).v)
+            return "the return type differs";
+        return "the two signatures differ in an attribute the type interner keys "
+               "on but this report does not enumerate";
     }
     HirNodeId errorNode(NodeId cst, TypeId type = InvalidType) {
         return track(builder.addLeaf(HirKind::Error, type, 0, HirFlags::HasError), cst);
@@ -8522,6 +8654,11 @@ struct Lowerer {
             //   * the LK11 merge binds it to a sibling-TU definition (the
             //     sqlite3.c-defines-what-shell.c-declares case) — import
             //     stripped, calls rewired direct;
+            //   * TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): a re-declaration of a
+            //     shipped row the platform realizes as a compiler-synthesized
+            //     SHIM (a `synthesize` row — pe `printf` and friends) emits NO
+            //     extern at all; the prototype inherits the shim. See the arm
+            //     below, which runs FIRST for exactly that reason;
             //   * a bare re-declaration of a SHIPPED descriptor symbol carries
             //     the suppressed descriptor's library map instead (goal-2: the
             //     user decl claimed the name, so the descriptor injected
@@ -8591,10 +8728,18 @@ struct Lowerer {
                     && pr->kind == DeclarationKind::Function
                     && pr->type.valid()
                     && protoLinkage().binding != SymbolBinding::Local) {
-                    HirNodeId const ef = track(
-                        builder.makeExternFunction(pr->type, sym.v, {}), d);
                     auto const* shipped =
                         model.suppressedShippedSymbolFor(pr->name);
+                    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): THE SUPPRESSED SHIM
+                    // ARM, and it MUST precede the import synthesis below — see
+                    // `claimSuppressedShimSymbol` for the whole argument. On a
+                    // `synthesize` row an import is not a degradation, it is a
+                    // binary that will not LOAD.
+                    if (claimSuppressedShimSymbol(shipped, d, sym, pr->name,
+                                                  pr->type))
+                        continue;   // shim (or refusal) — never an import row.
+                    HirNodeId const ef = track(
+                        builder.makeExternFunction(pr->type, sym.v, {}), d);
                     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a bare-prototype
                     // cross-TU reference carries the
                     // prototype's own asm label (set below), so a labelled
@@ -9099,9 +9244,23 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec == nullptr || !rec->isInline || !rec->type.valid()) return false;
         if (!decl.prototypeSynthesizesExtern) return true;
+        auto const* shipped = model.suppressedShippedSymbolFor(rec->name);
+        // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): this arm is the SECOND site that
+        // displaces a shipped row and then synthesizes an extern for it, and it
+        // was a live instance of the same load failure the bare-prototype arm
+        // was — MEASURED, `inline int printf(const char *, ...) { … }` over
+        // `#include <stdio.h>` emitted `ExternImport{printf, ucrtbase.dll}` and
+        // the binary died at load with 0xC0000139, rc=0 and no diagnostic. The
+        // external definition 6.7.4p7 sends the call to IS the shim on such a
+        // target, so claiming it here is not a workaround for the suppression —
+        // it is the correct realization of it. Routed through the SHARED helper
+        // so the two sites cannot drift again (they already had).
+        // Claimed ⇒ no extern node, no import row; `outNode` stays invalid,
+        // which the caller already handles ("the language synthesizes nothing").
+        if (claimSuppressedShimSymbol(shipped, node, sym, rec->name, rec->type))
+            return true;
         HirNodeId const ef =
             track(builder.makeExternFunction(rec->type, sym.v, {}), node);
-        auto const* shipped = model.suppressedShippedSymbolFor(rec->name);
         externDecls.push_back(HirExternRecord{
             ef, rec->name,
             shipped != nullptr ? shipped->library
@@ -9990,6 +10149,17 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // SymbolId.v) accumulator, moved onto result->typedefVlaOriginBySymbol after
     // finish().
     std::vector<std::pair<std::uint32_t, std::uint32_t>> typedefOriginAcc;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + TF-C112
+    // (D-FFI-PE-CRT-UCRT-MIGRATION): shared (shim SymbolId.v → `synthesize` recipe
+    // id) accumulator, moved onto result->synthRecipeBySymbol after finish(). TWO
+    // producers, and they must write the SAME map or a shim symbol reaches only one
+    // of the two seams that need it: the descriptor-INJECTION loop below (the
+    // ordinary case — `#include <threads.h>` / `<stdio.h>` and call it), and the
+    // Lowerer's bare-prototype arm (the SUPPRESSED case — the user re-declares the
+    // name, so goal-2 deleted the injected row and the prototype is the only
+    // surviving declaration). Declared HERE, above the Lowerer construction, so the
+    // per-schema Lowerers can bind it.
+    std::vector<std::pair<std::uint32_t, std::string>> synthRecipeAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -10004,7 +10174,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
             noSanitizeThreadAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
-            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
+            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -10032,8 +10202,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // object symbol synthesizes ExternGlobal.
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> shim SymbolId.v →
     // recipe id, for the module maps below. A tagged symbol is NOT turned into an
-    // ExternFunction/HirExternRecord here (see the skip in the loop).
-    std::vector<std::pair<std::uint32_t, std::string>> synthRecipeAcc;
+    // ExternFunction/HirExternRecord here (see the skip in the loop). The
+    // accumulator itself is declared ABOVE the Lowerer construction (TF-C112) —
+    // this loop is only ONE of its two producers.
     for (ShippedExternSymbol const& ext : model.shippedExterns()) {
         // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): a `synthesize`-tagged symbol is a
         // pe64 shim (mtx_lock etc.). Do NOT synthesize an extern import — kernel32

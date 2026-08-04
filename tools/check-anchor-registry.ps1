@@ -71,15 +71,61 @@ function Get-Anchors([string]$Path, [string[]]$Filters) {
 # The drivers are SCRIPTS, so they need their own filter set — reusing
 # $AnchorFileFilters would have scanned real-examples/ for *.cpp and found
 # nothing, which is the silent no-op version of this fix.
-# ⚠ Dry-run before widening further: measured at 22 anchors cited across the
-# drivers, ALL 22 already resolving, so this landed green. A future root that
-# reds must be closed by REGISTERING the rows, never by narrowing the guard.
+# ⚠ Dry-run before widening further. A future root that reds must be closed by
+# REGISTERING the rows, never by narrowing the guard.
+# ★ CORRECTION 2026-08-03 (TF-C112): the TF-C111 note here (and its `.sh` twin) said
+# "measured at 22 anchors cited across the drivers". With the filter set that actually
+# SHIPPED the figure is **24** — `*.sh` + `*.ps1` alone is exactly 22, so the dry-run
+# that justified the change was run WITHOUT the `*.py` filter that landed with it. All
+# 24 resolve, so nothing was ever broken by it; the defect is that a MEASURED claim was
+# stated twice and was off by the one filter the same commit added. Recorded rather
+# than quietly corrected, because "I measured it" is exactly the kind of claim this
+# project requires to be true.
+#
+# ★★ FAIL-CLOSED, ADDED 2026-08-03 (TF-C112), D-GATE-ANCHOR-GUARD-FAILS-OPEN-ON-MISSING-ROOT.
+# Mirrors the `.sh` sibling: assert every root EXISTS, then apply a count FLOOR.
+# The `.sh` form could report `OK (1 src anchors all resolve to plans)` while scanning
+# NOTHING; this script's `Get-ChildItem -ErrorAction SilentlyContinue` has the same
+# shape — a renamed root yields an empty set and a silently smaller scan. A guard that
+# reports success while checking nothing is the worst defect a guard can have.
+foreach ($_root in @('src', 'examples', 'real-examples')) {
+    if (-not (Test-Path -LiteralPath $_root -PathType Container)) {
+        Write-Host "anchor-registry: FAIL - scan root '$_root' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass."
+        exit 2
+    }
+}
 $AnchorFileFilters     = @('*.cpp', '*.hpp', '*.json', '*.c')
 $HarnessFileFilters    = @('*.sh', '*.ps1', '*.py')
 $srcAnchors = (Get-Anchors 'src'           $AnchorFileFilters) +
               (Get-Anchors 'examples'      $AnchorFileFilters) +
               (Get-Anchors 'real-examples' $HarnessFileFilters)
 $srcAnchors = $srcAnchors | Sort-Object -Unique
+
+# The floor. Same reasoning as the `.sh`: "no match" is not distinguishable from "scan
+# collapsed" by status alone, so a COUNT is the only signal that separates them. Kept
+# far below the live count (800 at time of writing) so ordinary churn never trips it —
+# this catches collapse, not drift. Both scripts MUST use the same value or the pairing
+# is decorative.
+$AnchorFloor = 100
+if ($srcAnchors.Count -lt $AnchorFloor) {
+    Write-Host "anchor-registry: FAIL - only $($srcAnchors.Count) anchors found across src/ examples/ real-examples/, below the floor of $AnchorFloor."
+    Write-Host "  This does NOT mean the tree is clean - it means the SCAN COLLAPSED (an unreadable root, a broken regex, or a filter that matches nothing)."
+    Write-Host "  Refusing to report a pass. Fix the scan; do not lower the floor."
+    exit 2
+}
+
+# ⚠ KNOWN PAIRING DIVERGENCES, extension-case half — documented 2026-08-03 (TF-C112),
+# adding to the three already listed above. `Get-ChildItem -Include '*.sh'` matches
+# `RUN.SH`; `grep --include='*.sh'` does NOT. So a driver with an uppercase extension
+# would be scanned on Windows and INVISIBLE on the Linux leg. Likewise the FAIL-path
+# locator: the `.sh` uses `grep -rln` (case-SENSITIVE) while this script uses
+# `Select-String -SimpleMatch`, which is case-INSENSITIVE by default — the
+# regex-vs-literal half of that divergence was already documented, the CASE half was
+# not. Both are inert today (zero uppercase-extension files in the scanned roots) and
+# are left as documented divergences rather than "fixed", because forcing either side
+# to the other's casing rules would change which files are scanned on one leg only —
+# which is the very asymmetry being guarded against. If an uppercase-extension driver
+# ever lands, close this by making BOTH sides case-sensitive, not by matching Windows.
 
 # Read every plan-file's raw content for substring matching. Substring
 # (vs equality vs extracted-anchor-set) handles two false-positive modes:

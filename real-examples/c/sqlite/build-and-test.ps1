@@ -120,8 +120,22 @@
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
 #                      DSS_TIER  DSS_CONFIG  DSS_TEST_FILE  DSS_CONFOUNDS
 #                      DSS_TIER_EXCLUDES  DSS_MAX_RESUMES
+#                      DSS_BRANCH  DSS_COMMIT
 #                      DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
 #                      TCL_DLL  ZLIB_DLL  TCL_LIBRARY
+#
+# DSS_BRANCH  — the branch you INTEND to test. Unset (default) = whatever the
+#               checkout is on. Set, and Step 2 ASSERTS it and DIES on a mismatch.
+# DSS_COMMIT  — the commit you INTEND to test (full or abbreviated). Unset = no
+#               assertion. ⚠ An ASSERTION, never a checkout instruction: this
+#               driver NEVER moves our repo (a bare-sha checkout would leave a
+#               detached HEAD, contradicting "the checkout AS-IS").
+# ★ BOTH ARE PARITY WITH build-and-test.sh:105-121 / :780-799, and the parity is
+# load-bearing rather than cosmetic. A CI template or /loop driver that exports
+# DSS_COMMIT=<sha> for BOTH legs used to get an assertion on Linux and SILENCE
+# here: Windows ignored the variable, built whatever was in the tree, and printed
+# a green verdict a reader would take as commit-pinned BECAUSE THE SIBLING LEG WAS.
+# A capability in one driver and not the other is a silent harness bug.
 
 $ErrorActionPreference = 'Stop'
 # WSL emits UTF-8. Without this, every non-ASCII character in a message coming back
@@ -263,8 +277,29 @@ if ($env:DSS_SKIP_SELFTEST -eq '1') {
     $stOut | ForEach-Object { "      $_" } | Write-Host
     Die "DRIVER SELF-TEST FAILED — refusing to start.`n      The end-of-run classifier is broken, so this run would execute the whole corpus (hours) and then abort while classifying."
   }
-  $n = ($stOut | Select-String -Pattern '^passed=(\d+)').Matches.Groups[1].Value
-  Info "driver self-test: OK ($n assertions)"
+  # ★ PARITY with build-and-test.sh: the SKIP COUNT is part of the result, not a
+  # footnote, and an UNPARSEABLE summary is a failure rather than a blank. The old
+  # form indexed .Matches.Groups[1] unconditionally, so a self-test that stopped
+  # printing `passed=` rendered "OK ( assertions)" -- a pass reported over a result
+  # nobody could read, which is the very defect class this guard exists to catch.
+  $sm = ($stOut | Select-String -Pattern '^passed=(\d+) failed=(\d+) skipped=(\d+)$' | Select-Object -Last 1)
+  if (-not $sm) {
+    $stOut | ForEach-Object { "      $_" } | Write-Host
+    Die @"
+driver self-test exited 0 but printed no readable summary line.
+      Expected a final 'passed=N failed=N skipped=N'. Its assertions may well have passed,
+      but a self-test whose RESULT cannot be read proves nothing and this guard will not
+      report OK over it. Either test-confound-scope.ps1's summary format changed (update
+      this parse with it) or it died before printing the line.
+"@
+  }
+  $n = $sm.Matches[0].Groups[1].Value
+  $nSkip = $sm.Matches[0].Groups[3].Value
+  if ($nSkip -eq '0') {
+    Info "driver self-test: OK ($n assertions, 0 skipped)"
+  } else {
+    Warn "driver self-test: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host (unmet prerequisite, normally 'no git on PATH'). That part of the late-stage logic is UNPROVEN for this run: $selfTest"
+  }
 }
 # <<< dss:selftest <<<
 
@@ -286,11 +321,146 @@ Info "host: Windows ($([Environment]::OSVersion.Version))   leg: $Spec   tier: $
 Pass "Windows host + WSL online"
 
 # ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
+# >>> dss:src-provenance >>>
+# ★ THIS REGION IS EXTRACTED AND EXECUTED by test-confound-scope.ps1 (the Step-0
+# self-test) against throwaway git repos — the same discipline the .sh's self-test
+# applies to its Step-2 gate: run the SHIPPED code, never a re-implementation that
+# would stay green while this rotted. The sentinel comments are a CONTRACT with
+# that file; rename or move one and the self-test fails with "could not locate",
+# which this driver treats as refuse-to-start.
 Step "2/9  Use dss-code-prime at $RepoRoot (current checkout, untouched)"
-$dssHead = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
-$dssBranch = (& git -C $RepoRoot rev-parse --abbrev-ref HEAD 2>$null)
-Info "  at $dssHead on $dssBranch"
+$DssBranchWant = if ($env:DSS_BRANCH) { $env:DSS_BRANCH } else { '' }
+$DssCommitWant = if ($env:DSS_COMMIT) { $env:DSS_COMMIT } else { '' }
+# One line of git output, or '' — never $null, never an array, never a throw.
+# The try/catch is not decoration: under PowerShell 7.4+ the (now stable)
+# $PSNativeCommandUseErrorActionPreference makes a nonzero-exiting NATIVE command
+# throw while $ErrorActionPreference is 'Stop', so an unresolvable rev-parse would
+# abort the driver instead of yielding the UNKNOWN this block exists to print.
+# MEASURED here: pwsh 7.5.2 with that preference $false — precisely why it must not
+# be relied on. `("$o").Trim()` also collapses git's single output line out of the
+# ARRAY PowerShell may hand back, so downstream `-ne` compares strings rather than
+# silently doing array filtering.
+function Get-GitLine($dir, [string[]]$gitArgs) {
+  try { $o = (& git -C $dir @gitArgs 2>$null) } catch { return '' }
+  if ($null -eq $o) { return '' }
+  return ("$o").Trim()
+}
+# ★ TEST FOR .git BEFORE CALLING git AT ALL. `git -C <dir>` WALKS UPWARD: aimed at a
+# directory that is not a checkout it answers with an ENCLOSING repository's HEAD, so
+# the verdict would cite a real but WRONG commit — strictly worse than UNKNOWN,
+# because it reads as verified. `Test-Path` with no -PathType on purpose: a
+# `git worktree` (and a submodule) keeps .git as a FILE, and a directory-only test
+# would call such a checkout "not a repo" — the same choice the .sh makes with `-e`
+# (build-and-test.sh:537).
+$dssIsRepo = Test-Path -LiteralPath (Join-Path $RepoRoot '.git')
+$dssHead = ''; $dssHeadLong = ''; $dssBranch = ''
+if ($dssIsRepo) {
+  $dssHead     = Get-GitLine $RepoRoot @('rev-parse','--short','HEAD')
+  $dssHeadLong = Get-GitLine $RepoRoot @('rev-parse','HEAD')
+  $dssBranch   = Get-GitLine $RepoRoot @('rev-parse','--abbrev-ref','HEAD')
+}
+# PARITY with build-and-test.sh, which grew this in the same cycle
+# (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE item 3, and the preferred fix in
+# its measured sibling D-HARNESS-WSL-TREE-PROVENANCE-UNVERIFIABLE). A verdict line
+# naming a commit is a CITATION later cycles quote as "the compiler that ran this",
+# and it lied in two ways:
+#   * an EMPTY field -- `& git ... 2>$null` yields $null when git fails, and
+#     "compiler : $DssBin @ " then reads as fine rather than as unknown;
+#   * a hash the SOURCES do not match. Mid-cycle this checkout normally carries
+#     uncommitted work, so the built compiler is NOT that commit and the verdict
+#     should say so rather than assert it.
+# Reported, NEVER fatal: gating uncommitted work is what these drivers are for.
+# ── WHAT IS PORTED FROM THE .sh's STEP-2, AND WHAT IS DELIBERATELY NOT ───────
+# NOT PORTED — the CLONE GATE. Its shapes (a) and (c) are about $SRC_DIR being
+# absent, or populated-but-not-a-checkout, and about the harness then CLONING our
+# repo onto the default branch. $RepoRoot is derived from $PSScriptRoot, so this
+# driver always runs on the checkout it lives in and never clones dss-code-prime at
+# all -- neither shape can occur, and inventing a gate for them would be ceremony.
+# Nor does the .sh's stale-.git hybrid exist here: the measured instance of that was
+# the rsync'd WSL tree, and this driver reads the real Windows checkout (verified in
+# that same session: the .ps1 reported correctly while the .sh did not).
+# PORTED, because nothing about them is host-shaped: the UNKNOWN(...)-never-empty
+# fields, the .git guard, the DETACHED-HEAD mapping, the divergence count, and the
+# DSS_BRANCH / DSS_COMMIT ASSERTIONS below. Those last two were the silent gap this
+# comment previously said nothing about -- see the env-var block at the top of this
+# file for the failure it produced.
+if     (-not $dssIsRepo) { $dssHead   = "UNKNOWN(no .git under $RepoRoot)" }
+elseif (-not $dssHead)   { $dssHead   = "UNKNOWN(rev-parse HEAD failed in $RepoRoot)" }
+# A DETACHED HEAD makes `rev-parse --abbrev-ref HEAD` print the literal string
+# "HEAD", which reads as a branch NAMED HEAD and would make the DSS_BRANCH mismatch
+# message below nonsense ("but the tree is on 'HEAD'"). Mapped, as the .sh does at
+# build-and-test.sh:549.
+if     (-not $dssBranch)       { $dssBranch = 'UNKNOWN' }
+elseif ($dssBranch -eq 'HEAD') { $dssBranch = 'DETACHED-HEAD' }
+$dssDivergeNote = ''
+if (-not $dssIsRepo) {
+  # Same reason as above: `git status` in a non-checkout reports the ENCLOSING
+  # repository's dirt. Not measuring is honest; measuring the wrong tree is not.
+  $dssDivergeNote = " (divergence from HEAD UNVERIFIED -- no .git under $RepoRoot)"
+} else {
+  try {
+    # --no-optional-locks: a plain `status` refreshes and REWRITES .git/index, and this
+    # step's whole promise is "current checkout, untouched". Untracked files COUNT: a
+    # source file HEAD never knew about is divergence exactly as much as an edit is.
+    $porcelain = @(& git -C $RepoRoot --no-optional-locks status --porcelain 2>$null | Where-Object { $_ -ne '' })
+    if ($LASTEXITCODE -ne 0) {
+      $dssDivergeNote = ' (divergence from HEAD UNVERIFIED -- git status failed)'
+    } elseif ($porcelain.Count -gt 0) {
+      $dssDivergeNote = " (+$($porcelain.Count) file(s) differ from HEAD -- the sources built are NOT exactly this commit)"
+    }
+  } catch {
+    # A throwing git (old git rejecting --no-optional-locks, or PowerShell's native
+    # -command error preference) must never cost a run -- it costs the COUNT, and the
+    # note says which.
+    $dssDivergeNote = ' (divergence from HEAD UNVERIFIED -- git status could not run)'
+  }
+}
+Info "  at $dssHead on $dssBranch$dssDivergeNote"
+# ── the DECLARED ref, ASSERTED against the checkout ──────────────────────────
+# PARITY with build-and-test.sh:777-799. Intent the operator STATES beats intent
+# inferred from the filesystem. Both unset (the default) leaves behaviour exactly
+# as it was: use the checkout as it is.
+# ⚠ These are ASSERTIONS, never checkout instructions — the .sh made that choice
+# deliberately and this driver holds to it: checking out a bare sha leaves a
+# DETACHED HEAD, which contradicts the "current checkout, untouched" contract that
+# is the whole reason a pre-commit probe can gate uncommitted work.
+if ($DssBranchWant -and $dssBranch -ne $DssBranchWant) {
+  Die @"
+DSS_BRANCH='$DssBranchWant' but $RepoRoot is on '$dssBranch'.
+      Refusing to spend a multi-hour corpus run on a branch you did not ask for.
+      Check the branch out yourself — this harness NEVER switches our own repo, so
+      that a probe tests the working tree exactly as it is — or drop DSS_BRANCH.
+"@
+}
+if ($DssCommitWant) {
+  if (-not $dssIsRepo) {
+    Die "DSS_COMMIT='$DssCommitWant' cannot be verified: $RepoRoot is not a git checkout (no .git entry)."
+  }
+  # `--verify … ^{commit}` both resolves an abbreviation and proves the object is a
+  # commit that EXISTS here; a typo or an unfetched sha fails loud instead of
+  # silently comparing two strings that were never going to match.
+  $dssCommitFull = Get-GitLine $RepoRoot @('rev-parse','--verify','--quiet',"$DssCommitWant^{commit}")
+  if (-not $dssCommitFull) {
+    Die "DSS_COMMIT='$DssCommitWant' does not resolve to a commit in $RepoRoot — fetch it, or fix the value."
+  }
+  if (-not $dssHeadLong) {
+    Die "DSS_COMMIT='$DssCommitWant' cannot be verified: rev-parse HEAD failed in $RepoRoot."
+  }
+  if ($dssCommitFull -ne $dssHeadLong) {
+    Die @"
+DSS_COMMIT='$DssCommitWant' ($dssCommitFull) but $RepoRoot is at $dssHeadLong.
+      The run would have validated the checkout, not the commit you named.
+"@
+  }
+  Info "  DSS_COMMIT verified: HEAD is $dssCommitFull"
+}
+# The divergence is REPORTED, never fatal — a dirty tree is the NORMAL shape of a
+# pre-commit probe, and refusing it would delete this driver's main use. It is
+# WARNED about (not merely noted) so a commit-pinned run cannot read as byte-pinned:
+# DSS_COMMIT proves which COMMIT is checked out, never that the sources match it.
+if ($dssDivergeNote) { Warn "  $RepoRoot$dssDivergeNote" }
 Pass "dss-code-prime checkout ready"
+# <<< dss:src-provenance <<<
 
 # ── Step 2b — take the RUN LOCK on the work tree ─────────────────────────────
 # MEASURED FAILURE (2026-07-26) this exists to prevent: two harness invocations
@@ -748,7 +918,23 @@ win "$STAGE/test" > "$STAGE/testdir.win.txt"
 echo "RECIPE-TUS=$(wc -l < "$STAGE/tus.txt")"
 echo "RECIPE-DEFS=$(wc -l < "$STAGE/defines.txt")"
 echo "RECIPE-INCS=$(wc -l < "$STAGE/includes.txt")"
-echo "SQLITE-HEAD=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null)"
+# SQLITE-HEAD is a PROVENANCE FIELD: Step 9 prints it as `sqlite : <dir> @ <sha>`.
+# The bare `$(git rev-parse …)` this used to be printed an EMPTY field whenever git
+# failed or $DIR was not a checkout -- "sqlite : /home/…/src/sqlite @" reads as fine
+# rather than as unknown, which is exactly the shape build-and-test.sh closed by
+# routing every provenance read through git_head_short (never empty, always says WHY
+# it is unknown). `set -e` never sees a substitution that fails inside an argument,
+# so nothing else would have caught it. Same UNKNOWN(<why>) vocabulary here.
+if [ -e "$DIR/.git" ]; then
+  # `-e`, not `-d`: a worktree/submodule checkout keeps .git as a FILE.
+  SQLITE_HEAD="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null)" || SQLITE_HEAD=""
+  [ -n "$SQLITE_HEAD" ] || SQLITE_HEAD="UNKNOWN(rev-parse HEAD failed in $DIR)"
+else
+  # git -C WALKS UPWARD out of a non-checkout, so without this guard the field could
+  # name an enclosing repository's commit -- a confident wrong citation.
+  SQLITE_HEAD="UNKNOWN(no .git under $DIR)"
+fi
+echo "SQLITE-HEAD=$SQLITE_HEAD"
 echo "CLONE-LOCK-NOTES=$DSS_CLONE_NOTES"
 '@
 # The shared-clone lock is EXTRACTED from build-and-test.sh rather than copied, so
@@ -1536,7 +1722,9 @@ if ($TierExcludes.Count) {
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
 Step '9/9  Results'
-Info "compiler : $DssBin @ $dssHead"
+# $dssDivergeNote is the Step-2 measurement, reprinted verbatim so the opening
+# banner and the closing verdict cannot disagree about the same run.
+Info "compiler : $DssBin @ $dssHead$dssDivergeNote"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
 # The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will actually

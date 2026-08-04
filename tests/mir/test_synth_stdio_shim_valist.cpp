@@ -2,13 +2,22 @@
 // SELECTION, pinned at the OPERAND the synthesized call actually forwards.
 //
 // WHY THIS FILE EXISTS SEPARATELY FROM THE SynthStdioShim SUITE IN
-// `test_mir_merge.cpp`. That suite pins the shim's SHAPE (a defined variadic
-// function, one call through the module's already-imported UCRT core, no minted
-// import). This one pins a different thing entirely: WHICH va_list leaf the body
+// `test_mir_merge.cpp`. That suite pins the shim's OPERAND CONTRACT — for each of
+// the five recipes, the callee symbol, the operand count, and every argument by
+// position. This one pins a different thing entirely: WHICH va_list leaf the body
 // anchors `ap` on, which is a per-TARGET correctness fork with no shape
 // consequence at all — both arms produce a structurally identical function.
 // tests/mir's stated convention is one executable per file for ctest parallelism
 // and per-file failure isolation, and a decision site this sharp earns its own.
+//
+// ★ AND THE FAMILY'S NEGATIVE SPACE LIVES HERE TOO (TF-C112). Every recipe's
+// va-leaf question is WHICH leaf — except `vfprintf`, whose question is WHETHER,
+// and the answer is none: C 7.21.6.8 gives it a DECLARED `va_list ap` parameter,
+// so the shim forwards `Arg 2` verbatim under a NON-variadic signature. A
+// regression to `vaStart(2)`/`vsig` would both re-derive `ap` from a frame with no
+// varargs in it AND hand `lir_callconv` a prologue-spill signal for a function
+// that receives none. Same decision site, opposite answer — so it is pinned beside
+// its siblings rather than somewhere the next reader of this fork will not look.
 //
 // ★ THE MISCOMPILE THIS GUARDS. `synthesizeStdioShim` used to gate on
 // `strategy == HomogeneousPointer` and then emit `VaHomeArgAreaAddr`
@@ -44,6 +53,28 @@
 // src/mir/merge/synth_stdio_shim.cpp with the unconditional `VaHomeArgAreaAddr`
 // it used to be reds `OverflowBaseArmAnchorsApOnTheOverflowBase` on the `ap`
 // operand's opcode, with the home arm and every other test still green.
+//
+// ★ RED-ON-DISABLE FOR THE TF-C112 ADDITIONS, each mutation applied to
+// src/mir/merge/synth_stdio_shim.cpp ONE AT A TIME, both mir stdio binaries re-run,
+// then restored (src verified byte-identical by `git hash-object` afterwards):
+//   * `kIobStdout = 1 -> 2`  -> HomePayloadTracksEachRecipesNamedArgCount, on the iob
+//     index ("Which is: (2)" vs "(1)").
+//   * printf keeps calling `__acrt_iob_func(1)` but forwards `nullP()` as `_Stream`
+//     -> the SAME test, on the CHAIN assertion (`printfOps[2].v == iobCall->v`, 28 vs
+//     25). This is the one that matters: the old bare `has_value()` on the accessor
+//     call stayed green through it, because the accessor really was still there.
+//   * `vfprintf` sig -> `vsig`  -> VfprintfEmitsNoVaLeafAndKeepsANonVariadicSignature,
+//     on `fnIsVariadic`.
+//   * `vfprintf` `Arg 2` -> `vaStart(2)`  -> the same test, on the `ap` opcode AND on
+//     both zero-leaf assertions.
+//   * `sscanf` re-pointed at the `__stdio_common_vsprintf` core  -> the payload test's
+//     sscanf row, which MISSES its core (`ap.has_value()` false) rather than matching
+//     the wrong one — the two cores share one TypeId, so nothing else can see it.
+//   * `fprintf`'s `vaStart(2)` -> `vaStart(1)`  -> the payload test's fprintf row (1
+//     vs 2), which is exactly what the single-recipe form could not have caught.
+// And the negative control: the sprintf `buf`/`fmt` transposition and the `_Options`,
+// `_BufferCount` and `_Locale` mutations leave THIS file green, as they should — they
+// are operand-contract faults, and test_mir_merge.cpp reds on each of them.
 
 #include "core/types/aggregate_layout.hpp"      // VaListStrategy
 #include "core/types/diagnostic_reporter.hpp"
@@ -67,7 +98,9 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -76,13 +109,23 @@ namespace {
 
 // Pre-minted symbol ids. The shim symbols are the ones stdio.json tags with
 // `synthesize`; the core ids are ordinary descriptor imports.
-constexpr std::uint32_t kSprintfSym = 10;
-constexpr std::uint32_t kPrintfSym  = 11;
-constexpr std::uint32_t kMainSym    = 100;
+constexpr std::uint32_t kSprintfSym  = 10;
+constexpr std::uint32_t kPrintfSym   = 11;
+constexpr std::uint32_t kFprintfSym  = 12;
+constexpr std::uint32_t kVfprintfSym = 13;
+constexpr std::uint32_t kSscanfSym   = 14;
+constexpr std::uint32_t kMainSym     = 100;
 
 constexpr std::uint32_t kCoreVsprintfSym = 20;
 constexpr std::uint32_t kCoreVfprintfSym = 21;
 constexpr std::uint32_t kAcrtIobFuncSym  = 22;
+constexpr std::uint32_t kCoreVsscanfSym  = 23;
+
+// `__acrt_iob_func(0/1/2)` == stdin/stdout/stderr (corecrt_wstdio.h). Restated from
+// the UCRT contract rather than read out of the pass, whose constant is a file-local
+// `constexpr` in an anonymous namespace — importing it would let any future change to
+// it approve itself.
+constexpr std::int64_t kIobStdoutIndex = 1;
 
 MirLiteralValue i32Lit(std::int64_t v) {
     MirLiteralValue lit;
@@ -91,14 +134,25 @@ MirLiteralValue i32Lit(std::int64_t v) {
     return lit;
 }
 
+// Each shim's C declaration, so the scaffold below references it at its REAL arity and
+// variadicity. `vfprintf` is the odd one — three DECLARED parameters and NOT variadic
+// (C 7.21.6.8) — and spelling that here keeps `main`'s reference a plausible call
+// rather than a stub that only happens to verify.
+struct ShimDecl { std::uint32_t fixedArgc; bool variadic; };
+ShimDecl declOf(std::uint32_t sym) {
+    switch (sym) {
+    case kPrintfSym:   return {1, true};    // printf(fmt, ...)
+    case kVfprintfSym: return {3, false};   // vfprintf(stream, fmt, ap)
+    default:           return {2, true};    // fprintf / sprintf / sscanf
+    }
+}
+
 // The caller-side scaffold: one `main` that references each shim symbol through a
 // GlobalAddr against a NOT-yet-defined callee — the shape the CST->HIR seam leaves
 // behind for a `synthesize`-tagged descriptor row.
 Mir buildCaller(TypeInterner& in, std::vector<std::uint32_t> const& shimSyms) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
-    std::array<TypeId, 2> const sp{pCh, pCh};
-    TypeId const variadicSig = in.fnSig(sp, i32, CallConv::CcMS64, /*isVariadic=*/true);
 
     MirBuilder mb;
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{kMainSym});
@@ -106,8 +160,11 @@ Mir buildCaller(TypeInterner& in, std::vector<std::uint32_t> const& shimSyms) {
     mb.beginBlock(e);
     MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
     for (std::uint32_t sym : shimSyms) {
-        MirInstId const ga = mb.addGlobalAddr(SymbolId{sym}, in.pointer(variadicSig));
-        std::array<MirInstId, 3> const co{ga, buf, buf};
+        ShimDecl const d = declOf(sym);
+        std::vector<TypeId> const params(d.fixedArgc, pCh);
+        TypeId const shimSig = in.fnSig(params, i32, CallConv::CcMS64, d.variadic);
+        std::vector<MirInstId> co{mb.addGlobalAddr(SymbolId{sym}, in.pointer(shimSig))};
+        for (std::uint32_t i = 0; i < d.fixedArgc; ++i) co.push_back(buf);
         mb.addInst(MirOpcode::Call, co, i32);
     }
     mb.addReturn(mb.addConst(i32Lit(0), i32));
@@ -128,6 +185,7 @@ std::vector<ExternImport> stdioCoreImports() {
     };
     return {make(kCoreVsprintfSym, "__stdio_common_vsprintf"),
             make(kCoreVfprintfSym, "__stdio_common_vfprintf"),
+            make(kCoreVsscanfSym, "__stdio_common_vsscanf"),
             make(kAcrtIobFuncSym, "__acrt_iob_func")};
 }
 
@@ -148,9 +206,9 @@ std::optional<MirFuncId> findFuncBySymbol(Mir const& mir, std::uint32_t symV) {
 // Selecting the call by CALLEE matters: `printf`'s body contains TWO calls (the
 // `__acrt_iob_func(1)` stream fetch and the core), and "the first call in the
 // block" would silently probe the wrong one.
-std::optional<MirInstId> apOperandOfCoreCall(Mir const& mir, MirFuncId fn,
-                                             std::uint32_t coreSymV,
-                                             std::size_t* operandCountOut = nullptr) {
+// The CALL ITSELF, so a caller can pin an operand CHAIN (`printf`'s `_Stream` slot must
+// hold THIS instruction's result) and not merely a value read out of it.
+std::optional<MirInstId> coreCallOf(Mir const& mir, MirFuncId fn, std::uint32_t coreSymV) {
     for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
         MirBlockId const b = mir.funcBlockAt(fn, bi);
         for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
@@ -159,12 +217,31 @@ std::optional<MirInstId> apOperandOfCoreCall(Mir const& mir, MirFuncId fn,
             auto const ops = mir.instOperands(id);
             if (ops.empty()) continue;
             if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
-            if (mir.globalAddrSymbol(ops[0]).v != coreSymV) continue;
-            if (operandCountOut != nullptr) *operandCountOut = ops.size();
-            return ops.back();
+            if (mir.globalAddrSymbol(ops[0]).v == coreSymV) return id;
         }
     }
     return std::nullopt;
+}
+
+std::optional<MirInstId> apOperandOfCoreCall(Mir const& mir, MirFuncId fn,
+                                             std::uint32_t coreSymV,
+                                             std::size_t* operandCountOut = nullptr) {
+    auto const call = coreCallOf(mir, fn, coreSymV);
+    if (!call.has_value()) return std::nullopt;
+    auto const ops = mir.instOperands(*call);
+    if (operandCountOut != nullptr) *operandCountOut = ops.size();
+    return ops.back();
+}
+
+// Read a Const operand's integer literal. Returns nullopt for a non-Const or a
+// non-integer arm rather than reading it — `Mir::constLiteralIndex` aborts LOUD on the
+// wrong opcode, which would take the whole binary down instead of failing one
+// assertion.
+std::optional<std::int64_t> constI64(Mir const& mir, MirInstId id) {
+    if (mir.instOpcode(id) != MirOpcode::Const) return std::nullopt;
+    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(id));
+    auto const* v = std::get_if<std::int64_t>(&lit.value);
+    return v == nullptr ? std::nullopt : std::optional<std::int64_t>{*v};
 }
 
 std::uint32_t countOpcode(Mir const& mir, MirFuncId fn, MirOpcode op) {
@@ -285,14 +362,13 @@ TEST(SynthStdioShimVaListArm, OverflowBaseArmAnchorsApOnTheOverflowBase) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// The home leaf's payload must TRACK EACH RECIPE's named-arg count rather than be
-// a constant that happens to match `sprintf`. `printf` takes one fixed parameter
-// (fmt) and `sprintf` two (buf, fmt); both are synthesized in ONE pass here, so a
-// hardcoded 2 reds on `printf` and a hardcoded 1 reds on `sprintf`.
-//
-// `printf`'s body also carries a SECOND call — the `__acrt_iob_func(1)` stream
-// fetch — which is exactly why the probe selects its call by callee symbol.
-TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
+// The overflow leaf is payload-free BECAUSE THE BASE HAS NO HOME BLOCK, not because
+// `sprintf` happens to be the recipe under test above. Re-run on `printf`, whose named
+// count is 1 rather than 2: a fork that reached the overflow leaf but still stamped the
+// recipe's named-arg count onto it — the home-arm reflex — would show a DIFFERENT wrong
+// payload per recipe, and a single-recipe test cannot distinguish "always 0" from
+// "always the same number that happened to be 0".
+TEST(SynthStdioShimVaListArm, OverflowLeafIsPayloadFreeForEveryRecipeNamedCount) {
     TypeInterner in{CompilationUnitId{1}};
     Mir mir = buildCaller(in, {kSprintfSym, kPrintfSym});
 
@@ -300,32 +376,179 @@ TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
         {kSprintfSym, "sprintf"}, {kPrintfSym, "printf"}};
     std::vector<ExternImport> const externs = stdioCoreImports();
     DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, homogeneousPointer(true),
+                                    externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    for (auto const& [shimSym, coreSym, named] :
+         std::vector<std::tuple<std::uint32_t, std::uint32_t, char const*>>{
+             {kSprintfSym, kCoreVsprintfSym, "sprintf — 2 named args"},
+             {kPrintfSym, kCoreVfprintfSym, "printf — 1 named arg"}}) {
+        SCOPED_TRACE(named);
+        auto const shim = findFuncBySymbol(mir, shimSym);
+        ASSERT_TRUE(shim.has_value());
+        auto const ap = apOperandOfCoreCall(mir, *shim, coreSym);
+        ASSERT_TRUE(ap.has_value());
+        ASSERT_EQ(mir.instOpcode(*ap), MirOpcode::VaOverflowArgAreaAddr);
+        EXPECT_EQ(mir.instPayload(*ap), 0u)
+            << "payload-free on EVERY recipe — the count belongs to the home base only";
+        EXPECT_EQ(countOpcode(mir, *shim, MirOpcode::VaHomeArgAreaAddr), 0u);
+    }
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// The home leaf's payload must TRACK EACH RECIPE's named-arg count rather than be
+// a constant that happens to match `sprintf`. `printf` takes one fixed parameter
+// (fmt) while `fprintf`, `sprintf` and `sscanf` take two; ALL FOUR leaf-emitting
+// recipes are synthesized in ONE pass here, so a hardcoded 2 reds on `printf` and a
+// hardcoded 1 reds on the other three.
+//
+// `printf`'s body also carries a SECOND call — the `__acrt_iob_func(1)` stream
+// fetch — which is exactly why the probe selects its call by callee symbol.
+TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildCaller(in, {kSprintfSym, kPrintfSym, kFprintfSym, kSscanfSym});
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{
+        {kSprintfSym, "sprintf"},
+        {kPrintfSym, "printf"},
+        {kFprintfSym, "fprintf"},
+        {kSscanfSym, "sscanf"}};
+    std::vector<ExternImport> const externs = stdioCoreImports();
+    DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, homogeneousPointer(false),
                                     externs, rep));
     ASSERT_FALSE(rep.hasErrors());
 
-    auto const sprintfShim = findFuncBySymbol(mir, kSprintfSym);
-    auto const printfShim  = findFuncBySymbol(mir, kPrintfSym);
-    ASSERT_TRUE(sprintfShim.has_value());
+    // (shim symbol, ITS core, named-arg count) — each arm resolved through the core it
+    // is supposed to use, so a mis-wire is a MISS here rather than a silent match. The
+    // sprintf/sscanf pair matters most: the two cores share one six-parameter TypeId, so
+    // swapping them type-checks everywhere.
+    struct Arm { std::uint32_t shim; std::uint32_t core; std::uint32_t named;
+                 char const* why; };
+    for (Arm const& a : std::vector<Arm>{
+             {kSprintfSym, kCoreVsprintfSym, 2, "sprintf(buf, fmt, ...) — 2 named"},
+             {kPrintfSym, kCoreVfprintfSym, 1, "printf(fmt, ...) — 1 named"},
+             {kFprintfSym, kCoreVfprintfSym, 2, "fprintf(stream, fmt, ...) — 2 named"},
+             {kSscanfSym, kCoreVsscanfSym, 2, "sscanf(buf, fmt, ...) — 2 named"}}) {
+        SCOPED_TRACE(a.why);
+        auto const shim = findFuncBySymbol(mir, a.shim);
+        ASSERT_TRUE(shim.has_value());
+        auto const ap = apOperandOfCoreCall(mir, *shim, a.core);
+        ASSERT_TRUE(ap.has_value())
+            << "this arm must forward through ITS OWN core — not another arm's";
+        ASSERT_EQ(mir.instOpcode(*ap), MirOpcode::VaHomeArgAreaAddr);
+        EXPECT_EQ(mir.instPayload(*ap), a.named);
+    }
+
+    // ★ THE STREAM FETCH, PINNED AS A CHAIN. This assertion used to be a bare
+    // `has_value()` on the accessor call — it held the iob INDEX operand in its hand and
+    // threw it away, so `kIobStdout = 1 -> 2` (every `printf` silently writing to
+    // STDERR) passed it. Measured, TF-C112. Now: the index must be 1, AND printf's core
+    // call must take its `_Stream` from THAT call's result — a shim that fetched stdout
+    // and then passed something else would satisfy the weaker form.
+    auto const printfShim = findFuncBySymbol(mir, kPrintfSym);
     ASSERT_TRUE(printfShim.has_value());
-
-    auto const sprintfAp = apOperandOfCoreCall(mir, *sprintfShim, kCoreVsprintfSym);
-    ASSERT_TRUE(sprintfAp.has_value());
-    EXPECT_EQ(mir.instOpcode(*sprintfAp), MirOpcode::VaHomeArgAreaAddr);
-    EXPECT_EQ(mir.instPayload(*sprintfAp), 2u) << "sprintf(buf, fmt, ...) — 2 named";
-
-    auto const printfAp = apOperandOfCoreCall(mir, *printfShim, kCoreVfprintfSym);
-    ASSERT_TRUE(printfAp.has_value())
-        << "printf must forward through __stdio_common_vfprintf, not the sprintf core";
-    EXPECT_EQ(mir.instOpcode(*printfAp), MirOpcode::VaHomeArgAreaAddr);
-    EXPECT_EQ(mir.instPayload(*printfAp), 1u) << "printf(fmt, ...) — 1 named";
-
-    // The probe's discrimination is itself load-bearing: printf's body really does
-    // hold a second call, so "the first Call in the block" would have been wrong.
-    EXPECT_TRUE(apOperandOfCoreCall(mir, *printfShim, kAcrtIobFuncSym).has_value())
+    auto const iobCall = coreCallOf(mir, *printfShim, kAcrtIobFuncSym);
+    ASSERT_TRUE(iobCall.has_value())
         << "printf's body must also call __acrt_iob_func for the stdout stream — if "
            "it does not, the callee-selecting probe above is not discriminating "
            "anything and this file's operand assertions are weaker than they look";
+    auto const iobOps = mir.instOperands(*iobCall);
+    ASSERT_EQ(iobOps.size(), 2u) << "__acrt_iob_func takes exactly one argument";
+    EXPECT_EQ(constI64(mir, iobOps[1]), std::optional<std::int64_t>{kIobStdoutIndex})
+        << "★ printf IS fprintf to STDOUT — __acrt_iob_func(1). Index 2 is stderr, and "
+           "nothing at any tier can tell the difference: it compiles, links, loads, "
+           "runs, and puts all of printf's output on the wrong stream";
+
+    auto const printfCall = coreCallOf(mir, *printfShim, kCoreVfprintfSym);
+    ASSERT_TRUE(printfCall.has_value())
+        << "printf must forward through __stdio_common_vfprintf, not the sprintf core";
+    auto const printfOps = mir.instOperands(*printfCall);
+    ASSERT_EQ(printfOps.size(), 6u);
+    EXPECT_EQ(printfOps[2].v, iobCall->v)
+        << "the core's `_Stream` argument must BE the accessor call's result";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── THE ARM WITH NO LEAF AT ALL ──────────────────────────────────────────────
+//
+// `vfprintf` is the family's negative space, and this file is where that belongs:
+// every other recipe's correctness question is WHICH leaf, and this one's is
+// WHETHER — the answer being no. C 7.21.6.8 gives `vfprintf` a DECLARED `va_list
+// ap` parameter that already points at the CALLER's first unnamed argument, so the
+// shim forwards `Arg 2` verbatim.
+//
+// ★ A REGRESSION TO `vaStart(2)` WOULD BREAK TWO THINGS AT ONCE, both silently:
+//   * `ap` would be re-derived from THIS frame — which has no varargs in it — so it
+//     would point just past the shim's own three named args instead of at the
+//     caller's list, and the core would format arbitrary stack;
+//   * the leaf is ALSO lir_callconv's prologue-spill signal, so a non-variadic
+//     function would acquire a home-area spill it never needs, and (with `vsig`) a
+//     variadic declaration nothing ever fills.
+// Neither shows up as a diagnostic at any tier. Both are pinned here, positively
+// (the `ap` slot IS `Arg 2`) and negatively (neither leaf appears anywhere).
+TEST(SynthStdioShimVaListArm, VfprintfEmitsNoVaLeafAndKeepsANonVariadicSignature) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildCaller(in, {kVfprintfSym});
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{
+        {kVfprintfSym, "vfprintf"}};
+    std::vector<ExternImport> const externs = stdioCoreImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, homogeneousPointer(false),
+                                    externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kVfprintfSym);
+    ASSERT_TRUE(shim.has_value()) << "vfprintf must be a synthesized definition";
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_FALSE(in.fnIsVariadic(shimSig))
+        << "★ vfprintf is NOT variadic — `ap` is a declared parameter. A variadic "
+           "signature here declares a vararg frame that nothing ever fills";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 3u)
+        << "vfprintf's arity is (stream, fmt, ap) — all three DECLARED";
+
+    std::size_t operandCount = 0;
+    auto const ap = apOperandOfCoreCall(mir, *shim, kCoreVfprintfSym, &operandCount);
+    ASSERT_TRUE(ap.has_value())
+        << "vfprintf must forward through the STREAM core __stdio_common_vfprintf";
+    EXPECT_EQ(operandCount, std::size_t{6})
+        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
+
+    ASSERT_EQ(mir.instOpcode(*ap), MirOpcode::Arg)
+        << "★ the `ap` slot must hold a DECLARED PARAMETER, never a va leaf";
+    EXPECT_EQ(mir.argIndex(*ap), 2u)
+        << "and specifically parameter 2 — forwarding `Arg 0` (the stream) or `Arg 1` "
+           "(the format) as the va_list is the same class of silent wrong-bytes bug";
+
+    EXPECT_EQ(countOpcode(mir, *shim, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "★ NO home leaf: it would re-derive `ap` from a frame with no varargs, and "
+           "hand lir_callconv a prologue-spill signal for a non-variadic function";
+    EXPECT_EQ(countOpcode(mir, *shim, MirOpcode::VaOverflowArgAreaAddr), 0u)
+        << "and no overflow leaf either — the arm emits NEITHER, on EITHER base";
+
+    // Same refusal on the other HomogeneousPointer base: `vfprintf` has no va leaf to
+    // choose, so `variadicUsesOverflowBase` must change NOTHING about this body.
+    TypeInterner in2{CompilationUnitId{1}};
+    Mir mir2 = buildCaller(in2, {kVfprintfSym});
+    DiagnosticReporter rep2;
+    ASSERT_TRUE(synthesizeStdioShim(mir2, in2, recipes, homogeneousPointer(true),
+                                    stdioCoreImports(), rep2));
+    auto const shim2 = findFuncBySymbol(mir2, kVfprintfSym);
+    ASSERT_TRUE(shim2.has_value());
+    EXPECT_EQ(countOpcode(mir2, *shim2, MirOpcode::VaOverflowArgAreaAddr), 0u)
+        << "the overflow-base target must not grow a leaf the arm does not want";
+    EXPECT_EQ(countOpcode(mir2, *shim2, MirOpcode::VaHomeArgAreaAddr), 0u);
+    auto const ap2 = apOperandOfCoreCall(mir2, *shim2, kCoreVfprintfSym);
+    ASSERT_TRUE(ap2.has_value());
+    ASSERT_EQ(mir2.instOpcode(*ap2), MirOpcode::Arg);
+    EXPECT_EQ(mir2.argIndex(*ap2), 2u);
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep));

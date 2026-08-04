@@ -250,6 +250,37 @@ roundTripVerify(TargetSchema const&            schema,
                                    info->mnemonic, wire.index,
                                    static_cast<unsigned>(srcOp.kind)));
                 return false;
+            // FC12a-struct + c77: two PASS-INTERNAL markers, added to
+            // `LirOperandKind` after this oracle was written and never given
+            // arms — so they hit the very hazard the closed-enum switch above
+            // exists to prevent. MEASURED pre-fix: `expected` stayed at its
+            // initializer 0, the encoded slot held 0, `checkSlot` matched, and
+            // `roundTripVerify` returned TRUE with ZERO diagnostics — the
+            // oracle reporting SUCCESS on an instruction it never verified.
+            // They are distinguished from the drift arm above because they are
+            // not "an encoder consumer that has not landed yet": both are
+            // CONSUMED by `materializeCallingConvention` before the encoder is
+            // ever reached (`ByValueStackAgg` becomes an overflow-area byte
+            // copy; `SpillSlotRef` becomes a `frame_load` into the ABI arg
+            // register), so reaching an ENCODER-OUTPUT oracle means a pass
+            // LEAKED one into the final instruction stream. The encoder has no
+            // slot semantics for either, so any `expected` invented here would
+            // be fiction — refuse instead.
+            case LirOperandKind::ByValueStackAgg:
+            case LirOperandKind::SpillSlotRef:
+                report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                       DiagnosticSeverity::Error,
+                       std::format("round-trip: opcode '{}' wire {} carries "
+                                   "pass-internal LirOperandKind ordinal {} "
+                                   "({}) — this marker must be CONSUMED by "
+                                   "the callconv pass before encoding; "
+                                   "reaching the encoder means a pass leaked "
+                                   "it into the final inst stream",
+                                   info->mnemonic, wire.index,
+                                   static_cast<unsigned>(srcOp.kind),
+                                   srcOp.kind == LirOperandKind::ByValueStackAgg
+                                       ? "ByValueStackAgg" : "SpillSlotRef"));
+                return false;
         }
         if (!checkSlot(slot, expected,
                        std::format("wire[index={}]", wire.index))) {

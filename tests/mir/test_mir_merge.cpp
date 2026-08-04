@@ -2688,3 +2688,710 @@ TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
         << "an unimplemented va_list model MUST fail loud, never forward under a wrong ABI";
     EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — THE FIVE-ARM OPERAND CONTRACT
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// WHY THIS SECTION EXISTS, stated as the defect it closes rather than as "more
+// coverage". Everything above pins the shim's SHAPE by reading three things about the
+// synthesized call — `ops[0]` (the callee), `ops.size()`, and `ops.back()`. Every
+// operand BETWEEN those was unasserted, and three of the five shipped recipes
+// (`fprintf`, `vfprintf`, `sscanf`) had no unit at all.
+//
+// ★ THAT GAP WAS MEASURED, NOT SUPPOSED (TF-C112). Each mutation below was applied to
+// src/mir/merge/synth_stdio_shim.cpp one at a time and BOTH mir stdio binaries re-run:
+//   * TRANSPOSING `buf` and `fmt` in the sprintf arm — a wrong-argument miscompile that
+//     formats the destination buffer and writes the result over the format string —
+//     passed EVERY assertion in both files, AND the MirVerifier. Both operands are
+//     `char*`, so no type check at any tier can see it; only the POSITION can.
+//   * `kIobStdout = 1 -> 2`, i.e. `printf` silently writing to STDERR, likewise passed
+//     everything: the sole test holding that operand discarded it with `has_value()`.
+// So the rule below is: EVERY operand of EVERY arm is pinned BY POSITION, and where an
+// operand is a COMPUTED value (`printf`'s stream, every variadic arm's `ap`) it is
+// pinned as THAT instruction's result rather than as "an instruction of that kind
+// exists somewhere in the body" — an aggregate a sibling code path can satisfy on its
+// own is not a guard.
+//
+// The `_Options` / `_BufferCount` / iob-index values are re-stated here from the UCRT
+// contract (corecrt_stdio_config.h, and stdio.json's own `$comment`) rather than read
+// back out of the pass: the pass's constants are file-local `constexpr`s in an
+// anonymous namespace, and importing them would make any future change to them
+// self-approving.
+//
+// ★ RED-ON-DISABLE, DEMONSTRATED BY BREAKING EACH GUARDED THING. Every mutation below
+// was applied to src/mir/merge/synth_stdio_shim.cpp ONE AT A TIME, both mir stdio
+// binaries re-run, and the source then restored (verified byte-identical afterwards by
+// `git hash-object`). Each reds the named assertion and nothing else in this file:
+//   sprintf `buf`/`fmt` transposed      -> SprintfArmPassesBufCountFmtInThatOrder
+//                                          ("slot holds parameter `Arg 1`, want `Arg 0`")
+//   sprintf _Options LEGACY_NULLTERM->0 -> the same test ("Const is 0, want 1")
+//   sscanf _BufferCount -> 0            -> SscanfArmUsesTheScanfCoreWithZeroOptions
+//                                          ("Const is 0, want -1")
+//   printf _Locale nullP() -> u64c(0)   -> PrintfArmForwardsStdoutFmtAndApByPosition
+//                                          ("Const core is #9, want #27")
+//   kIobStdout 1 -> 2                   -> the same test ("Const is 2, want 1")
+//   printf forwards NULL as _Stream     -> the same test, on the CHAIN — the accessor
+//     while still calling the accessor      call is STILL emitted, so "the body calls
+//                                           __acrt_iob_func" stays true; only "the
+//                                           `_Stream` slot IS that call" catches it
+//   fprintf `stream`/`fmt` transposed   -> FprintfArmForwardsItsStreamAndFmtByPosition
+//   fprintf vaStart(2) -> vaStart(1)    -> that test + the all-five test's fprintf row
+//   vfprintf `sig` -> `vsig`            -> VfprintfArmForwardsItsDeclaredApAndIsNotVariadic
+//   vfprintf Arg 2 -> vaStart(2)        -> that test, on the `ap` slot AND both
+//                                          zero-leaf assertions
+//   sscanf re-pointed at the vsprintf   -> SscanfArmUsesTheScanfCoreWithZeroOptions,
+//     core                                 which MISSES its core rather than matching
+//                                          the wrong one, plus the all-five test
+//   the sprintf missing-core path emits -> EveryPostCloneFailurePathLeavesTheModuleUntouched
+//     the body and publishes the           (func count 2 vs 1, and the symbol DEFINED)
+//     builder before returning false       while the fail-loud assertions stay green
+
+namespace {
+
+// Pre-minted shim symbols — the rows stdio.json tags `synthesize`. `sprintf` keeps id
+// 10 (the id every test above already uses) so the two halves of this file describe
+// one module rather than two conventions.
+constexpr std::uint32_t kShimSprintf  = 10;
+constexpr std::uint32_t kShimPrintf   = 11;
+constexpr std::uint32_t kShimFprintf  = 12;
+constexpr std::uint32_t kShimVfprintf = 13;
+constexpr std::uint32_t kShimSscanf   = 14;
+
+// The UCRT cores + the stdin/stdout/stderr accessor, as ORDINARY descriptor imports.
+constexpr std::uint32_t kCoreVsprintf = 20;
+constexpr std::uint32_t kCoreVfprintf = 21;
+constexpr std::uint32_t kCoreVsscanf  = 22;
+constexpr std::uint32_t kCoreAcrtIob  = 23;
+
+// The UCRT `_Options` bits, restated from corecrt_stdio_config.h. `sprintf` passes
+// LEGACY_VSPRINTF_NULL_TERMINATION (bit 0); every other arm passes ZERO — and on the
+// scanf side that is load-bearing rather than incidental, because bit 0 there is
+// SECURECRT, which turns `__stdio_common_vsscanf` into `sscanf_s` and makes every `%s`
+// consume an EXTRA buffer-size argument out of `ap`. Wrong bits corrupt the argument
+// stream or the NUL handling; none of them diagnoses.
+constexpr std::int64_t kOptNone                   = 0;
+constexpr std::int64_t kOptLegacyVsprintfNullTerm = 1;
+// UCRT's UNBOUNDED sentinel, `(size_t)-1`. The pass builds it as `~0ull` narrowed into
+// the pool's signed arm, so the stored literal is -1.
+constexpr std::int64_t kBufferCountUnbounded = -1;
+// `__acrt_iob_func(0/1/2)` == stdin/stdout/stderr. `printf` IS `fprintf` to STDOUT, so
+// this index is the difference between conforming output and output on the wrong
+// stream — with nothing at any tier to notice.
+constexpr std::int64_t kIobStdout = 1;
+
+// All four helpers the five arms reach through, as ORDINARY descriptor imports (what
+// stdio.json's pe rows produce). Distinct from `ucrtCoreImports()` above, which
+// deliberately carries only the sprintf core.
+std::vector<ExternImport> allStdioHelperImports() {
+    auto make = [](std::uint32_t sym, char const* name) {
+        ExternImport e;
+        e.symbol      = SymbolId{sym};
+        e.mangledName = name;
+        e.libraryPath = "ucrtbase.dll";
+        e.isData      = false;
+        return e;
+    };
+    return {make(kCoreVsprintf, "__stdio_common_vsprintf"),
+            make(kCoreVfprintf, "__stdio_common_vfprintf"),
+            make(kCoreVsscanf, "__stdio_common_vsscanf"),
+            make(kCoreAcrtIob, "__acrt_iob_func")};
+}
+
+// Each shim's C declaration, so the caller-side scaffold references it with its REAL
+// arity and variadicity instead of a stub that only happens to verify. `vfprintf` is
+// the odd one: three DECLARED parameters and NOT variadic (C 7.21.6.8).
+struct ShimDecl {
+    std::uint32_t symbol;
+    std::uint32_t fixedArgc;
+    bool          variadic;
+};
+constexpr ShimDecl kDeclPrintf{kShimPrintf, 1, true};      // (fmt, ...)
+constexpr ShimDecl kDeclFprintf{kShimFprintf, 2, true};    // (stream, fmt, ...)
+constexpr ShimDecl kDeclVfprintf{kShimVfprintf, 3, false}; // (stream, fmt, ap)
+constexpr ShimDecl kDeclSprintf{kShimSprintf, 2, true};    // (buf, fmt, ...)
+constexpr ShimDecl kDeclSscanf{kShimSscanf, 2, true};      // (buf, fmt, ...)
+
+// The caller-side scaffold: one `main` that references each shim through a GlobalAddr
+// against a NOT-yet-defined callee — the shape the CST->HIR seam leaves behind for a
+// `synthesize`-tagged descriptor row — and calls it at its declared arity.
+Mir buildStdioCaller(TypeInterner& in, std::vector<ShimDecl> const& decls) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
+
+    MirBuilder mb;
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});   // main
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
+    for (ShimDecl const& d : decls) {
+        std::vector<TypeId> const params(d.fixedArgc, pCh);
+        TypeId const shimSig = in.fnSig(params, i32, CallConv::CcMS64, d.variadic);
+        std::vector<MirInstId> call{mb.addGlobalAddr(SymbolId{d.symbol}, in.pointer(shimSig))};
+        for (std::uint32_t i = 0; i < d.fixedArgc; ++i) call.push_back(buf);
+        mb.addInst(MirOpcode::Call, call, i32);
+    }
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+std::unordered_map<std::uint32_t, std::string> recipeMap(
+    std::vector<std::pair<std::uint32_t, char const*>> const& rows) {
+    std::unordered_map<std::uint32_t, std::string> m;
+    for (auto const& [sym, name] : rows) m.emplace(sym, name);
+    return m;
+}
+
+// Locate the synthesized forward BY ITS CALLEE SYMBOL. Selecting by callee (rather
+// than "the first Call in the block") is load-bearing twice over: `printf`'s body holds
+// TWO calls, and asking for a SPECIFIC core is what makes a mis-wired arm — `sscanf`
+// routed to `__stdio_common_vsprintf`, which shares the very same six-parameter TypeId
+// so the verifier stays silent — a MISS rather than a false match.
+std::optional<MirInstId> coreCallOf(Mir const& mir, MirFuncId fn, std::uint32_t coreSymV) {
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) != MirOpcode::Call) continue;
+            auto const ops = mir.instOperands(id);
+            if (ops.empty()) continue;
+            if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
+            if (mir.globalAddrSymbol(ops[0]).v == coreSymV) return id;
+        }
+    }
+    return std::nullopt;
+}
+
+std::uint32_t countOpcodeIn(Mir const& mir, MirFuncId fn, MirOpcode op) {
+    std::uint32_t n = 0;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i)
+            if (mir.instOpcode(mir.blockInstAt(b, i)) == op) ++n;
+    }
+    return n;
+}
+
+// ── SINGLE-SLOT IDENTITY PROBES ─────────────────────────────────────────────────────
+// Each answers "does THIS operand slot hold THAT value" and reports what it found
+// instead. They check the opcode FIRST and only then read the opcode-specific payload,
+// because `Mir::argIndex` / `Mir::constLiteralIndex` / `Mir::instPayload` abort LOUD on
+// a wrong opcode: a plain `EXPECT_EQ(opcode, …)` followed by a payload read would take
+// the whole test binary down on the first mismatch instead of failing one assertion and
+// letting the remaining slots report too.
+
+testing::AssertionResult isArg(Mir const& mir, MirInstId op, std::uint32_t ordinal) {
+    if (mir.instOpcode(op) != MirOpcode::Arg)
+        return testing::AssertionFailure()
+               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
+               << ", not the parameter `Arg " << ordinal << "`";
+    if (mir.argIndex(op) != ordinal)
+        return testing::AssertionFailure()
+               << "slot holds parameter `Arg " << mir.argIndex(op) << "`, want `Arg "
+               << ordinal << "` — the arm forwarded the WRONG PARAMETER into this slot "
+                             "(a transposition; both are pointers, so no type check "
+                             "anywhere can see it)";
+    if (mir.argPosition(op) != ordinal)
+        return testing::AssertionFailure()
+               << "`Arg " << ordinal << "` records flat call-operand position "
+               << mir.argPosition(op);
+    return testing::AssertionSuccess();
+}
+
+testing::AssertionResult isIntConst(Mir const& mir, MirInstId op, std::int64_t want,
+                                    TypeKind wantCore) {
+    if (mir.instOpcode(op) != MirOpcode::Const)
+        return testing::AssertionFailure()
+               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
+               << ", not a Const (want " << want << ")";
+    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(op));
+    auto const* got = std::get_if<std::int64_t>(&lit.value);
+    if (got == nullptr)
+        return testing::AssertionFailure() << "Const does not carry an integer literal";
+    if (*got != want)
+        return testing::AssertionFailure()
+               << "Const is " << *got << ", want " << want;
+    if (lit.core != wantCore)
+        return testing::AssertionFailure()
+               << "Const core is #" << static_cast<int>(lit.core) << ", want #"
+               << static_cast<int>(wantCore)
+               << " — the core is what separates a zero `_Options` MASK from a NULL "
+                  "`_Locale` POINTER, which are otherwise the same literal";
+    return testing::AssertionSuccess();
+}
+
+// `_Locale = NULL` (the ambient locale) — a null POINTER const, not an integer zero.
+testing::AssertionResult isNullLocale(Mir const& mir, MirInstId op) {
+    return isIntConst(mir, op, 0, TypeKind::Ptr);
+}
+
+// The `ap` slot must hold the va LEAF ITSELF at the recipe's own named-arg count.
+testing::AssertionResult isVaLeaf(Mir const& mir, MirInstId op, MirOpcode leaf,
+                                  std::uint32_t payload) {
+    if (mir.instOpcode(op) != leaf)
+        return testing::AssertionFailure()
+               << "the `ap` slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
+               << ", not the va leaf #" << static_cast<int>(leaf);
+    if (mir.instPayload(op) != payload)
+        return testing::AssertionFailure()
+               << "va leaf payload is " << mir.instPayload(op) << ", want " << payload
+               << " — the leaf is &home[namedArgCount], so a wrong count silently skips "
+                  "or re-reads an argument slot";
+    return testing::AssertionSuccess();
+}
+
+// `printf`'s STREAM operand must BE the `__acrt_iob_func(1)` call's result — the full
+// chain, not "the body calls the accessor somewhere". A shim that fetched stdout and
+// then handed the core a different value would satisfy the weaker form.
+testing::AssertionResult isAcrtIobCall(Mir const& mir, MirInstId op, std::int64_t index) {
+    if (mir.instOpcode(op) != MirOpcode::Call)
+        return testing::AssertionFailure()
+               << "the `_Stream` slot holds opcode #"
+               << static_cast<int>(mir.instOpcode(op)) << ", not the accessor call";
+    auto const ops = mir.instOperands(op);
+    if (ops.size() != 2)
+        return testing::AssertionFailure()
+               << "__acrt_iob_func takes exactly one argument (callee + 1 == 2 operands), "
+                  "found "
+               << ops.size();
+    if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr ||
+        mir.globalAddrSymbol(ops[0]).v != kCoreAcrtIob)
+        return testing::AssertionFailure()
+               << "the `_Stream` slot's call does not go to __acrt_iob_func";
+    return isIntConst(mir, ops[1], index, TypeKind::U32);
+}
+
+VaListLayout const kWin64Layout = [] {
+    VaListLayout l;
+    l.strategy                 = VaListStrategy::HomogeneousPointer;
+    l.namedArgSlotBytes        = 8;
+    l.variadicUsesOverflowBase = false;
+    return l;
+}();
+
+}  // namespace
+
+// ── ARM 1/5 · printf ────────────────────────────────────────────────────────────────
+//   int printf(char const* fmt, ...)
+//     -> __stdio_common_vfprintf(0, __acrt_iob_func(1), fmt, NULL, ap)
+//
+// The STREAM operand is the interesting one: it is the only COMPUTED argument in the
+// family, and its index selects the destination file. `__acrt_iob_func(2)` is stderr —
+// which compiles, links, loads, runs, and puts every `printf` on the wrong stream. It
+// is pinned here as the accessor call's RESULT with the accessor's own argument read.
+TEST(SynthStdioShim, PrintfArmForwardsStdoutFmtAndApByPosition) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(in, {kDeclPrintf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimPrintf, "printf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kShimPrintf);
+    ASSERT_TRUE(shim.has_value()) << "printf must be a synthesized definition";
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "printf is variadic";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 1u) << "printf's FIXED arity is (fmt)";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
+    ASSERT_TRUE(call.has_value())
+        << "printf must forward through the STREAM core __stdio_common_vfprintf";
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 6u)
+        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
+
+    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64))
+        << "_Options must be 0: DSS links no legacy_stdio_definitions.lib, so plain 0 "
+           "IS the modern C-conforming behavior";
+    EXPECT_TRUE(isAcrtIobCall(mir, ops[2], kIobStdout))
+        << "_Stream must be __acrt_iob_func(1) == stdout; index 2 is stderr and nothing "
+           "downstream can tell the difference";
+    EXPECT_TRUE(isArg(mir, ops[3], 0)) << "_Format is printf's Arg 0";
+    EXPECT_TRUE(isNullLocale(mir, ops[4]));
+    EXPECT_TRUE(isVaLeaf(mir, ops[5], MirOpcode::VaHomeArgAreaAddr, 1))
+        << "_ArgList is the va leaf at printf's 1 named arg";
+
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsprintf).has_value())
+        << "printf must not reach the BUFFERED core";
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsscanf).has_value());
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── ARM 2/5 · fprintf ───────────────────────────────────────────────────────────────
+//   int fprintf(FILE* stream, char const* fmt, ...)
+//     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
+//
+// Structurally `printf` minus the accessor: the stream arrives as `Arg 0`. `stream` and
+// `fmt` are ADJACENT operands of the same core, and transposing them is a wrong-output
+// miscompile no type check can see (`FILE*` is `ptr<void>` and `fmt` is `char*` at MIR,
+// but the CALL is untyped against the core's FnSig) — so both are pinned by ordinal.
+TEST(SynthStdioShim, FprintfArmForwardsItsStreamAndFmtByPosition) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(in, {kDeclFprintf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimFprintf, "fprintf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kShimFprintf);
+    ASSERT_TRUE(shim.has_value()) << "fprintf must be a synthesized definition";
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "fprintf is variadic";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "fprintf's FIXED arity is (stream, fmt)";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
+    ASSERT_TRUE(call.has_value());
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 6u)
+        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
+
+    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64));
+    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Stream is fprintf's Arg 0";
+    EXPECT_TRUE(isArg(mir, ops[3], 1)) << "_Format is fprintf's Arg 1";
+    EXPECT_TRUE(isNullLocale(mir, ops[4]));
+    EXPECT_TRUE(isVaLeaf(mir, ops[5], MirOpcode::VaHomeArgAreaAddr, 2))
+        << "_ArgList is the va leaf at fprintf's 2 named args";
+
+    // fprintf takes its stream as an ARGUMENT — it must never fetch one.
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value())
+        << "fprintf writes to the CALLER's stream; calling __acrt_iob_func here would "
+           "pin output to a fixed file regardless of the argument";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── ARM 3/5 · vfprintf — THE ONE THAT IS NOT VARIADIC ───────────────────────────────
+//   int vfprintf(FILE* stream, char const* fmt, va_list ap)
+//     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
+//
+// C 7.21.6.8 gives `vfprintf` a DECLARED `va_list ap` parameter that already points at
+// the CALLER's first unnamed argument, so the shim forwards `Arg 2` verbatim. Two
+// things must therefore be true here and nowhere else in the family, and BOTH are
+// silent if they regress:
+//   * NO `Va*ArgAreaAddr` leaf. One would re-derive `ap` from THIS frame — which has no
+//     varargs at all — so `ap` would point at whatever follows the shim's own named
+//     args instead of at the caller's list.
+//   * a NON-variadic signature. The va leaf's presence is `lir_callconv`'s
+//     prologue-spill signal, and a `vsig` here would additionally declare a variadic
+//     frame nothing ever fills.
+TEST(SynthStdioShim, VfprintfArmForwardsItsDeclaredApAndIsNotVariadic) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(in, {kDeclVfprintf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimVfprintf, "vfprintf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kShimVfprintf);
+    ASSERT_TRUE(shim.has_value()) << "vfprintf must be a synthesized definition";
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_FALSE(in.fnIsVariadic(shimSig))
+        << "★ vfprintf is NOT variadic (C 7.21.6.8) — `ap` is a declared parameter. A "
+           "variadic signature here hands lir_callconv a prologue-spill signal for a "
+           "function that receives no varargs";
+    EXPECT_EQ(in.fnParams(shimSig).size(), 3u)
+        << "vfprintf's arity is (stream, fmt, ap) — all three DECLARED";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
+    ASSERT_TRUE(call.has_value());
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 6u)
+        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
+
+    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64));
+    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Stream is vfprintf's Arg 0";
+    EXPECT_TRUE(isArg(mir, ops[3], 1)) << "_Format is vfprintf's Arg 1";
+    EXPECT_TRUE(isNullLocale(mir, ops[4]));
+    EXPECT_TRUE(isArg(mir, ops[5], 2))
+        << "★ _ArgList must be the DECLARED `Arg 2`, forwarded verbatim — not a leaf, "
+           "and not some other parameter";
+
+    EXPECT_EQ(countOpcodeIn(mir, *shim, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "★ vfprintf must emit NO va leaf: one would re-derive `ap` from a frame with "
+           "no varargs in it";
+    EXPECT_EQ(countOpcodeIn(mir, *shim, MirOpcode::VaOverflowArgAreaAddr), 0u)
+        << "neither leaf, on either base";
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value())
+        << "vfprintf writes to the CALLER's stream";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── ARM 4/5 · sprintf ───────────────────────────────────────────────────────────────
+//   int sprintf(char* buf, char const* fmt, ...)
+//     -> __stdio_common_vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION, buf, (size_t)-1,
+//                                fmt, NULL, ap)
+//
+// ★ THE TRANSPOSITION THIS TEST WAS WRITTEN FOR. `buf` and `fmt` are BOTH `char*`, they
+// sit two operands apart in the same call, and swapping them makes the shim format the
+// destination buffer as a control string and write the result over the format string.
+// Measured (TF-C112): that swap passed every pre-existing assertion in both stdio test
+// binaries and the MirVerifier, because the only thing that distinguishes the two
+// operands is their POSITION.
+TEST(SynthStdioShim, SprintfArmPassesBufCountFmtInThatOrder) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(in, {kDeclSprintf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimSprintf, "sprintf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kShimSprintf);
+    ASSERT_TRUE(shim.has_value());
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig));
+    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sprintf's FIXED arity is (buf, fmt)";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVsprintf);
+    ASSERT_TRUE(call.has_value())
+        << "sprintf must forward through the BUFFERED core __stdio_common_vsprintf";
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 7u)
+        << "callee + (_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)";
+
+    EXPECT_TRUE(isIntConst(mir, ops[1], kOptLegacyVsprintfNullTerm, TypeKind::U64))
+        << "sprintf pairs LEGACY_VSPRINTF_NULL_TERMINATION (bit 0) with the unbounded "
+           "count; dropping it changes the core's NUL handling SILENTLY";
+    EXPECT_TRUE(isArg(mir, ops[2], 0))
+        << "★ _Buffer is sprintf's Arg 0. If this reads `Arg 1`, the arm transposed buf "
+           "and fmt: the shim formats the destination as a control string and writes "
+           "the result over the format string — both are char*, so nothing else sees it";
+    EXPECT_TRUE(isIntConst(mir, ops[3], kBufferCountUnbounded, TypeKind::U64))
+        << "_BufferCount is UCRT's (size_t)-1 UNBOUNDED sentinel — sprintf has no limit";
+    EXPECT_TRUE(isArg(mir, ops[4], 1))
+        << "★ _Format is sprintf's Arg 1 — the other half of the transposition pair";
+    EXPECT_TRUE(isNullLocale(mir, ops[5]));
+    EXPECT_TRUE(isVaLeaf(mir, ops[6], MirOpcode::VaHomeArgAreaAddr, 2));
+
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsscanf).has_value())
+        << "sprintf must not reach the SCANF core — the two share one six-parameter "
+           "TypeId, so a swap is invisible to the verifier";
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value());
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── ARM 5/5 · sscanf ────────────────────────────────────────────────────────────────
+//   int sscanf(char const* buf, char const* fmt, ...)
+//     -> __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap)
+//
+// ★ THE MIS-WIRE THIS TEST WAS WRITTEN FOR. `__stdio_common_vsscanf` and
+// `__stdio_common_vsprintf` take the SAME six parameters, so the pass gives them ONE
+// shared TypeId — which means routing `sscanf` to the printf core is type-correct at
+// every tier and caught by nothing. The callee symbol is therefore asserted POSITIVELY
+// (the call must go to the scanf core) and the printf core is asserted ABSENT.
+//
+// `_Options` is the second load-bearing operand: bit 0 here is SECURECRT, which turns
+// the core into `sscanf_s` — every `%s` then consumes an EXTRA buffer-size argument out
+// of `ap`, silently desynchronising the whole argument stream.
+TEST(SynthStdioShim, SscanfArmUsesTheScanfCoreWithZeroOptions) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(in, {kDeclSscanf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimSscanf, "sscanf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kShimSscanf);
+    ASSERT_TRUE(shim.has_value());
+
+    TypeId const shimSig = mir.funcSignature(*shim);
+    EXPECT_TRUE(in.fnIsVariadic(shimSig));
+    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sscanf's FIXED arity is (buf, fmt)";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVsscanf);
+    ASSERT_TRUE(call.has_value())
+        << "★ sscanf MUST forward through __stdio_common_vsscanf. Routing it to "
+           "__stdio_common_vsprintf is type-identical (one shared TypeId) and would "
+           "make the shim FORMAT into the caller's read-only source string";
+    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsprintf).has_value())
+        << "★ and it must NOT reach the printf core at all";
+
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 7u)
+        << "callee + (_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)";
+
+    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64))
+        << "★ _Options MUST be 0. Bit 0 is SECURECRT (`sscanf_s`: every %s eats an extra "
+           "buffer-size argument out of `ap`) and bit 1 is LEGACY_WIDE_SPECIFIERS — both "
+           "corrupt argument consumption rather than diagnose";
+    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Buffer is sscanf's Arg 0 (the source string)";
+    EXPECT_TRUE(isIntConst(mir, ops[3], kBufferCountUnbounded, TypeKind::U64))
+        << "_BufferCount is the UNBOUNDED sentinel — a sscanf source is NUL-terminated";
+    EXPECT_TRUE(isArg(mir, ops[4], 1)) << "_Format is sscanf's Arg 1";
+    EXPECT_TRUE(isNullLocale(mir, ops[5]));
+    EXPECT_TRUE(isVaLeaf(mir, ops[6], MirOpcode::VaHomeArgAreaAddr, 2))
+        << "_ArgList is the va leaf at sscanf's 2 named args";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── ALL FIVE IN ONE PASS ────────────────────────────────────────────────────────────
+//
+// The arms above each run alone, which cannot catch a value that is right per-recipe
+// but shared across them. Synthesizing the whole family in ONE invocation is what makes
+// a hoisted constant fail: a hardcoded named-arg count reds on whichever recipe does
+// not have it, and a core resolved once and reused reds on whichever arm needs the
+// other one. It also pins the emission ORDER contract (sorted by SymbolId — the
+// determinism the pass sorts for), and that `main` survives the rebuild.
+TEST(SynthStdioShim, AllFiveArmsSynthesizeTogetherWithPerRecipeValues) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildStdioCaller(
+        in, {kDeclSprintf, kDeclPrintf, kDeclFprintf, kDeclVfprintf, kDeclSscanf});
+
+    std::vector<ExternImport> const externs = allStdioHelperImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in,
+                                    recipeMap({{kShimSprintf, "sprintf"},
+                                               {kShimPrintf, "printf"},
+                                               {kShimFprintf, "fprintf"},
+                                               {kShimVfprintf, "vfprintf"},
+                                               {kShimSscanf, "sscanf"}}),
+                                    kWin64Layout, externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    EXPECT_EQ(mir.moduleFuncCount(), 6u) << "main + five shims";
+    EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must survive the rebuild";
+
+    // Emission order is SORTED BY SymbolId — the pass sorts precisely because
+    // `unordered_map` iteration is not stable and a shifting function order would make
+    // the binary non-reproducible. main is the clone, so the shims start at index 1.
+    ASSERT_EQ(mir.moduleFuncCount(), 6u);
+    std::vector<std::uint32_t> const wantOrder{100,           kShimSprintf, kShimPrintf,
+                                               kShimFprintf,  kShimVfprintf, kShimSscanf};
+    for (std::uint32_t i = 0; i < wantOrder.size(); ++i)
+        EXPECT_EQ(mir.funcSymbol(mir.funcAt(i)).v, wantOrder[i])
+            << "function #" << i << ": shim emission must be sorted by SymbolId so the "
+                                   "output is byte-reproducible";
+
+    // Per-recipe named-arg counts, all produced by the SAME invocation: printf has one
+    // fixed parameter and the rest have two, so any hoisted constant reds here.
+    struct LeafCase { std::uint32_t shim; std::uint32_t core; std::size_t apSlot;
+                      std::uint32_t named; };
+    for (LeafCase const& c : std::vector<LeafCase>{
+             {kShimPrintf, kCoreVfprintf, 5, 1},
+             {kShimFprintf, kCoreVfprintf, 5, 2},
+             {kShimSprintf, kCoreVsprintf, 6, 2},
+             {kShimSscanf, kCoreVsscanf, 6, 2}}) {
+        SCOPED_TRACE(testing::Message() << "shim symbol " << c.shim);
+        auto const fn = findFuncBySymbol(mir, c.shim);
+        ASSERT_TRUE(fn.has_value());
+        auto const call = coreCallOf(mir, *fn, c.core);
+        ASSERT_TRUE(call.has_value()) << "each arm must reach ITS OWN core";
+        auto const ops = mir.instOperands(*call);
+        ASSERT_EQ(ops.size(), c.apSlot + 1);
+        EXPECT_TRUE(isVaLeaf(mir, ops[c.apSlot], MirOpcode::VaHomeArgAreaAddr, c.named));
+    }
+
+    // …and vfprintf, in the same module, still emits no leaf and forwards its parameter.
+    auto const vf = findFuncBySymbol(mir, kShimVfprintf);
+    ASSERT_TRUE(vf.has_value());
+    EXPECT_EQ(countOpcodeIn(mir, *vf, MirOpcode::VaHomeArgAreaAddr), 0u);
+    EXPECT_FALSE(in.fnIsVariadic(mir.funcSignature(*vf)));
+    auto const vfCall = coreCallOf(mir, *vf, kCoreVfprintf);
+    ASSERT_TRUE(vfCall.has_value());
+    ASSERT_EQ(mir.instOperands(*vfCall).size(), 6u);
+    EXPECT_TRUE(isArg(mir, mir.instOperands(*vfCall)[5], 2));
+
+    // Exactly ONE body fetches stdout, and it is printf's.
+    for (std::uint32_t sym : {kShimFprintf, kShimVfprintf, kShimSprintf, kShimSscanf})
+        EXPECT_FALSE(coreCallOf(mir, *findFuncBySymbol(mir, sym), kCoreAcrtIob).has_value())
+            << "only printf has a fixed destination stream; symbol " << sym;
+    EXPECT_TRUE(
+        coreCallOf(mir, *findFuncBySymbol(mir, kShimPrintf), kCoreAcrtIob).has_value());
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── THE "NO HALF-BUILT DEFINITION" PIN, MOVED ONTO THE PATHS THAT CAN VIOLATE IT ────
+//
+// ★ THIS PIN WAS ON THE WRONG PATHS. Both places it existed (the nullopt-layout and
+// unimplemented-strategy refusals, in test_synth_stdio_shim_valist.cpp) return BEFORE
+// `MirBuilder` is even constructed, so "the module is unchanged" there is guaranteed by
+// statement order and asserts nothing. The paths that CAN violate it are the ones below:
+// every one of them is reached AFTER the whole module has been cloned into the builder,
+// with a function possibly open.
+//
+// That is not a hypothetical. src/mir/merge/synth_stdio_shim.cpp's own comment at the
+// `coreSym` lambda records the shape it used to have — report the failure, hand back a
+// default-constructed `SymbolId`, and let the arm use it as operand 0 of the `Call`,
+// which `MirBuilder::checkSameModule_` waves through because an untagged id passes. The
+// invariant the pass now holds, and this test states: on ANY failure the caller's `Mir`
+// is left EXACTLY as it was found — no appended definition, no partial body, and the
+// shim symbol still UNDEFINED so the next stage reports an undefined symbol rather than
+// consuming a wrong-ABI body.
+TEST(SynthStdioShim, EveryPostCloneFailurePathLeavesTheModuleUntouched) {
+    struct Case {
+        char const*   what;
+        std::uint32_t shim;
+        char const*   recipe;
+        char const*   dropHelper;   // "" == drop nothing (the unknown-recipe backstop)
+    };
+    // One case per `return false` that sits AFTER the clone loop in the pass.
+    std::vector<Case> const cases{
+        {"printf without the stdout accessor", kShimPrintf, "printf", "__acrt_iob_func"},
+        {"printf without the stream core", kShimPrintf, "printf", "__stdio_common_vfprintf"},
+        {"fprintf without the stream core", kShimFprintf, "fprintf", "__stdio_common_vfprintf"},
+        {"vfprintf without the stream core", kShimVfprintf, "vfprintf", "__stdio_common_vfprintf"},
+        {"sprintf without the buffered core", kShimSprintf, "sprintf", "__stdio_common_vsprintf"},
+        {"sscanf without the scanf core", kShimSscanf, "sscanf", "__stdio_common_vsscanf"},
+        {"an id the recipe/switch vocabularies disagree on", kShimSprintf, "no_such_recipe", ""},
+    };
+
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildStdioCaller(in, {ShimDecl{c.shim, 2, true}});
+        std::size_t const before = mir.moduleFuncCount();
+
+        std::vector<ExternImport> externs;
+        for (auto const& e : allStdioHelperImports())
+            if (e.mangledName != c.dropHelper) externs.push_back(e);
+        std::size_t const wantHelpers = (*c.dropHelper == '\0') ? std::size_t{4} : std::size_t{3};
+        ASSERT_EQ(externs.size(), wantHelpers)
+            << "the case must actually remove the helper it names — otherwise this row "
+               "silently tests the happy path";
+
+        DiagnosticReporter rep;
+        EXPECT_FALSE(synthesizeStdioShim(mir, in, recipeMap({{c.shim, c.recipe}}),
+                                         kWin64Layout, externs, rep))
+            << "a missing helper / unknown recipe MUST fail loud";
+        EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
+
+        // ★ The pin, on the path where it means something.
+        EXPECT_EQ(mir.moduleFuncCount(), before)
+            << "a failure AFTER the module was cloned into the builder must not publish "
+               "the builder: no definition may be appended";
+        EXPECT_FALSE(findFuncBySymbol(mir, c.shim).has_value())
+            << "the shim symbol must remain UNDEFINED — a half-built body would be "
+               "consumed by the next stage as though synthesis had succeeded";
+        EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value())
+            << "and the caller's own functions must survive untouched";
+
+        MirVerifier verifier{mir, &in};
+        DiagnosticReporter vrep;
+        EXPECT_TRUE(verifier.verify(vrep))
+            << "the module handed back on the failure path must still verify";
+    }
+}

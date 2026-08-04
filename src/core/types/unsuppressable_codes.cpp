@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 136> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -210,6 +210,17 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
     // concat is never silent.
     DiagnosticCode::H_ConflictingStringLiteralPrefixes,
+    // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
+    // user prototype re-declares a shipped row realized as a compiler-synthesized
+    // SHIM with a signature that is not the row's. Unlike its H_* neighbours this
+    // one has NO second line of defence: the refusal is the only thing standing
+    // between the mismatch and a shim body that answers the call under a different
+    // ABI than the caller made it — nothing downstream re-derives the callee's
+    // signature from the prototype, so nothing else can notice. Suppressed, the
+    // build goes GREEN and emits a wrong-ABI call. It also guards the surface the
+    // whole cycle exists to close: the alternative realization for that symbol is a
+    // raw `ucrtbase.dll` import, which does not load at all (0xC0000139).
+    DiagnosticCode::H_ShippedShimSignatureMismatch,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.
@@ -243,6 +254,13 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // non-atomic access to atomic memory sail past (the exact miscompile `_Atomic`
     // exists to prevent).
     DiagnosticCode::I_AtomicAccessNotLowered,
+    // I_CallSignatureMismatch (TF-C112, D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK):
+    // the call-site signature belt — a MIR `Call` whose operands do not match its
+    // statically-resolved callee's FnSig (arity, or the type at a POSITION). A
+    // member like every I_* verifier invariant; suppressed, a mis-wired synthesis
+    // shim would call the C runtime with arguments in the wrong slots and ship
+    // green — a wrong-BYTES miscompile with no other build-time symptom.
+    DiagnosticCode::I_CallSignatureMismatch,
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code
