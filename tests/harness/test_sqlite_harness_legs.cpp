@@ -259,6 +259,45 @@ constexpr SimHost kSimHosts[] = {
     return out;
 }
 
+// A scratch copy of the shipped catalogue with one edit applied, for the tests
+// that must witness a LINT REFUSAL. Mutating the shipped file is not an option
+// and inventing a fixture catalogue would let the mutation tests pass against a
+// document the drivers never read, so each one starts from the real thing.
+class MutatedCatalogue {
+public:
+    MutatedCatalogue(fs::path const& source, char const* tag)
+        : dir_{dss::test_support::Location::Temp, tag} {
+        doc_  = json::parse(fileText(source));
+        path_ = dir_.path() / "legs.json";
+    }
+    [[nodiscard]] json& doc() { return doc_; }
+    // Write and return the path. Called once the caller has edited `doc()`.
+    [[nodiscard]] fs::path const& commit() {
+        std::ofstream out(path_, std::ios::binary);
+        out << doc_.dump(2) << '\n';
+        out.close();
+        return path_;
+    }
+    // The first launcher entry of the named leg — every mutation below targets
+    // one, and finding it by label keeps the tests readable when the catalogue
+    // grows a leg.
+    [[nodiscard]] json& firstLauncherOf(std::string const& label) {
+        for (auto& leg : doc_.at("legs")) {
+            if (leg.at("label").get<std::string>() != label) continue;
+            EXPECT_FALSE(leg.at("launchers").empty())
+                << label << " declares no launcher to mutate";
+            return leg.at("launchers").at(0);
+        }
+        ADD_FAILURE() << "no leg labelled '" << label << '\'';
+        return doc_;  // unreachable in a passing run
+    }
+
+private:
+    dss::test_support::ScratchDir dir_;
+    json                          doc_;
+    fs::path                      path_;
+};
+
 // A `<arch>:<format>-exec` target spec written as a literal. The catalogue is
 // the only place a leg's spec may be stated.
 [[nodiscard]] bool mentionsTargetSpecLiteral(std::string const& line) {
@@ -924,5 +963,711 @@ TEST_F(HarnessLegs, BothDriversStageOneZincPerTransform) {
                 << "\nThe list's last entry is the staged zlib dir, which is"
                    " per target — so there is one list per header stage.";
         }
+    }
+}
+
+// ── 8. A launcher's PATH NAMESPACE is declared, closed, and enforced ───────
+//
+// D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. The catalogue declared Wine for
+// pe-on-Linux and NOTHING for elf-on-Windows, so a Windows host recorded
+// `skipped-by-runOn` for a leg whose testfixture it had just built — and that
+// same artefact, run under WSL BY HAND, passed 330,436 tests.
+//
+// WHY IT WAS NOT A ONE-LINE CONFIG ADDITION, which is what these tests are
+// really about: a launcher does not always share a filesystem NAMESPACE with the
+// driver that spawns it. `wine /home/me/x.exe` takes the driver's own path;
+// `wsl.exe` needs `/mnt/c/...` where the driver holds `C:\...`. An untranslated
+// path is NOT reported as a bad path — the callee opens a RELATIVE file of that
+// name, misses, and the run reads as a broken binary. So every launcher declares
+// `pathTranslation`, the resolver owns the closed vocabulary AND performs the
+// translation (`--translate-path`), and `--assert-translated` is the net under
+// the drivers.
+//
+// ★ WHAT IS NOT TESTED HERE AND WHY: none of these tests invokes `wslpath`.
+// This file runs on Windows, on WSL and on an arm64 Linux VPS, and a test whose
+// green depended on `wsl.exe` would be a skip-or-red on two of the three. The
+// translator CONTRACT (separator normalisation before the call, rc, empty
+// output, an output still in the source namespace, a source path in the wrong
+// namespace) is exercised by `harness_legs.py --self-test` with an INJECTED
+// translator — which this file runs, as `TheResolverSelfTestPasses`. The live
+// `wslpath` path is measured by the driver run recorded in the cycle report.
+
+// The vocabulary is CLOSED and the catalogue may not step outside it. Asserted
+// from both directions: the resolver prints the set, and every verb any launcher
+// declares is in it.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): give a launcher a verb
+// the resolver does not implement and this fails naming the leg and the verb.
+TEST_F(HarnessLegs, EveryLauncherDeclaresAVerbFromTheClosedNamespaceVocabulary) {
+    auto const r = run({"--path-translations"});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_EQ(r.exitCode, 0u) << r.output;
+
+    std::map<std::string, std::string> known;  // verb -> translator argv
+    for (auto const& line : splitLines(r.output)) {
+        auto const tab = line.find('\t');
+        ASSERT_NE(tab, std::string::npos) << "malformed line: " << line;
+        known[line.substr(0, tab)] = line.substr(tab + 1);
+    }
+    ASSERT_EQ(known.count("none"), 1u)
+        << "`none` must always exist: it is how a launcher that takes this"
+           " driver's paths verbatim SAYS SO, and without it the absence of a"
+           " key would have to mean it.";
+    EXPECT_TRUE(known.at("none").empty())
+        << "`none` names a translator ('" << known.at("none")
+        << "') — it is the identity by definition.";
+    ASSERT_GE(known.size(), 2u)
+        << "only one verb is declared, so 'closed vocabulary' is untested by the"
+           " resolver it ships with";
+
+    auto const  doc      = json::parse(fileText(catalogue_));
+    std::size_t declared = 0;
+    std::set<std::string> verbsSeen;
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        for (auto const& entry : leg.at("launchers")) {
+            ASSERT_TRUE(entry.contains("pathTranslation"))
+                << label << ": a launcher for (" << entry.at("hostOs")
+                << ", " << entry.at("hostArch")
+                << ") declares no pathTranslation. Every launcher states the"
+                   " PATH NAMESPACE its argv lives in — a default would make"
+                   " 'nobody thought about it' indistinguishable from 'it takes"
+                   " our paths verbatim'.";
+            auto const verb = entry.at("pathTranslation").get<std::string>();
+            EXPECT_EQ(known.count(verb), 1u)
+                << label << ": launcher for (" << entry.at("hostOs") << ", "
+                << entry.at("hostArch") << ") declares pathTranslation '" << verb
+                << "', which the resolver does not implement";
+            verbsSeen.insert(verb);
+            ++declared;
+        }
+    }
+    EXPECT_GE(declared, 2u) << "no launcher declared a namespace — vacuous";
+    EXPECT_GE(verbsSeen.size(), 2u)
+        << "every launcher in the catalogue declares the SAME namespace ("
+        << *verbsSeen.begin()
+        << "), so this catalogue cannot witness the distinction the key exists"
+           " to make. That is a silent-vacuity failure, not a pass.";
+
+    // ── the ENVIRONMENT namespace, the same three ways ────────────────────
+    // A launcher in another OS namespace does not inherit the driver's
+    // environment either, and that failure is quieter than the path one: the
+    // child runs with an EMPTY run environment and simply does something else.
+    auto const e = run({"--env-transfers"});
+    ASSERT_TRUE(e.spawned) << e.diagnostic;
+    ASSERT_EQ(e.exitCode, 0u) << e.output;
+    std::map<std::string, std::string> envVerbs;  // verb -> carrier variable
+    for (auto const& line : splitLines(e.output)) {
+        auto const tab = line.find('\t');
+        ASSERT_NE(tab, std::string::npos) << "malformed line: " << line;
+        envVerbs[line.substr(0, tab)] = line.substr(tab + 1);
+    }
+    ASSERT_EQ(envVerbs.count("inherit"), 1u);
+    EXPECT_TRUE(envVerbs.at("inherit").empty())
+        << "`inherit` names a carrier variable ('" << envVerbs.at("inherit")
+        << "') — inheriting is precisely needing none.";
+    ASSERT_GE(envVerbs.size(), 2u)
+        << "only one environment-transfer verb is declared, so the vocabulary is"
+           " untested by the resolver it ships with";
+    std::set<std::string> envSeen;
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        for (auto const& entry : leg.at("launchers")) {
+            ASSERT_TRUE(entry.contains("envTransfer"))
+                << label << ": a launcher for (" << entry.at("hostOs") << ", "
+                << entry.at("hostArch")
+                << ") declares no envTransfer. MEASURED 2026-08-04: a"
+                   " wsl.exe-launched fixture saw SQLITE_TEST_PATTERN_LIST as"
+                   " EMPTY, and the corpus resume engine — which selects its"
+                   " files through that variable — re-ran the whole corpus"
+                   " instead of the tail after the abort.";
+            auto const verb = entry.at("envTransfer").get<std::string>();
+            EXPECT_EQ(envVerbs.count(verb), 1u)
+                << label << ": envTransfer '" << verb
+                << "' is not implemented by the resolver";
+            envSeen.insert(verb);
+        }
+    }
+    EXPECT_GE(envSeen.size(), 2u)
+        << "every launcher declares the SAME environment transfer ("
+        << *envSeen.begin() << ") — vacuous, as above.";
+}
+
+// The lint REFUSES the three ways a declaration can be wrong. Each mutation is
+// applied to a scratch copy of the SHIPPED catalogue, so what is refused is a
+// realistic edit and not a straw fixture.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): delete any of the
+// three lint rules in harness_legs.py and the matching case here goes green with
+// `findings=0`.
+TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
+    struct Case {
+        char const* tag;
+        char const* leg;
+        char const* needle;  // must appear in the lint output
+    };
+    // (1) an unknown verb, (2) the key omitted entirely, (3) a verb declared on
+    // a host whose namespace it does not describe.
+    {
+        MutatedCatalogue m{catalogue_, "legs-unknown-verb"};
+        m.firstLauncherOf("pe64-x86_64")["pathTranslation"] = "windows-to-posix";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an unknown pathTranslation verb LINTED CLEAN:\n"
+            << r.output
+            << "\nA verb nothing implements is a declaration that reads as"
+               " configuration and is not — the launcher would be handed"
+               " untranslated paths and the failure would look like a broken"
+               " binary.";
+        EXPECT_NE(r.output.find("windows-to-posix"), std::string::npos)
+            << "the refusal must NAME the verb:\n" << r.output;
+        EXPECT_NE(r.output.find("pe64-x86_64"), std::string::npos)
+            << "the refusal must NAME the leg:\n" << r.output;
+    }
+    {
+        MutatedCatalogue m{catalogue_, "legs-missing-verb"};
+        m.firstLauncherOf("pe64-x86_64").erase("pathTranslation");
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a launcher with NO pathTranslation linted clean:\n"
+            << r.output
+            << "\nThe key is required on every entry for the same reason every"
+               " zconf guard is: a reader must not have to know a default.";
+        EXPECT_NE(r.output.find("pathTranslation"), std::string::npos)
+            << r.output;
+    }
+    {
+        // `windows-to-wsl` translates FROM a drive-letter path using a Windows
+        // tool. On a Linux host there is neither. The lint can DERIVE that, so
+        // it checks the declaration instead of trusting it.
+        MutatedCatalogue m{catalogue_, "legs-verb-wrong-host"};
+        m.firstLauncherOf("pe64-x86_64")["pathTranslation"] = "windows-to-wsl";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "pathTranslation 'windows-to-wsl' declared on a LINUX host"
+               " launcher linted clean:\n"
+            << r.output;
+        EXPECT_NE(r.output.find("windows-to-wsl"), std::string::npos) << r.output;
+    }
+    // ── the same three, for the ENVIRONMENT namespace ──────────────────────
+    {
+        MutatedCatalogue m{catalogue_, "legs-unknown-envverb"};
+        m.firstLauncherOf("pe64-x86_64")["envTransfer"] = "copy-the-block";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an unknown envTransfer verb LINTED CLEAN:\n" << r.output;
+        EXPECT_NE(r.output.find("copy-the-block"), std::string::npos) << r.output;
+    }
+    {
+        MutatedCatalogue m{catalogue_, "legs-missing-envverb"};
+        m.firstLauncherOf("pe64-x86_64").erase("envTransfer");
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a launcher with NO envTransfer linted clean:\n" << r.output;
+        EXPECT_NE(r.output.find("envTransfer"), std::string::npos) << r.output;
+    }
+    {
+        MutatedCatalogue m{catalogue_, "legs-envverb-wrong-host"};
+        m.firstLauncherOf("pe64-x86_64")["envTransfer"] = "wslenv";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "envTransfer 'wslenv' declared on a LINUX host launcher linted"
+               " clean:\n"
+            << r.output;
+    }
+}
+
+// THE RESUME ENGINE'S OWN HOOK MUST CROSS. `--env-transfer` turns a verb plus a
+// list of variable NAMES into the assignments a driver must make, and this is
+// the part that decides whether a cross-OS launcher's fixture can be steered at
+// all. Needs no WSL: the merge and the carrier are pure string work.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): make
+// `env_carrier_assignments` return [] for every verb and the wslenv cases fail.
+TEST_F(HarnessLegs, TheRunEnvironmentIsForwardedIntoTheLaunchersNamespace) {
+    auto forward = [&](char const* verb, std::vector<std::string> const& names,
+                       char const* current) {
+        std::vector<std::string> args{"--env-transfer", verb, "--carrier-current",
+                                      current};
+        for (auto const& n : names) { args.push_back("--forward"); args.push_back(n); }
+        return run(args);
+    };
+    {  // `inherit` must add NOTHING — a native run stays byte-for-byte itself.
+        auto const r = forward("inherit", {"SQLITE_TEST_PATTERN_LIST"}, "");
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_EQ(r.exitCode, 0u) << r.output;
+        EXPECT_TRUE(splitLines(r.output).empty())
+            << "an inheriting launcher was given environment assignments:\n"
+            << r.output;
+    }
+    {
+        auto const r = forward("wslenv",
+                               {"SQLITE_TEST_PATTERN_LIST", "QUICKTEST_OMIT"}, "");
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const lines = splitLines(r.output);
+        ASSERT_EQ(lines.size(), 1u) << r.output;
+        EXPECT_EQ(lines[0], "WSLENV=SQLITE_TEST_PATTERN_LIST:QUICKTEST_OMIT")
+            << "the resume engine steers the corpus through"
+               " SQLITE_TEST_PATTERN_LIST; a launcher that cannot see it re-runs"
+               " the whole corpus and looks like it is working";
+    }
+    {  // an operator's own carrier value survives.
+        auto const r = forward("wslenv", {"QUICKTEST_OMIT"}, "MYVAR/u");
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const lines = splitLines(r.output);
+        ASSERT_EQ(lines.size(), 1u) << r.output;
+        EXPECT_EQ(lines[0], "WSLENV=MYVAR/u:QUICKTEST_OMIT")
+            << "an operator's existing carrier setting was clobbered";
+    }
+    {  // an unknown verb is FATAL, never a silent "inherit".
+        auto const r = forward("copy-the-block", {"A"}, "");
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an unknown envTransfer verb resolved silently:\n" << r.output;
+    }
+}
+
+// THE FAILURE THE BAR NAMES: a translation that covers argv[0] and nothing else.
+// `--assert-translated` is the guard both drivers call at the ONE point the
+// child is spawned, and it must see the fixture AND every file argument.
+//
+// This test needs no translator, which is why it can run on every gate leg.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): make
+// `assert_translated` inspect only args[0] and the second case goes green.
+TEST_F(HarnessLegs, TheLauncherArgvGuardCoversTheFixtureAndEveryFileArgument) {
+    // The real shapes: a fixture, a `.test` script, and a tester.tcl flag.
+    constexpr char const* kFixtureOk = "/mnt/c/out/elf64-x86_64/testfixture";
+    constexpr char const* kScriptOk  = "/mnt/c/stage/test/veryquick.test";
+    constexpr char const* kFixtureBad =
+        "C:\\build\\out\\elf64-x86_64\\testfixture";
+    constexpr char const* kScriptBad = "C:\\build\\stage\\test\\veryquick.test";
+
+    auto assertTranslated = [&](std::vector<std::string> const& argv) {
+        std::vector<std::string> args{"--path-translation", "windows-to-wsl"};
+        for (auto const& a : argv) args.push_back("--assert-translated=" + a);
+        return run(args);
+    };
+
+    {  // everything translated — the only shape that may spawn.
+        auto const r = assertTranslated({kFixtureOk, kScriptOk, "--start=full:"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_EQ(r.exitCode, 0u)
+            << "a fully-translated argv was REFUSED:\n" << r.output;
+    }
+    {  // argv[0] untranslated.
+        auto const r = assertTranslated({kFixtureBad, kScriptOk});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an untranslated FIXTURE path was accepted:\n" << r.output;
+    }
+    {  // ★ THE ONE THE BAR NAMES: argv[0] fine, the file argument not.
+        auto const r = assertTranslated({kFixtureOk, kScriptBad});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "the FIXTURE was translated and a FILE ARGUMENT was not, and the"
+               " guard accepted it:\n"
+            << r.output
+            << "\nThat is exactly the half-done translation this guard exists"
+               " for: the fixture would load, the first test would fail to open"
+               " its script, and the failure would read as a test bug.";
+        EXPECT_NE(r.output.find("veryquick.test"), std::string::npos)
+            << "the refusal must NAME the offending argument:\n" << r.output;
+    }
+    {  // a path hiding inside a flag is still a path.
+        auto const r = assertTranslated({kFixtureOk, "--testdir=D:\\scratch"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an untranslated path EMBEDDED IN A FLAG was accepted:\n"
+            << r.output;
+    }
+    {  // and a launcher that declared `none` translates nothing, by definition.
+        auto const r = run({"--path-translation", "none",
+                            std::string{"--assert-translated="} + kFixtureBad});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_EQ(r.exitCode, 0u)
+            << "a `none` launcher refused this driver's own path spelling:\n"
+            << r.output;
+    }
+}
+
+// THE CELL THE ANCHOR IS ABOUT. On a Windows host the elf64 leg must be
+// LAUNCHED, with a translating launcher — and when the launcher is absent the
+// verdict must be the ENVIRONMENTAL skip, not the structural one, because
+// "nobody can ever run this here" and "this machine lacks a tool" are different
+// facts and only the second is actionable.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): delete the wsl.exe
+// launcher entry from legs.json and both halves fail with `skipped-by-runOn`.
+TEST_F(HarnessLegs, AWindowsHostLaunchesTheLinuxLegRatherThanSkippingIt) {
+    struct Cell {
+        char const* hostArch;
+        char const* leg;
+    };
+    // WSL runs the HOST's architecture: an x86_64 Windows box reaches the
+    // x86_64 Linux leg, an arm64 one the arm64 leg.
+    constexpr Cell kCells[] = {{"x86_64", "elf64-x86_64"},
+                               {"arm64", "elf64-arm64"}};
+    for (auto const& cell : kCells) {
+        auto const r = run({"--plan", "--host-os", "windows", "--host-arch",
+                            cell.hostArch, "--launchers-available", "wsl.exe",
+                            "--format", "json"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const plan  = json::parse(r.output);
+        bool       found = false;
+        for (auto const& leg : plan.at("legs")) {
+            if (leg.at("label").get<std::string>() != cell.leg) continue;
+            found = true;
+            auto const& runPlan = leg.at("run");
+            EXPECT_EQ(runPlan.at("mode").get<std::string>(), "launched")
+                << "windows/" << cell.hostArch << ' ' << cell.leg
+                << " is not launched: " << runPlan.at("detail")
+                << "\nD-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS: this driver"
+                   " BUILDS this leg on this host and the artefact has been"
+                   " MEASURED to pass 330,436 tests under WSL. A skip beside a"
+                   " working binary is a declaration gap, not a capability one.";
+            ASSERT_FALSE(runPlan.at("launcher").empty());
+            EXPECT_EQ(runPlan.at("launcher").at(0).get<std::string>(), "wsl.exe");
+            EXPECT_EQ(runPlan.at("pathTranslation").get<std::string>(),
+                      "windows-to-wsl")
+                << "the launcher lives in another path namespace and must say"
+                   " so; a plain command entry would spawn and then fail in a"
+                   " way that looks like a broken binary";
+            EXPECT_FALSE(runPlan.at("pathTranslator").empty())
+                << "a translating verb must resolve to the argv that performs"
+                   " it, so neither driver has to name the tool";
+            EXPECT_EQ(runPlan.at("envTransfer").get<std::string>(), "wslenv")
+                << "the launcher does not inherit this driver's environment"
+                   " either — MEASURED: SQLITE_TEST_PATTERN_LIST arrives EMPTY,"
+                   " and the resume engine then re-runs the whole corpus";
+        }
+        EXPECT_TRUE(found) << cell.leg << " is not in the plan at all";
+
+        // Launcher absent -> ENVIRONMENTAL, and it must name what is missing.
+        auto const none = run({"--plan", "--host-os", "windows", "--host-arch",
+                               cell.hostArch, "--launchers-none", "--format",
+                               "json"});
+        ASSERT_TRUE(none.spawned) << none.diagnostic;
+        ASSERT_EQ(none.exitCode, 0u) << none.output;
+        // ★ The parsed document is NAMED, not a temporary iterated in place:
+        // this file is C++23 but the gate compiles with GCC 13.2, which predates
+        // P2718R0's lifetime extension for range-for temporaries — so
+        // `for (x : json::parse(s).at("legs"))` iterates a DESTROYED object and
+        // silently yields nothing, which an EXPECT-only loop reads as a pass.
+        // MEASURED in this cycle: the first draft of the Wine test did exactly
+        // that and failed with "pe64-x86_64 is not in the plan".
+        auto const  nonePlan  = json::parse(none.output);
+        bool        sawNoneCell = false;
+        for (auto const& leg : nonePlan.at("legs")) {
+            if (leg.at("label").get<std::string>() != cell.leg) continue;
+            sawNoneCell = true;
+            EXPECT_EQ(leg.at("run").at("verdict").get<std::string>(),
+                      armVerdictName(ArmVerdict::SkippedEmulatorMissing))
+                << "windows/" << cell.hostArch << ' ' << cell.leg
+                << " without wsl.exe must be the ENVIRONMENTAL skip — a"
+                   " structural one would say no Windows host can ever run it,"
+                   " which is false and which DSS_STRICT_ARM_VERDICTS could not"
+                   " act on.";
+        }
+        EXPECT_TRUE(sawNoneCell)
+            << cell.leg << " is absent from the launcher-less plan, so the"
+                           " environmental-skip half of this test compared"
+                           " nothing";
+    }
+}
+
+// WINE IS UNCHANGED. It is the one launcher that was already working, it takes
+// the driver's own paths, and the whole mechanism above must not have moved it.
+//
+// RED-ON-DISABLE: give the Wine launchers a translating verb and this fails on
+// both the declaration and the resolved plan.
+TEST_F(HarnessLegs, WineStillTakesTheDriversOwnPathsUnchanged) {
+    auto const doc = json::parse(fileText(catalogue_));
+    std::size_t wineEntries = 0;
+    for (auto const& leg : doc.at("legs")) {
+        for (auto const& entry : leg.at("launchers")) {
+            if (entry.at("command").at(0).get<std::string>() != "wine") continue;
+            ++wineEntries;
+            EXPECT_EQ(entry.at("pathTranslation").get<std::string>(), "none")
+                << "Wine takes a unix path on a unix host — it shares this"
+                   " driver's namespace, and translating for it would break the"
+                   " one launcher that already worked.";
+            EXPECT_EQ(entry.at("envTransfer").get<std::string>(), "inherit")
+                << "a Wine child is an ordinary process of this host and gets"
+                   " this driver's environment block; carrying it would be"
+                   " machinery for nothing.";
+        }
+    }
+    ASSERT_GE(wineEntries, 1u) << "no Wine launcher to check — vacuous";
+
+    auto const r = run({"--plan", "--host-os", "linux", "--host-arch", "x86_64",
+                        "--launchers-available", "wine,qemu-aarch64", "--format",
+                        "json"});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_EQ(r.exitCode, 0u) << r.output;
+    bool       checked = false;
+    auto const plan    = json::parse(r.output);  // NAMED — see the note above
+    for (auto const& leg : plan.at("legs")) {
+        if (leg.at("label").get<std::string>() != "pe64-x86_64") continue;
+        checked = true;
+        auto const& runPlan = leg.at("run");
+        EXPECT_EQ(runPlan.at("mode").get<std::string>(), "launched");
+        ASSERT_FALSE(runPlan.at("launcher").empty());
+        EXPECT_EQ(runPlan.at("launcher").at(0).get<std::string>(), "wine");
+        EXPECT_EQ(runPlan.at("pathTranslation").get<std::string>(), "none");
+        EXPECT_TRUE(runPlan.at("pathTranslator").empty())
+            << "a `none` launcher resolved a translator argv — the drivers"
+               " would then spawn one per path for no reason";
+        EXPECT_EQ(runPlan.at("envTransfer").get<std::string>(), "inherit");
+    }
+    EXPECT_TRUE(checked) << "pe64-x86_64 is not in the plan";
+}
+
+// BOTH DRIVERS, OR NEITHER. A translation landing in one driver only is the
+// recurring capability-pair defect in this harness — it is what let the .sh
+// build its pe64 leg against a POSIX zconf.h for a whole cycle.
+//
+// The pins are structural because the alternative is running a driver, and each
+// one names a shape that would silently half-work:
+//   · the FIXTURE must be translated — otherwise the launcher cannot even be
+//     handed the binary;
+//   · EVERY segment record's script argument must be translated — the "argv[0]
+//     only" failure, caught at the construction site rather than at run time;
+//   · the intermediary each driver routes segments through must be BOUND to the
+//     real translation call, so it cannot quietly become a passthrough;
+//   · the spawn-point guard must be called, because translating at construction
+//     is only safe with a net;
+//   · and the translation must be ASKED OF THE RESOLVER (`--translate-path`),
+//     not hand-rolled, so there is one implementation and not two.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): drop the translation
+// from either driver, or add a fourth segment record that does not call the
+// helper, and this fails naming the file and the line.
+TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
+    struct Driver {
+        char const* name;
+        bool        powershell;
+        char const* fixtureHelper;  // translates the fixture, once per leg
+        char const* fixtureSite;    // the line that must call it
+        char const* segmentHelper;  // translates a segment's script argument
+        char const* segmentNeedle;  // marks a segment-queue RECORD
+        char const* forwardListSite; // names the variables that must cross
+    };
+    // Each driver reaches the translator through ONE named intermediary, and it
+    // is the intermediary the segment records must name:
+    //   · the .sh stores each translated script in a `LAUNCH_*` variable —
+    //     deliberately NOT `$(launch_path …)` inline, because `die` inside a
+    //     command substitution exits only the SUBSHELL and `set -e` would not
+    //     see the empty field it leaves behind;
+    //   · the .ps1 wraps its per-segment call in `Get-SegmentArgs`, which is
+    //     where the "arg1 is the only path" invariant is spelled.
+    // `segmentHelper` is that intermediary and `fixtureHelper` is the real
+    // translation call; the pair must be BOUND on some live line, so an
+    // intermediary that stopped translating cannot satisfy this test.
+    // `forwardListSite` is the ONE construct that names the variables carried
+    // into the launcher's environment. It is checked ON ITS OWN LINE rather than
+    // "somewhere in the file": the first version of this pin looked for a line
+    // naming both variables anywhere and was satisfied by the RESTORE line
+    // (`$env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = …`), so
+    // emptying the real list stayed GREEN. Measured, and fixed here.
+    constexpr Driver kDrivers[] = {
+        {"build-and-test.sh", false, "launch_path", "launch_bin=", "LAUNCH_",
+         "${US}", "LEG_ENV_FORWARD"},
+        {"build-and-test.ps1", true, "Convert-LaunchPath", "$legLaunchFixture =",
+         "Get-SegmentArgs", "Kind = '", "$legForward"}};
+
+    for (auto const& d : kDrivers) {
+        auto const path = harnessDir() / d.name;
+        ASSERT_TRUE(fs::exists(path)) << path;
+        auto const lines = liveLines(path, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+
+        bool        translatesFixture = false;
+        bool        guardsTheArgv     = false;
+        bool        boundToTranslator = false;
+        std::size_t segmentRecords    = 0;
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            auto const& line = lines[i];
+            if (line.find(d.fixtureSite) != std::string::npos &&
+                line.find(d.fixtureHelper) != std::string::npos) {
+                translatesFixture = true;
+            }
+            // A SMALL WINDOW, not the same line: the .sh binds them in one
+            // assignment but the .ps1's intermediary is a function whose body is
+            // the next line. Four lines is enough for either shape and still far
+            // too narrow to pair two unrelated mentions.
+            if (line.find(d.segmentHelper) != std::string::npos) {
+                for (std::size_t j = i; j < std::min(i + 4, lines.size()); ++j) {
+                    if (lines[j].find(d.fixtureHelper) != std::string::npos) {
+                        boundToTranslator = true;
+                    }
+                }
+            }
+            if (line.find("assert") != std::string::npos &&
+                (line.find("Translated") != std::string::npos ||
+                 line.find("translated") != std::string::npos)) {
+                guardsTheArgv = true;
+            }
+            if (line.find(d.segmentNeedle) == std::string::npos) continue;
+            ++segmentRecords;
+            EXPECT_NE(line.find(d.segmentHelper), std::string::npos)
+                << d.name
+                << " builds a fixture segment whose script argument is NOT"
+                   " translated into the launcher's namespace:\n  "
+                << line
+                << "\nThe first argument of every segment is the .test script"
+                   " the fixture sources. Under a translating launcher an"
+                   " untranslated one is opened as a RELATIVE file, missed, and"
+                   " reported as a test failure rather than a harness bug.";
+        }
+        EXPECT_TRUE(translatesFixture)
+            << d.name << " never translates the FIXTURE path (looked for a line"
+                         " containing both '"
+            << d.fixtureSite << "' and '" << d.fixtureHelper
+            << "'). A launcher in another namespace cannot even be handed the"
+               " binary.";
+        EXPECT_TRUE(boundToTranslator)
+            << d.name << " names '" << d.segmentHelper
+            << "' at its segment records but never BINDS it to '"
+            << d.fixtureHelper
+            << "' on any live line. An intermediary that has stopped calling the"
+               " translator satisfies the per-record check above while"
+               " translating nothing.";
+        EXPECT_TRUE(guardsTheArgv)
+            << d.name
+            << " never calls the assert-translated guard. Translating at"
+               " construction is only safe with a net at the spawn point: a"
+               " future segment kind that adds a path argument must be refused"
+               " by name, not discovered three hours in.";
+        EXPECT_GE(segmentRecords, 3u)
+            << d.name << " has only " << segmentRecords
+            << " segment record(s) matching '" << d.segmentNeedle
+            << "' — the corpus engine builds three (tier, permutation resume,"
+               " tier resume), so this pin has stopped seeing them and is"
+               " vacuous. Fix the needle, do not delete the test.";
+
+        // THE LAUNCHER TRANSLATION GOES THROUGH THE RESOLVER. This is the "one
+        // implementation, two drivers" property stated as a needle: whatever a
+        // driver's helper is called, it must ASK harness_legs.py.
+        //
+        // ⚠ Deliberately NOT a blanket ban on the word `wslpath`: both drivers
+        // legitimately name it in their recipe-DERIVATION step, which spells a
+        // WSL path the Windows way for the manifest — the opposite direction and
+        // a different mechanism, tracked separately as
+        // D-HARNESS-STAGING-PATH-TRANSLATION-IS-HAND-ROLLED-AND-HOST-KEYED. A
+        // pin that outlawed the word would be "fixed" by renaming a variable.
+        // ★ OVER LIVE LINES, not raw text. Both drivers DOCUMENT these flags in
+        // their headers, so a raw-text search is satisfied by a comment — the
+        // same lesson `liveLines` already exists for. And each capability is
+        // pinned by the flag that ONLY its call site carries: `--env-transfers`
+        // (the vocabulary read) would be matched as a prefix of nothing else,
+        // but the RESOLUTION is `--carrier-current`, and that is what a driver
+        // losing the capability actually deletes.
+        bool asksForTranslation = false, asksForAssertion = false;
+        bool asksForEnvVocabulary = false, asksForEnvResolution = false;
+        for (auto const& line : lines) {
+            if (line.find("--translate-path") != std::string::npos) asksForTranslation = true;
+            if (line.find("--assert-translated") != std::string::npos) asksForAssertion = true;
+            if (line.find("--env-transfers") != std::string::npos) asksForEnvVocabulary = true;
+            if (line.find("--carrier-current") != std::string::npos) asksForEnvResolution = true;
+        }
+        EXPECT_TRUE(asksForTranslation && asksForAssertion)
+            << d.name
+            << " does not ask harness_legs.py to translate (--translate-path: "
+            << asksForTranslation << ") and guard (--assert-translated: "
+            << asksForAssertion
+            << ") its launcher paths. Its launcher translation is therefore"
+               " implemented somewhere inside this driver — and a capability"
+               " that exists in one driver and not the other is the silent"
+               " harness bug this file exists to end.";
+        EXPECT_TRUE(asksForEnvVocabulary && asksForEnvResolution)
+            << d.name
+            << " does not ask harness_legs.py how its run environment reaches a"
+               " launched process (--env-transfers: " << asksForEnvVocabulary
+            << ", --carrier-current: " << asksForEnvResolution
+            << "). On this driver's own host that may be a no-op today; a"
+               " capability present in one driver and absent from the other is"
+               " the defect regardless.";
+
+        // The forward list itself, ON ITS OWN CONSTRUCT.
+        bool forwardsThePatternList = false;
+        for (auto const& line : lines) {
+            if (line.find(d.forwardListSite) == std::string::npos) continue;
+            if (line.find("SQLITE_TEST_PATTERN_LIST") != std::string::npos &&
+                line.find("QUICKTEST_OMIT") != std::string::npos) {
+                forwardsThePatternList = true;
+            }
+            // NAMESPACE-NEUTRAL VALUES ONLY. Forwarding a HOST path into a
+            // foreign namespace is worse than not forwarding it: the child gets
+            // a path it cannot resolve and uses it anyway.
+            EXPECT_EQ(line.find("TCL_LIBRARY"), std::string::npos)
+                << d.name << " forwards a HOST PATH into the launcher's"
+                             " environment:\n  "
+                << line;
+            EXPECT_EQ(line.find("PATH'"), std::string::npos)
+                << d.name << " forwards this host's PATH into the launcher's"
+                             " environment:\n  "
+                << line;
+        }
+        EXPECT_TRUE(forwardsThePatternList)
+            << d.name << ": its forward list (" << d.forwardListSite
+            << ") does not name both SQLITE_TEST_PATTERN_LIST and"
+               " QUICKTEST_OMIT. The first is how the RESUME ENGINE selects its"
+               " files: MEASURED 2026-08-04, a launched fixture that could not"
+               " see it re-ran the corpus from the beginning after an abort and"
+               " reported it as progress.";
+    }
+}
+
+// A SUMMARY LINE IS NOT PROOF THAT A SUITE RAN. Both drivers must refuse a
+// segment that completed ZERO test files, whatever tester.tcl printed.
+//
+// MEASURED 2026-08-04 (TF-C116) and it is why this pin exists: an environment
+// variable that arrived EMPTY-BUT-SET through a cross-OS launcher made the tier
+// select no files at all; tester.tcl finalised and printed `0 errors out of 1
+// tests`; the driver reported "corpus GREEN — 0 errors out of 1 tests" beside
+// "0 test file(s) completed". A false pass is the worst outcome this harness can
+// produce, and the floor belongs in the verdict ladder rather than beside the
+// one cause that happened to expose it.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): delete the
+// zero-files-completed branch from either driver and this fails naming it.
+TEST_F(HarnessLegs, NeitherDriverCallsAZeroFileRunGreen) {
+    struct Driver {
+        char const* name;
+        bool        powershell;
+        char const* guard;   // the counter the branch must test
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false, "files_done"},
+                                   {"build-and-test.ps1", true, "$filesDone"}};
+    for (auto const& d : kDrivers) {
+        auto const lines = liveLines(harnessDir() / d.name, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+        bool hasFloor = false;
+        for (auto const& line : lines) {
+            if (line.find(d.guard) == std::string::npos) continue;
+            // `elif [[ "$files_done" -eq 0 ]]` / `} elseif ($filesDone -eq 0) {`
+            if (line.find("-eq 0") == std::string::npos) continue;
+            if (line.find("els") == std::string::npos &&
+                line.find("if") == std::string::npos) {
+                continue;
+            }
+            hasFloor = true;
+        }
+        EXPECT_TRUE(hasFloor)
+            << d.name << " has no verdict branch testing '" << d.guard
+            << " -eq 0'. Without it a run that executed NOTHING is reported"
+               " GREEN on the strength of tester.tcl's summary line — measured"
+               " 2026-08-04, `corpus GREEN — 0 errors out of 1 tests` beside `0"
+               " test file(s) completed`.";
     }
 }

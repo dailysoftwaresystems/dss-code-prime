@@ -354,6 +354,131 @@ function Invoke-PosixCommand($bashLine) {
   return @{ Rc = $LASTEXITCODE; Out = $out }
 }
 
+# ── THE LAUNCHER'S PATH NAMESPACE ────────────────────────────────────────────
+# D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS.
+#
+# A launcher does not always address files the way this driver does. Wine on
+# Linux does (`wine /home/me/x.exe`); `wsl.exe` does NOT — this driver holds a
+# drive-letter path and the callee needs `/mnt/c/...`. THE FAILURE MODE IS THE
+# REASON THIS IS NOT A ONE-LINE CONFIG ADDITION: an untranslated path is not
+# rejected as a bad path, it is opened as a RELATIVE file of that name, missed,
+# and the run reads as a broken binary rather than a harness defect.
+#
+# ★ NEITHER FUNCTION KNOWS WHAT `wslpath` IS, AND THAT IS DELIBERATE. The verb
+# comes off the resolved leg (`run.pathTranslation`, declared per LAUNCHER in
+# legs.json) and harness_legs.py performs it. Two drivers each hand-rolling a
+# `C:\ -> /mnt/c/` rewrite is the capability-pair defect this project keeps
+# paying for; and drive letters are remappable (/etc/wsl.conf `root=`), UNC is a
+# different mapping again, and case is not ours to guess.
+#
+# ★ `--assert-translated=` USES THE `=` FORM ON PURPOSE: a real fixture argv
+# carries `--start=full:`, and the space-separated spelling would have the
+# resolver's own argument parser read that as an option.
+#
+# ★ TWO POWERSHELL NATIVE-COMMAND TRAPS, both already paid for elsewhere in this
+# file and both handled here rather than rediscovered:
+#   · with `2>&1`, stderr arrives as ErrorRecord objects INTERLEAVED with stdout,
+#     so the translated path is not reliably `$out[0]`. The stdout lines are
+#     separated by TYPE, which is exact — an ErrorRecord is stderr, by
+#     construction — instead of by position;
+#   · PowerShell 7.3+ can make a nonzero-exiting native command THROW while
+#     $ErrorActionPreference is 'Stop', which would abort with a stack trace
+#     instead of the diagnostic below. Same try/catch shape as the leg plan's.
+function Convert-LaunchPath($verb, $p) {
+  if (-not $verb -or $verb -eq 'none') { return "$p" }
+  try {
+    $out = @(& $python3.Source $LegsPy '--path-translation' "$verb" '--translate-path' "$p" 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  $stdout = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+                     ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+  if ($rc -ne 0 -or $stdout.Count -lt 1) {
+    Die "could not translate '$p' into the launcher's path namespace (pathTranslation '$verb', rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      The leg's DECLARED launcher cannot be handed a path at all, so this run stops here rather than spawn it with one its callee would silently read as a relative filename."
+  }
+  return $stdout[0]
+}
+# The net under "translate at construction": every argument, at the ONE choke
+# point where the child is spawned. A future segment kind that adds a
+# path-valued argument and forgets to translate it is refused BY NAME here,
+# instead of failing three hours in looking like a fixture bug.
+#
+# ★ THE INVARIANT THE SEGMENT QUEUE RESTS ON, spelled in exactly one place: a
+# segment's FIRST argument is always the .test SCRIPT the fixture sources (its
+# Tcl `$argv0`) and is therefore always a PATH; every later argument is a bare
+# Tcl word (a permutation name) or a tester.tcl flag (`--start=<perm>:`) and is
+# never one. Assert-LaunchArgsTranslated is what catches a future segment kind
+# that breaks it, rather than that segment silently reading a relative filename.
+function Get-SegmentArgs($verb, $scriptPath, $rest) {
+  return @((Convert-LaunchPath $verb $scriptPath)) + @($rest | Where-Object { $null -ne $_ })
+}
+#
+# ── THE LAUNCHER'S ENVIRONMENT NAMESPACE ─────────────────────────────────────
+# The second half of the same fact, and it was found by MEASURING the first: a
+# launcher in another OS namespace does not inherit this driver's environment
+# any more than it understands its paths. ✔MEASURED 2026-08-04: a wsl.exe-
+# launched fixture saw SQLITE_TEST_PATTERN_LIST as EMPTY, so the corpus RESUME
+# ENGINE — which selects its files through exactly that variable — silently
+# re-ran the corpus FROM THE BEGINNING instead of from the abort point.
+#
+# ★★ ONLY A VARIABLE THAT IS ACTUALLY SET MAY BE CARRIED, AND THAT IS NOT
+# TIDINESS — IT IS THE DIFFERENCE BETWEEN A RUN AND A FALSE GREEN. MEASURED
+# 2026-08-04: naming an UNSET Windows variable in `WSLENV` materialises it INSIDE
+# WSL as EMPTY-BUT-EXISTING. sqlite's permutations.test asks
+# `info exists ::env(SQLITE_TEST_PATTERN_LIST)`, so an empty-but-existing value
+# is an EMPTY FILE LIST, not "no filter": the tier selected ZERO files, tester.tcl
+# still finalised and printed `0 errors out of 1 tests`, and the run was reported
+# GREEN. The forward list is therefore recomputed PER SEGMENT, from the values
+# actually in place at that moment.
+#
+# `Get-LaunchEnvCarrierName` is the per-leg half (the carrier's NAME does not
+# change); `Resolve-LaunchEnvCarrier` is the per-segment half. Both the name and
+# the list separator belong to the VERB, so both come from the resolver.
+function Get-LaunchEnvCarrierName($verb) {
+  if (-not $verb -or $verb -eq 'inherit') { return '' }
+  try { $vocab = @(& $python3.Source $LegsPy '--env-transfers' 2>&1); $rc = $LASTEXITCODE }
+  catch { $rc = 1; $vocab = @("$($_.Exception.Message)") }
+  if ($rc -ne 0) { Die "could not read the environment-transfer vocabulary (rc=$rc):`n$(($vocab | ForEach-Object { "      $_" }) -join "`n")" }
+  $carrier = ''
+  foreach ($line in $vocab) {
+    $parts = "$line".Split("`t")
+    if ($parts.Count -ge 2 -and $parts[0].Trim() -eq $verb) { $carrier = $parts[1].Trim() }
+  }
+  if (-not $carrier) { Die "envTransfer '$verb' declares no carrier variable, yet it is not 'inherit'. The resolver and this driver disagree about the vocabulary." }
+  return $carrier
+}
+function Resolve-LaunchEnvCarrier($verb, $names, $current) {
+  if (-not $verb -or $verb -eq 'inherit') { return @() }
+  # THE FILTER, and it is the load-bearing line of this function.
+  $wanted = @($names | Where-Object { $_ } |
+              Where-Object { [Environment]::GetEnvironmentVariable($_) })
+  if (-not $wanted.Count) { return @() }
+  $call = @('--env-transfer', "$verb", '--carrier-current', "$current")
+  foreach ($n in $wanted) { $call += @('--forward', "$n") }
+  try { $out = @(& $python3.Source $LegsPy @call 2>&1); $rc = $LASTEXITCODE }
+  catch { $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $out = @("$($_.Exception.Message)") }
+  if ($rc -ne 0) { Die "could not resolve the launcher's environment transfer (envTransfer '$verb', rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      Without it the launched fixture runs with an EMPTY run environment, which does not fail — it silently changes what the corpus does." }
+  return @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+                  ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+function Assert-LaunchArgsTranslated($verb, $argv) {
+  if (-not $verb -or $verb -eq 'none') { return }
+  $call = @('--path-translation', "$verb")
+  foreach ($a in @($argv)) { $call += "--assert-translated=$a" }
+  try {
+    $out = @(& $python3.Source $LegsPy @call 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  if ($rc -ne 0) {
+    Die "REFUSING to spawn the leg's launcher — an argument is still in THIS driver's path namespace, not the launcher's:`n$(($out | ForEach-Object { "      $_" }) -join "`n")"
+  }
+}
+
 # ── THE STAGED-SOURCE COHERENCE GATE ─────────────────────────────────────────
 # D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE. MEASURED 2026-08-04.
 #
@@ -661,7 +786,7 @@ foreach ($lg in $AllLegs) {
   $sel = if ($SelectedLabels -contains $lg.label) { ' ' } else { '-' }
   $runTxt = switch ($lg.run.mode) {
     'native'   { 'run: NATIVE' }
-    'launched' { "run: LAUNCHED via '$($lg.run.launcher -join ' ')'" }
+    'launched' { "run: LAUNCHED via '$($lg.run.launcher -join ' ')'$(if ("$($lg.run.pathTranslation)" -ne 'none') { " [paths -> $($lg.run.pathTranslation)]" })" }
     default    { "run: skip [$($lg.run.verdict)]" }
   }
   Info "  [$sel] $($lg.label.PadRight(15)) $($lg.spec.PadRight(34)) build: ATTEMPTED   $runTxt"
@@ -1967,13 +2092,22 @@ function Stop-OurFixtures($fixturePath, $why) {
 #     floor. That is a real limitation of the process sweep, not of the run, and
 #     it is reported at the call sites rather than papered over: killing by image
 #     name would be the workaround, and it would kill a developer's own qemu.
-function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap, $launcher) {
+#
+# $xlate is the launcher's DECLARED path namespace (legs.json `pathTranslation`)
+# and $launchExe is $exe already spelled in it — the fixture path is translated
+# ONCE per leg rather than once per segment. $exe itself stays in THIS driver's
+# namespace throughout, because the process sweep and every log line address the
+# file the way this driver does. The assertion below is the choke point: nothing
+# reaches the launcher still spelled the way we hold it.
+function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap, $launcher, $xlate, $launchExe) {
   $emptyIn = Join-Path ([System.IO.Path]::GetDirectoryName($logPath)) '.stdin-eof'
   Set-Content -LiteralPath $emptyIn -Value '' -NoNewline -Encoding ascii
   $launcher = @($launcher | Where-Object { $_ })
+  if (-not "$launchExe") { $launchExe = $exe }
   if ($launcher.Count) {
     $procExe  = $launcher[0]
-    $procArgs = @($launcher | Select-Object -Skip 1) + @($exe) + @($argv)
+    $procArgs = @($launcher | Select-Object -Skip 1) + @($launchExe) + @($argv)
+    Assert-LaunchArgsTranslated $xlate (@($launchExe) + @($argv))
   } else {
     $procExe  = $exe
     $procArgs = @($argv)
@@ -2193,11 +2327,18 @@ $fixture     = $legRec.Fixture
 $legOut      = $legRec.OutDir
 $LegRunMode  = $leg.run.mode
 $legLauncher = @($leg.run.launcher)
+# The launcher's DECLARED path namespace + this leg's fixture spelled in it.
+# Translated ONCE, here, so a per-segment path is the only other site.
+$legXlate    = "$($leg.run.pathTranslation)"
+$legLaunchFixture = Convert-LaunchPath $legXlate $fixture
 # CONFOUNDS ARE PER LEG AND EVERY ONE OF THEM WAS EARNED SOMEWHERE. See
 # Get-LegConfounds: a non-pe64 leg starts EMPTY rather than inheriting a list
 # measured on a platform it is not.
 $Confounds   = @(Get-LegConfounds $LegTag)
-Step "8/9  [$LegTag] $($leg.spec) — $Tier.test ($LegRunMode$(if ($legLauncher.Count) { ": $($legLauncher -join ' ')" }))"
+Step "8/9  [$LegTag] $($leg.spec) — $Tier.test ($LegRunMode$(if ($legLauncher.Count) { ": $($legLauncher -join ' ')" })$(if ($legXlate -and $legXlate -ne 'none') { "; paths -> '$legXlate' via '$($leg.run.pathTranslator -join ' ')'" }))"
+if ($legXlate -and $legXlate -ne 'none') {
+  Info "[$LegTag] the launcher addresses files in ANOTHER namespace — fixture $fixture -> $legLaunchFixture"
+}
 if ($Confounds.Count) {
   Info "[$LegTag] confound patterns in force ($($Confounds.Count)): $($Confounds -join ' ')$(if ($null -ne $ConfoundsOverride) { '   [operator DSS_CONFOUNDS — applied to EVERY leg]' } else { '   [EARNED on this leg]' })"
 } else {
@@ -2215,7 +2356,7 @@ $Ledger = Join-Path $legOut 'corpus-units.txt'
 # Segment queue. Segment 0 is EXACTLY today's invocation (`fixture <tier>.test`)
 # so a run with no abort is bit-for-bit the run it always was; resume segments are
 # only ever appended by an abort.
-$segments   = @(@{ Kind = 'tier'; Args = @($TestFile); Patterns = @(); Label = "$Tier.test"; Perm = '' })
+$segments   = @(@{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @()); Patterns = @(); Label = "$Tier.test"; Perm = '' })
 $results    = @()          # one Read-CorpusSegment record per segment actually run
 $aborts     = @()          # one record per abort — these NEVER disappear from the verdict
 $notReached = @()          # units we can prove were never given a chance
@@ -2247,6 +2388,20 @@ $oldOmit = $env:QUICKTEST_OMIT; $oldPatterns = $env:SQLITE_TEST_PATTERN_LIST
 $legEnvNames = @(); if ($leg.run.env) { $legEnvNames = @($leg.run.env.PSObject.Properties.Name | Where-Object { $_ }) }
 $oldLegEnv = @{}
 foreach ($en in $legEnvNames) { $oldLegEnv[$en] = [Environment]::GetEnvironmentVariable($en) }
+# ── the launcher's ENVIRONMENT namespace ─────────────────────────────────────
+# WHICH VARIABLES MAY CROSS IS THIS DRIVER'S KNOWLEDGE — it is the one that sets
+# them — and the rule is NAMESPACE-NEUTRAL VALUES ONLY. `$env:PATH` and
+# `$env:TCL_LIBRARY` are deliberately ABSENT: both hold HOST paths, and a foreign
+# fixture handed this host's PATH would be worse off than with its own. What must
+# cross are the two sqlite hooks the corpus engine steers with, plus whatever the
+# leg's launcher declared. HOW they cross belongs to the verb, not here.
+$legEnvVerb     = "$($leg.run.envTransfer)"
+$legForward     = @('SQLITE_TEST_PATTERN_LIST', 'QUICKTEST_OMIT') + $legEnvNames
+$legCarrierName = Get-LaunchEnvCarrierName $legEnvVerb
+$legCarrierOld  = if ($legCarrierName) { [Environment]::GetEnvironmentVariable($legCarrierName) } else { $null }
+if ($legCarrierName) {
+  Info "[$LegTag] the launcher does NOT inherit this driver's environment (envTransfer '$legEnvVerb') — variables that are SET at spawn time cross via $legCarrierName; candidates: $($legForward -join ', ')"
+}
 $si = 0
 while ($si -lt $segments.Count) {
   $seg = $segments[$si]
@@ -2266,12 +2421,20 @@ while ($si -lt $segments.Count) {
     # SQLITE_TEST_PATTERN_LIST is a Tcl LIST of globs; corpus basenames are
     # bare words, so a space join is a valid list.
     if ($seg.Patterns.Count) { $env:SQLITE_TEST_PATTERN_LIST = ($seg.Patterns -join ' ') } else { $env:SQLITE_TEST_PATTERN_LIST = $null }
-    $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap $legLauncher
+    # LAST, because it reads the variables set above: the launcher's declared
+    # environment TRANSFER, resolved PER SEGMENT from what is actually SET right
+    # now. For `inherit` this is empty and the block below is byte-for-byte the
+    # run it always was.
+    foreach ($a in (Resolve-LaunchEnvCarrier $legEnvVerb $legForward $legCarrierOld)) {
+      $kv = $a.Split('=', 2); [Environment]::SetEnvironmentVariable($kv[0], $kv[1])
+    }
+    $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap $legLauncher $legXlate $legLaunchFixture
     $segRc = $run.Rc
   } finally {
     $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
     foreach ($en in $legEnvNames) { [Environment]::SetEnvironmentVariable($en, $oldLegEnv[$en]) }
+    if ($legCarrierName) { [Environment]::SetEnvironmentVariable($legCarrierName, $legCarrierOld) }
   }
   if ($run.KillReason) { Warn "[$LegTag] segment $($si + 1) HUNG — killed: $($run.KillReason)"; $hygiene += "segment $($si + 1) TIMED OUT and was killed — $($run.KillReason)" }
   # POST-SEGMENT HYGIENE — a segment that spawned or left a fixture behind must not
@@ -2368,7 +2531,7 @@ while ($si -lt $segments.Count) {
   $after = Get-FilesAfter $CorpusFiles $boundary
   $resumes++; $lastBoundary = $boundary
   Info  "        -> resume $resumes/$($MaxResumes): permutations.test $perm, corpus files after $boundary"
-  $tail = @(@{ Kind = 'perm'; Args = @((Join-Path $StagedTestDir 'permutations.test'), $perm)
+  $tail = @(@{ Kind = 'perm'; Args = (Get-SegmentArgs $legXlate (Join-Path $StagedTestDir 'permutations.test') @($perm))
                Patterns = $after; Perm = $perm; Label = "permutations.test $perm (after $boundary)" })
   # (b) the tier continued from the NEXT permutation — the ORIGINAL tier script, so
   # every ifcapable/platform guard is evaluated by sqlite exactly as in a full run.
@@ -2378,7 +2541,7 @@ while ($si -lt $segments.Count) {
       $notReached += "every permutation after '$perm' in $([System.IO.Path]::GetFileName($TestFile)) — '$perm' is not one of its run_test_suite entries"
     } elseif ($permIdx -lt $TierPerms.Count - 1) {
       $next = $TierPerms[$permIdx + 1]
-      $tail += @{ Kind = 'tier'; Args = @($TestFile, "--start=${next}:"); Patterns = @(); Perm = $next
+      $tail += @{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @("--start=${next}:")); Patterns = @(); Perm = $next
                   Label = "$([System.IO.Path]::GetFileName($TestFile)) --start=${next}:" }
       Info  "        -> then: $([System.IO.Path]::GetFileName($TestFile)) --start=${next}:  (permutations $next..$($TierPerms[$TierPerms.Count - 1]))"
     }
@@ -2517,6 +2680,20 @@ if ($aborts.Count) {
   $unitVerdict = "FAIL: fixture did not complete the suite (crash?) — see $runlog"; $unitFail = $true
   Warn "[$LegTag] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
   Get-Content $runlog -Tail 6 | ForEach-Object { Info "      $_" }
+} elseif ($filesDone -eq 0) {
+  # ★★ A RUN THAT COMPLETED ZERO TEST FILES IS NOT GREEN, WHATEVER ITS SUMMARY
+  # LINE SAYS. MEASURED 2026-08-04 (TF-C116): with the corpus tier reduced to no
+  # files, tester.tcl still finalises and prints `0 errors out of 1 tests`, and
+  # this driver reported "corpus GREEN" beside "0 test file(s) completed" — a
+  # FALSE PASS from a run that executed nothing. The cause that day was one
+  # environment variable arriving EMPTY-BUT-SET through a cross-OS launcher, but
+  # the defect is this branch's absence: a summary line was treated as proof that
+  # a suite ran. The floor is structural and belongs here, not next to the cause.
+  $unitVerdict = "FAIL: the fixture completed ZERO test files yet printed a summary ($summaryText) — a suite that ran nothing is not a pass; see $runlog"
+  $unitFail = $true
+  Warn "[$LegTag] corpus FAIL — 0 test file(s) completed, though the fixture printed '$summaryText'."
+  Info "      A tier that selects no files still finalises and reports a summary. That is not a run."
+  Get-Content $runlog -Tail 6 | ForEach-Object { Info "      $_" }
 } elseif ($totalErrors -gt 0 -and $failNames.Count -eq 0) {
   $unitVerdict = "FAIL: $totalErrors error(s) but no failure markers ('Failures on these tests:' / '! <name>') to classify — see $runlog"; $unitFail = $true
   Warn "[$LegTag] corpus FAIL — $summaryText (unclassifiable — no failure markers)"
@@ -2556,7 +2733,7 @@ if ($TierExcludes.Count) {
 # test result. A leg that ran and failed is `1 verified … 0 poisoned` plus a
 # non-zero exit, not a vanished leg.
 $legRec.Verdict     = 'ran'
-$legRec.Detail      = "$LegRunMode$(if ($legLauncher.Count) { " via '$($legLauncher -join ' ')'" }) — $unitVerdict"
+$legRec.Detail      = "$LegRunMode$(if ($legLauncher.Count) { " via '$($legLauncher -join ' ')'" })$(if ($legXlate -and $legXlate -ne 'none') { " [paths -> $legXlate]" }) — $unitVerdict"
 $legRec.UnitVerdict = $unitVerdict
 $legRec.UnitFail    = $unitFail
 $legRec.Ledger      = $Ledger

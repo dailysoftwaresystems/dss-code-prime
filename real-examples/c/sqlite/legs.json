@@ -1,7 +1,7 @@
 {
   "$comment": "THE SQLITE HARNESS LEG CATALOGUE — the declared, HOST-FREE answer to 'which targets does this harness build?'. D-HARNESS-CROSS-HOST-ANY-TARGET item (2). ★ THE RULE THIS FILE EXISTS TO ENFORCE: the set of legs is a property of the HARNESS, not of the machine running it. Read this file on Windows, on Linux, on an arm64 VPS or on a Mac and you get the SAME five legs. What the host changes is ONLY whether it can EXECUTE a leg's artifact — a separate question, answered by `runOn` + `launchers` below and never by an `if host == ...` in a driver. Before this file existed, build-and-test.sh derived its leg list from `uname` (pe64 was unreachable from any host, macho only from a Mac) and build-and-test.ps1 refused to start unless $IsWindows (pe64 was its ONLY leg, hardcoded). Each driver therefore conflated HOST with TARGET, which is the opposite of the user's hard requirement: 'build ANY target inside ANY host, this MUST work.'",
 
-  "$vocabularyComment": "The declaration vocabulary is the CORPUS's, not a new one: `spec` and `runOn` mean exactly what they mean in examples/**/expected.json, and the verdicts a driver records for a leg come from the closed 7+1-name set in tests/test_support/arm_verdict_ledger.hpp (pinned by tests/harness/test_sqlite_harness_legs.cpp, which compares this catalogue's resolver output against that C++ enum). `launchers` is the ONE strict extension: the corpus's `emulator` key covers a cross-ARCH host on the SAME OS, and this harness additionally needs the cross-OS case (a pe64 artifact under Wine on Linux), so both are expressed as one ordered list of declared launchers keyed by (hostOs, hostArch). Absence of a matching launcher entry IS the 'none declared' declaration — there is no empty-string spelling, so a reader cannot mistake 'we looked and there is none' for 'nobody filled this in'.",
+  "$vocabularyComment": "The declaration vocabulary is the CORPUS's, not a new one: `spec` and `runOn` mean exactly what they mean in examples/**/expected.json, and the verdicts a driver records for a leg come from the closed 7+1-name set in tests/test_support/arm_verdict_ledger.hpp (pinned by tests/harness/test_sqlite_harness_legs.cpp, which compares this catalogue's resolver output against that C++ enum). `launchers` is the ONE strict extension: the corpus's `emulator` key covers a cross-ARCH host on the SAME OS, and this harness additionally needs the cross-OS case (a pe64 artifact under Wine on Linux), so both are expressed as one ordered list of declared launchers keyed by (hostOs, hostArch). Absence of a matching launcher entry IS the 'none declared' declaration — there is no empty-string spelling, so a reader cannot mistake 'we looked and there is none' for 'nobody filled this in'. ★ EVERY launcher entry additionally declares `pathTranslation`: the PATH NAMESPACE its argv lives in, from the closed set in harness_legs.py (`none`, `windows-to-wsl`). It is required on every entry, never defaulted, for the same reason `zconfGuards` is: a reader must not have to know a default, and `none` — 'this launcher takes the driver's paths verbatim' — is a CLAIM about the launcher, not an absence. It exists because a launcher need not share a filesystem namespace with the driver that spawns it: `wine /home/me/x.exe` takes the driver's own path, `wsl.exe` needs `/mnt/c/...` where the driver holds a drive-letter path, and an untranslated path does not fail as a path error — the callee opens a relative file by that name, misses, and the run reads as a broken binary. The verb is resolved and APPLIED by harness_legs.py (`--translate-path` / `--assert-translated`), so the translator is named in one file and not in two drivers. ★★ AND `envTransfer`, THE SECOND HALF OF THE SAME FACT, found by measuring the first: a launcher in another OS namespace does not inherit the driver's ENVIRONMENT either. ✔MEASURED 2026-08-04 — a `wsl.exe`-launched fixture saw `SQLITE_TEST_PATTERN_LIST` and `QUICKTEST_OMIT` as EMPTY, so the corpus RESUME ENGINE (which selects its files through that variable) silently re-ran the corpus from the beginning instead of from the abort point: a harness that looks like it is working and is not. `inherit` = the child gets this driver's environment block (qemu, Wine, `arch`); `wslenv` = each variable must be NAMED in the `WSLENV` carrier. Resolved by harness_legs.py (`--env-transfer`), so the carrier and its separator are spelled once.",
 
   "$noHostKeyingComment": "NOTHING in this file may be keyed on the host. `build.libraries.searchPaths` is the one place host-shaped STRINGS appear, and they are CANDIDATES, not decisions: every path is tried on every host, a hit is used and a miss costs nothing. A driver that skips a search path because of the host it is on has reintroduced the defect. ⚠ If you are tempted to add a `\"onlyOnHost\"` key here, stop: the question you are answering is either 'can this host EXECUTE it' (that is `runOn`/`launchers`) or 'is a declared build input present' (that is a filesystem probe whose failure is the LOUD `skipped-build-input-missing` verdict) — never 'is this leg allowed to exist'.",
 
@@ -14,10 +14,14 @@
       "label": "elf64-x86_64",
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "runOn": ["linux"],
-      "$launchersComment": "qemu-x86_64 lets an arm64 Linux host run this leg. ★ NOTE THE ASYMMETRY WITH THE CORPUS, which is a finding and not a copy error: examples/**/expected.json declares NO emulator on its (x86_64, linux) arms, so on the native arm64 Linux VPS every one of them is a structural skip even though qemu-x86_64 exists. This catalogue declares it; the corpus's omission is tracked separately (D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST).",
+      "$launchersComment": "qemu-x86_64 lets an arm64 Linux host run this leg. ★ NOTE THE ASYMMETRY WITH THE CORPUS, which is a finding and not a copy error: examples/**/expected.json declares NO emulator on its (x86_64, linux) arms, so on the native arm64 Linux VPS every one of them is a structural skip even though qemu-x86_64 exists. This catalogue declares it; the corpus's omission is tracked separately (D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST). ★★ `wsl.exe` IS THE SECOND ENTRY AND IT CLOSES D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. A Windows host BUILDS this leg (TF-C115 did) and could always have RUN it — the artefact built by build-and-test.ps1 passed 330,436 tests under WSL BY HAND — but nothing declared the launcher, so the driver recorded `skipped-by-runOn` beside a binary it had just produced. It is not a plain command entry: wsl.exe lives in a DIFFERENT PATH NAMESPACE from the driver that spawns it (`pathTranslation`) AND in a different ENVIRONMENT namespace (`envTransfer`). The second was found by measuring the first — with paths translated but the environment assumed to inherit, the corpus resume engine's file selection arrived EMPTY and the resume re-ran the whole corpus while looking like it worked.",
       "launchers": [
         { "hostOs": "linux", "hostArch": "arm64", "command": ["qemu-x86_64"],
-          "env": { "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu" } }
+          "env": { "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu" },
+          "pathTranslation": "none", "envTransfer": "inherit" },
+        { "hostOs": "windows", "hostArch": "x86_64", "command": ["wsl.exe", "--"],
+          "env": {},
+          "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv" }
       ],
       "build": {
         "recipeTransform": "none",
@@ -39,9 +43,14 @@
       "label": "elf64-arm64",
       "spec": "arm64:elf64-aarch64-linux-exec",
       "runOn": ["linux"],
+      "$launchersComment": "qemu-aarch64 for a cross-ARCH Linux host, and `wsl.exe` for the cross-OS case — the same pair, one arch over. ⚠ THE wsl.exe ENTRY IS DECLARED AND NOT MEASURED, and it is labelled so rather than omitted: WSL2 runs the HOST's architecture, so an arm64 Windows box runs an arm64 Linux distro and therefore this leg (DOCUMENTED, Microsoft's WSL2-on-ARM64 support; no arm64 Windows machine exists in this project to measure it on). Omitting it would have been the worse error — it would say `wsl.exe only works for x86_64`, which is a claim about the launcher that is FALSE, and a Windows/arm64 host would then record `skipped-by-runOn` for the one Linux target it can actually execute.",
       "launchers": [
         { "hostOs": "linux", "hostArch": "x86_64", "command": ["qemu-aarch64"],
-          "env": { "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu" } }
+          "env": { "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu" },
+          "pathTranslation": "none", "envTransfer": "inherit" },
+        { "hostOs": "windows", "hostArch": "arm64", "command": ["wsl.exe", "--"],
+          "env": {},
+          "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv" }
       ],
       "build": {
         "recipeTransform": "none",
@@ -64,8 +73,10 @@
       "runOn": ["windows"],
       "$launchersComment": "Wine is the declared cross-OS launcher. It is a DECLARATION, not a claim that it is installed: a host without it records `skipped-emulator-missing` (environmental, loud, promotable to a hard failure) rather than vanishing. No launcher is declared for a non-x86_64 host: Wine alone does not emulate the ISA.",
       "launchers": [
-        { "hostOs": "linux",  "hostArch": "x86_64", "command": ["wine"], "env": {} },
-        { "hostOs": "darwin", "hostArch": "x86_64", "command": ["wine"], "env": {} }
+        { "hostOs": "linux",  "hostArch": "x86_64", "command": ["wine"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit" },
+        { "hostOs": "darwin", "hostArch": "x86_64", "command": ["wine"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit" }
       ],
       "build": {
         "$recipeTransformComment": "The recipe is derived from a POSIX `make -n`, so it carries that build host's configure/zlib feature probes (HAVE_*/Z_HAVE_*/_HAVE_SQLITE_CONFIG_H) — facts about the DERIVING host, never about this target. `windows-selfconfig` drops them and adds SQLITE_OS_WIN=1 so SQLite self-configures its Windows build. Keyed on THIS LEG, which is why the rule moved out of gen-pe64-manifest.py's prose ('this generator is pe-only, so keying the rule on the pe target is inherent here') into a declaration any driver can read.",
@@ -120,7 +131,8 @@
       "$launchersComment": "Rosetta 2 runs an x86_64 Mach-O on Apple Silicon TRANSPARENTLY, i.e. with no launcher command — but this harness will not model that as 'native', because it is not: it depends on a translation layer that may be absent. `arch -x86_64` is the declared, observable launcher; `arch` is present on every Mac, so a Rosetta-less machine fails at RUN time with a real error instead of a silent pass.",
       "runOn": ["darwin"],
       "launchers": [
-        { "hostOs": "darwin", "hostArch": "arm64", "command": ["arch", "-x86_64"], "env": {} }
+        { "hostOs": "darwin", "hostArch": "arm64", "command": ["arch", "-x86_64"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit" }
       ],
       "build": {
         "recipeTransform": "none",

@@ -49,6 +49,11 @@ USAGE
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json|sh]
                          [--launchers-available a,b,... | --launchers-none]
   harness_legs.py --header-stages
+  harness_legs.py --path-translations
+  harness_legs.py --path-translation VERB --translate-path PATH [--translate-path …]
+  harness_legs.py --path-translation VERB --assert-translated ARG [--assert-translated …]
+  harness_legs.py --env-transfers
+  harness_legs.py --env-transfer VERB --forward NAME [--forward NAME …] [--carrier-current V]
   harness_legs.py --lint
   harness_legs.py --self-test
 """
@@ -89,6 +94,153 @@ VERDICTS = [
 # LOUD lint failure rather than a silently-ignored typo.
 LIBRARY_PROVIDERS = {"host-system", "ubuntu-ports-arm64", "search-paths"}
 RECIPE_TRANSFORMS = {"none", "windows-selfconfig"}
+
+# ── Launcher path translation ───────────────────────────────────────────────
+#
+# D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. A launcher does not always share
+# a path NAMESPACE with the driver that spawns it. Wine on Linux does (`wine
+# /home/me/x.exe` — the argument is the driver's own path, verbatim); `wsl.exe`
+# on Windows does NOT (the driver holds `C:\...\testfixture`, the callee needs
+# `/mnt/c/.../testfixture`). Handing an untranslated path to a launcher of the
+# second kind does not fail as a path error: the callee opens a RELATIVE file
+# named `C:\...`, does not find it, and the run reads as a broken binary.
+#
+# So the namespace is DECLARED, per launcher, from this closed vocabulary — never
+# inferred from the host, and never from the launcher's name. Two launchers on the
+# same host can want different answers (a future ssh launcher on Windows would
+# need a third verb), and the same launcher on two hosts wants the same one.
+#
+# Each verb owns everything its translation needs, as DATA:
+#   translator   the argv that performs it, with the path appended. [] = identity.
+#   sourceShape  the FOREIGN-PATH predicate (below), used three ways: an input
+#                MUST match it (else it is not a path in the namespace we
+#                translate from), an output must NOT, and no argument handed to
+#                a launcher may still match it at spawn time.
+#   separator    [from, to] applied before the translator runs. [] = untouched.
+#   validHostOs  the only host OS on which this namespace exists, so the lint can
+#                CHECK a declaration instead of trusting it. "" = any.
+PATH_TRANSLATIONS = {
+    "none": {
+        "translator": [],
+        "sourceShape": "",
+        "separator": [],
+        "validHostOs": "",
+    },
+    "windows-to-wsl": {
+        # `wslpath` is the translator because the parts that bite are its job:
+        # the drive-letter -> mount-point mapping is configurable (/etc/wsl.conf
+        # `root=`), UNC paths are a different mapping again, and case is not
+        # ours to guess. Hand-rolled `C:\` -> `/mnt/c/` string surgery gets all
+        # three wrong quietly.
+        "translator": ["wsl.exe", "wslpath", "-a", "-u"],
+        "sourceShape": "windows-drive",
+        # ✔MEASURED 2026-08-04 on this host: `wsl.exe wslpath -a -u 'C:\a\b'`
+        # exits 1 and prints `wslpath: C:ab` — the backslashes are eaten before
+        # wslpath ever sees them. The forward-slash spelling of the SAME path
+        # exits 0 and yields /mnt/c/a/b. Normalising the separator is not path
+        # surgery: `/` is accepted by every Windows path API and `\` is never a
+        # filename character there, so this is a re-spelling of the same string,
+        # and everything that actually varies is still wslpath's to decide.
+        "separator": ["\\", "/"],
+        "validHostOs": "windows",
+    },
+}
+
+
+def _looks_like_windows_drive_path(arg):
+    """`C:\\x`, `c:/x`, `--out=D:\\y`, or a `\\\\server\\share` UNC.
+
+    Scans the WHOLE argument rather than only its head: a path that arrives
+    embedded in a `--flag=<path>` is exactly as untranslated as a bare one, and
+    the point of this predicate is that nothing untranslated reaches a launcher.
+    A false positive here stops the run with a nameable reason, which is the
+    direction a harness should fail in."""
+    for i in range(max(0, len(arg) - 2)):
+        if arg[i].isalpha() and arg[i + 1] == ":" and arg[i + 2] in "\\/":
+            return True
+    return arg.startswith("\\\\")
+
+
+# shape name -> predicate. A `sourceShape` naming no entry here is a LegError,
+# not a silently-true test.
+FOREIGN_PATH_SHAPES = {
+    "windows-drive": _looks_like_windows_drive_path,
+}
+
+
+# ── Launcher environment transfer ───────────────────────────────────────────
+#
+# THE SECOND HALF OF THE SAME FORK, and it was found by MEASURING the first.
+# A launcher that lives in another OS namespace does not inherit the driver's
+# environment any more than it understands the driver's paths.
+#
+# ✔MEASURED 2026-08-04 on this host: with `SQLITE_TEST_PATTERN_LIST` and
+# `QUICKTEST_OMIT` set in the Windows parent, `wsl.exe -- sh -c 'echo …'` prints
+# BOTH as EMPTY. With `WSLENV` naming them, both arrive intact. The consequence
+# was observed live, not argued: the corpus resume engine passes its file
+# selection through SQLITE_TEST_PATTERN_LIST, so under a wsl.exe launcher the
+# resume silently re-ran the corpus FROM THE BEGINNING instead of from the abort
+# point — a harness that looks like it is working and is not.
+#
+# ⚠ AND THE SHARP EDGE, MEASURED THE HARD WAY THE SAME DAY: naming an UNSET
+# variable in the carrier does NOT leave it unset on the other side — it arrives
+# EMPTY BUT EXISTING. sqlite's permutations.test asks `info exists
+# ::env(SQLITE_TEST_PATTERN_LIST)`, so an empty-but-existing value is an EMPTY
+# FILE LIST, not "no filter": the tier selected ZERO files, tester.tcl still
+# finalised and printed `0 errors out of 1 tests`, and the driver called the run
+# GREEN. THIS FUNCTION DOES NOT KNOW WHICH VARIABLES ARE SET — the caller does,
+# and both drivers filter to the ones that are, per segment, before calling.
+#
+# Same shape as the path namespace, for the same reason: DECLARED per launcher,
+# closed vocabulary, unknown verb is a LOUD lint failure.
+#   nameCarrier  the variable whose VALUE is the list of names to forward.
+#                "" = the child simply inherits and nothing is needed.
+#   separator    how that list is joined.
+#   validHostOs  the only host OS the mechanism exists on, so the lint can CHECK.
+ENV_TRANSFERS = {
+    "inherit": {"nameCarrier": "", "separator": "", "validHostOs": ""},
+    "wslenv": {"nameCarrier": "WSLENV", "separator": ":", "validHostOs": "windows"},
+}
+
+
+def env_transfer(verb):
+    """The declared verb's spec, or a LegError — never a permissive default.
+    Defaulting to `inherit` for an unknown verb is exactly the silent-empty-
+    environment failure this vocabulary exists to prevent."""
+    spec = ENV_TRANSFERS.get(verb)
+    if spec is None:
+        raise LegError(
+            "unknown envTransfer %r (known: %s). A launcher declares how the "
+            "driver's run environment reaches the process it spawns; an "
+            "unrecognised verb cannot be silently treated as 'inherit', because "
+            "'inherit' is itself a claim — that the child sees this driver's "
+            "environment block."
+            % (verb, ", ".join(sorted(ENV_TRANSFERS))))
+    return spec
+
+
+def env_carrier_assignments(verb, names, current=""):
+    """The extra `NAME=VALUE` assignments the driver must make so that `names`
+    are visible to the launched process. Empty for a verb that inherits.
+
+    `current` is any value the carrier already holds, so an operator's own
+    setting survives — the merge, and the separator it uses, belong here rather
+    than in two drivers."""
+    spec = env_transfer(verb)
+    carrier = spec["nameCarrier"]
+    if not carrier:
+        return []
+    wanted = [n for n in names if n]
+    if not wanted:
+        return []
+    sep = spec["separator"]
+    have = [x for x in (current or "").split(sep) if x]
+    merged = list(have)
+    for n in wanted:
+        # `WSLENV` entries may carry a `/u`-style suffix; compare on the NAME.
+        if not any(h == n or h.startswith(n + "/") for h in merged):
+            merged.append(n)
+    return ["%s=%s" % (carrier, sep.join(merged))]
 
 # The zconf.h guards `./configure` may have baked into the DERIVING host's zlib
 # header, and which each leg therefore has to declare for ITS OWN target. Closed,
@@ -269,6 +421,106 @@ def launcher_available(command, available):
     return shutil.which(exe) is not None
 
 
+# ── Path translation ────────────────────────────────────────────────────────
+
+def path_translation(verb):
+    """The declared verb's spec, or a LegError. Never a permissive default: an
+    unknown verb that silently meant "none" would pass every path through
+    untranslated, which is the exact failure this vocabulary exists to prevent."""
+    spec = PATH_TRANSLATIONS.get(verb)
+    if spec is None:
+        raise LegError(
+            "unknown pathTranslation %r (known: %s). A launcher declares the "
+            "PATH NAMESPACE its argv lives in; an unrecognised verb cannot be "
+            "silently treated as 'none', because 'none' is itself a claim — that "
+            "the launcher takes this driver's paths verbatim."
+            % (verb, ", ".join(sorted(PATH_TRANSLATIONS))))
+    return spec
+
+
+def looks_untranslated(verb, arg):
+    """Does `arg` still look like a path in the namespace `verb` translates FROM?
+    Always False for a verb that translates nothing."""
+    shape = path_translation(verb)["sourceShape"]
+    if not shape:
+        return False
+    predicate = FOREIGN_PATH_SHAPES.get(shape)
+    if predicate is None:
+        raise LegError("pathTranslation %r names foreign-path shape %r, which "
+                       "nothing implements" % (verb, shape))
+    return predicate(arg)
+
+
+def translate_path(verb, raw, runner=None):
+    """`raw`, spelled the way the launcher declaring `verb` addresses it.
+
+    Fails loud on every step: an input that is not in the source namespace, a
+    translator that is absent, a non-zero rc, empty output, or output that STILL
+    looks like a source-namespace path. `runner` is injected by the self-test so
+    the contract can be exercised without the translator being installed."""
+    spec = path_translation(verb)
+    if not spec["translator"]:
+        return raw
+    if not looks_untranslated(verb, raw):
+        raise LegError(
+            "pathTranslation '%s' was asked to translate %r, which is not a "
+            "path in the namespace it translates FROM (%s). Translating it "
+            "would resolve it against the translator's own working directory "
+            "and produce a plausible-looking wrong answer."
+            % (verb, raw, spec["sourceShape"]))
+    text = raw
+    sep = spec["separator"]
+    if sep:
+        text = text.replace(sep[0], sep[1])
+    argv = list(spec["translator"]) + [text]
+    if runner is None:
+        runner = _run_translator
+    rc, out, err = runner(argv)
+    out = out.strip()
+    if rc != 0 or not out:
+        raise LegError(
+            "pathTranslation '%s' FAILED for %r: `%s` exited %s%s. The launcher "
+            "that declared this verb cannot be given a path at all, so the run "
+            "must stop rather than hand it one the callee will misread as a "
+            "relative filename."
+            % (verb, raw, " ".join(argv), rc,
+               (" — " + (err.strip() or out)) if (err.strip() or out) else ""))
+    if looks_untranslated(verb, out):
+        raise LegError(
+            "pathTranslation '%s' returned %r for %r, which is STILL a %s path "
+            "— the translator ran but did not translate."
+            % (verb, out, raw, spec["sourceShape"]))
+    return out
+
+
+def _run_translator(argv):
+    """(rc, stdout, stderr). rc is taken DIRECTLY off the process."""
+    import subprocess  # local: nothing else in this resolver spawns anything.
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return 127, "", "%s" % exc
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def assert_translated(verb, args):
+    """Every argument about to be handed to a launcher is in ITS namespace.
+
+    The net under "translate at construction": a caller that adds a new
+    path-valued argument and forgets to translate it gets a named refusal here
+    instead of a test failure three hours in that looks like a fixture bug."""
+    for i, arg in enumerate(args):
+        if looks_untranslated(verb, arg):
+            raise LegError(
+                "argument %d of the launcher command line is still a %s path: "
+                "%r. This launcher declares pathTranslation '%s', so every PATH "
+                "in its argv must be translated first — a callee in the other "
+                "namespace does not report this as a bad path, it opens a "
+                "relative file by that name, misses, and the failure reads as a "
+                "broken binary."
+                % (i, path_translation(verb)["sourceShape"], arg, verb))
+
+
 # ── The one decision ────────────────────────────────────────────────────────
 
 def plan_leg(leg, host_os, host_arch, available):
@@ -285,7 +537,12 @@ def plan_leg(leg, host_os, host_arch, available):
     os_ok = host_os in run_on
     arch_ok = host_arch == arch
 
-    run = {"mode": None, "launcher": [], "env": {}, "verdict": None, "detail": ""}
+    # `pathTranslation` is ALWAYS present and ALWAYS a declared verb — "none" for
+    # a native run, because "this driver's paths are the ones the callee sees" is
+    # a claim worth stating rather than an absence a driver has to interpret.
+    run = {"mode": None, "launcher": [], "env": {}, "verdict": None, "detail": "",
+           "pathTranslation": "none", "pathTranslator": [],
+           "envTransfer": "inherit"}
 
     if os_ok and arch_ok:
         run["mode"] = "native"
@@ -302,20 +559,46 @@ def plan_leg(leg, host_os, host_arch, available):
                                "command is neither a declaration nor a denial"
                                % (leg["label"], entry.get("hostOs"),
                                   entry.get("hostArch")))
-            if launcher_available(command, available):
+            # The launcher's PATH NAMESPACE, declared by the entry. A verb the
+            # resolver does not know raises rather than degrading to "none":
+            # "none" means the launcher takes this driver's paths VERBATIM, and
+            # guessing that for a launcher that does not is the whole defect.
+            verb = entry.get("pathTranslation", "none")
+            xlate = path_translation(verb)
+            translator = list(xlate["translator"])
+            # The launcher's ENVIRONMENT namespace, declared beside its path
+            # namespace. Same refusal on an unknown verb, same reason.
+            env_verb = entry.get("envTransfer", "inherit")
+            env_transfer(env_verb)
+            # A launcher is USABLE only if its translator is too. They are one
+            # capability: `wsl.exe` present with no distro behind it resolves
+            # neither, and the honest verdict for that machine is the
+            # environmental skip, not a run that dies on its first path.
+            needed = [command] + ([translator] if translator else [])
+            missing = [c for c in needed if not launcher_available(c, available)]
+            if not missing:
                 run["mode"] = "launched"
                 run["launcher"] = command
                 run["env"] = dict(entry.get("env", {}))
+                run["pathTranslation"] = verb
+                run["pathTranslator"] = translator
+                run["envTransfer"] = env_verb
                 run["detail"] = ("host %s/%s cannot run %s natively; declared "
-                                 "launcher '%s' is available"
-                                 % (host_os, host_arch, spec, " ".join(command)))
+                                 "launcher '%s' is available%s"
+                                 % (host_os, host_arch, spec, " ".join(command),
+                                    "" if not translator else
+                                    " (paths translated into its namespace by "
+                                    "'%s', pathTranslation '%s')"
+                                    % (" ".join(translator), verb)))
             else:
                 run["mode"] = "skip"
                 run["verdict"] = "skipped-emulator-missing"
-                run["detail"] = ("declared launcher '%s' for host %s/%s is not on "
-                                 "PATH — install it (or set DSS_STRICT_ARM_VERDICTS=1 "
-                                 "to make this a hard failure)"
-                                 % (" ".join(command), host_os, host_arch))
+                run["detail"] = ("declared launcher '%s' for host %s/%s is not "
+                                 "usable: %s not on PATH — install it (or set "
+                                 "DSS_STRICT_ARM_VERDICTS=1 to make this a hard "
+                                 "failure)"
+                                 % (" ".join(command), host_os, host_arch,
+                                    " and ".join(c[0] for c in missing)))
         elif os_ok:
             # Same OS, different arch, nothing declared. The corpus's
             # SkippedNoEmulatorDeclared, meaning-for-meaning.
@@ -395,6 +678,17 @@ def emit_sh(resolved):
         put("LEG_LAUNCH", " ".join(q(x) for x in run["launcher"]))
         put("LEG_LAUNCH_ENV",
             " ".join("%s=%s" % (k, q(v)) for k, v in sorted(run["env"].items())))
+        # The launcher's PATH NAMESPACE + the argv that maps into it. The driver
+        # never performs the translation itself — it calls this resolver back
+        # (`--translate-path`), so `wslpath` is named in exactly one file. The
+        # translator argv is emitted anyway so a build log can state, per leg,
+        # HOW its paths were translated.
+        put("LEG_PATH_TRANSLATION", run["pathTranslation"])
+        put("LEG_PATH_TRANSLATOR", " ".join(q(x) for x in run["pathTranslator"]))
+        # How the driver's run environment reaches the launched process. Same
+        # story as the path namespace: the driver reads the VERB and asks this
+        # resolver to turn it into assignments (`--env-transfer`).
+        put("LEG_ENV_TRANSFER", run["envTransfer"])
         put("LEG_RECIPE_TRANSFORM", b.get("recipeTransform", "none"))
         # The leg's OWN staged-header directory name + the guards that made it.
         # The driver joins the key onto its zinc/ root; it never decides the
@@ -488,6 +782,75 @@ def lint(path=CATALOGUE):
                                 "how 'no launcher exists' is spelled"
                                 % (label, entry["hostOs"], entry["hostArch"], cmd))
                 continue
+            # ── the launcher's PATH NAMESPACE ──────────────────────────────
+            # Declared on EVERY entry, explicitly, for the same reason every
+            # zconf guard is: a reader must never have to know a default, and
+            # "this launcher takes my paths verbatim" is a claim, not a silence.
+            if "pathTranslation" not in entry:
+                findings.append(
+                    "leg '%s': launcher for (%s, %s) declares no "
+                    "pathTranslation. Every launcher states the PATH NAMESPACE "
+                    "its argv lives in — 'none' when it takes this driver's "
+                    "paths verbatim (Wine, qemu), a named verb when it does not "
+                    "(known: %s). Omitting it is how a launcher comes to be "
+                    "handed a path its callee reads as a relative filename."
+                    % (label, entry["hostOs"], entry["hostArch"],
+                       ", ".join(sorted(PATH_TRANSLATIONS))))
+            else:
+                verb = entry["pathTranslation"]
+                if verb not in PATH_TRANSLATIONS:
+                    findings.append(
+                        "leg '%s': launcher for (%s, %s) declares unknown "
+                        "pathTranslation %r (known: %s) — a verb nothing "
+                        "implements is a declaration that reads as "
+                        "configuration and is not"
+                        % (label, entry["hostOs"], entry["hostArch"], verb,
+                           ", ".join(sorted(PATH_TRANSLATIONS))))
+                else:
+                    # DERIVABLE, so it is checked rather than trusted: a path
+                    # namespace belongs to a host OS. `windows-to-wsl` on a
+                    # Linux host would translate a path shape that host cannot
+                    # produce, using a tool it does not have.
+                    want_os = PATH_TRANSLATIONS[verb]["validHostOs"]
+                    if want_os and entry["hostOs"] != want_os:
+                        findings.append(
+                            "leg '%s': launcher for (%s, %s) declares "
+                            "pathTranslation '%s', whose source namespace only "
+                            "exists on a '%s' host — so on this host there is "
+                            "no such path to translate and no translator to do "
+                            "it with"
+                            % (label, entry["hostOs"], entry["hostArch"], verb,
+                               want_os))
+            # ── the launcher's ENVIRONMENT namespace ───────────────────────
+            # Declared on EVERY entry too. A launcher whose child cannot see the
+            # driver's run environment does not fail — it runs with an EMPTY one,
+            # which is how a resume engine came to re-run a whole corpus.
+            if "envTransfer" not in entry:
+                findings.append(
+                    "leg '%s': launcher for (%s, %s) declares no envTransfer. "
+                    "Every launcher states how the driver's run environment "
+                    "reaches the process it spawns — 'inherit' when the child "
+                    "gets this driver's environment block (qemu, Wine, arch), a "
+                    "named verb when it does not (known: %s)."
+                    % (label, entry["hostOs"], entry["hostArch"],
+                       ", ".join(sorted(ENV_TRANSFERS))))
+            else:
+                everb = entry["envTransfer"]
+                if everb not in ENV_TRANSFERS:
+                    findings.append(
+                        "leg '%s': launcher for (%s, %s) declares unknown "
+                        "envTransfer %r (known: %s)"
+                        % (label, entry["hostOs"], entry["hostArch"], everb,
+                           ", ".join(sorted(ENV_TRANSFERS))))
+                else:
+                    want_os = ENV_TRANSFERS[everb]["validHostOs"]
+                    if want_os and entry["hostOs"] != want_os:
+                        findings.append(
+                            "leg '%s': launcher for (%s, %s) declares "
+                            "envTransfer '%s', whose carrier only exists on a "
+                            "'%s' host"
+                            % (label, entry["hostOs"], entry["hostArch"], everb,
+                               want_os))
             if entry["hostOs"] in leg.get("runOn", []) and entry["hostArch"] == arch:
                 findings.append("leg '%s': launcher declared for (%s, %s), which "
                                 "is this leg's NATIVE host — dead config: the "
@@ -623,15 +986,20 @@ RUN_ORACLE = {
         "macho64-x86_64": "skipped-by-runOn",
     },
     ("windows", "x86_64"): {
-        "elf64-x86_64": "skipped-by-runOn",
+        # D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS: this row used to read
+        # `skipped-by-runOn` for elf64-x86_64 while the driver had a working
+        # Linux testfixture sitting on disk beside the verdict.
+        "elf64-x86_64": "launched:wsl.exe",
         "elf64-arm64": "skipped-by-runOn",
         "pe64-x86_64": "native",
         "macho64-arm64": "skipped-by-runOn",
         "macho64-x86_64": "skipped-by-runOn",
     },
     ("windows", "arm64"): {
+        # WSL2 runs the HOST's architecture, so an arm64 Windows box reaches the
+        # arm64 Linux leg and not the x86_64 one.
         "elf64-x86_64": "skipped-by-runOn",
-        "elf64-arm64": "skipped-by-runOn",
+        "elf64-arm64": "launched:wsl.exe",
         # Same OS, different arch, no launcher declared for (windows, arm64).
         "pe64-x86_64": "skipped-no-emulator-declared",
         "macho64-arm64": "skipped-by-runOn",
@@ -676,6 +1044,23 @@ RUN_ORACLE = {
 }
 
 
+def _raises(thunk):
+    """Did `thunk` refuse LOUDLY? Only a LegError counts — an AttributeError or a
+    TypeError is a bug in the resolver, not the refusal under test."""
+    try:
+        thunk()
+    except LegError:
+        return True
+    return False
+
+
+def _forbidden_runner(argv):
+    """A translator that must never be reached. Raises a non-LegError on purpose,
+    so `_raises` cannot mistake "it spawned something" for "it refused"."""
+    raise AssertionError("a translator was invoked when none should have been: %r"
+                         % (argv,))
+
+
 def self_test(path=CATALOGUE, out=sys.stdout):
     passed = failed = 0
 
@@ -698,7 +1083,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # TARGET item (2) expressed as an executable property: if a future edit
     # makes the leg list depend on the host in ANY way, this reds.
     for host in SELF_TEST_HOSTS:
-        for available in (None, set(), {"qemu-aarch64", "qemu-x86_64", "wine", "arch"}):
+        for available in (None, set(),
+                          {"qemu-aarch64", "qemu-x86_64", "wine", "arch", "wsl.exe"}):
             resolved = plan(host[0], host[1], available, path)
             got = [leg["label"] for leg in resolved["legs"]]
             check("build set is host-invariant on %s/%s (launchers=%s)"
@@ -722,7 +1108,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                       bool(leg["run"]["detail"]))
 
     # The RUN oracle — hand-written expectations, all launchers present.
-    every = {"qemu-aarch64", "qemu-x86_64", "wine", "arch"}
+    every = {"qemu-aarch64", "qemu-x86_64", "wine", "arch", "wsl.exe"}
     for host, expectations in RUN_ORACLE.items():
         resolved = plan(host[0], host[1], every, path)
         check("the run oracle covers every declared leg on %s/%s" % host,
@@ -754,6 +1140,146 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                   % (host[0], host[1], leg["label"]),
                   leg["run"]["verdict"] == "skipped-emulator-missing",
                   "got %r" % leg["run"]["verdict"])
+
+    # ── the launcher's PATH NAMESPACE ────────────────────────────────────────
+    # D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. Three properties, and the
+    # third is the one that would have caught the original defect: the verb is
+    # the LAUNCHER's, so it must be the same verb whichever leg declared that
+    # launcher and whichever host is asking.
+    for host in SELF_TEST_HOSTS:
+        resolved = plan(host[0], host[1], every, path)
+        for leg in resolved["legs"]:
+            run = leg["run"]
+            verb = run.get("pathTranslation")
+            check("run plan carries a DECLARED pathTranslation (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  verb in PATH_TRANSLATIONS, "got %r" % verb)
+            check("a non-launched run translates nothing (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  run["mode"] == "launched" or verb == "none",
+                  "mode=%r verb=%r" % (run["mode"], verb))
+            check("the translator argv IS the verb's (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  run.get("pathTranslator")
+                  == (PATH_TRANSLATIONS[verb]["translator"]
+                      if run["mode"] == "launched" else []),
+                  "verb=%r translator=%r" % (verb, run.get("pathTranslator")))
+    # A launcher that needs a translator is UNUSABLE without it, and the verdict
+    # for that is the environmental skip — not a run that dies on its first path.
+    translating = [(h, leg["label"])
+                   for h in SELF_TEST_HOSTS
+                   for leg in plan(h[0], h[1], every, path)["legs"]
+                   if leg["run"].get("pathTranslator")]
+    check("at least one host/leg cell exercises a translating launcher",
+          bool(translating),
+          "no leg in this catalogue declares a pathTranslation with a "
+          "translator, so every assertion above is vacuous")
+    for host, label in translating:
+        # Everything present EXCEPT the translator's own argv[0].
+        # ⚠ HONEST LABEL: for every verb this catalogue ships, the translator's
+        # argv[0] IS the launcher's argv[0] (`wsl.exe`), so removing one removes
+        # both and this cannot separate "launcher missing" from "translator
+        # missing". What it DOES pin is that a translating launcher whose tool is
+        # absent degrades to the ENVIRONMENTAL skip rather than to a planned run
+        # that dies on its first path. The separation becomes testable the day a
+        # verb names a translator distinct from its launcher.
+        translator_exes = {t["translator"][0] for t in PATH_TRANSLATIONS.values()
+                           if t["translator"]}
+        without = every - translator_exes
+        for leg in plan(host[0], host[1], without, path)["legs"]:
+            if leg["label"] != label:
+                continue
+            check("a translating launcher whose TOOLING is absent is "
+                  "environmental, not a silent run (%s/%s %s)"
+                  % (host[0], host[1], label),
+                  leg["run"]["verdict"] == "skipped-emulator-missing",
+                  "got mode=%r verdict=%r"
+                  % (leg["run"]["mode"], leg["run"]["verdict"]))
+
+    # The translation CONTRACT, exercised with an injected translator so it holds
+    # on a machine that has none. Each case is a way the mechanism can go wrong
+    # QUIETLY, which is why each one raises instead of returning something.
+    check("an unknown pathTranslation verb raises rather than meaning 'none'",
+          _raises(lambda: translate_path("windows-to-posix", "C:/x")))
+    check("'none' is the identity",
+          translate_path("none", "C:\\a\\b") == "C:\\a\\b")
+    check("'none' never calls a translator",
+          translate_path("none", "/x", runner=_forbidden_runner) == "/x")
+    seen = []
+
+    def _ok_runner(argv):
+        seen.append(list(argv))
+        return 0, "/mnt/c/a/b\n", ""
+
+    check("windows-to-wsl normalises the separator BEFORE the translator",
+          translate_path("windows-to-wsl", "C:\\a\\b", runner=_ok_runner)
+          == "/mnt/c/a/b" and seen and seen[0][-1] == "C:/a/b",
+          "translator saw %r" % (seen[0] if seen else None))
+    check("windows-to-wsl invokes the DECLARED translator argv",
+          bool(seen) and seen[0][:-1]
+          == PATH_TRANSLATIONS["windows-to-wsl"]["translator"],
+          "argv=%r" % (seen[0] if seen else None))
+    check("a translator that exits non-zero is FATAL, not a passthrough",
+          _raises(lambda: translate_path("windows-to-wsl", "C:/a",
+                                         runner=lambda a: (1, "", "boom"))))
+    check("a translator that prints NOTHING is FATAL",
+          _raises(lambda: translate_path("windows-to-wsl", "C:/a",
+                                         runner=lambda a: (0, "  \n", ""))))
+    check("a translator that returns the SOURCE spelling is FATAL",
+          _raises(lambda: translate_path("windows-to-wsl", "C:/a",
+                                         runner=lambda a: (0, "C:/a\n", ""))))
+    check("a path NOT in the source namespace is FATAL, never resolved "
+          "against the translator's own cwd",
+          _raises(lambda: translate_path("windows-to-wsl", "relative/x",
+                                         runner=_forbidden_runner)))
+    # The net under "translate at construction".
+    check("assert_translated passes a fully-translated argv",
+          not _raises(lambda: assert_translated(
+              "windows-to-wsl", ["/mnt/c/f/testfixture", "/mnt/c/t/x.test",
+                                 "--start=full:"])))
+    for bad in ("C:\\t\\x.test", "c:/t/x.test", "--testdir=D:\\t",
+                "\\\\server\\share\\x"):
+        check("assert_translated CATCHES an untranslated %r" % bad,
+              _raises(lambda b=bad: assert_translated("windows-to-wsl",
+                                                      ["/mnt/c/f", b])))
+    check("assert_translated is a no-op for a non-translating verb",
+          not _raises(lambda: assert_translated("none", ["C:\\t\\x.test"])))
+
+    # ── the launcher's ENVIRONMENT namespace ─────────────────────────────────
+    # The half that was found by measuring the first: a wsl.exe-launched fixture
+    # saw an EMPTY SQLITE_TEST_PATTERN_LIST, so the corpus resume engine re-ran
+    # the whole corpus instead of the tail after the abort.
+    for host in SELF_TEST_HOSTS:
+        for leg in plan(host[0], host[1], every, path)["legs"]:
+            run = leg["run"]
+            everb = run.get("envTransfer")
+            check("run plan carries a DECLARED envTransfer (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  everb in ENV_TRANSFERS, "got %r" % everb)
+            check("a non-launched run inherits (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  run["mode"] == "launched" or everb == "inherit",
+                  "mode=%r verb=%r" % (run["mode"], everb))
+    check("an unknown envTransfer verb raises rather than meaning 'inherit'",
+          _raises(lambda: env_transfer("copy-the-block")))
+    check("'inherit' needs no assignments",
+          env_carrier_assignments("inherit", ["A", "B"]) == [])
+    check("'wslenv' names each forwarded variable in its carrier",
+          env_carrier_assignments("wslenv", ["A", "B"]) == ["WSLENV=A:B"])
+    check("'wslenv' with nothing to forward assigns nothing",
+          env_carrier_assignments("wslenv", []) == [])
+    check("an operator's existing carrier value is MERGED, not clobbered",
+          env_carrier_assignments("wslenv", ["B"], "A/u") == ["WSLENV=A/u:B"])
+    check("a variable already carried (even with a /flag) is not duplicated",
+          env_carrier_assignments("wslenv", ["A"], "A/u") == ["WSLENV=A/u"])
+    check("an unknown envTransfer verb raises from the assignment path too",
+          _raises(lambda: env_carrier_assignments("nope", ["A"])))
+    # At least one leg/host cell must actually need a carrier, or every
+    # assertion above is about a mechanism this catalogue never reaches.
+    check("some declared launcher needs a non-inherit envTransfer",
+          any(leg["run"].get("envTransfer") not in (None, "inherit")
+              for h in SELF_TEST_HOSTS
+              for leg in plan(h[0], h[1], every, path)["legs"]))
 
     # ── the staged-header plan ───────────────────────────────────────────────
     # HOST-INVARIANT for exactly the reason the build set is: which zlib header a
@@ -798,8 +1324,14 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 19,
+          len(statements) == 1 + len(labels) * 22,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    check("the sh emitter carries the launcher's path namespace",
+          "LEG_PATH_TRANSLATION[" in sh and "LEG_PATH_TRANSLATOR[" in sh,
+          "build-and-test.sh cannot translate a launcher's paths without it")
+    check("the sh emitter carries the launcher's environment namespace",
+          "LEG_ENV_TRANSFER[" in sh,
+          "build-and-test.sh cannot forward its run environment without it")
     for stmt in statements:
         check("the sh emitter emits assignments only",
               ASSIGNMENT_RE.match(stmt) is not None, stmt)
@@ -822,6 +1354,45 @@ def main(argv=None):
                         "must materialise: '<key>\\t<GUARD>=<0|1> ...', one per "
                         "line. HOST-FREE — a leg's header configuration is a fact "
                         "about its TARGET.")
+    p.add_argument("--path-translations", action="store_true",
+                   help="print the closed path-translation vocabulary: "
+                        "'<verb>\\t<translator argv>', one per line")
+    p.add_argument("--path-translation", default=None,
+                   help="the verb --translate-path / --assert-translated act "
+                        "under (a leg plan's run.pathTranslation)")
+    p.add_argument("--translate-path", action="append", default=None,
+                   metavar="PATH",
+                   help="print PATH spelled the way the launcher declaring "
+                        "--path-translation addresses it. Repeatable; one line "
+                        "of output per PATH, in order. THIS is what keeps the "
+                        "translator named in one file instead of two drivers.")
+    p.add_argument("--assert-translated", action="append", default=None,
+                   metavar="ARG",
+                   help="verify no ARG is still a path in the namespace "
+                        "--path-translation translates FROM. Silent on success; "
+                        "FATAL naming the argument otherwise. ★ USE THE `=` "
+                        "FORM (--assert-translated=ARG): a real launcher argv "
+                        "contains things like `--start=full:`, and the "
+                        "space-separated form would have argparse read that as "
+                        "an option. The space form still works for a value that "
+                        "does not begin with `-`, and misuse is a LOUD argparse "
+                        "error rather than a skipped check.")
+    p.add_argument("--env-transfers", action="store_true",
+                   help="print the closed environment-transfer vocabulary: "
+                        "'<verb>\\t<carrier variable>', one per line")
+    p.add_argument("--env-transfer", default=None, metavar="VERB",
+                   help="resolve --forward NAMEs under this verb (a leg plan's "
+                        "run.envTransfer) and print the extra NAME=VALUE "
+                        "assignments the driver must make. Prints NOTHING for a "
+                        "verb whose child simply inherits.")
+    p.add_argument("--forward", action="append", default=None, metavar="NAME",
+                   help="an environment variable the launched process must see. "
+                        "Repeatable. ⚠ NAMESPACE-NEUTRAL VALUES ONLY: forwarding "
+                        "a variable whose value is a HOST path (PATH, "
+                        "TCL_LIBRARY) hands the child a path it cannot resolve.")
+    p.add_argument("--carrier-current", default="", metavar="VALUE",
+                   help="the carrier variable's existing value, so an operator's "
+                        "own setting is merged rather than clobbered")
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -835,13 +1406,45 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
-            or args.header_stages):
+            or args.header_stages or args.path_translations
+            or args.translate_path or args.assert_translated
+            or args.env_transfers or args.env_transfer):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / --lint "
-                "/ --self-test is required")
+                "/ --self-test / --path-translations / --translate-path / "
+                "--assert-translated / --env-transfers / --env-transfer is "
+                "required")
+    if (args.translate_path or args.assert_translated) and not args.path_translation:
+        p.error("--translate-path / --assert-translated require "
+                "--path-translation <verb> — the namespace is the launcher's "
+                "DECLARATION, never something this tool infers")
 
     try:
         if args.verdict_vocabulary:
             sys.stdout.write("\n".join(VERDICTS) + "\n")
+            return 0
+        if args.path_translations:
+            for verb in sorted(PATH_TRANSLATIONS):
+                sys.stdout.write("%s\t%s\n" % (
+                    verb, " ".join(PATH_TRANSLATIONS[verb]["translator"])))
+            return 0
+        if args.translate_path:
+            for raw in args.translate_path:
+                sys.stdout.write("%s\n"
+                                 % translate_path(args.path_translation, raw))
+            return 0
+        if args.assert_translated:
+            assert_translated(args.path_translation, args.assert_translated)
+            return 0
+        if args.env_transfers:
+            for verb in sorted(ENV_TRANSFERS):
+                sys.stdout.write("%s\t%s\n"
+                                 % (verb, ENV_TRANSFERS[verb]["nameCarrier"]))
+            return 0
+        if args.env_transfer:
+            for line in env_carrier_assignments(args.env_transfer,
+                                                args.forward or [],
+                                                args.carrier_current):
+                sys.stdout.write("%s\n" % line)
             return 0
         if args.header_stages:
             for key, guards in header_stages(load_catalogue(args.catalogue)).items():

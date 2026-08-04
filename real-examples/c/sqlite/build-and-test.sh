@@ -389,6 +389,7 @@ esac
 declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
+           LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
            LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
@@ -854,6 +855,103 @@ else
   info "host: native Linux ($HOST_ARCH, $(uname -r))"
 fi
 
+# ── THE LAUNCHER'S PATH NAMESPACE ────────────────────────────────────────────
+# D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. Twin of Convert-LaunchPath /
+# Assert-LaunchArgsTranslated in build-and-test.ps1 — capability-paired on
+# purpose, because a translation that exists in one driver and not the other is
+# the silent harness bug this project keeps re-paying for.
+#
+# A launcher need not address files the way the driver spawning it does. Wine on
+# Linux does (`wine /home/me/x.exe`); `wsl.exe` does not — the driver holds a
+# drive-letter path and the callee needs `/mnt/c/...`. AND THE FAILURE IS NOT A
+# PATH ERROR: the callee opens a RELATIVE file of that name, misses, and the run
+# reads as a broken binary.
+#
+# ★ NEITHER FUNCTION KNOWS WHAT `wslpath` IS. The verb is the LAUNCHER's
+# declaration (legs.json `pathTranslation`, arriving as LEG_PATH_TRANSLATION) and
+# the resolver performs it, so the translator is named in exactly one file.
+launch_path() {                # launch_path <verb> <path>  -> stdout
+  local verb="$1" p="$2" out rc
+  if [[ -z "$verb" || "$verb" == "none" ]]; then printf '%s\n' "$p"; return 0; fi
+  # rc DIRECTLY off python3, never after a pipe.
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+              --path-translation "$verb" --translate-path "$p" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 && -n "${out//[[:space:]]/}" ]] || die "could not translate '$p' into the launcher's path namespace (pathTranslation '$verb', rc=$rc):
+      ${out:-<no diagnostic>}
+      The leg's DECLARED launcher cannot be handed a path at all, so this run stops here
+      rather than spawn it with one its callee would silently read as a relative filename."
+  printf '%s\n' "${out%%$'\n'*}"
+}
+# The net under "translate at construction": every argument, at the ONE place the
+# child is spawned. A future segment kind that adds a path-valued argument and
+# forgets to translate it is refused BY NAME instead of failing hours in looking
+# like a fixture bug.
+# ★ `--assert-translated=` uses the `=` form deliberately: a real fixture argv
+# carries `--start=full:`, which the space form would be parsed as an option.
+#
+# ── THE LAUNCHER'S ENVIRONMENT NAMESPACE ─────────────────────────────────────
+# Twin of Resolve-LaunchEnvCarrier in build-and-test.ps1. The second half of the
+# same fact, found by MEASURING the first: a launcher in another OS namespace
+# does not inherit this driver's environment any more than it understands its
+# paths. ✔MEASURED 2026-08-04: a wsl.exe-launched fixture saw
+# SQLITE_TEST_PATTERN_LIST as EMPTY, so the corpus RESUME ENGINE — which selects
+# its files through exactly that variable — silently re-ran the corpus from the
+# beginning instead of from the abort point.
+#
+# Prints the `NAME=VALUE` assignments the caller must EXPORT, one per line, and
+# nothing at all for a verb whose child inherits (every launcher this catalogue
+# declares on a POSIX host). The carrier's NAME and the separator its list uses
+# belong to the VERB, so both come from the resolver.
+# ★★ ONLY A VARIABLE THAT IS ACTUALLY SET MAY BE CARRIED, AND THAT IS NOT
+# TIDINESS — IT IS THE DIFFERENCE BETWEEN A RUN AND A FALSE GREEN. MEASURED
+# 2026-08-04 on the .ps1 side: naming an UNSET variable in the carrier
+# materialised it in the other namespace as EMPTY-BUT-EXISTING, sqlite's
+# permutations.test asks `info exists ::env(SQLITE_TEST_PATTERN_LIST)`, and an
+# empty-but-existing value is an EMPTY FILE LIST rather than "no filter" — the
+# tier selected ZERO files and the driver called it GREEN. Hence the `-v` guard
+# below, and hence this is called PER SEGMENT.
+launch_env_carrier_name() {    # launch_env_carrier_name <verb>  -> stdout
+  local verb="$1" vocab rc carrier
+  [[ -n "$verb" && "$verb" != "inherit" ]] || return 0
+  if vocab="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --env-transfers 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 ]] || die "could not read the environment-transfer vocabulary (rc=$rc):
+      ${vocab:-<no diagnostic>}"
+  carrier="$(printf '%s\n' "$vocab" | awk -F'\t' -v v="$verb" '$1 == v { print $2 }')"
+  [[ -n "$carrier" ]] || die "envTransfer '$verb' declares no carrier variable, yet it is not 'inherit'.
+      The resolver and this driver disagree about the vocabulary."
+  printf '%s\n' "$carrier"
+}
+launch_env_carrier() {         # launch_env_carrier <verb> <current> <name...>
+  local verb="$1" current="$2"; shift 2
+  [[ -n "$verb" && "$verb" != "inherit" ]] || return 0
+  local -a call=(--env-transfer "$verb" --carrier-current "$current") n
+  for n in "$@"; do
+    [[ -n "$n" ]] || continue
+    [[ -n "${!n:-}" ]] || continue     # THE FILTER — see the note above
+    call+=(--forward "$n")
+  done
+  # Nothing SET means nothing to carry, and carrying nothing is the correct
+  # answer — not an empty carrier that manufactures empty variables.
+  [[ " ${call[*]} " == *" --forward "* ]] || return 0
+  local out rc
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" "${call[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 ]] || die "could not resolve the launcher's environment transfer (envTransfer '$verb', rc=$rc):
+      ${out:-<no diagnostic>}
+      Without it the launched fixture runs with an EMPTY run environment, which does not
+      fail — it silently changes what the corpus does."
+  printf '%s\n' "$out"
+}
+assert_launch_args_translated() {   # assert_launch_args_translated <verb> <arg...>
+  local verb="$1"; shift
+  [[ -n "$verb" && "$verb" != "none" ]] || return 0
+  local -a call=(--path-translation "$verb") a
+  for a in "$@"; do call+=("--assert-translated=$a"); done
+  local out rc
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" "${call[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 ]] || die "REFUSING to spawn the leg's launcher — an argument is still in THIS driver's path namespace, not the launcher's:
+      ${out:-<no diagnostic>}"
+}
+
 # ── THE LEG PLAN ─────────────────────────────────────────────────────────────
 # ONE call, one resolver, shared with build-and-test.ps1. The host is an INPUT to
 # the plan (it decides run mode), never a filter on it: every host gets the same
@@ -893,7 +991,7 @@ info "legs declared by $(basename "$LEG_CATALOGUE") (the SAME set on every host)
 for _l in "${LEG_DECLARED[@]}"; do
   case "${LEG_RUN_MODE[$_l]}" in
     native)   info "  $_l  ${LEG_SPEC[$_l]}  — build + run NATIVELY here" ;;
-    launched) info "  $_l  ${LEG_SPEC[$_l]}  — build here, run under '${LEG_LAUNCH[$_l]}'" ;;
+    launched) info "  $_l  ${LEG_SPEC[$_l]}  — build here, run under '${LEG_LAUNCH[$_l]}'$( [[ "${LEG_PATH_TRANSLATION[$_l]}" != "none" ]] && printf ' [paths -> %s]' "${LEG_PATH_TRANSLATION[$_l]}" )" ;;
     skip)     info "  $_l  ${LEG_SPEC[$_l]}  — build here; NOT runnable on this host [${LEG_RUN_VERDICT[$_l]}]: ${LEG_RUN_DETAIL[$_l]}" ;;
     *)        die  "leg '$_l' has an unknown run mode '${LEG_RUN_MODE[$_l]}' — the resolver and this driver disagree about the vocabulary." ;;
   esac
@@ -2456,6 +2554,11 @@ stop_our_fixtures() {          # stop_our_fixtures <fixture-abs-path> <why>
 # GRANDCHILD and the timeout's `kill $child` reaps only the shell — leaving the hung
 # fixture alive, holding its file handles, and defeating the point of the timeout.
 # It lives inside this region precisely because that contract is load-bearing here.
+#
+# ★ <bin> ARRIVES ALREADY SPELLED IN THE LAUNCHER'S PATH NAMESPACE (legs.json
+# `pathTranslation`), translated ONCE per leg by the caller rather than once per
+# segment, and so does every path-valued argument. run_fixture_segment ASSERTS
+# that before it forks — see the comment there for why not here.
 run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES this shell
   local leg="$1" bin="$2"; shift 2
   # THE LAUNCHER IS DECLARED, NOT INFERRED. `LEG_LAUNCH` is the catalogue's
@@ -2487,16 +2590,27 @@ run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES thi
   fi
 }
 
-run_fixture_segment() {        # run_fixture_segment <leg> <bin> <log> <args...>
-  local leg="$1" bin="$2" log="$3"; shift 3
+# <bin> is the fixture as THIS DRIVER addresses it — the spelling `ps` reports and
+# every log line names, so it is what the leftover-fixture sweeps below match on.
+# <launch_bin> is the same file spelled in the LAUNCHER's namespace, which is what
+# the child actually receives. They are identical for `pathTranslation: none`.
+run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <log> <args...>
+  local leg="$1" bin="$2" launch_bin="$3" log="$4"; shift 4
   SEG_RC=0; SEG_KILL_REASON=""
+  # THE CHOKE POINT for the launcher's path namespace, and it is HERE rather than
+  # in run_leg on purpose: run_leg is the last command of a BACKGROUND subshell
+  # that has already done `trap - ERR; set +e`, so a `die` inside it would exit
+  # that subshell into the segment log and be read as a failing test rather than
+  # as the harness refusing to start. In the foreground it stops the run.
+  [[ "${LEG_RUN_MODE[$leg]}" != "launched" ]] \
+    || assert_launch_args_translated "${LEG_PATH_TRANSLATION[$leg]:-none}" "$launch_bin" "$@"
   # `trap - ERR; set +e` inside the subshell is load-bearing. The old form was a
   # `|| segrc=$?` list, which suppresses errexit and the ERR trap; a BACKGROUND job
   # does not, so this subshell would inherit them (set -E) and the harness-level
   # `die` would fire on the fixture's own non-zero exit — writing a bogus
   # " [X] ERROR: failed at line …" INTO the segment log (stderr is redirected there)
   # and masking the real exit status. A failing test is data here, not an error.
-  ( trap - ERR; set +e; cd "$rundir" && run_leg "$leg" "$bin" "$@" ) > "$log" 2>&1 < /dev/null &
+  ( trap - ERR; set +e; cd "$rundir" && run_leg "$leg" "$launch_bin" "$@" ) > "$log" 2>&1 < /dev/null &
   local child=$!
   local last_len=-1 last_grow t0
   t0="$(date +%s)"; local last_grow_t="$t0"
@@ -2924,6 +3038,36 @@ for leg in "${LEG_ORDER[@]}"; do
     continue                                   # already warned at Step 6
   fi
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
+  # The launcher's DECLARED path namespace, and this leg's fixture spelled in it.
+  # Translated ONCE per leg; the only other translation site is a segment's FIRST
+  # argument (the .test script), below. `$bin` itself keeps this driver's spelling
+  # because the process sweep and every log line address the file the way we do.
+  leg_xlate="${LEG_PATH_TRANSLATION[$leg]:-none}"
+  launch_bin="$(launch_path "$leg_xlate" "$bin")"
+  if [[ "$leg_xlate" != "none" ]]; then
+    info "[$leg] the launcher addresses files in ANOTHER namespace (pathTranslation '$leg_xlate' via '${LEG_PATH_TRANSLATOR[$leg]}') — fixture $bin -> $launch_bin"
+  fi
+  # ── the launcher's ENVIRONMENT namespace ───────────────────────────────────
+  # WHICH variables may cross is THIS DRIVER's knowledge — it is the one that
+  # sets them — and the rule is NAMESPACE-NEUTRAL VALUES ONLY: PATH and
+  # TCL_LIBRARY are deliberately absent because both hold HOST paths. HOW they
+  # cross belongs to the verb. Empty on every POSIX host, where the child simply
+  # inherits, so this leaves the .sh's long-standing behaviour untouched.
+  # Only the carrier's NAME and its prior value are per-LEG; WHICH variables are
+  # actually carried is decided per SEGMENT, in the loop below, from what is set
+  # at that moment (see launch_env_carrier for why that distinction is the
+  # difference between a run and a false green).
+  leg_env_verb="${LEG_ENV_TRANSFER[$leg]:-inherit}"
+  declare -a LEG_ENV_NAMES=()
+  mapfile -t LEG_ENV_NAMES < <(printf '%s\n' ${LEG_LAUNCH_ENV[$leg]} | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
+  declare -a LEG_ENV_FORWARD=(SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT
+                              ${LEG_ENV_NAMES[@]+"${LEG_ENV_NAMES[@]}"})
+  leg_carrier_name="$(launch_env_carrier_name "$leg_env_verb")"
+  leg_carrier_old=""
+  if [[ -n "$leg_carrier_name" ]]; then
+    leg_carrier_old="${!leg_carrier_name:-}"
+    info "[$leg] the launcher does NOT inherit this driver's environment (envTransfer '$leg_env_verb') — variables that are SET at spawn time cross via $leg_carrier_name; candidates: ${LEG_ENV_FORWARD[*]}"
+  fi
   stage_loadext_extension "$leg" "$rundir"
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
@@ -2943,8 +3087,23 @@ for leg in "${LEG_ORDER[@]}"; do
   # Segment 0 is EXACTLY today's invocation (`fixture <tier>.test`) so a run with
   # no abort is bit-for-bit the run it always was; resume segments are only ever
   # spliced in by an abort.
+  # ★ THE INVARIANT THIS QUEUE RESTS ON, spelled once: `arg1` is ALWAYS the .test
+  # SCRIPT the fixture sources (its Tcl `$argv0`) and is therefore always a PATH,
+  # so it is stored ALREADY TRANSLATED into the launcher's namespace; `arg2` is a
+  # bare Tcl word (a permutation name) or a tester.tcl flag (`--start=<perm>:`)
+  # and is never a path. run_fixture_segment's assertion is what catches a future
+  # segment kind that breaks the invariant.
+  # ★ THE TRANSLATED PATHS ARE COMPUTED INTO SIMPLE ASSIGNMENTS FIRST, never
+  # embedded as `$(launch_path …)` inside the array element. `launch_path` fails
+  # by calling `die`, and `die` inside a command substitution exits the SUBSHELL:
+  # in `SEGQ=("…$(launch_path …)…")` that leaves an EMPTY field which `set -e`
+  # does not see, so a refusal would become a silently-relative script path — the
+  # exact "a failing substitution leaves an empty field" trap this driver already
+  # records for its leg plan. A simple `v="$(…)"` DOES propagate the status.
+  LAUNCH_TIER_SCRIPT="$(launch_path "$leg_xlate" "$TEST_FILE")"
+  LAUNCH_PERM_SCRIPT="$(launch_path "$leg_xlate" "$TESTDIR_SRC/permutations.test")"
   US=$'\x1f'
-  SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}$TEST_FILE${US}")
+  SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}${LAUNCH_TIER_SCRIPT}${US}")
   declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() SEG_COUNTS=() ABORTS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=() CALIBRATION=()
   sum_tests=0; sum_errors=0; n_summarised=0; der_tests=0; der_errors=0; n_derived=0
   # Carry Step 7's pre-flight kills into this leg's hygiene record, then sweep again:
@@ -2965,7 +3124,7 @@ for leg in "${LEG_ORDER[@]}"; do
     IFS="$US" read -r s_kind s_perm s_label s_patfile s_arg1 s_arg2 <<< "${SEGQ[$seg_i]}"
     if [[ $seg_i -eq 0 ]]; then
       seglog="$runlog"
-      info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_LAUNCH[$leg]}" ]] && printf ' (under the declared launcher: %s)' "${LEG_LAUNCH[$leg]}" )…"
+      info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_LAUNCH[$leg]}" ]] && printf ' (under the declared launcher: %s%s)' "${LEG_LAUNCH[$leg]}" "$( [[ "$leg_xlate" != "none" ]] && printf ', paths -> %s' "$leg_xlate" )" )…"
     else
       seglog="$OUT_DIR/$leg/corpus.resume$seg_i.log"
       info "[$leg] segment $((seg_i + 1)): $s_label$( [[ -n "$s_patfile" ]] && printf '  (SQLITE_TEST_PATTERN_LIST: %s candidate file(s))' "$(wc -l < "$s_patfile")" )"
@@ -2975,9 +3134,34 @@ for leg in "${LEG_ORDER[@]}"; do
     # words, so a whitespace join is a valid list.
     if [[ -n "$s_patfile" ]]; then SQLITE_TEST_PATTERN_LIST="$(tr '\n' ' ' < "$s_patfile")"; export SQLITE_TEST_PATTERN_LIST
     else unset SQLITE_TEST_PATTERN_LIST; fi
-    run_fixture_segment "$leg" "$bin" "$seglog" "${seg_argv[@]}"
+    # LAST, because it reads the variables set just above: the launcher's declared
+    # environment TRANSFER, resolved PER SEGMENT from what is actually SET right
+    # now. Empty on every host whose launcher inherits, which is all of them here.
+    # ★ A SIMPLE ASSIGNMENT, then a split — NOT `mapfile < <(launch_env_carrier …)`.
+    # The helper fails by calling `die`, and `die` inside a PROCESS SUBSTITUTION
+    # exits only that subshell: mapfile would read zero lines, `set -e` would see
+    # nothing, and the segment would run with an un-forwarded environment — the
+    # very silence this mechanism exists to end. Same trap, same remedy, as the
+    # translated segment paths above.
+    declare -a LEG_ENV_CARRIER=()
+    leg_env_carrier_out="$(launch_env_carrier "$leg_env_verb" "$leg_carrier_old" \
+                             ${LEG_ENV_FORWARD[@]+"${LEG_ENV_FORWARD[@]}"})"
+    if [[ -n "$leg_env_carrier_out" ]]; then
+      mapfile -t LEG_ENV_CARRIER <<< "$leg_env_carrier_out"
+      export "${LEG_ENV_CARRIER[@]}"
+    elif [[ -n "$leg_carrier_name" ]]; then
+      # Nothing to carry THIS segment: the carrier must not keep a previous
+      # segment's list, or an unset variable is manufactured as empty.
+      if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
+      else unset "$leg_carrier_name"; fi
+    fi
+    run_fixture_segment "$leg" "$bin" "$launch_bin" "$seglog" "${seg_argv[@]}"
     segrc="$SEG_RC"
     unset SQLITE_TEST_PATTERN_LIST
+    if [[ -n "$leg_carrier_name" ]]; then
+      if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
+      else unset "$leg_carrier_name"; fi
+    fi
     if [[ -n "$SEG_KILL_REASON" ]]; then
       warn "[$leg] segment $((seg_i + 1)) HUNG — killed: $SEG_KILL_REASON"
       HYGIENE+=("segment $((seg_i + 1)) TIMED OUT and was killed — $SEG_KILL_REASON")
@@ -3108,7 +3292,7 @@ for leg in "${LEG_ORDER[@]}"; do
     patfile="$scratch/after.$resumes"
     files_after "$boundary" "$scratch/files.txt" > "$patfile"
     info "        -> resume $resumes/$DSS_MAX_RESUMES: permutations.test $perm, corpus files after $boundary"
-    declare -a TAIL_SEGS=("perm${US}${perm}${US}permutations.test $perm (after $boundary)${US}${patfile}${US}${TESTDIR_SRC}/permutations.test${US}${perm}")
+    declare -a TAIL_SEGS=("perm${US}${perm}${US}permutations.test $perm (after $boundary)${US}${patfile}${US}${LAUNCH_PERM_SCRIPT}${US}${perm}")
     # (b) the tier continued from the NEXT permutation — the ORIGINAL tier script,
     # so every ifcapable/platform guard is evaluated by sqlite exactly as always.
     if [[ "$s_kind" != "perm" ]]; then
@@ -3117,7 +3301,7 @@ for leg in "${LEG_ORDER[@]}"; do
         NOT_REACHED+=("every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries")
       elif [[ $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]]; then
         nextperm="${TIER_PERMS[$((perm_idx + 1))]}"
-        TAIL_SEGS+=("tier${US}${nextperm}${US}${TEST_FILE##*/} --start=${nextperm}:${US}${US}${TEST_FILE}${US}--start=${nextperm}:")
+        TAIL_SEGS+=("tier${US}${nextperm}${US}${TEST_FILE##*/} --start=${nextperm}:${US}${US}${LAUNCH_TIER_SCRIPT}${US}--start=${nextperm}:")
         info "        -> then: ${TEST_FILE##*/} --start=${nextperm}:  (permutations $nextperm..${TIER_PERMS[-1]})"
       fi
     fi
@@ -3263,6 +3447,18 @@ for leg in "${LEG_ORDER[@]}"; do
   elif [[ -z "$summary" ]]; then
     UNIT_VERDICT["$leg"]="FAIL:fixture did not complete the suite (crash?) — see $runlog"
     UNIT_FAILS=$((UNIT_FAILS + 1)); warn "[$leg] corpus FAIL — no summary line (fixture crashed mid-suite); tail:"
+    tail -4 "$runlog" 2>/dev/null | sed 's/^/      /'
+  elif [[ "$files_done" -eq 0 ]]; then
+    # ★★ A RUN THAT COMPLETED ZERO TEST FILES IS NOT GREEN, WHATEVER ITS SUMMARY
+    # LINE SAYS. Twin of the same branch in build-and-test.ps1, added with it.
+    # MEASURED 2026-08-04 (TF-C116) on the .ps1 side: a tier that selected no
+    # files still made tester.tcl finalise and print `0 errors out of 1 tests`,
+    # and the driver reported "corpus GREEN" beside "0 test file(s) completed".
+    # The floor is structural — a summary line is not proof that a suite ran.
+    UNIT_VERDICT["$leg"]="FAIL:the fixture completed ZERO test files yet printed a summary ($summary) — a suite that ran nothing is not a pass; see $runlog"
+    UNIT_FAILS=$((UNIT_FAILS + 1))
+    warn "[$leg] corpus FAIL — 0 test file(s) completed, though the fixture printed '$summary'."
+    info "      A tier that selects no files still finalises and reports a summary. That is not a run."
     tail -4 "$runlog" 2>/dev/null | sed 's/^/      /'
   elif [[ "$total_errors" -gt 0 && -z "${faillist// /}" ]]; then
     # conservative: errors reported but no classifiable failure list -> RED.
