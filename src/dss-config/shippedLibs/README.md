@@ -27,6 +27,38 @@ The universal reader is `src/ffi/shipped_lib_descriptor.{hpp,cpp}`. It is
 **source/target/linker agnostic**: pure `nlohmann/json` + the single
 `parseTypeFromText` codec, with no language/CPU/format identity branch.
 
+## ★★ SCOPE — OS LIBRARIES ONLY. THIRD-PARTY LIBRARIES NEVER BELONG HERE.
+
+This directory describes **the operating system's own surface** and nothing else:
+libc/POSIX, Win32, libSystem, the platform's headers. That is DSS's *own*
+vocabulary for a target platform, which is why it can ship it, version it, and
+guarantee it on every host.
+
+A third-party library — Tcl, zlib, OpenSSL, anything a *user* chose to depend on
+— is **NOT** part of that surface and must never get a descriptor here. It is
+supplied as a **per-leg compilation input**, declared by the build that consumes
+it. DSS supports both dynamic and **static** third-party libraries through that
+channel, so a project can compile against whatever it needs without the compiler
+adopting responsibility for it.
+
+**Why the rule is absolute, and not merely tidy.** A descriptor here is a promise
+DSS makes about every target it supports. Admitting one third-party library makes
+DSS's platform vocabulary responsible for someone else's release cycle, ABI and
+symbol set — and it sets the precedent that the *next* dependency gets the same
+treatment. The directory then stops meaning "the platform" and starts meaning
+"whatever happened to be convenient", which is unfixable once it has begun.
+
+⚠ **This rule was breached in proposal on 2026-08-04 and caught only because the
+operator was reading.** The sqlite testfixture links Tcl (~102 symbols) and zlib
+(8 symbols), and because those two lack descriptors, `--resolve-library` must read
+a real binary's export table to learn their names — which is impossible for a
+Darwin target on a non-Mac host. "Just give them descriptors" is the obvious fix,
+it is wrong, and it was recommended by an agent *and* by the orchestrator before
+being rejected. **The rule was nowhere in this README at the time, which is
+precisely why it was proposed.** It is here now. See
+`D-HARNESS-MACHO-LEG-INPUTS-UNOBTAINABLE-OFF-MAC` for the correct direction: a
+per-leg declared library input, living with the build, not with the platform.
+
 ---
 
 ## Directory layout
@@ -249,6 +281,13 @@ the one `stdio.json`.
 
 ## Adding or extending a descriptor
 
+0. **Check the scope rule first (see "SCOPE" above). Is this header part of the
+   OPERATING SYSTEM's surface?** libc/POSIX, Win32, libSystem: yes. Tcl, zlib,
+   OpenSSL, curl, or anything a *user* chose to depend on: **NO — stop here.**
+   That library is a per-leg compilation input declared by the build that
+   consumes it, not a descriptor. If you are here because a build cannot find a
+   third-party library's symbols on some host, adding a descriptor is the wrong
+   fix and will be rejected in review.
 1. Pick the right `<header>.json` (create it if the header is new — flat, no
    per-platform subdir).
 2. Add the symbol with its hir-text signature (see `docs/ir-type-text.md` for
