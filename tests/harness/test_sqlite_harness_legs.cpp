@@ -33,6 +33,15 @@
 //      corpus both declare a launcher for the same (targetArch, hostOs), they
 //      must spell it the same way, so a reader cannot conclude the project has
 //      two qemus.
+//   7. EVERY LEG COMPILES AGAINST A THIRD-PARTY HEADER CONFIGURED FOR ITS OWN
+//      TARGET (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED). One staged zconf.h
+//      used to serve all five legs, carrying the pe leg's `Z_HAVE_UNISTD_H`
+//      answer — so the .ps1 refused every other leg and the .sh, which never
+//      applied the flip at all, could not build its pe leg. The catalogue now
+//      declares each target's answer, the drivers stage one zinc/ per
+//      recipeTransform through stage-zinc.py, and these tests hold all three
+//      pieces to account: the declaration matches the target, the stage plan is
+//      host-free, and the staging tool actually writes what was declared.
 //
 // PYTHON IS A HARD DEPENDENCY, NOT AN OPTIONAL ONE. Both drivers already
 // `ensure_cmd python3` / gate on python3 before they will run, and the manifest
@@ -265,6 +274,65 @@ constexpr SimHost kSimHosts[] = {
         }
     }
     return false;
+}
+
+// `x86_64:pe64-x86_64-windows-exec` -> `windows`. The python twin is
+// `spec_target_os()`; the format names are `<container><bits>-<arch>-<os>-<kind>`.
+[[nodiscard]] std::string specTargetOs(std::string const& spec) {
+    auto const colon = spec.find(':');
+    std::string const  fmt = colon == std::string::npos ? spec : spec.substr(colon + 1);
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= fmt.size(); ++i) {
+        if (i == fmt.size() || fmt[i] == '-') {
+            parts.push_back(fmt.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return parts.size() >= 3 ? parts[parts.size() - 2] : std::string{};
+}
+
+// The `./configure` block shape stage-zinc.py rewrites, reproduced as a FIXTURE.
+// Not the machine's real zconf.h: this test must give the same answer on a box
+// with no zlib installed, and the shipped header's exact line numbers are not
+// this test's business. What IS its business is that the tool, driven by the
+// SHIPPED catalogue, writes a per-stage header whose guard matches each leg's
+// own target.
+constexpr char const* kZconfFixture =
+    "/* fixture standing in for a ./configure'd zconf.h */\n"
+    "#ifndef ZCONF_H\n"
+    "#define ZCONF_H\n"
+    "#if 1    /* was set to #if 1 by ./configure */\n"
+    "#  define Z_HAVE_UNISTD_H\n"
+    "#endif\n"
+    "\n"
+    "#if 1    /* was set to #if 1 by ./configure */\n"
+    "#  define Z_HAVE_STDARG_H\n"
+    "#endif\n"
+    "\n"
+    "#ifndef Z_HAVE_UNISTD_H\n"
+    "#  ifdef __WATCOMC__\n"
+    "#    define Z_HAVE_UNISTD_H\n"
+    "#  endif\n"
+    "#endif\n"
+    "#endif /* ZCONF_H */\n";
+
+// The effective state of one guard in a staged zconf.h: the `#if N` line
+// immediately above `#  define <guard>`. Mirrors what a preprocessor would do
+// with the ./configure block, and deliberately does NOT reuse stage-zinc.py's
+// own parser — a test that asked the tool to check itself would pass on any
+// self-consistent mistake.
+[[nodiscard]] int guardStateIn(fs::path const& zconf, std::string const& guard) {
+    auto const lines = splitLines(fileText(zconf));
+    std::string const needle = "#  define " + guard;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        if (lines[i] != needle) continue;
+        auto const& prev = lines[i - 1];
+        if (prev.rfind("#if 1", 0) == 0) return 1;
+        if (prev.rfind("#if 0", 0) == 0) return 0;
+        return -1;  // present but not a plain #if 1/#if 0
+    }
+    return -2;  // no ./configure site at all
 }
 
 }  // namespace
@@ -603,4 +671,258 @@ TEST_F(HarnessLegs, LauncherSpellingsAgreeWithTheExamplesCorpus) {
         << "no (arch, host OS) pair is declared by BOTH the sqlite catalogue and"
            " the examples corpus, so this test compared nothing. That is a"
            " silent-vacuity failure, not a pass.";
+}
+
+// ── 7. Every leg's staged zlib header is configured for ITS OWN target ─────
+//
+// D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. Three tests, one per link in the
+// chain: the DECLARATION (does the catalogue say the right thing?), the PLAN (is
+// the recipeTransform -> zinc/ mapping host-free and one-stage-per-transform?),
+// and the ARTEFACT (does stage-zinc.py actually write it?).
+
+// THE DECLARATION. `Z_HAVE_UNISTD_H` governs `#include <unistd.h>`, which exists
+// on POSIX and not on Windows — so its correct value is DERIVABLE from the leg's
+// own target and can be checked rather than trusted.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): give the pe64 leg the
+// POSIX answer — or give the four POSIX legs the pe answer, which is exactly the
+// shared pe-shaped stage this anchor is about — and this fails naming the leg,
+// its target OS and both values.
+TEST_F(HarnessLegs, EveryLegsZlibHeaderIsConfiguredForItsOwnTarget) {
+    auto const doc = json::parse(fileText(catalogue_));
+    std::size_t checked = 0;
+    std::set<std::string> osSeen;
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        auto const spec  = leg.at("spec").get<std::string>();
+        auto const os    = specTargetOs(spec);
+        ASSERT_FALSE(os.empty())
+            << label << ": cannot derive a target OS from spec '" << spec << '\'';
+        osSeen.insert(os);
+        ASSERT_TRUE(leg.at("build").contains("zconfGuards"))
+            << label
+            << ": declares no build.zconfGuards. Without it the drivers have"
+               " nothing to stage this leg's zlib header FROM, and the only"
+               " remaining option is the copy some other leg's target wanted —"
+               " which is the defect.";
+        auto const& guards = leg.at("build").at("zconfGuards");
+        ASSERT_TRUE(guards.contains("Z_HAVE_UNISTD_H")) << label;
+        ASSERT_TRUE(guards.at("Z_HAVE_UNISTD_H").is_boolean())
+            << label << ": Z_HAVE_UNISTD_H must be a JSON boolean — a string is"
+                        " truthy in bash, PowerShell and python alike";
+        bool const posix = (os == "linux" || os == "darwin");
+        EXPECT_EQ(guards.at("Z_HAVE_UNISTD_H").get<bool>(), posix)
+            << label << " targets OS '" << os
+            << "' but declares Z_HAVE_UNISTD_H="
+            << guards.at("Z_HAVE_UNISTD_H").get<bool>()
+            << ". That guard decides whether the staged zconf.h does"
+               " `#include <unistd.h>` and therefore whether z_off_t is off_t or"
+               " long. MEASURED TF-C115: on darwin those are `long long` vs"
+               " `long` — same width, DIFFERENT type — and on pe the POSIX answer"
+               " does not compile at all (error[F001D] got unistd.h).";
+        ++checked;
+    }
+    EXPECT_GE(checked, 2u);
+    EXPECT_GE(osSeen.size(), 2u)
+        << "every leg targets the same OS, so this test cannot witness a"
+           " per-target difference — it would pass on a single shared header";
+}
+
+// THE PLAN. One stage per recipeTransform, the same on every host, and each
+// leg's key is its own transform.
+//
+// RED-ON-DISABLE: make `headerStageKey` depend on anything but the leg's
+// declared transform (a host, a label) and the cross-host comparison fails; give
+// two legs the same transform but different guards and `--header-stages` exits
+// non-zero with the conflict named.
+TEST_F(HarnessLegs, TheHeaderStagePlanIsPerTransformAndHostFree) {
+    auto const stagesRun = run({"--header-stages"});
+    ASSERT_TRUE(stagesRun.spawned) << stagesRun.diagnostic;
+    ASSERT_EQ(stagesRun.exitCode, 0u) << stagesRun.output;
+    std::map<std::string, std::string> stages;  // key -> guard string
+    for (auto const& line : splitLines(stagesRun.output)) {
+        auto const tab = line.find('\t');
+        ASSERT_NE(tab, std::string::npos) << "malformed stage line: " << line;
+        stages[line.substr(0, tab)] = line.substr(tab + 1);
+    }
+    ASSERT_GE(stages.size(), 2u)
+        << "the catalogue declares fewer than two header stages, so per-target"
+           " staging is untested by the catalogue it ships with:\n"
+        << stagesRun.output;
+
+    auto const doc = json::parse(fileText(catalogue_));
+    std::set<std::string> transforms;
+    for (auto const& leg : doc.at("legs")) {
+        transforms.insert(
+            leg.at("build").at("recipeTransform").get<std::string>());
+    }
+    std::set<std::string> stageKeys;
+    for (auto const& [k, _] : stages) stageKeys.insert(k);
+    EXPECT_EQ(stageKeys, transforms)
+        << "the stage set must be exactly the distinct recipeTransforms — one"
+           " zinc/ per transform, no more (a stage nothing uses) and no fewer"
+           " (two targets sharing one header).";
+
+    // Same answer on every host, including three this project has never run on.
+    std::map<std::string, std::string> firstHostKeys;
+    for (auto const& host : kSimHosts) {
+        auto const r = run({"--plan", "--host-os", host.os, "--host-arch",
+                            host.arch, "--launchers-none", "--format", "json"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const plan = json::parse(r.output);
+        std::map<std::string, std::string> keys;
+        for (auto const& leg : plan.at("legs")) {
+            auto const label = leg.at("label").get<std::string>();
+            auto const& build = leg.at("build");
+            ASSERT_TRUE(build.contains("headerStageKey")) << label;
+            auto const key = build.at("headerStageKey").get<std::string>();
+            EXPECT_EQ(key, build.at("recipeTransform").get<std::string>())
+                << host.os << '/' << host.arch << ' ' << label
+                << ": the staged-header key must BE the declared"
+                   " recipeTransform. Anything else is a second mapping a"
+                   " reader would have to find.";
+            EXPECT_EQ(stages.count(key), 1u)
+                << host.os << '/' << host.arch << ' ' << label
+                << ": names stage '" << key << "', which is not in the plan";
+            keys[label] = key;
+        }
+        if (firstHostKeys.empty()) {
+            firstHostKeys = keys;
+        } else {
+            EXPECT_EQ(keys, firstHostKeys)
+                << "host " << host.os << '/' << host.arch
+                << " assigns DIFFERENT staged headers than the first host."
+                   " Which zlib header a leg compiles against is a fact about"
+                   " its TARGET; a host that changes it has re-locked the"
+                   " harness one level down from the leg set.";
+        }
+    }
+}
+
+// THE ARTEFACT. Drive the REAL staging tool with the SHIPPED catalogue over a
+// zconf.h fixture, then read every leg's include dir back off disk and confirm
+// the guard it got is the one its own target wanted.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): revert to one shared
+// zinc/ — i.e. point every leg at a single staged directory, however that
+// directory was configured — and the legs on the other side of the guard fail
+// here with the value they actually got.
+TEST_F(HarnessLegs, StageZincWritesOneHeaderPerTargetAndEveryLegGetsItsOwn) {
+    dss::test_support::ScratchDir work{dss::test_support::Location::Temp,
+                                       "sqlite-harness-zinc"};
+    auto const zconfSrc = work.path() / "zconf.h";
+    auto const zlibSrc  = work.path() / "zlib.h";
+    {
+        std::ofstream out(zconfSrc, std::ios::binary);
+        out << kZconfFixture;
+        std::ofstream z(zlibSrc, std::ios::binary);
+        z << "#include \"zconf.h\"\n";
+    }
+    auto const dest = work.path() / "zinc";
+
+    auto const py = pythonPath();
+    ASSERT_FALSE(py.empty())
+        << "python3 is a hard dependency of both drivers; a skip here would be"
+           " the no-verdict defect this file exists to end.";
+    std::vector<std::string> argv{
+        py,
+        (harnessDir() / "stage-zinc.py").string(),
+        "--zlib-h",  zlibSrc.string(),
+        "--zconf-h", zconfSrc.string(),
+        "--dest",    dest.string(),
+        // `runBinary` APPENDS its `binaryPath` as the final argv element (see
+        // `runResolver`), so the catalogue's VALUE is supplied by that
+        // append — and it is the scratch copy, which is also what keeps this
+        // from chmod'ing a tracked repo file on POSIX.
+        "--catalogue"};
+    auto const res = dss::test_support::runBinary(
+        catalogue_, std::chrono::seconds{120}, /*captureStdout=*/true, argv);
+    ASSERT_TRUE(res.spawned && !res.timedOut) << res.diagnostic;
+    ASSERT_EQ(res.exitCode, 0u)
+        << "stage-zinc.py could not produce every declared stage:\n"
+        << res.capturedStdout;
+    EXPECT_NE(res.capturedStdout.find("ZINC-STAGES="), std::string::npos)
+        << res.capturedStdout;
+
+    auto const doc = json::parse(fileText(catalogue_));
+    std::map<std::string, int> observed;  // stage key -> Z_HAVE_UNISTD_H state
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        auto const key =
+            leg.at("build").at("recipeTransform").get<std::string>();
+        auto const zconf = dest / key / "zconf.h";
+        ASSERT_TRUE(fs::exists(zconf))
+            << label << ": no staged zlib header at " << zconf
+            << ". A leg without its own zinc/ has nowhere to go but another"
+               " target's copy, and stage-zinc.py refuses that on purpose —"
+               " so the driver poisons the leg instead.";
+        bool const want =
+            leg.at("build").at("zconfGuards").at("Z_HAVE_UNISTD_H").get<bool>();
+        int const got = guardStateIn(zconf, "Z_HAVE_UNISTD_H");
+        EXPECT_EQ(got, want ? 1 : 0)
+            << label << " (target OS "
+            << specTargetOs(leg.at("spec").get<std::string>())
+            << ") compiles against " << zconf
+            << ", whose Z_HAVE_UNISTD_H reads " << got << " — it declared "
+            << want
+            << ". A leg parsing a zlib header configured for a different target"
+               " is D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED exactly.";
+        // Z_HAVE_STDARG_H is the CONTROL: it is declared true on every leg, so
+        // if the tool were rewriting whole blocks rather than the one declared
+        // guard, this would move too.
+        EXPECT_EQ(guardStateIn(zconf, "Z_HAVE_STDARG_H"), 1)
+            << label << ": the sibling guard must be untouched at #if 1";
+        observed[key] = got;
+    }
+    ASSERT_GE(observed.size(), 2u);
+    std::set<int> distinct;
+    for (auto const& [k, v] : observed) distinct.insert(v);
+    EXPECT_EQ(distinct.size(), 2u)
+        << "every staged header came out with the SAME Z_HAVE_UNISTD_H, so this"
+           " test would pass against the single shared zinc/ it was written to"
+           " outlaw. That is a silent-vacuity failure, not a pass.";
+}
+
+// THE DRIVERS. Both must use the shared tool, and neither may carry the shapes
+// that made one zinc/ serve every leg.
+//
+// RED-ON-DISABLE: put the `perl -0777 … Z_HAVE_UNISTD_H` flip back into either
+// driver, or hand every leg one `includes.txt`, and this fails naming the line.
+TEST_F(HarnessLegs, BothDriversStageOneZincPerTransform) {
+    struct Driver {
+        char const* name;
+        bool        powershell;
+        char const* sharedIncludeList;  // the pre-TF-C115 single-file spelling
+    };
+    constexpr Driver kDrivers[] = {
+        {"build-and-test.sh", false, "recipe-includes.txt"},
+        {"build-and-test.ps1", true, "includes.txt'"}};
+
+    for (auto const& d : kDrivers) {
+        auto const path = harnessDir() / d.name;
+        ASSERT_TRUE(fs::exists(path)) << path;
+        EXPECT_NE(fileText(path).find("stage-zinc.py"), std::string::npos)
+            << d.name
+            << " does not call stage-zinc.py. Per-target header staging then"
+               " lives somewhere else in that driver — and a capability in one"
+               " driver and not the other is a silent harness bug, which is how"
+               " the .sh came to build its pe64 leg against a POSIX zconf.h.";
+
+        for (auto const& line : liveLines(path, d.powershell)) {
+            // The macro names belong to the CATALOGUE and to stage-zinc.py. A
+            // driver that spells one is deciding a target's header itself.
+            EXPECT_EQ(line.find("Z_HAVE_UNISTD_H"), std::string::npos)
+                << d.name << " names a zconf guard in live code:\n  " << line
+                << "\nGuards are declared per leg in legs.json and applied by"
+                   " stage-zinc.py; a driver that edits one has re-created the"
+                   " single pe-shaped stage.";
+            EXPECT_EQ(line.find("perl -0777"), std::string::npos)
+                << d.name << " patches a staged header in place:\n  " << line;
+            EXPECT_EQ(line.find(d.sharedIncludeList), std::string::npos)
+                << d.name << " still names ONE shared include list:\n  " << line
+                << "\nThe list's last entry is the staged zlib dir, which is"
+                   " per target — so there is one list per header stage.";
+        }
+    }
 }

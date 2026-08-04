@@ -115,6 +115,68 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
     EXPECT_EQ(cu.driverDiagnostics().all().size(), 0u);  // D2: D_* codes start in CU2
 }
 
+// ── TF-C115: a predefined-macro collision must DIAGNOSE, not CRASH ────────
+//    ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]])
+//
+// This is the CONSUMER half of the defect. `C_ConflictingPredefinedMacro` is
+// documented in three shipped config files as the collision policy, "neither
+// side silently wins", FATAL — and it was UNREACHABLE through the compiler:
+// `preprocess()`'s conflict return left `tokens` empty, `parseAndAdd_` did
+// `pp.tokens.back()` on it under a comment asserting the vector is
+// "Eof-terminated by contract", and the process died. MEASURED on unmodified
+// HEAD config via the CLI (a `__STDC__` row added to a SCRATCH COPY of
+// `x86_64.target.json`, shipped configs untouched): rc 139 / SIGSEGV, zero
+// output. Post-fix the SAME input gives rc 1 and the named diagnostic.
+//
+// The preprocessor's own suite could not have caught this: it asserted the
+// diagnostic and `fatal`, never that the returned result was usable. THIS test
+// runs the real consumer, which is where the crash lived.
+//
+// RED-ON-DISABLE: restore `pp.tokens.back()` in
+// `compilation_unit.cpp::parseAndAdd_`, or drop the
+// `establishResultContract(...)` call from `preprocess()`'s single exit.
+TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_TRUE(schema->preprocess().enabled);
+
+    // Collide with a name the SHIPPED c-subset language config owns. The row is
+    // built HERE, in the fixture — never added to a shipped config, which must
+    // stay valid.
+    PredefinedMacroDef clash;
+    clash.name  = "__LINE__";
+    clash.kind  = PredefinedMacroKind::Constant;
+    clash.value = "1";
+
+    UnitBuilder b{schema};
+    b.setTargetPredefinedMacros({clash});
+    // Reaching this line at all is the primary assertion: pre-fix the process
+    // died inside `addInMemory` and no EXPECT below ever ran.
+    b.addInMemory("int x = 1;\n", "collide.c");
+    auto cu = std::move(b).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u)
+        << "the aborting preprocess must still yield a well-formed (empty) "
+           "tree carrying the PP diagnostics, not nothing";
+    auto const& diags = cu.trees()[0].diagnostics();
+    EXPECT_TRUE(hasCode(diags, DiagnosticCode::C_ConflictingPredefinedMacro))
+        << "the documented collision policy must actually reach the user";
+    EXPECT_TRUE(diags.hasErrors())
+        << "a collision must drive a NON-ZERO exit — a crash has no exit code "
+           "the driver can reason about, and a silent win has none at all";
+
+    // The message must NAME the colliding macro, from DATA. A diagnostic that
+    // only says "conflict" cannot be acted on, and one that names the macro
+    // from a hardcoded list would not survive the next config edit.
+    bool named = false;
+    for (auto const& d : diags.all()) {
+        if (d.code != DiagnosticCode::C_ConflictingPredefinedMacro) continue;
+        if (d.actual.find("__LINE__") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << "the collision message must name the colliding macro";
+}
+
 // c105 (D-PP-USER-DEFINE, the audit-F3 pin): `--define` macros on a language
 // WITHOUT a preprocess block (toy) can never be consumed — the plain
 // tokenize→parse path must fail LOUD (D_DefineRequiresPreprocess), never

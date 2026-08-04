@@ -5,6 +5,8 @@
 
   "$noHostKeyingComment": "NOTHING in this file may be keyed on the host. `build.libraries.searchPaths` is the one place host-shaped STRINGS appear, and they are CANDIDATES, not decisions: every path is tried on every host, a hit is used and a miss costs nothing. A driver that skips a search path because of the host it is on has reintroduced the defect. ⚠ If you are tempted to add a `\"onlyOnHost\"` key here, stop: the question you are answering is either 'can this host EXECUTE it' (that is `runOn`/`launchers`) or 'is a declared build input present' (that is a filesystem probe whose failure is the LOUD `skipped-build-input-missing` verdict) — never 'is this leg allowed to exist'.",
 
+  "$stagedHeadersComment": "★ THE THIRD-PARTY HEADERS A LEG COMPILES AGAINST ARE A TARGET FACT, NOT A HOST ONE (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed TF-C115). The staged zlib header is copied from the DERIVING POSIX host, where `./configure` baked ITS OWN probe results into zconf.h — `#if 1 → #define Z_HAVE_UNISTD_H` and friends. Those are facts about the deriving machine, exactly like the recipe's HAVE_*/Z_HAVE_* defines that `recipeTransform` exists to drop, and handing them to a foreign target is the same cross-compile category error one level down. Each leg therefore DECLARES `build.zconfGuards` — the value ITS target has for each guard `./configure` may have set — and the drivers stage ONE zinc/ PER `recipeTransform` (stage-zinc.py, called by both) and give each leg an include list pointing at its own. Two legs may share a zinc/ only by sharing a recipeTransform, and the lint refuses a catalogue where same-transform legs declare different guards. Before this, ONE pe-shaped zinc/ served every leg and the .ps1 REFUSED (`poisoned`) any leg that was not `windows-selfconfig` rather than compile it against the wrong header — the right call, and the reason this key exists is to make the refusal unnecessary instead of relaxing it.",
+
   "dssHarnessLegsVersion": 1,
 
   "legs": [
@@ -19,6 +21,8 @@
       ],
       "build": {
         "recipeTransform": "none",
+        "$zconfGuardsComment": "See the pe64 leg for the whole story. This target HAS <unistd.h>, so zlib must see it — which is what the deriving Linux host's ./configure already decided, so these values are the staged header's own.",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-shared", "-fPIC"],
         "targetCc": { "candidates": ["cc", "gcc", "clang"], "package": "" },
@@ -41,6 +45,7 @@
       ],
       "build": {
         "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-shared", "-fPIC"],
         "targetCc": { "candidates": ["aarch64-linux-gnu-gcc"], "package": "gcc-aarch64-linux-gnu" },
@@ -65,6 +70,8 @@
       "build": {
         "$recipeTransformComment": "The recipe is derived from a POSIX `make -n`, so it carries that build host's configure/zlib feature probes (HAVE_*/Z_HAVE_*/_HAVE_SQLITE_CONFIG_H) — facts about the DERIVING host, never about this target. `windows-selfconfig` drops them and adds SQLITE_OS_WIN=1 so SQLite self-configures its Windows build. Keyed on THIS LEG, which is why the rule moved out of gen-pe64-manifest.py's prose ('this generator is pe-only, so keying the rule on the pe target is inherent here') into a declaration any driver can read.",
         "recipeTransform": "windows-selfconfig",
+        "$zconfGuardsComment": "THE HEADER HALF OF THE SAME CROSS-COMPILE CATEGORY ERROR the recipeTransform fixes, and until TF-C115 the ONLY leg it was applied for — by a `perl -0777 -pi` flip buried in one driver's staging step, against ONE zinc/ shared by every leg, which is why a non-pe leg had to be REFUSED (`poisoned`) rather than built. The staged zconf.h comes from the deriving POSIX host, where ./configure wrote `#if 1 → #define Z_HAVE_UNISTD_H`; that is a fact about THAT HOST, and on a Windows TARGET <unistd.h> does not exist. Each guard is now DECLARED per leg and one zinc/ is staged per recipeTransform (stage-zinc.py), so every leg parses a zlib header configured for ITS OWN target and no leg is refused. ★ Z_HAVE_STDARG_H stays true: <stdarg.h> is C-standard and exists on pe. ★ MEASURED (TF-C115) on the elf64-x86_64 leg, both gcc and DSS: with these recipe defines the ONLY thing the guard changes is `z_off_t` = off_t vs long — the same 8-byte `long` on LP64 — and SEEK_*/z_off64_t/the gz* symbol names are byte-identical either way. So the flip is BENIGN on LP64; it is NOT benign on the pe target, where the guard's `#include <unistd.h>` simply does not resolve.",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": false, "Z_HAVE_STDARG_H": true },
         "$stackReserveComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — Windows defaults a process to 1 MiB; e_fkey-63.1.x recurses to SQLITE_MAX_TRIGGER_DEPTH and overflows it (a NATIVE gcc build overflows too). 8 MiB = what Linux hands the process for free.",
         "stackReserveBytes": 8388608,
         "sharedLibFlags": ["-shared"],
@@ -94,6 +101,7 @@
       "launchers": [],
       "build": {
         "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },
@@ -116,6 +124,7 @@
       ],
       "build": {
         "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },

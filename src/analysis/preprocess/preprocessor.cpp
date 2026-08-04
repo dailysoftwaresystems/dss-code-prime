@@ -187,6 +187,23 @@ LineMap::Resolved LineMap::resolve(ByteOffset synthOffset) const noexcept {
     return r;
 }
 
+Token const& PreprocessResult::eofToken() const {
+    // Fail LOUD and NAMED rather than reading past the end. `preprocess()`'s
+    // single exit (`establishResultContract`) guarantees both conditions for
+    // every result it hands out, so reaching either message means a
+    // `PreprocessResult` was produced by something other than that exit.
+    if (tokens.empty()) {
+        ppFatal("PreprocessResult::eofToken: the token vector is EMPTY - every "
+                "result `preprocess()` returns is Eof-terminated by contract, "
+                "so this one did not come from that function's single exit");
+    }
+    if (tokens.back().coreKind != CoreTokenKind::Eof) {
+        ppFatal("PreprocessResult::eofToken: the token vector is NOT "
+                "Eof-terminated - its last token is not CoreTokenKind::Eof");
+    }
+    return tokens.back();
+}
+
 std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const {
     BufferId const synthId = synthBuffer ? synthBuffer->id() : BufferId{};
     // Redirect EVERY synth-buffer diagnostic onto its real origin buffer --
@@ -5489,7 +5506,36 @@ MergedPredefinedMacros mergePredefinedMacros(
     return out;
 }
 
-PreprocessResult preprocess(
+namespace {
+
+// The preprocess RUN — the whole pass, MINUS the result-shape guarantee.
+// PRECONDITION (validated by the exported `preprocess()` wrapper below, which
+// is this function's ONLY caller): `mainSource` and `schema` are non-null and
+// `schema->preprocess().enabled` is true.
+//
+// ★ WHY THIS IS NOT THE EXPORTED ENTRY POINT
+//   ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+// `PreprocessResult` documents an invariant its consumers rely on: `tokens` is
+// Eof-terminated and `synthBuffer` is live. The happy path establishes that
+// invariant at its very TAIL (the Eof append + `SourceBuffer::fromString`
+// below). So the invariant held only for the path that ran to completion, and
+// EVERY early return silently shipped a result that broke the documented shape
+// — with no way for the caller to tell, because the shape is asserted in a
+// comment.
+//
+// That was not hypothetical. The predefined-macro-collision abort returned with
+// `tokens` EMPTY and `synthBuffer` NULL, and `compilation_unit.cpp`'s
+// `pp.tokens.back()` — carrying the comment "Eof-terminated by contract" —
+// dereferenced past the end of an empty vector. MEASURED TF-C115: the CLI
+// SEGFAULTED (rc 139 Linux / 0xC0000005 Windows) with NOT ONE diagnostic
+// printed, for a fault whose entire purpose is to be loud.
+//
+// Wrapping the run funnels every `return` — this one and every one a future
+// cycle adds — through ONE exit that establishes the contract. A new early
+// return can no longer reintroduce the crash by omission, which is the whole
+// point: the previous shape made "remember to Eof-terminate" a rule each
+// author had to know, and the fix makes it a rule no author can break.
+PreprocessResult preprocessRun(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
@@ -5499,12 +5545,6 @@ PreprocessResult preprocess(
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
     std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
-    if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
-    if (!schema->preprocess().enabled) {
-        ppFatal("preprocess: called with a schema whose preprocess pass is "
-                "disabled - caller must gate on preprocess().enabled");
-    }
-
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>();
 
@@ -5519,7 +5559,14 @@ PreprocessResult preprocess(
     if (!merged.conflicts.empty()) {
         // A name owned by more than one config. None may silently win, so the
         // pass does not run at all: `fatal` stops the caller from treating the
-        // (empty) token stream as a successful preprocess.
+        // token stream as a successful preprocess.
+        //
+        // This return produces NO tokens and NO synth buffer. That is fine
+        // HERE and only here: the single exit in `preprocess()` turns it into
+        // the well-formed EMPTY translation unit the contract promises. Before
+        // TF-C115 this return went straight to the caller and crashed it —
+        // see `establishResultContract` for what "well-formed empty" means and
+        // why "refused to run" is representable rather than a hole.
         for (std::string const& msg : merged.conflicts) {
             emitPP(*result.diagnostics,
                    DiagnosticCode::C_ConflictingPredefinedMacro,
@@ -5686,7 +5733,9 @@ PreprocessResult preprocess(
     const ByteOffset prefixLen = static_cast<ByteOffset>(synthText.size());
     auto prefixBuffer = SourceBuffer::fromString(
         synthText, std::string{mainSource->name()});
-    result.mainSourceId = mainSource->id();
+    // (`result.mainSourceId` is stamped by `establishResultContract` on the
+    //  single exit, so an aborting return carries it too — it used to be set
+    //  here, i.e. on the happy path only.)
 
     // c17 (P000E fix): the main tokenize's diagnostics go to a PROVISIONAL
     // reporter, NOT straight onto `result.diagnostics`. A `P_IllegalChar` whose
@@ -5854,6 +5903,111 @@ PreprocessResult preprocess(
         }
     }
 
+    return result;
+}
+
+// Establish the `PreprocessResult` shape contract on the SINGLE exit every run
+// funnels through ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+//
+// Two situations, deliberately handled DIFFERENTLY, because they are not the
+// same fact:
+//
+//  (1) the run produced NO tokens at all. That is a LEGITIMATE abort state: the
+//      pass refused to run (today: a predefined-macro collision, which must not
+//      let either config silently win; tomorrow: whatever else must refuse).
+//      The honest representation of "refused" is a well-formed EMPTY
+//      translation unit — a real, empty synth buffer and the single Eof token
+//      that terminates it — NOT a hole every consumer must remember to test
+//      for. Nothing is swallowed: `fatal` is set and the diagnostics are
+//      reported, so the caller still parses an Eof-only stream, still surfaces
+//      the error, and still exits non-zero. What changes is that it does so
+//      instead of reading past the end of an empty vector.
+//
+//  (2) the run produced tokens but LOST the terminator. NO legitimate path can
+//      do that — the run appends the Eof itself, unconditionally, right before
+//      its normal return — so this is an internal invariant break and it fails
+//      LOUD. Silently appending an Eof here would paper over a real truncation
+//      bug behind a stream the parser happily accepts, which is the "traded a
+//      crash for a silent skip" outcome the fail-loud rule forbids.
+//
+// Everything it touches is DATA-DRIVEN: it reads the token vector's shape and
+// the main buffer's name/id. It knows no language, no architecture and no
+// object format.
+void establishResultContract(PreprocessResult& result,
+                             std::shared_ptr<SourceBuffer> const& mainSourcePtr) {
+    SourceBuffer const& mainSource = *mainSourcePtr;
+    // Every path reports through this; an abort before the run allocated one
+    // would otherwise hand the caller a null `unique_ptr` it dereferences.
+    if (!result.diagnostics) {
+        result.diagnostics = std::make_unique<DiagnosticReporter>();
+    }
+    result.mainSourceId = mainSource.id();
+    // The MAIN source is an origin buffer of every preprocess result, by
+    // definition — it is the input. The run derives `originBuffers` from the
+    // LINE MAP, which an abort leaves empty, so on an aborting path the main
+    // buffer was never collected and the diagnostics stamped with its id had
+    // nothing to resolve against: MEASURED TF-C115, the collision error
+    // rendered `--> <unknown-buffer:1>:offset 0` instead of naming the file the
+    // user compiled. Stating the invariant here (deduped by id, exactly as the
+    // run's own collection loop does) makes it hold on EVERY path rather than
+    // on the paths that happen to build a line map.
+    {
+        bool present = false;
+        for (auto const& ob : result.originBuffers) {
+            if (ob && ob->id() == mainSource.id()) { present = true; break; }
+        }
+        if (!present) result.originBuffers.push_back(mainSourcePtr);
+    }
+    if (!result.synthBuffer) {
+        // An EMPTY buffer under the MAIN FILE's name: every consumer that
+        // dereferences `synthBuffer` (the Parser's source, the CU sidecar's
+        // `source`, `makeRemap`'s synth id) gets a live object, and a span into
+        // it is attributed to the file the user actually named rather than to
+        // `<unknown-buffer>`.
+        result.synthBuffer =
+            SourceBuffer::fromString(std::string{}, std::string{mainSource.name()});
+    }
+    if (result.tokens.empty()) {
+        Token eof;
+        eof.coreKind = CoreTokenKind::Eof;
+        eof.span     = SourceSpan::empty(
+            static_cast<ByteOffset>(result.synthBuffer->size()));
+        result.tokens.push_back(eof);
+        return;
+    }
+    if (result.tokens.back().coreKind != CoreTokenKind::Eof) {
+        ppFatal("preprocess: the result token vector is NOT Eof-terminated - a "
+                "return path in preprocessRun produced tokens but dropped the "
+                "terminating Eof, breaking the PreprocessResult contract every "
+                "consumer reads (see establishResultContract)");
+    }
+}
+
+} // namespace
+
+PreprocessResult preprocess(
+    std::shared_ptr<SourceBuffer>        mainSource,
+    std::shared_ptr<GrammarSchema const> schema,
+    std::span<fs::path const>            includeDirs,
+    HeaderNameMatching                   headerNameMatching,
+    std::span<fs::path const>            systemDirs,
+    std::optional<ObjectFormatKind>      activeFormat,
+    std::span<std::string const>         userDefines,
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros,
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
+    if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
+    if (!schema->preprocess().enabled) {
+        ppFatal("preprocess: called with a schema whose preprocess pass is "
+                "disabled - caller must gate on preprocess().enabled");
+    }
+    PreprocessResult result = preprocessRun(
+        mainSource, std::move(schema), includeDirs, headerNameMatching,
+        systemDirs, activeFormat, userDefines, targetPredefinedMacros,
+        formatPredefinedMacros);
+    // ★ THE SINGLE EXIT. Its value is that it is not optional: a `return` added
+    // anywhere inside `preprocessRun` — for a config fault nobody has thought
+    // of yet — cannot bypass it.
+    establishResultContract(result, mainSource);
     return result;
 }
 

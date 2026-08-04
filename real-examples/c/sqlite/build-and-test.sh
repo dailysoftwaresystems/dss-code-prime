@@ -389,7 +389,8 @@ esac
 declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
-           LEG_RECIPE_TRANSFORM=() LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
+           LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
+           LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
            LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
            LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=()
 # Resolved by this driver: the leg's chosen target compiler, its (tcl, z) pair, and
@@ -1841,21 +1842,80 @@ for _d in "${SQLITE_INCS[@]:-}"; do
       (which also passes --with-tclsh/--with-tcl to configure so the recipe follows the pin), then
       delete $BLD so configure re-runs."
 done
-ZINC="$BLD/zinc"; mkdir -p "$ZINC"
+# ── the zlib headers — ONE STAGED DIRECTORY PER TARGET CONFIGURATION ─────────
+# ★ D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED (closed TF-C115).
+# The deriving host's zconf.h has been through ITS ./configure, which rewrote
+#     #if 1  /* was set to #if 1 by ./configure */
+#     #  define Z_HAVE_UNISTD_H
+# That `#if 1` is a measurement of THIS MACHINE — the header-level twin of the
+# recipe's HAVE_*/Z_HAVE_* defines that `recipeTransform` already exists to drop.
+# So the pair is copied to `zinc-src/` UNTOUCHED and NO leg includes it: each leg
+# DECLARES its target's answer for each guard (legs.json `build.zconfGuards`) and
+# stage-zinc.py — the same tool build-and-test.ps1 calls — writes one
+# zinc/<recipeTransform>/ per declared stage. Step 7 gives each leg the include
+# list carrying ITS OWN stage, so no leg parses another target's zlib header.
+#
+# ★ THIS DRIVER'S HALF OF THE DEFECT WAS THE MIRROR IMAGE, AND IT WAS SILENT.
+# The .ps1 flipped the guard for pe and said out loud that the shared stage was
+# therefore pe-shaped; this driver never flipped it at all, so once TF-C114 gave
+# it the pe64 leg, that leg was staged a POSIX-configured zconf.h. MEASURED
+# TF-C115: that combination does not miscompile, it fails loud —
+# `error[F001D] got unistd.h` — so the pe64 leg was unbuildable from here. Both
+# halves are closed by the same per-target staging.
+ZINC_SRC="$BLD/zinc-src"; ZINC_ROOT="$BLD/zinc"; mkdir -p "$ZINC_SRC" "$ZINC_ROOT"
+# ZINC_ROOT lives INSIDE the sqlite checkout and survives between runs, so a tree
+# staged by the pre-TF-C115 driver still has `zinc/zlib.h` + `zinc/zconf.h` sitting
+# at its top level — the single pe-shaped header this cycle removed. Nothing puts
+# that directory on an include path any more (only `zinc/<stage>/` goes there), but
+# check-source-coherence.sh walks $BLD at `-maxdepth 2` and would still SEE them.
+# Delete them: a stale artefact of the exact layout that was just replaced is the
+# last thing a reader of this tree should find.
+rm -f "$ZINC_ROOT"/*.h
 ZH="$(find_in "${INC_ROOTS[@]}" -- -maxdepth 3 -name zlib.h | sed -n '1p')"
 # Fatal for the whole run for the same reason as tcl.h above: one portable header,
 # parsed by every leg.
 [[ -n "$ZH" ]] || die "zlib.h not found — install zlib1g-dev (or 'brew install zlib').
       This is fatal for the ENTIRE run, not for one leg: every leg parses this same header.
       roots searched: ${INC_ROOTS[*]}"
-cp -f "$ZH" "$ZINC/"
+cp -f "$ZH" "$ZINC_SRC/"
 # zconf.h beside zlib.h first (they are a matched pair); the sweep is the fallback.
 # Deliberately unquoted — this word-splits the find results into loop items.
+ZCH=""
 for zc in "$(dirname "$ZH")/zconf.h" $(find_in "${INC_ROOTS[@]}" -- -maxdepth 3 -name zconf.h); do
-  [[ -f "$zc" ]] && { cp -f "$zc" "$ZINC/"; break; }
+  [[ -f "$zc" ]] && { cp -f "$zc" "$ZINC_SRC/"; ZCH="$zc"; break; }
 done
-THIRD_PARTY_INCS=("$TCL_INC" "$ZINC")
-info "tcl $TCL_VER headers: $TCL_INC   zlib headers: $ZINC (staged from $ZH)"
+# zconf.h is where every guard lives, so "zlib.h without it" is not a degraded
+# stage, it is no stage — and it used to be tolerated silently (`|| true`).
+[[ -n "$ZCH" ]] || die "zconf.h not found beside $ZH nor anywhere under ${INC_ROOTS[*]}.
+      zlib.h includes it and every ./configure guard lives in it; without it no leg's
+      zlib header can be configured for its target."
+# label -> the include-list file that leg's manifest must use; populated below.
+declare -A LEG_INC_FILE=() LEG_ZINC_DIR=()
+declare -A ZINC_STAGE_DIR=()
+# rc DIRECTLY off python3 (never through a pipe) — the output is captured first
+# and parsed after, so a FAIL line is still read on a non-zero rc.
+ZINC_OUT="$(python3 "$SCRIPT_DIR/stage-zinc.py" --zlib-h "$ZINC_SRC/zlib.h" \
+              --zconf-h "$ZINC_SRC/$(basename "$ZCH")" --dest "$ZINC_ROOT" \
+              --catalogue "$LEG_CATALOGUE" 2>&1)" || true
+while IFS= read -r _zl; do
+  case "$_zl" in
+    ZINC-STAGE-OK=*)
+      _rest="${_zl#ZINC-STAGE-OK=}"; _k="${_rest%%|*}"; _rest="${_rest#*|}"
+      _dir="${_rest%%|*}"; _rest="${_rest#*|}"; _guards="${_rest%%|*}"; _note="${_rest#*|}"
+      ZINC_STAGE_DIR["$_k"]="$_dir"
+      info "zinc stage '$_k' -> $_dir   [$_guards]"
+      [[ -z "$_note" ]] || info "      note: $_note" ;;
+    ZINC-STAGE-FAIL=*)
+      _rest="${_zl#ZINC-STAGE-FAIL=}"
+      warn "zinc stage '${_rest%%|*}' COULD NOT BE PRODUCED — ${_rest#*|}" ;;
+    ZINC-STAGES=*) info "zinc stages: ${_zl#ZINC-STAGES=} produced" ;;
+    *) [[ -z "$_zl" ]] || info "      $_zl" ;;
+  esac
+done <<< "$ZINC_OUT"
+[[ ${#ZINC_STAGE_DIR[@]} -gt 0 ]] || die "stage-zinc.py produced NO per-target zlib header dir:
+$ZINC_OUT"
+THIRD_PARTY_INCS=("$TCL_INC")
+info "tcl $TCL_VER headers: $TCL_INC   zlib source headers: $ZINC_SRC (from $ZH) -> ${#ZINC_STAGE_DIR[@]} per-target stage(s) under $ZINC_ROOT"
 
 # ── PER-LEG libraries — each leg resolves its OWN (tcl, z) pair ──────────────
 # WHAT THESE ARE FOR — they flow into the per-leg `.dss-project.json`
@@ -2490,8 +2550,14 @@ ensure_cmd python3 python3
 # recipe's relative `-I.`). These dirs, the TU list (${TUS[@]}) and the recipe
 # defines (${RECIPE_DEFS[@]}, already `-D`-stripped) are the SAME inputs the
 # per-file CLI fed; here they populate a `.dss-project.json` manifest instead.
-declare -a INC_DIRS=()
-for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"); done
+# ★ SPLIT IN TWO SO THE PER-TARGET zinc/ CAN GO WHERE THE SHARED ONE USED TO.
+# HEAD ends where the staged third-party headers end; the leg's own zlib dir is
+# spliced in there and TAIL follows. Appending it to the end instead would put it
+# AFTER the macOS SDK include dir below — and the SDK also ships a zlib.h, so on a
+# Mac host the leg would silently take Apple's copy instead of its own staged one.
+declare -a INC_DIRS_HEAD=() INC_DIRS_TAIL=()
+for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}"; do INC_DIRS_HEAD+=("$d"); done
+INC_DIRS_TAIL+=("$BLD")
 # ★ macOS: the Xcode SDK include dir goes on the path LAST
 # (D-CSUBSET-DARWIN-PLATFORM-MACROS follow-on). Now that a macho target
 # predefines __APPLE__, the Darwin-guarded arms of sqlite compile for the first
@@ -2509,20 +2575,36 @@ for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"
 # note that it applies to EVERY leg built here, not just the macho ones.
 if [[ "$HOST_OS" == "darwin" ]]; then
   _sdk_inc="$(sdk_prefix)"
-  [[ -n "$_sdk_inc" && -d "$_sdk_inc/usr/include" ]] && INC_DIRS+=("$_sdk_inc/usr/include")
+  [[ -n "$_sdk_inc" && -d "$_sdk_inc/usr/include" ]] && INC_DIRS_TAIL+=("$_sdk_inc/usr/include")
 fi
 
-# ── the recipe arrays, staged ONCE as files for the shared manifest generator ─
-# The TU list, the include dirs and the recipe defines are LEG-INDEPENDENT, so they
-# are written once and every leg's manifest is generated from the same three files.
+# ── the recipe arrays, staged as files for the shared manifest generator ─────
+# The TU list and the recipe defines are LEG-INDEPENDENT, so they are written once
+# and every leg's manifest is generated from the same two files.
 # FILES, not argv: ~185 absolute paths would overflow a Windows command line, which
 # is why gen-pe64-manifest.py took this shape in the first place.
+#
+# ★ THE INCLUDE LIST IS *NOT* LEG-INDEPENDENT, and pretending it was is
+# D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. Its last entry is the staged zlib
+# header dir, which is configured for ONE target family. So one list is written
+# PER HEADER STAGE — base dirs + that stage's zinc/ — and each leg is handed the
+# one carrying its own. The stage KEY comes from the resolver
+# (`LEG_HEADER_STAGE_KEY`, derived from the leg's declared recipeTransform); this
+# driver only joins it onto a path.
 RECIPE_TUS_FILE="$OUT_DIR/recipe-tus.txt"
-RECIPE_INCS_FILE="$OUT_DIR/recipe-includes.txt"
 RECIPE_DEFS_FILE="$OUT_DIR/recipe-defines.txt"
 printf '%s\n' "${TUS[@]}"         > "$RECIPE_TUS_FILE"
-printf '%s\n' "${INC_DIRS[@]}"    > "$RECIPE_INCS_FILE"
 printf '%s\n' "${RECIPE_DEFS[@]}" > "$RECIPE_DEFS_FILE"
+for _k in "${!ZINC_STAGE_DIR[@]}"; do
+  printf '%s\n' "${INC_DIRS_HEAD[@]}" "${ZINC_STAGE_DIR[$_k]}" "${INC_DIRS_TAIL[@]}" \
+    > "$OUT_DIR/recipe-includes.$_k.txt"
+done
+for _l in "${LEG_DECLARED[@]}"; do
+  _k="${LEG_HEADER_STAGE_KEY[$_l]:-}"
+  [[ -n "$_k" && -n "${ZINC_STAGE_DIR[$_k]:-}" ]] || continue
+  LEG_INC_FILE["$_l"]="$OUT_DIR/recipe-includes.$_k.txt"
+  LEG_ZINC_DIR["$_l"]="${ZINC_STAGE_DIR[$_k]}"
+done
 
 # generate_manifest <leg> <out-manifest> — write this leg's project manifest.
 #
@@ -2537,12 +2619,16 @@ printf '%s\n' "${RECIPE_DEFS[@]}" > "$RECIPE_DEFS_FILE"
 #   · --resolve-library   its resolved (tcl, z) pair
 #   · --recipe-transform  `none` | `windows-selfconfig`  (build.recipeTransform)
 #   · --stack-reserve     bytes; 0 omits the key           (build.stackReserveBytes)
+#   · --includes          THIS LEG's include list — the one carrying the zlib
+#                         header staged for its target (build.zconfGuards, via
+#                         build.headerStageKey). Not one shared file: that is
+#                         D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED.
 # rc is taken DIRECTLY off python3 by the caller's `if`, never through a pipe.
 generate_manifest() {
   local leg="$1" out="$2"
   python3 "$MANIFEST_GEN" \
     --tus       "$RECIPE_TUS_FILE" \
-    --includes  "$RECIPE_INCS_FILE" \
+    --includes  "${LEG_INC_FILE[$leg]}" \
     --defines   "$RECIPE_DEFS_FILE" \
     --target    "${LEG_SPEC[$leg]}" \
     --resolve-library "${LEG_TCL_LIB[$leg]}" \
@@ -2644,6 +2730,17 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] build NOT ATTEMPTED [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}"
     continue
   fi
+  # THE OTHER thing that can stop a leg here, and it is a DEFECT rather than an
+  # environment: its own staged zlib header dir could not be produced (a
+  # ZINC-STAGE-FAIL in Step 6). `poisoned`, named, and NO fallback to a sibling
+  # stage's zinc/ — that fallback is D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED.
+  if [[ -z "${LEG_INC_FILE[$leg]:-}" ]]; then
+    LEG_VERDICT["$leg"]='poisoned'
+    LEG_VERDICT_DETAIL["$leg"]="the zlib header dir for this leg's stage 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' (its declared zconfGuards: ${LEG_ZCONF_GUARDS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header is refused."
+    COMPILE_FAILS=$((COMPILE_FAILS + 1))
+    warn "[$leg] POISONED — ${LEG_VERDICT_DETAIL[$leg]}"
+    continue
+  fi
   spec="${LEG_SPEC[$leg]}"; fmt="${LEG_FORMAT[$leg]}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
   manifest="$outd/$leg.dss-project.json"
   mkdir -p "$outd"
@@ -2665,6 +2762,7 @@ for leg in "${LEG_ORDER[@]}"; do
   done <<< "$preflight_out"
   # <<< dss:preflight <<<
   info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "${LEG_TCL_LIB[$leg]}"), $(basename "${LEG_Z_LIB[$leg]}"); transform: ${LEG_RECIPE_TRANSFORM[$leg]}; stackReserve: ${LEG_STACK_RESERVE[$leg]})"
+  info "[$leg] zlib headers: ${LEG_ZINC_DIR[$leg]}  [${LEG_ZCONF_GUARDS[$leg]}]"
   # rc DIRECTLY off the generator (the `if` also keeps errexit out of it). It emits
   # two lines — the transform summary and the counts — so both are surfaced.
   if counts="$(generate_manifest "$leg" "$manifest")"; then

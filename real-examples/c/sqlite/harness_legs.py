@@ -48,6 +48,7 @@ USAGE
   harness_legs.py --verdict-vocabulary
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json|sh]
                          [--launchers-available a,b,... | --launchers-none]
+  harness_legs.py --header-stages
   harness_legs.py --lint
   harness_legs.py --self-test
 """
@@ -88,6 +89,22 @@ VERDICTS = [
 # LOUD lint failure rather than a silently-ignored typo.
 LIBRARY_PROVIDERS = {"host-system", "ubuntu-ports-arm64", "search-paths"}
 RECIPE_TRANSFORMS = {"none", "windows-selfconfig"}
+
+# The zconf.h guards `./configure` may have baked into the DERIVING host's zlib
+# header, and which each leg therefore has to declare for ITS OWN target. Closed,
+# for the same reason every other vocabulary here is: a typo'd guard name would
+# otherwise be a declaration that silently does nothing.
+# ★ These are NAMES OF MACROS IN A THIRD-PARTY HEADER, listed here only so a
+# declaration can be validated. stage-zinc.py is what applies them; nothing in
+# this file knows what either macro MEANS.
+ZCONF_GUARDS = ("Z_HAVE_UNISTD_H", "Z_HAVE_STDARG_H")
+
+# The one guard whose correct value is DERIVABLE from the target, so the lint can
+# check a declaration instead of trusting it: <unistd.h> is POSIX, and a Windows
+# target does not have it. (Z_HAVE_STDARG_H is not in here because <stdarg.h> is
+# C-standard — every target has it, so there is nothing to cross-check.)
+POSIX_ONLY_ZCONF_GUARDS = ("Z_HAVE_UNISTD_H",)
+TARGET_OS_NAMES = ("linux", "windows", "darwin")
 
 # Host identity, in the SAME spellings the corpus manifests use for `runOn` and
 # the same arch spellings the shipped *.target.json files use as their `name`.
@@ -136,6 +153,58 @@ def spec_target_arch(spec):
 
 def spec_format(spec):
     return spec.split(":", 1)[1] if ":" in spec else ""
+
+
+def spec_target_os(spec):
+    """'x86_64:pe64-x86_64-windows-exec' -> 'windows'.
+
+    The shipped `*.format.json` names are `<container><bits>-<arch>-<os>-<kind>`,
+    so the OS is the second-to-last token. Returns "" when the format name is not
+    that shape — the caller LINTS that, rather than this guessing."""
+    parts = spec_format(spec).split("-")
+    return parts[-2] if len(parts) >= 3 else ""
+
+
+# ── Staged third-party headers, per TARGET ──────────────────────────────────
+#
+# D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. The staged zlib header carries the
+# DERIVING host's ./configure probe results; a leg declares what ITS target's
+# answers are (`build.zconfGuards`), and the drivers stage one zinc/ per
+# `recipeTransform`. The KEY is the transform name and nothing else, so the
+# mapping is a property of the catalogue rather than of a branch in a driver.
+
+def header_stage_key(leg):
+    # `str()` because this becomes a DIRECTORY NAME in both drivers: a catalogue
+    # that wrote a number here must not produce a path spelled differently in
+    # python, bash and PowerShell.
+    return str(leg.get("build", {}).get("recipeTransform", "none"))
+
+
+def zconf_guards(leg):
+    return dict(leg.get("build", {}).get("zconfGuards", {}))
+
+
+def header_stages(legs):
+    """key -> guards, in first-declared order.
+
+    RAISES on a conflict: two legs sharing a recipeTransform but declaring
+    DIFFERENT guards cannot share one staged zinc/, and silently picking either
+    one would put a leg back where this whole anchor started — compiling against
+    a header configured for somebody else's target."""
+    stages, owner = {}, {}
+    for leg in legs:
+        key = header_stage_key(leg)
+        guards = zconf_guards(leg)
+        if key in stages and stages[key] != guards:
+            raise LegError(
+                "legs '%s' and '%s' both declare recipeTransform '%s' — so they "
+                "share ONE staged zinc/ — but declare DIFFERENT zconfGuards "
+                "(%r vs %r). One stage cannot be two headers; give them "
+                "different recipeTransforms or reconcile the guards."
+                % (owner[key], leg.get("label"), key, stages[key], guards))
+        stages.setdefault(key, guards)
+        owner.setdefault(key, leg.get("label"))
+    return stages
 
 
 # ── Catalogue ───────────────────────────────────────────────────────────────
@@ -281,7 +350,10 @@ def plan_leg(leg, host_os, host_arch, available):
         # ★ UNCONDITIONAL. This key exists so that a reader (and a diff) can see
         # that no host makes it false. If you ever find yourself writing
         # `"attempt": <expression>` here, you are re-locking the harness.
-        "build": dict(build, attempt=True),
+        # `headerStageKey` is DERIVED here so a driver never has to spell the
+        # recipeTransform -> zinc/ mapping itself; it reads the key and joins it
+        # onto the stage root. Host-free, like everything else in this dict.
+        "build": dict(build, attempt=True, headerStageKey=header_stage_key(leg)),
         "run": run,
     }
 
@@ -324,6 +396,15 @@ def emit_sh(resolved):
         put("LEG_LAUNCH_ENV",
             " ".join("%s=%s" % (k, q(v)) for k, v in sorted(run["env"].items())))
         put("LEG_RECIPE_TRANSFORM", b.get("recipeTransform", "none"))
+        # The leg's OWN staged-header directory name + the guards that made it.
+        # The driver joins the key onto its zinc/ root; it never decides the
+        # mapping and never reads the guards (stage-zinc.py applies those) — the
+        # guard string is emitted so a build log states, per leg, WHICH header
+        # configuration that leg was compiled against.
+        put("LEG_HEADER_STAGE_KEY", b.get("headerStageKey", "none"))
+        put("LEG_ZCONF_GUARDS",
+            " ".join("%s=%d" % (k, 1 if v else 0)
+                     for k, v in sorted(b.get("zconfGuards", {}).items())))
         put("LEG_STACK_RESERVE", str(b.get("stackReserveBytes", 0)))
         put("LEG_SHARED_FLAGS", " ".join(b.get("sharedLibFlags", [])))
         put("LEG_CC_CANDIDATES", " ".join(b.get("targetCc", {}).get("candidates", [])))
@@ -419,6 +500,52 @@ def lint(path=CATALOGUE):
         if transform not in RECIPE_TRANSFORMS:
             findings.append("leg '%s': unknown recipeTransform %r (known: %s)"
                             % (label, transform, ", ".join(sorted(RECIPE_TRANSFORMS))))
+        # ── the staged zlib header this leg compiles against ──────────────────
+        # Every guard, declared explicitly, with a value that is a BOOLEAN and
+        # not a string: `"false"` is truthy in every language a driver here is
+        # written in, and a guard that silently reads as "on" is exactly the
+        # defect this key exists to end.
+        guards = build.get("zconfGuards")
+        target_os = spec_target_os(spec)
+        if target_os not in TARGET_OS_NAMES:
+            findings.append("leg '%s': cannot derive a target OS from spec %r "
+                            "(format names are <container><bits>-<arch>-<os>-<kind>; "
+                            "got %r) — so the staged-header declaration below "
+                            "cannot be cross-checked against the target"
+                            % (label, spec, target_os))
+        if not isinstance(guards, dict):
+            findings.append("leg '%s': missing build.zconfGuards — every leg must "
+                            "declare, for ITS OWN target, the value of each zconf.h "
+                            "guard ./configure may have set on the DERIVING host "
+                            "(%s). Omitting it is how one pe-shaped zinc/ came to "
+                            "serve every leg." % (label, ", ".join(ZCONF_GUARDS)))
+        else:
+            for name in sorted(set(guards) - set(ZCONF_GUARDS)):
+                findings.append("leg '%s': unknown zconf guard %r (known: %s) — a "
+                                "guard nothing applies is a declaration that reads "
+                                "as configuration and is not"
+                                % (label, name, ", ".join(ZCONF_GUARDS)))
+            for name in ZCONF_GUARDS:
+                if name not in guards:
+                    findings.append("leg '%s': build.zconfGuards omits %r — every "
+                                    "guard is declared for every leg, so a reader "
+                                    "never has to know a default" % (label, name))
+                elif not isinstance(guards[name], bool):
+                    findings.append("leg '%s': zconf guard %r is %r, not a JSON "
+                                    "boolean — a string is truthy in bash, "
+                                    "PowerShell and python alike"
+                                    % (label, name, guards[name]))
+            for name in POSIX_ONLY_ZCONF_GUARDS:
+                want = target_os in ("linux", "darwin")
+                if target_os in TARGET_OS_NAMES and guards.get(name) is not want:
+                    findings.append(
+                        "leg '%s': targets OS '%s' but declares %s=%r. That guard "
+                        "governs `#include <unistd.h>`, which exists on POSIX and "
+                        "not on Windows, so its correct value is DERIVABLE from the "
+                        "target (%r) — a declaration that disagrees with the target "
+                        "would stage a header configured for a different machine, "
+                        "which is the whole defect this key closes."
+                        % (label, target_os, name, guards.get(name), want))
         libs = build.get("libraries", {})
         provider = libs.get("provider")
         if provider not in LIBRARY_PROVIDERS:
@@ -439,6 +566,14 @@ def lint(path=CATALOGUE):
                             % label)
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
+    # One staged zinc/ per recipeTransform is only sound if every leg sharing a
+    # transform wants the SAME header. header_stages() raises on a conflict; here
+    # that is a finding rather than a crash, so `--lint` reports it beside the
+    # others instead of dying on the first one.
+    try:
+        header_stages(legs)
+    except LegError as exc:
+        findings.append("%s" % exc)
     for key, spellings in sorted(vocab.items()):
         if len(spellings) > 1:
             findings.append("(targetArch=%s, hostOs=%s, hostArch=%s) has %d "
@@ -620,6 +755,42 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                   leg["run"]["verdict"] == "skipped-emulator-missing",
                   "got %r" % leg["run"]["verdict"])
 
+    # ── the staged-header plan ───────────────────────────────────────────────
+    # HOST-INVARIANT for exactly the reason the build set is: which zlib header a
+    # leg compiles against is a fact about that leg's TARGET. If this ever starts
+    # varying by host, a leg is being configured by the machine again.
+    stages = header_stages(legs)
+    check("one staged header stage per distinct recipeTransform",
+          sorted(stages) == sorted({leg["build"]["recipeTransform"] for leg in legs}),
+          "stages=%r transforms=%r" % (sorted(stages),
+                                       sorted({leg["build"]["recipeTransform"] for leg in legs})))
+    check("more than one header stage is declared", len(stages) > 1,
+          "only %r — with a single stage this whole mechanism is untested by the "
+          "catalogue it ships with" % sorted(stages))
+    for host in SELF_TEST_HOSTS:
+        resolved = plan(host[0], host[1], set(), path)
+        for leg in resolved["legs"]:
+            key = leg["build"]["headerStageKey"]
+            check("header stage key is host-invariant on %s/%s for %s"
+                  % (host[0], host[1], leg["label"]),
+                  key == leg["build"]["recipeTransform"],
+                  "key=%r transform=%r" % (key, leg["build"]["recipeTransform"]))
+            check("the leg's header stage exists in the stage plan (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]), key in stages)
+            check("the leg's declared guards ARE its stage's guards (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  stages.get(key) == leg["build"].get("zconfGuards"),
+                  "stage=%r leg=%r" % (stages.get(key),
+                                       leg["build"].get("zconfGuards")))
+    # Two legs with DIFFERENT transforms must not share a stage — otherwise the
+    # per-target staging is per-target in name only.
+    by_key = {}
+    for leg in legs:
+        by_key.setdefault(header_stage_key(leg), set()).add(leg["build"]["recipeTransform"])
+    for key, transforms in sorted(by_key.items()):
+        check("stage '%s' serves exactly one recipeTransform" % key,
+              len(transforms) == 1, "serves %r" % sorted(transforms))
+
     # The sh emitter must round-trip every leg, and must emit assignments ONLY —
     # build-and-test.sh `eval`s this text, so a line that is not an assignment is
     # a command it would execute.
@@ -627,7 +798,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 17,
+          len(statements) == 1 + len(labels) * 19,
           "got %d statements for %d legs" % (len(statements), len(labels)))
     for stmt in statements:
         check("the sh emitter emits assignments only",
@@ -646,6 +817,11 @@ def main(argv=None):
     p.add_argument("--verdict-vocabulary", action="store_true",
                    help="print the closed verdict names, one per line, in order")
     p.add_argument("--plan", action="store_true")
+    p.add_argument("--header-stages", action="store_true",
+                   help="print the distinct staged-header directories the drivers "
+                        "must materialise: '<key>\\t<GUARD>=<0|1> ...', one per "
+                        "line. HOST-FREE — a leg's header configuration is a fact "
+                        "about its TARGET.")
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -658,13 +834,19 @@ def main(argv=None):
                    help="treat every declared launcher as absent")
     args = p.parse_args(argv)
 
-    if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test):
-        p.error("one of --verdict-vocabulary / --plan / --lint / --self-test "
-                "is required")
+    if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
+            or args.header_stages):
+        p.error("one of --verdict-vocabulary / --plan / --header-stages / --lint "
+                "/ --self-test is required")
 
     try:
         if args.verdict_vocabulary:
             sys.stdout.write("\n".join(VERDICTS) + "\n")
+            return 0
+        if args.header_stages:
+            for key, guards in header_stages(load_catalogue(args.catalogue)).items():
+                sys.stdout.write("%s\t%s\n" % (key, " ".join(
+                    "%s=%d" % (n, 1 if v else 0) for n, v in sorted(guards.items()))))
             return 0
         if args.lint:
             findings = lint(args.catalogue)

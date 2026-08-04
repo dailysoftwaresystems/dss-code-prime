@@ -213,6 +213,9 @@ $Work         = [System.IO.Path]::Combine($RepoRoot, 'build', 'real-examples', '
 # leg set now comes from legs.json via harness_legs.py (Step 1b, `$Legs`), and
 # every target-shaped value below is read off the LEG being processed.
 $LegsPy       = Join-Path $PSScriptRoot 'harness_legs.py'
+# The catalogue itself, named explicitly rather than left to the resolver's
+# default: stage-zinc.py takes it too, and both must be reading the SAME file.
+$LegsJson     = Join-Path $PSScriptRoot 'legs.json'
 # DSS_TIER: which unit-corpus tier — veryquick (default) | quick | full | all.
 $Tier         = if ($env:DSS_TIER) { $env:DSS_TIER } else { 'veryquick' }
 # DSS_CONFIG: RELEASE by default (load-bearing — the corpus must exercise the
@@ -893,7 +896,11 @@ $StageShell = ToShellPath $Stage
 # libsqlite3.a core recovered via `ar t`), then STAGES the sqlite sources +
 # generated derived sources + real tcl8.6/zlib headers into the driver-visible
 # $Stage dir and writes the recipe as three files IN THE PATHS THIS DRIVER USES:
-#   $Stage/tus.txt  $Stage/includes.txt  $Stage/defines.txt
+#   $Stage/tus.txt  $Stage/includes.base.txt  $Stage/defines.txt
+# plus $Stage/zinc-src/{zlib.h,zconf.h} — the deriving host's copy, VERBATIM. The
+# per-TARGET zlib header dirs ($Stage/zinc/<recipeTransform>/) and the per-stage
+# include lists ($Stage/includes.<recipeTransform>.txt) are written just below,
+# by stage-zinc.py, from the guards each leg declares in legs.json.
 # The shell-side `win()` below performs that last translation: `wslpath -m` when
 # the POSIX shell is WSL and the driver is on the Windows side of a boundary,
 # and the identity when the shell and the driver share one filesystem.
@@ -1214,7 +1221,7 @@ done
 [ ${#RECIPE_DEFS[@]} -ge 18 ] || { echo "recipe yielded only ${#RECIPE_DEFS[@]} defines (<18)" >&2; exit 1; }
 
 # ── stage: sqlite sources + generated derived sources + tcl8.6/zlib headers ──
-mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc" "$STAGE/test"
+mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc-src" "$STAGE/test"
 cp -r "$DIR/src" "$STAGE/sqlite/src"
 cp -r "$DIR/ext" "$STAGE/sqlite/ext"
 cp "$BLD"/*.c "$STAGE/sqlite/bld/" 2>/dev/null || true
@@ -1239,29 +1246,33 @@ TCLH="$( . "$(find /usr/lib -name tclConfig.sh 2>/dev/null | head -1)" >/dev/nul
 [ -f "$TCLH/tcl.h" ] || { echo "tcl.h not found in WSL — apt-get install tcl-dev" >&2; exit 1; }
 cp "$TCLH"/*.h "$STAGE/tclinc/"
 # zlib headers (staged privately so they never shadow anything on -I)
+#
+# ★★ THE DERIVING HOST'S COPY, STAGED VERBATIM AND CONFIGURED FOR NOBODY.
+# (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed TF-C115.)
+# This zconf.h has been through the deriving host's ./configure, which rewrote
+# `#if 1 /* was set to #if 1 by ./configure */ #define Z_HAVE_UNISTD_H` — a
+# measurement of THIS MACHINE, exactly like the recipe's HAVE_*/Z_HAVE_* defines
+# that `recipeTransform` exists to drop. So it is copied to `zinc-src/` UNTOUCHED
+# and no leg ever includes it: the PowerShell side runs stage-zinc.py, which
+# writes ONE zinc/<recipeTransform>/ per declared stage with that stage's guards
+# applied, and each leg's include list points at its own.
+#
+# What used to be here was a `perl -0777 -pi` that flipped Z_HAVE_UNISTD_H to
+# `#if 0` IN PLACE — correct for the pe64 leg, wrong for every other one, and
+# with a single shared zinc/ there was nowhere for the other four legs' header to
+# go. The .ps1 therefore refused them (`poisoned`) rather than compile them
+# against a header configured for a different target, and the refusal was right:
+# MEASURED TF-C115, that flip is NOT type-neutral off Linux. On darwin `off_t` is
+# `long long`, so the guard decides whether zlib's z_off_t is `long long` (guard
+# on, matching the real libz.dylib) or `long` (guard off) — same width, DIFFERENT
+# TYPE, which is exactly what D-LANG-TYPE-IDENTITY-VOCABULARY forbids. On the pe
+# target the un-flipped header fails loud instead (`error[F001D] got unistd.h`).
 ZH="$(find /usr/include -maxdepth 3 -name zlib.h 2>/dev/null | head -1)"
 [ -f "$ZH" ] || { echo "zlib.h not found in WSL — apt-get install zlib1g-dev" >&2; exit 1; }
-cp "$ZH" "$STAGE/zinc/"; cp "$(dirname "$ZH")/zconf.h" "$STAGE/zinc/" 2>/dev/null || true
-# un-configure the Linux ./configure edit for the pe TARGET: the staged zconf.h has
-# `#if 1 → #define Z_HAVE_UNISTD_H` (a ./configure host-probe result ~line 444) which
-# forces `#include <unistd.h>` — absent on windows (F001D). Flip ONLY that guard to
-# `#if 0` in the STAGED copy (target-appropriate header staging — the zconf.h analog of
-# gen-pe64-manifest.py's HAVE_/Z_HAVE_ host-probe drop). The sibling Z_HAVE_STDARG_H
-# `#if 1` block is deliberately left intact (<stdarg.h> exists on pe).
-#
-# ★★ THIS MAKES THE SHARED STAGE pe-SHAPED, AND THE DRIVER SAYS SO RATHER THAN
-# PRETENDING OTHERWISE. There is ONE staged zinc/ for all legs, and this flip is
-# the `windows-selfconfig` decision applied to a HEADER. On an elf/mach-o target
-# <unistd.h> exists and zlib SHOULD see it — without Z_HAVE_UNISTD_H, zlib's
-# z_off_t falls back to `long` instead of off_t, i.e. an ABI difference against
-# the system libz that leg would link. So a leg whose declared recipeTransform is
-# NOT `windows-selfconfig` cannot be built correctly out of this stage, and the
-# PowerShell side records it as `poisoned` with that reason IN THE VERDICT — it
-# does not build it wrong and call the result green. Per-leg staging (one zinc/
-# per recipeTransform) is the fix; it is a behaviour change to what every leg
-# COMPILES AGAINST and needs its own measured run, so it is reported, not
-# drive-by'd. See Test-LegManifestBlockers on the PowerShell side.
-perl -0777 -pi -e 's{#if 1(\s*/\* was set to #if 1 by \./configure \*/\s*\n#  define Z_HAVE_UNISTD_H)}{#if 0$1}' "$STAGE/zinc/zconf.h"
+[ -f "$(dirname "$ZH")/zconf.h" ] || { echo "zconf.h not found beside $ZH — the pair is what ./configure rewrites; a zlib.h without it cannot be staged for any target" >&2; exit 1; }
+mkdir -p "$STAGE/zinc-src"
+cp "$ZH" "$(dirname "$ZH")/zconf.h" "$STAGE/zinc-src/"
+echo "ZLIB-SRC=$(win "$STAGE/zinc-src")"
 
 # remap a shell-side path under $DIR or the header dirs → its STAGED location; the
 # `win()` defined at the top of this script then spells it the way the DRIVER does.
@@ -1281,13 +1292,15 @@ remap() {
 # tus.txt (Windows paths)
 : > "$STAGE/tus.txt"
 for f in "${TUS[@]}"; do s="$(remap "$f")"; [ -f "$s" ] && win "$s" >> "$STAGE/tus.txt"; done
-# includes.txt: the sqlite -I dirs (remapped) + $BLD + tcl + zlib
-: > "$STAGE/includes.txt"
+# includes.base.txt: the sqlite -I dirs (remapped) + $BLD + tcl. NOT zlib: that
+# dir is PER TARGET, so the PowerShell side appends each stage's own zinc/ to
+# this base and writes one includes.<stage>.txt per stage. The base is
+# leg-independent — everything in it is sqlite's own portable C.
+: > "$STAGE/includes.base.txt"
 { echo "$BLD"; for d in "${SQLITE_INCS[@]}"; do echo "$d"; done; } | while read -r d; do
-  [ -n "$d" ] || continue; s="$(remap "$d")"; [ -d "$s" ] && win "$s" >> "$STAGE/includes.txt"
+  [ -n "$d" ] || continue; s="$(remap "$d")"; [ -d "$s" ] && win "$s" >> "$STAGE/includes.base.txt"
 done
-win "$STAGE/tclinc" >> "$STAGE/includes.txt"
-win "$STAGE/zinc"   >> "$STAGE/includes.txt"
+win "$STAGE/tclinc" >> "$STAGE/includes.base.txt"
 # defines.txt
 printf '%s\n' "${RECIPE_DEFS[@]}" > "$STAGE/defines.txt"
 # the staged test dir (Windows path) for the corpus run
@@ -1295,7 +1308,7 @@ win "$STAGE/test" > "$STAGE/testdir.win.txt"
 
 echo "RECIPE-TUS=$(wc -l < "$STAGE/tus.txt")"
 echo "RECIPE-DEFS=$(wc -l < "$STAGE/defines.txt")"
-echo "RECIPE-INCS=$(wc -l < "$STAGE/includes.txt")"
+echo "RECIPE-INCS=$(wc -l < "$STAGE/includes.base.txt")"
 # SQLITE-HEAD is a PROVENANCE FIELD: Step 9 prints it as `sqlite : <dir> @ <sha>`.
 # The bare `$(git rev-parse …)` this used to be printed an EMPTY field whenever git
 # failed or $DIR was not a checkout -- "sqlite : /home/…/src/sqlite @" reads as fine
@@ -1400,6 +1413,61 @@ if ($RefOracle) {
   Warn "        a corpus failure on this leg therefore cannot be EXONERATED against a non-DSS build."
 }
 if (-not (Test-Path (Join-Path $Stage 'tus.txt'))) { Die "recipe derivation produced no tus.txt:`n$($deriveOut -join "`n")" }
+
+# ── PER-TARGET zlib headers + PER-LEG include lists ──────────────────────────
+# ★ D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed. The staged zconf.h carries
+# the DERIVING host's ./configure probe results; each leg declares what ITS target's
+# answers are (legs.json `build.zconfGuards`) and stage-zinc.py — the SAME tool
+# build-and-test.sh calls — writes one zinc/<recipeTransform>/ per declared stage.
+# Nothing here knows what a guard means or which target has <unistd.h>: this loop
+# joins a KEY the resolver derived onto a directory. That is the whole difference
+# between "target-keyed" and "a branch in a driver".
+#
+# A stage that cannot be produced is NAMED, and every leg that would have used it
+# is poisoned in Step 7 — there is deliberately no fallback to a sibling stage's
+# copy, because that fallback is precisely the defect this closes.
+$ZincSrc  = Join-Path $Stage 'zinc-src'
+$ZincRoot = Join-Path $Stage 'zinc'
+foreach ($h in @('zlib.h', 'zconf.h')) {
+  if (-not (Test-Path (Join-Path $ZincSrc $h))) { Die "the derivation did not stage $h into $ZincSrc — every leg parses this one header, so there is no leg to build on any host. See the derive output above." }
+}
+$StageZincPy = Join-Path $PSScriptRoot 'stage-zinc.py'
+if (-not (Test-Path $StageZincPy)) { Die "stage-zinc.py not found next to this script ($StageZincPy) — it is the single implementation of per-target zlib header staging, shared with build-and-test.sh." }
+$zincOut = & $python3.Source $StageZincPy `
+             '--zlib-h'  (Join-Path $ZincSrc 'zlib.h') `
+             '--zconf-h' (Join-Path $ZincSrc 'zconf.h') `
+             '--dest'    $ZincRoot `
+             '--catalogue' $LegsJson 2>&1
+$zincRc = $LASTEXITCODE
+# label -> the include-list file that leg's manifest must use. A leg absent from
+# this map lost its header stage and is poisoned in Step 7.
+$LegIncludes = @{}
+$StageDirs   = @{}
+foreach ($ln in $zincOut) {
+  if ($ln -match '^ZINC-STAGE-OK=([^|]*)\|([^|]*)\|([^|]*)\|(.*)$') {
+    $k = $Matches[1]; $StageDirs[$k] = $Matches[2]
+    Info "zinc stage '$k' -> $($Matches[2])   [$($Matches[3])]"
+    if ($Matches[4]) { Info "      note: $($Matches[4])" }
+  } elseif ($ln -match '^ZINC-STAGE-FAIL=([^|]*)\|(.*)$') {
+    Warn "zinc stage '$($Matches[1])' COULD NOT BE PRODUCED — $($Matches[2])"
+  } elseif ($ln -match '^ZINC-STAGES=(.*)$') {
+    Info "zinc stages: $($Matches[1]) produced"
+  } else { Info "      $ln" }
+}
+if ($StageDirs.Count -eq 0) { Die "stage-zinc.py produced NO per-target zlib header dir (rc=$zincRc):`n$($zincOut -join "`n")" }
+$IncBase = Get-Content -LiteralPath (Join-Path $Stage 'includes.base.txt')
+foreach ($k in $StageDirs.Keys) {
+  $f = Join-Path $Stage "includes.$k.txt"
+  # utf8NoBOM, NOT ascii: these lines are PATHS, and `-Encoding ascii` replaces
+  # every non-ASCII character with `?` — a user profile with an accent in it
+  # would silently become an include dir that does not exist. gen-pe64-manifest.py
+  # reads this file as UTF-8, and a BOM would corrupt its first entry.
+  Set-Content -LiteralPath $f -Value (@($IncBase) + @(($StageDirs[$k] -replace '\\','/'))) -Encoding utf8NoBOM
+}
+foreach ($lg in $AllLegs) {
+  $k = "$($lg.build.headerStageKey)"
+  if ($StageDirs.ContainsKey($k)) { $LegIncludes[$lg.label] = (Join-Path $Stage "includes.$k.txt") }
+}
 # FIRST GATE ON THE SHARED INPUT — the moment the stage exists, before anything is
 # read out of it. See Assert-StagedSourceCoherence for why this is a run-wide Die
 # and not a per-leg verdict, and why it has no opt-out.
@@ -1558,23 +1626,32 @@ function Resolve-LegLibraries($leg) {
 }
 
 # ── Can this driver express THIS leg's manifest correctly? ───────────────────
-# Two things are keyed on the leg's DECLARED recipeTransform:
+# ONE thing is keyed on the leg's DECLARED recipeTransform:
 #
-#   1. THE GENERATOR. gen-pe64-manifest.py once applied the windows self-config
-#      transform (drop the deriving host's HAVE_/Z_HAVE_/_HAVE_SQLITE_CONFIG_H
-#      probes, add SQLITE_OS_WIN=1) and an 8 MiB stackReserve UNCONDITIONALLY.
-#      It has since grown --recipe-transform/--stack-reserve, so both are now the
-#      LEG's to declare. This still PROBES for those arguments rather than
-#      assuming them: the two files land in different cycles, and a driver that
-#      assumed the newer generator would silently apply the WINDOWS transform to
-#      a non-Windows target — a cross-compile category error — against the older
-#      one. The probe makes the blocker appear and disappear on its own.
-#   2. THE STAGE. The staged zconf.h carries the pe-shaped Z_HAVE_UNISTD_H flip
-#      (Step 3+4) and there is ONE stage for every leg. That blocker is the
-#      STAGE's, not the generator's, and no generator argument removes it.
+#   THE GENERATOR. gen-pe64-manifest.py once applied the windows self-config
+#   transform (drop the deriving host's HAVE_/Z_HAVE_/_HAVE_SQLITE_CONFIG_H
+#   probes, add SQLITE_OS_WIN=1) and an 8 MiB stackReserve UNCONDITIONALLY.
+#   It has since grown --recipe-transform/--stack-reserve, so both are now the
+#   LEG's to declare. This still PROBES for those arguments rather than
+#   assuming them: the two files land in different cycles, and a driver that
+#   assumed the newer generator would silently apply the WINDOWS transform to
+#   a non-Windows target — a cross-compile category error — against the older
+#   one. The probe makes the blocker appear and disappear on its own.
 #
-# A leg that trips either blocker records `poisoned` WITH THE REASON. It is not
-# built wrong and reported green, and it is not quietly dropped.
+# ★ THE SECOND BLOCKER IS GONE, AND THAT IS THE POINT OF TF-C115. It read: "the
+# SHARED staged zconf.h has Z_HAVE_UNISTD_H forced to '#if 0' for the pe target
+# and there is ONE zinc/ for all legs", so every non-`windows-selfconfig` leg was
+# refused. Step 3+4 now stages one zinc/ PER recipeTransform (stage-zinc.py) and
+# each leg's manifest gets its OWN include list, so there is nothing left to
+# refuse. The blocker was NOT relaxed to get a green — the need for it was
+# removed. The ABI question it flagged as UNMEASURED is now MEASURED, and the
+# refusal was right: on darwin the guard flips z_off_t between `long long` and
+# `long` (same width, different type), and on pe the un-flipped header fails
+# loud with `error[F001D] got unistd.h`. Only on Linux LP64 was it benign.
+#
+# A leg that trips the remaining blocker — or whose header stage could not be
+# produced at all — records `poisoned` WITH THE REASON. It is not built wrong and
+# reported green, and it is not quietly dropped.
 function Get-GenCapabilities {
   $h = ''
   try { $h = (& $python3.Source $GenPy '--help' 2>&1) -join "`n" } catch { $h = '' }
@@ -1591,7 +1668,12 @@ function Test-LegManifestBlockers($leg, $gen) {
       $have = @(); if ($gen.RecipeTransform) { $have += '--recipe-transform' }; if ($gen.StackReserve) { $have += '--stack-reserve' }
       $blockers += "this leg declares recipeTransform='$t' + stackReserveBytes=$($leg.build.stackReserveBytes), but $([System.IO.Path]::GetFileName($GenPy)) applies 'windows-selfconfig' + an 8 MiB reserve UNCONDITIONALLY and exposes $(if ($have.Count) { "only $($have -join ' ')" } else { 'neither --recipe-transform nor --stack-reserve' }). Generating this leg's manifest with the generator as it stands would silently apply the WINDOWS transform to a non-Windows target — a cross-compile category error, so it is refused"
     }
-    $blockers += "the SHARED staged zconf.h has Z_HAVE_UNISTD_H forced to '#if 0' for the pe target (Step 3+4), and there is ONE zinc/ for all legs. A recipeTransform='$t' leg would therefore compile against a zlib header CONFIGURED FOR A DIFFERENT TARGET than the one it is being built for: <unistd.h> exists on that target, and the guard governs whether zlib sees it (SEEK_*, off_t, z_off_t / z_off64_t). ★ WHETHER THAT IS BENIGN ON A 64-BIT TARGET IS UNMEASURED — on LP64 it may well come out identical — and 'probably fine' is not a basis for compiling and then reporting green. This driver refuses instead of guessing. FIX (a measured cycle of its own, because it changes what a leg COMPILES AGAINST): stage one zinc/ per recipeTransform and give each leg its own includes list"
+  }
+  # The leg's OWN staged zlib header. Absent = its zinc/<recipeTransform>/ could
+  # not be produced (stage-zinc.py said so, loudly, in Step 3+4). There is NO
+  # fallback to a sibling stage's copy: that fallback is the defect.
+  if (-not $LegIncludes.ContainsKey($leg.label)) {
+    $blockers += "this leg's staged zlib header dir (zinc/$($leg.build.headerStageKey)/, from its declared zconfGuards) was NOT produced, so there is no include list this leg could correctly be compiled with. See the ZINC-STAGE-FAIL line in Step 3+4. Compiling it against another stage's zinc/ is exactly D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED and is refused"
   }
   return $blockers
 }
@@ -2007,10 +2089,13 @@ foreach ($leg in $BuildableLegs) {
   # its own recipe transform + stack reserve. When it cannot (Test-LegManifestBlockers
   # has already refused any leg that would need them to differ), the call is
   # BYTE-FOR-BYTE the pe64 invocation this driver has always made.
+  # ★ THIS LEG'S OWN INCLUDE LIST — the base recipe dirs plus the zinc/ staged for
+  # ITS recipeTransform. Not one shared includes.txt: that is what made every leg
+  # compile against the pe leg's zlib header.
   $genArgs = @(
     $GenPy,
     '--tus',      (Join-Path $Stage 'tus.txt'),
-    '--includes', (Join-Path $Stage 'includes.txt'),
+    '--includes', $LegIncludes[$lbl],
     '--defines',  (Join-Path $Stage 'defines.txt'),
     '--target',   $leg.spec,
     '--resolve-library', $LegLibs[$lbl].Tcl,
@@ -2027,6 +2112,7 @@ foreach ($leg in $BuildableLegs) {
     continue
   }
   Info "[$lbl] manifest -> $manifest ($genOut)"
+  Info "[$lbl] zlib headers: $($StageDirs[""$($leg.build.headerStageKey)""])  [$(($leg.build.zconfGuards.PSObject.Properties | Sort-Object Name | ForEach-Object { "$($_.Name)=$(if ($_.Value) { 1 } else { 0 })" }) -join ' ')]"
 
   # SCOPED TO THIS LEG. The wipe used to take the whole of out/; with five legs
   # that would destroy a sibling's just-built artifact. The guard is not ceremony:
@@ -2148,7 +2234,17 @@ $oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
 $oldOmit = $env:QUICKTEST_OMIT; $oldPatterns = $env:SQLITE_TEST_PATTERN_LIST
 # The leg's DECLARED launcher environment (legs.json `launchers[].env`, e.g.
 # QEMU_LD_PREFIX). Snapshotted so it is restored exactly, including "was unset".
-$legEnvNames = @(); if ($leg.run.env) { $legEnvNames = @($leg.run.env.PSObject.Properties.Name) }
+# ★ `Where-Object { $_ }` IS LOAD-BEARING, MEASURED TF-C115 — NOT defensive noise.
+# Every leg the resolver plans carries `run.env`, and for a NATIVE run (or a
+# launcher declaring `"env": {}`) it is an EMPTY PSCustomObject. An empty object
+# is TRUTHY in PowerShell, so the `if` fires; `.PSObject.Properties.Name` over
+# zero properties yields a single $null, and `@($null)` is an array of ONE null.
+# The next line then evaluates `$oldLegEnv[$null]` and PowerShell throws
+# "Index operation failed; the array index evaluated to null" — killing Step 8
+# outright for the ONE leg a Windows host can execute. MEASURED: a full driver run
+# on 2026-08-04 built both legs and died HERE, at the first line of the corpus
+# step, with two good testfixtures already on disk.
+$legEnvNames = @(); if ($leg.run.env) { $legEnvNames = @($leg.run.env.PSObject.Properties.Name | Where-Object { $_ }) }
 $oldLegEnv = @{}
 foreach ($en in $legEnvNames) { $oldLegEnv[$en] = [Environment]::GetEnvironmentVariable($en) }
 $si = 0

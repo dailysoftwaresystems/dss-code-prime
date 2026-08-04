@@ -2642,8 +2642,19 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `__GNUC__`/`__GNUC_MINOR__`/`__GNUC_PATCHLEVEL__` and `__clang__`) and 1
     // macho-gated (`__APPLE_CC__`). 11+5=16 un-gated, 11 pe-gated, 2+1=3
     // macho-gated = 30.
-    EXPECT_EQ(pms.size(), 30u)
-        << "c-subset declares 16 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
+    //
+    // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): +3 UN-GATED rows — the byte-order
+    // NAMING VOCABULARY `__ORDER_LITTLE_ENDIAN__`/`__ORDER_BIG_ENDIAN__`/
+    // `__ORDER_PDP_ENDIAN__` (1234/4321/3412). They are on the LANGUAGE, not the
+    // target, because MEASURED 2026-08-04 (`clang-19 -dM -E -x c /dev/null
+    // -target <triple>`) they are IDENTICAL on every triple DSS targets AND on
+    // the big-endian control `aarch64_be-linux-gnu` — they are names, not the
+    // machine's answer, so they vary by nothing. The per-CPU ANSWER
+    // (`__LITTLE_ENDIAN__`, `__BYTE_ORDER__`) is on the TARGET and is therefore
+    // absent from this list, exactly like the TF-C74 identity spellings.
+    // 16+3=19 un-gated, 11 pe-gated, 3 macho-gated = 33.
+    EXPECT_EQ(pms.size(), 33u)
+        << "c-subset declares 19 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2680,11 +2691,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h:342 conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 16u)
+    EXPECT_EQ(ungated, 19u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
            "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
-           "__GNUC_PATCHLEVEL__, __clang__) are un-gated (every format); "
+           "__GNUC_PATCHLEVEL__, __clang__) + the 3 TF-C115 __ORDER_* byte-order "
+           "vocabulary rows (D-PP-ENDIANNESS-PREDEFINES — measured identical on "
+           "every triple INCLUDING the big-endian control, so they are names "
+           "rather than a per-CPU fact and belong here rather than on a target) "
+           "are un-gated (every format); "
            "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
     EXPECT_EQ(peGated, 11u)
@@ -7615,6 +7630,102 @@ TEST(Preprocessor, TFC74CollisionDetectedBeforeFormatFilter) {
            "a macro, not who OWNS the name";
 }
 
+// ── TF-C115: the ABORT PATH MUST STILL HONOUR THE RESULT CONTRACT ─────────
+//    ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]])
+//
+// The two tests above prove the collision is DETECTED. They say nothing about
+// whether the `PreprocessResult` handed back is USABLE — and it was not. The
+// abort returned with `tokens` EMPTY and `synthBuffer` NULL, while
+// `PreprocessResult` documents `tokens` as "Eof-terminated" and every consumer
+// dereferences `synthBuffer`. `compilation_unit.cpp` did `pp.tokens.back()` on
+// that empty vector, so the DOCUMENTED FAIL-LOUD DIAGNOSTIC WAS ACTUALLY A
+// SEGFAULT: MEASURED before the fix, the CLI exited 139 (Linux) / 0xC0000005
+// (Windows) printing NOTHING at all. The whole suite stayed green because
+// nobody asserted the SHAPE of an aborting result.
+//
+// RED-ON-DISABLE: delete the `establishResultContract(...)` call from
+// `preprocess()`'s single exit and every EXPECT below fails.
+TEST(Preprocessor, TFC115CollisionAbortReturnsUsableResult) {
+    auto schema = cSubset();
+    std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+
+    // The abort is still an abort — the contract must not have quietly turned
+    // the refusal into a successful (and silently one-sided) preprocess.
+    ASSERT_TRUE(r.fatal);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+
+    // (1) Eof-termination. This is the exact byte the crash read past.
+    ASSERT_FALSE(r.tokens.empty())
+        << "an aborting preprocess must still return the Eof-terminated token "
+           "vector `PreprocessResult` documents — an empty vector is what the "
+           "consumer's `tokens.back()` dereferenced past the end of";
+    EXPECT_EQ(r.tokens.back().coreKind, CoreTokenKind::Eof);
+    EXPECT_EQ(r.tokens.size(), 1u)
+        << "a refused pass produces the EMPTY translation unit: the Eof alone, "
+           "never a partially-merged token stream a caller could mistake for a "
+           "successful preprocess";
+    // The checked read the consumer now uses must agree and must not abort.
+    EXPECT_EQ(r.eofToken().coreKind, CoreTokenKind::Eof);
+
+    // (2) every other field a consumer dereferences without asking first.
+    ASSERT_NE(r.synthBuffer, nullptr)
+        << "the Parser takes `synthBuffer` as its source and the CU sidecar "
+           "stores it; a null here is the NEXT crash after the token one";
+    EXPECT_TRUE(r.synthBuffer->text().empty());
+    EXPECT_NE(r.mainSourceId, BufferId{});
+    ASSERT_NE(r.diagnostics, nullptr);
+
+    // (3) the diagnostic must be RENDERABLE, not just present. Its span is
+    // stamped with the MAIN buffer's id, so that buffer has to be among the
+    // origins the caller registers — otherwise the error prints
+    // `--> <unknown-buffer:1>` and cannot say which file to fix (MEASURED:
+    // exactly what it did before the origin invariant moved to the exit).
+    bool mainIsAnOrigin = false;
+    for (auto const& ob : r.originBuffers) {
+        if (ob && ob->id() == buf->id()) mainIsAnOrigin = true;
+    }
+    EXPECT_TRUE(mainIsAnOrigin)
+        << "the main source is an origin buffer of EVERY preprocess result — "
+           "it is the input — so a diagnostic stamped with its id resolves";
+}
+
+// The SAME contract on a HAPPY-path result, as the matched control: the single
+// exit must not have changed the shape of a successful preprocess (in
+// particular it must not append a SECOND Eof, and must not duplicate the main
+// buffer in `originBuffers`).
+// RED-ON-DISABLE: make `establishResultContract` append its Eof
+// unconditionally, or push the main buffer without the dedup scan.
+TEST(Preprocessor, TFC115ContractExitLeavesHappyPathShapeUnchanged) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
+                                    ObjectFormatKind::Elf, noDefines, {});
+    EXPECT_FALSE(r.fatal);
+    ASSERT_FALSE(r.tokens.empty());
+    EXPECT_EQ(r.tokens.back().coreKind, CoreTokenKind::Eof);
+    // EXACTLY ONE Eof — a second one would be the exit double-terminating.
+    std::size_t eofs = 0;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) ++eofs;
+    }
+    EXPECT_EQ(eofs, 1u);
+    // The main buffer appears exactly once among the origins.
+    std::size_t mainHits = 0;
+    for (auto const& ob : r.originBuffers) {
+        if (ob && ob->id() == buf->id()) ++mainHits;
+    }
+    EXPECT_EQ(mainHits, 1u)
+        << "the exit's origin invariant must DEDUPE against what the run "
+           "already collected from the line map, not append a duplicate";
+}
+
 // ── the NO-REGRESSION invariant: empty target span == legacy ──────────────
 // An empty target list must produce a token stream BYTE-IDENTICAL to the
 // pre-TF-C74 engine, on every format. This is the guarantee that lets the
@@ -7740,8 +7851,12 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and arm64 configs must not collide";
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::MachO)),
-                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__",
-                                            "__arm64", "__arm64__"}));
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__BYTE_ORDER__",
+                                            "__LITTLE_ENDIAN__", "__aarch64__",
+                                            "__arm64", "__arm64__"}))
+            << "TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the two endianness rows "
+               "are UNGATED, so they appear on macho alongside the Apple-only "
+               "identity pair; `__BIG_ENDIAN__` must appear on NO leg";
     }
     // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
     // APPEARS — the two gates point in OPPOSITE directions on the same target,
@@ -7762,12 +7877,17 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty());
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
                   (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
+                                            "__BYTE_ORDER__",
                                             "__CHAR_UNSIGNED__",
+                                            "__LITTLE_ENDIAN__",
                                             "__aarch64__"}))
             << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
                "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
                "there — it is the preprocessor face of the target's "
-               "`charIsUnsigned` default, which macho/pe override to signed";
+               "`charIsUnsigned` default, which macho/pe override to signed. "
+               "TF-C115: the two endianness rows are UNGATED and therefore "
+               "appear on BOTH legs — the negative that matters is "
+               "`__BIG_ENDIAN__`, which appears on none";
     }
     // x86_64: the same four spellings on every format.
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
@@ -7777,8 +7897,66 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and x86_64 configs must not collide";
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(fmt)),
-                  (std::vector<std::string>{"__amd64", "__amd64__", "__x86_64",
-                                            "__x86_64__"}));
+                  (std::vector<std::string>{"__BYTE_ORDER__", "__LITTLE_ENDIAN__",
+                                            "__amd64", "__amd64__", "__x86_64",
+                                            "__x86_64__"}))
+            << "TF-C115: x86_64 is little-endian under elf64, macho64 AND pe64, "
+               "so the two endianness rows are UNGATED and identical on all "
+               "three — the property `__LP64__` did NOT have (LP64 on elf/macho, "
+               "LLP64 on pe), which is why that one lives on the object format "
+               "and these live here";
+    }
+}
+
+// TF-C115 (D-PP-ENDIANNESS-PREDEFINES) — THE CROSS-LAYER PIN.
+//
+// `__BYTE_ORDER__` is declared on the TARGET but its value NAMES
+// `__ORDER_LITTLE_ENDIAN__`, which is declared on the LANGUAGE. Two things must
+// hold and neither is implied by the per-layer exact sets above:
+//   (a) the reference RESOLVES — the value text must be exactly the vocabulary
+//       name the language declares, so `#if __BYTE_ORDER__ ==
+//       __ORDER_LITTLE_ENDIAN__` is a comparison of two DEFINED integers rather
+//       than C 6.10.1p4's `0 == 0`;
+//   (b) `__BIG_ENDIAN__` is declared by NO layer, on NO format. That is not a
+//       missing feature, it is the declaration that DSS ships no big-endian
+//       target (MEASURED 2026-08-04: clang defines it only for
+//       aarch64_be-linux-gnu), and Apple's libkern/OSByteOrder.h:165 tests it
+//       BEFORE the little-endian arm, so a stray row silently selects
+//       byte-swapping macros on a little-endian machine.
+TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    for (char const* arch : {"arm64", "x86_64"}) {
+        auto t = TargetSchema::loadShipped(arch);
+        ASSERT_TRUE(t.has_value()) << arch;
+        for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
+                                     ObjectFormatKind::Pe}) {
+            auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                           (*t)->predefinedMacros(), {}, fmt);
+            ASSERT_TRUE(m.conflicts.empty()) << arch;
+            std::optional<std::string> byteOrderValue;
+            std::optional<std::string> orderLittleValue;
+            bool sawBigEndianSpelling = false;
+            for (auto const& pm : m.effective) {
+                if (pm.name == "__BYTE_ORDER__")           byteOrderValue   = pm.value;
+                if (pm.name == "__ORDER_LITTLE_ENDIAN__")  orderLittleValue = pm.value;
+                if (pm.name == "__BIG_ENDIAN__")           sawBigEndianSpelling = true;
+            }
+            ASSERT_TRUE(byteOrderValue.has_value())
+                << arch << ": __BYTE_ORDER__ must be in the effective set on every format";
+            ASSERT_TRUE(orderLittleValue.has_value())
+                << arch << ": __ORDER_LITTLE_ENDIAN__ must be in the effective set";
+            EXPECT_EQ(*byteOrderValue, "__ORDER_LITTLE_ENDIAN__")
+                << arch << ": __BYTE_ORDER__'s body must NAME the language-declared "
+                           "vocabulary constant, not restate its literal — the "
+                           "reference is what keeps the two layers from drifting";
+            EXPECT_EQ(*orderLittleValue, "1234")
+                << arch << ": the vocabulary constant must carry its measured value";
+            EXPECT_FALSE(sawBigEndianSpelling)
+                << arch << ": __BIG_ENDIAN__ must be declared by NO layer on ANY "
+                           "format — DSS ships no big-endian target, and Apple's "
+                           "libkern/OSByteOrder.h tests this spelling FIRST";
+        }
     }
 }
 

@@ -299,12 +299,18 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // (gating those would SWALLOW the real frontend errors — e.g. an
         // unresolved `#include` must not suppress the rest of the file).
         const bool ppFatal = pp.fatal;
-        // `pp.tokens` is Eof-terminated by contract; its last element is
-        // that Eof. `fromTokens` takes its argument by value (copies),
-        // so `pp.tokens` survives intact for the sidecar move below.
+        // `pp.eofToken()` is the CHECKED read of the Eof terminator
+        // ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]). This used to be
+        // `pp.tokens.back()` under a comment asserting the vector is
+        // "Eof-terminated by contract" — and when a producer early-return
+        // broke that contract (the predefined-macro-collision abort) this line
+        // read past the end of an EMPTY vector and crashed the compiler with
+        // no diagnostic. The accessor cannot do that: it aborts with a named
+        // message. `fromTokens` takes its argument by value (copies), so
+        // `pp.tokens` survives intact for the sidecar move below.
         TokenStream stream =
             ppFatal
-                ? TokenStream::fromTokens({pp.tokens.back()})
+                ? TokenStream::fromTokens({pp.eofToken()})
                 : TokenStream::fromTokens(pp.tokens);
         phase.emplace(substrate::CompilePhase::Parse);
         // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: seed the binder sketch's global

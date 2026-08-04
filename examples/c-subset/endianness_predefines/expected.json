@@ -1,0 +1,38 @@
+{
+  "$comment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the runnable end-to-end pin for the byte-order predefined macros, on every shipped (architecture x object-format) leg: preprocess -> parse -> lower -> codegen -> LINK -> spawn -> stdout + exit code. WHAT IT COVERS THAT arch_identity_predefines DOES NOT: (a) a predefine declared on the LANGUAGE and one declared on the TARGET that REFERENCE each other, so the merged table is exercised ACROSS layers rather than within one; (b) a `constant` body that is a MACRO REFERENCE (`__BYTE_ORDER__` -> `__ORDER_LITTLE_ENDIAN__` -> 1234) rather than a literal; (c) a NEGATIVE that was measurably WRONG before this cycle. GROUND TRUTH (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1, plus gcc 13.3.0 native and aarch64-linux-gnu-gcc-13 as the GNU control): __ORDER_LITTLE_ENDIAN__ 1234 / __ORDER_BIG_ENDIAN__ 4321 / __ORDER_PDP_ENDIAN__ 3412 and __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ on ALL FIVE triples DSS targets (arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc); __LITTLE_ENDIAN__ 1 on all five and ABSENT on the big-endian control aarch64_be-linux-gnu, where __BIG_ENDIAN__ 1 and __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ appear instead -> __LITTLE_ENDIAN__/__BYTE_ORDER__ correctly UNGATED on the target, __BIG_ENDIAN__ correctly SHIPPED NOWHERE. The three __ORDER_* names are identical on all six triples INCLUDING the big-endian one, which is why they sit on the LANGUAGE and not on either target. gcc defines the __ORDER_*/__BYTE_ORDER__ family but NOT __LITTLE_ENDIAN__ (a clang/Apple spelling) -- DSS claims `__clang__` unconditionally, so shipping it is consistent with the identity it already asserts. ★ THE DEFECT THIS EXAMPLE LOCKS OUT, MEASURED not hypothesised: before TF-C115 neither operand of `#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` was defined, so C 6.10.1p4 made it `0 == 0` and it was silently TRUE on every little-endian leg -- observed directly (probe F of the TF-C115 mechanism probe fired on the unpatched config). A big-endian-first ladder therefore selected the wrong arm with no diagnostic; sqlite3.c:16138 and :218892 (SQLITE_BYTEORDER) test exactly that shape, as do Apple's libkern/OSByteOrder.h and unicode/platform.h. LEG 3b of main.c is that case, asserted in the correct direction. ★ THE REFERENCE-BODY CLAIM THIS EXAMPLE RETIRES: both *.target.json files recorded `__BYTE_ORDER__` as unshippable because 'its value must be a macro REFERENCE ... which needs a different mechanism than a literal Constant body'. MEASURED FALSE 2026-08-04 -- a materialized predefine is spliced over its invocation and RESCANNED like any other replacement, so the reference resolves with zero engine change. Leg 2 is the standing proof, and it is red the day rescanning stops. RED-ON-DISABLE MATRIX -- every row OBSERVED, never asserted, by compiling this example against a PATCHED COPY of src/dss-config reached through DSS_CONFIG_ROOT (the live checkout stayed byte-identical; the copy was re-made from the checkout for each row). [ROW A] the three __ORDER_* rows deleted from c-subset.lang.json -> error[P001E] leg 1 (vocabulary undefined) + leg 2 (the literal-1234 half) on ALL FOUR targets, no artifact; leg 3b ALSO fires, which is the pre-TF-C115 defect reproducing itself the moment the vocabulary layer is removed. [ROW B] the two endianness rows deleted from BOTH *.target.json -> error[P001E] leg 2 (__BYTE_ORDER__ undefined) + leg 4 (__LITTLE_ENDIAN__ undefined) + leg 3b on ALL FOUR targets, no artifact. [ROW C] __BIG_ENDIAN__ added as a target row (value 1) -> error[P001E] leg 3a on all four; the negative is falsifiable, not decorative. [ROW D] `availableObjectFormats: [\"macho\"]` added to both target rows -> the three non-macho legs fire leg 2/4/5, while arm64:macho64 stays GREEN (exit 42, `endian=little-apple`) -- the ungatedness falsified in exactly ONE direction, the arch_identity_predefines leg-3 pattern. [ROW E] __BYTE_ORDER__'s value changed to the literal `4321` -> leg 2 and leg 3b fire on all four; a wrong ANSWER is caught even though the vocabulary is intact. FOLD-RESISTANCE: `endianWitness()` reads the low byte of a `volatile unsigned int` through a `char` lens, so the RUNTIME arm reports the byte order the CODE GENERATOR produced, independent of the macro table; it is multiplied into the exit code, so a macro table that disagreed with the emitted code could not exit 42. The `release` arm runs the SHIPPED release pipeline over the same source so the optimizer x feature composition is witnessed rather than assumed.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "endian=little\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "endian=little\r\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "endian=little\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "endian=little\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "endian=little-apple\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

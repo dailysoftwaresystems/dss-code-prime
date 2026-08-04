@@ -264,6 +264,20 @@ struct DSS_EXPORT PreprocessResult {
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers
     // pass through untouched.
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
+
+    // The Eof token that terminates `tokens`.
+    //
+    // ★ USE THIS, NEVER `tokens.back()` ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+    // A consumer that needs an Eof-only stream (the D-PP-FATAL-HALTS-PARSE arm
+    // in `compilation_unit.cpp`) used to reach for `tokens.back()` under a
+    // comment asserting the vector is "Eof-terminated by contract" — a contract
+    // the consumer had no way to verify. When a producer path broke it, the
+    // result was not a diagnostic but a SEGFAULT (MEASURED TF-C115: rc 139 /
+    // 0xC0000005 on the predefined-macro-collision abort, with no output at
+    // all). This accessor is the ONE place the contract is checked on the read
+    // side: `preprocess()`'s single exit makes the violation impossible, and
+    // this makes any residual violation LOUD and named instead of undefined.
+    [[nodiscard]] Token const& eofToken() const;
 };
 
 // ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS) + TF-C97
