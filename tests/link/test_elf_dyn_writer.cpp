@@ -402,6 +402,7 @@ TEST(ElfDynFormatJson, InterpreterOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
@@ -413,6 +414,7 @@ TEST(ElfDynFormatJson, EntryPointOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-entry","kind":"elf"},
       "entryPoint": "main",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
@@ -427,6 +429,7 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-exec-va","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -438,6 +441,7 @@ TEST(ElfDynFormatJson, CopyRelocationBindingOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-copy-reloc","kind":"elf"},
       "dataImportBinding": "copy-relocation",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
@@ -450,6 +454,7 @@ TEST(ElfDynFormatJson, SonameOnNonDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-with-soname","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "soname": "libx.so.1" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -500,6 +505,7 @@ TEST(ElfDynWriter, SonameEmittedWhenConfigured) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-soname","kind":"elf"},
       "externCallDispatch": "direct-plt",
       "supportedDataSections": ["rodata", "data", "bss", "relro"],
@@ -1007,6 +1013,7 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto a = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
@@ -1020,6 +1027,7 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto b = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-exit","kind":"elf"},
       "externCallDispatch": "direct-plt",
       "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
@@ -1037,6 +1045,7 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto c = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-args","kind":"elf"},
       "externCallDispatch": "direct-plt",
       "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
@@ -1056,6 +1065,7 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"pie-with-soname","kind":"elf"},
       "externCallDispatch": "direct-plt",
       "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},

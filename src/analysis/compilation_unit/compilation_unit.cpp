@@ -266,7 +266,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // splice + tokenize-of-the-synth-buffer + macro expansion.
         std::optional<substrate::PhaseTimers::Scope> phase;
         phase.emplace(substrate::CompilePhase::Preprocess);
-        PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
+        PreprocessResult pp = preprocess(src, schema, includeDirs_,
+                                         headerNameMatching_, systemDirs_,
                                          activeFormat_, userDefines_,
                                          targetPredefinedMacros_,
                                          formatPredefinedMacros_);
@@ -465,6 +466,13 @@ void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
     activeFormat_ = fmt;
 }
 
+void UnitBuilder::setHeaderNameMatching(HeaderNameMatching matching) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setHeaderNameMatching called after finish()");
+    }
+    headerNameMatching_ = matching;
+}
+
 void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
     if (finished_) {
         cuFatal("UnitBuilder::setUserDefines called after finish()");
@@ -622,6 +630,7 @@ CompilationUnit UnitBuilder::finish() && {
         driverDiagnostics_,
         includeDirs_,
         systemDirs_,
+        headerNameMatching_,
         [this](std::filesystem::path const& path, bool& ok,
                std::shared_ptr<GrammarSchema const> schema) {
             return loadAndAdd_(path, ok, std::move(schema));
@@ -814,6 +823,7 @@ CompilationUnit UnitBuilder::finish() && {
                     scratchDiags,
                     includeDirs_,
                     systemDirs_,
+                    headerNameMatching_,
                     [this](std::filesystem::path const& path, bool& ok,
                            std::shared_ptr<GrammarSchema const> schema) {
                         return loadAndAdd_(path, ok, std::move(schema));

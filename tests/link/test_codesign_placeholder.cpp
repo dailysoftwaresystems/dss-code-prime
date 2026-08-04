@@ -69,6 +69,7 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -88,6 +89,7 @@ TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -109,6 +111,7 @@ TEST(MachOCodeSignPlaceholder, ObjectFiletypeRejectsCodeSigField) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
       "image": { "codeSignatureSize": 4096 },
@@ -130,6 +133,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-static","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -171,6 +175,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -218,6 +223,7 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-dyn","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -327,6 +333,7 @@ TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-bad-cert","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": {
@@ -355,6 +362,7 @@ TEST(PeCertPlaceholder, ObjFormatRejectsCertField) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-obj-with-cert","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "optionalHeader": { "attributeCertReserveSize": 1024 },
@@ -371,6 +379,7 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-cert","kind":"pe"},
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
@@ -432,6 +441,7 @@ TEST(PeExecFormatJsonValidate,
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-no-exec-bit","kind":"pe"},
       "pe": { "machine": 34404, "characteristics": 0, "type": "exec" },
       "optionalHeader": {
@@ -461,6 +471,7 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-imports-with-cert","kind":"pe"},
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },

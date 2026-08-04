@@ -41,6 +41,12 @@ public:
     // merge-candidate single-predecessor check.
     void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds);
 
+    // D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE — THE ACYCLICITY
+    // CHOKEPOINT for `jumpThreadMap_`. Called by `analyze` between the
+    // trampoline-collection loop and `pathCompressAndVerify`; see the
+    // definition for the full argument.
+    void breakJumpThreadCycles(std::vector<MirBlockId> const& rpo);
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         // Walk reachable-from-entry blocks in RPO order, excluding
@@ -245,6 +251,138 @@ private:
     std::size_t blocksMerged_       = 0;
 };
 
+// ── D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE ────────────────────────
+//
+// THE SHAPE. A trampoline is a block whose ONLY instruction is `Br(S)`. When
+// a CFG cycle is composed ENTIRELY of trampolines, every one of them is a
+// candidate, so `jumpThreadMap_` acquires B1→B2→…→Bk→B1 — a cycle — and the
+// downstream `resolveTransitive` walk never reaches a non-key and aborts
+// (rc=127, no binary). The shape is reached from ordinary C: an empty-bodied
+// infinite `for` lowers to header:`Br(body)` / body:`Br(header)` (k=2), and
+// `l1: goto l2; l2: goto l1;` produces the same k=2 map with no loop
+// statement anywhere. k is unbounded — `l1:goto l2; l2:goto l3; l3:goto l1;`
+// gives k=3. Nothing about this is source-spelling-specific: the pass sees
+// only "a cycle of 1-instruction Br blocks", which is why the fix is stated
+// over MIR block shape and never over a language construct.
+//
+// ★ THE LENGTH-1 CASE WAS THE ONLY ONE GUARDED, WHICH IS WHY THIS SURVIVED.
+// The collection loop used to carry `if (tgt.v == b.v) continue;`, so a
+// literal `Br`-to-self never entered the map and `l1: goto l1;` compiled
+// clean — while every k >= 2 cycle went straight through. A guard covering
+// exactly one length of an unbounded family is the defect, so this function
+// replaces it rather than joining it: the length-1 case is now handled here,
+// by the same code as every other length, and the bespoke check is gone.
+//
+// THE FIX — un-elide exactly ONE block per cycle. The cycle cannot be
+// dissolved (there is no non-trampoline block in it to redirect to), so one
+// member must survive to carry the loop. Every member holds nothing but a
+// `Br` — no SSA definition, no side effect, no observable state — so which
+// member survives is semantically free: entering the cycle at any member
+// spins forever doing nothing. The survivor is therefore chosen for
+// DETERMINISM and locality: the RPO-earliest member of the cycle, i.e. the
+// loop header for a natural loop. It is dropped from the map, every other
+// member still resolves (transitively, through the now-open chain) to it,
+// and its own `Br` is redirected to itself by `redirectBlockTarget` — so the
+// whole cycle collapses to a single self-looping block. That is precisely
+// the shape `while(1){}` already produces today via constant-branch folding
+// (its header keeps 2 instructions, so it was never a trampoline, and its
+// fold retargets it at itself) — this makes the all-trampoline cycle reach
+// the SAME canonical form instead of aborting.
+//
+// WHY BY CONSTRUCTION. Acyclicity is established while the map is being
+// finalized, at the single point that owns it, rather than checked after the
+// fact: after this returns, no chain in `jumpThreadMap_` can revisit a block.
+// The alternative shapes were rejected on the bar — raising
+// `resolveTransitive`'s bound HIDES a cycle instead of preventing one, and
+// resolving a self-mapped entry as a fixed point only re-solves k=1, the one
+// length that already worked.
+//
+// TERMINATION + DETERMINISM. The map is a functional graph (each key has one
+// out-edge), so a 3-colour walk suffices. Each block is pushed onto a walk at
+// most once (`Unvisited` -> `OnWalk` is one-way) and settled once, so the
+// sweep is O(blocks). Walks START in RPO order and the survivor is picked by
+// RPO rank, so the output never depends on `unordered_map` iteration order.
+void SimplifyCfgPolicy::breakJumpThreadCycles(std::vector<MirBlockId> const& rpo) {
+    if (jumpThreadMap_.empty()) return;
+
+    // RPO rank, for the deterministic anchor pick. Built LAZILY, on the first
+    // cycle this function actually contains: a cycle is rare, but this runs on
+    // every function of every SimplifyCfg iteration, and eagerly ranking every
+    // block would charge O(BLOCKS) to the overwhelmingly common acyclic path.
+    // As written, that path touches only `mark` and `walk`, both O(TRAMPOLINES)
+    // — the same order `pathCompressAndVerify` already walks. (The pass's cost
+    // on SQLite is a live concern: D-PERF-*, and the marker re-derivation that
+    // the release posture had to stop doing per pass.)
+    std::unordered_map<std::uint32_t, std::uint32_t> rpoRank;
+    auto rank = [&](MirBlockId b) -> std::uint32_t {
+        if (rpoRank.empty()) {
+            rpoRank.reserve(rpo.size());
+            for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(rpo.size()); ++i) {
+                rpoRank.emplace(rpo[i].v, i);
+            }
+        }
+        // `.at()`, not `operator[]`: every walked block is a map key and every
+        // key came from `rpo`, so a rank is guaranteed to exist. `operator[]`
+        // would default a missing one to rank 0 and silently make it
+        // "earliest", degrading the determinism guarantee with no signal. (A
+        // wrong anchor is not a miscompile — any member is semantically valid
+        // — which is exactly why it must fail loud rather than be absorbed.)
+        return rpoRank.at(b.v);
+    };
+
+    // Unvisited: not yet walked. OnWalk: on the CURRENT walk — re-reaching one
+    // is exactly what closes a cycle. Settled: its chain is already proven to
+    // terminate, so a later walk can stop there.
+    enum class Mark : std::uint8_t { Unvisited, OnWalk, Settled };
+    std::unordered_map<std::uint32_t, Mark> mark;
+    mark.reserve(jumpThreadMap_.size());
+    std::vector<MirBlockId> walk;
+
+    for (MirBlockId const start : rpo) {
+        if (jumpThreadMap_.count(start) == 0) continue;
+        if (mark[start.v] != Mark::Unvisited) continue;
+        walk.clear();
+        MirBlockId v = start;
+        for (;;) {
+            auto const it = jumpThreadMap_.find(v);
+            if (it == jumpThreadMap_.end()) break;  // ends at a surviving block
+            Mark& m = mark[v.v];
+            if (m == Mark::Settled) break;          // joins a proven chain
+            if (m == Mark::OnWalk) {
+                // `v` closes a cycle whose members are the tail of `walk`
+                // beginning at `v`'s position. `OnWalk` is set only by THIS
+                // walk (the previous walk's blocks were all flipped to
+                // `Settled`), and `walk` was cleared when it started, so `v`
+                // is necessarily present — anything else is a broken
+                // invariant, not a shape to tolerate.
+                std::size_t cycleStart = walk.size();
+                while (cycleStart > 0 && walk[cycleStart - 1].v != v.v) --cycleStart;
+                if (cycleStart == 0) {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::SimplifyCfg fatal: block v=%u is "
+                        "marked on-walk but is absent from the current "
+                        "jump-thread walk — cycle-break invariant violation.\n",
+                        v.v);
+                    std::abort();
+                }
+                MirBlockId survivor = v;  // == walk[cycleStart - 1]
+                for (std::size_t i = cycleStart; i < walk.size(); ++i) {
+                    if (rank(walk[i]) < rank(survivor)) survivor = walk[i];
+                }
+                jumpThreadMap_.erase(survivor);
+                break;
+            }
+            m = Mark::OnWalk;
+            walk.push_back(v);
+            v = it->second;
+        }
+        // Every block on this walk now reaches a non-key (the walk either ran
+        // off the end of the map, joined a settled chain, or had its cycle
+        // opened above), so its chain is proven to terminate.
+        for (MirBlockId const b : walk) mark[b.v] = Mark::Settled;
+    }
+}
+
 void SimplifyCfgPolicy::analyze(MirFuncId fn,
                                 std::vector<std::vector<MirBlockId>> const& preds) {
     resetPerFunction();
@@ -304,16 +442,30 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
         if (succs.size() != 1) continue;  // defense — Br has exactly 1
         MirBlockId const tgt = succs[0];
         if (hasAnyPhi(tgt)) continue;
-        // Also skip if the target is the trampoline itself (would
-        // mean an infinite Br-to-self loop; verifier should reject
-        // but defense in depth).
-        if (tgt.v == b.v) continue;
+        // NOTE — there is deliberately NO `tgt.v == b.v` special case here.
+        // A Br-to-self IS a redirect cycle, just the length-1 one, and it is
+        // handled by `breakJumpThreadCycles` below together with every other
+        // length. Re-adding a bespoke self-check would reintroduce the exact
+        // defect D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE names: a
+        // guard that covers ONE cycle length and silently admits the rest.
         jumpThreadMap_[b] = tgt;
     }
+    // ── D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE: make the map
+    // ACYCLIC before anything walks it. This is the precondition
+    // `pathCompressAndVerify` / `resolveTransitive` require and cannot
+    // themselves establish — they can only DETECT the violation (by
+    // aborting), which is what the defect manifested as.
+    breakJumpThreadCycles(rpo);
     // Path-compress the trampoline chain B1 → B2 → ... → S so every
     // entry maps directly to a non-trampoline target. Fail loud if
     // the post-compression invariant breaks (target still a key) —
     // cycle in jump-thread chain is a substrate violation.
+    //
+    // With `breakJumpThreadCycles` upstream this call can no longer abort on
+    // any input: the map is acyclic by construction, so every chain walk
+    // terminates at a non-key. The fail-loud is KEPT (never weakened, never
+    // given a bigger bound) as the standing backstop against a future
+    // maintainer inserting into `jumpThreadMap_` outside the chokepoint.
     pathCompressAndVerify(jumpThreadMap_, "SimplifyCfg");
     blocksJumpThreaded_ += jumpThreadMap_.size();
 

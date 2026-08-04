@@ -6,13 +6,35 @@
 #
 # Clone the repo and run ONE command to prove DSS Code Prime builds SQLite from
 # its REAL sources (no amalgamation) into the Tcl `testfixture` and runs SQLite's
-# own `.test` unit corpus GREEN — on the native host AND on arm64 under qemu.
+# own `.test` unit corpus GREEN — for EVERY DECLARED TARGET, on whatever host you
+# happen to be standing on.
 #
-# Windows companion: build-and-test.ps1 does the same for the pe64 leg.
+# ★★ TARGET-KEYED, NEVER HOST-KEYED (D-HARNESS-CROSS-HOST-ANY-TARGET item 2; user
+# HARD REQUIREMENT 2026-07-25: "build ANY target inside ANY host — this MUST work").
+# This driver used to derive its leg list from `uname`: the "host" leg was whatever
+# the machine was, and an arm64 leg appeared ONLY when the host happened to be
+# Linux/x86_64 — so pe64 and mach-o were unreachable from it on every host. That
+# conflated HOST with TARGET, which is the inverse of the requirement.
+#   · WHICH LEGS EXIST is now declared, host-free, in `legs.json` and resolved by
+#     `harness_legs.py` — the SAME five legs on Linux, macOS, an arm64 VPS or
+#     Windows/WSL. BUILDING is attempted for every one of them, unconditionally.
+#   · THE ONLY LEGITIMATE HOST QUESTION is "can this host EXECUTE this artifact",
+#     and it is answered by the catalogue's own `runOn` + `launchers` (a launcher
+#     is qemu for a cross-ARCH host, Wine for a cross-OS one), never by a
+#     `uname`/`$HOST_OS` branch in leg selection.
+#   · EVERY declared leg reaches a NAMED verdict from the closed vocabulary in
+#     tests/test_support/arm_verdict_ledger.hpp — Step 9 prints the ledger line.
+# The remaining `$HOST_OS` tests in this file are all about the BUILD HOST'S OWN
+# toolchain/filesystem (brew vs apt, the Xcode SDK, macOS's per-inode exec deny);
+# each one says so at its site. None of them decides which target gets built.
 #
-# The pipeline, end-to-end on a Linux (or WSL) host — macOS runs the native leg:
+# Windows companion: build-and-test.ps1 (its own de-host-locking is a separate item).
 #
-#   1. verify the host is Linux / WSL / macOS and online
+# The pipeline, end-to-end:
+#
+#   1. IDENTIFY the host (Linux / WSL / macOS, online), then RESOLVE the declared
+#      leg set from legs.json through harness_legs.py — one host-independent
+#      resolver shared with build-and-test.ps1
 #   2. use the dss-code-prime checkout at ~/src AS-IS on its CURRENT branch —
 #      NEVER switched or pulled (a probe tests the working tree exactly as it is).
 #      An ABSENT (or non-checkout) dir is a REFUSAL, never a silent clone of the
@@ -34,18 +56,21 @@
 #   5. build dss-code-prime              (its default CMake-4 Release build)
 #   6. stage the third-party HEADERS DSS parses agnostically (the host's REAL tcl
 #      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
-#      LIBS-OS-ONLY) and obtain the per-leg LIBS the fixture links + runs against
-#      (host libtcl/libz; arm64 via ports .deb extract)
+#      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
+#      (tcl, z) library pair from the provider its catalogue entry declares
+#      (`host-system` | `ubuntu-ports-arm64` | `search-paths`). A leg whose pair
+#      cannot be resolved on this machine records `skipped-build-input-missing`
+#      NAMING what was searched — the run continues, and the other legs are
+#      unaffected.
 #   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
-#      from a generated `.dss-project.json` manifest (dss --project mode):
-#        - host  → the native ELF/Mach-O target (runs directly)
-#        - arm64 → elf64-aarch64 (Linux x86_64 host only; runs under qemu-aarch64)
-#      each leg's manifest declares c-subset / cli / the leg's
-#      <targetName>:<formatName> target / the ~185 TUs (absolute `sources`) / the
-#      sqlite+tcl+zlib include dirs / the recipe defines / the leg's host libtcl +
-#      libz (resolveLibraries — the arm64 cross leg keeps its own fixed
-#      libtcl8.6.so.0 + libz.so.1 from the ports .deb); the build routes the binary
-#      to <out>/<leg>/<formatName>/testfixture.
+#      from a generated `.dss-project.json` manifest (dss --project mode). Every
+#      declared leg is attempted, on every host. Each leg's manifest declares
+#      c-subset / cli / the leg's <targetName>:<formatName> target / the ~185 TUs
+#      (absolute `sources`) / the sqlite+tcl+zlib include dirs / the recipe defines
+#      (transformed per the leg's declared `recipeTransform`) / the leg's own
+#      resolveLibraries / its declared `stackReserve`; the build routes the binary
+#      to <out>/<leg>/<formatName>/testfixture. ONE manifest generator
+#      (gen-pe64-manifest.py) serves this driver and the .ps1.
 #   8. stage each leg's run dir — including the `libtestloadext.so` extension the
 #      loadext corpus dlopen()s, compiled by THE LEG'S TARGET compiler — then run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
@@ -59,8 +84,11 @@
 #      and RESUMED past through sqlite's own `--start=` / SQLITE_TEST_PATTERN_LIST
 #      hooks so every remaining unit still reaches a verdict, while the abort
 #      itself stays on the record as a failure (see "THE CORPUS RESUME ENGINE").
-#   9. summarise + exit non-zero if any leg has a GENUINE (non-confound) unit
-#      failure, a compile miss, a fixture abort, or a unit that never ran.
+#   9. summarise — including a LEDGER LINE that names every verdict class and
+#      counts every DECLARED leg — and exit non-zero if any leg has a GENUINE
+#      (non-confound) unit failure, a compile miss, a fixture abort, or a unit that
+#      never ran. Structural skips are reported, never fatal; ENVIRONMENTAL skips
+#      warn by default and become FATAL under DSS_STRICT_ARM_VERDICTS=1.
 #
 # DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
 # fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
@@ -69,7 +97,7 @@
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
-#                      ARM64_LIBDIR  DSS_TCL_VERSION
+#                      ARM64_LIBDIR  DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
 #                      DSS_BRANCH  DSS_COMMIT  DSS_ALLOW_FRESH_CLONE
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
@@ -130,6 +158,15 @@ DSS_ALLOW_FRESH_CLONE="${DSS_ALLOW_FRESH_CLONE:-0}"
 # script copied out of the repo suggests nothing rather than something wrong.
 SELF_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || SELF_REPO=""
 [[ -n "$SELF_REPO" && -e "$SELF_REPO/.git" ]] || SELF_REPO=""
+# The directory THIS driver ships in — home of its three siblings: the leg
+# catalogue (legs.json), the leg resolver (harness_legs.py) and the driver
+# self-test (test-confound-scope.sh). Resolved ONCE so every consumer below reads
+# the same copy that was shipped beside this script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LEG_CATALOGUE="$SCRIPT_DIR/legs.json"
+LEG_RESOLVER="$SCRIPT_DIR/harness_legs.py"
+MANIFEST_GEN="$SCRIPT_DIR/gen-pe64-manifest.py"
+SRC_COHERENCE="$SCRIPT_DIR/check-source-coherence.sh"
 # DSS_TCL_VERSION: OPTIONAL pin for the Tcl the fixture is staged against (e.g.
 # "8.6", "9.0"). UNSET — the default — means VERSION-AGNOSTIC: Step 6 discovers
 # whatever Tcl the host actually has, from that installation's OWN tclConfig.sh.
@@ -292,62 +329,77 @@ DSS_SEGMENT_TIMEOUT="${DSS_SEGMENT_TIMEOUT:-0}"
 # `error deleting "test.db": permission denied` — the harness manufacturing its own
 # next failure out of the previous kill.
 DSS_KILL_SETTLE="${DSS_KILL_SETTLE:-20}"
+# DSS_STRICT_ARM_VERDICTS: promote every ENVIRONMENTAL skip
+# (`skipped-emulator-missing`, `skipped-build-input-missing`) from a loud warning
+# to a HARD FAILURE. Same variable, same accepted spellings and the same
+# malformed-value discipline as the two examples-corpus runners — see
+# `readStrictArmVerdicts` in tests/test_support/arm_verdict_ledger.hpp: a stale
+# `=0` must never quietly disable a gate, and a typo'd `=ture` must never quietly
+# disable it either, so an unrecognised value is refused rather than read as off.
+# Default (unset) = warn: a developer without qemu/Wine/a Darwin libtcl must still
+# get a usable run out of this harness; a GATE opts in.
+# Parsed and VALIDATED at Step 1 (cheap) rather than at Step 9 (hours later) —
+# an unreadable gate setting must stop the run before it costs anything.
+DSS_STRICT_ARM_VERDICTS="${DSS_STRICT_ARM_VERDICTS:-}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
+# ★ IDENTITY ONLY. These two variables answer "what machine am I standing on",
+# which is a legitimate question — the harness has to know whether to call apt or
+# brew, and where this OS keeps its headers. They must NEVER decide which TARGET
+# gets built: that comes from legs.json (see the banner). Every surviving use of
+# $HOST_OS below is annotated with which host fact it is about.
+#
+# The spellings are the CORPUS's, not this script's invention: `linux` / `darwin` /
+# `windows` are what examples/**/expected.json uses for `runOn`, what
+# `currentHostOs()` returns in tests/test_support/arm_verdict_ledger.hpp, and what
+# harness_legs.py's OS_ALIASES canonicalise to. This driver said `macos` for years,
+# which meant the one string that had to match across the resolver boundary was the
+# one string spelled differently on each side.
+# WSL reports `Linux` from `uname -s` and IS linux for every purpose here (same
+# toolchain, same ELF targets, same filesystem semantics) — it needs no arm of its
+# own; Step 1 merely NAMES it in the banner so a reader knows which box this was.
 HOST_OS=""
 case "$(uname -s)" in
-  Linux)  HOST_OS="linux"  ;;
-  Darwin) HOST_OS="macos"  ;;
+  Linux)  HOST_OS="linux"  ;;   # WSL lands here too, and that is correct
+  Darwin) HOST_OS="darwin" ;;
 esac
 HOST_ARCH=""
 case "$(uname -m)" in
   arm64|aarch64) HOST_ARCH="arm64"  ;;
   x86_64|amd64)  HOST_ARCH="x86_64" ;;
 esac
-# the host's native target spec — a full `<targetName>:<formatName>` pair (what
-# both the CLI --target and a project manifest's targets[] require), keyed by
-# (OS, arch). targetName ∈ {x86_64, arm64} (a shipped .target.json); formatName
-# is the shipped exec object-format for that arch+OS.
-host_target_spec() {
-  case "$HOST_OS/$HOST_ARCH" in
-    linux/x86_64) echo "x86_64:elf64-x86_64-linux-exec"   ;;
-    linux/arm64)  echo "arm64:elf64-aarch64-linux-exec"   ;;
-    macos/arm64)  echo "arm64:macho64-arm64-darwin-exec"  ;;
-    macos/x86_64) echo "x86_64:macho64-x86_64-darwin-exec";;
-  esac
-}
-
-# ── LEGS: label -> "spec|runner-prefix|libsrc|cc|cc-pkg" ─────────────────────
-# The "host" leg is always the native target (runs directly). On a Linux x86_64
-# host the "arm64" cross leg is added: elf64-aarch64 compiled here + RUN under
-# user-mode qemu-aarch64 (QEMU_LD_PREFIX → the aarch64 sysroot; LD_LIBRARY_PATH →
-# the staged arm64 tcl/zlib). libsrc selects which tcl/zlib libraries the leg's
-# fixture links + runs against ("host" | "arm64"). cc is the leg's TARGET C
-# compiler — a per-leg target fact exactly like the runner prefix and libsrc, used
-# to build the corpus's dlopen()ed helper extension FOR THE LEG (step 8); cc-pkg is
-# the apt package providing it (empty = already ensured by step 1).
-QEMU_SYSROOT="${QEMU_SYSROOT:-/usr/aarch64-linux-gnu}"
-declare -A LEG_SPEC=() LEG_PREFIX=() LEG_LIBSRC=() LEG_CC=() LEG_CC_PKG=()
-declare -a LEG_ORDER=()
-add_leg() {                    # add_leg <label> <spec> <runner-prefix> <libsrc> <cc> [<cc-apt-pkg>]
-  LEG_ORDER+=("$1"); LEG_SPEC["$1"]="$2"; LEG_PREFIX["$1"]="$3"; LEG_LIBSRC["$1"]="$4"
-  LEG_CC["$1"]="$5"; LEG_CC_PKG["$1"]="${6:-}"
-}
-_hspec="$(host_target_spec)"
-[[ -n "$_hspec" ]] && add_leg "host" "$_hspec" "" "host" "${CC:-cc}"
-if [[ "$HOST_OS" == "linux" && "$HOST_ARCH" == "x86_64" ]]; then
-  add_leg "arm64" "arm64:elf64-aarch64-linux-exec" "qemu-aarch64" "arm64" \
-          "aarch64-linux-gnu-gcc" "gcc-aarch64-linux-gnu"
-fi
-# DSS_LEGS: comma-separated filter (e.g. DSS_LEGS=host) for fast iteration.
-if [[ -n "${DSS_LEGS:-}" ]]; then
-  declare -a _filtered=()
-  for _l in "${LEG_ORDER[@]}"; do
-    case ",${DSS_LEGS}," in *",${_l},"*) _filtered+=("$_l");; esac
-  done
-  [[ ${#_filtered[@]} -gt 0 ]] || { echo "DSS_LEGS='${DSS_LEGS}' matched no leg (have: ${LEG_ORDER[*]})" >&2; exit 2; }
-  LEG_ORDER=("${_filtered[@]}")
-fi
+# ── LEGS ─────────────────────────────────────────────────────────────────────
+# ★ THE LEG SET IS NOT DECIDED HERE, AND NOT BY THIS MACHINE.
+# It is DECLARED, host-free, in `legs.json` and resolved by `harness_legs.py`
+# (D-HARNESS-CROSS-HOST-ANY-TARGET item 2). All this file does is `declare -A` the
+# arrays the resolver's `--format sh` emitter fills and `eval` its output — see
+# Step 1, which is where the plan is taken, once the host has been IDENTIFIED.
+#
+# WHAT WAS HERE BEFORE, so a future reader does not "restore" it: a `host` leg
+# built from `host_target_spec()` (a uname→spec table) plus an `arm64` leg added
+# only `if [[ "$HOST_OS" == linux && "$HOST_ARCH" == x86_64 ]]`. Under that shape
+# pe64 and mach-o could not be reached from this driver at all, and the arm64 leg
+# vanished on an arm64 host — the leg set WAS the machine. The hardcoded specs are
+# gone with it: tests/harness/test_sqlite_harness_legs.cpp fails this driver for
+# naming any target spec the catalogue does not declare.
+#
+# Per-leg arrays, keyed by leg LABEL. The first block is filled verbatim by the
+# resolver (its names are a contract — see `emit_sh` in harness_legs.py); the
+# second is filled by this driver as the run proceeds.
+declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
+           LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
+           LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
+           LEG_RECIPE_TRANSFORM=() LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
+           LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
+           LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=()
+# Resolved by this driver: the leg's chosen target compiler, its (tcl, z) pair, and
+# its VERDICT — one name from the closed vocabulary in
+# tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
+# in flight"; Step 9 refuses to let any declared leg end that way.
+declare -A LEG_CC=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+# LEG_DECLARED = every leg the catalogue declares (the ledger's denominator).
+# LEG_ORDER    = the subset this invocation actually processes (DSS_LEGS filter).
+declare -a LEG_ORDER=() LEG_DECLARED=()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED-CLONE READER/WRITER LOCK
@@ -493,13 +545,19 @@ trap 'die "failed at line $LINENO (command: $BASH_COMMAND)"' ERR
 SUDO=""; [[ "$(id -u)" -eq 0 ]] || SUDO="sudo"
 APT_UPDATED=0
 pkg_install() {                 # pkg_install <apt-pkg> [<brew-pkg=apt-pkg>]
+  # HOST fact, not a target fact: which PACKAGE MANAGER this machine has.
   local apt_pkg="$1" brew_pkg="${2:-$1}"
-  if [[ "$HOST_OS" == "macos" ]]; then
+  if [[ "$HOST_OS" == "darwin" ]]; then
     command -v brew >/dev/null 2>&1 || die "Homebrew not found — install from https://brew.sh, then re-run (needed for: $brew_pkg)."
     info "installing (brew): $brew_pkg"
     brew list "$brew_pkg" >/dev/null 2>&1 || brew install "$brew_pkg"
   else
-    command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS. Install manually: $apt_pkg"
+    # ★ The host identity rides along: this helper can be reached at Step 0, i.e.
+    # BEFORE Step 1's "unsupported host OS" die, so on an unidentified host the
+    # apt branch is where the operator first learns anything. Saying WHICH host it
+    # could not identify turns a confusing "no apt-get" into the real answer.
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS
+      (host OS identified as: ${HOST_OS:-UNIDENTIFIED — uname -s = '$(uname -s)'}). Install manually: $apt_pkg"
     if [[ "$APT_UPDATED" -eq 0 ]]; then $SUDO apt-get update -y >/dev/null; APT_UPDATED=1; fi
     info "installing (apt): $apt_pkg"
     $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$apt_pkg" >/dev/null
@@ -657,7 +715,7 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 # is the one you least want to lose. A portability defect in the late-stage code
 # surfaces here, in seconds, instead of after a multi-hour corpus.
 # Set DSS_SKIP_SELFTEST=1 to bypass (not recommended; say why in the log).
-_selftest="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-confound-scope.sh"
+_selftest="$SCRIPT_DIR/test-confound-scope.sh"
 if [[ "${DSS_SKIP_SELFTEST:-0}" == "1" ]]; then
   warn "driver self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
 elif [[ ! -f "$_selftest" ]]; then
@@ -711,26 +769,189 @@ else
       names the failing assertion."
   fi
 fi
+
+# ── Step 0b — SELF-TEST the LEG PLAN (same refuse-to-start discipline) ───────
+# The leg plan decides WHICH TARGETS this run is about. A defect there does not
+# announce itself: it produces a SHORTER leg list, and a shorter leg list looks
+# exactly like a successful run of fewer things. That is the whole failure this
+# cycle exists to end, so the resolver's own battery — host-invariance of the build
+# set across nine simulated hosts, the closed verdict vocabulary, the run oracle,
+# and the assertions-only shape of the `sh` emitter this driver is about to `eval`
+# — runs HERE, in well under a second, beside the classifier self-test.
+# (The gate also runs it: tests/harness/test_sqlite_harness_legs.cpp. That covers
+# the repo; this covers the machine the operator is actually on, which may be a
+# host the gate never sees.)
+# Same DSS_SKIP_SELFTEST=1 escape hatch, same "a self-test whose result cannot be
+# READ proves nothing" rule as above.
+if [[ "${DSS_SKIP_SELFTEST:-0}" == "1" ]]; then
+  warn "leg-plan self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a broken leg plan will not surface until a leg silently fails to appear."
+else
+  [[ -f "$LEG_RESOLVER"  ]] || die "leg resolver missing: $LEG_RESOLVER
+      This file, with legs.json beside it, IS the answer to 'which targets does this
+      harness build?'. Without it the driver has nothing to read and the only thing
+      left to key on is the host — the exact defect D-HARNESS-CROSS-HOST-ANY-TARGET
+      closed. Restore it; there is no fallback, by design."
+  [[ -f "$LEG_CATALOGUE" ]] || die "leg catalogue missing: $LEG_CATALOGUE (see $LEG_RESOLVER)."
+  [[ -f "$MANIFEST_GEN"  ]] || die "manifest generator missing: $MANIFEST_GEN
+      Both drivers emit their .dss-project.json through this ONE file (Step 7). It is
+      checked here rather than at Step 7 so a missing generator costs a second, not the
+      whole recipe derivation and compiler build that precede it."
+  # python3 is needed HERE now — far earlier than the old `ensure_cmd python3` at
+  # Step 7 — because both the leg plan and every manifest are python. It is a hard
+  # dependency of this harness either way (build-and-test.ps1 dies without it too),
+  # so ensuring it at Step 0 only moves the cost forward, never adds one.
+  ensure_cmd python3 python3
+  if _lt_out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --self-test 2>&1)"; then
+    _lt_pass="$(printf '%s\n' "$_lt_out" | sed -n -e 's/^passed=\([0-9][0-9]*\) failed=0$/\1/p')"
+    if [[ -z "$_lt_pass" ]]; then
+      printf '%s\n' "$_lt_out" | sed 's/^/      /' >&2
+      die "leg-plan self-test exited 0 but printed no readable 'passed=N failed=0' line.
+      A self-test whose RESULT cannot be read proves nothing, and this guard will not
+      report OK over an unparseable one."
+    fi
+    info "leg-plan self-test: OK ($_lt_pass assertions)"
+  else
+    printf '%s\n' "$_lt_out" | sed 's/^/      /' >&2
+    die "LEG-PLAN SELF-TEST FAILED — refusing to start.
+      The leg resolver or the catalogue it reads is broken, so this run would build a
+      leg set nobody declared — and a MISSING leg is invisible in a green summary.
+      Fix $LEG_RESOLVER / $LEG_CATALOGUE first; the output above names the assertion."
+  fi
+  # The catalogue's own defects are host-independent and cheap to find, so they are
+  # found here rather than by whichever host happens to trip over one.
+  if _ll_out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --lint 2>&1)"; then
+    info "leg catalogue: lints clean ($LEG_CATALOGUE)"
+  else
+    printf '%s\n' "$_ll_out" | sed 's/^/      /' >&2
+    die "THE LEG CATALOGUE DOES NOT LINT — refusing to start. See $LEG_CATALOGUE."
+  fi
+fi
 # <<< dss:selftest <<<
 
-# ── Step 1 — host supported + online ─────────────────────────────────────────
-step "1/9  Host check (Linux / WSL / macOS, online)"
-[[ -n "$HOST_OS"   ]] || die "unsupported host OS — uname -s = '$(uname -s)' (need Linux/WSL or macOS/Darwin)."
+# ── Step 1 — IDENTIFY the host, then RESOLVE the declared legs ───────────────
+step "1/9  Host identification + leg plan (from legs.json), online"
+# ★ HOST IDENTIFICATION FAILING IS GENUINELY FATAL, and it is the ONE place a
+# `uname` answer may stop the run: everything below — which package manager, where
+# the headers are, whether the fresh-inode install applies — is a statement about
+# THIS MACHINE, and a machine the driver cannot name is one it cannot make those
+# statements about. This is NOT the old "no leg for this host": the leg set is
+# host-free now and identical everywhere (see the LEGS block above).
+[[ -n "$HOST_OS"   ]] || die "unsupported host OS — uname -s = '$(uname -s)' (need Linux/WSL or macOS/Darwin).
+      This is HOST IDENTIFICATION failing, not a target restriction: the five legs in
+      $LEG_CATALOGUE are the same on every host. What this driver cannot do on an
+      unrecognised OS is drive its package manager or find its headers.
+      A Windows host runs the pe64 leg through build-and-test.ps1 (or runs THIS script
+      inside WSL, which reports Linux and is treated as linux)."
 [[ -n "$HOST_ARCH" ]] || die "unsupported host arch — uname -m = '$(uname -m)' (need arm64/aarch64 or x86_64)."
-[[ ${#LEG_ORDER[@]} -gt 0 ]] || die "no runnable leg for this host ($HOST_OS/$HOST_ARCH)."
-if [[ "$HOST_OS" == "macos" ]]; then
+# The BUILD HOST's own flavour, for the banner only — WSL is linux for every
+# decision this driver makes, and is named merely so a log says which box it was.
+if [[ "$HOST_OS" == "darwin" ]]; then
   info "host: macOS ($HOST_ARCH, $(uname -r))"
 elif grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-  info "host: WSL ($HOST_ARCH, $(uname -r))"
+  info "host: WSL ($HOST_ARCH, $(uname -r))   [linux, for every purpose here]"
 else
   info "host: native Linux ($HOST_ARCH, $(uname -r))"
 fi
-info "legs: ${LEG_ORDER[*]}   tier: $DSS_TIER"
+
+# ── THE LEG PLAN ─────────────────────────────────────────────────────────────
+# ONE call, one resolver, shared with build-and-test.ps1. The host is an INPUT to
+# the plan (it decides run mode), never a filter on it: every host gets the same
+# legs, and `--format sh` emits ONLY variable assignments (asserted by the
+# resolver's own self-test, which ran at Step 0b) so this `eval` cannot execute a
+# command even if the catalogue were hostile.
+# ★ rc is captured DIRECTLY off python3 — never after a pipe, and never from
+# inside a `printf` argument, where a failing substitution leaves an EMPTY field
+# that `set -e` does not see (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE
+# item 5). stderr goes to its own file so a diagnostic can never be eval'd.
+_plan_err="$(mktemp)" || die "could not create a temp file for the leg plan's stderr."
+if LEG_PLAN_SH="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+                    --plan --host-os "$HOST_OS" --host-arch "$HOST_ARCH" \
+                    --format sh 2>"$_plan_err")"; then
+  _plan_rc=0
+else
+  _plan_rc=$?
+fi
+_plan_msg="$(cat "$_plan_err" 2>/dev/null || true)"; rm -f "$_plan_err"
+[[ "$_plan_rc" -eq 0 ]] || die "the leg resolver FAILED (rc=$_plan_rc) — refusing to guess a leg set.
+      command: python3 $LEG_RESOLVER --plan --host-os $HOST_OS --host-arch $HOST_ARCH --format sh
+      ${_plan_msg:-<no diagnostic on stderr>}"
+[[ -n "${LEG_PLAN_SH//[[:space:]]/}" ]] || die "the leg resolver produced EMPTY output (rc=0).
+      An empty plan would leave this run with ZERO legs and a summary that says nothing
+      failed — the silent-shortfall shape this whole mechanism exists to prevent.
+      ${_plan_msg:-<no diagnostic on stderr>}"
+eval "$LEG_PLAN_SH"
+[[ ${#LEG_ORDER[@]} -gt 0 ]] || die "the leg plan parsed but declares ZERO legs — see $LEG_CATALOGUE."
+LEG_DECLARED=("${LEG_ORDER[@]}")
+# Seed each leg's verdict from the plan: a leg the resolver already knows cannot be
+# EXECUTED here carries its named skip from this moment on, and it is STILL BUILT.
+for _l in "${LEG_DECLARED[@]}"; do
+  LEG_VERDICT["$_l"]="${LEG_RUN_VERDICT[$_l]}"
+  LEG_VERDICT_DETAIL["$_l"]="${LEG_RUN_DETAIL[$_l]}"
+done
+info "legs declared by $(basename "$LEG_CATALOGUE") (the SAME set on every host): ${LEG_DECLARED[*]}"
+for _l in "${LEG_DECLARED[@]}"; do
+  case "${LEG_RUN_MODE[$_l]}" in
+    native)   info "  $_l  ${LEG_SPEC[$_l]}  — build + run NATIVELY here" ;;
+    launched) info "  $_l  ${LEG_SPEC[$_l]}  — build here, run under '${LEG_LAUNCH[$_l]}'" ;;
+    skip)     info "  $_l  ${LEG_SPEC[$_l]}  — build here; NOT runnable on this host [${LEG_RUN_VERDICT[$_l]}]: ${LEG_RUN_DETAIL[$_l]}" ;;
+    *)        die  "leg '$_l' has an unknown run mode '${LEG_RUN_MODE[$_l]}' — the resolver and this driver disagree about the vocabulary." ;;
+  esac
+done
+
+# DSS_LEGS: comma-separated filter (e.g. DSS_LEGS=elf64-x86_64) for fast iteration.
+# It never adds a leg and never changes a verdict class — a filtered-out leg is
+# ledgered as `not-selected-by-runner`, the ledger's own name for "the harness, not
+# the machine, chose not to do this". It is reported and never fatal, but the COST
+# is spelled out: that leg's coverage is simply gone from this run.
+if [[ -n "${DSS_LEGS:-}" ]]; then
+  declare -a _filtered=() _dropped=()
+  for _l in "${LEG_ORDER[@]}"; do
+    case ",${DSS_LEGS}," in
+      *",${_l},"*) _filtered+=("$_l") ;;
+      *)           _dropped+=("$_l")  ;;
+    esac
+  done
+  [[ ${#_filtered[@]} -gt 0 ]] || \
+    die "DSS_LEGS='${DSS_LEGS}' matched no declared leg (have: ${LEG_DECLARED[*]})."
+  LEG_ORDER=("${_filtered[@]}")
+  if [[ ${#_dropped[@]} -gt 0 ]]; then
+    warn "DSS_LEGS='${DSS_LEGS}' DESELECTED ${#_dropped[@]} declared leg(s) — this run does NOT cover them:"
+    for _l in "${_dropped[@]}"; do
+      LEG_VERDICT["$_l"]="not-selected-by-runner"
+      LEG_VERDICT_DETAIL["$_l"]="deselected by DSS_LEGS='${DSS_LEGS}' — ${LEG_SPEC[$_l]} was NOT built and NOT verified by this run"
+      warn "      $_l (${LEG_SPEC[$_l]}) — not built, not verified"
+    done
+  fi
+fi
+info "legs selected: ${LEG_ORDER[*]}   tier: $DSS_TIER"
+
+# ── strict mode, parsed and VALIDATED now (never at Step 9) ──────────────────
+# Mirrors `readStrictArmVerdicts` in tests/test_support/arm_verdict_ledger.hpp,
+# accepted spellings and all. A value it does not recognise is REFUSED here rather
+# than read as "off": a typo'd `=ture` that silently disables the gate is exactly
+# the failure the C++ twin's `malformed` flag exists to make unsayable — and
+# refusing at Step 1 costs a second, while discovering it at Step 9 costs the run.
+STRICT_VERDICTS=0
+case "${DSS_STRICT_ARM_VERDICTS}" in
+  1|true|TRUE|yes)        STRICT_VERDICTS=1 ;;
+  ''|0|false|FALSE|no)    STRICT_VERDICTS=0 ;;
+  *) die "DSS_STRICT_ARM_VERDICTS='${DSS_STRICT_ARM_VERDICTS}' is not a value this harness recognises.
+      Accepted: 1 / true / TRUE / yes  (strict)  ·  0 / false / FALSE / no / empty (default).
+      An unrecognised value is REFUSED, never read as 'off' — a gate that a typo can
+      silently disable is worse than no gate. Same rule as readStrictArmVerdicts() in
+      tests/test_support/arm_verdict_ledger.hpp, which the corpus runners share." ;;
+esac
+[[ "$STRICT_VERDICTS" -eq 0 ]] || \
+  warn "DSS_STRICT_ARM_VERDICTS=1 — every ENVIRONMENTAL skip (a missing launcher, a missing declared build input) will FAIL this run."
+
 ensure_cmd curl curl
 curl -fsS --max-time 20 -o /dev/null https://github.com || die "offline — cannot reach https://github.com."
 pass "$HOST_OS/$HOST_ARCH host is online"
 ensure_cmd git git
-if [[ "$HOST_OS" == "macos" ]]; then
+# HOST toolchain, for the harness's OWN work (deriving the recipe, building the
+# reference oracle) — NOT the per-leg target compilers, which come from each leg's
+# declared `targetCc` candidates in Step 6.
+if [[ "$HOST_OS" == "darwin" ]]; then
   command -v cc >/dev/null 2>&1 || die "no C compiler (cc) — run 'xcode-select --install'."
   command -v make >/dev/null 2>&1 || die "no 'make' — run 'xcode-select --install'."
 else
@@ -940,7 +1161,11 @@ find_in() {
 brew_prefix() { command -v brew  >/dev/null 2>&1 && brew --prefix "$1" 2>/dev/null || true; }
 sdk_prefix()  { command -v xcrun >/dev/null 2>&1 && xcrun --show-sdk-path 2>/dev/null || true; }
 declare -a EXTRA_INC_ROOTS=() EXTRA_LIB_ROOTS=() EXTRA_BIN_ROOTS=()
-if [[ "$HOST_OS" == "macos" ]]; then
+# HOST fact, not a target fact: where THIS MACHINE keeps its headers and libraries.
+# Homebrew kegs and the Xcode SDK only exist on a Mac, so probing for them anywhere
+# else is wasted work — and `xcrun`/`brew` are absent there anyway, which is why the
+# helpers above already degrade to "" without this guard. Nothing here selects a leg.
+if [[ "$HOST_OS" == "darwin" ]]; then
   for _f in zlib tcl-tk tcl-tk@8; do
     _p="$(brew_prefix "$_f")"
     [[ -n "$_p" ]] && { EXTRA_INC_ROOTS+=("$_p/include"); EXTRA_LIB_ROOTS+=("$_p/lib"); EXTRA_BIN_ROOTS+=("$_p/bin"); }
@@ -1185,7 +1410,9 @@ ensure_tclsh() {
   if [[ -z "$ver" ]] || ! awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}"; then
     [[ -n "$ver" ]] && info "tclsh ${ver} is < 8.6 — installing a newer tcl"
     pkg_install tcl tcl-tk
-    if [[ "$HOST_OS" == "macos" ]]; then
+    # HOST fact: Homebrew's tcl-tk is KEG-ONLY, so its bin/ is not on PATH after
+    # an install. Nothing to do with which leg is being built.
+    if [[ "$HOST_OS" == "darwin" ]]; then
       local tclbin; tclbin="$(brew --prefix tcl-tk 2>/dev/null)/bin"
       [[ -d "$tclbin" ]] && export PATH="$tclbin:$PATH"
     fi
@@ -1198,7 +1425,8 @@ ensure_tclsh() {
 }
 ensure_tclsh
 # Tcl dev files (headers + tclConfig.sh) — configure needs them to emit the recipe.
-if [[ "$HOST_OS" == "macos" ]]; then
+# HOST fact: which package manager provides them (and what macOS does NOT ship).
+if [[ "$HOST_OS" == "darwin" ]]; then
   pkg_install tcl tcl-tk
   # zlib too — parity with the Linux branch below, and NOT optional here. macOS
   # ships NO libz a program can OPEN: /usr/lib/libz.1.dylib exists only inside the
@@ -1361,6 +1589,38 @@ else
   [[ -n "$REF_LDFLAGS" ]] && \
   warn "      link-path repair WAS in effect (LDFLAGS=$REF_LDFLAGS) — so this is a DIFFERENT miss."
 fi
+
+# ── STAGED-TREE COHERENCE — a PRECONDITION ON A SHARED INPUT ─────────────────
+# D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE. $BLD is REUSED across runs while
+# Step 3 `git pull --rebase`es the checkout underneath it, and `make` refreshes
+# only the prerequisites of the target we ask for (`testfixture
+# USE_AMALGAMATION=0`) — under which sqlite3.c / shell.c / tclsqlite3.c / tsrc/
+# are prerequisites of NOTHING. Those orphans sit there looking current while
+# everything around them marches forward, and the staged tree quietly accumulates
+# several upstream vintages. MEASURED consequence: a cross-built sqlite3 compiled
+# and linked cleanly, then exited 1 at startup on shell.c's own
+# `sqlite3_sourceid()` vs `SQLITE_SOURCE_ID` guard.
+#
+# ★ THIS IS NOT A PER-LEG VERDICT, AND MUST NOT BECOME ONE. Every leg compiles
+# the SAME staged tree, so an incoherent stage does not disadvantage one target —
+# it invalidates the input all five share. Recording it as `skipped-*` on one leg
+# would let the other four build from a tree already known to be inconsistent and
+# then report their results as if they meant something. It is a run-wide `die`,
+# raised BEFORE any leg is built.
+#
+# ★ AND IT IS UNSKIPPABLE — no DSS_SKIP_SELFTEST, no opt-out variable. The defect
+# is host-independent and silent, and a check that only runs when someone
+# remembers it fails exactly the way a host-locked driver does. Its only
+# prerequisite is a POSIX shell, which is a strict subset of what this driver
+# already requires, so there is no environment in which skipping it would be the
+# honest thing to do — hence no skip path and no verdict name for one.
+[[ -x "$SRC_COHERENCE" ]] || die "the staged-source coherence gate is missing or not executable: $SRC_COHERENCE
+      It is what stops a REUSED $BLD from mixing upstream vintages behind your back
+      (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE). There is no skip path for it by
+      design; restore the file rather than routing around it."
+"$SRC_COHERENCE" --checkout "$SQLITE_DIR" --label "staged sqlite (Step 4)" "$BLD" \
+  || die "staged sqlite tree is INCOHERENT — refusing to build (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE)"
+
 # Emit the recipe: with testfixture removed but its prereqs built, `make -n` prints
 # the single testfixture cc/link command (the source of TUs + defines + -I dirs).
 # ★ THIS `rm` IS LOAD-BEARING — see "the PRESERVED oracle" above. The binary was
@@ -1434,7 +1694,9 @@ cmake_major() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\).*/
 ensure_cmake() {
   local major; major="$(cmake_major)"
   if [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]]; then info "cmake: $(cmake --version | sed -n '1p')"; return; fi
-  if [[ "$HOST_OS" == "macos" ]]; then
+  # HOST fact: how to OBTAIN cmake on this machine (brew vs the Kitware tarball,
+  # whose asset names are linux-only). cmake builds the COMPILER, not a leg.
+  if [[ "$HOST_OS" == "darwin" ]]; then
     warn "CMake ${MIN_CMAKE_MAJOR}+ required (found: ${major:-none}) — installing via Homebrew"
     pkg_install cmake cmake; hash -r; major="$(cmake_major)"
     [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || die "CMake ${MIN_CMAKE_MAJOR}+ install failed via brew."
@@ -1538,7 +1800,14 @@ tcl_header_dir() {              # tcl_header_dir <tclConfig.sh|""> <version|"">
   printf '%s' "$d"
 }
 TCL_INC="$(tcl_header_dir "$TCL_CFG" "$TCL_VER")"
+# ★ FATAL FOR THE WHOLE RUN, deliberately — unlike a per-leg library miss, which is
+# that leg's `skipped-build-input-missing`. The staged HEADERS are LEG-INDEPENDENT:
+# DSS parses this one portable C header for EVERY leg (ABI is irrelevant at parse
+# time — D-FFI-SHIPPED-LIBS-OS-ONLY), so with no tcl.h anywhere on the machine there
+# is no leg — not one of the five, on any host — that could be compiled at all.
+# A per-leg skip would just say the same thing five times.
 [[ -f "$TCL_INC/tcl.h" ]] || die "tcl.h not found — install the Tcl DEV files (apt: tcl-dev / tcl8.6-dev; brew: tcl-tk).
+      This is fatal for the ENTIRE run, not for one leg: every leg parses this same header.
       roots searched: ${INC_ROOTS[*]}"
 # Cross-check the header we are about to stage against the installation we chose.
 # A tcl.h from one Tcl beside a libtcl from another COMPILES AND LINKS and then
@@ -1574,7 +1843,10 @@ for _d in "${SQLITE_INCS[@]:-}"; do
 done
 ZINC="$BLD/zinc"; mkdir -p "$ZINC"
 ZH="$(find_in "${INC_ROOTS[@]}" -- -maxdepth 3 -name zlib.h | sed -n '1p')"
+# Fatal for the whole run for the same reason as tcl.h above: one portable header,
+# parsed by every leg.
 [[ -n "$ZH" ]] || die "zlib.h not found — install zlib1g-dev (or 'brew install zlib').
+      This is fatal for the ENTIRE run, not for one leg: every leg parses this same header.
       roots searched: ${INC_ROOTS[*]}"
 cp -f "$ZH" "$ZINC/"
 # zconf.h beside zlib.h first (they are a matched pair); the sweep is the fallback.
@@ -1585,9 +1857,9 @@ done
 THIRD_PARTY_INCS=("$TCL_INC" "$ZINC")
 info "tcl $TCL_VER headers: $TCL_INC   zlib headers: $ZINC (staged from $ZH)"
 
-# ── host libraries (the native leg links + runs against these) ───────────────
-# WHAT THESE ARE FOR — both flow through leg_tcl_lib/leg_z_lib into the per-leg
-# `.dss-project.json` "resolveLibraries" (Step 7), i.e. DSS `--resolve-library`.
+# ── PER-LEG libraries — each leg resolves its OWN (tcl, z) pair ──────────────
+# WHAT THESE ARE FOR — they flow into the per-leg `.dss-project.json`
+# "resolveLibraries" (Step 7), i.e. DSS `--resolve-library`.
 # DSS OPENS AND READS each one AT COMPILE TIME to harvest its export table (the
 # FF1 binary reader) and fails loud `F_FileOpenFailed` on a path it cannot open
 # (src/program/compile_pipeline.cpp:305). They are NOT `-l` flags for a system
@@ -1615,6 +1887,31 @@ find_first() {                  # find_first <name>... -> first match that is a 
   done
   return 0
 }
+find_first_in() {               # find_first_in <dir>... -- <name>... -> first readable hit
+  local -a dirs=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do [[ -n "$1" ]] && dirs+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && shift
+  local d n
+  for d in ${dirs[@]+"${dirs[@]}"}; do
+    [[ -d "$d" ]] || continue
+    for n in "$@"; do
+      [[ -n "$n" && -f "$d/$n" && -r "$d/$n" ]] && { printf '%s' "$d/$n"; return; }
+    done
+  done
+  return 0
+}
+# The OBJECT-FORMAT FAMILY a library FILE NAME belongs to. Used to keep the
+# tclConfig-derived candidates below from leaking across formats — see
+# `host_system_tcl_names`. Keyed on the NAME, never on the host: a `.dylib` is a
+# Mach-O library wherever it is sitting.
+lib_name_family() {             # lib_name_family <file-name> -> dll | dylib | so | ""
+  case "$1" in
+    *.dll)          printf 'dll'   ;;
+    *.dylib)        printf 'dylib' ;;
+    *.so|*.so.*)    printf 'so'    ;;
+    *)              printf ''      ;;
+  esac
+}
 # Candidate library FILE NAMES for the chosen Tcl, from tclConfig.sh's TCL_LIB_FILE
 # (which is exactly that: `libtcl8.6.so` on Debian, `libtcl9.0.dylib` on Homebrew)
 # instead of a hardcoded list. `<file>.0` covers a host shipping only the versioned
@@ -1631,32 +1928,51 @@ tcl_lib_names() {
   return 0
 }
 declare -a TCL_LIB_NAMES=(); mapfile -t TCL_LIB_NAMES < <(tcl_lib_names)
-HOST_TCL_LIB="$(find_first "${TCL_LIB_NAMES[@]:-}")"
-# zlib: the two Linux names FIRST (so a Linux host resolves exactly as before),
-# then the macOS ones. Homebrew's keg ships libz.<ver>.dylib plus libz.dylib and
-# libz.1.dylib symlinks onto it, all readable.
-HOST_Z_LIB="$(find_first 'libz.so' 'libz.so.1' 'libz.dylib' 'libz.1.dylib')"
-[[ -n "$HOST_TCL_LIB" ]] || die "host libtcl ${TCL_VER:-<version unknown>} not found — install the Tcl runtime + dev files
-      (apt: tcl-dev / tcl${TCL_VER}-dev; brew: 'tcl-tk' for 9.x or 'tcl-tk@8' for 8.6 — KEG-ONLY, so
-      its own prefix is searched). names tried: ${TCL_LIB_NAMES[*]:-<none>}
-      roots searched: ${LIB_ROOTS[*]}"
-[[ -n "$HOST_Z_LIB"   ]] || die "host libz not found — install zlib1g-dev (linux) / 'brew install zlib' (macOS).
-      macOS ships NO OPENABLE libz: /usr/lib/libz.1.dylib exists only inside the dyld shared cache,
-      /usr/lib/libz.1.2.12.dylib is a dangling symlink to it, and the SDK carries .tbd TEXT stubs —
-      none can be read, and DSS must read the export table (--resolve-library). Homebrew's keg-only
-      zlib provides a real dylib under \$(brew --prefix zlib)/lib.
-      roots searched: ${LIB_ROOTS[*]}"
-info "host libs: $HOST_TCL_LIB  +  $HOST_Z_LIB"
+# The name list a `host-system` leg searches for, in PRECEDENCE order:
+#   1. the DERIVED names — this installation's own TCL_LIB_FILE, filtered to the
+#      OBJECT-FORMAT FAMILIES the leg itself declares. Derivation must come first
+#      or the harness loses its version-agnosticism (TF-C65: nothing pins a Tcl
+#      version any more, and a host whose Tcl is 8.7 or 9.1 matches no fixed list);
+#      the family filter is what stops a Linux host from handing its `libtcl8.6.so`
+#      to the macho64 legs, whose declared names are all `.dylib`. That filter is
+#      keyed on the LEG'S OWN DECLARATION, not on the host.
+#   2. the leg's DECLARED tclNames, verbatim, as the backstop for a host with no
+#      tclConfig.sh at all.
+# `!seen[$0]++` because the derived list and the declared list legitimately
+# OVERLAP (a Debian host derives `libtcl8.6.so`, which the elf leg also declares).
+# A duplicate candidate would search twice and, more to the point, print twice in
+# the "names tried" of a skip diagnostic — which reads as a mistake.
+host_system_tcl_names() {       # host_system_tcl_names <leg>  -> one candidate per line
+  local leg="$1" want n fam
+  local -a declared=()
+  read -r -a declared <<< "${LEG_LIB_TCL_NAMES[$leg]}"
+  { for n in ${TCL_LIB_NAMES[@]+"${TCL_LIB_NAMES[@]}"}; do
+      [[ -n "$n" ]] || continue
+      fam="$(lib_name_family "$n")"
+      for want in ${declared[@]+"${declared[@]}"}; do
+        if [[ "$fam" == "$(lib_name_family "$want")" ]]; then printf '%s\n' "$n"; break; fi
+      done
+    done
+    printf '%s\n' ${declared[@]+"${declared[@]}"}
+  } | LC_ALL=C awk 'NF && !seen[$0]++'
+}
 
-# arm64 libraries (only if an arm64 leg is selected) — Ubuntu ports .deb extract,
-# NO apt-source surgery: resolve the exact .deb from the ports Packages index, then
-# dpkg-deb -x and harvest the runtime .so. qemu resolves libc/libm from the sysroot.
+# arm64 libraries for the `ubuntu-ports-arm64` provider — Ubuntu ports .deb
+# extract, NO apt-source surgery: resolve the exact .deb from the ports Packages
+# index, then dpkg-deb -x and harvest the runtime .so. qemu resolves libc/libm from
+# the sysroot.
+# ★ NOT FATAL TO THE RUN. It used to `die`, which meant a host that cannot reach
+# ports.ubuntu.com (or has no dpkg-deb) lost EVERY leg over one leg's input. It is
+# now called in a SUBSHELL so a `die`/ERR inside it exits only that subshell: the
+# caller sees rc != 0, records `skipped-build-input-missing` for THAT leg, and the
+# other four carry on. The diagnostics still print — loudly — they just stop being
+# the whole run's obituary.
 ARM64_LIBDIR="${ARM64_LIBDIR:-$HOME/.cache/dss-code-prime/arm64libs}"
 ensure_arm64_libs() {
   if [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" && -e "$ARM64_LIBDIR/libz.so.1" ]]; then
     info "arm64 libs cached: $ARM64_LIBDIR ($(ls "$ARM64_LIBDIR" | tr '\n' ' '))"; return
   fi
-  ensure_cmd curl curl; ensure_cmd dpkg-deb dpkg; ensure_cmd gzip gzip; ensure_cmd qemu-aarch64 qemu-user
+  ensure_cmd curl curl; ensure_cmd dpkg-deb dpkg; ensure_cmd gzip gzip
   mkdir -p "$ARM64_LIBDIR"
   local work; work="$(mktemp -d)"
   local codename; codename="$( . /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-noble}" )"
@@ -1686,14 +2002,136 @@ ensure_arm64_libs() {
   [[ -e "$ARM64_LIBDIR/libz.so.1"      ]] || die "arm64 libz not obtained under $ARM64_LIBDIR."
   info "arm64 libs staged: $(ls "$ARM64_LIBDIR" | tr '\n' ' ')"
 }
+
+# ── resolve EVERY declared leg's build inputs ────────────────────────────────
+# ★ ONE VERDICT PER LEG, AND THE RUN CONTINUES. A leg whose DECLARED inputs are
+# absent from this machine is recorded `skipped-build-input-missing` — an
+# ENVIRONMENTAL skip in the ledger's vocabulary: not a compile failure (nothing was
+# miscompiled) and not structural (another machine, same catalogue, builds it
+# fine). It warns by default and REDS under DSS_STRICT_ARM_VERDICTS=1.
+#
+# PRECEDENCE, stated because two verdicts can apply at once: a leg that is BOTH
+# un-runnable here (say a macho leg on Linux) and missing its build inputs records
+# the BUILD-INPUT verdict. The build is what the driver actually attempted and the
+# earlier fact; the run verdict it displaces is preserved verbatim in the detail
+# string, so nothing is lost — and it is the honest headline, because "this box has
+# no Darwin libtcl" is the reason the artifact does not exist at all, which is a
+# strictly bigger statement than "and it could not have run it either".
+leg_marks_missing() {           # leg_marks_missing <leg> <what-is-lost> <why>
+  # The DISPLACED run verdict rides along in the detail, so promoting the build
+  # fact to the headline never erases the run fact.
+  local extra=""
+  [[ -z "${LEG_RUN_VERDICT[$1]}" ]] || extra="  [and this host could not RUN it either: ${LEG_RUN_VERDICT[$1]}]"
+  LEG_VERDICT["$1"]="skipped-build-input-missing"
+  LEG_VERDICT_DETAIL["$1"]="$3$extra"
+  warn "[$1] BUILD INPUT MISSING — $2: $3"
+}
 for leg in "${LEG_ORDER[@]}"; do
-  [[ "${LEG_LIBSRC[$leg]}" == "arm64" ]] && { ensure_arm64_libs; break; }
+  provider="${LEG_LIB_PROVIDER[$leg]}"
+  tcl_lib=""; z_lib=""; searched=""
+  case "$provider" in
+    host-system)
+      # This machine's OWN tcl/zlib, discovered the version-agnostic way.
+      declare -a _tnames=(); mapfile -t _tnames < <(host_system_tcl_names "$leg")
+      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
+      tcl_lib="$(find_first ${_tnames[@]+"${_tnames[@]}"})"
+      z_lib="$(find_first ${_znames[@]+"${_znames[@]}"})"
+      searched="provider 'host-system'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; roots: ${LIB_ROOTS[*]}"
+      ;;
+    ubuntu-ports-arm64)
+      # SUBSHELL on purpose — see ensure_arm64_libs. rc is taken DIRECTLY off the
+      # subshell, never through a pipe.
+      if ( ensure_arm64_libs ); then _ports_rc=0; else _ports_rc=$?; fi
+      declare -a _tnames=(); read -r -a _tnames <<< "${LEG_LIB_TCL_NAMES[$leg]}"
+      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
+      if [[ "$_ports_rc" -eq 0 ]]; then
+        tcl_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_tnames[@]+"${_tnames[@]}"})"
+        z_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_znames[@]+"${_znames[@]}"})"
+      fi
+      searched="provider 'ubuntu-ports-arm64' (rc=$_ports_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; staged under: $ARM64_LIBDIR"
+      ;;
+    search-paths)
+      # Declared candidate DIRECTORIES, tried on EVERY host: a hit is used, a miss
+      # costs nothing. NEWLINE-separated, because a path may contain spaces.
+      declare -a _paths=(); mapfile -t _paths < <(printf '%s' "${LEG_LIB_PATHS[$leg]}")
+      declare -a _tnames=(); read -r -a _tnames <<< "${LEG_LIB_TCL_NAMES[$leg]}"
+      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
+      tcl_lib="$(find_first_in ${_paths[@]+"${_paths[@]}"} -- ${_tnames[@]+"${_tnames[@]}"})"
+      z_lib="$(find_first_in ${_paths[@]+"${_paths[@]}"} -- ${_znames[@]+"${_znames[@]}"})"
+      searched="provider 'search-paths'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; paths searched: ${_paths[*]:-<none declared or all \${env:...} unset>}"
+      ;;
+    *)
+      die "[$leg] declares library provider '$provider', which this driver does not implement.
+      Known: host-system | ubuntu-ports-arm64 | search-paths (see $LEG_CATALOGUE and
+      LIBRARY_PROVIDERS in $LEG_RESOLVER). A provider the driver silently ignored would
+      resolve to an empty library pair and read as a missing input — so it fails loud here."
+      ;;
+  esac
+  if [[ -z "$tcl_lib" || -z "$z_lib" ]]; then
+    _lost="libtcl and libz"
+    [[ -n "$tcl_lib" ]] && _lost="libz"
+    [[ -n "$z_lib"   ]] && _lost="libtcl"
+    leg_marks_missing "$leg" "this leg is NOT built on this host" \
+      "no $_lost for ${LEG_SPEC[$leg]} on this machine — $searched"
+    continue
+  fi
+  LEG_TCL_LIB["$leg"]="$tcl_lib"; LEG_Z_LIB["$leg"]="$z_lib"
+  info "[$leg] libs ($provider): $tcl_lib  +  $z_lib"
 done
-# resolve each leg's (tcl,z) library pair for --resolve-library + runtime.
-leg_tcl_lib() { case "${LEG_LIBSRC[$1]}" in arm64) find_first_in "$ARM64_LIBDIR" libtcl8.6.so libtcl8.6.so.0 ;; *) printf '%s' "$HOST_TCL_LIB" ;; esac; }
-leg_z_lib()   { case "${LEG_LIBSRC[$1]}" in arm64) find_first_in "$ARM64_LIBDIR" libz.so.1 libz.so ;;          *) printf '%s' "$HOST_Z_LIB"   ;; esac; }
-find_first_in() { local d="$1"; shift; local n; for n in "$@"; do [[ -e "$d/$n" ]] && { printf '%s' "$d/$n"; return; }; done; }
-pass "headers + libraries ready for: ${LEG_ORDER[*]}"
+
+# ── each leg's TARGET C compiler (the loadext helper extension) ──────────────
+# WHY IT IS RESOLVED HERE AND NOT AT STEP 8, and why a missing one does NOT stop
+# the build: the compiler builds `libtestloadext.so`, the extension the loadext
+# corpus dlopen()s — a RUN input, not a build input for the fixture itself. So:
+#   · a leg that WILL run needs it. Absent (and un-installable) ⇒
+#     `skipped-build-input-missing`, decided NOW, at Step 6, rather than after a
+#     ~50 s..8 min compile and a staging step — the leg is still BUILT (that is
+#     unconditional), it just will not be run.
+#   · a leg that will NOT run here does not need it at all, and failing it for a
+#     cross-compiler it would never invoke would manufacture an environmental skip
+#     out of nothing — on a Linux box that is both macho legs, every run.
+# The candidates are the leg's own declared `targetCc.candidates`, first present
+# wins. ⚠ The old `${CC:-cc}` override is deliberately NOT carried over: with five
+# legs, one `$CC` cannot say WHICH leg's target compiler it means, and applying it
+# to a cross leg is exactly the wrong-arch helper this anchor
+# (D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO) exists to prevent. `$CC` still governs
+# PROBE_CC, which is a genuine host question.
+for leg in "${LEG_ORDER[@]}"; do
+  # A leg this host cannot RUN needs no helper extension — do not manufacture an
+  # environmental skip out of a cross-compiler it would never invoke.
+  [[ "${LEG_RUN_MODE[$leg]}" != "skip" ]] || continue
+  # A leg with no libraries is not built, so there is no run to stage for it.
+  [[ -n "${LEG_TCL_LIB[$leg]:-}" ]] || continue
+  declare -a _ccs=(); read -r -a _ccs <<< "${LEG_CC_CANDIDATES[$leg]}"
+  cc=""
+  for c in ${_ccs[@]+"${_ccs[@]}"}; do
+    command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }
+  done
+  if [[ -z "$cc" && -n "${LEG_CC_PKG[$leg]}" ]]; then
+    warn "[$leg] no target C compiler on PATH (${_ccs[*]:-<none declared>}) — trying to install ${LEG_CC_PKG[$leg]}"
+    # Subshell: a package manager that cannot supply it costs this leg its RUN,
+    # never the whole harness.
+    ( pkg_install "${LEG_CC_PKG[$leg]}" ) || true
+    hash -r
+    for c in ${_ccs[@]+"${_ccs[@]}"}; do
+      command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }
+    done
+  fi
+  if [[ -z "$cc" ]]; then
+    leg_marks_missing "$leg" "it is still BUILT, but this host cannot RUN its corpus" \
+      "no target C compiler for ${LEG_SPEC[$leg]} — tried ${_ccs[*]:-<none declared>}${LEG_CC_PKG[$leg]:+ (apt: ${LEG_CC_PKG[$leg]})}. It builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s; NOT falling back to the host compiler, because a HOST-arch extension the $leg fixture cannot load would false-red every loadext-* test as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]"
+    continue
+  fi
+  LEG_CC["$leg"]="$cc"
+  info "[$leg] target cc: $cc"
+done
+
+_ready=0
+for leg in "${LEG_ORDER[@]}"; do [[ -n "${LEG_TCL_LIB[$leg]:-}" ]] && _ready=$((_ready + 1)); done
+[[ "$_ready" -gt 0 ]] || die "NOT ONE of the ${#LEG_ORDER[@]} selected leg(s) could resolve its declared (tcl, z) libraries on this host.
+      Every leg is reported above with the exact names and roots it searched. There is nothing
+      left to build, so this is fatal rather than a run that would report five skips and exit 0."
+pass "headers staged + build inputs resolved for $_ready of ${#LEG_ORDER[@]} selected leg(s)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # THE CORPUS RESUME ENGINE — an abort is a RECOVERABLE, REPORTED outcome
@@ -1960,12 +2398,32 @@ stop_our_fixtures() {          # stop_our_fixtures <fixture-abs-path> <why>
 # It lives inside this region precisely because that contract is load-bearing here.
 run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES this shell
   local leg="$1" bin="$2"; shift 2
-  local pfx="${LEG_PREFIX[$leg]}"
-  if [[ -z "$pfx" ]]; then
+  # THE LAUNCHER IS DECLARED, NOT INFERRED. `LEG_LAUNCH` is the catalogue's
+  # launcher argv, shlex-quoted and space-joined by the resolver, so it may be
+  # MULTI-WORD (`arch -x86_64`) and may contain spaces inside a word; `eval` on the
+  # resolver's own quoting is the only correct way to split it back into an argv.
+  # `LEG_LAUNCH_ENV` is the same for `NAME='value'` pairs — it is what carries
+  # QEMU_LD_PREFIX for the arm64 leg, which used to be a hardcoded $QEMU_SYSROOT
+  # here and is now a property of the leg that needs it.
+  local -a launch=() envs=()
+  eval "launch=(${LEG_LAUNCH[$leg]})"
+  eval "envs=(${LEG_LAUNCH_ENV[$leg]})"
+  [[ ${#envs[@]} -eq 0 ]] || export "${envs[@]}"
+  # The leg's OWN library directories, for the runtime loader. Only for a leg whose
+  # libraries the harness STAGED (`ubuntu-ports-arm64`, `search-paths`): a
+  # `host-system` leg's libraries are, by definition, already where this machine's
+  # loader looks, and prepending a system dir would be a change with no purpose.
+  # Keyed on the leg's DECLARED provider, so a future staged-library leg inherits it.
+  if [[ "${LEG_LIB_PROVIDER[$leg]}" != "host-system" ]]; then
+    local d1 d2 libpath
+    d1="$(dirname "${LEG_TCL_LIB[$leg]}")"; d2="$(dirname "${LEG_Z_LIB[$leg]}")"
+    libpath="$d1"; [[ "$d2" == "$d1" ]] || libpath="$d1:$d2"
+    export LD_LIBRARY_PATH="$libpath${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+  if [[ ${#launch[@]} -eq 0 ]]; then
     exec "$bin" "$@" 2>&1
   else
-    export QEMU_LD_PREFIX="$QEMU_SYSROOT" LD_LIBRARY_PATH="$ARM64_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    exec "$pfx" "$bin" "$@" 2>&1
+    exec "${launch[@]}" "$bin" "$@" 2>&1
   fi
 }
 
@@ -2022,7 +2480,9 @@ step "7/9  Build the full-source testfixture (dss-code-prime --project), per leg
 declare -A FIXTURE=()          # leg -> binary path (on success)
 declare -A COMPILE_OK=()
 COMPILE_FAILS=0
-# the per-leg manifest is emitted as clean JSON by python3 (a harness dep now).
+# python3 was already ensured at Step 0b (the leg plan needs it far earlier than
+# the manifest does). Re-asserted here because this is where the manifest is
+# actually generated, and `ensure_cmd` on a present command costs nothing.
 ensure_cmd python3 python3
 # The leg-INDEPENDENT include-dir set: the sqlite recipe dirs + the staged
 # third-party tcl/zlib headers (whatever Tcl Step 6 discovered — the harness pins
@@ -2044,49 +2504,53 @@ for d in "${SQLITE_INCS[@]}" "${THIRD_PARTY_INCS[@]}" "$BLD"; do INC_DIRS+=("$d"
 # and because the angle resolver consults SHIPPED DESCRIPTORS FIRST, adding this
 # dir cannot shadow the OS descriptors (<stdio.h>/<unistd.h>/… keep resolving to
 # stdio.json/unistd.json; only descriptor-less Apple headers fall through to it).
-# Linux/Windows no-op: gated on HOST_OS, and `sdk_prefix` is empty without xcrun.
-if [[ "$HOST_OS" == "macos" ]]; then
+# Linux/Windows no-op: `sdk_prefix` is empty without xcrun. HOST fact: only a Mac
+# HAS an Xcode SDK, and this is about where THIS MACHINE keeps Apple's headers —
+# note that it applies to EVERY leg built here, not just the macho ones.
+if [[ "$HOST_OS" == "darwin" ]]; then
   _sdk_inc="$(sdk_prefix)"
   [[ -n "$_sdk_inc" && -d "$_sdk_inc/usr/include" ]] && INC_DIRS+=("$_sdk_inc/usr/include")
 fi
 
-# generate_manifest <spec> <tcl-lib> <z-lib> <out-manifest> — write a project
-# manifest reproducing the recipe: language c-subset, profile cli, ONE target
-# (the leg's <targetName>:<formatName> spec), artifactName testfixture, the full
-# TU set as ABSOLUTE `sources`, the `includes` dirs, the `defines` (a leading
-# `-D` stripped defensively; an empty SQLITE_PRIVATE= value preserved), and the
-# leg's (tcl, z) libraries as `resolveLibraries`. The arrays reach python3 via
-# the ENVIRONMENT (newline-joined) — never argv — so 185 paths can't overflow
-# ARG_MAX or trip quoting. Echoes the array counts for the build log.
+# ── the recipe arrays, staged ONCE as files for the shared manifest generator ─
+# The TU list, the include dirs and the recipe defines are LEG-INDEPENDENT, so they
+# are written once and every leg's manifest is generated from the same three files.
+# FILES, not argv: ~185 absolute paths would overflow a Windows command line, which
+# is why gen-pe64-manifest.py took this shape in the first place.
+RECIPE_TUS_FILE="$OUT_DIR/recipe-tus.txt"
+RECIPE_INCS_FILE="$OUT_DIR/recipe-includes.txt"
+RECIPE_DEFS_FILE="$OUT_DIR/recipe-defines.txt"
+printf '%s\n' "${TUS[@]}"         > "$RECIPE_TUS_FILE"
+printf '%s\n' "${INC_DIRS[@]}"    > "$RECIPE_INCS_FILE"
+printf '%s\n' "${RECIPE_DEFS[@]}" > "$RECIPE_DEFS_FILE"
+
+# generate_manifest <leg> <out-manifest> — write this leg's project manifest.
+#
+# ★ ONE GENERATOR, BOTH DRIVERS. This used to be a second, inline python heredoc
+# that emitted the same JSON as gen-pe64-manifest.py — two implementations of one
+# decision, kept in step by hand. They had already diverged: the .py applies the
+# recipe transform and emits `stackReserve`, the heredoc did neither, and the .py
+# additionally asserts every source EXISTS. Calling the .py here deletes the fork
+# and gives the .sh both capabilities. Everything leg-specific is an ARGUMENT, read
+# from the leg's own declaration in legs.json:
+#   · --target            the leg's <targetName>:<formatName> spec
+#   · --resolve-library   its resolved (tcl, z) pair
+#   · --recipe-transform  `none` | `windows-selfconfig`  (build.recipeTransform)
+#   · --stack-reserve     bytes; 0 omits the key           (build.stackReserveBytes)
+# rc is taken DIRECTLY off python3 by the caller's `if`, never through a pipe.
 generate_manifest() {
-  local spec="$1" tcl_lib="$2" z_lib="$3" out="$4"
-  MANIFEST_SPEC="$spec" MANIFEST_TCL="$tcl_lib" MANIFEST_Z="$z_lib" \
-  MANIFEST_TUS="$(printf '%s\n' "${TUS[@]}")" \
-  MANIFEST_INCS="$(printf '%s\n' "${INC_DIRS[@]}")" \
-  MANIFEST_DEFS="$(printf '%s\n' "${RECIPE_DEFS[@]}")" \
-  python3 - "$out" <<'PY'
-import json, os, sys
-out = sys.argv[1]
-def lines(name):
-    return [x for x in os.environ.get(name, "").splitlines() if x]
-def strip_d(d):
-    return d[2:] if d.startswith("-D") else d   # RECIPE_DEFS is pre-stripped; defensive
-manifest = {
-    "language":         "c-subset",
-    "artifactProfile":  "cli",
-    "targets":          [os.environ["MANIFEST_SPEC"]],
-    "artifactName":     "testfixture",
-    "sources":          lines("MANIFEST_TUS"),
-    "includes":         lines("MANIFEST_INCS"),
-    "defines":          [strip_d(d) for d in lines("MANIFEST_DEFS")],
-    "resolveLibraries": [os.environ["MANIFEST_TCL"], os.environ["MANIFEST_Z"]],
-}
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
-    f.write("\n")
-print("sources=%d includes=%d defines=%d" % (
-    len(manifest["sources"]), len(manifest["includes"]), len(manifest["defines"])))
-PY
+  local leg="$1" out="$2"
+  python3 "$MANIFEST_GEN" \
+    --tus       "$RECIPE_TUS_FILE" \
+    --includes  "$RECIPE_INCS_FILE" \
+    --defines   "$RECIPE_DEFS_FILE" \
+    --target    "${LEG_SPEC[$leg]}" \
+    --resolve-library "${LEG_TCL_LIB[$leg]}" \
+    --resolve-library "${LEG_Z_LIB[$leg]}" \
+    --artifact-name   testfixture \
+    --recipe-transform "${LEG_RECIPE_TRANSFORM[$leg]}" \
+    --stack-reserve    "${LEG_STACK_RESERVE[$leg]}" \
+    --output    "$out"
 }
 compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
 # >>> dss:fresh-inode >>>
@@ -2155,9 +2619,32 @@ fixture_fresh_inode() {
   printf '%s\n' "$new"
 }
 # <<< dss:fresh-inode <<<
+# ── STAGED-TREE COHERENCE, RE-ASSERTED IMMEDIATELY BEFORE THE FIRST LEG ──────
+# The same run-wide precondition as at the end of Step 4, checked AGAIN here and
+# for a reason: Steps 5-6 sit between the two, and Step 6 writes inside the
+# checkout ($BLD/zinc) while Step 5 can take many minutes — long enough for a
+# concurrent `git pull` or a hand-run `make` in that tree to move it. Re-reading a
+# precondition immediately before the work it guards costs a second and is the
+# difference between "the tree was coherent at some point earlier" and "the tree
+# these five legs are about to compile is coherent". Same shape, same reasoning:
+# a shared-input precondition, a run-wide `die`, no skip path.
+"$SRC_COHERENCE" --checkout "$SQLITE_DIR" --label "staged sqlite (Step 7, pre-build)" "$BLD" \
+  || die "staged sqlite tree is INCOHERENT — refusing to build (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE)"
+
 declare -a PREFLIGHT_KILLS=()
 for leg in "${LEG_ORDER[@]}"; do
-  spec="${LEG_SPEC[$leg]}"; fmt="${spec##*:}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
+  # ★ THE BUILD IS ATTEMPTED FOR EVERY DECLARED LEG, ON EVERY HOST — there is no
+  # host test in this loop, and there must never be one. The ONE thing that can
+  # stop a leg here is a DECLARED BUILD INPUT that Step 6 could not find on this
+  # machine (DSS reads each --resolve-library binary at compile time, so without
+  # them there is nothing to compile against). That is an OBSERVED absence with a
+  # named verdict, already recorded and already warned about — not an inference
+  # from what kind of box this is.
+  if [[ -z "${LEG_TCL_LIB[$leg]:-}" || -z "${LEG_Z_LIB[$leg]:-}" ]]; then
+    warn "[$leg] build NOT ATTEMPTED [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}"
+    continue
+  fi
+  spec="${LEG_SPEC[$leg]}"; fmt="${LEG_FORMAT[$leg]}"; outd="$OUT_DIR/$leg"; log="$outd/compile.log"
   manifest="$outd/$leg.dss-project.json"
   mkdir -p "$outd"
   # >>> dss:preflight >>>
@@ -2177,18 +2664,29 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; PREFLIGHT_KILLS+=("$k"); }
   done <<< "$preflight_out"
   # <<< dss:preflight <<<
-  tcl_lib="$(leg_tcl_lib "$leg")"; z_lib="$(leg_z_lib "$leg")"
-  [[ -n "$tcl_lib" && -n "$z_lib" ]] || die "[$leg] could not resolve tcl/zlib libraries."
-  info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "$tcl_lib"), $(basename "$z_lib"))"
-  counts="$(generate_manifest "$spec" "$tcl_lib" "$z_lib" "$manifest")" \
-    || die "[$leg] manifest generation failed (python3) — see above."
-  info "[$leg] manifest → $manifest ($counts)"
+  info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "${LEG_TCL_LIB[$leg]}"), $(basename "${LEG_Z_LIB[$leg]}"); transform: ${LEG_RECIPE_TRANSFORM[$leg]}; stackReserve: ${LEG_STACK_RESERVE[$leg]})"
+  # rc DIRECTLY off the generator (the `if` also keeps errexit out of it). It emits
+  # two lines — the transform summary and the counts — so both are surfaced.
+  if counts="$(generate_manifest "$leg" "$manifest")"; then
+    while IFS= read -r _cl; do [[ -z "$_cl" ]] || info "[$leg] manifest: $_cl"; done <<< "$counts"
+    info "[$leg] manifest → $manifest"
+  else
+    printf '%s\n' "$counts" | sed 's/^/      /' >&2
+    die "[$leg] manifest generation FAILED ($MANIFEST_GEN) — see above.
+      The generator also asserts that every TU EXISTS on disk, so a staged-tree miss
+      lands here rather than mid-compile."
+  fi
   # A project build routes each target to <output>/<formatName>/<artifactName>.
   # dss-code-prime returns EXIT 0 even on fatal errors → judge from `error[` + the binary.
   "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
   bin="$outd/$fmt/testfixture"
   if grep -qE 'error\[' "$log" || [[ ! -x "$bin" ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
+    # `poisoned` — the ledger's FAILURE class, and it DISPLACES whatever this leg
+    # was carrying: a build that produced no artifact is the strongest thing that
+    # can be said about it, and a failure must never read as a skip.
+    LEG_VERDICT["$leg"]="poisoned"
+    LEG_VERDICT_DETAIL["$leg"]="the fixture did not build for ${LEG_SPEC[$leg]} — see $log"
     if grep -qE 'error\[' "$log"; then
       warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
@@ -2205,7 +2703,11 @@ for leg in "${LEG_ORDER[@]}"; do
     # a copy/rename that does not land, or that lands on the SAME inode, is a
     # hard stop — continuing would exec the inode that carries the DENY and burn
     # the whole corpus on 137s.
-    if [[ "$HOST_OS" == "macos" ]]; then
+    # HOST fact, and the comment above says why in detail: AppleSystemPolicy pins
+    # the exec DENY to an inode on THIS MACHINE's filesystem. It is about the box
+    # that will exec the file, not about which target produced it — every leg built
+    # on a Mac goes through it.
+    if [[ "$HOST_OS" == "darwin" ]]; then
       fresh_ino="$(fixture_fresh_inode "$bin")" || die "[$leg] could not install the fixture on a FRESH INODE at $bin (rc=$?).
       D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE: macOS pins a permanent
       exec DENY to the INODE, and an in-place rebuild inherits it — the fixture
@@ -2253,9 +2755,12 @@ UNIT_FAILS=0
 # its CWD and cd's into it before any .test body runs, so a test's relative
 # `./libtestloadext.so` resolves HERE. The harness passes no --testdir override.
 SQLITE_TESTDIR_SUBDIR="testdir"
-# How a shared object is produced — decided by the leg's TARGET object format, never
-# by the host's.
-leg_shared_flags() { case "${LEG_SPEC[$1]##*:}" in macho64-*) printf '%s' '-dynamiclib';; *) printf '%s' '-shared -fPIC';; esac; }
+# How a shared object is produced — DECLARED by the leg (`build.sharedLibFlags` in
+# legs.json), not pattern-matched off its format name here. This used to be a
+# `case "${LEG_SPEC[$1]##*:}" in macho64-*)` in this file, i.e. a second, private
+# opinion about object formats sitting a long way from the catalogue that already
+# has one; a new format would have had to be taught to both.
+leg_shared_flags() { printf '%s' "${LEG_SHARED_FLAGS[$1]}"; }
 # [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO] Stage the helper shared object the
 # loadext corpus dlopen()s, built for THE LEG'S TARGET.
 #
@@ -2272,21 +2777,21 @@ leg_shared_flags() { case "${LEG_SPEC[$1]##*:}" in macho64-*) printf '%s' '-dyna
 # find neither from the run dir and silently fall through to a SYSTEM sqlite3.h of
 # an unrelated version.
 #
-# FAIL-LOUD: an unobtainable leg compiler DIES. Falling back to the host compiler is
-# precisely the defect above, and it would be invisible in the results.
+# FAIL-LOUD: the compiler was RESOLVED at Step 6, from the leg's own declared
+# `targetCc.candidates`, and a leg that could not resolve one never reaches this
+# function (it carries `skipped-build-input-missing` and its corpus is not run). So
+# by the time we are here the compiler is known to exist, and the only failure left
+# is the COMPILE ITSELF — which dies, loudly. What must never happen is a fallback
+# to the host compiler: that is precisely the defect above, and it is invisible in
+# the results.
 stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>
   local leg="$1" rundir="$2"
-  local cc="${LEG_CC[$leg]}" pkg="${LEG_CC_PKG[$leg]:-}"
+  local cc="${LEG_CC[$leg]}"
   local src="$SQLITE_DIR/src/test_loadext.c"
   local dst="$rundir/$SQLITE_TESTDIR_SUBDIR/libtestloadext.so"
   [[ -f "$src" ]] || die "[$leg] sqlite extension source not found: $src"
-  if ! command -v "$cc" >/dev/null 2>&1 && [[ -n "$pkg" ]]; then
-    warn "[$leg] target C compiler '$cc' not found — installing $pkg"
-    pkg_install "$pkg"
-    hash -r
-  fi
   command -v "$cc" >/dev/null 2>&1 || die \
-"[$leg] target C compiler '$cc' not found${pkg:+ (apt: $pkg)} — it builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s.
+"[$leg] target C compiler '$cc' resolved at Step 6 is no longer on PATH — it builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s.
       NOT falling back to the host compiler: sqlite's loadext.test would then build a HOST-arch extension the $leg fixture cannot load, and every
       loadext-* test would false-red as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]."
   mkdir -p "$(dirname "$dst")"
@@ -2296,8 +2801,29 @@ stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>
   info "[$leg] loadext helper -> $dst (built by $cc)"
 }
 for leg in "${LEG_ORDER[@]}"; do
+  # ── the three ways a leg does not reach the corpus, each already NAMED ──────
+  # None of them is a host test: they are the recorded OUTCOMES of Step 6 and
+  # Step 7. The verdict is left exactly as those steps set it — this loop never
+  # invents one, and never silently drops a leg.
+  if [[ -z "${LEG_TCL_LIB[$leg]:-}" ]]; then
+    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}"
+    continue                                   # already warned at Step 6/7
+  fi
   if [[ "${COMPILE_OK[$leg]:-0}" != "1" ]]; then
-    UNIT_VERDICT["$leg"]="skipped (compile failed)"; warn "[$leg] corpus skipped — step 7 did not compile the fixture"; continue
+    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — step 7 did not produce a fixture"
+    warn "[$leg] corpus skipped — step 7 did not compile the fixture"; continue
+  fi
+  if [[ "${LEG_RUN_MODE[$leg]}" == "skip" ]]; then
+    # ★ BUILT, and the build result is REPORTED — this is the whole point of the
+    # split. The artifact for this target exists and is on disk; this machine
+    # simply cannot execute it, which the resolver said up front and by name.
+    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}  (the fixture DID build: ${FIXTURE[$leg]})"
+    info "[$leg] fixture built but NOT RUN here [${LEG_RUN_VERDICT[$leg]}]: ${LEG_RUN_DETAIL[$leg]}"
+    continue
+  fi
+  if [[ -z "${LEG_CC[$leg]:-}" ]]; then
+    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}  (the fixture DID build: ${FIXTURE[$leg]})"
+    continue                                   # already warned at Step 6
   fi
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
   stage_loadext_extension "$leg" "$rundir"
@@ -2341,7 +2867,7 @@ for leg in "${LEG_ORDER[@]}"; do
     IFS="$US" read -r s_kind s_perm s_label s_patfile s_arg1 s_arg2 <<< "${SEGQ[$seg_i]}"
     if [[ $seg_i -eq 0 ]]; then
       seglog="$runlog"
-      info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_PREFIX[$leg]}" ]] && printf ' (under %s)' "${LEG_PREFIX[$leg]}" )…"
+      info "[$leg] running $DSS_TIER.test$( [[ -n "${LEG_LAUNCH[$leg]}" ]] && printf ' (under the declared launcher: %s)' "${LEG_LAUNCH[$leg]}" )…"
     else
       seglog="$OUT_DIR/$leg/corpus.resume$seg_i.log"
       info "[$leg] segment $((seg_i + 1)): $s_label$( [[ -n "$s_patfile" ]] && printf '  (SQLITE_TEST_PATTERN_LIST: %s candidate file(s))' "$(wc -l < "$s_patfile")" )"
@@ -2530,9 +3056,15 @@ for leg in "${LEG_ORDER[@]}"; do
       || derivation="$derivation  [!! the derivation DISAGREES with sqlite on ${#CALIBRATION[@]} segment(s) that did report — treat the aborted-segment figures as APPROXIMATE: ${CALIBRATION[*]}]"
   fi
   # A confound may be SCOPED to an execution mode: `native:<re>` or `emulated:<re>`
-  # (bare `<re>` = every leg). The mode is derived from whether the leg needs a
-  # runner prefix to execute its binaries — a per-leg TARGET fact, never a host or
-  # arch identity test, so a future emulated target inherits this for free.
+  # (bare `<re>` = every leg). The mode is the RESOLVER'S OWN run mode for this leg
+  # — `native` (this host executes the artifact directly) vs `launched` (it goes
+  # through a declared launcher: qemu for a cross-arch host, Wine for a cross-OS
+  # one). It used to be inferred from "is LEG_PREFIX non-empty", which was the same
+  # fact read out of a variable this driver maintained by hand. Still never a host
+  # or arch identity test, so a future launched target inherits the scoping free.
+  # The SCOPE NAMES stay `native:`/`emulated:` — they are the DSS_CONFOUNDS
+  # vocabulary an operator types, and renaming them would silently un-excuse every
+  # `emulated:` pattern in the shipped default list.
   # WHY SCOPES EXIST: `writecrash-` fails ONLY under qemu, because the emulator
   # writes "qemu: uncaught target signal 6" into the child's captured output that
   # sqlite's crash harness compares (D-SQLITE-ARM64-WRITECRASH-QEMU-ABORT-ARTIFACT,
@@ -2545,7 +3077,7 @@ for leg in "${LEG_ORDER[@]}"; do
   # "can only be used in a function" — it aborted a completed 13 h arm64 run at the
   # classification step, AFTER the whole corpus had been executed.
   leg_mode='native'
-  [[ -n "${LEG_PREFIX[$leg]:-}" ]] && leg_mode='emulated'
+  [[ "${LEG_RUN_MODE[$leg]:-native}" == 'launched' ]] && leg_mode='emulated'
   declare -a real=() confound=() scoped_excused=()
   for t in $faillist; do
     is_c=0; by_scope=0
@@ -2669,6 +3201,16 @@ for leg in "${LEG_ORDER[@]}"; do
   LEG_ABORTS["$leg"]="${ABORTS[*]-}"; LEG_NOTREACHED["$leg"]="$(printf '%s\n' ${NOT_REACHED[@]+"${NOT_REACHED[@]}"})"
   LEG_HYGIENE["$leg"]="$(printf '%s\n' ${HYGIENE[@]+"${HYGIENE[@]}"})"
   # <<< dss:corpus-loop <<<
+  # ★ THE LEDGER VERDICT for a leg that reached the corpus: `ran` — the ledger's
+  # VERIFIED class, "this arm produced an assertion". It is `ran` whether the
+  # corpus came back GREEN or RED: a failing assertion is still an assertion, and
+  # the redness is carried by $UNIT_FAILS and $UNIT_VERDICT — exactly the split the
+  # C++ corpus runners make (a gtest failure does not turn an arm's verdict from
+  # Ran into something else). `poisoned` stays reserved for "no artifact, never
+  # spawned", so a reader can always tell "we tested it and it failed" apart from
+  # "we never tested it".
+  LEG_VERDICT["$leg"]="ran"
+  LEG_VERDICT_DETAIL["$leg"]="${UNIT_VERDICT[$leg]:-<no unit verdict recorded>}"
   unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
 done
 
@@ -2710,31 +3252,133 @@ if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
 else
   printf '   excluded : (none — the full tier ran)\n'
 fi
-for leg in "${LEG_ORDER[@]}"; do
+for leg in "${LEG_DECLARED[@]}"; do
   spec="${LEG_SPEC[$leg]}"
   if [[ "${COMPILE_OK[$leg]:-0}" == "1" ]]; then
     # Only printed when there is something to say: a clean single-segment run
     # leaves this block byte-identical to what it always was.
     if [[ "${LEG_SEGMENTS[$leg]:-1}" -gt 1 || -n "${LEG_ABORTS[$leg]:-}" || -n "${LEG_NOTREACHED[$leg]:-}" || -n "${LEG_HYGIENE[$leg]:-}" ]]; then
-      printf '   %-6s segments : %s (%s resume(s) of max %s)   %s test file(s) completed   ledger: %s\n' \
+      printf '   %-14s segments : %s (%s resume(s) of max %s)   %s test file(s) completed   ledger: %s\n' \
         "$leg" "${LEG_SEGMENTS[$leg]}" "${LEG_RESUMES[$leg]}" "$DSS_MAX_RESUMES" "${LEG_FILESDONE[$leg]}" "${LEG_LEDGER[$leg]}"
       for a in ${LEG_ABORTS[$leg]:-}; do
-        printf '   %-6s aborted  : %s — its remaining cases did NOT run\n' "$leg" "$a"
+        printf '   %-14s aborted  : %s — its remaining cases did NOT run\n' "$leg" "$a"
       done
-      while IFS= read -r n; do [[ -z "$n" ]] || printf '   %-6s NOT RUN  : %s\n' "$leg" "$n"; done <<< "${LEG_NOTREACHED[$leg]:-}"
-      while IFS= read -r h; do [[ -z "$h" ]] || printf '   %-6s hygiene  : %s\n' "$leg" "$h"; done <<< "${LEG_HYGIENE[$leg]:-}"
+      while IFS= read -r n; do [[ -z "$n" ]] || printf '   %-14s NOT RUN  : %s\n' "$leg" "$n"; done <<< "${LEG_NOTREACHED[$leg]:-}"
+      while IFS= read -r h; do [[ -z "$h" ]] || printf '   %-14s hygiene  : %s\n' "$leg" "$h"; done <<< "${LEG_HYGIENE[$leg]:-}"
     fi
     # $EXCL_NOTE rides along on EVERY verdict — pass and fail alike — so a GREEN
     # line can never be read as "the whole corpus ran".
-    printf '   %-6s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
+    printf '   %-14s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
+  elif [[ "${LEG_VERDICT[$leg]:-}" == "poisoned" ]]; then
+    printf '   %-14s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
   else
-    printf '   %-6s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
+    # ★ NOT BUILT — and it says WHY, by name. This line is the difference between
+    # the old driver and this one: a leg that this host could not build or run used
+    # to be ABSENT from the leg list entirely, so the summary said nothing at all
+    # about it and a reader had no way to know it was ever declared.
+    printf '   %-14s (%s): %sNOT BUILT%s [%s] — %s\n' "$leg" "$spec" "$C_YLW" "$C_RST" \
+      "${LEG_VERDICT[$leg]:-<NO VERDICT>}" "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}"
   fi
 done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE VERDICT LEDGER — every DECLARED leg, one named verdict, counts that SUM
+# ─────────────────────────────────────────────────────────────────────────────
+# Same shape and the same words as `ArmVerdictLedger::renderCountsLine()` in
+# tests/test_support/arm_verdict_ledger.hpp, deliberately: the sqlite harness does
+# not get private words for "did not run", and a reader greps ONE vocabulary across
+# this driver and the two examples-corpus runners.
+#
+# WHY EVERY CLASS IS NAMED even when its count is 0 (this harness never produces
+# `expect-error-asserted`, and only DSS_LEGS produces `not-selected-by-runner`): a
+# bare "N skipped" re-creates exactly the conflation the ledger exists to end, and
+# a class that appears only when non-zero cannot be grepped for reliably.
+declare -A VERDICT_COUNT=()
+declare -a LEDGER_VOCAB=(ran expect-error-asserted skipped-by-runOn
+                         skipped-no-emulator-declared skipped-emulator-missing
+                         skipped-build-input-missing not-selected-by-runner poisoned)
+for v in "${LEDGER_VOCAB[@]}"; do VERDICT_COUNT["$v"]=0; done
+declare -a LEDGER_UNNAMED=() LEDGER_BOGUS=()
+for leg in "${LEG_DECLARED[@]}"; do
+  v="${LEG_VERDICT[$leg]:-}"
+  if [[ -z "$v" ]]; then LEDGER_UNNAMED+=("$leg"); continue; fi
+  if [[ -z "${VERDICT_COUNT[$v]+set}" ]]; then LEDGER_BOGUS+=("$leg=$v"); continue; fi
+  # ★ `${VERDICT_COUNT[...]}` — a full parameter expansion INSIDE the arithmetic,
+  # never a bare `VERDICT_COUNT[key]`. MEASURED (bash 5.2.37): while the array is
+  # ASSOCIATIVE both forms are correct — bash takes an associative subscript as a
+  # literal string, so the hyphens in `expect-error-asserted` are safe. But that
+  # correctness rests entirely on the `declare -A` above still being in force: on
+  # an INDEXED array the same bare subscript is evaluated as an EXPRESSION and dies
+  # `expect: unbound variable` under `set -u`. Expanding first hands the evaluator a
+  # plain integer and makes the reading independent of a declaration 20 lines away.
+  VERDICT_COUNT["$v"]=$(( ${VERDICT_COUNT[$v]} + 1 ))
+done
+LEDGER_VERIFIED=$(( ${VERDICT_COUNT[ran]} + ${VERDICT_COUNT[expect-error-asserted]} ))
+LEDGER_STRUCTURAL=$(( ${VERDICT_COUNT[skipped-by-runOn]} + ${VERDICT_COUNT[skipped-no-emulator-declared]} ))
+LEDGER_ENVIRONMENTAL=$(( ${VERDICT_COUNT[skipped-emulator-missing]} + ${VERDICT_COUNT[skipped-build-input-missing]} ))
+LEDGER_HARNESS=$(( ${VERDICT_COUNT[not-selected-by-runner]} ))
+LEDGER_SKIPPED=$(( LEDGER_STRUCTURAL + LEDGER_ENVIRONMENTAL + LEDGER_HARNESS ))
+LEDGER_FAILED=$(( ${VERDICT_COUNT[poisoned]} ))
+LEDGER_ACCOUNTED=$(( LEDGER_VERIFIED + LEDGER_SKIPPED + LEDGER_FAILED ))
+LEDGER_TOTAL=${#LEG_DECLARED[@]}
+printf '   verdicts : %d verified (%d ran, %d expect-error), %d skipped [structural: %d by-runOn, %d no-emulator-declared; environmental: %d emulator-missing, %d build-input-missing; harness: %d not-selected], %d poisoned  (of %d declared legs)\n' \
+  "$LEDGER_VERIFIED" "${VERDICT_COUNT[ran]}" "${VERDICT_COUNT[expect-error-asserted]}" \
+  "$LEDGER_SKIPPED" "${VERDICT_COUNT[skipped-by-runOn]}" "${VERDICT_COUNT[skipped-no-emulator-declared]}" \
+  "${VERDICT_COUNT[skipped-emulator-missing]}" "${VERDICT_COUNT[skipped-build-input-missing]}" \
+  "${VERDICT_COUNT[not-selected-by-runner]}" "$LEDGER_FAILED" "$LEDGER_TOTAL"
+# FAIL LOUD IN THE SUMMARY LINE ITSELF. A breakdown that does not sum to its own
+# denominator is worse than no breakdown: it READS like full accounting. Same
+# precedent, same words, as renderCountsLine()'s hole detector — and here it is
+# also FATAL, because a leg with no verdict is precisely the silent shortfall this
+# whole cycle removed, and a run that ends 0 while one leg vanished would restore it.
+LEDGER_HOLE=0
+if [[ "$LEDGER_ACCOUNTED" -ne "$LEDGER_TOTAL" ]]; then
+  LEDGER_HOLE=1
+  printf '   %s★ LEDGER ACCOUNTING HOLE: %d of %d declared legs fall in a reported class — the rest belong to NO class and have VANISHED from the line above%s\n' \
+    "$C_RED" "$LEDGER_ACCOUNTED" "$LEDGER_TOTAL" "$C_RST"
+  [[ ${#LEDGER_UNNAMED[@]} -eq 0 ]] || printf '     with NO verdict at all : %s\n' "${LEDGER_UNNAMED[*]}"
+  [[ ${#LEDGER_BOGUS[@]}   -eq 0 ]] || printf '     with a verdict OUTSIDE the closed vocabulary: %s\n' "${LEDGER_BOGUS[*]}"
+  printf '     the closed vocabulary is: %s  (tests/test_support/arm_verdict_ledger.hpp)\n' "${LEDGER_VOCAB[*]}"
+fi
+# One line per NON-verified leg, with its reason. Verified legs are omitted: they
+# are already fully reported by the per-leg block above.
+for leg in "${LEG_DECLARED[@]}"; do
+  v="${LEG_VERDICT[$leg]:-<NO VERDICT>}"
+  case "$v" in ran|expect-error-asserted) continue ;; esac
+  printf '   [%s] %s spec=%s — %s\n' "$v" "$leg" "${LEG_SPEC[$leg]}" "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}"
+done
+# ENVIRONMENTAL skips: a loud warning by default, FATAL under
+# DSS_STRICT_ARM_VERDICTS=1 — the same variable and the same semantics as the two
+# examples-corpus runners. STRUCTURAL skips are never fatal and are not listed here:
+# nothing about this machine can change them.
+declare -a ENV_SKIPS=()
+for leg in "${LEG_DECLARED[@]}"; do
+  case "${LEG_VERDICT[$leg]:-}" in
+    skipped-emulator-missing|skipped-build-input-missing) ENV_SKIPS+=("$leg") ;;
+  esac
+done
+if [[ ${#ENV_SKIPS[@]} -gt 0 ]]; then
+  if [[ "$STRICT_VERDICTS" -eq 1 ]]; then
+    printf '\n   %s✗ %d ENVIRONMENTAL skip(s) and DSS_STRICT_ARM_VERDICTS=1 — this run is RED: %s%s\n' \
+      "$C_RED" "${#ENV_SKIPS[@]}" "${ENV_SKIPS[*]}" "$C_RST"
+    printf '     Each one is a DECLARED input this machine could not supply (a launcher, a\n'
+    printf '     resolve-library binary, a target compiler) — not a compiler defect, and not a\n'
+    printf '     property of the catalogue. Supply them, or drop DSS_STRICT_ARM_VERDICTS.\n'
+  else
+    warn "${#ENV_SKIPS[@]} leg(s) were skipped for an ENVIRONMENTAL reason — this machine could not supply a DECLARED input: ${ENV_SKIPS[*]}"
+    warn "      Those targets are NOT covered by this run. Set DSS_STRICT_ARM_VERDICTS=1 to make it a hard failure."
+  fi
+fi
 # Release the run lock. Correctness does NOT depend on this — the lock is
 # liveness-based, so a run that dies here just leaves one the next invocation steals
 # and reports. Releasing simply keeps that report quiet when it should be.
 rm -rf "$LOCK_DIR"
+if [[ "$LEDGER_HOLE" -eq 1 ]]; then
+  printf '\n%sTHE LEDGER DOES NOT ADD UP — a declared leg reached no named verdict.%s\n' "$C_RED" "$C_RST"
+  printf 'That is a HARNESS defect, not a compiler result: whatever this run proved, it did\n'
+  printf 'not prove it about every leg it claimed to cover. Refusing to exit 0.\n'
+  exit 1
+fi
 if [[ "$COMPILE_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) failed to compile the testfixture — inspect the compile.log diagnostics.%s\n' "$C_RED" "$COMPILE_FAILS" "$C_RST"
   exit 1
@@ -2743,4 +3387,9 @@ if [[ "$UNIT_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) had genuine unit failures (non-confound) — the corpus is not green.%s\n' "$C_RED" "$UNIT_FAILS" "$C_RST"
   exit 1
 fi
-pass "every leg compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime"
+if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
+# ★ THE CLOSING CLAIM IS BOUNDED BY THE LEDGER. It used to read "every leg
+# compiled ... GREEN", which on the old driver meant "every leg this host happened
+# to produce" — a sentence that got smaller as the host got less capable, without
+# ever saying so. It now names what was verified out of what was DECLARED.
+pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; 0 poisoned)"

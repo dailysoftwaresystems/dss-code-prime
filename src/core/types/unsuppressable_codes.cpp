@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 136> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 137> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -127,6 +127,14 @@ constexpr std::array<DiagnosticCode, 136> kUnsuppressableCodes{{
     // restore exactly that silent loader death — the class this fail-loud exists
     // to convert into a compile-time error.
     DiagnosticCode::F_ShippedSymbolUnavailableForTarget,
+    // F_HeaderNameCaseAmbiguous (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04): an
+    // `#include` name fold-matched TWO OR MORE distinct files under a
+    // case-INSENSITIVE format's header-name convention. Suppressing it would
+    // force the resolver to pick one — and since a case-only pair cannot exist on
+    // NTFS or default APFS at all, the pick would differ by BUILD HOST. That is
+    // the precise host-dependence the `headerNameMatching` axis removes, so a
+    // suppressible form of this code would reinstate the defect one layer down.
+    DiagnosticCode::F_HeaderNameCaseAmbiguous,
     // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
     // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
     // active (arch, format). The selection contract is exactly-one-matches;

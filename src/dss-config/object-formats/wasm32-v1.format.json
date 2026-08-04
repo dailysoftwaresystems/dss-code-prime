@@ -11,5 +11,7 @@
 
   "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): THIS FORMAT DELIBERATELY DECLARES NO `predefinedMacros` -- `dataModel` above is ILP32, and `__LP64__`/`_LP64` name the LP64 model specifically, so neither may be defined here. The absence is an ANSWER, not an omission, and is pinned as one by tests/link/test_object_format_schema.cpp. (This format is DECLARED-ONLY anyway -- the semantic consumer fails loud when an ILP32 format is actually selected -- so no C program on this leg can observe it yet; the row exists so the file STATES its answer instead of defaulting into one.)",
   "$dataModelComment": "FC3 c1: 32-bit data model (int 32, long 32, ptr 32) -- DECLARED-ONLY: the semantic consumer fails loud (S_UnsupportedDataModel) when an ILP32 format is actually selected, so no untested width path runs. REQUIRED closed-enum field like every format.",
-  "dataModel": "ILP32"
+  "dataModel": "ILP32",
+  "$headerNameMatchingComment": "D-PP-HEADER-CASE-INSENSITIVE-PE: REQUIRED closed-enum field on EVERY format, including the declared-only skeletons. This format ships no C header surface of its own, so it declares the CONSERVATIVE value: byte-exact matching can only ever REJECT a spelling loudly, never silently ACCEPT one the target would reject. Revisit if/when a real header convention is defined for it.",
+  "headerNameMatching": "case-sensitive"
 }

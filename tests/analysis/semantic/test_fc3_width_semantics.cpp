@@ -829,6 +829,7 @@ namespace {
     return std::string{R"({
   "dssObjectFormatVersion": 1,
   )"} + dataModelLine + R"(
+  "headerNameMatching": "case-sensitive",
   "format": { "name": "fc3-stub", "version": "1.0", "kind": "elf" },
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 }
 })";

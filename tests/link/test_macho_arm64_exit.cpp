@@ -368,6 +368,7 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-indirect-bad","kind":"macho"},
       "entryPoint": "",
       "externCallDispatch": "indirect-slot",
@@ -564,6 +565,7 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badpage","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
@@ -600,6 +602,7 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badva","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },

@@ -42,6 +42,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/include_path_resolve.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
 
@@ -83,6 +84,17 @@ struct DSS_EXPORT ResolutionContext {
     // fatal C error, unlike the soft D_UnresolvedImport for a missing
     // quote include.
     std::span<std::filesystem::path const> systemDirs;
+
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: how a header NAME is matched against the
+    // filesystem, as the ACTIVE OBJECT FORMAT declares it (`headerNameMatching`
+    // in `*.format.json`). This tier MUST carry it: it owns both
+    // `F_ShippedHeaderNotFound` emit sites, so if only the preprocessor learned
+    // the policy then `#include` and `__has_include` would answer differently
+    // for `<Windows.h>` — the exact drift the FC15c single-funnel design exists
+    // to prevent. Defaults to the conservative POSIX rule for the callers with
+    // no active format (LSP, direct-API, tests, non-C languages); the driver
+    // threads the real value through `UnitBuilder::setHeaderNameMatching`.
+    HeaderNameMatching headerNameMatching = kDefaultHeaderNameMatching;
 
     // Load + tokenize + parse `path` UNDER `schema` (the including tree's
     // language — an `#include` in a c-subset file loads another c-subset file),

@@ -46,6 +46,7 @@ makeElfFormat(std::uint16_t machine) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine": )"}
       + std::to_string(machine) + R"(}
@@ -66,6 +67,7 @@ makePeFormat(std::uint16_t machine) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","kind":"pe"},
       "pe": {"machine": )"} + std::to_string(machine) + R"(}
     })";
@@ -85,6 +87,7 @@ makeMachOFormat(std::uint32_t cputype) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-macho","kind":"macho"},
       "macho": {"cputype": )"} + std::to_string(cputype) + R"(}
     })";
@@ -266,6 +269,7 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithWasmFormatFailsLoud) {
     auto wasm = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-wasm","kind":"wasm"}
     })");
     ASSERT_TRUE(wasm.has_value());
@@ -281,6 +285,7 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithSpirvFormatFailsLoud) {
     auto spirv = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-spirv","kind":"spirv"}
     })");
     ASSERT_TRUE(spirv.has_value());
@@ -326,6 +331,7 @@ TEST(ObjectFormatSchemaLoader, EmptyFormatNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"","kind":"elf"}
     })");
     ASSERT_FALSE(r.has_value());
@@ -335,6 +341,7 @@ TEST(ObjectFormatSchemaLoader, WhitespaceFormatNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":" elf64 ","kind":"elf"}
     })");
     ASSERT_FALSE(r.has_value());

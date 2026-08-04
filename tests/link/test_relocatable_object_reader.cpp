@@ -999,7 +999,7 @@ TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoud) {
     ASSERT_TRUE(loaded.target && loaded.format);
     auto obj = validObject(loaded);   // a structurally valid ELF object
     auto collide = ObjectFormatSchema::loadFromText(
-        R"({"dssObjectFormatVersion":1,"dataModel":"LP64",
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "format":{"name":"elf-collide","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
@@ -1019,7 +1019,7 @@ TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
     auto obj = validObject(loaded);
     // A wasm format schema cannot parse an ELF object.
     auto wasm = ObjectFormatSchema::loadFromText(
-        R"({"dssObjectFormatVersion":1,"dataModel":"LP64",
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "format":{"name":"w","kind":"wasm"}})");
     ASSERT_TRUE(wasm.has_value());
     DiagnosticReporter rep;

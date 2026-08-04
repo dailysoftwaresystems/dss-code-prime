@@ -11,6 +11,7 @@ dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cp
 dss_add_test(NAME core/test_char_decode         SOURCES test_char_decode.cpp)
 dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
+dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
 dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)

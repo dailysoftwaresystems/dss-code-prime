@@ -66,6 +66,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -369,10 +370,29 @@ struct DSS_EXPORT MergedPredefinedMacros {
 // more than one family is FATAL (`C_ConflictingPredefinedMacro`), never
 // silently resolved. Both default to {} ⇒ output byte-identical to pre-TF-C74,
 // so every existing caller compiles and behaves unchanged.
+// D-PP-HEADER-CASE-INSENSITIVE-PE: `headerNameMatching` is the ACTIVE OBJECT
+// FORMAT's declared header-NAME case rule (`*.format.json`'s
+// `headerNameMatching`), applied by EVERY include search this pass performs —
+// the angle `#include <h>` arm, the quote arm, both `__has_include` callbacks
+// (pre-scan + authoritative), the descriptor macro-splice, and `#embed`. It is
+// a SEPARATE input from `activeFormat`: that is a format KIND, and deriving a
+// case rule from a kind would be the `if (kind == Pe)` identity branch the
+// agnosticism bar forbids. Defaults to `kDefaultHeaderNameMatching`
+// (case-SENSITIVE — the conservative POSIX rule) so the LSP / direct-API /
+// test callers behave exactly as a conforming POSIX toolchain would.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
+    // ★ REQUIRED, AND ITS POSITION IS LOAD-BEARING. It sits in the required
+    // block — ahead of every defaulted parameter — because C++ only lets a
+    // parameter be un-defaultable if nothing before it is defaulted, and a
+    // defaulted case rule is a silent choice at every call site. "The compiler
+    // enforces that every caller states its policy" is only true when there is
+    // nothing to fall back to. A caller with no active object format passes
+    // `kDefaultHeaderNameMatching` EXPLICITLY, which makes that decision
+    // greppable instead of invisible.
+    HeaderNameMatching                   headerNameMatching,
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {},

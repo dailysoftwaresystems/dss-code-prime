@@ -87,11 +87,18 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // across all 24 shipped files: that union is 27 once the 18 LP64 files
     // declare `predefinedMacros`, and the two sets are identical — no key is
     // read-but-never-declared, and none is declared-but-never-read.
-    static constexpr std::array<std::string_view, 27> kFormatDocumentKeys{
+    // RE-DERIVED again after D-PP-HEADER-CASE-INSENSITIVE-PE added the REQUIRED
+    // `headerNameMatching`: 27 keys appear in a direct `doc.contains(…)`/
+    // `doc.at(…)`, plus `relocations` through the shared substrate, = 28; all
+    // 24 shipped files declare the new key, so the two sets stay identical.
+    static constexpr std::array<std::string_view, 28> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
+        // in one direction and a wrong REJECT in the other if it typos
+        "headerNameMatching",
         // the C-visible face of those axes (TF-C97 — `__LP64__`/`_LP64`)
         "predefinedMacros",
         // output packaging + artifact vocabulary
@@ -369,6 +376,48 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   "of 'LP64', 'LLP64', 'ILP32'", s));
         } else {
             data.dataModel = *dm;
+        }
+    }
+
+    // ── D-PP-HEADER-CASE-INSENSITIVE-PE: `headerNameMatching` — REQUIRED
+    //    on EVERY format ──────────────────────────────────────────────
+    //
+    // How an `#include` header NAME is matched against the filesystem
+    // ("case-sensitive" / "case-insensitive"). Closed enum + REQUIRED,
+    // for the SAME reason `dataModel` is: the alternative to declaring
+    // it is letting the BUILD HOST's filesystem answer a TARGET
+    // question. MEASURED before this axis existed, on one Linux host
+    // with one binary and only the filesystem varied: `<Windows.h>` was
+    // rejected for a pe64 target on ext4 and accepted through /mnt/c,
+    // and `<Stdio.h>` compiled CLEAN for an elf target on Windows.
+    //
+    // ★ Required rather than optional-with-default ON PURPOSE. A
+    // default would be silent, and the silence would land on exactly
+    // the files most likely to be added later: a new pe or macho
+    // format that forgot the key would resolve case-SENSITIVELY and
+    // reject `<Windows.h>` again, with nothing in the tree to say why.
+    // Making a new format file fail at LOAD is what removes that.
+    if (!doc.contains("headerNameMatching")) {
+        coll.emit(DiagnosticCode::C_MissingField, "/headerNameMatching",
+                  "missing required 'headerNameMatching' — every object "
+                  "format must declare how an `#include` header NAME is "
+                  "matched ('case-sensitive' or 'case-insensitive'); a "
+                  "silent default would let the build HOST's filesystem "
+                  "decide a TARGET question");
+    } else if (!doc.at("headerNameMatching").is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/headerNameMatching",
+                  "'headerNameMatching' must be a string ('case-sensitive' "
+                  "or 'case-insensitive')");
+    } else {
+        auto const s = doc.at("headerNameMatching").get<std::string>();
+        auto const hm = headerNameMatchingFromName(s);
+        if (!hm) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/headerNameMatching",
+                      std::format("unknown headerNameMatching '{}' — expected "
+                                  "one of 'case-sensitive', 'case-insensitive'",
+                                  s));
+        } else {
+            data.headerNameMatching = *hm;
         }
     }
 

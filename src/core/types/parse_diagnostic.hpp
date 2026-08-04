@@ -2693,6 +2693,23 @@ enum class DiagnosticCode : std::uint16_t {
     //   exists there. Member of `kUnsuppressableCodes` (a silent-loader-death
     //   guard). (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS, 2026-07-30.)
     F_ShippedSymbolUnavailableForTarget = 0x5024,
+    // F_HeaderNameCaseAmbiguous: an `#include` header name matched MORE THAN
+    //   ONE distinct file under the active object format's declared
+    //   case-INSENSITIVE header-name convention
+    //   (`headerNameMatching: "case-insensitive"` — pe / macho). Example: a
+    //   `-I` directory (or a shipped descriptor directory) holding BOTH
+    //   `foo.json` and `Foo.json`, reached by `#include <Foo.h>`.
+    //   Fail-loud, and deliberately NOT resolved by preferring the exact
+    //   spelling: such a directory CANNOT EXIST on NTFS or on a default
+    //   APFS/HFS+ volume, so any pick made here would resolve differently
+    //   depending on which host ran the build — reintroducing exactly the
+    //   host-dependence `headerNameMatching` exists to remove, one layer
+    //   down. The message names every colliding path. Remediation: rename so
+    //   the two names differ by more than ASCII case (a case-only pair cannot
+    //   be checked out on Windows or default macOS at all). Member of
+    //   `kUnsuppressableCodes` — suppressing it would restore the silent
+    //   host-dependent pick. (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04.)
+    F_HeaderNameCaseAmbiguous      = 0x5025,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

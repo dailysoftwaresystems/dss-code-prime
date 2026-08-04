@@ -1059,6 +1059,7 @@ namespace {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib","kind":"macho"},
       )";
     s += extraTopLevel;
@@ -1136,6 +1137,7 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exec-badid","kind":"macho"},
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": { "pageZeroSize": 4294967296, "segmentPageSize": 16384, "dylinkerPath": "/usr/lib/dyld", "installName": "@rpath/x.dylib", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -1150,6 +1152,7 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib-noid","kind":"macho"},
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "dylib", "flags": 1048709 },
       "image": { "segmentPageSize": 16384, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },

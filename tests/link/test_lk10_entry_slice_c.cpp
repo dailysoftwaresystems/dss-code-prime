@@ -125,6 +125,7 @@ makeSyscallElfExecFormat() {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-x64", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
@@ -155,6 +156,7 @@ makeSyscallElfExecFormatArm64() {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-arm64", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "externCallDispatch": "direct-plt",

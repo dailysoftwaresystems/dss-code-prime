@@ -26,10 +26,11 @@
 //     is additionally a MANIFEST defect, and it is caught host-independently by
 //     `lintDeclaredEmulators` below rather than by reddening the host that
 //     happens to notice it.
-//   * ENVIRONMENTAL (`SkippedEmulatorMissing`) — the manifest asked for a run
-//     and the machine could not supply it. A developer without qemu must still
-//     get a usable green suite, so the DEFAULT is a visible warning; the gate
-//     opts in to `DSS_STRICT_ARM_VERDICTS=1` and the same skip becomes a RED.
+//   * ENVIRONMENTAL (`SkippedEmulatorMissing`, `SkippedBuildInputMissing`) —
+//     the manifest asked for something and the machine could not supply it. A
+//     developer without qemu must still get a usable green suite, so the
+//     DEFAULT is a visible warning; the gate opts in to
+//     `DSS_STRICT_ARM_VERDICTS=1` and the same skip becomes a RED.
 //   * HARNESS     (`NotSelectedByRunner`) — the CLI-subprocess runner binds only
 //     the FIRST target whose `runOn` matches the host
 //     (D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET), so later matching targets
@@ -148,8 +149,21 @@ enum class ArmVerdict {
     // STRUCTURAL skips — manifest + host decide these; the machine cannot.
     SkippedByRunOn,             // the manifest's `runOn` excludes this host OS
     SkippedNoEmulatorDeclared,  // cross-arch arm with no `emulator` key
-    // ENVIRONMENTAL skip — depends on the machine, not the manifest.
+    // ENVIRONMENTAL skips — depend on the machine, not the manifest.
     SkippedEmulatorMissing,     // `emulator` declared but not found on PATH
+    SkippedBuildInputMissing,   // a DECLARED BUILD input is absent from this
+                                // machine — the sqlite harness's resolve-library
+                                // binaries (tcl86.dll for the pe64 leg, libtcl
+                                // .so for an elf leg, …) or a leg's target C
+                                // compiler. D-HARNESS-CROSS-HOST-ANY-TARGET: the
+                                // BUILD of a declared leg is attempted on every
+                                // host, so "this box has no copy of the target's
+                                // tcl runtime" needed a name of its own. It is
+                                // NOT `Poisoned` (nothing was miscompiled) and
+                                // NOT structural (another machine, same
+                                // manifest, builds it fine) — it is the build
+                                // twin of SkippedEmulatorMissing, and strict
+                                // mode promotes both for the same reason.
     // HARNESS limitation — see D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET.
     NotSelectedByRunner,        // runOn matched, but another target was bound first
     // FAILURE — every assertion has already fired at the recording site.
@@ -177,6 +191,7 @@ inline constexpr ArmVerdict kAllArmVerdicts[] = {
     ArmVerdict::SkippedByRunOn,
     ArmVerdict::SkippedNoEmulatorDeclared,
     ArmVerdict::SkippedEmulatorMissing,
+    ArmVerdict::SkippedBuildInputMissing,
     ArmVerdict::NotSelectedByRunner,
     ArmVerdict::Poisoned,
 };
@@ -201,6 +216,7 @@ static_assert(std::size(kAllArmVerdicts) == kArmVerdictCount,
         case ArmVerdict::SkippedByRunOn:            return "skipped-by-runOn";
         case ArmVerdict::SkippedNoEmulatorDeclared: return "skipped-no-emulator-declared";
         case ArmVerdict::SkippedEmulatorMissing:    return "skipped-emulator-missing";
+        case ArmVerdict::SkippedBuildInputMissing:  return "skipped-build-input-missing";
         case ArmVerdict::NotSelectedByRunner:       return "not-selected-by-runner";
         case ArmVerdict::Poisoned:                  return "poisoned";
         case ArmVerdict::kCount_:                   return "invalid-sentinel";
@@ -242,6 +258,7 @@ enum class ArmVerdictClass {
         case ArmVerdict::SkippedNoEmulatorDeclared:
             return ArmVerdictClass::StructuralSkip;
         case ArmVerdict::SkippedEmulatorMissing:
+        case ArmVerdict::SkippedBuildInputMissing:
             return ArmVerdictClass::EnvironmentalSkip;
         case ArmVerdict::NotSelectedByRunner:
             return ArmVerdictClass::HarnessSkip;
@@ -391,7 +408,8 @@ public:
           << count(ArmVerdict::SkippedByRunOn) << " by-runOn, "
           << count(ArmVerdict::SkippedNoEmulatorDeclared) << " no-emulator-declared"
           << "; environmental: "
-          << count(ArmVerdict::SkippedEmulatorMissing) << " emulator-missing"
+          << count(ArmVerdict::SkippedEmulatorMissing) << " emulator-missing, "
+          << count(ArmVerdict::SkippedBuildInputMissing) << " build-input-missing"
           << "; harness: "
           << count(ArmVerdict::NotSelectedByRunner) << " not-selected], "
           << count(ArmVerdict::Poisoned) << " poisoned"

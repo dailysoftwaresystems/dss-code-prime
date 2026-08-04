@@ -1,0 +1,131 @@
+{
+  "$comment": "THE SQLITE HARNESS LEG CATALOGUE — the declared, HOST-FREE answer to 'which targets does this harness build?'. D-HARNESS-CROSS-HOST-ANY-TARGET item (2). ★ THE RULE THIS FILE EXISTS TO ENFORCE: the set of legs is a property of the HARNESS, not of the machine running it. Read this file on Windows, on Linux, on an arm64 VPS or on a Mac and you get the SAME five legs. What the host changes is ONLY whether it can EXECUTE a leg's artifact — a separate question, answered by `runOn` + `launchers` below and never by an `if host == ...` in a driver. Before this file existed, build-and-test.sh derived its leg list from `uname` (pe64 was unreachable from any host, macho only from a Mac) and build-and-test.ps1 refused to start unless $IsWindows (pe64 was its ONLY leg, hardcoded). Each driver therefore conflated HOST with TARGET, which is the opposite of the user's hard requirement: 'build ANY target inside ANY host, this MUST work.'",
+
+  "$vocabularyComment": "The declaration vocabulary is the CORPUS's, not a new one: `spec` and `runOn` mean exactly what they mean in examples/**/expected.json, and the verdicts a driver records for a leg come from the closed 7+1-name set in tests/test_support/arm_verdict_ledger.hpp (pinned by tests/harness/test_sqlite_harness_legs.cpp, which compares this catalogue's resolver output against that C++ enum). `launchers` is the ONE strict extension: the corpus's `emulator` key covers a cross-ARCH host on the SAME OS, and this harness additionally needs the cross-OS case (a pe64 artifact under Wine on Linux), so both are expressed as one ordered list of declared launchers keyed by (hostOs, hostArch). Absence of a matching launcher entry IS the 'none declared' declaration — there is no empty-string spelling, so a reader cannot mistake 'we looked and there is none' for 'nobody filled this in'.",
+
+  "$noHostKeyingComment": "NOTHING in this file may be keyed on the host. `build.libraries.searchPaths` is the one place host-shaped STRINGS appear, and they are CANDIDATES, not decisions: every path is tried on every host, a hit is used and a miss costs nothing. A driver that skips a search path because of the host it is on has reintroduced the defect. ⚠ If you are tempted to add a `\"onlyOnHost\"` key here, stop: the question you are answering is either 'can this host EXECUTE it' (that is `runOn`/`launchers`) or 'is a declared build input present' (that is a filesystem probe whose failure is the LOUD `skipped-build-input-missing` verdict) — never 'is this leg allowed to exist'.",
+
+  "dssHarnessLegsVersion": 1,
+
+  "legs": [
+    {
+      "label": "elf64-x86_64",
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "runOn": ["linux"],
+      "$launchersComment": "qemu-x86_64 lets an arm64 Linux host run this leg. ★ NOTE THE ASYMMETRY WITH THE CORPUS, which is a finding and not a copy error: examples/**/expected.json declares NO emulator on its (x86_64, linux) arms, so on the native arm64 Linux VPS every one of them is a structural skip even though qemu-x86_64 exists. This catalogue declares it; the corpus's omission is tracked separately (D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST).",
+      "launchers": [
+        { "hostOs": "linux", "hostArch": "arm64", "command": ["qemu-x86_64"],
+          "env": { "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu" } }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-shared", "-fPIC"],
+        "targetCc": { "candidates": ["cc", "gcc", "clang"], "package": "" },
+        "libraries": {
+          "provider": "host-system",
+          "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0", "libtcl9.0.so", "libtcl.so"],
+          "zNames": ["libz.so", "libz.so.1"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "elf64-arm64",
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "runOn": ["linux"],
+      "launchers": [
+        { "hostOs": "linux", "hostArch": "x86_64", "command": ["qemu-aarch64"],
+          "env": { "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu" } }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-shared", "-fPIC"],
+        "targetCc": { "candidates": ["aarch64-linux-gnu-gcc"], "package": "gcc-aarch64-linux-gnu" },
+        "libraries": {
+          "provider": "ubuntu-ports-arm64",
+          "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0"],
+          "zNames": ["libz.so.1", "libz.so"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "pe64-x86_64",
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "runOn": ["windows"],
+      "$launchersComment": "Wine is the declared cross-OS launcher. It is a DECLARATION, not a claim that it is installed: a host without it records `skipped-emulator-missing` (environmental, loud, promotable to a hard failure) rather than vanishing. No launcher is declared for a non-x86_64 host: Wine alone does not emulate the ISA.",
+      "launchers": [
+        { "hostOs": "linux",  "hostArch": "x86_64", "command": ["wine"], "env": {} },
+        { "hostOs": "darwin", "hostArch": "x86_64", "command": ["wine"], "env": {} }
+      ],
+      "build": {
+        "$recipeTransformComment": "The recipe is derived from a POSIX `make -n`, so it carries that build host's configure/zlib feature probes (HAVE_*/Z_HAVE_*/_HAVE_SQLITE_CONFIG_H) — facts about the DERIVING host, never about this target. `windows-selfconfig` drops them and adds SQLITE_OS_WIN=1 so SQLite self-configures its Windows build. Keyed on THIS LEG, which is why the rule moved out of gen-pe64-manifest.py's prose ('this generator is pe-only, so keying the rule on the pe target is inherent here') into a declaration any driver can read.",
+        "recipeTransform": "windows-selfconfig",
+        "$stackReserveComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — Windows defaults a process to 1 MiB; e_fkey-63.1.x recurses to SQLITE_MAX_TRIGGER_DEPTH and overflows it (a NATIVE gcc build overflows too). 8 MiB = what Linux hands the process for free.",
+        "stackReserveBytes": 8388608,
+        "sharedLibFlags": ["-shared"],
+        "targetCc": { "candidates": ["x86_64-w64-mingw32-gcc", "gcc"], "package": "gcc-mingw-w64-x86-64" },
+        "$librariesComment": "pe64 --resolve-library reads a DLL's EXPORT table (.edata), so these must be real DLLs, not import .libs. A DLL is just a FILE: DSS reads a PE export table on any host, so a Linux or macOS box that HAS these files can build this leg. The search paths are candidates on every host (see $noHostKeyingComment).",
+        "libraries": {
+          "provider": "search-paths",
+          "tclNames": ["tcl86.dll", "tcl90.dll"],
+          "zNames": ["zlib1.dll"],
+          "searchPaths": [
+            "${env:DSS_PE_LIBDIR}",
+            "C:/Program Files/Git/mingw64/bin",
+            "C:/msys64/mingw64/bin",
+            "${env:HOME}/.cache/dss-code-prime/pe64libs",
+            "${env:USERPROFILE}/.cache/dss-code-prime/pe64libs",
+            "/mnt/c/Program Files/Git/mingw64/bin"
+          ]
+        }
+      }
+    },
+
+    {
+      "label": "macho64-arm64",
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "$launchersComment": "EMPTY, and the emptiness is the hardest-won fact in this file: there is NO off-Mac emulator for a Darwin arm64 executable. Unlike pe-under-Wine or aarch64-under-qemu, the only way to observe this artifact RUN is a real Mac — which is exactly why TF-C113 proved it by BUILDING it on a Windows host and shipping the binary to one. So this leg's build is attempted everywhere and its run is a structural skip everywhere but Darwin/arm64. Do not invent a launcher here.",
+      "runOn": ["darwin"],
+      "launchers": [],
+      "build": {
+        "recipeTransform": "none",
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-dynamiclib"],
+        "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "libraries": {
+          "provider": "host-system",
+          "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
+          "zNames": ["libz.dylib", "libz.1.dylib"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "macho64-x86_64",
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "$launchersComment": "Rosetta 2 runs an x86_64 Mach-O on Apple Silicon TRANSPARENTLY, i.e. with no launcher command — but this harness will not model that as 'native', because it is not: it depends on a translation layer that may be absent. `arch -x86_64` is the declared, observable launcher; `arch` is present on every Mac, so a Rosetta-less machine fails at RUN time with a real error instead of a silent pass.",
+      "runOn": ["darwin"],
+      "launchers": [
+        { "hostOs": "darwin", "hostArch": "arm64", "command": ["arch", "-x86_64"], "env": {} }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-dynamiclib"],
+        "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "libraries": {
+          "provider": "host-system",
+          "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
+          "zNames": ["libz.dylib", "libz.1.dylib"],
+          "searchPaths": []
+        }
+      }
+    }
+  ]
+}

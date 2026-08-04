@@ -68,7 +68,15 @@ TMPPROV=$(mktemp /tmp/confprov_XXXXXX)
 PROVTMP=$(mktemp -d /tmp/confprovd_XXXXXX)
 trap 'rm -f "$TMPRUN" "$TMPPROV"; rm -rf "$PROVTMP"' EXIT
 
-declare -A LEG_PREFIX=( [host]="" [arm64]="qemu-aarch64" )
+# The classifier's ONE input for confound scoping: the leg's RUN MODE, as the
+# host-independent leg resolver (harness_legs.py) reports it — `native` when this
+# host executes the artifact directly, `launched` when it goes through a declared
+# launcher (qemu for a cross-arch host, Wine for a cross-OS one). This used to be
+# `LEG_PREFIX` (the runner-prefix string the driver maintained by hand); the driver
+# now reads the resolver's own answer, so the fixture must speak the same word or
+# the extracted block would evaluate an unset array under `set -u`.
+# The leg LABELS are the shipped catalogue's (legs.json), not invented here.
+declare -A LEG_RUN_MODE=( [elf64-x86_64]="native" [elf64-arm64]="launched" )
 # Real declared prefixes from permutations.test: the dotted default AND the `mmap`
 # override "mm-" (a DASH, not derivable from the suite name).
 declare -a TIER_PREFIXES=(no_mutex_try. memsubsys1. memsubsys2. mm-)
@@ -79,7 +87,7 @@ classify() {
     echo 'warn() { echo "      WARN: $*"; }'
     printf 'leg=%q\n' "$1"
     printf 'faillist=%q\n' "$2"
-    declare -p LEG_PREFIX
+    declare -p LEG_RUN_MODE
     declare -p TIER_PREFIXES
     declare -p CONFOUND_PATTERNS
     printf '%s\n' "$BLOCK"
@@ -127,21 +135,21 @@ check_eq() { # <label> <expected-EXACT> <actual>
   else echo "  FAIL $1"; echo "       want exactly: [$2]"; echo "       got         : [$3]"; fail=$((fail+1)); fi
 }
 
-echo "--- emulated leg (arm64: runner prefix set) ---"
-A=$(classify arm64 "$fails"); echo "$A" | sed 's/^/      /'
+echo "--- LAUNCHED leg (elf64-arm64: runs through a declared launcher) ---"
+A=$(classify elf64-arm64 "$fails"); echo "$A" | sed 's/^/      /'
 check "writecrash EXCUSED on emulated"        "CONFOUND=[writecrash-1.1.1" "$A"
 check "writecrash NAMED as scope-excused"     "SCOPED=[writecrash-1.1.1]"  "$A"
 check "genuine failure still REAL"            "REAL=[sometest-9.9]"        "$A"
 
-echo "--- native leg (host: no runner prefix) ---"
-B=$(classify host "$fails"); echo "$B" | sed 's/^/      /'
+echo "--- NATIVE leg (elf64-x86_64: this host executes it directly) ---"
+B=$(classify elf64-x86_64 "$fails"); echo "$B" | sed 's/^/      /'
 check "writecrash NOT excused on native"      "REAL=[writecrash-1.1.1 sometest-9.9]" "$B"
 check "no scope excusals on native"           "SCOPED=[]"                            "$B"
 check "bare patterns still excuse on native"  "CONFOUND=[walsetlk-2.1.3 zipfile-25.0]" "$B"
 
 echo "--- RED-ON-DISABLE: drop the scope prefix -> it must leak onto native ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$' '^recoverfault' '^writecrash-')
-C=$(classify host "$fails")
+C=$(classify elf64-x86_64 "$fails")
 if [[ "$C" == *"CONFOUND=[writecrash-1.1.1"* ]]; then
   echo "  ok   unscoped pattern DOES leak onto native (so the scope is what prevents it)"; pass=$((pass+1))
 else
@@ -151,7 +159,7 @@ fi
 echo "--- PERMUTATION-QUALIFIED names (the \`all\` tier) ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
 qual='memsubsys1.walsetlk-2.2.6 no_mutex_try.busy2-2.2.3 memsubsys2.recoverfault-1-oom-persistent.515 memsubsys1.zipfile-25.0 no_mutex_try.walsetlk_recover-1.2 memsubsys2.realbug-1.1'
-D=$(classify host "$qual"); echo "$D" | sed 's/^/      /'
+D=$(classify elf64-x86_64 "$qual"); echo "$D" | sed 's/^/      /'
 dconf="$(echo "$D" | sed 's/.*CONFOUND=\[//;s/\].*//')"
 dreal="$(echo "$D" | sed 's/.*REAL=\[//;s/\].*//')"
 check "qualified walsetlk excused"             "memsubsys1.walsetlk-2.2.6"                    "$dconf"
@@ -167,7 +175,7 @@ check "a genuine failure stays REAL"           "memsubsys2.realbug-1.1"         
 
 echo "--- walsetlk_recover WITH its own row ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^walsetlk_recover-' '^recoverfault')
-W=$(classify host 'no_mutex_try.walsetlk_recover-1.2 walsetlk_recover-1.3.(36244809) memsubsys2.realbug-1.1')
+W=$(classify elf64-x86_64 'no_mutex_try.walsetlk_recover-1.2 walsetlk_recover-1.3.(36244809) memsubsys2.realbug-1.1')
 wconf="$(echo "$W" | sed 's/.*CONFOUND=\[//;s/\].*//')"
 wreal="$(echo "$W" | sed 's/.*REAL=\[//;s/\].*//')"
 check "excused by its OWN row"        "walsetlk_recover-1.2"    "$wconf"
@@ -176,7 +184,7 @@ check "an unrelated failure REAL"     "memsubsys2.realbug-1.1"  "$wreal"
 
 echo "--- mm- prefixed names (what the pe64 all tier emits) ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^zipfile-25\.0$')
-G=$(classify host 'mm-zipfile-25.0 mm-walsetlk-2.1.3 mm-backup4-3.3')
+G=$(classify elf64-x86_64 'mm-zipfile-25.0 mm-walsetlk-2.1.3 mm-backup4-3.3')
 gconf="$(echo "$G" | sed 's/.*CONFOUND=\[//;s/\].*//')"
 greal="$(echo "$G" | sed 's/.*REAL=\[//;s/\].*//')"
 check "mm- zipfile excused"            "mm-zipfile-25.0"   "$gconf"
@@ -186,7 +194,7 @@ check "mm- backup4 (no pattern) REAL"  "mm-backup4-3.3"    "$greal"
 echo "--- RED-ON-DISABLE: with NO prefixes known, qualified names go unmatched ---"
 CONFOUND_PATTERNS=('^walsetlk-' '^busy2-' '^zipfile-25\.0$' '^recoverfault')
 TIER_PREFIXES=()
-E=$(classify host "$qual")
+E=$(classify elf64-x86_64 "$qual")
 if [[ "$E" == *"REAL=[memsubsys1.walsetlk-2.2.6"* ]]; then
   echo "  ok   without TIER_PREFIXES the qualified confounds ARE misreported as genuine"
   pass=$((pass+1))

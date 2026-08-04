@@ -5,6 +5,7 @@
 #include "core/types/aggregate_layout.hpp"    // BitFieldStrategy (D-CSUBSET-BITFIELD-ABI-EXACT — the per-ABI bit-field rule, FORMAT-determined)
 #include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
+#include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE — the per-OS `#include` case rule)
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
 #include "core/types/preprocess_config.hpp"   // PredefinedMacroDef (TF-C97 — the format's data-model predefines)
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
@@ -775,6 +776,24 @@ struct DSS_EXPORT ObjectFormatData {
     // validate() (the loader path always sets it or fails).
     DataModel            dataModel{};
 
+    // ── D-PP-HEADER-CASE-INSENSITIVE-PE: the `#include` header-NAME case rule ──
+    //
+    // REQUIRED top-level `"headerNameMatching"` field ("case-sensitive" /
+    // "case-insensitive"; closed enum, loader fails loud on missing OR
+    // unknown). Like `dataModel` it is an OS property carried by the FORMAT
+    // (one x86_64 CPU target serves pe64-windows's case-insensitive rule AND
+    // elf64-linux's case-sensitive one), and like `dataModel` it is REQUIRED
+    // rather than optional-with-default: an optional key would let a future
+    // pe/macho format file silently regress to case-sensitive matching, which
+    // is the whole failure class the axis closes.
+    //
+    // Consumed by `core/types/include_path_resolve.hpp`, which does the ASCII
+    // folding ITSELF rather than letting `fs::exists` (i.e. the BUILD HOST's
+    // filesystem) decide a case question. The zero default is the INVALID
+    // sentinel: a hand-built ObjectFormatData that never set it is rejected by
+    // validate() (the loader path always sets it or fails).
+    HeaderNameMatching   headerNameMatching{};
+
     // ── D-CSUBSET-BITFIELD-ABI-EXACT: the per-ABI bit-field PACKING strategy ──
     //
     // C bit-field allocation is genuinely ABI-defined and is determined by the
@@ -1168,6 +1187,15 @@ public:
     // Always a valid member for a loader-produced schema (the field is
     // REQUIRED + closed-enum at load).
     [[nodiscard]] DataModel            dataModel() const noexcept { return d_.dataModel; }
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: how an `#include` header NAME is matched
+    // against the filesystem for THIS format ("case-sensitive" / "case-
+    // insensitive"). Always a valid member for a loader-produced schema (the
+    // field is REQUIRED + closed-enum at load). Threaded by the driver into the
+    // CU build key, and from there to every include resolver, so `#include` and
+    // `__has_include` answer the TARGET's convention on any build host.
+    [[nodiscard]] HeaderNameMatching   headerNameMatching() const noexcept {
+        return d_.headerNameMatching;
+    }
     // D-CSUBSET-BITFIELD-ABI-EXACT: the format's declared bit-field strategy, or
     // `None` if it declared none (the caller falls back to the target's value via
     // `effectiveBitFieldStrategy`). Read by the driver when resolving the

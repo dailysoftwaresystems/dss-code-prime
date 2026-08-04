@@ -95,6 +95,7 @@ add_subdirectory(ffi)
 add_subdirectory(program)
 add_subdirectory(lsp)
 add_subdirectory(examples)
+add_subdirectory(harness)
 
 # ── TF-C91 (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE) — the ORDER arm ──
 #

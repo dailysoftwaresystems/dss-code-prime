@@ -85,6 +85,7 @@ namespace {
 constexpr std::string_view kElfMinimal = R"({
   "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
   "format": {
     "name": "elf64-x86_64-linux",
     "version": "1.0",
@@ -137,7 +138,7 @@ TEST(ObjectFormatSchemaLoader, WrongVersionRejected) {
 TEST(ObjectFormatSchemaLoader, UnknownKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,
-  "dataModel": "LP64","format":{"name":"x","kind":"notafmt"}})");
+  "dataModel": "LP64","headerNameMatching": "case-sensitive","format":{"name":"x","kind":"notafmt"}})");
     ASSERT_FALSE(r.has_value());
 }
 
@@ -246,6 +247,7 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     auto ok = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "got",
@@ -262,6 +264,7 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     auto bad = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "plt",
@@ -275,6 +278,7 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "relocations":[
         {"name":"R_FOO","kind":1},
@@ -288,6 +292,7 @@ TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "relocations":[{"name":"R_BAD","kind":0}]
     })");
@@ -298,6 +303,7 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "relocations":[
         {"name":"R_A","kind":7},
@@ -322,6 +328,7 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
       "relocations":[]
     })");
@@ -354,6 +361,7 @@ TEST(ObjectFormatSchemaLoader, SentinelKindDoesNotCascadeIntoIdentityBlockNoise)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
       "elf": {"machine": 183, "type": "exec"},
       "relocations":[]
@@ -369,6 +377,7 @@ TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "relocations": "oops"
     })");
@@ -679,6 +688,7 @@ TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "processExit": {
@@ -697,6 +707,7 @@ TEST(LK10EntrySliceB, EntryCcWithoutProcessExitRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64"
@@ -710,6 +721,7 @@ TEST(LK10EntrySliceB, UnknownMechanismRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -724,6 +736,7 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -741,6 +754,7 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -757,6 +771,7 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -780,6 +795,7 @@ TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -794,6 +810,7 @@ TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -808,6 +825,7 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -825,6 +843,7 @@ TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -843,6 +862,7 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -861,6 +881,7 @@ TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
@@ -882,6 +903,7 @@ TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": " sysv_amd64",
@@ -902,6 +924,7 @@ TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
       "processExit": { "mechanism": "syscall" }
     })", "WASM format must reject `processExit` — no trampoline "
@@ -993,6 +1016,7 @@ TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1011,6 +1035,7 @@ TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1029,6 +1054,7 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1048,6 +1074,7 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1068,6 +1095,7 @@ TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1091,6 +1119,7 @@ TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "elf": {
@@ -1114,6 +1143,7 @@ TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
@@ -1135,6 +1165,7 @@ TEST(ProcessArgsSubstrate, WasmFormatRejectsProcessArgs) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0,
@@ -1164,6 +1195,7 @@ std::string elfWithArtifactProfiles(std::string_view profilesArrayJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "artifactProfiles": )"} + std::string{profilesArrayJson} + R"(
@@ -1189,6 +1221,7 @@ TEST(ObjectFormatArtifactProfiles, AbsentIsEmptyServesNothing) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62}
     })");
@@ -1290,6 +1323,11 @@ TEST(StaticLibraryFormats, AllFiveShippedStaticLibFormatsLoadValidateAndAreArchi
 // (relocatable, accepted) — the guard fires on the former and not the latter.
 TEST(StaticLibraryFormats, ArchiveContainerRejectedOnImageFlavor) {
     dss::detail::ObjectFormatData data;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: like `dataModel`, the header-name case
+    // rule is REQUIRED and its zero value is the INVALID sentinel, so a
+    // hand-built ObjectFormatData must set it or `validate()` reports it (which
+    // is the point — see HeaderNameMatchingIsRequired).
+    data.headerNameMatching = HeaderNameMatching::CaseSensitive;
     data.name             = "synth-staticlib";
     data.kind             = ObjectFormatKind::Elf;
     data.dataModel        = DataModel::Lp64;
@@ -1337,6 +1375,7 @@ TEST(StaticLibraryFormats, UnknownContainerSpellingFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "container": "bogus"
@@ -1379,6 +1418,7 @@ std::string peWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
       "pe": {"machine": 34404},
       "stackReserveControl": )"} + std::string{blockJson} + R"(
@@ -1389,6 +1429,7 @@ std::string elfWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","version":"1.0","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "stackReserveControl": )"} + std::string{blockJson} + R"(
@@ -1518,6 +1559,7 @@ TEST(StackReserveControl, ValidBlockLoadsAndIsExposedVerbatim) {
     auto none = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
       "pe": {"machine": 34404}
     })");
@@ -1685,6 +1727,7 @@ TEST(StackReserveControl, WasmSchemaRejectsTheWholeBlock) {
     expectRejectedAt(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "ILP32",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-wasm","version":"0.1","kind":"wasm"},
       "stackReserveControl": {
         "vehicle": "pe-optional-header",
@@ -2041,4 +2084,126 @@ TEST(FormatPredefinedMacros, ShippedPopulationFollowsDataModelNotFormatName) {
     // shows up here rather than passing vacuously.
     EXPECT_EQ(lp64Seen, 18u);
     EXPECT_EQ(otherSeen, 6u);
+}
+
+// ── D-PP-HEADER-CASE-INSENSITIVE-PE: `headerNameMatching` ────────────────────
+//
+// The header-NAME case rule is a REQUIRED, closed-enum root key. Required
+// rather than optional-with-default is the load-bearing part: an optional key
+// would let a future pe/macho format file silently regress to case-sensitive
+// matching and reject `<Windows.h>` again with nothing in the tree to say why.
+// A new format file that omits it must fail at LOAD, and these pin that.
+
+namespace {
+// The minimal ELF document these pins vary ONE key of, so every rejection is
+// attributable to that key and not to a missing sibling.
+[[nodiscard]] std::string headerCaseFormatJson(std::string_view matchingLine) {
+    return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      )"} + std::string{matchingLine} + R"(
+      "format": { "name": "hnm-stub", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 }
+    })";
+}
+} // namespace
+
+TEST(ObjectFormatSchemaLoader, HeaderNameMatchingIsRequired) {
+    // The CONTROL: identical document WITH the key loads clean, so the
+    // rejection below is attributable to the omission alone.
+    auto ok = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-sensitive",)"));
+    ASSERT_TRUE(ok.has_value());
+
+    auto missing = ObjectFormatSchema::loadFromText(headerCaseFormatJson(""));
+    ASSERT_FALSE(missing.has_value())
+        << "a format file that omits headerNameMatching must fail at LOAD — a "
+           "silent default is how a new pe/macho file would regress to "
+           "case-sensitive matching unnoticed";
+    bool sawMissingField = false;
+    for (auto const& d : missing.error()) {
+        if (d.code == DiagnosticCode::C_MissingField
+            && d.path == "/headerNameMatching") sawMissingField = true;
+    }
+    EXPECT_TRUE(sawMissingField)
+        << "the rejection must NAME the missing key, not just fail";
+}
+
+TEST(ObjectFormatSchemaLoader, HeaderNameMatchingIsAClosedVocabulary) {
+    // Both legal spellings parse and are EXPOSED (parsed, not merely accepted).
+    auto cs = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-sensitive",)"));
+    ASSERT_TRUE(cs.has_value());
+    EXPECT_EQ((*cs)->headerNameMatching(), HeaderNameMatching::CaseSensitive);
+
+    auto ci = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-insensitive",)"));
+    ASSERT_TRUE(ci.has_value());
+    EXPECT_EQ((*ci)->headerNameMatching(), HeaderNameMatching::CaseInsensitive);
+
+    // A typo'd VALUE fails LOUD — never a silent degrade to one of the two.
+    for (char const* bad : {R"("headerNameMatching": "caseinsensitive",)",
+                            R"("headerNameMatching": "insensitive",)",
+                            R"("headerNameMatching": "Case-Insensitive",)",
+                            R"("headerNameMatching": true,)"}) {
+        EXPECT_FALSE(ObjectFormatSchema::loadFromText(headerCaseFormatJson(bad))
+                         .has_value())
+            << "unknown headerNameMatching value must fail loud: " << bad;
+    }
+    // A typo'd KEY is caught by the closed root-key vocabulary, not ignored.
+    EXPECT_FALSE(
+        ObjectFormatSchema::loadFromText(
+            headerCaseFormatJson(R"("headerNameMatchng": "case-sensitive",)"))
+            .has_value());
+}
+
+// Every shipped format declares the key, and its value matches the platform's
+// real filesystem convention. This is a CONFIG pin, deliberately expressed as a
+// table here rather than as engine logic — the engine must never derive the
+// rule from the format kind (that would be the identity branch the agnosticism
+// bar forbids), so the only place the kind↔rule correspondence may be written
+// down is a test that reads the shipped files.
+TEST(ObjectFormatSchemaLoader, EveryShippedFormatDeclaresHeaderNameMatching) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed");
+
+    std::size_t insensitive = 0, sensitive = 0;
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        auto const m = (*r)->headerNameMatching();
+        ASSERT_NE(m, HeaderNameMatching::Invalid) << name;
+        switch ((*r)->kind()) {
+            case ObjectFormatKind::Pe:
+            case ObjectFormatKind::MachO:
+                EXPECT_EQ(m, HeaderNameMatching::CaseInsensitive)
+                    << name << ": Windows (NTFS) and default macOS (APFS/HFS+) "
+                               "fold header names, and their SDKs rely on it";
+                ++insensitive;
+                break;
+            default:
+                EXPECT_EQ(m, HeaderNameMatching::CaseSensitive)
+                    << name << ": POSIX matches byte-exact; the declared-only "
+                               "skeletons take the conservative value";
+                ++sensitive;
+                break;
+        }
+    }
+    // 4 pe + 8 macho fold; 10 elf + spirv + wasm32 do not. Pinned so a file
+    // added or dropped without a decision shows up here rather than vacuously.
+    EXPECT_EQ(insensitive, 12u);
+    EXPECT_EQ(sensitive, 12u);
 }

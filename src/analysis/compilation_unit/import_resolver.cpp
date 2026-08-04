@@ -1,5 +1,6 @@
 #include "analysis/compilation_unit/import_resolver.hpp"
 
+#include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -286,6 +287,27 @@ private:
                 // Miss handler: SYSTEM includes hard-fail (a missing
                 // shipped header is fatal in C); LOCAL includes soft-fail
                 // (D_UnresolvedImport Warning).
+                // D-PP-HEADER-CASE-INSENSITIVE-PE: a fold COLLISION is a
+                // separate, unsuppressable failure from a miss — the tree holds
+                // two files whose names differ only by ASCII case, so any pick
+                // would depend on which host ran the build. Never degraded to
+                // `unresolved()`: that would report a typo for a real tree
+                // defect and, worse, would let a `--suppress`ed miss hide it.
+                //
+                // ⚠ REACHABILITY, stated because the first cut of this change
+                // relied on the opposite: for the ANGLE form this fires for a
+                // real C compile, but for the QUOTE form it is DEAD whenever the
+                // language has a preprocessor — the directive walk above does
+                // `if (ppEnabled) return;` on every quote include, and C is the
+                // only language with a preprocessor today. The quote arm below
+                // is kept because it is correct and becomes live the moment a
+                // preprocessor-less C-like language ships; the preprocessor's
+                // own quote arm (`SynthBuilder`) owns the report until then.
+                auto const ambiguous = [&](HeaderSearchResult const& r) {
+                    reportHeaderCaseAmbiguity(context.diagnostics, sourceBuffer,
+                                              directive.span, directive.filename,
+                                              r.ambiguousCandidates);
+                };
                 auto const unresolved = [&] {
                     if (directive.isSystem) {
                         reportDriver(context.diagnostics, DiagnosticCode::F_ShippedHeaderNotFound,
@@ -325,9 +347,15 @@ private:
                     // byte-for-byte with `__has_include`'s; the new SOURCE verdict is
                     // the PP's alone (a residual uncertain-live source include fails
                     // loud here via F_ShippedHeaderNotFound below — strictly safer).
-                    auto const resolved = resolveSystemDescriptor(
-                        directive.filename, context.systemDirs);
-                    if (!resolved) { unresolved(); continue; }
+                    HeaderSearchResult const resolved = resolveSystemDescriptor(
+                        directive.filename, context.systemDirs,
+                        context.headerNameMatching);
+                    if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
+                        ambiguous(resolved); continue;
+                    }
+                    if (resolved.status != HeaderSearchStatus::Found) {
+                        unresolved(); continue;
+                    }
                     // D-FFI-DESCRIPTOR-INCLUDES: record a ShippedDescriptorRef for
                     // the resolved descriptor AND for every sibling its `includes`
                     // transitively declares — via the SHARED cycle-safe closure
@@ -343,13 +371,26 @@ private:
                     // F_ShippedHeaderNotFound as a direct miss, positioned on this
                     // `#include` line (this tier alone has systemDirs to catch it).
                     ffi::forEachDescriptorInClosure(
-                        *resolved, context.systemDirs, systemVisited,
+                        resolved.path, context.systemDirs,
+                        context.headerNameMatching, systemVisited,
                         [&](std::filesystem::path const& descPath) {
                             context.shippedLibDescriptors.push_back(
                                 ShippedDescriptorRef{descPath, directive.span,
                                                      sourceBuffer});
                         },
-                        [&](std::string const& missingHeader) {
+                        [&](std::string const&        missingHeader,
+                            HeaderSearchResult const& outcome) {
+                            // A closure edge that fold-COLLIDES gets the
+                            // collision diagnostic, not the miss one — same
+                            // separation the direct include above makes.
+                            if (outcome.status
+                                == HeaderSearchStatus::AmbiguousCase) {
+                                reportHeaderCaseAmbiguity(
+                                    context.diagnostics, sourceBuffer,
+                                    directive.span, missingHeader,
+                                    outcome.ambiguousCandidates);
+                                return;
+                            }
                             reportDriver(context.diagnostics,
                                          DiagnosticCode::F_ShippedHeaderNotFound,
                                          DiagnosticSeverity::Error, sourceBuffer,
@@ -361,12 +402,19 @@ private:
                 // QUOTE form: a LOCAL include, loaded as source under THIS
                 // schema (the included header is a source file in the same
                 // language) and recorded as a CrossTreeRef edge.
-                auto const resolved =
-                    resolveIncludePath(directive.filename, includingDir, context.includeDirs);
-                if (!resolved) { unresolved(); continue; }
+                HeaderSearchResult const resolved =
+                    resolveIncludePath(directive.filename, includingDir,
+                                       context.includeDirs,
+                                       context.headerNameMatching);
+                if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
+                    ambiguous(resolved); continue;
+                }
+                if (resolved.status != HeaderSearchStatus::Found) {
+                    unresolved(); continue;
+                }
 
                 bool ok = false;
-                TreeId const target = context.loadFile(*resolved, ok, schema_);
+                TreeId const target = context.loadFile(resolved.path, ok, schema_);
                 if (!ok) { unresolved(); continue; }
                 edges.push_back({sourceTree, directive.node, directive.span, target});
             }

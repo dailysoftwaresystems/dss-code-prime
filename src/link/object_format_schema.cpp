@@ -79,6 +79,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "widths");
     }
 
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the header-name case rule is REQUIRED
+    // (the loader rejects a missing or unknown `headerNameMatching` upstream;
+    // this arm catches a HAND-BUILT ObjectFormatData that never set it — the
+    // zero default is the invalid sentinel, never a silent case rule).
+    if (headerNameMatchingName(headerNameMatching).empty()) {
+        fail("/headerNameMatching",
+             "missing required 'headerNameMatching' — every object format "
+             "must declare how an `#include` header NAME is matched "
+             "('case-sensitive' or 'case-insensitive'); a silent default "
+             "would let the BUILD HOST's filesystem decide, which both "
+             "wrongly rejects `<Windows.h>` for a pe target on a "
+             "case-sensitive host and silently ACCEPTS `<Stdio.h>` for an "
+             "elf target on a case-insensitive one");
+    }
+
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
     //
     // `container: archive` is a STATIC-LIBRARY format: its driver output is

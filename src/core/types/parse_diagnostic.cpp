@@ -410,6 +410,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedTypeIdentityConflict";
         case DiagnosticCode::F_ShippedSymbolUnavailableForTarget:
             return "F_ShippedSymbolUnavailableForTarget";
+        case DiagnosticCode::F_HeaderNameCaseAmbiguous:
+            return "F_HeaderNameCaseAmbiguous";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

@@ -15,6 +15,7 @@ add_library(core OBJECT
     types/diagnostic_reporter.cpp
     types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
+    types/header_case_diagnostic.cpp
     types/include_path_resolve.cpp
     types/glob_match.cpp
     types/grammar_schema.cpp

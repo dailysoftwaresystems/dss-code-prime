@@ -12,3 +12,13 @@ dss_add_test(NAME test_support/test_host_native_target
 # the strict-mode guard would have no witness on that leg at all.
 dss_add_test(NAME test_support/test_arm_verdict_ledger
              SOURCES test_arm_verdict_ledger.cpp)
+# D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS. `runBinary` is the ONE spawn
+# chokepoint both corpus harnesses use, and its capture path used to drain the
+# pipe only after the child exited — a deadlock for any child bigger than the
+# pipe buffer, reported as if the CHILD had hung. This pin spawns the test
+# executable as its own 200 KB payload generator, so it needs no external tool
+# and clears both the Windows (~4 KiB) and Linux (64 KiB) buffers.
+# ★ It defines its own `main` (to intercept the payload flag before gtest parses
+# argv), which is why it must stay a SEPARATE target from its siblings above.
+dss_add_test(NAME test_support/test_run_binary_capture
+             SOURCES test_run_binary_capture.cpp)

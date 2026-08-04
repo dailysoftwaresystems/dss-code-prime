@@ -366,9 +366,58 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // the parent's copy open the ReadFile-until-EOF drain loop
     // below would hang forever waiting for ITSELF to close the
     // write end.
+    // ── D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS ──────────────────────
+    // The drain runs CONCURRENTLY with the wait, on its own thread. It used to
+    // run AFTER the child exited, which deadlocks any child that outgrows the
+    // pipe's kernel buffer: the child blocks in write(), the parent blocks in
+    // WaitForSingleObject, and neither moves until the timeout fires and the
+    // parent KILLS a child that was working correctly. MEASURED 2026-08-04 on
+    // the first caller to produce more than a few bytes (the sqlite harness leg
+    // resolver, ~7 KB of JSON): two spawns, 120 s timeout each, 240 s of a
+    // 240.7 s test run — and the symptom is a TIMEOUT, i.e. it reads as "the
+    // child hung", which is precisely backwards.
+    //
+    // The old code knew the buffer was bounded ("typically 4-64 KiB") and drew
+    // the wrong conclusion from it: it looped to EOF so a large capture would
+    // not be silently TRUNCATED, which fixes the symptom that cannot happen
+    // while leaving the one that can. Truncation was never the risk — the child
+    // cannot get far enough ahead to be truncated, because it is blocked.
+    //
+    // The drain thread owns `drainBuf`/`drainDiag`; the main thread must not
+    // touch either until join(). EOF arrives when the LAST write handle closes:
+    // ours above, and the child's when it exits — including when we terminate
+    // it — so the thread always finishes and the join cannot hang.
+    std::thread      drainThread;
+    std::string      drainBuf;
+    std::string      drainDiag;
     if (captureStdout) {
         ::CloseHandle(pipeWrite);
         pipeWrite = nullptr;
+        drainThread = std::thread([pipeRead, &drainBuf, &drainDiag] {
+            char readBuf[4096];
+            for (;;) {
+                DWORD bytesRead = 0;
+                BOOL const rok = ::ReadFile(pipeRead, readBuf, sizeof(readBuf),
+                                            &bytesRead, nullptr);
+                if (rok && bytesRead > 0) {
+                    drainBuf.append(readBuf, bytesRead);
+                    continue;
+                }
+                if (!rok) {
+                    DWORD const err = ::GetLastError();
+                    // EOF — the child closed its write end and we have drained
+                    // everything.
+                    if (err != ERROR_BROKEN_PIPE) {
+                        drainDiag = "ReadFile(pipe) failed (GetLastError="
+                                  + std::to_string(err) + ")";
+                    }
+                    break;
+                }
+                // rok && bytesRead == 0: anonymous pipes return this only after
+                // EOF in some configurations; treat as EOF for safety.
+                break;
+            }
+        });
     }
 
     DWORD const waitMs = static_cast<DWORD>(timeout.count());
@@ -393,46 +442,13 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     }
 
     if (captureStdout) {
-        // Drain pipe AFTER child exit. Buffer is bounded by the
-        // pipe's default kernel allocation (typically 4-64 KiB);
-        // FF6 hello-world prints ~6 bytes so a one-shot ReadFile
-        // typically returns everything, but we loop until EOF
-        // (ReadFile returns FALSE with GetLastError() ==
-        // ERROR_BROKEN_PIPE when the child's write end is closed
-        // AND the read buffer is drained — that's the EOF
-        // signal) so a future large-output test doesn't get a
-        // silently-truncated capture.
-        char readBuf[4096];
-        for (;;) {
-            DWORD bytesRead = 0;
-            BOOL const rok = ::ReadFile(pipeRead, readBuf,
-                                        sizeof(readBuf),
-                                        &bytesRead, nullptr);
-            if (rok && bytesRead > 0) {
-                out.capturedStdout.append(readBuf, bytesRead);
-                continue;
-            }
-            if (!rok) {
-                DWORD const err = ::GetLastError();
-                if (err == ERROR_BROKEN_PIPE) {
-                    // EOF — child closed its write end and we've
-                    // drained everything.
-                    break;
-                }
-                // Any other ReadFile failure: report it but keep
-                // whatever we managed to capture so far.
-                if (out.diagnostic.empty()) {
-                    out.diagnostic = "ReadFile(pipe) failed "
-                                     "(GetLastError="
-                                   + std::to_string(err) + ")";
-                }
-                break;
-            }
-            // rok && bytesRead == 0: anonymous pipes return this
-            // only after EOF in some configurations; treat as
-            // EOF for safety.
-            break;
-        }
+        // The child is gone (exited or terminated), so every write handle is
+        // closed and the drain thread has already seen EOF or is about to.
+        drainThread.join();
+        out.capturedStdout = std::move(drainBuf);
+        // A drain error never overwrites a spawn/wait diagnostic: those explain
+        // WHY there is nothing to read, and are the more useful message.
+        if (out.diagnostic.empty()) out.diagnostic = drainDiag;
         ::CloseHandle(pipeRead);
     }
 
@@ -562,10 +578,47 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     out.spawned = true;
     // Parent closes its write-end copy so EOF reaches the read
     // end after the child exits.
+    //
+    // D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS — the drain runs
+    // CONCURRENTLY with the waitpid poll, for the reason spelled out on the
+    // Windows arm above. A Linux pipe buffers 64 KiB by default (vs Windows'
+    // 4 KiB), so this arm needs a chattier child to hit it — the bug is the
+    // same bug, it just waits longer to be found, and BOTH arms are the shared
+    // spawn chokepoint for the two corpus harnesses.
+    std::thread drainThread;
+    std::string drainBuf;
+    std::string drainDiag;
     if (captureStdout) {
         ::close(pipeFds[1]);
         pipeFds[1] = -1;
+        int const readFd = pipeFds[0];
+        drainThread = std::thread([readFd, &drainBuf, &drainDiag] {
+            char readBuf[4096];
+            for (;;) {
+                ssize_t const n = ::read(readFd, readBuf, sizeof(readBuf));
+                if (n > 0) {
+                    drainBuf.append(readBuf, static_cast<std::size_t>(n));
+                    continue;
+                }
+                if (n == 0) break;              // EOF
+                if (errno == EINTR) continue;
+                drainDiag = "read(pipe) failed: errno="
+                          + std::to_string(errno);
+                break;
+            }
+        });
     }
+    // Join, adopt the bytes, and close the read end. Called on EVERY exit path
+    // below — a `return` that skipped it would terminate() on a joinable
+    // thread's destructor, turning a reporting bug into a crash.
+    auto const finishDrain = [&] {
+        if (!captureStdout) return;
+        drainThread.join();
+        out.capturedStdout = std::move(drainBuf);
+        if (out.diagnostic.empty()) out.diagnostic = drainDiag;
+        ::close(pipeFds[0]);
+        pipeFds[0] = -1;
+    };
 
     auto const start  = std::chrono::steady_clock::now();
     auto const deadline = start + timeout;
@@ -600,9 +653,15 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         if (w == -1) {
             out.diagnostic = "waitpid(pid=" + std::to_string(pid)
                            + ") failed: errno=" + std::to_string(errno);
-            if (captureStdout) {
-                ::close(pipeFds[0]);
-            }
+            // The child may still be alive here, so the drain thread may still
+            // be blocked in read(). Kill it first so the pipe reaches EOF and
+            // the join below is bounded — a waitpid failure must not become a
+            // hang.
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            auto const waitDiag = out.diagnostic;
+            finishDrain();
+            out.diagnostic = waitDiag;
             return out;
         }
         // w == 0 → child still running.
@@ -615,9 +674,12 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
             out.timedOut   = true;
             out.diagnostic = "child timed out after "
                            + std::to_string(timeout.count()) + " ms";
-            if (captureStdout) {
-                ::close(pipeFds[0]);
-            }
+            // Whatever the child managed to print before the kill is EVIDENCE
+            // about why it hung; the old code threw it away by closing the read
+            // end without draining.
+            auto const timeoutDiag = out.diagnostic;
+            finishDrain();
+            out.diagnostic = timeoutDiag;
             return out;
         }
         auto const remaining =
@@ -628,33 +690,9 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         std::this_thread::sleep_for(slice);
     }
 
-    if (captureStdout) {
-        // Drain pipe after child exit. read() returns 0 on EOF
-        // (parent's write end + all child write ends closed).
-        char readBuf[4096];
-        for (;;) {
-            ssize_t const n = ::read(pipeFds[0], readBuf,
-                                     sizeof(readBuf));
-            if (n > 0) {
-                out.capturedStdout.append(readBuf,
-                                          static_cast<std::size_t>(n));
-                continue;
-            }
-            if (n == 0) {
-                // EOF.
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            if (out.diagnostic.empty()) {
-                out.diagnostic = "read(pipe) failed: errno="
-                               + std::to_string(errno);
-            }
-            break;
-        }
-        ::close(pipeFds[0]);
-    }
+    // The child has exited, so every write end is closed and the drain thread
+    // has seen (or is about to see) EOF.
+    finishDrain();
     return out;
 #endif
 }

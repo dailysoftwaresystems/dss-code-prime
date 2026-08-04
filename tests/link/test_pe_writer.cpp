@@ -500,6 +500,7 @@ TEST(PeFormatJson, NonZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-va","kind":"pe"},
       "pe": { "machine": 34404 },
       "sections":[{"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4198400}]
@@ -518,6 +519,7 @@ TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-seg","kind":"pe"},
       "pe": { "machine": 34404 },
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}]
@@ -533,6 +535,7 @@ TEST(PeFormatJson, ZeroMachineRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe","kind":"pe"},
       "pe": { "machine": 0 }
     })");
@@ -1665,6 +1668,7 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
       "externCallDispatch": "direct-plt",
       "dataImportBinding": "copy-relocation",
@@ -2576,6 +2580,7 @@ TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-exec","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2588,6 +2593,7 @@ TEST(PeExecFormatJsonValidate, ObjWithOptionalHeaderRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-opt-hdr","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "optionalHeader": { "magic": 523 }
@@ -2599,6 +2605,7 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-align","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2616,6 +2623,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"sub-page","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2628,6 +2636,7 @@ TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-subsystem","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2640,6 +2649,7 @@ TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-stack","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
@@ -2652,6 +2662,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"sect-lt-file","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2666,6 +2677,7 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"misaligned-va","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2687,6 +2699,7 @@ TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dll","kind":"pe"},
       "pe": { "machine": 34404, "characteristics": 8226, "type": "dll" },
       "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 2, "dllCharacteristics": 352, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -3254,6 +3267,7 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-gate","kind":"elf"},
       "entryPoint": "",
       "elf": {
@@ -3626,6 +3640,7 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA require-section test — declares rodata capability but omits the section row.",
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-rodata-no-row", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
       "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
@@ -3712,6 +3727,7 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA cert-table-shift test — declares non-zero attributeCertReserveSize so the walker computes cert table offset past rdata+idata.",
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-cert-shift", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
       "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},

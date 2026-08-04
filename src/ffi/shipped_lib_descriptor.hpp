@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
@@ -597,12 +598,26 @@ readShippedLibIncludes(std::filesystem::path const& path,
 //     caller surfaces LOUD (the import resolver positions an
 //     `F_ShippedHeaderNotFound` on the `#include` line; this is the ONLY tier that
 //     can catch it, since the interner-less semantic tier has no `systemDirs`).
+//   * `matching` is the ACTIVE OBJECT FORMAT's header-name case rule
+//     (D-PP-HEADER-CASE-INSENSITIVE-PE). The closure's `includes` entries are
+//     header NAMES resolved by the same funnel a source `#include <h>` uses, so
+//     they MUST honour the same case policy — a descriptor declaring
+//     `includes:["Windows.h"]` has to reach `windows.json` on a pe build from a
+//     case-sensitive host exactly as the source spelling does.
+//   * `onUnresolvedInclude(headerName, outcome)` fires for any entry that did
+//     NOT resolve to exactly one descriptor. `outcome.status` separates a plain
+//     miss (NotFound) from a fold COLLISION (AmbiguousCase, whose
+//     `ambiguousCandidates` name every colliding file) so the caller can emit
+//     the right loud diagnostic; collapsing the two would report a typo for a
+//     tree that actually holds two case-colliding descriptors.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
+    HeaderNameMatching                                      matching,
     std::unordered_set<std::string>&                        visited,
     std::function<void(std::filesystem::path const&)> const& visit,
-    std::function<void(std::string const&)> const&           onUnresolvedInclude);
+    std::function<void(std::string const&,
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude);
 
 // True iff a header carrying availability set `availableObjectFormats` is
 // available on object-format `fmt`. EMPTY set ⇒ available on EVERY format

@@ -5,7 +5,12 @@ $ErrorActionPreference = 'Stop'
 $sh = Join-Path $PSScriptRoot 'build-and-test.ps1'
 $lines = Get-Content $sh
 $start = ($lines | Select-String -Pattern '^\$real = @\(\); \$confound = @\(\); \$scopedExcused = @\(\)' | Select-Object -First 1).LineNumber
-$end   = ($lines | Select-String -Pattern '^\s*Warn "\[pe64\] \$\(\$scopedExcused\.Count\) failure' | Select-Object -First 1).LineNumber
+# The end anchor's leg tag is a VARIABLE as of TF-C114 (`[$LegTag]`): the driver
+# now runs the same classifier for every declared leg, so it cannot carry the
+# literal `[pe64]` this used to match. `\[[^\]]*\]` keeps the anchor as specific as
+# it needs to be — it is the `$($scopedExcused.Count) failure` half that identifies
+# the line — while surviving whatever the driver names the leg.
+$end   = ($lines | Select-String -Pattern '^\s*Warn "\[[^\]]*\] \$\(\$scopedExcused\.Count\) failure' | Select-Object -First 1).LineNumber
 if (-not $start -or -not $end) { throw "could not locate the shipped classifier block (start=$start end=$end)" }
 # LineNumber is 1-based, the array 0-based: line N is at index N-1. Take through the
 # Warn line and supply the closing brace of `if ($scopedExcused.Count) {` ourselves.
@@ -35,6 +40,15 @@ function CheckEq($label, $want, $got) {
   else { "  FAIL $label"; "       want exactly: [$want]"; "       got         : [$got]"; $script:fail++ }
 }
 
+# The driver stamps its log lines with the LEG it is processing; standing in for
+# one here keeps this file's output readable. Nothing is asserted about it — the
+# assertions are all about $real / $confound / $scopedExcused.
+# ★ $LegRunMode is deliberately LEFT UNSET: the shipped block derives
+# `$legMode = if ($LegRunMode -eq 'launched') { 'emulated' } else { 'native' }`,
+# so an absent run mode must fall to 'native' — which is exactly the contract the
+# `emulated:`/`native:` assertions below test. If a future edit makes the default
+# anything else, these go red, which is the point.
+$LegTag = 'pe64-x86_64'
 $failNames = @('writecrash-1.1.1','walsetlk-2.1.3','zipfile-25.0','sometest-9.9')
 # Real declared prefixes from permutations.test: the dotted default AND the `mmap`
 # override "mm-" (a DASH, not derivable from the suite name). pe64's `all` run emits

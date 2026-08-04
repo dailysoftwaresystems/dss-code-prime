@@ -640,6 +640,7 @@ namespace {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dll","kind":"pe"},
       )";
     s += extraTopLevel;
@@ -690,6 +691,7 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exe","kind":"pe"},
       "pe": { "machine": 34404, "characteristics": 8226, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },

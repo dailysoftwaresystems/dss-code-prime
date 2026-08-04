@@ -2303,9 +2303,11 @@ readShippedLibIncludes(std::filesystem::path const& path,
 void forEachDescriptorInClosure(
     std::filesystem::path const&                             startPath,
     std::span<std::filesystem::path const>                   systemDirs,
+    HeaderNameMatching                                       matching,
     std::unordered_set<std::string>&                         visited,
     std::function<void(std::filesystem::path const&)> const& visit,
-    std::function<void(std::string const&)> const&           onUnresolvedInclude) {
+    std::function<void(std::string const&,
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude) {
     // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
     // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
     // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
@@ -2337,9 +2339,16 @@ void forEachDescriptorInClosure(
         // — the caller surfaces it LOUD (this is the ONLY tier that can, since the
         // interner-less semantic tier has no systemDirs). Continue past it so one
         // typo does not swallow the rest of the closure.
-        auto const childPath = resolveSystemDescriptor(headerName, systemDirs);
-        if (!childPath) { onUnresolvedInclude(headerName); continue; }
-        forEachDescriptorInClosure(*childPath, systemDirs, visited, visit,
+        // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy the source
+        // spelling gets — a `includes:["Windows.h"]` edge must reach
+        // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
+        HeaderSearchResult child =
+            resolveSystemDescriptor(headerName, systemDirs, matching);
+        if (child.status != HeaderSearchStatus::Found) {
+            onUnresolvedInclude(headerName, child);
+            continue;
+        }
+        forEachDescriptorInClosure(child.path, systemDirs, matching, visited, visit,
                                    onUnresolvedInclude);   // DFS recurse
     }
 }

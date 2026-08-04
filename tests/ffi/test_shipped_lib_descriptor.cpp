@@ -758,9 +758,11 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(
-        aPath, systemDirs, visited,
+        aPath, systemDirs, kDefaultHeaderNameMatching, visited,
         [&](fs::path const& p) { order.push_back(p.stem().string()); },
-        [&](std::string const& h) { unresolved.push_back(h); });
+        [&](std::string const& h, HeaderSearchResult const&) {
+            unresolved.push_back(h);
+        });
     // Terminated (we got here) + each descriptor visited exactly once.
     ASSERT_EQ(order.size(), 2u);
     EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
@@ -791,9 +793,9 @@ TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
     std::unordered_set<std::string> visited;
     std::vector<std::string> order;
     forEachDescriptorInClosure(
-        aPath, systemDirs, visited,
+        aPath, systemDirs, kDefaultHeaderNameMatching, visited,
         [&](fs::path const& p) { order.push_back(p.stem().string()); },
-        [&](std::string const&) {});
+        [&](std::string const&, HeaderSearchResult const&) {});
     ASSERT_EQ(order.size(), 4u);        // each of a/b/c/d visited exactly once
     EXPECT_EQ(order[0], "da");          // parent first (the DFS root)
     // The shared leaf `dd` appears exactly once (the diamond dedup — this is the
@@ -828,9 +830,11 @@ TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(
-        path, systemDirs, visited,
+        path, systemDirs, kDefaultHeaderNameMatching, visited,
         [&](fs::path const& p) { order.push_back(p.stem().string()); },
-        [&](std::string const& h) { unresolved.push_back(h); });
+        [&](std::string const& h, HeaderSearchResult const&) {
+            unresolved.push_back(h);
+        });
     ASSERT_EQ(order.size(), 1u);        // only the parent (the typo has no descriptor)
     EXPECT_EQ(order[0], "typo");
     ASSERT_EQ(unresolved.size(), 1u);   // the unresolvable entry was surfaced

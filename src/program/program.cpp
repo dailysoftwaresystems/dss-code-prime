@@ -988,10 +988,20 @@ struct CuBuildKey {
     std::string                     targetName;
     std::string                     formatName;
     std::optional<ObjectFormatKind> format;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the active FORMAT FILE's declared
+    // header-NAME case rule. It belongs in the KEY on the same principle every
+    // other member is here for — it can change the preprocessed token stream
+    // (`__has_include(<Windows.h>)` answers differently under it), so a CU
+    // built under one value must never be reused under another. In practice it
+    // is a function of `formatName` and adds no extra builds; carrying it makes
+    // the key's rule ("everything that changes the preprocessed source") true
+    // by construction rather than by an argument a reader has to reconstruct.
+    HeaderNameMatching              headerNameMatching = kDefaultHeaderNameMatching;
     [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
         if (targetName != o.targetName) return targetName < o.targetName;
         if (formatName != o.formatName) return formatName < o.formatName;
-        return format < o.format;
+        if (format != o.format) return format < o.format;
+        return headerNameMatching < o.headerNameMatching;
     }
 };
 
@@ -1221,6 +1231,11 @@ int runCusToTargets(
             // by the pre-flight above and every surviving spec's format is in
             // it — a failed load already returned at the drain.
             formatPredefines  = formatByName.at(key.formatName)->predefinedMacros();
+            // D-PP-HEADER-CASE-INSENSITIVE-PE: read the rule off the FORMAT
+            // FILE (never derived from `key.format`, the KIND — that would be
+            // the identity branch the agnosticism bar forbids).
+            key.headerNameMatching =
+                formatByName.at(key.formatName)->headerNameMatching();
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
@@ -1833,6 +1848,9 @@ int Program::compileFiles(
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
                 if (key.format) builder.setActiveFormat(*key.format);
+                // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
+                // header-name case rule (NOT derived from the format kind).
+                builder.setHeaderNameMatching(key.headerNameMatching);
                 // TF-C74: the active target's per-architecture identity macros.
                 builder.setTargetPredefinedMacros(
                     {targetPredefines.begin(), targetPredefines.end()});
@@ -1929,6 +1947,9 @@ int Program::compileUnits(
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
                     if (key.format) builder.setActiveFormat(*key.format);
+                    // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
+                    // header-name case rule (NOT derived from the format kind).
+                    builder.setHeaderNameMatching(key.headerNameMatching);
                     // TF-C74: the active target's per-architecture identity macros.
                     builder.setTargetPredefinedMacros(
                         {targetPredefines.begin(), targetPredefines.end()});

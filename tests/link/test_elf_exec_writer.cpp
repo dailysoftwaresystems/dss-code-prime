@@ -145,6 +145,7 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -161,6 +162,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"empty-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -176,6 +178,7 @@ TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "interpreter": "/lib64/ld-linux-x86-64.so.2" }
     })");
@@ -192,6 +195,7 @@ TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-bindnow-false","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "bindNow": false }
     })");
@@ -208,6 +212,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -418,6 +423,7 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"riscv-exec","kind":"elf"},
       "elf": {
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
@@ -954,6 +960,7 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-entry-named","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_42",
@@ -986,6 +993,7 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-bad-entry","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_99",
@@ -1054,6 +1062,7 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1065,6 +1074,7 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-default","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1079,6 +1089,7 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
       "entryPoint": "",
       "elf": {
@@ -1630,6 +1641,7 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-exec","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
@@ -1646,6 +1658,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-page-align","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1657,6 +1670,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-page-align","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1668,6 +1682,7 @@ TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-rel","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1679,6 +1694,7 @@ TEST(ElfFormatJson, UnknownTypeStringRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-type","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"executable" }
     })");
@@ -1705,6 +1721,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"forge-exec","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
@@ -1743,6 +1760,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-entry","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
@@ -1821,6 +1839,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]

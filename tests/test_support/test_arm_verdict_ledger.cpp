@@ -156,16 +156,40 @@ TEST(ArmVerdict, TheCardinalitySentinelIsNotAVerdict) {
 }
 
 // The distinction strict mode acts on. Red-on-disable: move
-// SkippedEmulatorMissing into the structural set and this fails.
-TEST(ArmVerdict, OnlyTheEmulatorMissingSkipIsEnvironmental) {
+// SkippedEmulatorMissing (or SkippedBuildInputMissing) into the structural set
+// and this fails.
+//
+// THE TWO ENVIRONMENTAL SKIPS, AND WHY THEY ARE SIBLINGS RATHER THAN ONE.
+// `SkippedEmulatorMissing` is "the machine cannot RUN it"; `SkippedBuildInput
+// Missing` is "the machine cannot BUILD it" — a declared resolve-library binary
+// or a leg's target compiler is absent (D-HARNESS-CROSS-HOST-ANY-TARGET). They
+// share a CLASS because they share an enforcement (warn by default, red under
+// DSS_STRICT_ARM_VERDICTS) and a remedy (install the missing thing), and they
+// stay SEPARATE names because a reader must be able to tell which half of the
+// pipeline the machine failed to supply.
+TEST(ArmVerdict, TheEnvironmentalSkipsAreExactlyTheTwoMachineSuppliedOnes) {
     EXPECT_TRUE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedEmulatorMissing));
+    EXPECT_TRUE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedBuildInputMissing));
     EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedByRunOn));
     EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedNoEmulatorDeclared));
+    EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::NotSelectedByRunner));
+    EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::Poisoned));
     EXPECT_TRUE(armVerdictIsStructuralSkip(ArmVerdict::SkippedByRunOn));
     EXPECT_TRUE(armVerdictIsStructuralSkip(ArmVerdict::SkippedNoEmulatorDeclared));
     EXPECT_TRUE(armVerdictIsVerified(ArmVerdict::Ran));
     EXPECT_TRUE(armVerdictIsVerified(ArmVerdict::ExpectErrorAsserted));
     EXPECT_FALSE(armVerdictIsVerified(ArmVerdict::SkippedEmulatorMissing));
+    EXPECT_FALSE(armVerdictIsVerified(ArmVerdict::SkippedBuildInputMissing));
+
+    // The counted membership, so a THIRD environmental skip cannot be added
+    // without a deliberate visit here.
+    std::size_t environmental = 0;
+    for (ArmVerdict const v : kAllArmVerdicts) {
+        if (armVerdictIsEnvironmentalSkip(v)) ++environmental;
+    }
+    EXPECT_EQ(environmental, 2u)
+        << "strict mode acts on exactly the environmental class; a new member"
+           " changes what the gate reds on and must be reviewed here";
 }
 
 // ── The ledger ─────────────────────────────────────────────────────────────
@@ -182,18 +206,21 @@ TEST(ArmVerdictLedgerTest, CountsSeparateVerifiedFromEveryFlavourOfSkip) {
                   ArmVerdict::SkippedNoEmulatorDeclared, "no emulator");
     ledger.record("c-subset/z", "spec-e", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "qemu-aarch64 not on PATH");
+    ledger.record("sqlite-harness/pe64-x86_64", "spec-h", "baseline",
+                  ArmVerdict::SkippedBuildInputMissing, "tcl86.dll not found");
     ledger.record("c-subset/z", "spec-f", "cli",
                   ArmVerdict::NotSelectedByRunner, "first-match binding");
     ledger.record("c-subset/w", "spec-g", "baseline", ArmVerdict::Poisoned,
                   "compile failed");
 
-    EXPECT_EQ(ledger.total(), 8u);
+    EXPECT_EQ(ledger.total(), 9u);
     EXPECT_EQ(ledger.verifiedCount(), 3u);
     // Poisoned is NOT a skip: it already failed loudly and must not be filed
     // under "not run" as if nobody had noticed.
-    EXPECT_EQ(ledger.skippedCount(), 4u);
+    EXPECT_EQ(ledger.skippedCount(), 5u);
     EXPECT_EQ(ledger.count(ArmVerdict::Ran), 2u);
     EXPECT_EQ(ledger.count(ArmVerdict::SkippedEmulatorMissing), 1u);
+    EXPECT_EQ(ledger.count(ArmVerdict::SkippedBuildInputMissing), 1u);
     EXPECT_EQ(ledger.count(ArmVerdict::NotSelectedByRunner), 1u);
     EXPECT_EQ(ledger.count(ArmVerdict::Poisoned), 1u);
 }
@@ -208,11 +235,17 @@ TEST(ArmVerdictLedgerTest, EnvironmentalSkipsAreTheOnlyStrictModeInput) {
     ledger.record("c-subset/x", "spec-c", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "qemu-aarch64 not on PATH");
     ledger.record("c-subset/x", "spec-d", "cli", ArmVerdict::NotSelectedByRunner, "d");
+    ledger.record("sqlite-harness/pe64-x86_64", "spec-e", "baseline",
+                  ArmVerdict::SkippedBuildInputMissing, "tcl86.dll not found");
 
     auto const env = ledger.environmentalSkips();
-    ASSERT_EQ(env.size(), 1u);
+    ASSERT_EQ(env.size(), 2u);
     EXPECT_EQ(env.front().spec, "spec-c");
     EXPECT_EQ(env.front().detail, "qemu-aarch64 not on PATH");
+    // Both environmental members, in record order — a strict-mode caller that
+    // reported only the first would silently drop the build-side half.
+    EXPECT_EQ(env.back().spec, "spec-e");
+    EXPECT_EQ(env.back().detail, "tcl86.dll not found");
 }
 
 // The counts line must NAME every class. A summary that says "4 skipped"
@@ -225,7 +258,8 @@ TEST(ArmVerdictLedgerTest, CountsLineNamesEverySkipClass) {
     auto const line = ledger.renderCountsLine();
     for (char const* needle : {"verified", "ran", "expect-error", "by-runOn",
                                "no-emulator-declared", "emulator-missing",
-                               "not-selected", "poisoned", "declared arms"}) {
+                               "build-input-missing", "not-selected", "poisoned",
+                               "declared arms"}) {
         EXPECT_NE(line.find(needle), std::string::npos)
             << "the counts line must name '" << needle << "': " << line;
     }
