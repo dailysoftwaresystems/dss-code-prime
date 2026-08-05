@@ -77,8 +77,10 @@
 #      (`dss-code-prime: artifact <spec> <path>` — see `dss_bh_reported_artifact`; the
 #      suffix is the object format's business, not this driver's). ONE manifest
 #      generator (gen-pe64-manifest.py) serves this driver and the .ps1.
-#   8. stage each leg's run dir — including the `libtestloadext.so` extension the
-#      loadext corpus dlopen()s, compiled by THE LEG'S TARGET compiler — then run
+#   8. stage each leg's run dir — including the loadext extension the corpus
+#      dlopen()s (`libtestloadext.so`, or `testloadext.dll` on a Windows target:
+#      the name is DECLARED per leg), compiled by THE LEG'S TARGET compiler,
+#      which is accepted only after it states that target — then run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
 #      runnable leg (DSS_TIER: veryquick[default] | quick | full | all), parse
 #      "N errors out of M tests", and classify each failing test against the
@@ -428,7 +430,7 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
-           LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() \
+           LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
            LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
            LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=() \
            LEG_LIB_TCL_IMPORT_NAME=() LEG_LIB_Z_IMPORT_NAME=()
@@ -436,7 +438,7 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
 # its VERDICT — one name from the closed vocabulary in
 # tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
 # in flight"; Step 9 refuses to let any declared leg end that way.
-declare -A LEG_CC=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+declare -A LEG_CC=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
 # For a leg whose libraries were ACQUIRED (`pinned-archive`): where they landed,
 # and the "<as>\t<path>" lines the resolver reported. Kept because the artefact is
 # not finished when the link is — an acquired library is a STAND-IN whose declared
@@ -783,7 +785,7 @@ else
   if _st_out="$("$BASH" "$_selftest" 2>&1)"; then
     # ★ The SKIP COUNT is part of the result, not a footnote. The self-test runs at
     # Step 0 and `ensure_cmd git` is Step 1, so on a git-less host its two git-gated
-    # blocks (26 of 46 assertions — the provenance helpers and the whole Step-2
+    # blocks (26 of 64 assertions — the provenance helpers and the whole Step-2
     # source gate) SKIP. The old form printed only `passed=`, so that host read
     # "driver self-test: OK (20 assertions)" — the exact number that at HEAD meant
     # the ENTIRE battery — over 43% of it. A partial run must never READ as a full
@@ -2574,8 +2576,9 @@ done
 
 # ── each leg's TARGET C compiler (the loadext helper extension) ──────────────
 # WHY IT IS RESOLVED HERE AND NOT AT STEP 8, and why a missing one does NOT stop
-# the build: the compiler builds `libtestloadext.so`, the extension the loadext
-# corpus dlopen()s — a RUN input, not a build input for the fixture itself. So:
+# the build: the compiler builds this leg's declared `loadExtHelperName`, the
+# extension the loadext corpus dlopen()s — a RUN input, not a build input for the
+# fixture itself. So:
 #   · a leg that WILL run needs it. Absent (and un-installable) ⇒
 #     `skipped-build-input-missing`, decided NOW, at Step 6, rather than after a
 #     ~50 s..8 min compile and a staging step — the leg is still BUILT (that is
@@ -2589,34 +2592,111 @@ done
 # to a cross leg is exactly the wrong-arch helper this anchor
 # (D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO) exists to prevent. `$CC` still governs
 # PROBE_CC, which is a genuine host question.
+#
+# ★★ "FIRST PRESENT WINS" WAS THE DEFECT, AND IT IS NOT WHAT THIS DOES ANY MORE.
+# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. ✔MEASURED
+# 2026-08-05, a full run on a WSL/Ubuntu x86_64 host: legs.json declared pe64's
+# candidates as ["x86_64-w64-mingw32-gcc", "gcc"], the mingw cross-compiler was
+# absent, and "first present wins" therefore picked the plain LINUX `gcc` to build
+# a WINDOWS leg's shared object — legitimately, because the catalogue had listed
+# it. The guard 30 lines below (and the one in stage_loadext_extension) forbid
+# exactly that fallback in so many words; neither fired, because they were
+# watching for a fallback the CONFIG had already licensed. The run died in
+# /usr/bin/ld ("relocation R_X86_64_PC32 against symbol `sqlite3_api` ...
+# recompile with -fPIC") after two legs had gone green, and pe64's units never ran.
+#
+# THE RESOLVER NOW ASKS THE COMPILER. `harness_legs.py --resolve-target-cc <leg>`
+# accepts a candidate only when `<cc> -dumpmachine` names this leg's own target
+# arch AND OS, both derived from the leg's declared `spec`. It lives in the PYTHON
+# and not here for the reason base-harness.sh's header gives: a decision both
+# drivers need is written once, in the file they already share, not twice in two
+# shells. ✔MEASURED after the fix — WSL: pe64 REFUSED ("targets OS 'linux' (triple
+# 'x86_64-linux-gnu'); this leg needs 'windows'"), elf64-x86_64 -> cc, elf64-arm64
+# -> aarch64-linux-gnu-gcc; Windows: pe64 -> x86_64-w64-mingw32-gcc.
+LEG_CC_WHY=""
+resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
+  local leg="$1" _err _out _rc
+  # stderr to its OWN file: it is the candidate ladder, and mixing it into the
+  # captured stdout would put prose where the driver reads a compiler name.
+  #
+  # ★ A PER-LEG REFUSAL, NOT A `die` (TF-C120). This function is called from
+  # inside the per-leg loop below, so an `exit` here would cost the OTHER legs
+  # their verdicts over one leg's temp file — structurally the same shape
+  # D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN was opened to
+  # end, and against the standing rule that the harness must SURVIVE everything
+  # (one bad unit must never cost us the other thousand; every unit gets a
+  # verdict). Low trigger probability — but the shape, not the odds, is what
+  # that anchor is about, and the new self-test does not cover this arm.
+  # It reuses this function's OWN refusal mechanism, the same one both failure
+  # exits below use — set LEG_CC_WHY, leave LEG_CC[$leg] unset, return
+  # non-zero — so the caller's existing `[[ -z "${LEG_CC[$leg]:-}" ]]` branch
+  # records `skipped-build-input-missing` for THIS leg and CONTINUES. NOT a
+  # silent skip: `leg_marks_missing` warns loudly, the leg reaches a NAMED
+  # verdict the Step-9 ledger counts (so it can never become a ledger hole),
+  # and the reason below is what the caller prints as "The resolver's ladder".
+  # rc 5 only to sit apart from the resolver's own rc and from the `return 4`
+  # below; every caller tests truthiness, never the value.
+  # The `if` (never `_err="$(mktemp)"; rc=$?`) keeps errexit out of it — the
+  # assignment-then-`$?` shape would EXIT before the rc could be read, the same
+  # trap the resolver call below documents.
+  if ! _err="$(mktemp)"; then
+    LEG_CC_WHY="mktemp could not create a temp file for the target-cc probe's stderr (TMPDIR='${TMPDIR:-<unset>}'), so the candidate ladder was never captured and no compiler could be resolved for this leg"
+    unset "LEG_CC[$leg]"
+    return 5
+  fi
+  # rc DIRECTLY off python3, never after a pipe, and the `if` keeps errexit out
+  # of it — the `_out=$(...); rc=$?` shape would EXIT here on the refusal this
+  # function exists to report.
+  # ★ CITED BY PREDICATE, NOT BY LINE. This comment used to point at `:3690`
+  # (the trap that made a whole classifier dead code) and `:3561` (the correct
+  # idiom); ✔MEASURED 2026-08-05 (TF-C120), BOTH were already wrong before the
+  # guard above shifted them further — `:3561` was `else` and `:3690` an
+  # unrelated subshell comment even at HEAD. Grep the spellings instead:
+  #   · the trap, written out in full — grep `is LOAD-BEARING, not style`
+  #     (the CLI build's `|| _rc=$?` note: a plain `x="$(fn)"; _rc=$?` under
+  #     `set -Eeuo pipefail` + ERR trap exits before the rc is ever read).
+  #   · what it COST — grep `DEAD CODE` (the per-leg CLI classifier, which the
+  #     early exit skipped entirely for every failing leg).
+  #   · the correct idiom is the `if`/`else _rc=$?` two lines below, and the
+  #     leg plan's `_plan_rc` capture.
+  if _out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+                --resolve-target-cc "$leg" 2>"$_err")"; then _rc=0; else _rc=$?; fi
+  # Flattened to one line: it becomes a ledger DETAIL, which Step 9 prints per leg.
+  LEG_CC_WHY="$(tr '\n' ' ' < "$_err" 2>/dev/null || true)"; rm -f "$_err"
+  [[ "$_rc" -eq 0 ]] || return "$_rc"
+  # `<cc>\t<triple>` — TAB-separated for the same reason acq_field is: neither
+  # field may be re-derived here, and a compiler PATH can contain spaces.
+  LEG_CC["$leg"]="${_out%%$'\t'*}"
+  LEG_CC_MACHINE["$leg"]="${_out#*$'\t'}"
+  [[ -n "${LEG_CC[$leg]}" ]] || {
+    LEG_CC_WHY="the resolver exited 0 but named no compiler (output: '$_out')"
+    unset "LEG_CC[$leg]"; return 4
+  }
+  return 0
+}
 for leg in "${LEG_ORDER[@]}"; do
   # A leg this host cannot RUN needs no helper extension — do not manufacture an
   # environmental skip out of a cross-compiler it would never invoke.
   [[ "${LEG_RUN_MODE[$leg]}" != "skip" ]] || continue
   # A leg with no libraries is not built, so there is no run to stage for it.
   [[ -n "${LEG_TCL_LIB[$leg]:-}" ]] || continue
-  declare -a _ccs=(); read -r -a _ccs <<< "${LEG_CC_CANDIDATES[$leg]}"
-  cc=""
-  for c in ${_ccs[@]+"${_ccs[@]}"}; do
-    command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }
-  done
-  if [[ -z "$cc" && -n "${LEG_CC_PKG[$leg]}" ]]; then
-    warn "[$leg] no target C compiler on PATH (${_ccs[*]:-<none declared>}) — trying to install ${LEG_CC_PKG[$leg]}"
+  if ! resolve_leg_target_cc "$leg" && [[ -n "${LEG_CC_PKG[$leg]}" ]]; then
+    warn "[$leg] no candidate compiler on PATH targets ${LEG_SPEC[$leg]} — trying to install ${LEG_CC_PKG[$leg]}"
+    info "      ${LEG_CC_WHY}"
     # Subshell: a package manager that cannot supply it costs this leg its RUN,
     # never the whole harness.
     ( pkg_install "${LEG_CC_PKG[$leg]}" ) || true
-    hash -r
-    for c in ${_ccs[@]+"${_ccs[@]}"}; do
-      command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }
-    done
+    hash -r    # this shell's own command hash; the resolver spawns fresh and
+               # reads $PATH itself, so this is for the rest of THIS driver.
+    resolve_leg_target_cc "$leg" || true
   fi
-  if [[ -z "$cc" ]]; then
+  if [[ -z "${LEG_CC[$leg]:-}" ]]; then
     leg_marks_missing "$leg" "it is still BUILT, but this host cannot RUN its corpus" \
-      "no target C compiler for ${LEG_SPEC[$leg]} — tried ${_ccs[*]:-<none declared>}${LEG_CC_PKG[$leg]:+ (apt: ${LEG_CC_PKG[$leg]})}. It builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s; NOT falling back to the host compiler, because a HOST-arch extension the $leg fixture cannot load would false-red every loadext-* test as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]"
+      "no declared targetCc candidate both EXISTS here and TARGETS ${LEG_SPEC[$leg]} — tried ${LEG_CC_CANDIDATES[$leg]:-<none declared>}${LEG_CC_PKG[$leg]:+ (apt: ${LEG_CC_PKG[$leg]})}. It builds this leg's ${LEG_LOADEXT_NAME[$leg]:-loadext helper}, the extension the loadext corpus dlopen()s; NOT falling back to a compiler that targets something else, because an extension the $leg fixture cannot load would false-red every loadext-* test as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]. The resolver's ladder: ${LEG_CC_WHY:-<no diagnostic>}"
     continue
   fi
-  LEG_CC["$leg"]="$cc"
-  info "[$leg] target cc: $cc"
+  info "[$leg] target cc: ${LEG_CC[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
+  [[ -z "${LEG_CC_WHY// /}" ]] || info "      candidates passed over: ${LEG_CC_WHY}"
 done
 
 _ready=0
@@ -3761,9 +3841,17 @@ declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
 # per-leg resume-engine bookkeeping, surfaced in Step 9
 declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=() LEG_HYGIENE=()
 UNIT_FAILS=0
+# Legs whose corpus could not be run because their loadext helper could not be
+# STAGED. Its own counter, deliberately: it is neither a fixture compile failure
+# (COMPILE_FAILS — the fixture built fine) nor a unit failure (UNIT_FAILS — no
+# unit ran), and folding it into either would print a Step-9 line that names the
+# wrong thing. It is REPORTED in Step 9 and it REDS the run
+# (D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN).
+STAGE_FAILS=0
 # tester.tcl's cmdlinearg(testdir) default: the fixture `file mkdir`s this subdir of
 # its CWD and cd's into it before any .test body runs, so a test's relative
-# `./libtestloadext.so` resolves HERE. The harness passes no --testdir override.
+# `./libtestloadext.so` (`./testloadext.dll` on a Windows Tcl) resolves HERE. The
+# harness passes no --testdir override.
 SQLITE_TESTDIR_SUBDIR="testdir"
 # How a shared object is produced — DECLARED by the leg (`build.sharedLibFlags` in
 # legs.json), not pattern-matched off its format name here. This used to be a
@@ -3787,29 +3875,93 @@ leg_shared_flags() { printf '%s' "${LEG_SHARED_FLAGS[$1]}"; }
 # find neither from the run dir and silently fall through to a SYSTEM sqlite3.h of
 # an unrelated version.
 #
-# FAIL-LOUD: the compiler was RESOLVED at Step 6, from the leg's own declared
-# `targetCc.candidates`, and a leg that could not resolve one never reaches this
-# function (it carries `skipped-build-input-missing` and its corpus is not run). So
-# by the time we are here the compiler is known to exist, and the only failure left
-# is the COMPILE ITSELF — which dies, loudly. What must never happen is a fallback
-# to the host compiler: that is precisely the defect above, and it is invisible in
-# the results.
-stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>
+# ★★ THE FILE NAME IS A TARGET FACT, NOT A CONSTANT. It was `libtestloadext.so`
+# for all five legs until 2026-08-05. ✔MEASURED from the staged upstream tree,
+# test/loadext.test:26-29: the name is chosen from `tcl_platform(platform)` —
+# `./testloadext.dll` on a Windows Tcl, `./libtestloadext.so` everywhere else —
+# and the `tcl_platform(os) eq Darwin` branch three lines down changes only the
+# compiler FLAGS, never the name. So the pe64 fixture looked for a name this
+# driver never wrote, `[file exists …]` was FALSE, and it fell through to exactly
+# the hardcoded-`gcc` self-build the pre-staging exists to prevent. Each leg now
+# DECLARES the name (`build.loadExtHelperName`, cross-checked against the target
+# OS by harness_legs.py's lint) and the driver reads it.
+#
+# ★★★ AND A FAILURE HERE IS A PER-LEG VERDICT, NOT THE END OF THE RUN.
+# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. This function used
+# to `die` on every failure path, and on 2026-08-05 it did: two legs had already
+# gone GREEN (331,351 and 331,355 units) when the pe64 helper failed to link, and
+# the `die` took the whole run with it — no Step 9, no ledger, no verdict for the
+# two legs that had passed and none for the two that had not been reached. That
+# violates the standing rule that the harness SURVIVES everything: "name the file,
+# resume AFTER it, report the union. One bad unit must never cost us the other
+# thousand." So every failure path below RETURNS, the caller records `poisoned`
+# (the ledger's FAILURE class, from the closed vocabulary in
+# tests/test_support/arm_verdict_ledger.hpp) and CONTINUES to the next leg, and
+# Step 9 both prints the reason and refuses to exit 0.
+#
+# ⚠ WHY `poisoned` AND NOT A SKIP, since the fixture itself built fine: without a
+# target-correct helper this leg's loadext-* units cannot be trusted, and the
+# alternative — run the corpus anyway — hands the fixture back to loadext.test's
+# own `exec gcc`, which is the wrong-arch helper this anchor is named after. A
+# skip would also be WRONG in the other direction: it reads as "nothing to see
+# here" and, being environmental, would leave the run green outside strict mode.
+# `poisoned` says the artefact's result is not trustworthy, which is the true
+# statement, and it is REPORTED rather than silent.
+#
+# ⚠ AND WHY THE WHOLE LEG, not just its 16 loadext units: this driver has no way
+# to give a single upstream unit its own verdict without EXCLUDING it, and
+# curating the corpus to get green is forbidden. The cost is stated plainly in the
+# verdict detail so a reader knows what this run did not cover.
+#
+# The compiler was RESOLVED at Step 6, from the leg's own declared
+# `targetCc.candidates` AND verified against this leg's target, and a leg that
+# could not resolve one never reaches this function (it carries
+# `skipped-build-input-missing` and its corpus is not run). What must never happen
+# is a fallback to the host compiler: that is precisely the defect above, and it
+# is invisible in the results.
+# >>> dss:loadext-stage >>>
+# EXTRACTED AND EXECUTED by test-confound-scope.sh, at top level, under this
+# driver's exact shell options — the same treatment the confound classifier and
+# the src-provenance gate get, and for the same reason: a re-implementation in the
+# test would stay green while the shipped function broke. The battery there
+# asserts the target-keyed NAME, every RETURN path, and — the red-on-disable that
+# matters most — that this block contains no `die`.
+STAGE_WHY=""
+stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>  -> 0 | 1
   local leg="$1" rundir="$2"
   local cc="${LEG_CC[$leg]}"
+  local name="${LEG_LOADEXT_NAME[$leg]:-}"
   local src="$SQLITE_DIR/src/test_loadext.c"
-  local dst="$rundir/$SQLITE_TESTDIR_SUBDIR/libtestloadext.so"
-  [[ -f "$src" ]] || die "[$leg] sqlite extension source not found: $src"
-  command -v "$cc" >/dev/null 2>&1 || die \
-"[$leg] target C compiler '$cc' resolved at Step 6 is no longer on PATH — it builds this leg's libtestloadext.so, the extension the loadext corpus dlopen()s.
-      NOT falling back to the host compiler: sqlite's loadext.test would then build a HOST-arch extension the $leg fixture cannot load, and every
-      loadext-* test would false-red as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]."
-  mkdir -p "$(dirname "$dst")"
-  # leg_shared_flags is a deliberate word-split flag list.
-  "$cc" $(leg_shared_flags "$leg") -I"$SQLITE_DIR/src" -I"$BLD" -o "$dst" "$src" \
-    || die "[$leg] could not build the loadext helper extension: $cc $(leg_shared_flags "$leg") -o $dst $src"
-  info "[$leg] loadext helper -> $dst (built by $cc)"
+  STAGE_WHY=""
+  if [[ -z "$name" ]]; then
+    STAGE_WHY="this leg declares no build.loadExtHelperName, so the harness does not know what file sqlite's test/loadext.test will look for on ${LEG_SPEC[$leg]}. Staging it under a guessed name is invisible to the corpus, which then builds its own with a hardcoded compiler. Declare it in legs.json (harness_legs.py --lint checks it against the target OS)."
+    return 1
+  fi
+  local dst="$rundir/$SQLITE_TESTDIR_SUBDIR/$name"
+  local log="$OUT_DIR/$leg/loadext-helper.log"
+  if [[ ! -f "$src" ]]; then
+    STAGE_WHY="sqlite extension source not found: $src — the staged tree is incomplete, so no leg's helper can be built from it."
+    return 1
+  fi
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    STAGE_WHY="the target C compiler '$cc' resolved at Step 6 (it reported '${LEG_CC_MACHINE[$leg]:-<unrecorded>}') is NO LONGER on PATH. NOT falling back to the host compiler: sqlite's loadext.test would then build a wrong-target extension the $leg fixture cannot load, and every loadext-* test would false-red as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]."
+    return 1
+  fi
+  mkdir -p "$(dirname "$dst")" "$(dirname "$log")" || {
+    STAGE_WHY="could not create the run's testdir ($(dirname "$dst")) — check free space and permissions."
+    return 1
+  }
+  # leg_shared_flags is a deliberate word-split flag list. The compiler's own
+  # diagnostics go to a per-leg log so the ledger line stays one line and the
+  # evidence survives; rc is taken DIRECTLY off the compiler, never after a pipe.
+  if ! "$cc" $(leg_shared_flags "$leg") -I"$SQLITE_DIR/src" -I"$BLD" -o "$dst" "$src" >"$log" 2>&1; then
+    STAGE_WHY="the loadext helper did not build: $cc $(leg_shared_flags "$leg") -I$SQLITE_DIR/src -I$BLD -o $dst $src  [full diagnostics: $log]  first line: $(head -1 "$log" 2>/dev/null || printf '<empty log>')"
+    return 1
+  fi
+  info "[$leg] loadext helper -> $dst (built by $cc, which reports '${LEG_CC_MACHINE[$leg]:-<unrecorded>}')"
+  return 0
 }
+# <<< dss:loadext-stage <<<
 for leg in "${LEG_ORDER[@]}"; do
   # ── the three ways a leg does not reach the corpus, each already NAMED ──────
   # None of them is a host test: they are the recorded OUTCOMES of Step 6 and
@@ -3866,7 +4018,23 @@ for leg in "${LEG_ORDER[@]}"; do
     leg_carrier_old="${!leg_carrier_name:-}"
     info "[$leg] the launcher does NOT inherit this driver's environment (envTransfer '$leg_env_verb') — variables that are SET at spawn time cross via $leg_carrier_name; candidates: ${LEG_ENV_FORWARD[*]}"
   fi
-  stage_loadext_extension "$leg" "$rundir"
+  # ★ RECOVERABLE. A helper that cannot be staged costs THIS leg its corpus and
+  # nothing else — the run continues to every remaining leg, Step 9 prints the
+  # reason, and $STAGE_FAILS keeps the run from exiting 0. Before 2026-08-05 this
+  # call was `stage_loadext_extension "$leg" "$rundir"` against a function that
+  # `die`d, so one leg's link error ended a run in which two legs had already
+  # gone green (D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN).
+  # >>> dss:loadext-verdict >>>
+  if ! stage_loadext_extension "$leg" "$rundir"; then
+    STAGE_FAILS=$((STAGE_FAILS + 1))
+    LEG_VERDICT["$leg"]="poisoned"
+    LEG_VERDICT_DETAIL["$leg"]="the fixture BUILT (${FIXTURE[$leg]}), but this leg's loadext helper extension ('${LEG_LOADEXT_NAME[$leg]:-<undeclared>}') could not be staged, so its corpus was NOT run and this run covers NONE of its units. $STAGE_WHY"
+    UNIT_VERDICT["$leg"]="not run [poisoned] — loadext helper staging FAILED: $STAGE_WHY"
+    warn "[$leg] POISONED — loadext helper staging FAILED; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+    warn "      $STAGE_WHY"
+    continue
+  fi
+  # <<< dss:loadext-verdict <<<
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
   # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the
@@ -4551,6 +4719,19 @@ if [[ "$COMPILE_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) failed to compile the testfixture — inspect the compile.log diagnostics.%s\n' "$C_RED" "$COMPILE_FAILS" "$C_RST"
   exit 1
 fi
+# ★ A DEGRADED LEG STILL REDS THE RUN. The staging failure is RECOVERABLE — the
+# run reached every other leg and every one of them has a verdict — but recovering
+# from it is not the same as it not having happened: the leg's entire corpus went
+# unrun, so the run must not be able to end 0 and read as coverage
+# (D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN). Its own branch,
+# and its own sentence, because "failed to compile the testfixture" above would be
+# false: those fixtures built.
+if [[ "${STAGE_FAILS:-0}" -gt 0 ]]; then
+  printf '\n%s%d leg(s) BUILT their testfixture but could not stage the loadext helper the corpus dlopen()s — their units did NOT run.%s\n' "$C_RED" "$STAGE_FAILS" "$C_RST"
+  printf 'Each one is named [poisoned] above with the exact reason and its %s/<leg>/loadext-helper.log.\n' "$OUT_DIR"
+  printf 'The run CONTINUED past it and every other leg reached a verdict — that is the recovery, not an excuse.\n'
+  exit 1
+fi
 # ★ THE CLI IS PART OF THE RUN'S VERDICT, NOT AN EXTRA. A CLI that failed to
 # build, or whose smoke gate went red, exits non-zero exactly as a fixture
 # failure does — otherwise "we can run all sqlite3 CLI in any host" would be a
@@ -4577,7 +4758,13 @@ if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # compiled ... GREEN", which on the old driver meant "every leg this host happened
 # to produce" — a sentence that got smaller as the host got less capable, without
 # ever saying so. It now names what was verified out of what was DECLARED.
-pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; 0 poisoned)"
+# ★ THE POISONED COUNT IS READ FROM THE LEDGER, NOT SPELLED `0`. It was a literal
+# until 2026-08-05, which was true only because every site that set `poisoned` also
+# incremented a counter with its own `exit 1` above — a correctness that lived in
+# another function and could be broken by adding one verdict site (this cycle added
+# one). A closing line that hardcodes its own denominator is the same defect class
+# as the ledger accounting hole it sits next to.
+pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; $LEDGER_FAILED poisoned)"
 # The CLI's own closing claim, BOUNDED the same way — it names how many legs
 # built it and how many actually EXECUTED the gate, because "built" and "ran the
 # 14 assertions" are different facts and a cross leg with no launcher on this

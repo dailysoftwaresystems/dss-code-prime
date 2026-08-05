@@ -66,7 +66,10 @@ TMPRUN=$(mktemp /tmp/confscope_XXXXXX)
 # ONE trap owns every temp — a second `trap … EXIT` would silently replace this one).
 TMPPROV=$(mktemp /tmp/confprov_XXXXXX)
 PROVTMP=$(mktemp -d /tmp/confprovd_XXXXXX)
-trap 'rm -f "$TMPRUN" "$TMPPROV"; rm -rf "$PROVTMP"' EXIT
+# Scratch for the loadext-staging section — created HERE, beside the others, and
+# added to the ONE trap for the reason the comment above gives.
+LOADTMP=$(mktemp -d /tmp/confload_XXXXXX)
+trap 'rm -f "$TMPRUN" "$TMPPROV"; rm -rf "$PROVTMP" "$LOADTMP"' EXIT
 
 # The classifier's ONE input for confound scoping: the leg's RUN MODE, as the
 # host-independent leg resolver (harness_legs.py) reports it — `native` when this
@@ -122,7 +125,8 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=46      # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=64      # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+                         # + 18 loadext staging (6 of them compiler-gated)
 pass=0; fail=0; skip=0
 check() { # <label> <expected-substring> <actual>
   if [[ "$3" == *"$2"* ]]; then echo "  ok   $1"; pass=$((pass+1))
@@ -428,6 +432,136 @@ else
   check "DSS_COMMIT matching HEAD is verified"  "DSS_COMMIT verified" "$OK_OUT"
   BAD_OUT="$(gate_run "$WT" "$ORIGIN" "" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "0")"
   check "DSS_COMMIT that is not here DIES"      "does not resolve to a commit" "$BAD_OUT"
+fi
+
+echo
+echo "=== THE LOADEXT HELPER: a target-keyed NAME, and a failure that does NOT kill the run ==="
+# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN.
+#
+# ✔MEASURED 2026-08-05 on a WSL/Ubuntu x86_64 host: two legs had already reported
+# GREEN (331,351 and 331,355 units) when `stage_loadext_extension` failed to link
+# the pe64 helper and `die`d. The run ENDED there — no Step 9, no ledger, no
+# verdict for the two legs that had passed and none for the two never reached. The
+# shipped function must now RETURN on every failure path so the caller can record
+# `poisoned` and CONTINUE, and it must stage the helper under the name THIS LEG'S
+# TARGET looks for (`testloadext.dll` on a Windows Tcl, `libtestloadext.so`
+# elsewhere — MEASURED at sqlite test/loadext.test:26-29), not one POSIX constant.
+#
+# Extracted and run the same way as the classifier above: at TOP LEVEL, under the
+# driver's exact `set -Eeuo pipefail`, with `die` defined so that reintroducing one
+# is VISIBLE (exit 9) instead of dying as "die: command not found".
+STAGEBLK=$(sed -n -e '/^# >>> dss:loadext-stage >>>$/,/^# <<< dss:loadext-stage <<<$/p' "$SH")
+VERDBLK=$(sed -n -e '/^  # >>> dss:loadext-verdict >>>$/,/^  # <<< dss:loadext-verdict <<<$/p' "$SH")
+if [ -z "$STAGEBLK" ]; then echo "FATAL: could not extract the loadext-stage block"; exit 1; fi
+if [ -z "$VERDBLK" ]; then echo "FATAL: could not extract the loadext-verdict block"; exit 1; fi
+echo "extracted $(printf '%s\n' "$STAGEBLK" | wc -l) staging + $(printf '%s\n' "$VERDBLK" | wc -l) verdict lines from the shipped script"
+
+# A stand-in sqlite tree. NOTHING here reads the real staged clone: this file is a
+# refuse-to-start gate for the driver and must run on a machine that has never
+# cloned sqlite.
+LOAD_SQ="$LOADTMP/sqlite"; LOAD_BLD="$LOADTMP/bld"; LOAD_OUT="$LOADTMP/out"
+mkdir -p "$LOAD_SQ/src" "$LOAD_BLD" "$LOAD_OUT/pe-shaped" "$LOAD_OUT/posix-shaped" "$LOAD_OUT/nameless"
+printf 'int dss_selftest_helper(void) { return 42; }\n' > "$LOAD_SQ/src/test_loadext.c"
+
+# Two legs whose ONLY difference is the declared helper name — that is the property
+# under test. The labels are shaped like the catalogue's, not copied from it: this
+# battery must not red when a leg is added or renamed in legs.json.
+declare -A LEG_CC=(          [pe-shaped]="__none__"  [posix-shaped]="__none__"  [nameless]="__none__" )
+declare -A LEG_CC_MACHINE=(  [pe-shaped]="x86_64-w64-mingw32" [posix-shaped]="x86_64-linux-gnu" [nameless]="x86_64-linux-gnu" )
+declare -A LEG_LOADEXT_NAME=([pe-shaped]="testloadext.dll" [posix-shaped]="libtestloadext.so" [nameless]="" )
+declare -A LEG_SHARED_FLAGS=([pe-shaped]="-shared" [posix-shaped]="-shared -fPIC" [nameless]="-shared" )
+declare -A LEG_SPEC=(        [pe-shaped]="x86_64:pe64-x86_64-windows-exec" [posix-shaped]="x86_64:elf64-x86_64-linux-exec" [nameless]="x86_64:elf64-x86_64-linux-exec" )
+
+stage_run() {   # stage_run <leg> <rundir> [<sqlite-dir override>]
+  {
+    echo 'set -Eeuo pipefail'          # the driver's own options (build-and-test.sh:64)
+    echo 'info() { echo "      INFO: $*"; }'
+    # ★ THE RED-ON-DISABLE THAT MATTERS. If a future edit puts a `die` back into
+    # the staging block, this prints DIE: and exits 9 — a distinct, asserted
+    # outcome — instead of the block failing for the unrelated reason that `die`
+    # is not defined out here.
+    echo 'die()  { echo "DIE: $*"; exit 9; }'
+    declare -p LEG_CC LEG_CC_MACHINE LEG_LOADEXT_NAME LEG_SHARED_FLAGS LEG_SPEC
+    printf 'SQLITE_DIR=%q\n' "${3:-$LOAD_SQ}"
+    printf 'BLD=%q\n' "$LOAD_BLD"
+    printf 'OUT_DIR=%q\n' "$LOAD_OUT"
+    echo 'SQLITE_TESTDIR_SUBDIR="testdir"'
+    echo 'leg_shared_flags() { printf "%s" "${LEG_SHARED_FLAGS[$1]}"; }'
+    printf '%s\n' "$STAGEBLK"
+    printf 'if stage_loadext_extension %q %q; then echo "RC=0"; else echo "RC=$?"; fi\n' "$1" "$2"
+    echo 'echo "WHY=[$STAGE_WHY]"'
+  } > "$TMPRUN"
+  "$BASH" "$TMPRUN" 2>&1
+}
+
+echo "--- a leg that declares NO helper name: refused, and it says which key ---"
+N=$(stage_run nameless "$LOAD_OUT/nameless/run"); echo "$N" | sed 's/^/      /'
+check "an undeclared helper name RETURNS 1"        "RC=1"                "$N"
+check "...naming the key to add"                   "loadExtHelperName"   "$N"
+
+echo "--- the sqlite source is missing: refused, and it names the file ---"
+M=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run" "$LOADTMP/no-such-tree")
+echo "$M" | sed 's/^/      /'
+check "a missing extension source RETURNS 1"       "RC=1"                "$M"
+check "...naming the path it looked for"           "no-such-tree"        "$M"
+
+echo "--- the resolved compiler vanished from PATH: refused, and it cites the anchor ---"
+G=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run"); echo "$G" | sed 's/^/      /'
+check "a compiler no longer on PATH RETURNS 1"     "RC=1"                "$G"
+check "...and REFUSES to fall back to the host cc" "D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO" "$G"
+
+# ── STRUCTURAL: the shipped text itself, because "it returns" is only half ────
+# The other half is that the CALLER turns that return into a named verdict and
+# keeps going. Asserted against the shipped lines rather than by re-running a
+# 4,600-line driver.
+check_eq "the staging block contains NO die"  "" \
+  "$(printf '%s\n' "$STAGEBLK" | grep -n '^\s*die \|[^_a-zA-Z]die "' | head -1)"
+check_eq "the verdict block contains NO die"  "" \
+  "$(printf '%s\n' "$VERDBLK"  | grep -n '^\s*die \|[^_a-zA-Z]die "' | head -1)"
+check "the caller records the ledger's FAILURE class" 'LEG_VERDICT["$leg"]="poisoned"' "$VERDBLK"
+check "the caller CONTINUES to the next leg"          "continue"                       "$VERDBLK"
+check "the caller counts the degraded leg"            "STAGE_FAILS=\$((STAGE_FAILS + 1))" "$VERDBLK"
+check "Step 9 REDS the run on a degraded leg" \
+  'if [[ "${STAGE_FAILS:-0}" -gt 0 ]]; then' "$(cat "$SH")"
+
+# ── compiler-gated: the SUCCESS path and a real compile failure ──────────────
+# These need a working C compiler for the HOST (any target — the property under
+# test is the file NAME and the return code, not the object format).
+LOAD_CC=""
+for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { LOAD_CC="$c"; break; } done
+if [ -z "$LOAD_CC" ]; then
+  echo "  SKIP no host C compiler (tried cc gcc clang) — 6 assertions not run"
+  echo "       (the staging function's success path and its compile-failure path)"
+  skip=$((skip+6))
+else
+  echo "--- the success path, with $LOAD_CC ---"
+  LEG_CC[pe-shaped]="$LOAD_CC"; LEG_CC[posix-shaped]="$LOAD_CC"
+  P=$(stage_run pe-shaped "$LOAD_OUT/pe-shaped/run"); echo "$P" | sed 's/^/      /'
+  check "a staged helper RETURNS 0" "RC=0" "$P"
+  if [ -f "$LOAD_OUT/pe-shaped/run/testdir/testloadext.dll" ]; then
+    echo "  ok   the helper lands under the leg's DECLARED name"; pass=$((pass+1))
+  else
+    echo "  FAIL the helper is not at run/testdir/testloadext.dll"; fail=$((fail+1))
+  fi
+  # RED-ON-DISABLE for the target-keying: the pre-fix driver wrote ONE POSIX name
+  # for every leg, so a pe64 fixture looked for a file that was never there.
+  if [ -f "$LOAD_OUT/pe-shaped/run/testdir/libtestloadext.so" ]; then
+    echo "  FAIL the old hardcoded POSIX name is still being written for a Windows leg"; fail=$((fail+1))
+  else
+    echo "  ok   the old hardcoded POSIX name is NOT written for a Windows leg"; pass=$((pass+1))
+  fi
+  Q=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run2"); echo "$Q" | sed 's/^/      /'
+  if [ -f "$LOAD_OUT/posix-shaped/run2/testdir/libtestloadext.so" ]; then
+    echo "  ok   a sibling leg gets ITS OWN declared name from the same code"; pass=$((pass+1))
+  else
+    echo "  FAIL the sibling leg's declared name was not honoured"; fail=$((fail+1))
+  fi
+
+  echo "--- a REAL compile failure: reported, never fatal ---"
+  LEG_SHARED_FLAGS[posix-shaped]="-shared -fdss-no-such-option"
+  F=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run3"); echo "$F" | sed 's/^/      /'
+  check "a failed helper compile RETURNS 1 (it does NOT die)" "RC=1" "$F"
+  check "...and points at the full diagnostics"               "loadext-helper.log" "$F"
 fi
 
 echo

@@ -377,6 +377,208 @@ def spec_target_os(spec):
     return parts[-2] if len(parts) >= 3 else ""
 
 
+# ── THE TARGET C COMPILER — A NAME IS NOT A DECLARATION OF TARGET ───────────
+#
+# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN, and the anchor it
+# grew out of, D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO.
+#
+# ✔MEASURED 2026-08-05, a full build-and-test.sh run on a WSL/Ubuntu x86_64 host:
+# both elf legs went GREEN (6 err / 331,351 and 5 err / 331,355, all known
+# confounds) and the run then DIED in /usr/bin/ld —
+#   "relocation R_X86_64_PC32 against symbol `sqlite3_api' can not be used when
+#    making a shared object; recompile with -fPIC" ... "final link failed"
+# — while building the pe64 leg's loadext helper. pe64's units never ran.
+#
+# THE CAUSE WAS THE CATALOGUE, NOT THE GUARD. build-and-test.sh:2615 and :3804
+# both state, emphatically and correctly, that this harness must never fall back
+# to the host compiler, because "a HOST-arch extension the $leg fixture cannot
+# load would false-red every loadext-* test as a genuine DSS failure". Neither
+# guard fired: legs.json declared pe64's targetCc candidates as
+# ["x86_64-w64-mingw32-gcc", "gcc"], the mingw cross-compiler was absent
+# (✔MEASURED on that host), and so the resolver picked plain host `gcc`
+# LEGITIMATELY — the config had already licensed the fallback the guards forbid.
+#
+# ★ AND THE FIX IS NOT "DELETE gcc FROM THAT LIST". ✔MEASURED 2026-08-05 on this
+# project's Windows box: `gcc -dumpmachine` there prints `x86_64-w64-mingw32`,
+# i.e. on a native Windows host the bare name `gcc` IS the pe64 leg's correct
+# compiler (Git for Windows and Strawberry both ship mingw gcc under it). Deleting
+# it would host-lock the leg in the other direction, which is the same defect
+# wearing a different hat (D-HARNESS-CROSS-HOST-ANY-TARGET).
+#
+# So the candidate list stays a list of names to TRY, and ACCEPTANCE is decided by
+# asking the compiler what it targets and comparing that against the leg's own
+# declared `spec`. That is a property of the LEG (its target), checked against a
+# property of the CANDIDATE (its own answer) — no host test, no format-name branch,
+# and no new catalogue key, because the leg already declares its target.
+#
+# ★★ IT GENERALISES BEYOND pe64, WHICH IS THE ARGUMENT FOR DOING IT THIS WAY. The
+# elf64-x86_64 leg declares candidates ["cc", "gcc", "clang"]; on the project's
+# NATIVE arm64 Linux VPS those resolve to an aarch64 compiler, which is exactly
+# the wrong-arch helper D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after.
+# The same one check refuses it, on a host nobody had to enumerate here.
+
+# `-dumpmachine` is THE question, asked ONE way. DOCUMENTED: GCC and Clang both
+# implement it and print the target triple on a single line.
+# ✔MEASURED 2026-08-05: gcc -> `x86_64-linux-gnu` (WSL) and `x86_64-w64-mingw32`
+# (Windows/Strawberry), aarch64-linux-gnu-gcc -> `aarch64-linux-gnu`.
+# ⚠ Apple clang is DOCUMENTED, NOT MEASURED — this project's Mac was asleep and
+# unreachable when this landed, and waking a personal machine needs the operator.
+# If a Mac ever rejects its own `clang` here, the diagnostic names this exact
+# probe and the leg degrades to `skipped-build-input-missing` (loud, and STILL
+# BUILT) — never to a silently wrong-target helper, which is the outcome that
+# reads as a DSS miscompile.
+CC_TARGET_MACHINE_FLAG = "-dumpmachine"
+
+
+def cc_machine_argv(cc):
+    """The argv that asks a compiler what it targets. Named ONCE, here, so the
+    two drivers cannot come to ask the question two different ways."""
+    return [cc, CC_TARGET_MACHINE_FLAG]
+
+
+def machine_target_os(token):
+    """The OS one TOKEN of a target triple names, in this file's own OS
+    vocabulary, or "" when it names none.
+
+    Matching is by PREFIX against OS_ALIASES, longest alias first, because a
+    triple's OS component routinely carries a version or a flavour suffix that
+    an exact lookup would miss: `mingw32`, `darwin24.4.0`, `macosx14.0`. Longest
+    first so a short alias can never shadow a longer one that also matches.
+    Vendor tokens (`pc`, `apple`, `w64`, `unknown`) and ABI tokens (`gnu`,
+    `musl`, `eabi`) match nothing, which is what makes the scan safe to run over
+    every token rather than guessing which position the OS is in — triples come
+    both 3-part (`x86_64-linux-gnu`) and 4-part (`x86_64-pc-linux-gnu`)."""
+    key = (token or "").strip().lower()
+    if not key:
+        return ""
+    for alias in sorted(OS_ALIASES, key=len, reverse=True):
+        if key.startswith(alias):
+            return OS_ALIASES[alias]
+    return ""
+
+
+def machine_matches_spec(machine, spec):
+    """Does a compiler reporting MACHINE produce objects for SPEC's target?
+
+    Returns (ok, reason) — the reason is populated on BOTH outcomes so a driver
+    can log why it accepted as readily as why it refused. PURE: no filesystem, no
+    process, no host, so the whole rule is unit-testable (see self_test)."""
+    first = ((machine or "").strip().splitlines() or [""])[0].strip()
+    if not first:
+        return (False, "printed no target triple at all")
+    want_arch = canon_arch(spec_target_arch(spec))
+    want_os = spec_target_os(spec)
+    tokens = [t for t in first.split("-") if t]
+    got_arch = canon_arch(tokens[0]) if tokens else ""
+    if got_arch != want_arch:
+        return (False, "targets arch '%s' (triple '%s'); this leg needs '%s'"
+                       % (got_arch or "<unreadable>", first, want_arch))
+    got_os = ""
+    for tok in tokens[1:]:
+        got_os = machine_target_os(tok)
+        if got_os:
+            break
+    if not got_os:
+        return (False, "triple '%s' names no OS this catalogue recognises "
+                       "(known: %s); this leg needs '%s'"
+                       % (first, ", ".join(sorted(set(OS_ALIASES.values()))),
+                          want_os or "<unreadable from the leg's spec>"))
+    if got_os != want_os:
+        return (False, "targets OS '%s' (triple '%s'); this leg needs '%s'"
+                       % (got_os, first, want_os or "<unreadable from the leg's spec>"))
+    return (True, "triple '%s' targets %s/%s" % (first, got_arch, got_os))
+
+
+def _run_machine_probe(argv):
+    """(rc, stdout). rc is taken DIRECTLY off the process, never after a pipe."""
+    import subprocess  # local, matching _run_translator: this resolver spawns
+                       # almost nothing and the import stays next to the spawn.
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return 127, "%s" % exc
+    return proc.returncode, proc.stdout
+
+
+def resolve_target_cc(leg, runner=None, which=None):
+    """The FIRST declared candidate that is BOTH present and proves it targets
+    this leg. Returns (cc, machine, rejections) with cc == "" when none does.
+
+    ★ AN UNVERIFIABLE CANDIDATE IS REFUSED, NOT ASSUMED. A compiler whose
+    `-dumpmachine` fails cannot say what it produces, and "accept it anyway" is
+    precisely the silent fallback that cost a run above. The refusal is loud, it
+    names the probe, and it costs the leg its RUN — never its BUILD."""
+    runner = runner or _run_machine_probe
+    which = which or shutil.which
+    spec = leg.get("spec", "")
+    rejections = []
+    for cc in leg.get("build", {}).get("targetCc", {}).get("candidates", []):
+        found = which(cc)
+        if not found:
+            rejections.append("%s: not on PATH" % cc)
+            continue
+        argv = cc_machine_argv(cc)
+        rc, out = runner(argv)
+        if rc != 0:
+            rejections.append(
+                "%s (%s): `%s` exited %d, so it cannot state its target; REFUSED "
+                "rather than assumed — output: %r"
+                % (cc, found, " ".join(argv), rc, (out or "").strip()[:200]))
+            continue
+        ok, why = machine_matches_spec(out, spec)
+        if not ok:
+            rejections.append("%s (%s): %s" % (cc, found, why))
+            continue
+        return (cc, ((out or "").strip().splitlines() or [""])[0].strip(),
+                rejections)
+    return ("", "", rejections)
+
+
+# ── The helper extension the loadext corpus dlopen()s, PER TARGET ───────────
+#
+# ✔MEASURED 2026-08-05 from the staged upstream tree, sqlite `test/loadext.test`
+# lines 24-30, quoted structurally rather than verbatim:
+#
+#     if {$::tcl_platform(platform) eq "windows"} -> ./testloadext.dll
+#     else                                        -> ./libtestloadext.so
+#
+# and `$::tcl_platform(os) eq "Darwin"` changes only the COMPILER FLAGS
+# (`-dynamiclib`), never the name — so a Darwin fixture looks for the `.so`
+# spelling too. DOCUMENTED (Tcl manual): `tcl_platform(platform)` is `windows` on
+# a Windows Tcl and `unix` everywhere else this harness targets.
+#
+# ★ WHY THIS IS A TARGET FACT AND NOT A DRIVER CONSTANT. build-and-test.sh:3801
+# hardcoded `libtestloadext.so` for EVERY leg. A pe64 fixture therefore looked for
+# `./testloadext.dll`, did not find it, and fell through to loadext.test's own
+# `exec gcc` self-build — the exact fallback the pre-staging exists to prevent.
+# The name is declared per leg (`build.loadExtHelperName`) and the lint checks the
+# declaration against the target OS derived from the leg's spec, the same
+# declare-then-cross-check discipline `zconfGuards` / POSIX_ONLY_ZCONF_GUARDS use.
+LOADEXT_HELPER_NAME_BY_TARGET_OS = {
+    "windows": "testloadext.dll",
+    "linux": "libtestloadext.so",
+    "darwin": "libtestloadext.so",
+}
+
+
+def loadext_helper_name(leg):
+    """The declared file name, verbatim. No default and no derivation here: an
+    omitted declaration is a LINT finding, not something this quietly fills in."""
+    return str(leg.get("build", {}).get("loadExtHelperName", ""))
+
+
+def leg_by_label(legs, label, where=""):
+    """ONE leg, by label, or a LegError naming every label there is. One copy,
+    because two subcommands looking a leg up two ways is how their diagnostics
+    come to disagree about what the catalogue contains."""
+    for leg in legs:
+        if leg.get("label") == label:
+            return leg
+    raise LegError("no leg labelled %r in %s (declared: %s)"
+                   % (label, where or CATALOGUE,
+                      ", ".join(l.get("label", "?") for l in legs)))
+
+
 # ── Staged third-party headers, per TARGET ──────────────────────────────────
 #
 # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. The staged zlib header carries the
@@ -1326,6 +1528,10 @@ def emit_sh(resolved):
         put("LEG_SHARED_FLAGS", " ".join(b.get("sharedLibFlags", [])))
         put("LEG_CC_CANDIDATES", " ".join(b.get("targetCc", {}).get("candidates", [])))
         put("LEG_CC_PKG", b.get("targetCc", {}).get("package", ""))
+        # The FILE NAME sqlite's own test/loadext.test looks for on THIS leg's
+        # target (see LOADEXT_HELPER_NAME_BY_TARGET_OS). Emitted so the driver
+        # never spells it, and never spells it once for five different targets.
+        put("LEG_LOADEXT_NAME", b.get("loadExtHelperName", ""))
         put("LEG_LIB_PROVIDER", libs.get("provider", ""))
         put("LEG_LIB_TCL_NAMES", " ".join(libs.get("tclNames", [])))
         put("LEG_LIB_Z_NAMES", " ".join(libs.get("zNames", [])))
@@ -1686,6 +1892,32 @@ def lint(path=CATALOGUE):
                             % label)
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
+        # ── the helper extension's FILE NAME, per target ─────────────────────
+        # DECLARED, then cross-checked against the target OS the spec already
+        # names — the same discipline as POSIX_ONLY_ZCONF_GUARDS above, and for
+        # the same reason: the value is DERIVABLE, so a declaration that
+        # disagrees with the target is a defect a lint can catch host-free
+        # instead of a corpus quietly building its own helper hours later
+        # (D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN).
+        declared_helper = build.get("loadExtHelperName")
+        want_helper = LOADEXT_HELPER_NAME_BY_TARGET_OS.get(target_os)
+        if not declared_helper:
+            findings.append(
+                "leg '%s': no build.loadExtHelperName — every leg declares the "
+                "file name sqlite's test/loadext.test looks for on ITS target "
+                "(MEASURED at test/loadext.test:26-29: '%s' on a Windows Tcl, "
+                "'%s' elsewhere). Omitting it is how one POSIX spelling came to "
+                "be staged for a Windows leg, whose fixture then never found it "
+                "and self-built one with a hardcoded `gcc`."
+                % (label, LOADEXT_HELPER_NAME_BY_TARGET_OS["windows"],
+                   LOADEXT_HELPER_NAME_BY_TARGET_OS["linux"]))
+        elif target_os in TARGET_OS_NAMES and declared_helper != want_helper:
+            findings.append(
+                "leg '%s': targets OS '%s' but declares loadExtHelperName %r; "
+                "sqlite's test/loadext.test looks for %r there. A helper staged "
+                "under any other name is invisible to the corpus, which then "
+                "falls back to building its own with a hardcoded compiler."
+                % (label, target_os, declared_helper, want_helper))
     # One staged zinc/ per recipeTransform is only sound if every leg sharing a
     # transform wants the SAME header. header_stages() raises on a conflict; here
     # that is a finding rather than a crash, so `--lint` reports it beside the
@@ -2103,8 +2335,13 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 24,
+          len(statements) == 1 + len(labels) * 25,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    check("the sh emitter carries the helper extension's target-keyed name",
+          "LEG_LOADEXT_NAME[" in sh,
+          "without it build-and-test.sh spells one POSIX file name for five "
+          "targets, which is D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-"
+          "ABORTS-THE-RUN's second half")
     check("the sh emitter carries the launcher's path namespace",
           "LEG_PATH_TRANSLATION[" in sh and "LEG_PATH_TRANSLATOR[" in sh,
           "build-and-test.sh cannot translate a launcher's paths without it")
@@ -2260,6 +2497,149 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               "dss", runner=lambda a: "  --resolve-library <path>  read a binary"),
           "assuming it would silently emit an artefact with the wrong identity")
 
+    # ── the target C compiler: a NAME is not a declaration of TARGET ─────────
+    # D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. Every triple
+    # below is either ✔MEASURED on a machine this project owns (marked) or a
+    # DOCUMENTED spelling of the same shape; the rule under test is pure, so it
+    # is tested as a table rather than by running a compiler.
+    check("the probe argv is spelled ONE way",
+          cc_machine_argv("gcc") == ["gcc", "-dumpmachine"])
+    for triple, spec, want in [
+        # ✔MEASURED 2026-08-05, WSL/Ubuntu x86_64 — `gcc -dumpmachine`.
+        ("x86_64-linux-gnu", "x86_64:elf64-x86_64-linux-exec", True),
+        # ★ THE DEFECT ITSELF: that same host gcc, offered for the pe64 leg.
+        ("x86_64-linux-gnu", "x86_64:pe64-x86_64-windows-exec", False),
+        # ✔MEASURED 2026-08-05, this project's Windows box — `gcc -dumpmachine`
+        # AND `x86_64-w64-mingw32-gcc -dumpmachine` both print this, which is why
+        # the bare name `gcc` must stay a legitimate pe64 candidate.
+        ("x86_64-w64-mingw32", "x86_64:pe64-x86_64-windows-exec", True),
+        ("x86_64-w64-mingw32", "x86_64:elf64-x86_64-linux-exec", False),
+        # ✔MEASURED 2026-08-05, WSL — `aarch64-linux-gnu-gcc -dumpmachine`.
+        ("aarch64-linux-gnu", "arm64:elf64-aarch64-linux-exec", True),
+        # ★ D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO, both directions: the arm64
+        # host's native gcc offered for the x86_64 leg, and vice versa.
+        ("aarch64-linux-gnu", "x86_64:elf64-x86_64-linux-exec", False),
+        ("x86_64-linux-gnu", "arm64:elf64-aarch64-linux-exec", False),
+        # DOCUMENTED clang spellings — 4-part triples, and an OS token carrying a
+        # version suffix, which is why machine_target_os matches by prefix.
+        ("arm64-apple-darwin24.4.0", "arm64:macho64-arm64-darwin-exec", True),
+        ("x86_64-apple-darwin24.4.0", "x86_64:macho64-x86_64-darwin-exec", True),
+        ("arm64-apple-darwin24.4.0", "x86_64:macho64-x86_64-darwin-exec", False),
+        ("x86_64-pc-linux-gnu", "x86_64:elf64-x86_64-linux-exec", True),
+        ("x86_64-alpine-linux-musl", "x86_64:elf64-x86_64-linux-exec", True),
+        ("x86_64-pc-windows-msvc", "x86_64:pe64-x86_64-windows-exec", True),
+        # A triple that names no OS at all (bare metal) matches nothing here.
+        ("arm-none-eabi", "arm64:elf64-aarch64-linux-exec", False),
+        # An i686 compiler is not an x86_64 one, whatever its OS says.
+        ("i686-linux-gnu", "x86_64:elf64-x86_64-linux-exec", False),
+    ]:
+        got, why = machine_matches_spec(triple, spec)
+        check("`%s` %s build %s" % (triple, "CAN" if want else "CANNOT", spec),
+              got == want, "reason given: %s" % why)
+    check("a compiler that printed NOTHING is refused, not read as a match",
+          machine_matches_spec("", "x86_64:elf64-x86_64-linux-exec")[0] is False)
+    check("both outcomes carry a reason",
+          all(machine_matches_spec(t, s)[1]
+              for t, s in [("x86_64-linux-gnu", "x86_64:elf64-x86_64-linux-exec"),
+                           ("x86_64-linux-gnu", "x86_64:pe64-x86_64-windows-exec")]))
+
+    # resolve_target_cc, with the host injected. `which` and the probe are both
+    # stubs, so these cells are reproducible on every machine — including the
+    # WSL cell that produced the measured failure this whole change came from.
+    _pe = leg_by_label(legs, "pe64-x86_64", path)
+    _elf64 = leg_by_label(legs, "elf64-x86_64", path)
+
+    def _host(present, machines):
+        """(which, runner) for a pretend host."""
+        return ((lambda cc: ("/usr/bin/" + cc) if cc in present else None),
+                (lambda argv: (0, machines[argv[0]]) if argv[0] in machines
+                              else (1, "unrecognised option '-dumpmachine'")))
+
+    _w, _r = _host({"gcc", "cc"}, {"gcc": "x86_64-linux-gnu\n",
+                                   "cc": "x86_64-linux-gnu\n"})
+    cc, machine, rej = resolve_target_cc(_pe, runner=_r, which=_w)
+    check("★ THE MEASURED FAILURE, REPRODUCED: a Linux host gcc is NOT accepted "
+          "for the pe64 leg", cc == "",
+          "accepted %r (%s) — this is the fallback that produced "
+          "'relocation R_X86_64_PC32 ... recompile with -fPIC' and killed a run "
+          "after two legs had gone green" % (cc, machine))
+    check("...and the refusal names every candidate it looked at",
+          len(rej) == len(_pe["build"]["targetCc"]["candidates"]),
+          "rejections=%r" % (rej,))
+    check("...naming the absent cross-compiler by name",
+          any("x86_64-w64-mingw32-gcc" in r for r in rej), "%r" % (rej,))
+
+    _w, _r = _host({"gcc"}, {"gcc": "x86_64-w64-mingw32\n"})
+    cc, machine, _ = resolve_target_cc(_pe, runner=_r, which=_w)
+    check("a WINDOWS host's bare `gcc` IS the pe64 leg's compiler",
+          (cc, machine) == ("gcc", "x86_64-w64-mingw32"),
+          "got %r/%r — deleting 'gcc' from the candidates would host-lock this "
+          "leg in the other direction" % (cc, machine))
+
+    _w, _r = _host({"x86_64-w64-mingw32-gcc", "gcc"},
+                   {"x86_64-w64-mingw32-gcc": "x86_64-w64-mingw32\n",
+                    "gcc": "x86_64-linux-gnu\n"})
+    cc, _, _ = resolve_target_cc(_pe, runner=_r, which=_w)
+    check("the cross-compiler wins when both are present",
+          cc == "x86_64-w64-mingw32-gcc", "got %r" % cc)
+
+    _w, _r = _host({"cc", "gcc", "clang"}, {"cc": "aarch64-linux-gnu\n",
+                                            "gcc": "aarch64-linux-gnu\n",
+                                            "clang": "aarch64-linux-gnu\n"})
+    cc, _, _ = resolve_target_cc(_elf64, runner=_r, which=_w)
+    check("an arm64 Linux host's native cc is NOT accepted for the x86_64 leg",
+          cc == "",
+          "D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO — got %r" % cc)
+
+    _w, _r = _host({"cc"}, {})   # present, but the probe fails
+    cc, _, rej = resolve_target_cc(_elf64, runner=_r, which=_w)
+    check("a compiler that cannot STATE its target is refused, not assumed",
+          cc == "" and any("cannot state its target" in r for r in rej),
+          "rejections=%r" % (rej,))
+
+    _w, _r = _host(set(), {})
+    cc, _, rej = resolve_target_cc(_elf64, runner=_r, which=_w)
+    check("nothing on PATH is a refusal that says so",
+          cc == "" and all("not on PATH" in r for r in rej), "%r" % (rej,))
+
+    # ── the helper extension's name is a TARGET fact ─────────────────────────
+    for leg in legs:
+        declared = loadext_helper_name(leg)
+        want = LOADEXT_HELPER_NAME_BY_TARGET_OS.get(spec_target_os(leg["spec"]))
+        check("leg '%s' declares the helper name its target's Tcl looks for"
+              % leg["label"], declared == want,
+              "declared %r, sqlite's test/loadext.test wants %r on target OS %r"
+              % (declared, want, spec_target_os(leg["spec"])))
+    check("the two spellings are the two sqlite has",
+          sorted(set(LOADEXT_HELPER_NAME_BY_TARGET_OS.values()))
+          == ["libtestloadext.so", "testloadext.dll"])
+
+    # RED ON DISABLE: the lint must actually catch a wrong declaration, so it is
+    # fed one. A mutated COPY on disk — never the shipped catalogue.
+    import tempfile as _tf
+    _mut_dir = _tf.mkdtemp(prefix="dss-legs-lint-")
+    try:
+        with open(path, "r", encoding="utf-8") as _f:
+            _doc = json.load(_f)
+        for _variant, _mutate in (
+            ("a POSIX helper name on the Windows leg",
+             lambda l: l["build"].update(loadExtHelperName="libtestloadext.so")),
+            ("no helper name at all",
+             lambda l: l["build"].pop("loadExtHelperName", None)),
+        ):
+            _copy = json.loads(json.dumps(_doc))
+            for _l in _copy["legs"]:
+                if spec_target_os(_l["spec"]) == "windows":
+                    _mutate(_l)
+            _p = os.path.join(_mut_dir, "legs.json")
+            with open(_p, "w", encoding="utf-8") as _f:
+                json.dump(_copy, _f)
+            _found = [f for f in lint(_p) if "loadExtHelperName" in f]
+            check("the lint REDS on %s" % _variant, bool(_found),
+                  "lint said nothing about it — the check is dead config")
+    finally:
+        shutil.rmtree(_mut_dir, ignore_errors=True)
+
     out.write("passed=%d failed=%d\n" % (passed, failed))
     return 0 if failed == 0 else 1
 
@@ -2339,6 +2719,16 @@ def main(argv=None):
     p.add_argument("--carrier-current", default="", metavar="VALUE",
                    help="the carrier variable's existing value, so an operator's "
                         "own setting is merged rather than clobbered")
+    p.add_argument("--resolve-target-cc", default=None, metavar="LABEL",
+                   help="pick LABEL's target C compiler — the FIRST declared "
+                        "targetCc candidate that is on PATH AND proves, via "
+                        "`" + CC_TARGET_MACHINE_FLAG + "`, that it targets this "
+                        "leg. Prints '<cc>\\t<triple>' on stdout; the per-"
+                        "candidate ladder always goes to stderr. Exits 3 when "
+                        "none qualifies — a candidate that cannot state its "
+                        "target is REFUSED, never assumed, because the compiler "
+                        "builds this leg's dlopen()ed loadext helper and a "
+                        "wrong-target one false-reds every loadext-* unit.")
     p.add_argument("--acquire", default=None, metavar="LABEL",
                    help="materialise LABEL's declared `pinned-archive` libraries "
                         "(download -> verify pinned sha256 -> extract -> slice to "
@@ -2388,11 +2778,13 @@ def main(argv=None):
             or args.header_stages or args.path_translations
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
-            or args.acquire or args.acquire_plan or args.resolve_library_argv):
+            or args.acquire or args.acquire_plan or args.resolve_library_argv
+            or args.resolve_target_cc):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
-                "--acquire / --acquire-plan / --resolve-library-argv is required")
+                "--acquire / --acquire-plan / --resolve-library-argv / "
+                "--resolve-target-cc is required")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -2434,17 +2826,37 @@ def main(argv=None):
                                             args.import_name, supported):
                 sys.stdout.write("%s\n" % tok)
             return 0
+        if args.resolve_target_cc:
+            leg = leg_by_label(load_catalogue(args.catalogue),
+                               args.resolve_target_cc, args.catalogue)
+            cc, machine, rejections = resolve_target_cc(leg)
+            # The LADDER goes to stderr on BOTH outcomes: on success it says which
+            # candidates were passed over and why, and on failure it IS the
+            # diagnostic the driver puts in the leg's verdict. stdout carries only
+            # the answer, so a caller can read it with a plain command
+            # substitution and never has to parse prose out of it.
+            for line in rejections:
+                sys.stderr.write("  rejected %s\n" % line)
+            if not cc:
+                sys.stderr.write(
+                    "no declared targetCc candidate for leg '%s' (%s) both exists "
+                    "on this host AND targets %s. NOT falling back to whatever "
+                    "compiler is here: it would build this leg's %s for the WRONG "
+                    "target, the fixture could not load it, and every loadext-* "
+                    "unit would false-red as a genuine DSS failure "
+                    "[D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO].\n"
+                    % (leg.get("label"), leg.get("spec"), leg.get("spec"),
+                       loadext_helper_name(leg) or "loadext helper"))
+                return 3
+            sys.stdout.write("%s\t%s\n" % (cc, machine))
+            return 0
         if args.acquire or args.acquire_plan:
             label = args.acquire or args.acquire_plan
             legs = load_catalogue(args.catalogue)
-            matches = [l for l in legs if l.get("label") == label]
-            if not matches:
-                raise LegError("no leg labelled %r in %s (declared: %s)"
-                               % (label, args.catalogue,
-                                  ", ".join(l.get("label", "?") for l in legs)))
             root = cache_root(args.cache_root)
-            result = (acquire_plan(matches[0], root) if args.acquire_plan
-                      else acquire(matches[0], root, offline=args.offline))
+            leg = leg_by_label(legs, label, args.catalogue)
+            result = (acquire_plan(leg, root) if args.acquire_plan
+                      else acquire(leg, root, offline=args.offline))
             sys.stdout.write(json.dumps(result, indent=1, sort_keys=True) + "\n")
             return 0
         if args.header_stages:

@@ -712,8 +712,21 @@ void expectExternSlotBind(Loaded const&    loaded,
                           std::string_view symName,
                           std::int64_t     addend = 0) {
     ASSERT_TRUE(loaded.target && loaded.format);
-    auto const bytes =
-        encodeDylib(makeExternSlotModule(externIsData, addend), loaded);
+    AssembledModule mod = makeExternSlotModule(externIsData, addend);
+    // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`): a format declaring
+    // `processExit` CONTRACTS that its image entry is the `_start`
+    // trampoline, which only `linker::link` injects. This helper drives
+    // `dss::macho::encode` DIRECTLY, so on the EXEC arm the module must
+    // state that its untrampolined entry IS functions[0] — semantically a
+    // no-op (index 0 is what the pre-gate default returned), so no bind /
+    // rebase / slot byte pinned below moves. Keyed on the FORMAT's own
+    // `processExit` rather than on the caller so the DYLIB arm is left
+    // alone: a dylib declares none, has no entry, and its walker REJECTS a
+    // caller-supplied override outright (ImageEntryOverrideFailsLoud).
+    if (loaded.format->processExit().has_value()) {
+        mod.imageEntryOverride = 0u;
+    }
+    auto const bytes = encodeDylib(mod, loaded);
 
     auto const di = readDyldInfo(bytes);
     ASSERT_TRUE(di.found);

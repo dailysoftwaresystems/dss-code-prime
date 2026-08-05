@@ -435,6 +435,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_InvalidStackReserveRequest";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
+        case DiagnosticCode::K_FormatLacksProcessExit:
+            return "K_FormatLacksProcessExit";
+        case DiagnosticCode::K_ExecEntryNotTrampolined:
+            return "K_ExecEntryNotTrampolined";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

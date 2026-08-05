@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 138> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -322,6 +322,28 @@ constexpr std::array<DiagnosticCode, 138> kUnsuppressableCodes{{
     // with no diagnostic trail back to the dropped request.
     DiagnosticCode::K_FormatLacksStackReserveControl,
     DiagnosticCode::K_InvalidStackReserveRequest,
+    // K_FormatLacksProcessExit / K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13)
+    // — the entry-trampoline contract, the same format-capability shape as the
+    // two codes above. They are TWO codes because their predicates DISAGREE on
+    // one field, and both REPLACE A SILENT WRONG-ENTRY EMISSION, so suppressing
+    // either restores exactly the defect it closed:
+    //   K_FormatLacksProcessExit — an exec-flavored format that declares NO
+    //     `processExit` skipped trampoline synthesis with NO diagnostic
+    //     (linker.cpp's gate tested the same predicate the emitter would have
+    //     failed on, making the emitter's own check dead code by construction).
+    //   K_ExecEntryNotTrampolined — a walker reached DIRECTLY (bypassing
+    //     `linker::link`) with no `imageEntryOverride`, under a format that DOES
+    //     declare `processExit`, defaulted the image entry to `functions[0]` —
+    //     MEASURED: a Mach-O exec whose LC_MAIN entryoff pointed at `main`'s
+    //     `sub rsp,0x10` prologue, rc=0, zero diagnostics.
+    // Neither has a runtime symptom that points back here: the program simply
+    // runs the wrong entry (or falls off it), so the diagnostic IS the only
+    // trace and must be undroppable. ★ And suppression is not even required to
+    // lose it — a code absent from this table is droppable by the reporter's
+    // dedup window and per-code cap, so membership is part of CREATING the
+    // code, not a follow-up.
+    DiagnosticCode::K_FormatLacksProcessExit,
+    DiagnosticCode::K_ExecEntryNotTrampolined,
 
     // The extern-import dedup fold (D-LK11-EXTERN-IMPORT-DEDUP) at BOTH merge
     // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'

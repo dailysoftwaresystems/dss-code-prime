@@ -987,31 +987,127 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // the user fn (the trampoline's call target).
     //
     // Without this hook, the emitted executables point e_entry /
-    // AddressOfEntryPoint / LC_MAIN.entryoff directly at the user
-    // fn, which SEGVs on its `ret` epilogue (process entry has no
-    // return address). See §2.13 for the full design.
+    // AddressOfEntryPoint / LC_MAIN.entryoff directly at the user fn.
+    // ★ CORRECTED at the D-LK10-ENTRY entry-gate fold — this line
+    // previously read "which SEGVs on its `ret` epilogue (process
+    // entry has no return address)" as though it held for all three
+    // formats. It does NOT:
+    //   * ELF `e_entry` / PE `AddressOfEntryPoint` — TRUE (DOCUMENTED):
+    //     the kernel/loader JUMPS to the entry, so the user fn's `ret`
+    //     pops whatever the process-entry stack happens to hold (argc
+    //     on ELF) and transfers there. SEGV is the typical outcome.
+    //   * Mach-O `LC_MAIN.entryoff` — FALSE, and it was an untested
+    //     over-generalisation: dyld CALLS that entry, with argc/argv
+    //     already in the argument registers (DOCUMENTED, and pinned
+    //     in-tree by tests/link/test_object_format_schema.cpp
+    //     `ProcessArgsSubstrate.ShippedMachoExecsDeclareNoneAndPe...`),
+    //     and Apple's libdyld `start` wraps it as `exit(main(...))`
+    //     (INFERRED from Apple documentation — NOTHING in this tree
+    //     verifies it; that test asserts only the argc/argv register
+    //     convention, and the TF-C120 audit caught it being cited as
+    //     though it pinned this half too).
+    //     An un-trampolined Mach-O entry RETURNS cleanly and the
+    //     process exits with the returned status — no crash, which is
+    //     precisely why the missing-trampoline defect below survived
+    //     unnoticed: it produced a binary that WORKED for the trivial
+    //     `return 42` case while silently skipping every DSS-side
+    //     entry responsibility (argument materialization, the declared
+    //     exit mechanism).
+    // The trampoline is therefore justified as DSS POLICY — one entry
+    // shape across every exec-flavored format — not as a per-platform
+    // crash avoidance. See §2.13 for the full design.
     //
     // Bypass conditions: caller-provided `imageEntryOverride` (a
     // pre-injected trampoline; do not re-inject) OR empty functions
     // (no module to wrap).
     //
     // c150 (D-LK1-4): the condition is SCHEMA-driven by design — an
-    // ELF ET_DYN `.so` declares NO `processExit` (validate() rejects
-    // it there: entry machinery is exec-flavor-only), so no
+    // ELF ET_DYN `.so` is NOT exec-flavored (it declares none of the
+    // entry cluster, so `isExecFlavor()` is false for it), so no
     // trampoline is synthesized for a shared library (a `.so` has no
     // entry; e_entry = 0). c151 (the D-LK1-4 PIE half, landed):
-    // the ELF ET_DYN PIE schema declares `processExit` (one of its
-    // entry-cluster members) and gets the trampoline through this
-    // same condition — zero gate changes, exactly as designed; its
+    // the ELF ET_DYN PIE schema declares the full entry cluster, IS
+    // exec-flavored, and gets the trampoline through this same
+    // condition — zero gate changes, exactly as designed; its
     // e_entry is the trampoline's BASE-RELATIVE VA (ld.so adds the
-    // load base).
+    // load base). (Both sentences said "`processExit`" before the
+    // entry-gate fold repointed the predicate; on ET_DYN the two are
+    // interchangeable — `isExecFlavor()`'s dyn arm CONTAINS
+    // `processExit.has_value()` — but the exec-flavor spelling is the
+    // one that also holds for ET_EXEC / PE / Mach-O.)
+    //
+    // ★ THE GATE ASKS `isExecFlavor()`, NOT `processExit().has_value()`.
+    // The old spelling tested the very field the emitter would have
+    // failed on (`injectEntryTrampoline`'s opening `!peOpt.has_value()`
+    // refusal — entry_trampoline.cpp:219-229 today; grep the predicate,
+    // not the line, when it drifts) — so the emitter's own fail-loud
+    // was DEAD CODE BY
+    // CONSTRUCTION: the caller could never reach it. `false` here meant
+    // the whole injection block was skipped with NO diagnostic, and the
+    // walker then took its `functions[0]` default. MEASURED on
+    // `macho64-x86_64-darwin-exec` while that format declared no
+    // `processExit`: rc=0, a 4162-byte artifact, `LC_MAIN
+    // entryoff=0x1000`, bytes there `48 81 ec 10 00 00 00`
+    // (`sub rsp,0x10`) — a FUNCTION PROLOGUE, i.e. the image entry was
+    // `main` itself. Zero diagnostics.
+    //
+    // Asking the SCHEMA a capability question ("is this a program the
+    // OS starts?") and then requiring the mechanism separately is what
+    // turns the silent skip into a refusal. `isExecFlavor()` is a
+    // closed predicate the schema answers (object_format_schema.hpp),
+    // never a format-identity branch here.
     AssembledModule moduleCopy;
     AssembledModule const* moduleP = &inputModule;
-    bool const wantTrampoline =
-        objectFormatSchema.processExit().has_value()
+    bool const needsTrampoline =
+        objectFormatSchema.isExecFlavor()
      && !inputModule.functions.empty()
      && !inputModule.imageEntryOverride.has_value();
-    if (wantTrampoline) {
+    // ★ UNREACHABLE FROM THE SHIPPED-CONFIG PATH BY DESIGN, AND THAT IS
+    // DELIBERATE. `ObjectFormatData::validate()` now rejects an
+    // exec-flavored format that declares no `processExit` at CONFIG-LOAD
+    // time (the ⟺ biconditional in object_format_schema.cpp), so no
+    // schema reaching here through `loadShipped` / `loadFromFile` /
+    // `loadFromText` can fail this check. It is defence-in-depth for the
+    // IN-MEMORY construction path — `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor that runs no validation, and every walker
+    // is likewise callable directly. The precedent is recorded in prose
+    // at the image-request gate above (linker.cpp:769-773): the first cut
+    // split the capability and bounds checks between the gate and the
+    // walker, and a direct `pe::encode` call then wrote an out-of-range
+    // stack reserve and reported success. A gate that is unreachable
+    // today is cheap; a bypass that is silent is not.
+    if (needsTrampoline && !objectFormatSchema.processExit().has_value()) {
+        report(reporter, DiagnosticCode::K_FormatLacksProcessExit,
+               DiagnosticSeverity::Error,
+               std::string{"linker: object format '"}
+                   + std::string{objectFormatSchema.name()}
+                   + "' is exec-flavored (the artifact is a program the OS "
+                     "starts) but declares no 'processExit' block. DSS "
+                     "ALWAYS synthesises an entry trampoline on an "
+                     "exec-flavored format -- the image entry IS that "
+                     "trampoline, and its last act is to call the mechanism "
+                     "'processExit' names -- so this format declares no "
+                     "mechanism for it to call and no entry can be built. "
+                     "This is a DSS policy about how DSS builds entries, NOT "
+                     "a claim that the platform cannot terminate otherwise "
+                     "(a Mach-O LC_MAIN entry, for one, is CALLED by dyld "
+                     "rather than jumped to). REMEDY: add a "
+                     "'processExit' block (mechanism 'syscall' or "
+                     "'by-name-import') plus the paired "
+                     "'entryCallingConvention' to this format's schema, or "
+                     "build for a format that declares them. The refusal is "
+                     "the point: before this gate the trampoline was skipped "
+                     "SILENTLY and the emitted image's entry pointed at the "
+                     "module's first function. (D-LK10-ENTRY 2.13.)");
+        image.resolvedFuncCount = 0;
+        return image;
+    }
+    // Past the refusal, `processExit` is guaranteed present whenever
+    // `needsTrampoline` holds — so the emitter's own `processExit`
+    // check (entry_trampoline.cpp) is now a genuine backstop for its
+    // OTHER callers rather than the dead code the old caller-side
+    // predicate made it.
+    if (needsTrampoline) {
         moduleCopy = inputModule;
         if (!injectEntryTrampoline(moduleCopy, targetSchema,
                                     objectFormatSchema, reporter)) {

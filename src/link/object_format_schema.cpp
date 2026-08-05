@@ -1283,20 +1283,13 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // their format blocks above (the PE `!= Obj` virtualAddress rules
     // cover Exec AND Dll; the Dll block adds the Text-row-required
     // rule).
-    bool const elfDynPieShape =
-        kind == ObjectFormatKind::Elf
-     && elf.objectType == ElfObjectType::Dyn
-     && !elf.interpreter.empty()
-     && processExit.has_value()
-     && !entryCallingConvention.empty()
-     && processArgs.has_value();
-    bool const isExecFlavor =
-        (kind == ObjectFormatKind::Elf
-         && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
-     || (kind == ObjectFormatKind::Pe
-         && pe.objectType == PeObjectType::Exec)
-     || (kind == ObjectFormatKind::MachO
-         && macho.filetype == MachOObjectType::Execute);
+    // D-LK10-ENTRY entry-gate fold: the four arms moved to
+    // `ObjectFormatData::isExecFlavor()` (object_format_schema.hpp) and are
+    // read from there by BOTH this rule set and the public
+    // `ObjectFormatSchema::isExecFlavor()` the linker's trampoline gate asks.
+    // One implementation on purpose — a second copy is how a config the loader
+    // accepts and a gate the linker applies come to disagree.
+    bool const isExecFlavor = this->isExecFlavor();
     if (isExecFlavor) {
         // Walker requires Text + virtualAddress != 0 to compute
         // e_entry / p_vaddr / IMAGE_OPTIONAL_HEADER.ImageBase. The
@@ -1346,12 +1339,91 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "(D-LK10-ENTRY §2.13). Either declare both or "
              "neither.");
     }
-    // silent-failure H1 (7425905 audit fold): `processExit` +
-    // `entryCallingConvention` are meaningful ONLY on exec-flavored
-    // formats — the trampoline emitter never runs on relocatables
-    // (.o / Obj / Object). Declaring them on a relocatable format
-    // is dead data that would silently confuse anyone diffing
-    // format schemas. Gate them on `isExecFlavor` (computed above).
+    // ═══════════════════════════════════════════════════════════════
+    // THE `processExit` ⟺ `isExecFlavor` BICONDITIONAL.
+    //
+    // Stated here as ONE rule with TWO enforcement halves, deliberately
+    // adjacent, because the two halves used to be the same distance apart
+    // as this comment is long — and a rule whose halves live 60 lines
+    // apart is a rule one of whose halves gets weakened later without
+    // anyone noticing the other exists.
+    //
+    //   ⇐ half (the older one, silent-failure H1 / 7425905 audit fold):
+    //     `processExit` (and its paired `entryCallingConvention`) are
+    //     meaningful ONLY on exec-flavored formats — the trampoline
+    //     emitter never runs on a relocatable (.o / Obj / Object) or on
+    //     an entry-less image (ELF `.so`, PE Dll, Mach-O MH_DYLIB).
+    //     Declaring them there is dead data that would silently confuse
+    //     anyone diffing format schemas.
+    //
+    //   ⇒ half (D-LK10-ENTRY entry-gate fold): an exec-flavored format
+    //     MUST declare `processExit`. DSS ALWAYS synthesises an entry
+    //     trampoline for an exec-flavored format — that is DSS POLICY,
+    //     not a platform fact — so a format that declares no exit
+    //     mechanism gives the trampoline emitter nothing to call.
+    //     Rejecting at CONFIG-LOAD time is what makes the linker's
+    //     runtime gate (link/linker.cpp, K_FormatLacksProcessExit)
+    //     unreachable from the shipped-config path: the config never
+    //     survives to reach it.
+    //     MEASURED before this rule existed: `int main(void){return 42;}`
+    //     at `--target x86_64:macho64-x86_64-darwin-exec` — whose format
+    //     JSON then declared no `processExit` — produced rc=0, a
+    //     4162-byte artifact and `LC_MAIN entryoff=0x1000` pointing at
+    //     `main`'s own `48 81 ec 10 00 00 00` (`sub rsp,0x10`) prologue,
+    //     with ZERO diagnostics.
+    //
+    // ★ THE ⇒ HALF HAS A KNOWN-VACUOUS ARM, AND IT IS ACCEPTABLE.
+    // `isExecFlavor()` has four arms. Three of them — ELF ET_EXEC, PE
+    // PE32+ Exec, Mach-O MH_EXECUTE — derive purely from `objectType` /
+    // `filetype`, and the ⇒ half has full teeth there. The FOURTH, ELF
+    // ET_DYN, qualifies only through `elfDynPieShape`, which ITSELF
+    // includes `processExit.has_value()` as one of its four cluster
+    // members — so on that arm "exec-flavored ⇒ declares processExit" is
+    // a TAUTOLOGY and enforces nothing.
+    // ★ WHAT ACTUALLY COVERS ET_DYN, STATED PER TIER (corrected by the
+    // TF-C120 audit, which caught this paragraph claiming ONE rule was
+    // "stronger" without saying WHERE it runs):
+    //   * AT CONFIG LOAD — the all-or-none `clusterCount` check above
+    //     (the `/elf` PARTIAL-cluster failure), which rejects any 1-, 2-
+    //     or 3-of-4 state naming exactly which members are missing. It
+    //     IS stronger than the ⇒ half. But it is a `validate()` rule, so
+    //     it runs on `loadShipped` / `loadFromFile` / `loadFromText` and
+    //     NOWHERE ELSE.
+    //   * IN MEMORY (`ObjectFormatSchema{ObjectFormatData}` — a public
+    //     constructor that runs no validation, the tier the linker and
+    //     walker gates defend) — `clusterCount` is ABSENT. The cover
+    //     there is the ELF walker's own half-cluster belt in
+    //     `elf::encodeElfExecDynamic` (`isPie != !interpreter.empty()`),
+    //     which refuses loud and emits no bytes. MEASURED by
+    //     `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartialEntryCluster`
+    //     (tests/link/test_lk10_entry_slice_c.cpp). That belt reads the
+    //     two cluster members the walker itself consumes, so a 3-of-4
+    //     ET_DYN missing only `processExit` — which satisfies neither
+    //     `isExecFlavor()` nor `processExit()` and is therefore invisible
+    //     to both entry-gate predicates — still cannot emit an image.
+    // Said out loud here so nobody reads the ⇒ half as covering ET_DYN,
+    // and so no test claims to cover the dyn arm of the ⇒ half — such a
+    // test would be asserting a truth of the predicate's own definition.
+    // ═══════════════════════════════════════════════════════════════
+    if (isExecFlavor && !processExit.has_value()) {
+        fail("/processExit",
+             "exec-flavored format (ELF ET_EXEC / ELF ET_DYN PIE with the "
+             "full entry cluster / PE PE32+ Exec / Mach-O MH_EXECUTE) must "
+             "declare a `processExit` block. DSS ALWAYS synthesises an entry "
+             "trampoline on an exec-flavored format -- the image entry is the "
+             "trampoline, and the trampoline's last act is to call the "
+             "mechanism this key names -- so a format that declares none "
+             "leaves the emitter nothing to call. Without this rule the "
+             "linker SKIPPED trampoline synthesis with no diagnostic and the "
+             "emitted image's entry pointed straight at the user's first "
+             "function. Declare `processExit` (mechanism `syscall` or "
+             "`by-name-import`) together with `entryCallingConvention`, or "
+             "make this format non-exec. (D-LK10-ENTRY 2.13.) NOTE: this is "
+             "a DSS policy about how DSS builds entries, NOT a claim that "
+             "the platform cannot terminate otherwise -- a Mach-O LC_MAIN "
+             "entry, for one, is CALLED by dyld rather than jumped to, so "
+             "the platform would cope; DSS's own entry shape will not.");
+    }
     if (processExit.has_value() && !isExecFlavor) {
         fail("/processExit",
              "processExit is only legal on exec-flavored formats "

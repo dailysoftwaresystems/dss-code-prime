@@ -23,6 +23,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/exec_data_section.hpp"   // TLS C1: addTlsSymbolOffsets pin
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
@@ -38,6 +39,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -96,6 +101,48 @@ struct Loaded {
     return mod;
 }
 
+// ★ THE ONE SEAM every byte-level writer test in this file drives the
+// ELF walker through — D-LK10-ENTRY §2.13, the `resolveEntryFnIdx`
+// entry gate (`link/format/exec_reloc_apply.hpp`).
+//
+// A format that declares `processExit` has CONTRACTED that its image
+// entry is the DSS-synthesized `_start` trampoline. `linker::link`
+// sets `imageEntryOverride` on EVERY injection (entry_trampoline.cpp:
+// 732 — the file's ONLY assignment to that field), so a module
+// reaching a walker WITHOUT that override was never
+// trampolined — which the gate now rejects loud rather than silently
+// making functions[0] the process entry (the measured defect: an
+// LC_MAIN pointing at a `sub rsp,0x10` prologue, rc=0, zero diags).
+//
+// These tests deliberately bypass `linker::link` to pin the writer's
+// bytes, so they must SAY they want an untrampolined image. Index 0 is
+// exactly what they were getting implicitly before the gate existed —
+// this states the existing intent, it does not change any emitted byte
+// (e_entry stays secText.virtualAddress + funcTextStart[0]).
+//
+// Funnelled HERE, not into the module builders, for two reasons: the
+// override describes how the writer is being DRIVEN (not a property of
+// the module — `LinkerEndToEnd.ElfExecDispatchProducesValidExecutable`
+// hands `makeTrivialModule`'s output to `linker::link` and must still
+// exercise real injection, which the linker SKIPS when an override is
+// already present), and a new writer test then inherits the contract
+// by construction instead of re-deriving it.
+//
+// NOT used by the four tests that exercise entry RESOLUTION itself
+// (EntryPoint{HonoredOnDynamicPath,ResolvesSecondFunctionByName} +
+// UnknownEntryPoint{FailsLoud,OnDynamicPathFailsLoud}): the override
+// branch returns BEFORE the schema's `entryPoint` is consulted, so
+// setting it there would erase the very behavior under test. Those
+// four call `elf::encode` directly, on purpose.
+[[nodiscard]] std::vector<std::uint8_t> encodeUntrampolined(
+        AssembledModule&          mod,
+        TargetSchema const&       target,
+        ObjectFormatSchema const& format,
+        DiagnosticReporter&       reporter) {
+    mod.imageEntryOverride = 0u;
+    return elf::encode(mod, target, format, reporter);
+}
+
 // c145: locate a section header index by its `.shstrtab` name (−1 if absent).
 [[nodiscard]] std::string readCStr(std::vector<std::uint8_t> const& b,
                                    std::uint64_t off) {
@@ -141,16 +188,45 @@ TEST(ElfExecFormatJson, ShippedFileLoadsCleanlyWithExecFields) {
               "/lib64/ld-linux-x86-64.so.2");
 }
 
+// ── Negative-load pins: the entry cluster + the SPECIFIC diagnostic ──
+//
+// Every ET_EXEC fixture below is EXEC-FLAVORED, so D-LK10-ENTRY §2.13
+// (`isExecFlavor && !processExit` → reject) would reject it for a reason
+// that has NOTHING to do with the defect under test. Each therefore
+// declares the entry cluster — `processExit` + its paired
+// `entryCallingConvention`, copied VERBATIM from the shipped
+// `src/dss-config/object-formats/elf64-x86_64-linux-exec.format.json` —
+// so the ONLY remaining reason to reject is the fixture's own defect.
+// The cluster is inert here: nothing in a load test builds a trampoline.
+//
+// And each asserts THAT SPECIFIC diagnostic rather than a bare
+// `ASSERT_FALSE(r.has_value())`. `validate()` ACCUMULATES (there is no
+// early return before its `return problems;`), so a bare has_value check
+// stays green when a NEW load rule starts rejecting the fixture — which
+// is exactly how §2.13 silently emptied this whole family. The
+// `countAtPath(r, "/processExit") == 0` line is the anti-subsumption
+// half: it goes red the moment the entry-cluster reason comes back.
 TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-interp","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/interpreter"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "'interpreter' must be a string"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
@@ -164,10 +240,23 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"empty-interp","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/interpreter"), 1u) << rejectSummary(r);
+    // The message discriminates EMPTY from WRONG-TYPE — both rules emit
+    // at `/elf/interpreter`, so the path alone cannot tell them apart.
+    EXPECT_EQ(countWithMessage(r, "'interpreter' must not be empty"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
@@ -209,11 +298,18 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     // path (not just the missing walker emission).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: an exec-flavored format MUST declare
+    // `processExit` + its paired `entryCallingConvention`, or
+    // loadFromText()'s validate() rejects this fixture AT LOAD.
+    // (`elf.interpreter` stays absent — that is what's under test;
+    // validate() ties the interpreter to the cluster on ET_DYN only.)
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -304,7 +400,7 @@ TEST(ElfExecWriter, ExternImportsOnArm64MachineSucceedsAfterDLK68Close) {
     mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     std::string diags;
     for (auto const& d : rep.all()) diags += d.actual + "\n";
     EXPECT_EQ(rep.errorCount(), 0u) << diags;
@@ -344,7 +440,7 @@ TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
     mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -420,11 +516,20 @@ TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
 TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. This fixture is
+    // RISC-V only in `elf.machine` (243, to reach the PLT-emitter
+    // guard) — the TARGET it is encoded against is the shipped x86_64
+    // one, and no RISC-V target ships, so the cc names that target's
+    // convention rather than inventing an unresolvable `lp64d`. The
+    // machine guard rejects before any trampoline work reads it.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"riscv-exec","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": {
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
         "pageAlign": 4096, "interpreter": "/lib/ld-linux-riscv64-lp64d.so.1", "bindNow": true
@@ -467,7 +572,7 @@ TEST(ElfExecWriter, ExternImportsEmitFivePhdrsAndDynamicSegment) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_phnum @ +56 = 5
     EXPECT_EQ(readU16LE(bytes, 56), 5u);
@@ -508,7 +613,7 @@ TEST(ElfExecWriter, ExternImportsEmitPltStubAndRel32PatchToPlt) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // .text starts at file offset = pageAlign (0x1000).
     constexpr std::size_t textFileOff = 0x1000;
@@ -551,7 +656,7 @@ TEST(ElfExecWriter, DynamicSectionEmitsExpectedDtEntriesInOrder) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Locate PT_DYNAMIC (phdr #5, 0-indexed = 4) → p_offset @ +8 (u64).
     std::uint64_t const phoff = readU64LE(bytes, 32);
@@ -571,6 +676,20 @@ TEST(ElfExecWriter, DynamicSectionEmitsExpectedDtEntriesInOrder) {
     }
     EXPECT_TRUE(sawSymentValid);
     EXPECT_TRUE(sawDfNow);
+    // ★ FATAL before `.back()` / `[0]`. The walk above is bounded by
+    // `off + 16 <= bytes.size()`, so a regression that drops PT_DYNAMIC (or
+    // puts a bogus p_offset in it) makes `dynamicOff` land past the end, the
+    // loop body never runs, and `tags` is EMPTY — `tags.back()` and `tags[0]`
+    // are then UB on an empty vector, not a failing assertion. ✔MEASURED
+    // 2026-08-05 (TF-C120): the same unguarded shape in
+    // `tests/link/test_pe_writer.cpp` segfaulted that binary after 83 of 97
+    // tests, so 14 tests never ran and nothing reported them missing (one of
+    // them, `LinkerExternResolution.OkFalseWhenWalkerFailsLoud`, was genuinely
+    // broken and had been hidden by the crash). A test may fail; it must never
+    // delete the tests scheduled behind it.
+    ASSERT_FALSE(tags.empty())
+        << "the .dynamic walk produced NO entries — PT_DYNAMIC's p_offset "
+           "(read from phdr #5) does not point into the image";
     EXPECT_EQ(tags.back(), 0u);  // DT_NULL terminator
     EXPECT_EQ(tags[0], 1u);      // first entry is DT_NEEDED
     // The DT_NEEDED val should index into .dynstr; locate .dynstr's
@@ -598,7 +717,7 @@ TEST(ElfExecWriter, RelaDynEntriesPackedAsGlobDat) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Walk .dynamic to find DT_RELA + DT_RELASZ for the rela.dyn VA.
     std::uint64_t const phoff = readU64LE(bytes, 32);
@@ -641,7 +760,7 @@ TEST(ElfExecWriter, PtLoad2PageAlignCongruence) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint64_t const phoff = readU64LE(bytes, 32);
     // PT_LOAD #2 = phdr #4 (0-indexed = 3); fields p_offset @ +8,
@@ -678,7 +797,7 @@ TEST(ElfExecWriter, MultipleExternsInOneLibraryCollapseToOneDtNeeded) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "exit",   "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Both externs share libc.so.6 → exactly 1 DT_NEEDED.
     std::uint64_t const phoff = readU64LE(bytes, 32);
@@ -729,7 +848,7 @@ TEST(ElfExecWriter, TwoLibrariesEmitTwoDtNeededInLexicographicOrder) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Walk .dynamic: collect every DT_NEEDED val + DT_STRTAB va.
     std::uint64_t const phoff = readU64LE(bytes, 32);
@@ -842,7 +961,7 @@ TEST(ElfExecWriter, VersionedImportEmitsVerneedVersymAndDynamicEntries) {
     imp.version = "GLIBC_2.3";
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // (a) .dynamic carries DT_VERSYM / DT_VERNEED / DT_VERNEEDNUM.
@@ -910,7 +1029,7 @@ TEST(ElfExecWriter, UnversionedImportEmitsNoVersionMachinery) {
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const dyn = dynEntries(bytes);
     EXPECT_FALSE(dyn.count(0x6ffffff0u));   // no DT_VERSYM
@@ -940,7 +1059,7 @@ TEST(ElfExecWriter, MixedVersionedAndUnversionedImportsVersymDiscriminates) {
     imp.version = "GLIBC_2.3";
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     int const vsymIdx = findSectionByName(bytes, ".gnu.version");
     ASSERT_GE(vsymIdx, 0);
@@ -957,11 +1076,19 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     // Schema overrides entry to function #2 → e_entry must reflect.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. NO
+    // `imageEntryOverride` here (this test calls `elf::encode`
+    // directly, not `encodeUntrampolined`): the override branch
+    // returns before `entryPoint` is consulted, and resolving
+    // "sym_42" IS the behavior under test.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-entry-named","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_42",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -990,11 +1117,18 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
 TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. NO
+    // `imageEntryOverride` (direct `elf::encode`, not
+    // `encodeUntrampolined`) — an override would satisfy the entry
+    // resolver and erase the K_SymbolUndefined this test pins.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-bad-entry","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_99",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1040,7 +1174,7 @@ TEST(ElfExecWriter, ExternImportsProduceDynamicImage) {
     imp.libraryPath = "libc.so.6";
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // e_type = ET_EXEC (2)
@@ -1064,18 +1198,34 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/bindNow"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "'bindNow' must be a boolean"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED, or this fixture never
+    // reaches the bindNow default it is here to pin.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-default","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1086,11 +1236,18 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
 TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. No
+    // `imageEntryOverride` needed: the bindNow reject fires in
+    // encodeElfExecDynamic's pre-conditions, well before the entry
+    // resolver runs.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "entryPoint": "",
       "elf": {
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
@@ -1147,7 +1304,7 @@ TEST(ElfExecWriter, Elf64EhdrTypeIsETEXEC) {
     // Single function with no calls — a `ret` (0xC3).
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 64u);
     // e_type @ +16 = ET_EXEC (2)
@@ -1158,7 +1315,7 @@ TEST(ElfExecWriter, EntryAddressDerivesFromVirtualAddress) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_entry @ +24 = secText.virtualAddress (0x401000) + 0 (first
     // function lives at .text offset 0 in cycle 2).
@@ -1169,7 +1326,7 @@ TEST(ElfExecWriter, ProgramHeaderTableImmediatelyFollowsEhdr) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_phoff @ +32 = 64 (right after Ehdr)
     EXPECT_EQ(readU64LE(bytes, 32), 64u);
@@ -1184,7 +1341,7 @@ TEST(ElfExecWriter, PtLoadHeaderHasReadExecutePermsAndPageAlign) {
     // 3-byte function: nop nop ret
     AssembledModule mod = makeTrivialModule({0x90, 0x90, 0xC3}, 7);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Program header table at byte 64
     std::uint32_t const pType = readU32LE(bytes, 64);
@@ -1208,7 +1365,7 @@ TEST(ElfExecWriter, TextSectionHeaderShAddrEqualsVirtualAddress) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_shoff @ +40
     std::uint64_t const shoff = readU64LE(bytes, 40);
@@ -1230,7 +1387,7 @@ TEST(ElfExecWriter, RelaTextSlotDroppedForExec) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_shnum @ +60 = 5 in ET_EXEC mode.
     EXPECT_EQ(readU16LE(bytes, 60), 5u);
@@ -1317,7 +1474,7 @@ TEST(ElfExecWriter, IntraModuleRel32CallAppliedByteForByte) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1359,7 +1516,7 @@ TEST(ElfExecWriter, IntraModuleAbs64AppliedByteForByte) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1399,7 +1556,7 @@ TEST(ElfExecWriter, NonZeroAddendIsRespectedSeparatelyFromAddendBias) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint64_t const shoff       = readU64LE(bytes, 40);
     std::uint64_t const textFileOff = readU64LE(bytes, shoff + 1 * 64 + 24);
@@ -1434,7 +1591,7 @@ TEST(ElfExecWriter, Abs32WriteRespectsWidthBytesAndPreservesAdjacentBytes) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint64_t const shoff       = readU64LE(bytes, 40);
     std::uint64_t const textVa      = readU64LE(bytes, shoff + 1 * 64 + 16);
@@ -1643,10 +1800,28 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-exec","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 2 reasons, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    // TWO by design: the ELF-block ET_EXEC rule and the terminal
+    // cross-format exec-flavor rule that restates the same contract
+    // for PE / Mach-O. Both are about THIS value.
+    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+    // Both land at this one pointer, so `GE` here -- retiring the
+    // redundant restatement must not become a false red -- and the
+    // message pin below names the ELF-block rule this test exists for.
+    EXPECT_GE(countAtPath(r, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "ELF ET_EXEC format requires"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
@@ -1660,10 +1835,21 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-page-align","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/pageAlign"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "must declare 'elf.pageAlign'"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
@@ -1672,10 +1858,27 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-page-align","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 2 reasons, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    // TWO, and the second is a KNOCK-ON of the first: the loader
+    // rejects 3000 and therefore never assigns `elf.pageAlign`, so
+    // validate() then sees 0 and adds its 'must declare' arm.
+    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+    // BOTH land at `/elf/pageAlign`, so `GE` there; the message pin
+    // below is what distinguishes THIS rule from the missing-key one
+    // pinned by ExecWithoutPageAlignRejected.
+    EXPECT_GE(countAtPath(r, "/elf/pageAlign"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "must be a positive power of two"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
@@ -1718,11 +1921,19 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     ASSERT_TRUE(execShared.has_value());
     // Forge a schema with entryPoint = "sym_42" by re-loading from text
     // (the shipped file has entryPoint=""; we override).
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. NO
+    // `imageEntryOverride` (direct `elf::encode`, not
+    // `encodeUntrampolined`): resolving "sym_42" to the SECOND
+    // function is the behavior under test, and the override branch
+    // returns before `entryPoint` is read.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"forge-exec","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
       "sections":[
@@ -1757,11 +1968,18 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
 TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED at load. NO
+    // `imageEntryOverride` (direct `elf::encode`, not
+    // `encodeUntrampolined`) — an override would resolve the entry
+    // and erase the K_SymbolUndefined this test pins.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-entry","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
       "sections":[
@@ -1795,7 +2013,7 @@ TEST(ElfExecWriter, PtLoadFileOffsetIsPageAligned) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
     std::uint64_t const pVaddr = readU64LE(bytes, 64 + 16);
@@ -1818,6 +2036,31 @@ TEST(LinkerEndToEnd, ElfExecDispatchProducesValidExecutable) {
     EXPECT_EQ(image.format, ObjectFormatKind::Elf);
     EXPECT_FALSE(image.bytes.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
+    // ★ FATAL size guard BEFORE the first index — the `EXPECT_FALSE(empty())`
+    // above is NON-fatal, so on a regression that returns no (or too few)
+    // bytes the pins below would walk into `image.bytes[0..3]` and
+    // `readU16LE(image.bytes, 16)`, and `readU16LE` indexes its
+    // `std::span` unchecked (this file's anonymous namespace). Its two
+    // siblings already do it this way — cited by TEST NAME, not line, since
+    // the numbers drift and the names do not:
+    //   `LinkerEndToEnd.PeDispatchProducesNonEmptyBytes` (test_pe_writer.cpp)
+    //   `LinkerEndToEnd.MachODispatchProducesNonEmptyBytes`
+    //       (test_macho_writer.cpp)
+    // ✔MEASURED 2026-08-05 (TF-C120) — why this is a fatal guard and not a
+    // tidy-up: the SAME shape elsewhere in `tests/link/test_pe_writer.cpp`
+    // (non-fatal empty-check, then an unchecked `std::span::operator[]`)
+    // SEGFAULTED that test binary after 83 of 97 tests, so 14 tests never
+    // ran and nothing reported them missing — and one of the 14,
+    // `LinkerExternResolution.OkFalseWhenWalkerFailsLoud`, turned out to be
+    // genuinely broken, hidden the whole time behind the crash. A
+    // non-fatal guard in front of an unchecked read does not just fail this
+    // test; it can delete every test scheduled after it.
+    // 18u = the highest byte any pin below touches (e_type is the u16 at
+    // offset 16, so bytes 16 and 17 must exist).
+    ASSERT_GE(image.bytes.size(), 18u)
+        << "the format-blind dispatch returned too few bytes to hold an ELF "
+           "header — asserting FATALLY so the pins below cannot read out of "
+           "bounds and take the rest of this binary's tests down with them";
     // ELF magic
     EXPECT_EQ(image.bytes[0], 0x7Fu);
     EXPECT_EQ(image.bytes[1], 'E');
@@ -1836,11 +2079,17 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     // dynamic image.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
+    // D-LK10-ENTRY 2.13: exec-flavored ⇒ `processExit` + its paired
+    // `entryCallingConvention` are REQUIRED, else the fixture is
+    // rejected at load. `elf.interpreter` stays absent on purpose —
+    // the empty-PT_INTERP reject is what this test pins.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1968,7 +2217,7 @@ TEST(ElfExecWriter, RodataSectionHeaderPinnedFromDataItems) {
     auto loaded = loadShipped();
     AssembledModule mod = makeModuleWithRodata();
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // .text sh_addr = secText.virtualAddress (0x401000); .rodata VA =
@@ -2005,7 +2254,7 @@ TEST(ElfExecWriter, RodataExtendsSinglePtLoadAndStaysReadExecute) {
     auto loaded = loadShipped();
     AssembledModule mod = makeModuleWithRodata();
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // e_phnum @ +56 = 1 (still a SINGLE PT_LOAD — no 2nd segment).
     EXPECT_EQ(readU16LE(bytes, 56), 1u)
@@ -2038,14 +2287,14 @@ TEST(ElfExecWriter, RodataShiftsShnumAndShstrndxVsControl) {
     // Control: identical function, NO dataItems.
     AssembledModule control = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter repC;
-    auto bytesC = elf::encode(control, *loaded.target, *loaded.format, repC);
+    auto bytesC = encodeUntrampolined(control, *loaded.target, *loaded.format, repC);
     ASSERT_EQ(repC.errorCount(), 0u);
     std::uint16_t const shnumC     = readU16LE(bytesC, 60);
     std::uint16_t const shstrndxC  = readU16LE(bytesC, 62);
 
     AssembledModule mod = makeModuleWithRodata();
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint16_t const shnum     = readU16LE(bytes, 60);
     std::uint16_t const shstrndx  = readU16LE(bytes, 62);
@@ -2074,7 +2323,7 @@ TEST(ElfExecWriter, NoDataItemsEmitsNoRodataByteIdenticalToBaseline) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0x90, 0x90, 0xC3}, 7);
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // 5 sections (NULL, .text, .symtab, .strtab, .shstrtab) — NO
     // .rodata. Same count the RelaTextSlotDroppedForExec pin asserts.
@@ -2117,7 +2366,7 @@ TEST(ElfExecWriter, RodataAlsoEmittedOnArm64SharedCodePath) {
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     constexpr std::uint64_t kRodataVa = 0x400000ull + 8;
     std::size_t const off = findRodataShdrOff(bytes, kRodataVa);
@@ -2146,7 +2395,7 @@ TEST(ElfExecWriter, DataSectionEmittedWritableInSeparateLoadSegment) {
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "ELF writer must ACCEPT a Data item now that D-LK4-DATA-PRODUCER "
            "closed (it was fail-loud before)";
@@ -2214,7 +2463,7 @@ TEST(ElfExecWriter, BssSectionEmittedNobitsWritable) {
     d.alignment    = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "ELF writer must ACCEPT a Bss item now that D-LK4-DATA-PRODUCER closed";
     ASSERT_FALSE(bytes.empty());
@@ -2314,7 +2563,7 @@ TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a relro item must NOT fail loud in an executable image";
     ASSERT_FALSE(bytes.empty());
@@ -2390,7 +2639,7 @@ TEST(ElfExecWriter, ElfExecMultipleRodataItemsLayoutWithAlignmentPadding) {
     mod.dataItems.push_back(std::move(d0));
     mod.dataItems.push_back(std::move(d1));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2465,7 +2714,7 @@ TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
     mod.dataItems.push_back(std::move(a0));
     mod.dataItems.push_back(std::move(a1));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(rep.errorCount(), 0u)
         << "two anonymous SymbolId{} rodata items must NOT collide";
     ASSERT_FALSE(bytes.empty());
@@ -2636,7 +2885,7 @@ TEST(ElfExecTls, TwoVarLayoutEmitsPtTlsWithExactVariant2Tpoffs) {
     mod.dataItems.push_back(std::move(ctl));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2748,7 +2997,7 @@ TEST(ElfExecTls, Alignas32MemberRecomputesTpoffsAndPAlign) {
     mod.dataItems.push_back(makeTbssItem(43, 4, 4));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2790,12 +3039,27 @@ TEST(ElfExecTls, NoTlsModuleByteIdenticalToPreTlsShape) {
     mod.dataItems.push_back(std::move(ctl));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
     EXPECT_EQ(readU16LE(bytes, 56), 5u) << "no PT_TLS slot without TLS items";
     auto const phdrs = readPhdrs(bytes);
+    // ★ FATAL size guard, mirroring the TLS sibling this control pairs with
+    // (`ElfExecTls.TwoVarLayoutEmitsPtTlsWithExactVariant2Tpoffs`, which
+    // asserts `phdrs.size() == 6u` before touching `phdrs[1]` — cited by test
+    // NAME, not line, because the numbers drift and the name does not).
+    // `readPhdrs` returns exactly e_phnum entries, and the ONLY check on
+    // e_phnum here is the NON-FATAL EXPECT above — so a regression that emits
+    // 0 or 1 phdrs would fall straight through it into `phdrs[1]`, an
+    // out-of-range index on a std::vector.
+    // ✔MEASURED 2026-08-05 (TF-C120): that class — a non-fatal
+    // guard in front of an unchecked index — segfaulted
+    // `tests/link/test_pe_writer.cpp` after 83 of 97 tests, hiding 14 tests
+    // (one of them, `LinkerExternResolution.OkFalseWhenWalkerFailsLoud`,
+    // genuinely broken) with no report that they had not run. 5u restates the
+    // count already pinned on the line above; it adds no new expectation.
+    ASSERT_EQ(phdrs.size(), 5u);
     ASSERT_EQ(phdrs[1].type, 3u);
     EXPECT_EQ(phdrs[1].off, 344u) << "layout must NOT shift without TLS";
     for (auto const& p : phdrs) EXPECT_NE(p.type, 7u);
@@ -2917,7 +3181,7 @@ TEST(ElfExecTls, TdataTemplateSlotPatchedWithRodataTargetVa) {
     mod.dataItems.push_back(std::move(slot));
 
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a reloc-bearing .tdata template must ENCODE (CRIT-2), not "
            "reject or demote";

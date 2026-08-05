@@ -1152,6 +1152,40 @@ struct DSS_EXPORT ObjectFormatData {
     //   * ELF identity: when kind == Elf, fileClass / dataEncoding /
     //     machine must all be != 0.
     [[nodiscard]] std::vector<ConfigDiagnostic> validate() const;
+
+    // EXEC-flavor predicate — THE single implementation. `validate()`
+    // computes its entry-machinery rules from this, and the public
+    // `ObjectFormatSchema::isExecFlavor()` forwards to it, so the
+    // rule that rejects a config and the predicate a linker gate asks
+    // can never drift apart. (It lives on the DATA type rather than
+    // on the schema class because `validate()` is a member of the
+    // data type and runs BEFORE any `ObjectFormatSchema` exists —
+    // duplicating the four arms into the schema class would have
+    // created exactly the two-copy divergence this arc is closing.)
+    // See the public forwarder for the full semantics + the ET_DYN
+    // caveat.
+    [[nodiscard]] bool isExecFlavor() const noexcept {
+        // ELF ET_DYN PIE shape: the c151 D-LK1-4 entry cluster, all
+        // four members. `validate()` pins the cluster ALL-OR-NONE
+        // (object_format_schema.cpp `clusterCount`), so any one member
+        // is a faithful witness of the other three on a LOADED schema;
+        // all four are re-derived here anyway so a hand-built
+        // (validate-bypassing) ObjectFormatData cannot fake a PIE with
+        // a single field.
+        bool const elfDynPieShape =
+            kind == ObjectFormatKind::Elf
+         && elf.objectType == ElfObjectType::Dyn
+         && !elf.interpreter.empty()
+         && processExit.has_value()
+         && !entryCallingConvention.empty()
+         && processArgs.has_value();
+        return (kind == ObjectFormatKind::Elf
+                && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
+            || (kind == ObjectFormatKind::Pe
+                && pe.objectType == PeObjectType::Exec)
+            || (kind == ObjectFormatKind::MachO
+                && macho.filetype == MachOObjectType::Execute);
+    }
 };
 
 } // namespace detail
@@ -1288,10 +1322,10 @@ public:
     // undefined externs" — that policy is the SEPARATE
     // `allowsUndefinedImports()` below (a .so is an image AND may
     // carry undefined symbols).
-    // The `isExecFlavor` rule inside `validate()` remains
-    // EXEC-only by design (it gates entry/processExit machinery a
-    // `.so` / `.dylib` must not declare) — the two predicates
-    // diverged at c150 and no longer mirror each other.
+    // `isExecFlavor()` (below) remains EXEC-only by design (it gates
+    // entry/processExit machinery a `.so` / `.dylib` must not
+    // declare) — the two predicates diverged at c150 and no longer
+    // mirror each other.
     [[nodiscard]] bool isImageFlavor() const noexcept {
         switch (d_.kind) {
             case ObjectFormatKind::Elf:
@@ -1303,6 +1337,60 @@ public:
             default:
                 return false;
         }
+    }
+
+    // Cross-format EXEC-flavor predicate. True iff the schema
+    // describes a PROGRAM the OS starts — the four arms are ELF
+    // ET_EXEC, ELF ET_DYN carrying the full PIE entry cluster, PE
+    // PE32+ Exec, and Mach-O MH_EXECUTE. FALSE for every entry-less
+    // image (ELF `.so`, PE Dll, Mach-O MH_DYLIB) and for every
+    // relocatable. Strictly narrower than `isImageFlavor()` above.
+    //
+    // Promoted from a `validate()`-local at the D-LK10-ENTRY
+    // entry-gate fold so `link/linker.cpp` can ask "does this format
+    // need an entry trampoline?" WITHOUT switching on the format
+    // kind itself. The closed-verb switch lives INSIDE the schema
+    // (the `isImageFlavor()` precedent directly above); the
+    // agnosticism bar forbids format-identity branching in the
+    // linker, not a closed predicate the schema answers.
+    // Single-sourced: forwards to `detail::ObjectFormatData::
+    // isExecFlavor()`, the SAME member `validate()` computes its
+    // entry-machinery rules from.
+    //
+    // ★ FOOTGUN FOR FUTURE CALLERS — the ET_DYN arm is NOT
+    // independent of `processExit()`. `elfDynPieShape` includes
+    // `processExit.has_value()` as one of its four cluster members,
+    // so on an ELF ET_DYN schema `isExecFlavor()` IMPLIES
+    // `processExit().has_value()` by construction. Consequences:
+    //   * a rule of the form "exec-flavored ⇒ must declare
+    //     processExit" is a TAUTOLOGY on the dyn arm and enforces
+    //     nothing there. ET_DYN's real enforcement is PER TIER, and
+    //     saying only the first half of this was the over-claim the
+    //     TF-C120 audit caught: AT CONFIG LOAD it is the all-or-none
+    //     `clusterCount` rule in object_format_schema.cpp (the `/elf`
+    //     PARTIAL-cluster failure) — a `validate()` rule, therefore
+    //     ABSENT on the in-memory
+    //     `ObjectFormatSchema{ObjectFormatData}` path; IN MEMORY it is
+    //     the ELF walker's own half-cluster belt in
+    //     `elf::encodeElfExecDynamic` (`isPie != !interpreter.empty()`),
+    //     which refuses loud before any entry is resolved (MEASURED by
+    //     `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartial...` in
+    //     tests/link/test_lk10_entry_slice_c.cpp);
+    //   * consequently a 3-of-4 ET_DYN missing only `processExit`
+    //     is invisible to BOTH this predicate and
+    //     `processExit().has_value()` — do not reach for either one
+    //     to police that shape;
+    //   * do NOT use this predicate to decide anything about a
+    //     format that has just had `processExit` edited — the
+    //     predicate's own value can move underneath you.
+    // The other three arms derive purely from `objectType` /
+    // `filetype` and carry no such dependency. (INFERRED from the
+    // cluster definition; the tautology is exercised by no test on
+    // purpose — a test claiming to cover the dyn arm would be
+    // asserting a truth of the predicate's definition, not of the
+    // rule.)
+    [[nodiscard]] bool isExecFlavor() const noexcept {
+        return d_.isExecFlavor();
     }
 
     // Undefined-extern policy (c150 + c151, D-LK1-4 — the c143
@@ -1343,6 +1431,21 @@ public:
     // `-undefined dynamic_lookup`), but that is a DIFFERENT bind
     // model the eager two-level machinery deliberately does not
     // ship; a flat-namespace schema knob would flip this arm then.
+    //
+    // ★ AFTER THE D-LK10-ENTRY ENTRY-GATE FOLD, read the "faithful
+    // single-member witness" sentence above precisely: it is the
+    // ALL-OR-NONE `clusterCount` rule (object_format_schema.cpp, the
+    // `/elf` PARTIAL-cluster failure) that makes `processExit`
+    // presence stand for the whole PIE cluster — NOT the new
+    // "exec-flavored ⇒ must declare processExit" rule, which is
+    // VACUOUS on the ET_DYN arm (`isExecFlavor()`'s dyn arm already
+    // contains `processExit.has_value()`; see the footgun note on
+    // that accessor). The line below is therefore left keyed on
+    // `d_.processExit` rather than rewritten as `!isExecFlavor()`:
+    // the two agree on every LOADED schema and diverge only on a
+    // hand-built validate-bypassing one (dyn + processExit but no
+    // interpreter), where the cluster-member spelling is the one
+    // that stays honest about what it read.
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
         return d_.kind == ObjectFormatKind::Elf

@@ -26,6 +26,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
 #include "link/format/macho_codesign.hpp"
 #include "link/object_format_schema.hpp"
@@ -43,6 +44,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -78,6 +83,15 @@ namespace {
 // a Mach-O schema is the correct vehicle regardless of CPU; x86_64 here
 // keeps the fixture host-buildable while the arm64 corpus carries the
 // runnable end-to-end proof.
+//
+// D-LK10-ENTRY 2.13: an exec-flavored (MH_EXECUTE) schema MUST declare
+// `processExit` + its paired `entryCallingConvention`, or `validate()`
+// REJECTS it at `loadFromText`. The entry cluster below is copied
+// verbatim from the shipped macho64-x86_64-darwin-exec.format.json,
+// matching this fixture's x86_64 cputype (`sysv_amd64` — deliberately
+// NOT the arm64 sibling's `apple_arm64`). It changes no emitted byte
+// this file pins: nothing here builds a trampoline, so the cluster is
+// present purely to satisfy the load-tier exec-flavor contract.
 [[nodiscard]] std::string codeSignSchemaJson(char const* identifier,
                                              unsigned pageSize = 4096) {
     return std::string(R"({
@@ -86,6 +100,12 @@ namespace {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-adhoc","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -118,6 +138,14 @@ namespace {
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_printf", "/usr/lib/libSystem.B.dylib"});
+    // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`): the fixture schema
+    // above declares `processExit`, which CONTRACTS that the image entry is
+    // the `_start` trampoline only `linker::link` injects. These codesign
+    // pins call `macho::encode` DIRECTLY, so no trampoline exists — state
+    // that the untrampolined entry IS functions[0]. Semantically a no-op
+    // (index 0 is what the pre-gate default returned), so codeLimit,
+    // nCodeSlots and every page hash pinned below are unchanged.
+    mod.imageEntryOverride = 0u;
     return mod;
 }
 
@@ -298,12 +326,31 @@ TEST(MachOAdHocCodeSign, NonDefaultPageSizeFlowsThroughWire) {
 // ── Malformed codeSignature blocks fail loud at schema load ──────────
 
 namespace {
+// D-LK10-ENTRY 2.13: an exec-flavored (MH_EXECUTE) schema MUST declare
+// `processExit` + its paired `entryCallingConvention`, or `validate()`
+// rejects it — which would give every fixture below a SECOND reason to
+// be rejected and make each `codeSignature` pin vacuous (validate()
+// accumulates, and `loadFromText` rejects on ANY error). The entry
+// cluster is therefore present so the ONLY remaining reason to reject is
+// the malformed `codeSignature` block each caller passes in. Values are
+// copied VERBATIM from the shipped
+// src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+// matching this fixture's own x86_64 cputype 16777223 (`sysv_amd64` —
+// deliberately NOT the arm64 sibling's `apple_arm64`). Inert for these
+// pins: nothing here builds a trampoline (the load is the whole test),
+// and no cc name is resolved against a target at load time.
 [[nodiscard]] std::string codeSignSchemaRaw(char const* csBody) {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-bad","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -316,39 +363,47 @@ namespace {
       ]
     })";
 }
-
-// Count diagnostics whose JSON-pointer path contains `needle`.
-[[nodiscard]] std::size_t
-countAtPath(LoadResult<std::shared_ptr<ObjectFormatSchema>> const& r,
-            char const* needle) {
-    if (r.has_value()) return 0;
-    std::size_t n = 0;
-    for (auto const& d : r.error()) {
-        if (d.path.find(needle) != std::string::npos) ++n;
-    }
-    return n;
-}
 } // namespace
 
 TEST(MachOAdHocCodeSign, BadKindFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "fullchain", "hashAlgorithm": "sha256", "identifier": "x" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/kind"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/kind"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, BadHashAlgorithmFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha1", "identifier": "x" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/hashAlgorithm"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/hashAlgorithm"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, NonPowerOfTwoPageSizeFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha256", "pageSize": 3000, "identifier": "x" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/pageSize"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/pageSize"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, PageSizeBelowFloorFailsLoud) {
@@ -358,7 +413,14 @@ TEST(MachOAdHocCodeSign, PageSizeBelowFloorFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha256", "pageSize": 1024, "identifier": "x" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/pageSize"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/pageSize"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, PageSizeAboveCeilingFailsLoud) {
@@ -367,26 +429,65 @@ TEST(MachOAdHocCodeSign, PageSizeAboveCeilingFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha256", "pageSize": 131072, "identifier": "x" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/pageSize"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/pageSize"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, EmptyIdentifierFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha256", "identifier": "" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/identifier"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/identifier"), 1u)
+        << rejectSummary(r);
+    // Two DIFFERENT rules share this pointer (present-but-empty vs
+    // absent), so pin the message too — otherwise this test and
+    // MissingIdentifierFailsLoud below cannot tell each other apart.
+    EXPECT_EQ(countWithMessage(r, "'identifier' must be a non-empty"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, MissingIdentifierFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(codeSignSchemaRaw(
         R"({ "kind": "adhoc", "hashAlgorithm": "sha256" })"));
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image/codeSignature/identifier"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/codeSignature/identifier"), 1u)
+        << rejectSummary(r);
+    // The absent-key branch, distinguished from EmptyIdentifierFailsLoud
+    // above by the message unique to it.
+    EXPECT_EQ(countWithMessage(r, "'identifier' is required"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOAdHocCodeSign, ObjectFiletypeWithCodeSignatureFailsLoud) {
     // The image block (including codeSignature) is meaningful only on a
     // MH_EXECUTE image; a MH_OBJECT carrying it is a config error.
+    //
+    // NOTE the deliberate ABSENCE of an entry cluster here, unlike every
+    // codeSignSchemaRaw fixture above: this filetype is `object`, which is
+    // NOT exec-flavored, so `processExit` is ILLEGAL on it (validate()
+    // rejects `processExit` on a non-exec-flavor format). Adding the
+    // cluster would change what this test proves. The `/processExit`
+    // zero-count below therefore holds by construction — the key is
+    // absent, the format is not exec-flavored, so neither half of the
+    // biconditional fires.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
@@ -397,5 +498,16 @@ TEST(MachOAdHocCodeSign, ObjectFiletypeWithCodeSignatureFailsLoud) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countAtPath(r, "/image"), 1u);
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r,
+                               "MH_OBJECT format must NOT declare an "
+                               "'image' block"),
+              1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }

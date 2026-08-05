@@ -1892,6 +1892,102 @@ TEST(FormatRootKeyVocabulary, AllShippedFormatsLoadCleanUnderClosedVocabulary) {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// D-LK10-ENTRY entry-gate fold — EVERY exec-flavored shipped format
+// declares `processExit`. The whole population, not a sample: this is
+// exactly the multi-site class where a green subset hides the miss, and
+// the miss it hides is a SILENT one. MEASURED 2026-08-05, before the
+// validate() rule landed: `macho64-x86_64-darwin-exec` declared no
+// `processExit`, and `int main(void){return 42;}` built against it
+// produced rc=0, a 4162-byte artifact and `LC_MAIN entryoff=0x1000`
+// pointing at `main`'s own `48 81 ec 10 00 00 00` (`sub rsp,0x10`)
+// prologue — the image entry was the user function, with ZERO
+// diagnostics.
+//
+// The sweep is over the SAME 24-name list above (single source of truth
+// for "what ships"), filtered by the schema's own `isExecFlavor()`
+// predicate rather than by a hand-kept list of exec names — so a 25th
+// format added without `processExit` reds HERE, and one added WITH it
+// needs no edit to this test.
+//
+// ★ WHAT THIS DOES NOT PROVE: nothing about the ELF ET_DYN (PIE) arm of
+// `isExecFlavor()`. That arm qualifies only via `elfDynPieShape`, which
+// contains `processExit.has_value()`, so for the two `-pie` formats the
+// assertion below is a TAUTOLOGY — it cannot fail, and it is not
+// evidence. Their real guard is the all-or-none entry-cluster rule
+// (`clusterCount`, object_format_schema.cpp) — ★ AT CONFIG LOAD, which is
+// the only tier this sweep reaches, since every format here arrives via
+// `loadShipped` and therefore through `validate()`. That qualifier is
+// load-bearing: the same sentence WITHOUT it appears at the linker and
+// walker tiers, where `clusterCount` does NOT run (an in-memory schema
+// never passes through `validate()`), and there a hand-built 3-of-4
+// ET_DYN is invisible to `isExecFlavor()` and `processExit()` alike. Its
+// guard there is the ELF walker's own PARTIAL-PIE belt (`elf.cpp`,
+// `encodeElfExecDynamic`), MEASURED by
+// `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartialEntryCluster`.
+// Said out loud so the row count here is never read as coverage it is not.
+// ═════════════════════════════════════════════════════════════════════
+TEST(FormatRootKeyVocabulary, EveryShippedExecFlavorFormatDeclaresProcessExit) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed — a sample "
+                  "is exactly how a multi-site miss stays green");
+    std::size_t execSeen = 0;
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value())
+            << name << " must load — a format that cannot load cannot be "
+                       "swept, which would silently shrink this population";
+        auto const& fmt = **r;
+        if (!fmt.isExecFlavor()) {
+            // The negative half, and it is not filler: `processExit` on a
+            // NON-exec format is the ⇐ half of the same biconditional and
+            // is likewise rejected at load. Asserting both directions here
+            // is what makes this a sweep of the RULE rather than of one
+            // key's presence.
+            EXPECT_FALSE(fmt.processExit().has_value())
+                << name << " is not exec-flavored and must NOT declare "
+                           "`processExit` (the ⇐ half of the ⟺ rule)";
+            continue;
+        }
+        ++execSeen;
+        EXPECT_TRUE(fmt.processExit().has_value())
+            << name << " is EXEC-FLAVORED and must declare `processExit`. "
+                       "DSS always synthesises an entry trampoline on an "
+                       "exec-flavored format; without a declared mechanism "
+                       "the linker used to SKIP injection silently and the "
+                       "image entry became the module's first function.";
+        // The inseparable partner — validate()'s §2.13 pairing rule. A
+        // format passing the line above while failing this one would have
+        // a mechanism the emitter cannot build a call for.
+        EXPECT_FALSE(fmt.entryCallingConvention().empty())
+            << name << " declares `processExit` and must therefore declare "
+                       "`entryCallingConvention` (§2.13 pairing rule)";
+    }
+    // Guards the sweep itself: if `isExecFlavor()` were ever broken to
+    // return false everywhere, every EXPECT above would vacuously pass and
+    // this test would report success while checking nothing. 7 = the two
+    // `-exec` ELFs + the two `-pie` ELFs + the two darwin `-exec` +
+    // pe64-x86_64-windows-exec (COUNTED from the list above, 2026-08-05).
+    EXPECT_EQ(execSeen, 7u)
+        << "the exec-flavored population must be 7 of the 24 shipped "
+           "formats — a different number means either a format was added/"
+           "removed without updating this sweep, or `isExecFlavor()` "
+           "changed meaning and every assertion above just went vacuous";
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES) — the FORMAT's own predefined
 // macros: the C-visible face of `dataModel`.

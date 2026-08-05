@@ -2372,7 +2372,115 @@ enum class DiagnosticCode : std::uint16_t {
     //   first-wins with no flag and no trace. See the rationale block in
     //   `core/types/unsuppressable_codes.cpp`.
     K_ExternImportAttributeConflict = 0x801B,
-    // K-NEXT-SLOT: 0x801C — grep this marker before adding a K_* code.
+    // K_FormatLacksProcessExit (D-LK10-ENTRY §2.13): the emitted image's ENTRY
+    //   would have no process-exit path BECAUSE THE FORMAT DECLARES NO
+    //   MECHANISM TO BUILD ONE FROM. An EXEC-FLAVORED format (ELF ET_EXEC, ELF
+    //   ET_DYN PIE, PE PE32+ Exec, Mach-O MH_EXECUTE) carries no `processExit`
+    //   block, so the linker has nothing to build the `_start` trampoline out
+    //   of. DSS ALWAYS synthesises an entry trampoline on an exec-flavored
+    //   format -- that is DSS POLICY, not a platform fact (see the wording note
+    //   below) -- so a missing mechanism is a dead end, not a fallback.
+    //   ★ THE NAME *IS* THE PREDICATE: this code means EXACTLY
+    //   `!format.processExit().has_value()`, at every site that fires it. THREE
+    //   sites, one fault: the linker's pre-injection gate (`link/linker.cpp`,
+    //   the `needsTrampoline && !processExit()` refusal); the WALKER-tier arm
+    //   (`link/format/exec_reloc_apply.hpp`, `resolveEntryFnIdx`'s
+    //   `if (format.isExecFlavor())` arm — added by the TF-C120 audit, which
+    //   found the walker silently defaulting to functions[0] for exactly this
+    //   shape); and `injectEntryTrampoline`'s own backstop for callers that
+    //   reach it directly (`link/entry_trampoline.cpp`, the opening
+    //   `if (!peOpt.has_value())`). ⚠ CITED BY PREDICATE, NOT BY LINE, AND
+    //   THAT IS DELIBERATE: this block carried a line number for each of the
+    //   first two sites until the TF-C120 audit-fix round, and that round's OWN
+    //   edits to linker.cpp shifted the first one by six lines in the very
+    //   commit that was fixing stale citations. Line numbers drift; the
+    //   PREDICATE spellings do not — grep those.
+    //   ★ WHAT THIS CODE IS *NOT*. The walker-tier fault where the format DOES
+    //   declare `processExit` but the module arrived UN-TRAMPOLINED is
+    //   `K_ExecEntryNotTrampolined` (0x801D) below. It was briefly filed under
+    //   THIS code (caught in the same cycle's review, before either code
+    //   shipped), and that was a misnomer with a concrete cost: a reader greps
+    //   `K_FormatLacksProcessExit`, opens the format, finds
+    //   `processExit` sitting right there, and concludes the compiler is lying.
+    //   Do not re-merge the two — the predicates are opposite on that field.
+    //   ★ WORDING DISCIPLINE (do not "simplify" this into a platform claim):
+    //   the message must say DSS always synthesises the trampoline and this
+    //   format declares no mechanism for it to call. It must NOT say an exec
+    //   format cannot terminate without one -- that is FALSE for Mach-O.
+    //   TWO CLAIMS, TWO DIFFERENT EVIDENCE GRADES, and the second is NOT
+    //   verified in this tree (TF-C120 audit F3):
+    //     * dyld CALLS an LC_MAIN entry, with argc/argv already in the
+    //       argument registers -- DOCUMENTED, and pinned in-tree by
+    //       tests/link/test_object_format_schema.cpp
+    //       `ProcessArgsSubstrate.ShippedMachoExecsDeclareNoneAndPe...`,
+    //       which is what justifies the shipped Mach-O execs declaring no
+    //       `processArgs`;
+    //     * Apple's libdyld `start` wrapping that call as `exit(main(...))`
+    //       -- INFERRED from Apple documentation. NOTHING in this tree
+    //       verifies it: that test asserts only the argc/argv register
+    //       convention, and it was mis-cited as pinning this half too. Do
+    //       not put this half into a user-facing diagnostic string.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE: outside
+    //   that table the reporter's dedup window and per-code cap can drop the
+    //   diagnostic silently, which restores exactly the silent trampoline SKIP
+    //   (and therefore the silent wrong-entry emission) it exists to prevent.
+    K_FormatLacksProcessExit       = 0x801C,
+    // K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13): the WALKER-TIER backstop
+    //   for an image whose entry would be USER CODE. The format DOES declare a
+    //   `processExit` block -- which CONTRACTS that its image entry is the
+    //   DSS-synthesized `_start` trampoline -- but the `AssembledModule` handed
+    //   to `{elf,macho,pe}::encode` carries NO `imageEntryOverride`, so no
+    //   trampoline was ever injected into it. The fault is the MISSING
+    //   TRAMPOLINE, and this name says so; see the `K_FormatLacksProcessExit`
+    //   block above for why the two must not share a code (the predicates
+    //   DISAGREE on `processExit()`: absent there, PRESENT here).
+    //   ★ HOW A MODULE GETS HERE (INFERRED — from the call graph; this is the
+    //   only route found, not a proof that no other exists):
+    //   `injectEntryTrampoline` sets `module.imageEntryOverride = 0` as the last
+    //   act of every SUCCESSFUL injection (`link/entry_trampoline.cpp:732` — the
+    //   FILE'S ONLY assignment to that field, so grep it if the line has
+    //   drifted; a comment here cited `:708` for a while, which is a line about
+    //   `expectedFuncCount`. The one early return below the prepend rolls the
+    //   prepend back and returns false, so a module that got a trampoline ALWAYS
+    //   carries the override), and `resolveEntryFnIdx` honors it before it can
+    //   reach this arm. So an un-trampolined module AT THE WALKER means
+    //   `{elf,macho,pe}::encode` was driven DIRECTLY, bypassing `linker::link`.
+    //   That is a real shape, not a hypothetical: the tests drive it (the
+    //   `elf::encode` call in tests/link/test_lk10_entry_slice_c.cpp T2), and
+    //   the walkers are public entry points any embedder can call.
+    //   ★ AND, UNLIKE 0x801C's LINKER ARM, THIS ONE IS REACHABLE WITH A PERFECTLY
+    //   VALID SHIPPED FORMAT. `ObjectFormatData::validate()` rejects an
+    //   exec-flavored format declaring no `processExit` at CONFIG-LOAD time (the
+    //   ⟺ biconditional in `link/object_format_schema.cpp`; DOCUMENTED, pinned by
+    //   the `loadFromText` refusal in tests/link/test_lk10_entry_slice_c.cpp), so
+    //   0x801C's linker arm is unreachable from any config that loads. NOTHING
+    //   validates the DRIVE, so this code's surface stays live forever.
+    //   ★ WHAT IT REPLACES (MEASURED, before the gate existed): defaulting to
+    //   `functions[0]` silently made the user's first function the process
+    //   entry -- `int main(void){return 42;}` at
+    //   `--target x86_64:macho64-x86_64-darwin-exec` produced rc=0, a 4162-byte
+    //   artifact, and `LC_MAIN entryoff=0x1000` whose bytes are
+    //   `48 81 ec 10 00 00 00` (`sub rsp,0x10`) -- a FUNCTION PROLOGUE. Such an
+    //   entry never materializes argc/argv and never calls the declared exit
+    //   mechanism; the program runs off the end of `main` into whatever bytes
+    //   follow it.
+    //   ★ A WALKER-TIER DUPLICATE OF A LINKER-TIER CHECK IS DELIBERATE, NOT
+    //   REDUNDANT. The precedent is recorded in prose at `link/linker.cpp:769-773`
+    //   (the image-request gate): the first cut split the CAPABILITY and BOUNDS
+    //   checks between the linker gate and the walker, and a direct `pe::encode`
+    //   call then wrote an out-of-range stack reserve AND REPORTED SUCCESS. Here
+    //   the case is stronger still -- `linker::link`'s `needsTrampoline` gate
+    //   CANNOT see this fault (the fault is precisely that `link` was never
+    //   called), so the walker is not a second opinion, it is the ONLY tier the
+    //   direct path passes through.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE, not an
+    //   optional extra: outside that table the reporter's dedup window and
+    //   per-code cap can drop the diagnostic with no flag and no trace, and this
+    //   failure has NO other trace -- the build reports success and the wrong
+    //   entry ships. See the rationale block in
+    //   `core/types/unsuppressable_codes.cpp`.
+    K_ExecEntryNotTrampolined      = 0x801D,
+    // K-NEXT-SLOT: 0x801E — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

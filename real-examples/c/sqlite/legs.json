@@ -7,6 +7,8 @@
 
   "$stagedHeadersComment": "★ THE THIRD-PARTY HEADERS A LEG COMPILES AGAINST ARE A TARGET FACT, NOT A HOST ONE (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed TF-C115). The staged zlib header is copied from the DERIVING POSIX host, where `./configure` baked ITS OWN probe results into zconf.h — `#if 1 → #define Z_HAVE_UNISTD_H` and friends. Those are facts about the deriving machine, exactly like the recipe's HAVE_*/Z_HAVE_* defines that `recipeTransform` exists to drop, and handing them to a foreign target is the same cross-compile category error one level down. Each leg therefore DECLARES `build.zconfGuards` — the value ITS target has for each guard `./configure` may have set — and the drivers stage ONE zinc/ PER `recipeTransform` (stage-zinc.py, called by both) and give each leg an include list pointing at its own. Two legs may share a zinc/ only by sharing a recipeTransform, and the lint refuses a catalogue where same-transform legs declare different guards. Before this, ONE pe-shaped zinc/ served every leg and the .ps1 REFUSED (`poisoned`) any leg that was not `windows-selfconfig` rather than compile it against the wrong header — the right call, and the reason this key exists is to make the refusal unnecessary instead of relaxing it.",
 
+  "$targetCcComment": "★★ A COMPILER'S NAME IS NOT A DECLARATION OF ITS TARGET, and this catalogue once said it was. D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. `build.targetCc.candidates` is a list of names to TRY, in order; it is NOT a list of compilers that are known to build this leg. ✔MEASURED 2026-08-05 on a WSL/Ubuntu x86_64 host: both elf legs ran GREEN (6 err / 331,351 and 5 err / 331,355, all known confounds) and the run then DIED in /usr/bin/ld — 'relocation R_X86_64_PC32 against symbol `sqlite3_api` can not be used when making a shared object; recompile with -fPIC' — building the pe64 leg's loadext helper, and pe64's units never ran. The mingw cross-compiler was absent, this leg listed plain `gcc` as an ALTERNATIVE, and so a LINUX compiler was picked, legitimately, to build a WINDOWS shared object. build-and-test.sh:2615 and :3804 both forbid exactly that fallback in so many words; neither guard fired, because the config had already licensed what the guards were watching for. ⇒ THE RESOLVER NOW ASKS THE COMPILER. harness_legs.py `--resolve-target-cc <leg>` accepts a candidate only if `<cc> -dumpmachine` names this leg's own target arch AND target OS, both derived from the leg's declared `spec`. No new key, because the leg already declares its target; no host test; no format-name branch. A candidate that CANNOT state its target (the probe fails) is REFUSED, never assumed — the leg is still BUILT, it records `skipped-build-input-missing`, and its corpus does not run. ★ AND THE RULE IS NOT pe64-SHAPED: the elf64-x86_64 leg's `cc`/`gcc`/`clang` resolve to an aarch64 compiler on this project's native arm64 Linux VPS, which is the wrong-arch helper D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after; the same one check refuses it. ★★ WHAT IT BUILDS is the corpus's dlopen()ed helper extension, whose FILE NAME is also a target fact — see each leg's `loadExtHelperName`.",
+
   "dssHarnessLegsVersion": 1,
 
   "legs": [
@@ -29,6 +31,8 @@
         "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-shared", "-fPIC"],
+        "$loadExtHelperNameComment": "The name sqlite's own test/loadext.test looks for on a `tcl_platform(platform) eq unix` fixture. See the top-level $targetCcComment for why the name is DECLARED per leg instead of spelled once in a driver.",
+        "loadExtHelperName": "libtestloadext.so",
         "targetCc": { "candidates": ["cc", "gcc", "clang"], "package": "" },
         "libraries": {
           "provider": "host-system",
@@ -57,6 +61,7 @@
         "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-shared", "-fPIC"],
+        "loadExtHelperName": "libtestloadext.so",
         "targetCc": { "candidates": ["aarch64-linux-gnu-gcc"], "package": "gcc-aarch64-linux-gnu" },
         "libraries": {
           "provider": "ubuntu-ports-arm64",
@@ -86,6 +91,9 @@
         "$stackReserveComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — Windows defaults a process to 1 MiB; e_fkey-63.1.x recurses to SQLITE_MAX_TRIGGER_DEPTH and overflows it (a NATIVE gcc build overflows too). 8 MiB = what Linux hands the process for free.",
         "stackReserveBytes": 8388608,
         "sharedLibFlags": ["-shared"],
+        "$loadExtHelperNameComment": "★ THE ONE LEG WHOSE NAME IS DIFFERENT, and the reason this key exists. ✔MEASURED from the staged upstream tree, test/loadext.test:26-29: a `tcl_platform(platform) eq windows` fixture looks for `./testloadext.dll` — the drivers hardcoded `libtestloadext.so` for every leg, so a pe64 fixture never found the staged helper and fell through to loadext.test's own hardcoded-`gcc` self-build, which is precisely the fallback the pre-staging exists to prevent [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO].",
+        "loadExtHelperName": "testloadext.dll",
+        "$targetCcComment": "`gcc` STAYS on this list and it is not a mistake: ✔MEASURED 2026-08-05 on this project's Windows box, `gcc -dumpmachine` prints `x86_64-w64-mingw32` (Git for Windows and Strawberry both ship mingw gcc under the bare name), so on a Windows host it IS this leg's correct compiler. What was missing is the CHECK, not a shorter list — see the top-level $targetCcComment.",
         "targetCc": { "candidates": ["x86_64-w64-mingw32-gcc", "gcc"], "package": "gcc-mingw-w64-x86-64" },
         "$librariesComment": "pe64 --resolve-library reads a DLL's EXPORT table (.edata), so these must be real DLLs, not import .libs. A DLL is just a FILE: DSS reads a PE export table on any host, so a Linux or macOS box that HAS these files can build this leg. The search paths are candidates on every host (see $noHostKeyingComment).",
         "libraries": {
@@ -116,6 +124,8 @@
         "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
+        "$loadExtHelperNameComment": "The `.so` spelling, on a Darwin target, is NOT a copy error. ✔MEASURED at test/loadext.test:26-32: the name is chosen from `tcl_platform(platform)` (`unix` on a Mac), and the `tcl_platform(os) eq Darwin` branch three lines down changes only the COMPILER FLAGS (`-dynamiclib`, which is what this leg's sharedLibFlags already say) — never the file name.",
+        "loadExtHelperName": "libtestloadext.so",
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },
         "$librariesComment": "★ THIS LEG ACQUIRES ITS LIBRARIES (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER). It used to declare `host-system`, which on any non-Mac means 'hope this box has a Darwin libtcl' — i.e. it never built anywhere but a Mac, in flat contradiction of the harness's own contract that every leg is BUILT everywhere and only RUN is gated. MacPorts publishes unauthenticated-HTTPS binary archives, and the two we need are UNIVERSAL (one download carries both the arm64 and the x86_64 slice, which is why the sibling macho leg names the SAME url + digest and differs only in the slice it takes). ✔MEASURED 2026-08-04: 110/110 required symbols present on BOTH arches — all 102 `Tcl*` the testfixture imports, 0 missing, plus 8/8 zlib — so there is no eager-import hazard [[D-FFI-DESCRIPTOR-EAGER-IMPORT]].",
         "libraries": {
@@ -166,6 +176,7 @@
         "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
         "stackReserveBytes": 0,
         "sharedLibFlags": ["-dynamiclib"],
+        "loadExtHelperName": "libtestloadext.so",
         "targetCc": { "candidates": ["clang", "cc"], "package": "" },
         "$librariesComment": "The SAME two MacPorts archives as macho64-arm64 — same url, same pinned digest — because they are UNIVERSAL. What differs is only which slice this leg takes, and that is DERIVED from the leg's own target arch rather than spelled here (see harness_legs.py MACHO_CPU_TYPES). The download is content-addressed by its digest, so the two legs share one fetch and the second is a cache hit with no network at all.",
         "libraries": {

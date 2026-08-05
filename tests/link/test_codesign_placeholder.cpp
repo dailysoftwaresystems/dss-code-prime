@@ -28,6 +28,7 @@
 #include "link/object_format_schema.hpp"
 #include "lir/lir.hpp"
 #include "macho_test_support.hpp"
+#include "format_reject_support.hpp"   // countAtPath / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -38,6 +39,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -61,6 +65,44 @@ makeTrivialModule(std::uint32_t funcSymV = 1) {
     return mod;
 }
 
+// ★ THE TWO DOORS every walker call in this file goes through — every
+// format it exercises is EXEC-flavored, so there is no raw-`encode`
+// exception here.
+//
+// They share the `Untrampolined` word with the same-purpose helper in the
+// ELF / PE / Mach-O writer test files — one concept, one vocabulary — but
+// keep the walker in the name because BOTH of them live in THIS
+// translation unit with IDENTICAL signatures: a bare `encodeUntrampolined`
+// declared twice is a redefinition, not an overload.
+//
+// D-LK10-ENTRY entry gate (`resolveEntryFnIdx`,
+// src/link/format/exec_reloc_apply.hpp): a format declaring
+// `processExit` has CONTRACTED that its image entry is the
+// DSS-synthesized `_start` trampoline, and only `linker::link` injects
+// one (entry_trampoline.cpp stamps `imageEntryOverride = 0`). These are
+// placeholder-RESERVATION pins: they drive the walker directly, on
+// purpose, and never want a trampoline. Stamping the override says that
+// deliberately — semantically a no-op, since index 0 is what the
+// pre-gate default produced implicitly. One door per walker so a new
+// call site cannot quietly skip the contract.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeMachoUntrampolined(AssembledModule           mod,  // by value: stamped copy
+                         TargetSchema const&       target,
+                         ObjectFormatSchema const& fmt,
+                         DiagnosticReporter&       reporter) {
+    mod.imageEntryOverride = std::size_t{0};
+    return macho::encode(mod, target, fmt, reporter);
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodePeUntrampolined(AssembledModule           mod,  // by value: stamped copy
+                      TargetSchema const&       target,
+                      ObjectFormatSchema const& fmt,
+                      DiagnosticReporter&       reporter) {
+    mod.imageEntryOverride = std::size_t{0};
+    return pe::encode(mod, target, fmt, reporter);
+}
+
 } // namespace
 
 // ── Mach-O: schema validate-reject for invalid reservation sizes ─────
@@ -71,6 +113,9 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-cs","kind":"macho"},
+      "$entryClusterComment": "D-LK10-ENTRY 2.13: validate() REJECTS an exec-flavored format (here MH_EXECUTE) that declares no processExit, so without this pair the fixture would be rejected for a reason unrelated to the defect it pins. Values verbatim from the shipped macho64-x86_64-darwin-exec.format.json, matching this fixture cputype 16777223 (x86_64); importLibraryPath is already in image.loadDylibs below. Inert here -- a load test builds no trampoline.",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -83,6 +128,19 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // Pin THE diagnostic, not merely "something was wrong". `validate()`
+    // ACCUMULATES (no early return), so a bare has_value() check stays
+    // green the moment a NEW rule starts rejecting this fixture -- which
+    // is exactly how D-LK10-ENTRY 2.13 emptied this family. The
+    // `/processExit` zero-count is the anti-subsumption half.
+    EXPECT_EQ(countAtPath(r, "/image/codeSignatureSize"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
@@ -91,6 +149,9 @@ TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs","kind":"macho"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format (here MH_EXECUTE) that declares no processExit, so a synthetic macho-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped macho64-x86_64-darwin-exec.format.json; importLibraryPath is already in image.loadDylibs below. Inert for these pins (the walker is driven directly -- no trampoline is built -- and the MH_EXECUTE walker arm reads no processExit field).",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -135,6 +196,9 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-static","kind":"macho"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format (here MH_EXECUTE) that declares no processExit, so a synthetic macho-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped macho64-x86_64-darwin-exec.format.json; importLibraryPath is already in image.loadDylibs below. Inert for these pins (the walker is driven directly -- no trampoline is built -- and the MH_EXECUTE walker arm reads no processExit field).",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "entryCallingConvention": "sysv_amd64",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -150,7 +214,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeTrivialModule();  // no externImports
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeMachoUntrampolined(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawAnchor = false;
     for (auto const& d : rep.all()) {
@@ -177,6 +241,9 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format (here MH_EXECUTE) that declares no processExit, so a synthetic macho-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped macho64-x86_64-darwin-exec.format.json; importLibraryPath is already in image.loadDylibs below. Inert for these pins (the walker is driven directly -- no trampoline is built -- and the MH_EXECUTE walker arm reads no processExit field).",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "entryCallingConvention": "sysv_amd64",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -193,7 +260,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeTrivialModule();  // no externImports
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeMachoUntrampolined(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawD_LK7_1 = false;
     bool sawD_LK6_13 = false;
@@ -225,6 +292,9 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-dyn","kind":"macho"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format (here MH_EXECUTE) that declares no processExit, so a synthetic macho-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped macho64-x86_64-darwin-exec.format.json; importLibraryPath is already in image.loadDylibs below. Inert for these pins (the walker is driven directly -- no trampoline is built -- and the MH_EXECUTE walker arm reads no processExit field).",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "entryCallingConvention": "sysv_amd64",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -255,7 +325,7 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeMachoUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -313,7 +383,7 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
     EXPECT_EQ((*fmt)->machoImage().codeSignatureSize, 0u);
     AssembledModule mod = makeTrivialModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeMachoUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint32_t ncmds = readU32LE(bytes, 16);
     std::size_t off = 32;
@@ -335,7 +405,10 @@ TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-bad-cert","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "D-LK10-ENTRY 2.13: validate() REJECTS an exec-flavored format that declares no processExit, so without this pair the fixture would be rejected for a reason unrelated to the defect it pins. Values verbatim from the shipped pe64-x86_64-windows-exec.format.json. Inert here -- a load test builds no trampoline.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
         "magic": 523, "imageBase": 5368709120,
         "sectionAlignment": 4096, "fileAlignment": 512,
@@ -344,11 +417,24 @@ TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
         "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096,
         "attributeCertReserveSize": 7
       },
+      "$sectionRowComment": "Row shape copied from the sibling pe-with-cert fixture below, which LOADS CLEANLY -- so the two differ ONLY in attributeCertReserveSize (7 here vs 2048 there) and form a matched pair. It previously carried flags 1610612768 + addrAlign 16, both of which PE rejects outright (PE folds alignment and flags into Characteristics via the substrate 'type' field): two further reasons to reject that had nothing to do with the multiple-of-8 rule under test. MEASURED, not assumed -- they showed up in a red-on-disable run.",
       "sections":[
-        {"kind":"text","name":".text","type":0,"flags":1610612768,"addrAlign":16,"entrySize":0,"virtualAddress":4096}
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // `pe.characteristics` = 34 above is the same isolation move as the
+    // entry cluster: without it the missing IMAGE_FILE_EXECUTABLE_IMAGE
+    // bit is a SECOND reason to reject, and this test would pass even
+    // with the multiple-of-8 rule deleted.
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/attributeCertReserveSize"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeCertPlaceholder, ZeroAcceptedAsDisabled) {
@@ -381,6 +467,9 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-cert","kind":"pe"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so a synthetic pe-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert for these pins (the walker is driven directly, so no trampoline is built).",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
@@ -405,7 +494,7 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeTrivialModule();
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = encodePeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -443,6 +532,9 @@ TEST(PeExecFormatJsonValidate,
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-no-exec-bit","kind":"pe"},
+      "$entryClusterComment": "D-LK10-ENTRY 2.13: validate() REJECTS an exec-flavored format that declares no processExit, so without this pair the fixture would be rejected for a reason unrelated to the defect it pins. Values verbatim from the shipped pe64-x86_64-windows-exec.format.json. Inert here -- a load test builds no trampoline.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 0, "type": "exec" },
       "optionalHeader": {
         "magic": 523, "imageBase": 5368709120,
@@ -456,6 +548,16 @@ TEST(PeExecFormatJsonValidate,
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // `characteristics: 0` IS this fixture's defect, so -- unlike its
+    // siblings above -- it is deliberately NOT repaired to 34; only the
+    // entry cluster is added.
+    EXPECT_EQ(countAtPath(r, "/pe/characteristics"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
@@ -473,6 +575,9 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-imports-with-cert","kind":"pe"},
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so a synthetic pe-exec schema must carry the pair or it never LOADS. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert for these pins (the walker is driven directly, so no trampoline is built).",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": {
@@ -506,7 +611,7 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "GetStdHandle", "kernel32.dll"});
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = encodePeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     constexpr std::size_t kSecurityDirOff = 152 + 112 + 4 * 8;
@@ -532,7 +637,7 @@ TEST(PeCertPlaceholder, ZeroSizeOmitsSecurityDir) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeTrivialModule();
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = encodePeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     constexpr std::size_t kSecurityDirOff = 152 + 112 + 4 * 8;

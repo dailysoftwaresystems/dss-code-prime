@@ -194,13 +194,37 @@ bool injectEntryTrampoline(AssembledModule&          module,
                            TargetSchema const&       target,
                            ObjectFormatSchema const& format,
                            DiagnosticReporter&       reporter) {
+    // ★ THIS CHECK WAS DEAD CODE BY CONSTRUCTION until the
+    // D-LK10-ENTRY entry-gate fold. Its only caller
+    // (`linker::link`) gated the call on `processExit().has_value()`
+    // — the SAME predicate — so a format lacking `processExit` never
+    // reached here; the linker just skipped injection with no
+    // diagnostic at all. The caller now asks the schema's
+    // `isExecFlavor()` instead and refuses separately
+    // (K_FormatLacksProcessExit, linker.cpp), which makes this a
+    // genuine backstop for the DIRECT-call path: tests and future
+    // callers invoke `injectEntryTrampoline` without going through
+    // `link` (10+ sites in tests/link/test_lk10_entry_slice_c.cpp
+    // alone).
+    //
+    // The code is `K_FormatLacksProcessExit`, the SAME code the
+    // linker gate and the walker-tier resolver fire: one fault class
+    // — "the emitted entry would have no process-exit path" — must
+    // not present under three different codes depending on which
+    // tier noticed. (Was `K_NoMatchingObjectFormat`, a generic
+    // catch-all that said nothing about the missing key; no test
+    // pinned it here — VERIFIED by grepping every
+    // `injectEntryTrampoline` call site, none of which passes a
+    // format without `processExit`.)
     auto const& peOpt = format.processExit();
     if (!peOpt.has_value()) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+        emit(reporter, DiagnosticCode::K_FormatLacksProcessExit,
              std::format("entry-trampoline: format '{}' did not "
-                         "declare a `processExit` block — runnable "
-                         "binaries require it (D-LK10-ENTRY §2.13 "
-                         "plan 14).",
+                         "declare a `processExit` block — DSS always "
+                         "synthesises an entry trampoline on an "
+                         "exec-flavored format and this one declares "
+                         "no mechanism for the trampoline to call "
+                         "(D-LK10-ENTRY §2.13 plan 14).",
                          std::string{format.name()}));
         return false;
     }

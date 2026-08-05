@@ -3150,6 +3150,64 @@ foreach ($leg in $BuiltLegs) {
 $RunnableLegs = @($BuiltLegs | Where-Object { $_.run.mode -eq 'native' -or $_.run.mode -eq 'launched' })
 if ($RunnableLegs.Count -eq 0) { Info "no built leg can be EXECUTED on this host — every one of them has a named skip verdict above." }
 
+# ── THE LOADEXT HELPER: THIS DRIVER STAGES NONE, AND SAYS SO ONCE, OUT LOUD ──
+# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED — this gap's OWN
+# anchor, registered 2026-08-05 (TF-C120). It is a DIFFERENT defect from its .sh
+# sibling D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN (✅ CLOSED
+# the same cycle): that one staged a WRONG-TARGET helper and died on it; this one
+# stages NO helper at all. Filing them under one name is what let this half hide.
+#
+# build-and-test.sh pre-stages the shared object sqlite's test/loadext.test
+# dlopen()s, built by the leg's own VERIFIED target compiler (harness_legs.py
+# --resolve-target-cc). THIS DRIVER DOES NOT, and never has — ✔MEASURED
+# 2026-08-05: neither a staging call nor a target-cc resolution exists anywhere
+# in this file. That is a real difference in what the two drivers prove, so it is
+# STATED rather than left for a reader to notice; silence about a coverage
+# difference is the harness bug, not the difference itself.
+#
+# ★ WHY IT IS NOT SIMPLY COPIED OVER — the obvious move, and it is WRONG HERE.
+# The helper must be built FOR THE LEG'S TARGET by a compiler on the DRIVER'S
+# host. ✔MEASURED 2026-08-05 on this box: `gcc -dumpmachine` prints
+# `x86_64-w64-mingw32`, so the verified resolver accepts it for pe64 and
+# correctly REFUSES it for elf64-x86_64. Adding staging here would therefore mark
+# this driver's LARGEST leg — elf64-x86_64, the one it runs under `wsl.exe`,
+# 330,436 units — `skipped-build-input-missing` for want of a Linux-targeting
+# compiler on a Windows PATH. It would cost real coverage to close a gap that on
+# THIS driver is not currently biting, because:
+#
+#   every leg this driver can execute runs its fixture in an environment whose
+#   own native compiler IS that leg's target — pe64 natively on Windows (mingw
+#   gcc), the elf legs inside WSL (Linux gcc) — so loadext.test's own `exec gcc`
+#   self-build is target-correct here. The .sh needs pre-staging because IT
+#   launches a cross-ARCH leg under qemu, where the guest's `exec gcc` is passed
+#   through to the HOST kernel and yields a HOST x86-64 object
+#   (D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO).
+#
+# WHAT IS STILL LOST, said plainly because it is the honest part: on a host with
+# no gcc at all, loadext.test does not fail — it prints "Skipping loadext tests:
+# Test extension not built..." and returns (✔MEASURED at test/loadext.test:83-95),
+# so ~16 units leave the run with only that line to show for it. Closing it
+# properly means resolving the helper compiler IN THE LAUNCHER'S NAMESPACE (a
+# WSL-side cc for a wsl.exe-launched leg), which neither driver can do today.
+#
+# ✔ THIS GAP NOW HAS ITS OWN REGISTRY ROW — D-HARNESS-PS1-STAGES-NO-LOADEXT-
+# HELPER-COVERAGE-IS-UNDECLARED, registered 2026-08-05 (TF-C120), 🔴 OPEN.
+# ★ ORDERING LESSON, kept because it cost a gate failure to learn: a new `D-*`
+# token cannot be minted in this file first. tools/check-anchor-registry.sh scans
+# real-examples/ and FAILS the gate on any anchor with no plan-side row (✔MEASURED
+# 2026-08-05 — it failed on exactly that). The registry row is written BEFORE the
+# citation, never after.
+#
+# ⚠ ASCII ONLY in the emitted strings below: a non-ASCII character in gate output
+# has already killed a run on a cp1252 console at its LAST line.
+if ($RunnableLegs.Count) {
+  Warn "this driver pre-stages NO loadext helper extension (build-and-test.sh does)"
+  Info "      sqlite's test/loadext.test builds its own with a hardcoded 'gcc', inside the fixture's OWN environment."
+  Info "      That is target-correct for every leg THIS driver can launch (pe64 native on Windows; the elf legs inside WSL),"
+  Info "      but on a host with no gcc at all loadext.test SKIPS itself and ~16 loadext-* units leave no verdict behind."
+  Info "      [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED]"
+}
+
 foreach ($leg in $RunnableLegs) {
 # ★★ THE BODY OF THIS LOOP IS DELIBERATELY NOT INDENTED. Two reasons, both
 # load-bearing: (1) test-confound-scope.ps1 EXTRACTS the shipped classifier below
