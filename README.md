@@ -190,6 +190,8 @@ cd build && ctest --output-on-failure
 
 Issues and discussions are open — the [issue forms](.github/ISSUE_TEMPLATE) will guide you. The one hard rule: the shared engine stays **source-, target-, and format-agnostic** (no `if (arch/format/language == …)` in the substrate), and the project **fails loud** rather than ever silently miscompiling. New behavior comes with a test that goes red when it regresses.
 
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide — what to send, the bar in detail, and how code contributions are licensed.
+
 ## Support the project
 
 If DSS Code Prime is useful to you — or you simply want to see a genuinely independent, auditable toolchain exist — the **Sponsor** button (linking to [dailysoftwaresystems.com](https://dailysoftwaresystems.com/)) funds the work directly. Every contribution extends the runway toward full C23, DSS Axis, and more architectures.
