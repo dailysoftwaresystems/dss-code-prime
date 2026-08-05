@@ -14,9 +14,11 @@ compiler gets wrong**, together with what you expected and what you got. A
 reduced reproduction is worth more here than a patch, because every fix in this
 project has to come with a test that pins the behaviour permanently.
 
-**Code contributions** — see [Licensing of contributions](#licensing-of-contributions)
-below first. Please open an issue before writing a patch so we can confirm the
-terms and the approach before you invest the time.
+**Code contributions** are welcome. Sign your commits with `git commit -s` — see
+[Licensing of contributions](#licensing-of-contributions) — and for anything
+beyond a small fix, open an issue first so we can agree the approach before you
+spend real time on it. The bar below is strict, and it is much cheaper to discuss
+a design than to rework a finished patch.
 
 ## The bar
 
@@ -96,21 +98,55 @@ please don't skip those tests to get green locally.
 ## Licensing of contributions
 
 DSS Code Prime is licensed under **Apache License 2.0** (see [LICENSE](LICENSE)
-and [NOTICE](NOTICE)). Copyright is currently held in full by **Daily Software
-Systems LTDA** — which is what made relicensing the project from proprietary to
-open source possible in the first place.
+and [NOTICE](NOTICE)). Contributions come in under the same license they go out
+under — there is no separate contributor agreement, and **you keep the copyright
+to everything you write**. We ask for no rights beyond Apache 2.0, and we are not
+reserving the ability to ship your work under other terms.
 
-**We are finalizing our formal contribution terms.** Until they are published:
+That is a deliberate choice. This project does not sell licenses to its own code.
+Where a company commissions a feature, that feature lands here in the open, on
+the same terms as everything else, available to everyone — including the people
+who did not pay for it. What is being sold is the work, never exclusivity.
 
-- **Issues, bug reports, reproductions, and discussions require no agreement.**
-  Send them freely.
-- **Code contributions are accepted by prior arrangement.** Open an issue or
-  email us first and we will confirm the terms before you write anything. We
-  would rather have that conversation up front than ask you to re-license work
-  you have already done.
+### Sign your commits (DCO)
 
-This is not a closed door — it is us not wanting to take your work under terms
-neither side has read yet.
+We use the [Developer Certificate of Origin](DCO) — the same lightweight
+mechanism the Linux kernel uses. It is not a contributor agreement and it takes
+no rights from you. It is a statement that you have the right to send us what you
+are sending: that you wrote it, or it came from a compatible open source
+source and you are permitted to pass it on.
+
+Sign off each commit:
+
+```bash
+git commit -s -m "your message"
+```
+
+`-s` appends a line to the commit message:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+By adding it you certify the [DCO](DCO) — please read it once; it is short.
+
+Use a real name and a real email address that reaches you. The sign-off is part
+of the permanent public git history, as clause (d) of the DCO spells out.
+
+**Forgot to sign off?** Amend the last commit:
+
+```bash
+git commit --amend -s --no-edit
+```
+
+For several commits, rebase across the range and sign each:
+
+```bash
+git rebase --signoff origin/main
+```
+
+Then force-push your branch. Nobody will hold an unsigned first attempt against
+you — it is a one-command fix.
 
 ## Security
 
